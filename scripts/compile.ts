@@ -35,7 +35,63 @@ import { $ } from "bun";
 const PKG_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = join(PKG_ROOT, "src", "main.ts");
 const OUT_DIR = join(PKG_ROOT, "dist");
-const CLOUD_ORIGIN = process.env.OPENLLM_CLOUD_ORIGIN ?? "https://openllm.sh";
+
+const DEFAULT_CLOUD_ORIGIN = "https://openllm.sh";
+
+/**
+ * Validate the cloud origin BEFORE baking it into every shipped binary via
+ * `--define`. An unvalidated value (audit §3 / §4b N1) lets a poisoned build
+ * env point every daemon at a rogue origin, and an empty string is silently
+ * accepted. So we fail closed:
+ *
+ * - empty / missing  → the public default (`https://openllm.sh`).
+ * - the default      → accepted verbatim.
+ * - `https://` with a hostname that is `openllm.sh`, a `*.openllm.sh`
+ *   subdomain (e.g. `dev.openllm.sh` staging), or a `*.vercel.app` preview →
+ *   accepted (the documented dev/preview/self-host workflow; `dist.ts` bakes
+ *   whatever `OPENLLM_CLOUD_ORIGIN` is set when packaging a self-host build).
+ * - `http://` ONLY for `localhost` / `127.0.0.1` (local dev).
+ * - anything else (a remote non-allow-listed host, or a non-http(s) scheme) →
+ *   THROW, failing the compile.
+ *
+ * NOTE: this guards the COMPILE-TIME bake only. The runtime still lets the
+ * `OPENLLM_CLOUD_ORIGIN` env var win (`packages/daemon/src/env.ts`), so dev /
+ * preview daemons are normally re-pointed at runtime, not via the bake.
+ */
+const isAllowedCloudHost = (host: string): boolean =>
+  host === "localhost" ||
+  host === "127.0.0.1" ||
+  host === "openllm.sh" ||
+  host.endsWith(".openllm.sh") ||
+  host.endsWith(".vercel.app");
+
+const resolveCloudOrigin = (): string => {
+  const raw = process.env.OPENLLM_CLOUD_ORIGIN;
+  if (raw === undefined || raw.length === 0) return DEFAULT_CLOUD_ORIGIN;
+  if (raw === DEFAULT_CLOUD_ORIGIN) return raw;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(
+      `OPENLLM_CLOUD_ORIGIN (${raw}) is not a valid URL — refusing to bake it into the daemon binary`,
+    );
+  }
+  const isLoopback =
+    url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  const schemeOk =
+    url.protocol === "https:" || (url.protocol === "http:" && isLoopback);
+  if (!schemeOk || !isAllowedCloudHost(url.hostname)) {
+    throw new Error(
+      `OPENLLM_CLOUD_ORIGIN (${raw}) is not allow-listed — must be https://openllm.sh, ` +
+        `a *.openllm.sh / *.vercel.app host, or http://localhost|127.0.0.1; ` +
+        `refusing to bake an unrecognised cloud origin into the daemon binary`,
+    );
+  }
+  return raw;
+};
+
+const CLOUD_ORIGIN = resolveCloudOrigin();
 
 const TARGETS = [
   "bun-darwin-arm64",
