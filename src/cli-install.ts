@@ -113,9 +113,14 @@ export const runInstallScript = (
   env: NodeJS.ProcessEnv,
 ): Promise<TInstallRun> =>
   new Promise<TInstallRun>((resolve) => {
-    const child = spawn("bash", ["-c", `curl -fsSL ${url} | bash`], {
+    // Pass the URL through an ENV VAR referenced as a quoted `"$INSTALL_URL"`
+    // rather than interpolating it into the command string. `runInstallScript`
+    // is exported (for the regression test), so a caller-supplied `url` must
+    // never be able to break out of the `bash -c` and inject shell — the env-var
+    // indirection makes that impossible regardless of the url's contents.
+    const child = spawn("bash", ["-c", 'curl -fsSL "$INSTALL_URL" | bash'], {
       stdio: ["ignore", "pipe", "pipe"],
-      env,
+      env: { ...env, INSTALL_URL: url },
       detached: true,
     });
 
