@@ -36,6 +36,10 @@ const INSTALL_SCRIPT: Readonly<Record<TCliProvider, string>> = {
   claude_code: "https://claude.ai/install.sh",
   chatgpt: "https://chatgpt.com/codex/install.sh",
   kimi_code: "https://code.kimi.com/kimi-code/install.sh",
+  // The official Grok Build curl installer. Verified live (2026-06-30): the URL
+  // serves the real install script over HTTP 200 — it is NOT Cloudflare-walled,
+  // and grok ships no npm package, so curl is the only install path.
+  grok: "https://x.ai/cli/install.sh",
 };
 
 /** Hard ceiling for a vendor install — a stalled download/install is killed so
@@ -121,6 +125,11 @@ export const runInstallScript = (
     const child = spawn("bash", ["-c", 'curl -fsSL "$INSTALL_URL" | bash'], {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...env, INSTALL_URL: url },
+      // Run in the daemon-owned temp dir, never the daemon's inherited cwd `/`:
+      // a vendor installer launched at `/` walks the filesystem root (tripping
+      // macOS's TCC network-volume prompt on `/Volumes/*`). The dir is granted
+      // read-write by the sandbox working set.
+      cwd: daemonTempDir(),
       detached: true,
     });
 
@@ -206,7 +215,9 @@ export const ensureHostCli = async (
   // group-killing timeout (see `runInstallScript`): a stalled download/install —
   // or a survivor descendant holding the pipe — can't wedge the serial control
   // loop forever, so the `cli_install` handler always returns and clears the
-  // card's "Installing…" state.
+  // card's "Installing…" state. `runInstallScript` also pins the child cwd to
+  // the daemon temp dir so the installer never walks the daemon's inherited `/`
+  // (which trips macOS's TCC network-volume prompt on `/Volumes/*`).
   const { timedOut, output } = await runInstallScript(
     INSTALL_SCRIPT[provider],
     {

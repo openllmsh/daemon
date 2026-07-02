@@ -38,6 +38,12 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   chatgpt: { binRel: "bin/codex" },
   // kimi install.sh with KIMI_INSTALL_DIR=<root> → <root>/bin/kimi.
   kimi_code: { binRel: "bin/kimi" },
+  // grok (Grok Build, x.ai/cli) is HOME-rooted like claude, so its isolated
+  // symlink lives under the isolated HOME's bin, paralleling claude's launcher.
+  // NB: this is only where the ISOLATED SYMLINK is created — the real installer
+  // drops the host launcher at ~/.grok/bin/grok (see `hostCliCandidates`), and
+  // that is what gets symlinked here.
+  grok: { binRel: "home/.local/bin/grok" },
 };
 
 export const cliRoot = (provider: TCliProvider): string =>
@@ -80,6 +86,16 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
         join(home, ".kimi-code", "bin", "kimi"),
         join(home, ".local", "bin", "kimi"),
       ];
+    // The official x.ai/cli installer's default BIN_DIR is ~/.grok/bin
+    // (`BIN_DIR="${GROK_BIN_DIR:-$HOME/.grok/bin}"`), and it only adds a
+    // ~/.local/bin/grok symlink WHEN ~/.grok/bin isn't already on PATH — so the
+    // primary location must come first, with ~/.local/bin/grok as the
+    // conditional fallback. (Verified against the live installer 2026-06-30.)
+    case "grok":
+      return [
+        join(home, ".grok", "bin", "grok"),
+        join(home, ".local", "bin", "grok"),
+      ];
   }
 };
 
@@ -98,6 +114,9 @@ export const cliConfigDir = (provider: TCliProvider): string => {
       return join(home, ".codex");
     case "kimi_code":
       return join(home, ".kimi-code");
+    // grok caches its OAuth token at <home>/.grok/auth.json.
+    case "grok":
+      return join(home, ".grok");
   }
 };
 
@@ -154,6 +173,19 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
         KIMI_INSTALL_DIR: root,
         // Don't edit the user's shell rc files.
         KIMI_NO_MODIFY_PATH: "1",
+      };
+    // grok is HOME-rooted (like claude): it reads/writes its config +
+    // `auth.json` under <home>/.grok, so pinning HOME isolates it from the
+    // user's real ~/.grok. The x.ai/cli installer DOES expose a GROK_BIN_DIR
+    // knob, but we deliberately don't set it: like every provider here the host
+    // binary installs to its DEFAULT location (~/.grok/bin) via `ensureHostCli`
+    // (which runs with the default env, not `cliEnv`) and the isolated path is a
+    // symlink to it — there is no isolated install for an install-dir knob to
+    // redirect.
+    case "grok":
+      return {
+        HOME: home,
+        TMPDIR: tmp,
       };
   }
 };

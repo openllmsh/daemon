@@ -41,14 +41,23 @@ import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
-  setPendingAuth,
 } from "../pending-auth";
-import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
+import {
+  ensureAuthConfig,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
+import type { TDeviceAuth, TDevicePoll } from "./login-direct";
+import { makeDeviceCodeConnect } from "./login-direct";
+import { loginSlot, makeCancelConnect } from "./login-flow";
+import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
-import { cliVersion, openUrl, readJsonFile } from "./util";
+import { cliVersion, readJsonFile } from "./util";
 
 const PROVIDER = "kimi_code" as const;
-const USAGE_URL = "https://api.kimi.com/coding/v1/usages";
+// Usage endpoint LEAF path — the host is derived from the captured inference
+// endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
+const USAGE_PATH = "/coding/v1/usages";
 
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
 // (constants.ts + oauth.ts). Same host + public client id the CLI uses,
@@ -60,9 +69,11 @@ const OAUTH_HOST = (
 ).replace(/\/$/, "");
 const OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
-// Refresh the access token when it's within this of `expires_at` — both
-// on a status/usage read and before serving a request (a small skew
-// avoids a guaranteed 401 → refresh → retry on the next call).
+// When the access token is within this window of `expires_at`, `readToken`
+// TRIGGERS the kimi CLI's OWN native refresh (a minimal `kimi -p` inference — the
+// CLI refreshes mid-request and persists it). No token endpoint or client id is
+// used for REFRESH; the constants above belong to the device-code LOGIN flow,
+// which the daemon must drive itself (kimi's only sign-in is the in-TUI /login).
 const REFRESH_LEEWAY_MS = 60_000;
 
 const bin = (): string => cliBin(PROVIDER);
@@ -77,48 +88,142 @@ type TKimiToken = {
   readonly expires_at?: number;
 };
 
+// kimi's native refresh is a `kimi -p` inference through the MANAGED (OAuth)
+// provider — which the CLI's `ensureFresh` refreshes mid-request. `kimi -p` needs
+// the managed model in config.toml, which kimi's interactive `/login` registers
+// (via `provisionManagedKimiCodeConfig` → `GET /models`). The daemon drives
+// device-code login DIRECTLY, so it never writes that config → `kimi -p` errors
+// "No model configured" and the token never refreshes. We replicate ONLY the
+// data-fetch: the managed model entries are pulled from the SAME `/models`
+// endpoint and written verbatim (never hardcoded). These are the CLI's stable
+// structural constants (ref/kimi-code `managed-kimi-code.ts`).
+const MANAGED_PROVIDER = "managed:kimi-code"; // KIMI_CODE_PROVIDER_NAME
+const MANAGED_OAUTH_KEY = "oauth/kimi-code"; // KIMI_CODE_OAUTH_KEY
+const MANAGED_ALIAS_PREFIX = "kimi-code"; // managedModelKey = `${this}/<id>`
+const configTomlPath = (): string => join(kimiHome(), "config.toml");
+
+// Provisioned once per process; single-flight; back off after a failed fetch.
+let configEnsured = false;
+let provisionInFlight: Promise<void> | null = null;
+let provisionBackoffUntil = 0;
+
 /**
- * Exchange the stored refresh token for a fresh one via the SAME
- * device-code token endpoint with `grant_type=refresh_token` the CLI
- * uses (ref/kimi-code packages/oauth `refreshAccessToken`). Returns the
- * new wire blob on success, null on any failure — the caller then falls
- * back to the stale token and the upstream's own 401 surfaces.
+ * Fetch the vendor's managed model list (`GET /coding/v1/models` — exactly the
+ * call the CLI's `fetchManagedKimiCodeModels` makes after login) and write the
+ * managed provider + those models into the isolated `config.toml`. The MODEL
+ * entries (ids, context sizes) come straight from the API — nothing about them is
+ * hardcoded; `base_url` is derived from the captured upstream host. Returns false
+ * on any failure (non-200 / no models / parse).
  */
-const refreshOAuth = async (
-  refresh: string,
-  headers: Record<string, string>,
-): Promise<Record<string, unknown> | null> => {
+const provisionModelConfig = async (
+  accessToken: string,
+  base: string,
+): Promise<boolean> => {
   try {
-    const { status, data } = await postForm(
-      "/api/oauth/token",
-      {
-        client_id: OAUTH_CLIENT_ID,
-        grant_type: "refresh_token",
-        refresh_token: refresh,
+    const resp = await fetch(`${base}/models`, {
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        ...(await identityHeaders()),
+        accept: "application/json",
       },
-      headers,
-    );
-    return status === 200 && typeof data.access_token === "string"
-      ? data
-      : null;
+    });
+    if (!resp.ok) return false;
+    const body = (await resp.json()) as {
+      data?: ReadonlyArray<Record<string, unknown>>;
+    };
+    const models = (body.data ?? [])
+      .map((m) => ({
+        id: typeof m.id === "string" ? m.id : "",
+        ctx: Number(m.context_length),
+      }))
+      .filter((m) => m.id.length > 0 && Number.isInteger(m.ctx) && m.ctx > 0);
+    if (models.length === 0) return false;
+    const lines: string[] = [
+      `default_model = "${MANAGED_ALIAS_PREFIX}/${models[0].id}"`,
+      "",
+      `[providers."${MANAGED_PROVIDER}"]`,
+      'type = "kimi"',
+      `base_url = "${base}"`,
+      'api_key = ""',
+      "",
+      `[providers."${MANAGED_PROVIDER}".oauth]`,
+      'storage = "file"',
+      `key = "${MANAGED_OAUTH_KEY}"`,
+    ];
+    for (const m of models) {
+      lines.push(
+        "",
+        `[models."${MANAGED_ALIAS_PREFIX}/${m.id}"]`,
+        `provider = "${MANAGED_PROVIDER}"`,
+        `model = "${m.id}"`,
+        `max_context_size = ${m.ctx}`,
+      );
+    }
+    await Bun.write(configTomlPath(), `${lines.join("\n")}\n`);
+    return true;
   } catch {
-    return null;
+    return false;
   }
 };
 
-// Single-flight guard: concurrent callers that all see a stale token
-// share ONE refresh (Kimi rotates the refresh token, so parallel
-// refreshes would invalidate each other).
-let inFlightRefresh: Promise<void> | null = null;
+/**
+ * Ensure the isolated `config.toml` carries the managed model so `kimi -p` (the
+ * native refresh path) can run. Idempotent + single-flight + backs off after a
+ * failure. Called from `readToken` WHILE THE TOKEN IS VALID (the `/models` fetch
+ * needs a live token), so the config is ready before the near-expiry refresh.
+ */
+const ensureModelConfig = async (accessToken: string): Promise<void> => {
+  if (configEnsured) return;
+  if (provisionInFlight !== null) return provisionInFlight;
+  const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
+  const existing = await Bun.file(configTomlPath())
+    .text()
+    .catch(() => "");
+  // Configured AND on the CURRENT host. If the captured upstream host migrated,
+  // the stored `base_url` is stale — re-provision instead of returning early, or
+  // `kimi -p` would refresh against the wrong host.
+  if (
+    existing.includes(MANAGED_PROVIDER) &&
+    existing.includes(`base_url = "${base}"`)
+  ) {
+    configEnsured = true;
+    return;
+  }
+  if (Date.now() < provisionBackoffUntil) return;
+  provisionInFlight = provisionModelConfig(accessToken, base)
+    .then((ok) => {
+      if (ok) configEnsured = true;
+      else provisionBackoffUntil = Date.now() + 60_000;
+    })
+    .finally(() => {
+      provisionInFlight = null;
+    });
+  return provisionInFlight;
+};
+
+/**
+ * Trigger the kimi CLI's OWN native token refresh: a minimal `kimi -p` inference
+ * through the managed (OAuth) provider. The CLI refreshes its token mid-request
+ * (`ensureFresh`) and persists it; the daemon never touches the token. `kimi -p`
+ * is TTY-gated (so under a PTY); the managed model it runs is provisioned by
+ * `readToken` from the native `/models` list. Output ignored; bounded.
+ */
+const triggerRefresh = async (): Promise<void> => {
+  await spawnRefresh([bin(), "-p", "ping"], env(), { pty: true });
+};
+
+// Within the leeway window → fire the CLI refresh in the background (still
+// valid, no stall); hard-expired → await it. Single-flight per provider.
+const refresh = makeRefresher({
+  leewayMs: REFRESH_LEEWAY_MS,
+  trigger: triggerRefresh,
+});
 
 /**
  * The current access token from
- * `<KIMI_CODE_HOME>/credentials/kimi-code.json` (storage name resolves to
- * `kimi-code`; see packages/oauth resolveKimiTokenStorageName) —
- * REFRESHED + persisted when it's within the leeway of `expires_at`.
- * Used by `status`, `usage`, and `credentialForUpstream`, so a status
- * check AND a served request both carry a live token (the CLI itself
- * only refreshes mid-its-own-inference, which the daemon never triggers).
+ * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
+ * refresh when it's within the leeway of `expires_at`. Used by `status`,
+ * `usage`, and `credentialForUpstream` so each carries a live token.
  */
 const readToken = async (): Promise<{ accessToken: string } | null> => {
   const tok = await readJsonFile<TKimiToken>(credentialPath());
@@ -129,39 +234,24 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
     typeof tok.expires_at === "number" && tok.expires_at > 0
       ? tok.expires_at * 1000
       : null;
-  const stale =
-    expiresAtMs !== null && expiresAtMs - Date.now() < REFRESH_LEEWAY_MS;
-  if (
-    !stale ||
-    tok.refresh_token === undefined ||
-    tok.refresh_token.length === 0
-  ) {
+  // Provision the managed model config from the native `/models` list WHILE the
+  // token is still valid (the fetch needs a live token), so the near-expiry
+  // `kimi -p` refresh has a model to run. Idempotent — a no-op once configured.
+  if (expiresAtMs === null || expiresAtMs > Date.now()) {
+    await ensureModelConfig(tok.access_token);
+  }
+  // Only trigger when the credential CAN be refreshed — an empty/missing refresh
+  // token can't (and the CLI can't either), so don't waste a spawn.
+  const outcome =
+    tok.refresh_token !== undefined && tok.refresh_token.length > 0
+      ? await refresh(expiresAtMs)
+      : "fresh";
+  if (outcome !== "awaited") {
     return { accessToken: tok.access_token };
   }
-
-  if (inFlightRefresh === null) {
-    const rt = tok.refresh_token;
-    inFlightRefresh = (async () => {
-      const wire = await refreshOAuth(rt, await identityHeaders());
-      if (wire === null) return;
-      // Kimi rotates the refresh token; keep the old one if the response
-      // omits it so we can still refresh next time. `writeCredential`
-      // persists the exact wire shape the CLI's storage uses.
-      if (
-        typeof wire.refresh_token !== "string" ||
-        wire.refresh_token.length === 0
-      ) {
-        wire.refresh_token = rt;
-      }
-      writeCredential(wire);
-    })().finally(() => {
-      inFlightRefresh = null;
-    });
-  }
-  await inFlightRefresh;
-
-  // Re-read the (now-rotated) credential; fall back to the stale token if
-  // the refresh failed — the upstream then 401s and the UI says re-login.
+  // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
+  // credential; fall back to the stale token if it failed (the upstream then
+  // 401s and the UI says re-login).
   const fresh = await readJsonFile<TKimiToken>(credentialPath());
   return {
     accessToken:
@@ -224,14 +314,10 @@ const identityHeaders = async (): Promise<Record<string, string>> =>
   headersFor(await kimiVersion(), await ensureDeviceId());
 
 // ─── Device-code login flow ──────────────────────────────────────────────
-
-type TDeviceAuth = {
-  readonly userCode: string;
-  readonly deviceCode: string;
-  readonly verificationUriComplete: string;
-  readonly intervalMs: number;
-  readonly expiresInMs: number;
-};
+//
+// kimi DRIVES the device-code flow; the direct-login adaptor ORCHESTRATES it
+// (surface URL+code → background poll). The request (`TDeviceAuth`) + poll
+// (`TDevicePoll`) shapes are the adaptor's generic contract, imported above.
 
 const postForm = async (
   path: string,
@@ -259,7 +345,7 @@ const postForm = async (
   return { status: resp.status, data };
 };
 
-const requestDeviceAuth = async (
+const requestDeviceCode = async (
   headers: Record<string, string>,
 ): Promise<TDeviceAuth | null> => {
   try {
@@ -295,15 +381,10 @@ const requestDeviceAuth = async (
   }
 };
 
-type TPoll =
-  | { readonly kind: "success"; readonly wire: Record<string, unknown> }
-  | { readonly kind: "pending"; readonly slowDown: boolean }
-  | { readonly kind: "stop" };
-
-const pollToken = async (
+const pollDeviceToken = async (
   deviceCode: string,
   headers: Record<string, string>,
-): Promise<TPoll> => {
+): Promise<TDevicePoll> => {
   const { status, data } = await postForm(
     "/api/oauth/token",
     {
@@ -345,68 +426,6 @@ const writeCredential = (wire: Record<string, unknown>): void => {
     encoding: "utf-8",
     mode: 0o600,
   });
-};
-
-// One in-flight login per process. The background poll writes the
-// credential on success; the status watcher (~5s) then flips the card to
-// connected — so we don't import the SSE broadcaster here (avoids a
-// delegation→events cycle).
-let loginInFlight = false;
-// Set by `cancelConnect` to abort the background poll mid-flight. Checked each
-// iteration; reset when a fresh login starts so a prior cancel can't kill it.
-let loginAborted = false;
-const sleep = (ms: number): Promise<void> =>
-  new Promise((r) => setTimeout(r, ms));
-
-/** Abort an in-flight Kimi device-code poll. The loop exits on its next tick;
- *  the in-memory code is dropped now so status reflects the cancel at once. */
-const cancelBackgroundLogin = (): void => {
-  if (loginInFlight) loginAborted = true;
-  clearPendingAuth(PROVIDER);
-};
-
-const startBackgroundLogin = (
-  auth: TDeviceAuth,
-  headers: Record<string, string>,
-): void => {
-  if (loginInFlight) return;
-  loginInFlight = true;
-  loginAborted = false;
-  void (async () => {
-    const deadline = Date.now() + auth.expiresInMs;
-    let delayMs = auth.intervalMs;
-    try {
-      while (Date.now() < deadline) {
-        if (loginAborted) return;
-        await sleep(delayMs);
-        if (loginAborted) return;
-        const res = await pollToken(auth.deviceCode, headers);
-        // Re-check AFTER the (awaited) poll: a cancel that arrived while the
-        // request was in flight must win, or we'd write a credential — signing
-        // the user in — for a login they just cancelled.
-        if (loginAborted) return;
-        if (res.kind === "success") {
-          writeCredential(res.wire);
-          // Refresh the auth config (upstream URL) now that the identity is
-          // established. Best-effort + non-blocking.
-          void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-          return;
-        }
-        if (res.kind === "stop") return;
-        if (res.slowDown) delayMs += 5_000;
-      }
-    } catch {
-      // swallow — the user can retry Connect
-    } finally {
-      loginInFlight = false;
-      // Always drop the in-memory device code when the flow ends. On SUCCESS the
-      // credential is now on disk, so `status()` reports Connected from the token
-      // regardless of pending-auth; on expiry / denial / error / deadline this
-      // stops the card from showing a DEAD code forever (and the dashboard from
-      // fast-polling it indefinitely). Mirrors codex's `proc.exited` cleanup.
-      clearPendingAuth(PROVIDER);
-    }
-  })();
 };
 
 // ─── /usages parsing ─────────────────────────────────────────────────────
@@ -515,8 +534,52 @@ const parseUsageWindows = (payload: unknown): ReadonlyArray<TUsageRow> => {
   return rows;
 };
 
+// ─── Login wiring ────────────────────────────────────────────────────────
+//
+// kimi's only sign-in is the device-code flow, driven via the direct-login
+// adaptor; `cancelConnect` aborts the background poll through the shared slot.
+
+const slot = loginSlot(PROVIDER);
+// Identity headers (UA + device id) computed ONCE per login (single-flight
+// guarantees no overlap) and reused by the device-code request + every poll,
+// matching the pre-refactor flow which captured `headers` once in `connect`.
+let loginHeaders: Record<string, string> = {};
+
+const connectDevice = makeDeviceCodeConnect({
+  provider: PROVIDER,
+  slot,
+  installed: async () => (await cliInstallState(PROVIDER)).installed,
+  installHint: "Install the Kimi CLI from the Providers tab first.",
+  connected: async () => (await readToken()) !== null,
+  connectedDetail: "signed in via Kimi Code",
+  inProgressDetail:
+    "Kimi sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  requestDeviceAuth: async () => {
+    loginHeaders = await identityHeaders();
+    return requestDeviceCode(loginHeaders);
+  },
+  pollToken: (deviceCode) => pollDeviceToken(deviceCode, loginHeaders),
+  onCredential: (wire) => writeCredential(wire),
+  // Refresh the auth config (upstream URL) now the identity is established.
+  onConnected: () => {
+    void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
+  },
+  pendingDetail: (auth) =>
+    `Authorize Kimi in the browser window that just opened (code ${auth.userCode}). This page updates automatically when you're done — or open ${auth.verificationUriComplete}`,
+  startFailDetail:
+    "Couldn't start Kimi sign-in (device authorization failed). Check your connection and retry.",
+});
+
+const cancelConnect = makeCancelConnect(PROVIDER, slot, {
+  cancelled: "Kimi sign-in cancelled",
+  none: "no sign-in was in progress",
+});
+
 export const kimiCodeDelegate: TProviderDelegate = {
   slug: PROVIDER,
+
+  connect: connectDevice,
+  cancelConnect,
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
@@ -544,72 +607,13 @@ export const kimiCodeDelegate: TProviderDelegate = {
     };
   },
 
-  connect: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Kimi CLI from the Providers tab first.",
-      };
-    }
-    if ((await readToken()) !== null) {
-      return { connected: true, detail: "signed in via Kimi Code" };
-    }
-    if (loginInFlight) {
-      return {
-        connected: false,
-        detail:
-          "Kimi sign-in already in progress — finish authorizing in your browser; this updates automatically.",
-      };
-    }
-    // Drive Kimi's own device-code OAuth flow (the flow the CLI's in-TUI
-    // `/login` runs). Request a device code, open the pre-filled
-    // verification URL in the browser, and poll in the background; on
-    // success the credential file lands and the status watcher flips the
-    // card to connected (~5s) — no terminal, no TUI.
-    const headers = await identityHeaders();
-    const auth = await requestDeviceAuth(headers);
-    if (auth === null) {
-      return {
-        connected: false,
-        detail:
-          "Couldn't start Kimi sign-in (device authorization failed). Check your connection and retry.",
-      };
-    }
-    // Surface the URL + code to the dashboard (the daemon may be on a
-    // different machine than the user's browser — for a remote box `openUrl`
-    // opens nothing useful, but the dashboard shows these so the user
-    // authorizes from THEIR machine). Cleared when the credential lands.
-    setPendingAuth(PROVIDER, {
-      url: auth.verificationUriComplete,
-      code: auth.userCode,
-    });
-    openUrl(auth.verificationUriComplete);
-    startBackgroundLogin(auth, headers);
-    return {
-      connected: false,
-      pending: true,
-      detail: `Authorize Kimi in the browser window that just opened (code ${auth.userCode}). This page updates automatically when you're done — or open ${auth.verificationUriComplete}`,
-    };
-  },
-
-  cancelConnect: async () => {
-    const wasInFlight = loginInFlight;
-    cancelBackgroundLogin();
-    return {
-      ok: true,
-      detail: wasInFlight
-        ? "Kimi sign-in cancelled"
-        : "no sign-in was in progress",
-    };
-  },
-
   usage: async (): Promise<TProviderUsageSnapshot> => {
     const token = await readToken();
     if (token === null) {
       return { kind: "unavailable", reason: "not signed in to Kimi CLI" };
     }
     try {
-      const resp = await fetch(USAGE_URL, {
+      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
         method: "GET",
         headers: {
           authorization: `Bearer ${token.accessToken}`,
