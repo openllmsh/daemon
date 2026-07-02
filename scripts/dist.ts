@@ -99,7 +99,10 @@ const main = async (): Promise<void> => {
 
   const template = readFileSync(TEMPLATE, "utf-8");
   // The real installer, minus its shebang (the wrapper supplies its own).
-  const installBody = readFileSync(INSTALL_SH, "utf-8").replace(/^#![^\n]*\n/, "");
+  const installBody = readFileSync(INSTALL_SH, "utf-8").replace(
+    /^#![^\n]*\n/,
+    "",
+  );
   const cloud = cloudDefault();
 
   for (const target of wrapTargets) {
@@ -110,7 +113,9 @@ const main = async (): Promise<void> => {
     }
     // The integrity gate verifies the DECOMPRESSED binary (matches install.sh
     // + the gateway's published `.sha256`).
-    const sha = createHash("sha256").update(readFileSync(rawPath)).digest("hex");
+    const sha = createHash("sha256")
+      .update(readFileSync(rawPath))
+      .digest("hex");
     // Wrap the base64 at 76 cols — friendlier to editors/diff than one giant line.
     const payload = readFileSync(gzPath)
       .toString("base64")
