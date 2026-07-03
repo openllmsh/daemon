@@ -26,7 +26,7 @@
 import type { Pointer } from "bun:ffi";
 import { CString, dlopen, FFIType, ptr } from "bun:ffi";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { logInfo, logWarn } from "../logger";
 import type { TSandboxState } from "./landlock";
 import { daemonWorkingSet } from "./working-set";
@@ -63,18 +63,55 @@ const macHomeRead = (home: string): string[] => [
 ];
 
 /**
- * Vendor credential FILES that sit INSIDE the re-allowed working-set config
- * dirs (`~/.codex`, `~/.claude`) and so must be re-denied even though their
- * parent dir is read-granted — the daemon writes config there but never needs
- * the user's vendor tokens. Every OTHER user secret (`~/.ssh`, `~/.aws`,
- * `~/.gnupg`, `~/.config/{gcloud,gh}`, the login keychain, browser cookies,
- * and anything unenumerated) is already denied by the deny-`$HOME`-default and
- * needs no explicit entry — that is the whole point of flipping to a whitelist.
+ * Vendor credential stores that sit INSIDE (or under) re-allowed working-set
+ * config dirs and so must be re-denied even though a parent is granted — the
+ * daemon writes config there but never needs the user's vendor tokens:
+ *   - `~/.codex/auth.json` — codex OAuth store (its dir is a setup target);
+ *   - `~/.kimi-code/credentials/` — the kimi OAuth store SUBTREE (dir deny,
+ *     not a single literal, so a renamed/added store file stays covered);
+ *   - `~/.claude/.credentials.json` — belt-and-braces: the working set now
+ *     grants only scoped `~/.claude` subtrees (never the root), but macOS is
+ *     where Claude Code keeps tokens in the keychain anyway — keep the file
+ *     deny in case a future grant re-widens.
+ * Denied for BOTH read (exfiltration) and write (tampering / token swap) —
+ * `buildProfile` emits each rule under `file-read*` AND `file-write*`. Every
+ * OTHER user secret (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/{gcloud,gh}`,
+ * the login keychain, browser cookies, and anything unenumerated) is already
+ * denied by the deny-`$HOME`-default and needs no explicit entry — that is
+ * the whole point of flipping to a whitelist.
  */
-const credentialReadDeny = (home: string): string[] => [
+const credentialDeny = (home: string): string[] => [
   `(literal "${esc(home)}/.codex/auth.json")`,
+  `(subpath "${esc(home)}/.kimi-code/credentials")`,
   `(literal "${esc(home)}/.claude/.credentials.json")`,
 ];
+
+/**
+ * Every strict in-`$HOME` ANCESTOR directory of the granted paths (plus
+ * `$HOME` itself), for `file-read-metadata` literals. Path resolution + BSD
+ * `mkdir -p` walk every ancestor of a target and `stat()` each one; with the
+ * working set now SCOPED (e.g. `~/.claude/plugins` granted but `~/.claude`
+ * not), a vendor script's `mkdir -p ~/.claude/plugins/x` would EPERM at the
+ * unreadable `~/.claude` node exactly like the original `$HOME` bug this
+ * generalises (see the profile comment). Metadata only — never contents: the
+ * ancestors' OTHER children (e.g. `~/.claude/.credentials.json`) stay
+ * deny-default. Pure + exported for unit tests.
+ */
+export const homeAncestorPaths = (
+  granted: readonly string[],
+  home: string,
+): string[] => {
+  const out = new Set<string>([home]);
+  for (const p of granted) {
+    if (!p.startsWith(`${home}/`)) continue;
+    let cur = dirname(p);
+    while (cur.startsWith(`${home}/`)) {
+      out.add(cur);
+      cur = dirname(cur);
+    }
+  }
+  return [...out].sort();
+};
 
 /**
  * Build the SBPL profile. WRITES and READS are now BOTH deny-by-default
@@ -118,8 +155,18 @@ const buildProfile = (home: string): string => {
     .filter(inHome)
     .map((p) => `  (subpath "${esc(p)}")`)
     .join("\n");
-  const readDeny = credentialReadDeny(home)
+  const credDeny = credentialDeny(home)
     .map((rule) => `  ${rule}`)
+    .join("\n");
+  // stat()-only ancestors of every granted in-home path (see homeAncestorPaths)
+  // — the working set is scoped now, so intermediate nodes like `~/.claude`
+  // must be stat-able for `mkdir -p` / path resolution without exposing their
+  // contents.
+  const metadataAllow = homeAncestorPaths(
+    [...ws.readWrite, ...ws.readOnly, ...macRuntimeWrite(home)].filter(inHome),
+    home,
+  )
+    .map((p) => `  (literal "${esc(p)}")`)
     .join("\n");
   return `(version 1)
 (allow default)
@@ -137,19 +184,25 @@ ${writeAllow})
 (allow file-read* (require-not (subpath "${esc(home)}")))
 (allow file-read*
 ${readAllow})
-; STAT (metadata only, NOT contents) of $HOME itself. Path resolution + BSD
-; \`mkdir -p\` walk every ancestor of a target and \`stat()\` each one; \`$HOME\` is
-; an ancestor of the granted working set (\`~/.openllm\`, \`~/.claude\`, …), so
-; denying its metadata makes \`mkdir -p ~/.openllm/.../x\` EPERM at \`$HOME\` and
-; breaks the vendor CLI installers (claude.ai/install.sh \`mkdir -p
-; $HOME/.claude/downloads\`). This grants ONLY \`file-read-metadata\` on the home
-; DIRECTORY node — not its contents (every $HOME subpath stays deny-default, and
-; the credential denies below still apply), so no user secret becomes readable.
-(allow file-read-metadata (literal "${esc(home)}"))
-; …but the vendor credential FILES inside the re-allowed config dirs stay denied
-; (last-match-wins): the daemon writes config there but never needs the tokens.
+; STAT (metadata only, NOT contents) of $HOME and every in-home ANCESTOR of a
+; granted path. Path resolution + BSD \`mkdir -p\` walk every ancestor of a
+; target and \`stat()\` each one; the working set is SCOPED (e.g.
+; \`~/.claude/plugins\` granted, \`~/.claude\` not), so denying an intermediate
+; node's metadata would EPERM \`mkdir -p ~/.claude/plugins/x\` at \`~/.claude\` —
+; the same bug class as the original \`$HOME\`-only literal (claude.ai/install.sh
+; \`mkdir -p $HOME/.claude/downloads\`). These are \`file-read-metadata\` literals
+; on the DIRECTORY nodes only — not contents (every unenumerated subpath stays
+; deny-default, and the credential denies below still apply), so no user secret
+; becomes readable.
+(allow file-read-metadata
+${metadataAllow})
+; …but the vendor credential STORES inside/under re-allowed config dirs stay
+; denied (last-match-wins), for BOTH read (exfiltration) and write (token
+; tampering): the daemon writes config there but never needs the tokens.
 (deny file-read*
-${readDeny})
+${credDeny})
+(deny file-write*
+${credDeny})
 `;
 };
 

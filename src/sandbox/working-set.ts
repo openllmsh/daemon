@@ -16,18 +16,33 @@
  *       the installer places the binary inside the state dir);
  *     - the executable's real directory (belt-and-braces when `execPath`
  *       lives outside the state dir — a manual install);
- *     - the claude-code integration footprint (`~/.claude`, `~/.claude.json`)
- *       — the DECLARED target the SHA-gated skill/plugin/setup scripts
- *       install into (`packages/api/handlers/{skills,plugins,setup}.ts`).
+ *     - the claude-code integration footprint — SCOPED to the subtrees the
+ *       SHA-gated skill/plugin/setup scripts actually write
+ *       (`~/.claude/{skills,plugins,commands,hooks,plugin-state,downloads}`
+ *       + the `settings.json` FILE + `~/.claude.json`), NEVER the whole
+ *       `~/.claude`: the user's real Claude OAuth token
+ *       (`~/.claude/.credentials.json` on Linux) sits at that root and must
+ *       stay outside the working set on BOTH backends (the
+ *       2026-07-03 working-set-exposure audit §5-A parity fix).
  *
  *   read-only
  *     - the system trees the runtime + spawned tools (`bash`, `curl`, the
  *       vendor CLIs' loaders) need: `/usr`, `/lib*`, `/bin`, `/sbin`, `/opt`,
- *       `/etc` (resolv.conf + TLS trust), `/proc`, `/sys`, `/run`, `/var`.
+ *       `/etc` (resolv.conf + TLS trust), `/proc`, `/sys`, `/run`, `/var`;
+ *     - `~/.bun/bin` (exec `bun` — read+exec only; the RW half of the old
+ *       whole-tree `~/.bun` grant survives only as `~/.bun/install/cache`,
+ *       the dir `bun install` populates during plugin installs).
  *
  *   deny (implicit — everything else, notably the rest of `$HOME`)
- *     - `~/.ssh`, `~/.aws`, `~/.gnupg`, the user's real `~/.codex` /
- *       `~/.kimi-code`, browser profiles, documents.
+ *     - `~/.ssh`, `~/.aws`, `~/.gnupg`, browser profiles, documents,
+ *       `~/.claude/.credentials.json` (outside the scoped `~/.claude` grants),
+ *       the shell rc files (`~/.zshrc` etc. — the daemon-driven installers
+ *       suppress their PATH edits instead: `cli-install.ts` / `cli-paths.ts`
+ *       `hostInstallEnv`), and `~/.bun/bin` writes (launcher-trojan guard).
+ *       Known residuals (documented in the audit, closed by the §3 broker):
+ *       `~/.codex/auth.json` + `~/.kimi-code/credentials/` remain inside
+ *       still-granted setup-target dirs on Linux (Landlock has no deny
+ *       rules); macOS re-denies them (`seatbelt.ts` `credentialDeny`).
  *
  * Note the system `/tmp` is deliberately NOT granted (granting it would leak
  * every other process's temp files — and the user unit no longer sets
@@ -37,7 +52,7 @@
  * codex/kimi installers' `mktemp -d` stages inside the working set rather than
  * EACCESing on the ungranted `/tmp`.
  */
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { stateDir } from "../env";
@@ -135,7 +150,18 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // need this — pre-creating is a harmless no-op there. Same pattern as the
   // daemonTempDir / integrationTmp pre-creation above.
   for (const d of [
-    join(home, ".claude"),
+    // claude-code: SCOPED subtrees only, never the whole ~/.claude — the
+    // user's real OAuth token (`~/.claude/.credentials.json` on Linux) lives
+    // at the root and must stay outside the working set (audit §5-A). These
+    // are exactly what the SHA-gated scripts + the official installer write:
+    //   skills/commands/hooks/plugins/plugin-state — skill+plugin installs;
+    //   downloads — claude.ai/install.sh's staging dir.
+    join(home, ".claude", "skills"),
+    join(home, ".claude", "plugins"),
+    join(home, ".claude", "commands"),
+    join(home, ".claude", "hooks"),
+    join(home, ".claude", "plugin-state"),
+    join(home, ".claude", "downloads"),
     join(home, ".codex"),
     join(home, ".kimi-code"),
     // grok (x.ai/cli): the installer writes ~/.grok/{downloads,bin}; pre-create
@@ -167,6 +193,42 @@ export const daemonWorkingSet = (): TWorkingSet => {
       // back / fails visibly, not a daemon-boot failure.
     }
   }
+  // ~/.claude/settings.json is granted as a FILE (never the whole ~/.claude —
+  // see the scoped subtrees above). A Landlock file rule needs the file to
+  // EXIST, and a file-scoped grant cannot authorize creating it (open(O_CREAT)
+  // needs MAKE_REG on the PARENT dir, which stays ungranted) — so pre-create
+  // an empty JSON object when absent. Every settings-merge script branches on
+  // `[ -f ]` / parses the file, and `{}` merges cleanly on all of them. `wx`
+  // never touches an existing file, so a populated settings.json is untouched.
+  const claudeSettings = join(home, ".claude", "settings.json");
+  try {
+    writeFileSync(claudeSettings, "{}\n", { flag: "wx" });
+  } catch {
+    // exists already (the common case) or ~/.claude itself couldn't be made —
+    // either way the grant below lands on whatever is really there.
+  }
+  // Same for ~/.claude.json (the MCP-server registry the plugin installs merge
+  // into): it's a FILE grant at the $HOME root, so a confined child can never
+  // CREATE it (that needs MAKE_REG on the ungranted $HOME) and Landlock can't
+  // grant a missing path. `wx` never touches an existing file.
+  const claudeJson = join(home, ".claude.json");
+  try {
+    writeFileSync(claudeJson, "{}\n", { flag: "wx" });
+  } catch {
+    // exists already — the grant lands on the real file.
+  }
+  // bun's global install cache — the RW half of the split ~/.bun grant (bin is
+  // read+exec only, below). Only pre-create it when bun IS installed: absent
+  // bun means the plugin install fails its own `command -v bun` check, and
+  // fabricating ~/.bun on a bun-less box would be pure noise.
+  const bunCache = join(home, ".bun", "install", "cache");
+  if (existsSync(join(home, ".bun"))) {
+    try {
+      mkdirSync(bunCache, { recursive: true });
+    } catch {
+      // best-effort — see the vendor-dir loop above.
+    }
+  }
   const readWrite = new Set<string>([
     // The whole state dir: daemon.env (config + key + device id) + logs + isolated CLI roots
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
@@ -182,9 +244,21 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // kimi / claude setups (`packages/setup/{codex,kimi-code,claude-code}`)
     // and the plugin/skill installers (`packages/{plugin,skill}`). Every path
     // they write MUST be granted or the install fails under the sandbox.
-    //   claude-code: ~/.claude/** (skills, plugins, commands, hooks,
-    //                settings.json, plugin-state) + ~/.claude.json (MCP config).
-    join(home, ".claude"),
+    //   claude-code: SCOPED to the subtrees the scripts + installer write —
+    //   NEVER the whole ~/.claude, whose root holds the user's real OAuth
+    //   token on Linux (`.credentials.json`; audit §5-A credential-parity
+    //   fix — Landlock has no deny rules, so the only way to keep the token
+    //   out is to not grant its parent). settings.json is a FILE grant
+    //   (pre-created above; `ruleAccessFor` masks it to file-applicable
+    //   rights) — note a file-scoped grant can't take a cross-dir rename, so
+    //   the merge scripts write it IN PLACE (`cat > settings.json`).
+    join(home, ".claude", "skills"),
+    join(home, ".claude", "plugins"),
+    join(home, ".claude", "commands"),
+    join(home, ".claude", "hooks"),
+    join(home, ".claude", "plugin-state"),
+    join(home, ".claude", "downloads"),
+    claudeSettings,
     join(home, ".claude.json"),
     //   codex (non-isolated setup): ~/.codex/config.toml + catalog json.
     join(home, ".codex"),
@@ -211,14 +285,14 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   non-isolated `claude`/`codex` installers drop their launcher + where the
     //   setup fast path copies an adopted CLI binary.
     join(home, ".local", "bin"),
-    //   bun's install dir: the official installer drops `bun` at ~/.bun/bin, and
-    //   the claude-context plugin install runs `bun install` (writing its global
-    //   cache under ~/.bun/install/cache). Read-WRITE, not just read: the spawn
-    //   must EXEC the binary AND let `bun install` populate that cache, or the
-    //   plugin's node_modules never hydrate and its MCP server can't start.
-    //   Absent when bun isn't installed — the install then fails its own
-    //   `command -v bun` check, correctly. Holds no credentials.
-    join(home, ".bun"),
+    //   bun's global install cache ONLY (the SPLIT ~/.bun grant — audit §5-B):
+    //   the claude-context plugin install runs `bun install`, which populates
+    //   ~/.bun/install/cache. The `bun` BINARY dir (~/.bun/bin) is read+exec in
+    //   the readOnly set below — write access there would let a compromised
+    //   daemon trojan the user's `bun` launcher. Absent when bun isn't
+    //   installed — the install then fails its own `command -v bun` check,
+    //   correctly. Holds no credentials.
+    bunCache,
     //   claude's install dir: the `~/.local/bin/claude` launcher resolves to
     //   `~/.local/share/claude/versions/<v>`. The official `claude install`
     //   WRITES versions here, and the daemon's isolated CLI is a SYMLINK to that
@@ -233,20 +307,13 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   / `~/.cache`) — no secrets there.
     join(home, ".local", "state", "claude"),
     join(home, ".cache", "claude"),
-    //   shell rc / profile files: the non-isolated setup's tier-3 official
-    //   installers (codex/kimi/claude) append a PATH line to the user's shell
-    //   profile so the freshly-installed CLI is on PATH. Only these specific
-    //   files are granted (existing ones grant the file; absent ones the
-    //   to-be-created path), NOT all of `$HOME` — the tamper guard stays tight
-    //   everywhere else. SECURITY NOTE: this is a deliberate, scoped widening of
-    //   the deny-`$HOME` tamper guard to let the setup wire up PATH; a
-    //   compromised daemon could append to these startup files, so the set is
-    //   kept to the minimum the installers touch.
-    join(home, ".zshrc"),
-    join(home, ".zprofile"),
-    join(home, ".bashrc"),
-    join(home, ".bash_profile"),
-    join(home, ".profile"),
+    //   (NO shell rc / profile grants. They were the single worst tamper
+    //   lever — an rc append is code exec in every future shell — and the
+    //   installers' PATH edits are suppressed instead: kimi via
+    //   KIMI_NO_MODIFY_PATH, codex via a PATH that already carries
+    //   ~/.local/bin (its add_to_path early-returns), claude edits no rc at
+    //   all, and grok's rc append simply EACCESes AFTER its binary landed —
+    //   see `cli-paths.ts` `hostInstallEnv` + `integrations.ts`.)
     //   the integration scripts' OWN staging dir: the shared script preamble
     //   (`packages/api/lib/scripts.ts` `pick_tmpdir`) points TMPDIR at
     //   `$HOME/.cache/openllm` (the root fs, to dodge the small /tmp tmpfs on
@@ -286,6 +353,13 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // (~/.local/share/claude is granted READ-WRITE in the readWrite set above —
     //  it serves both the install fast-path adoption READ and the non-isolated
     //  setup's tier-3 claude install WRITE.)
+    // bun's BINARY dir — read+exec only (the split ~/.bun grant, audit §5-B):
+    // the plugin install must EXEC `bun`, but a write grant here would let a
+    // compromised daemon replace the user's `bun` launcher. The cache half
+    // (~/.bun/install/cache) is read-write above. `existing()` returns the
+    // path unchanged when bun isn't installed, and the missing-path rule is
+    // skipped at apply time — correct (nothing to exec anyway).
+    join(home, ".bun", "bin"),
     // Toolchain + loaders for spawned children (bash, curl, vendor CLIs).
     "/usr",
     "/lib",

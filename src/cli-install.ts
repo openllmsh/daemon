@@ -16,9 +16,10 @@
  *   kimi   → https://code.kimi.com/kimi-code/install.sh
  */
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import {
   cliBin,
   cliConfigDir,
@@ -26,10 +27,12 @@ import {
   cliHome,
   cliRoot,
   hostCliCandidates,
+  hostInstallEnv,
   type TCliProvider,
 } from "./cli-paths";
 import { runCapture } from "./delegation/util";
 import { logInfo } from "./logger";
+import { DEFAULT_BIN_DIRS } from "./path-utils";
 import { daemonTempDir } from "./sandbox/working-set";
 
 const INSTALL_SCRIPT: Readonly<Record<TCliProvider, string>> = {
@@ -199,10 +202,18 @@ export const runInstallScript = (
  * the OFFICIAL vendor installer runs ONCE for the default (non-isolated)
  * location. No isolated copy is ever downloaded.
  *
- * The install runs with the DEFAULT env (so the binary lands in the user's own
- * `~/.local/bin` etc. and the installer wires up PATH) — only `TMPDIR` is
- * redirected to a sandbox-granted dir so the installer's `mktemp` doesn't EACCES
- * on the ungranted `/tmp`. `candidates` is injectable for tests.
+ * The install runs with a NEAR-default env (so the binary lands in the user's
+ * own `~/.local/bin` etc.) with three sandbox-driven adjustments:
+ *   - `TMPDIR` → the daemon temp dir, so the installer's `mktemp` doesn't
+ *     EACCES on the ungranted `/tmp`;
+ *   - `PATH` gets `DEFAULT_BIN_DIRS` prepended — a background daemon inherits
+ *     a minimal PATH, and codex's `add_to_path` only skips its rc edit when
+ *     its BIN_DIR (~/.local/bin) is ALREADY on PATH (no suppression knob);
+ *   - `hostInstallEnv(provider)` — the per-vendor PATH-edit/prompt
+ *     suppression knobs. The sandbox no longer grants the shell rc files, so
+ *     PATH edits must be suppressed (kimi) or made unnecessary (codex); the
+ *     dashboard surfaces the "add ~/.local/bin to PATH" note instead.
+ * `candidates` is injectable for tests.
  */
 export const ensureHostCli = async (
   provider: TCliProvider,
@@ -223,6 +234,15 @@ export const ensureHostCli = async (
     {
       ...process.env,
       TMPDIR: daemonTempDir(),
+      // Prepend the standard user bin dirs: makes codex's `add_to_path`
+      // early-return (BIN_DIR already on PATH → no rc edit) and lets the
+      // installers find user-local tools despite the service's minimal PATH.
+      PATH: [...DEFAULT_BIN_DIRS, process.env.PATH ?? ""]
+        .filter((p) => p.length > 0)
+        .join(":"),
+      // Per-vendor rc-edit/prompt suppression (the sandbox no longer grants
+      // the shell rc files — see `hostInstallEnv`).
+      ...hostInstallEnv(provider),
     },
   );
   if (timedOut) {
@@ -233,10 +253,41 @@ export const ensureHostCli = async (
   }
 
   const installed = candidates.find((c) => existsSync(c));
+  if (installed !== undefined) {
+    // Shell-reachability parity: the vendor installers' shell-rc PATH edits
+    // are suppressed now (the sandbox dropped the rc-file grants), so a CLI
+    // that landed OUTSIDE ~/.local/bin (kimi → ~/.kimi-code/bin, grok →
+    // ~/.grok/bin) would be invisible to the user's own shell. Canonicalize:
+    // link it into ~/.local/bin (a granted workflow target — the same move
+    // grok's installer makes) so one PATH dir serves every vendor CLI. The
+    // daemon itself never needs this (it resolves absolute candidate paths);
+    // this is purely so the USER can type `kimi`/`grok` in their terminal.
+    canonicalizeIntoLocalBin(installed);
+  }
   return {
     path: installed ?? null,
     output: installed !== undefined ? "" : output.slice(-500),
   };
+};
+
+/** Symlink a host CLI binary into `~/.local/bin/<name>` when it landed
+ *  elsewhere. Best-effort: an EEXIST-with-real-file or a denied write must
+ *  never fail the install (the binary itself is fine either way). */
+const canonicalizeIntoLocalBin = (binPath: string): void => {
+  const localBin = join(homedir(), ".local", "bin");
+  if (binPath.startsWith(`${localBin}/`)) return; // already canonical
+  const link = join(localBin, basename(binPath));
+  try {
+    mkdirSync(localBin, { recursive: true });
+    // Replace only a stale SYMLINK; never clobber a real file the user put
+    // there themselves.
+    if (existsSync(link) && !lstatSync(link).isSymbolicLink()) return;
+    rmSync(link, { force: true });
+    symlinkSync(binPath, link);
+    logInfo("cli-install", `linked ${link} → ${binPath} (shell reachability)`);
+  } catch {
+    // best-effort — the CLI still works via its absolute path.
+  }
 };
 
 /**

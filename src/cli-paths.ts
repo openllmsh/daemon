@@ -121,6 +121,40 @@ export const cliConfigDir = (provider: TCliProvider): string => {
 };
 
 /**
+ * Env knobs for a HOST (non-isolated) vendor install — `ensureHostCli` merges
+ * these onto the default env so the official installer lands the binary in
+ * its default location WITHOUT editing the user's shell rc files. The OS
+ * sandbox no longer grants the rc files (`working-set.ts` — they were the
+ * single worst tamper lever), so an unsuppressed PATH edit would EACCES and,
+ * for kimi (whose `_update_path` runs under `set -e` BEFORE its final
+ * summary), could fail an otherwise-successful install. Per provider
+ * (verified against the live installers 2026-07-03):
+ *   - kimi  → `KIMI_NO_MODIFY_PATH=1`, the documented skip knob.
+ *   - codex → `CODEX_NON_INTERACTIVE=1` skips prompts only — there is NO
+ *     PATH-suppression knob; its `add_to_path` early-returns when BIN_DIR
+ *     (~/.local/bin) is ALREADY on PATH, which `ensureHostCli`'s
+ *     DEFAULT_BIN_DIRS PATH-prepend guarantees. The knob here is for the
+ *     `Start Codex now?` prompt (pipes hang without it).
+ *   - claude → edits no rc file at all (verified) — nothing to suppress.
+ *   - grok  → no knob; its rc append runs AFTER the binary lands, so under
+ *     the sandbox it EACCESes harmlessly (install still succeeds — the
+ *     binary-presence check is what `ensureHostCli` keys off).
+ */
+export const hostInstallEnv = (
+  provider: TCliProvider,
+): Record<string, string> => {
+  switch (provider) {
+    case "chatgpt":
+      return { CODEX_NON_INTERACTIVE: "1" };
+    case "kimi_code":
+      return { KIMI_NO_MODIFY_PATH: "1" };
+    case "claude_code":
+    case "grok":
+      return {};
+  }
+};
+
+/**
  * Environment overrides that (1) isolate the CLI's runtime home and
  * (2) — at INSTALL time — redirect where the vendor script drops the
  * binary. Merge onto `process.env` for every spawn of an isolated CLI.
