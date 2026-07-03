@@ -20,6 +20,7 @@ import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import type { TCliProvider } from "./cli-paths";
 import {
   cliBin,
   cliConfigDir,
@@ -28,7 +29,6 @@ import {
   cliRoot,
   hostCliCandidates,
   hostInstallEnv,
-  type TCliProvider,
 } from "./cli-paths";
 import { runCapture } from "./delegation/util";
 import { logInfo } from "./logger";
@@ -213,14 +213,25 @@ export const runInstallScript = (
  *     suppression knobs. The sandbox no longer grants the shell rc files, so
  *     PATH edits must be suppressed (kimi) or made unnecessary (codex); the
  *     dashboard surfaces the "add ~/.local/bin to PATH" note instead.
- * `candidates` is injectable for tests.
+ * `candidates` and `localBinDir` are injectable for tests (the latter keeps the
+ * canonicalize symlink out of the real `~/.local/bin` under test).
  */
 export const ensureHostCli = async (
   provider: TCliProvider,
   candidates: readonly string[] = hostCliCandidates(provider),
+  localBinDir: string = join(homedir(), ".local", "bin"),
 ): Promise<TEnsureHostResult> => {
   const present = candidates.find((c) => existsSync(c));
-  if (present !== undefined) return { path: present, output: "" };
+  if (present !== undefined) {
+    // Reuse fast path (setup-first, or a pre-existing user install): still
+    // canonicalize so a binary that landed OUTSIDE ~/.local/bin (kimi →
+    // ~/.kimi-code/bin, grok → ~/.grok/bin) is reachable as `kimi`/`grok` in
+    // the user's shell — the post-install path below does the same, and the
+    // reuse flow must not skip it. Best-effort + non-clobbering (see
+    // `canonicalizeIntoLocalBin`).
+    canonicalizeIntoLocalBin(present, localBinDir);
+    return { path: present, output: "" };
+  }
 
   // Run the vendor installer in its own process group under a HARD,
   // group-killing timeout (see `runInstallScript`): a stalled download/install —
@@ -262,7 +273,7 @@ export const ensureHostCli = async (
     // grok's installer makes) so one PATH dir serves every vendor CLI. The
     // daemon itself never needs this (it resolves absolute candidate paths);
     // this is purely so the USER can type `kimi`/`grok` in their terminal.
-    canonicalizeIntoLocalBin(installed);
+    canonicalizeIntoLocalBin(installed, localBinDir);
   }
   return {
     path: installed ?? null,
@@ -273,8 +284,10 @@ export const ensureHostCli = async (
 /** Symlink a host CLI binary into `~/.local/bin/<name>` when it landed
  *  elsewhere. Best-effort: an EEXIST-with-real-file or a denied write must
  *  never fail the install (the binary itself is fine either way). */
-const canonicalizeIntoLocalBin = (binPath: string): void => {
-  const localBin = join(homedir(), ".local", "bin");
+const canonicalizeIntoLocalBin = (
+  binPath: string,
+  localBin: string = join(homedir(), ".local", "bin"),
+): void => {
   if (binPath.startsWith(`${localBin}/`)) return; // already canonical
   const link = join(localBin, basename(binPath));
   try {

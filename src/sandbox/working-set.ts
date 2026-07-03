@@ -81,7 +81,34 @@ export type TWorkingSet = {
  *  bootstrap targets or handle the grant failure. */
 const existing = (paths: readonly string[]): string[] => {
   const home = homedir();
+  // Secret-bearing roots whose SCOPED children must resolve EXACTLY — never by
+  // climbing. A grant like `~/.bun/install/cache`, `~/.bun/bin`,
+  // `~/.grok/{bin,downloads}`, `~/.config/raycast/ai`, or any `~/.claude/*`
+  // subtree is pre-created best-effort in `daemonWorkingSet()`; if that
+  // pre-create failed and the leaf is missing, DROP the grant rather than let
+  // the ancestor-walk widen it back onto the parent, which holds the very
+  // secrets the scoping exists to keep out: `~/.bun/bin` (write = §5-B
+  // launcher trojan), `~/.grok/auth.json`, `~/.config`'s gcloud/gh tokens, and
+  // `~/.claude/.credentials.json` (the §5-A Linux OAuth token at the
+  // `~/.claude` root). `~/.cache`/`~/.local` are deliberately NOT sensitive —
+  // `~/.cache/openllm` legitimately climbs to `~/.cache` (documented + tested,
+  // no secrets there). The roots themselves are never grant entries, so this
+  // only ever affects their children.
+  const sensitiveRoots = [
+    join(home, ".bun"),
+    join(home, ".grok"),
+    join(home, ".config"),
+    join(home, ".claude"),
+  ];
+  const underSensitiveRoot = (p: string): boolean =>
+    sensitiveRoots.some((root) => p.startsWith(`${root}/`));
   return paths.map((p) => {
+    // Exact/no-climb for scoped grants beneath a secret-bearing root: a missing
+    // leaf is DROPPED (returned unchanged → fails to grant safely), never
+    // substituted by its parent.
+    if (!existsSync(p) && underSensitiveRoot(p)) {
+      return p;
+    }
     let candidate = p;
     while (candidate !== "/" && !existsSync(candidate)) {
       const parent = dirname(candidate);
@@ -202,7 +229,10 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // never touches an existing file, so a populated settings.json is untouched.
   const claudeSettings = join(home, ".claude", "settings.json");
   try {
-    writeFileSync(claudeSettings, "{}\n", { flag: "wx" });
+    // Explicit 0o600, not the process umask: these seed a user-config file
+    // that carries the gateway API key once the setup merge runs — keep it
+    // private from group/other regardless of the daemon's inherited umask.
+    writeFileSync(claudeSettings, "{}\n", { flag: "wx", mode: 0o600 });
   } catch {
     // exists already (the common case) or ~/.claude itself couldn't be made —
     // either way the grant below lands on whatever is really there.
@@ -213,7 +243,9 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // grant a missing path. `wx` never touches an existing file.
   const claudeJson = join(home, ".claude.json");
   try {
-    writeFileSync(claudeJson, "{}\n", { flag: "wx" });
+    // 0o600 for the same reason as settings.json above — private by mode, not
+    // by inherited umask.
+    writeFileSync(claudeJson, "{}\n", { flag: "wx", mode: 0o600 });
   } catch {
     // exists already — the grant lands on the real file.
   }

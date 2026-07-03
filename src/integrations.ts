@@ -20,6 +20,7 @@
  */
 import { createHash } from "node:crypto";
 import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";
+import { hostInstallEnv } from "./cli-paths";
 import { daemonEnv } from "./env";
 import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";
@@ -159,13 +160,14 @@ export const runIntegration = async (
   // skipped (KIMI_NO_MODIFY_PATH) or its `set -e` install fails on the EACCES;
   // codex needs no PATH edit because DEFAULT_BIN_DIRS is already prepended
   // above (its add_to_path early-returns), and CODEX_NON_INTERACTIVE keeps its
-  // prompts from hanging the piped run. Mirrors `cli-paths.ts hostInstallEnv`
-  // (the connect-flow install path). Manual `curl | bash` runs by the user
-  // keep vendor-default behaviour — these are set only on daemon spawns.
+  // prompts from hanging the piped run. Sourced FROM `cli-paths.ts
+  // hostInstallEnv` (the connect-flow install path) rather than re-hardcoding
+  // the knobs, so the two stay in lockstep. Manual `curl | bash` runs by the
+  // user keep vendor-default behaviour — these are set only on daemon spawns.
   const suppress = {
-    KIMI_NO_MODIFY_PATH: "1",
-    CODEX_NON_INTERACTIVE: "1",
-  } as const;
+    ...hostInstallEnv("kimi_code"),
+    ...hostInstallEnv("chatgpt"),
+  };
   // The key is exposed to the `install` script only — uninstall/state don't
   // need it, so they run with it stripped from the env entirely.
   const env =
