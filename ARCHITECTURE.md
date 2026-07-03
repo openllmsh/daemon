@@ -68,13 +68,13 @@ daemon/
       seatbelt.ts           macOS Seatbelt backend — in-process sandbox_init() deny-by-default profile (bun:ffi, inherited by children)
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
-    control.ts              localhost control surface (/status,/events,/connect,/cli-install,/usage,/config)
+    control.ts              localhost control surface (/status,/events,/connect,/usage,/config)
     status.ts               computeStatus() — shared snapshot for /status + /events
     usage-cache.ts          per-provider TTL cache over delegate.usage() (rate-limit safe)
     events.ts               /events SSE: push status on change (replaces polling)
     cors.ts                 shared CORS + PNA preflight for both surfaces
-    cli-paths.ts            isolated-CLI paths + per-provider run/install env
-    cli-install.ts          install the daemon's own isolated vendor CLIs
+    cli-paths.ts            isolated-CLI paths + per-provider run env
+    cli-install.ts          link the isolated run-view symlink + probe state (the daemon NEVER installs a vendor CLI — installs are user-run, unsandboxed, via the daemon install script; cliInstallState auto-links lazily)
     cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record + web_search callback)
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
@@ -220,8 +220,8 @@ is a belt-and-braces confidence check, not a ship gate.
   cloud (`forward.ts`) rather than decrypted locally.
 - **Control surface** — called DIRECTLY by the dashboard browser. Reads
   (`GET /status`, `GET /events`, `GET /usage/:slug`) and writes
-  (`POST /config/api-key`, `POST /cli-install/:slug`,
-  `POST /connect/:slug`) are served to the dashboard origin. Access control is the localhost bind + the CORS
+  (`POST /config/api-key`, `POST /connect/:slug`) are served to the
+  dashboard origin. Access control is the localhost bind + the CORS
   origin lock (`allowOrigin` reflects the configured dashboard origin and
   its loopback sibling; any loopback origin in dev) — there is no
   separate control token at this stage; revisit if the daemon ever binds
@@ -280,20 +280,22 @@ runs its OWN copy of each CLI under `<stateDir>/cli/<provider>/`
 
 - **`cli-paths.ts`** — `cliRoot/cliBin/cliHome/cliConfigDir/cliEnv` per
   provider. `cliEnv` is the single source of truth for the isolation
-  env: `HOME` pointed at the isolated home for all three (which also
-  redirects Claude's installer), plus the explicit install-dir + home
-  knobs each vendor script honors — `CLAUDE_CONFIG_DIR`,
-  `CODEX_HOME`+`CODEX_INSTALL_DIR`, `KIMI_CODE_HOME`+`KIMI_INSTALL_DIR`
-  (+ PATH-edit suppression so the installer never touches the user's
-  shell rc files). Every spawn (`spawnLogin`/`runCapture`/`cliVersion`)
-  merges `cliEnv(slug)`; every store read derives from `cliConfigDir`, so
-  the read location and the run location can't drift.
-- **`cli-install.ts`** — `installCli(provider)` pipes the official vendor
-  script (`claude.ai/install.sh`, `chatgpt.com/codex/install.sh`,
-  `code.kimi.com/kimi-code/install.sh`) through a shell with `cliEnv`
-  merged. Idempotent (skips when the binary is already present).
-  `cliInstallState(provider)` → `{ installed, version }` from the
-  isolated binary's `--version`.
+  env: `HOME` pointed at the isolated home for all providers, plus the
+  explicit home knobs each vendor CLI honors — `CLAUDE_CONFIG_DIR`,
+  `CODEX_HOME`, `KIMI_CODE_HOME`. Every spawn
+  (`spawnLogin`/`runCapture`/`cliVersion`) merges `cliEnv(slug)`; every
+  store read derives from `cliConfigDir`, so the read location and the run
+  location can't drift.
+- **`cli-install.ts`** — the daemon NEVER installs a vendor CLI; installs
+  are user-run + unsandboxed (the daemon install script background-runs the
+  official installer for any missing CLI, or the user runs it by hand).
+  `linkIsolatedCli(provider, hostBin)` points the isolated run-view
+  (`<state>/cli/<provider>/…`) at the user's host binary via a symlink (no
+  copy). `cliInstallState(provider)` → `{ installed, version }` is the single
+  chokepoint every delegate reads: SELF-HEALING — if the isolated symlink is
+  missing but the host binary exists (`hostCliCandidates`), it links it before
+  probing `--version`, so a newly-installed CLI shows up on the next status
+  push with no command.
 
 ## OS sandbox + typed control vocabulary (hardening)
 
@@ -486,9 +488,11 @@ connected/failed directly — the dashboard's Connect button stays in its
   connected (~5s). `connect` returns immediately with the device code /
   URL; no terminal, no TUI.
 
-The dashboard's `/providers` OAuth tab drives a 3-state flow off
-`/status`'s per-provider `cli_installed` + `connected`: **Install** the
-isolated CLI → **Connect** (sign in) → connected (usage panel).
+The dashboard's `/providers` OAuth tab drives a flow off `/status`'s
+per-provider `cli_installed` + `connected`: CLI missing (prompt to re-run
+the daemon installer, which background-installs it) → **Connect** (sign in)
+→ connected (usage panel). The daemon never installs the CLI itself — it
+auto-links its isolated run-view to whatever the user-run installer lands.
 
 > ⚠️ The delegates are **research-derived**. `claude_code` install +
 > isolation is validated (binary in the isolated dir; `auth status` reads

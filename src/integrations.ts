@@ -20,7 +20,6 @@
  */
 import { createHash } from "node:crypto";
 import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";
-import { hostInstallEnv } from "./cli-paths";
 import { daemonEnv } from "./env";
 import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";
@@ -154,31 +153,27 @@ export const runIntegration = async (
   const pathValue = [...DEFAULT_BIN_DIRS, baseEnv.PATH ?? ""]
     .filter((p) => p.length > 0)
     .join(":");
-  // Vendor-installer rc-edit/prompt suppression: a setup script's `ensure_cli`
-  // may run the official kimi/codex installer, and the OS sandbox no longer
-  // grants the shell rc files (working-set.ts) — kimi's PATH edit must be
-  // skipped (KIMI_NO_MODIFY_PATH) or its `set -e` install fails on the EACCES;
-  // codex needs no PATH edit because DEFAULT_BIN_DIRS is already prepended
-  // above (its add_to_path early-returns), and CODEX_NON_INTERACTIVE keeps its
-  // prompts from hanging the piped run. Sourced FROM `cli-paths.ts
-  // hostInstallEnv` (the connect-flow install path) rather than re-hardcoding
-  // the knobs, so the two stay in lockstep. Manual `curl | bash` runs by the
-  // user keep vendor-default behaviour — these are set only on daemon spawns.
-  const suppress = {
-    ...hostInstallEnv("kimi_code"),
-    ...hostInstallEnv("chatgpt"),
-  };
+  // The daemon NEVER installs a vendor CLI (installs are user-run + unsandboxed,
+  // via the daemon install script). A setup script's `ensure_cli` must therefore
+  // NOT run the official installer when the daemon invokes it — it would EACCES
+  // on the (ungranted) shell rc files under the OS sandbox anyway. This marker
+  // makes `ensure_cli` (packages/api/lib/scripts.ts) skip its `curl | bash`
+  // branch and instead report the missing CLI + point at the daemon installer.
+  // A manual `curl | bash` run by the user has no marker set and installs as
+  // normal (with the native rc/PATH edits). Set on both install + uninstall
+  // spawns.
+  const skipCliInstall = { OPENLLM_SKIP_CLI_INSTALL: "1" };
   // The key is exposed to the `install` script only — uninstall/state don't
   // need it, so they run with it stripped from the env entirely.
   const env =
     mode === "install"
       ? {
           ...baseEnv,
-          ...suppress,
+          ...skipCliInstall,
           PATH: pathValue,
           OPENLLM_API_KEY: apiKey ?? "",
         }
-      : { ...baseEnv, ...suppress, PATH: pathValue };
+      : { ...baseEnv, ...skipCliInstall, PATH: pathValue };
   const proc = Bun.spawn(["bash", "-s"], {
     stdin: new TextEncoder().encode(script),
     env,

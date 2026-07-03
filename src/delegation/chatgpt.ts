@@ -197,7 +197,8 @@ const userAgent = async (): Promise<string> => {
 // `loginSlot` so only one `codex login` runs at a time (each binds a localhost
 // callback / polls), and `cancelConnect` kills whichever is live.
 
-const INSTALL_HINT = "Install the Codex CLI from the Providers tab first.";
+const INSTALL_HINT =
+  "Codex CLI not found — re-run the OpenLLM daemon installer to add it.";
 const CONNECTED_DETAIL = "signed in via Codex";
 const IN_PROGRESS_DETAIL =
   "Codex sign-in already in progress — finish authorizing in your browser; this updates automatically.";

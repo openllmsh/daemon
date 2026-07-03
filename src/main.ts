@@ -7,7 +7,7 @@
  * the official vendor CLIs) plus a tiny read-only `/whoami` that returns this
  * daemon's opaque `device_id` so the dashboard can tell which key's daemon is
  * on THIS host (`docs/proposals/this-machine-detection-audit.md`). CONTROL
- * (status / connect / cli-install) is NOT served on localhost: the daemon
+ * (status / connect / integrations) is NOT served on localhost: the daemon
  * dials OUT to the cloud relay over a WebSocket (`control-channel.ts`) and the
  * dashboard drives it from there. Both loopback routes share one cross-origin
  * CORS/PNA grant. See `docs/proposals/daemon-relay-websocket-push.md`.

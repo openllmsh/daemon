@@ -12,7 +12,6 @@ import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
 import { getInstalledIntegrations } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
-import { isInstalling } from "./installing-state";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { sandboxState } from "./sandbox/landlock";
@@ -23,11 +22,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
-        const base = await d.status();
-        // Surface an in-flight CLI install so the card shows "Installing…".
-        const conn = isInstalling(d.slug)
-          ? { ...base, installing: true }
-          : base;
+        const conn = await d.status();
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
         if (!conn.connected) return conn;

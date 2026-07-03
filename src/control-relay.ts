@@ -1,6 +1,6 @@
 /**
  * The daemon's command executor — the kind→handler mapping for every control
- * command (connect / cli-install / integration / login-code / auto-update / …).
+ * command (connect / integration / login-code / auto-update / …).
  *
  * It is transport-agnostic: the WebSocket control channel (`control-channel.ts`)
  * pulls a command off the relay socket, runs it through `runCommandInner`, and
@@ -10,14 +10,11 @@
 
 import type { TDaemonCommand, TDaemonCommandAck } from "@quantidexyz/openllmp";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
-import { installCli } from "./cli-install";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { probeIntegration } from "./device-state";
-import { clearInstalling, setInstalling } from "./installing-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
-import { logError } from "./logger";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
@@ -51,46 +48,6 @@ export const runCommandInner = async (
         }
         const r = await delegate.connect();
         return { id: cmd.id, status: "done", result: r };
-      }
-      case "cli_install": {
-        const slug = cmd.payload.slug;
-        if (getDelegate(slug) === null) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "unknown provider" },
-          };
-        }
-        // Mark installing so the next status snapshot the control channel pushes
-        // (its change-detected watcher, or the post-command push) carries
-        // `installing: true` and the card shows "Installing…". `clearInstalling`
-        // always runs in the finally so a failed install never wedges the
-        // provider in `installing: true`.
-        setInstalling(slug);
-        try {
-          const r = await installCli(slug);
-          // The vendor installer can run to completion yet never produce a
-          // working binary (sandbox EACCES, network failure, …). Reflect the
-          // REAL outcome in the ack status so the dashboard shows the failure
-          // (and `r.output` carries the installer tail) instead of a misleading
-          // "done". See docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §2.
-          if (!r.installed) {
-            // Log the failure at ERROR with the captured installer output so
-            // the WHY lands in the error log — without it, a failed install was
-            // invisible (the ack was the only signal and it carried no reason).
-            logError("cli-install", `cli_install failed for ${slug}`, {
-              slug,
-              output: r.output,
-            });
-          }
-          return {
-            id: cmd.id,
-            status: r.installed ? "done" : "error",
-            result: r,
-          };
-        } finally {
-          clearInstalling(slug);
-        }
       }
       case "install_integration":
       case "uninstall_integration": {

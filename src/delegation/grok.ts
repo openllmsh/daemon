@@ -218,7 +218,8 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
 //   - connect            → `grok login` (browser, this machine);
 //   - connectDeviceCode  → `grok login --device-auth` (headless/remote).
 
-const INSTALL_HINT = "Install the Grok CLI from the Providers tab first.";
+const INSTALL_HINT =
+  "Grok CLI not found — re-run the OpenLLM daemon installer to add it.";
 const CONNECTED_DETAIL = "signed in via Grok";
 const IN_PROGRESS_DETAIL =
   "Grok sign-in already in progress — finish authorizing in your browser; this updates automatically.";

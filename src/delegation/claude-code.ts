@@ -222,7 +222,7 @@ const NO_REFRESH_HINT =
 
 const slot = loginSlot(PROVIDER);
 const INSTALL_HINT =
-  "Install the Claude Code CLI from the Providers tab first.";
+  "Claude Code CLI not found — re-run the OpenLLM daemon installer to add it.";
 const CONNECTED_DETAIL = "signed in via Claude Code";
 const LOGIN_ARGV = (): ReadonlyArray<string> => [
   bin(),

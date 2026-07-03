@@ -36,13 +36,15 @@
  *   deny (implicit — everything else, notably the rest of `$HOME`)
  *     - `~/.ssh`, `~/.aws`, `~/.gnupg`, browser profiles, documents,
  *       `~/.claude/.credentials.json` (outside the scoped `~/.claude` grants),
- *       the shell rc files (`~/.zshrc` etc. — the daemon-driven installers
- *       suppress their PATH edits instead: `cli-install.ts` / `cli-paths.ts`
- *       `hostInstallEnv`), and `~/.bun/bin` writes (launcher-trojan guard).
- *       Known residuals (documented in the audit, closed by the §3 broker):
- *       `~/.codex/auth.json` + `~/.kimi-code/credentials/` remain inside
- *       still-granted setup-target dirs on Linux (Landlock has no deny
- *       rules); macOS re-denies them (`seatbelt.ts` `credentialDeny`).
+ *       the shell rc files (`~/.zshrc` etc.), and WRITES to the provider-CLI
+ *       binary dirs (`~/.local/bin`, `~/.local/share/claude`, `~/.grok/bin` are
+ *       read+exec only — the daemon runs the CLIs but never installs or updates
+ *       them; that is user-run + unsandboxed) and `~/.bun/bin`
+ *       (launcher-trojan guard). Known residuals (documented in the audit,
+ *       closed by the §3 broker): `~/.codex/auth.json` +
+ *       `~/.kimi-code/credentials/` remain inside still-granted setup-target
+ *       dirs on Linux (Landlock has no deny rules); macOS re-denies them
+ *       (`seatbelt.ts` `credentialDeny`).
  *
  * Note the system `/tmp` is deliberately NOT granted (granting it would leak
  * every other process's temp files — and the user unit no longer sets
@@ -188,14 +190,14 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude", "commands"),
     join(home, ".claude", "hooks"),
     join(home, ".claude", "plugin-state"),
-    join(home, ".claude", "downloads"),
     join(home, ".codex"),
     join(home, ".kimi-code"),
-    // grok (x.ai/cli): the installer writes ~/.grok/{downloads,bin}; pre-create
-    // both so the SCOPED grants below land on real leaves (NOT bare ~/.grok —
-    // `existing()` won't widen to $HOME). The user's real ~/.grok/auth.json
-    // stays out of the working set.
-    join(home, ".grok", "downloads"),
+    // grok (x.ai/cli): the daemon EXECS ~/.grok/bin/grok (the isolated CLI is a
+    // symlink to it), so pre-create the bin dir for the READ+EXEC grant below to
+    // land on a real leaf (NOT bare ~/.grok — `existing()` won't widen to $HOME;
+    // the user's real ~/.grok/auth.json stays out of the working set). The
+    // installer's ~/.grok/downloads staging dir is NOT granted — installs are
+    // user-run + unsandboxed now.
     join(home, ".grok", "bin"),
     // raycast (non-isolated setup): the setup writes ~/.config/raycast/ai/
     // providers.yaml (+ its .openllm-bak backup). Pre-create the `ai` leaf so
@@ -289,7 +291,6 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude", "commands"),
     join(home, ".claude", "hooks"),
     join(home, ".claude", "plugin-state"),
-    join(home, ".claude", "downloads"),
     claudeSettings,
     join(home, ".claude.json"),
     //   codex (non-isolated setup): ~/.codex/config.toml + catalog json.
@@ -303,20 +304,11 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   the `ai` leaf so the config write is granted and every other secret
     //   stays denied.
     join(home, ".config", "raycast", "ai"),
-    //   grok (x.ai/cli): ONLY the install + exec dirs, NOT the whole ~/.grok.
-    //   The installer writes the binary to ~/.grok/downloads and links
-    //   ~/.grok/bin/grok → it (the launcher `hostCliCandidates` finds), and the
-    //   isolated grok CLI is a symlink that EXECUTES through both — so both must
-    //   be read-write/exec-granted. Unlike codex/kimi above, grok has NO
-    //   in-place setup script, and the daemon's grok delegate reads creds from
-    //   its ISOLATED home (`cliConfigDir`), so the user's real ~/.grok/auth.json
-    //   is deliberately left UNgranted (the file's tight-grant security note).
-    join(home, ".grok", "bin"),
-    join(home, ".grok", "downloads"),
-    //   the user-level bin dir: the `openllmd` PATH symlink AND where the
-    //   non-isolated `claude`/`codex` installers drop their launcher + where the
-    //   setup fast path copies an adopted CLI binary.
-    join(home, ".local", "bin"),
+    //   (~/.grok/bin, ~/.local/bin, ~/.local/share/claude are READ+EXEC in the
+    //   readOnly set below — the daemon EXECS the vendor CLIs there but never
+    //   WRITES: installs + vendor self-update are user-run + unsandboxed now.
+    //   ~/.grok/downloads + ~/.claude/downloads were installer STAGING dirs and
+    //   are no longer granted at all.)
     //   bun's global install cache ONLY (the SPLIT ~/.bun grant — audit §5-B):
     //   the claude-context plugin install runs `bun install`, which populates
     //   ~/.bun/install/cache. The `bun` BINARY dir (~/.bun/bin) is read+exec in
@@ -325,27 +317,19 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   installed — the install then fails its own `command -v bun` check,
     //   correctly. Holds no credentials.
     bunCache,
-    //   claude's install dir: the `~/.local/bin/claude` launcher resolves to
-    //   `~/.local/share/claude/versions/<v>`. The official `claude install`
-    //   WRITES versions here, and the daemon's isolated CLI is a SYMLINK to that
-    //   launcher — so EXECUTING the isolated claude reads through to this dir.
-    //   Read-write so the setup can install claude AND the isolated symlink can
-    //   run it. The user's own claude binary — no credentials (those live in
-    //   `~/.claude`).
-    join(home, ".local", "share", "claude"),
-    //   claude's XDG STATE + CACHE dirs — its Linux native installer/runtime
-    //   write `~/.local/state/claude` (logs/state) + `~/.cache/claude`; absent
-    //   on macOS. Scoped to the claude subdirs (not the whole `~/.local/state`
-    //   / `~/.cache`) — no secrets there.
+    //   claude's XDG STATE + CACHE dirs — the isolated claude WRITES these at
+    //   RUN time (logs/state + cache) on Linux; absent on macOS. Scoped to the
+    //   claude subdirs (not the whole `~/.local/state` / `~/.cache`) — no
+    //   secrets there. (`~/.local/share/claude`, the BINARY dir, is read+exec in
+    //   readOnly — the daemon execs but never writes it.)
     join(home, ".local", "state", "claude"),
     join(home, ".cache", "claude"),
     //   (NO shell rc / profile grants. They were the single worst tamper
-    //   lever — an rc append is code exec in every future shell — and the
-    //   installers' PATH edits are suppressed instead: kimi via
-    //   KIMI_NO_MODIFY_PATH, codex via a PATH that already carries
-    //   ~/.local/bin (its add_to_path early-returns), claude edits no rc at
-    //   all, and grok's rc append simply EACCESes AFTER its binary landed —
-    //   see `cli-paths.ts` `hostInstallEnv` + `integrations.ts`.)
+    //   lever — an rc append is code exec in every future shell. The daemon no
+    //   longer installs vendor CLIs, so there are no in-sandbox installer PATH
+    //   edits to worry about: installs run in the UNSANDBOXED user context (the
+    //   daemon install script), where the native installers do their normal
+    //   rc/PATH edits.)
     //   the integration scripts' OWN staging dir: the shared script preamble
     //   (`packages/api/lib/scripts.ts` `pick_tmpdir`) points TMPDIR at
     //   `$HOME/.cache/openllm` (the root fs, to dodge the small /tmp tmpfs on
@@ -382,9 +366,24 @@ export const daemonWorkingSet = (): TWorkingSet => {
     ...(DAEMON_VERSION === "0.0.0-dev"
       ? [resolve(import.meta.dir, "..", "..", "..", "..")]
       : []),
-    // (~/.local/share/claude is granted READ-WRITE in the readWrite set above —
-    //  it serves both the install fast-path adoption READ and the non-isolated
-    //  setup's tier-3 claude install WRITE.)
+    // ── Provider-CLI binary dirs — READ+EXEC only ─────────────────────
+    // The daemon RUNS the vendor CLIs (each isolated run-view is a symlink to
+    // the host binary), so it must EXEC through these — but it never WRITES
+    // them: installs are user-run + unsandboxed (the daemon install script),
+    // and vendor self-update likewise happens out of band when the user re-runs
+    // the installer. Read+exec, not read-write:
+    //   ~/.local/bin        — the `claude`/`codex` launchers + the `openllmd`
+    //                         PATH symlink (the daemon install script writes
+    //                         this one, unsandboxed; the daemon only reads it);
+    //   ~/.local/share/claude — the claude launcher resolves to
+    //                         `versions/<v>` here; exec reads through to it;
+    //   ~/.grok/bin         — grok's binary; the isolated grok symlink execs it.
+    // The user's real ~/.grok/auth.json stays UNgranted (it's a sibling file,
+    // not under ~/.grok/bin). `cliInstallState`'s auto-link writes only the
+    // isolated symlink under the state dir (read-write), never these dirs.
+    join(home, ".local", "bin"),
+    join(home, ".local", "share", "claude"),
+    join(home, ".grok", "bin"),
     // bun's BINARY dir — read+exec only (the split ~/.bun grant, audit §5-B):
     // the plugin install must EXEC `bun`, but a write grant here would let a
     // compromised daemon replace the user's `bun` launcher. The cache half

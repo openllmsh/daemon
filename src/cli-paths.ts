@@ -59,14 +59,14 @@ export const cliBin = (provider: TCliProvider): string =>
 
 /**
  * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
- * order — `cli-install.ts` `ensureHostCli` returns the first that exists (else
- * installs the official CLI there once), and `installCli` SYMLINKS the isolated
- * path to it (no copy, zero duplicate bytes). The single binary on disk is the
- * non-isolated one; the isolated CLI is always a link to it.
+ * order — `cli-install.ts` `cliInstallState` returns the first that exists and
+ * SYMLINKS the isolated path to it (no copy, zero duplicate bytes). The daemon
+ * NEVER installs the CLI; installs are user-run + unsandboxed. The single binary
+ * on disk is the non-isolated one; the isolated CLI is always a link to it.
  *
  * The symlink target must be EXEC-able under the OS sandbox: the codex
  * (`~/.codex`) + kimi (`~/.kimi-code`) homes (read-write working set) and
- * claude's install dir (`~/.local/share/claude`, granted in `working-set.ts`)
+ * claude's binary dir (`~/.local/share/claude`, read+exec in `working-set.ts`)
  * + anything outside `$HOME` all qualify.
  */
 export const hostCliCandidates = (provider: TCliProvider): string[] => {
@@ -117,40 +117,6 @@ export const cliConfigDir = (provider: TCliProvider): string => {
     // grok caches its OAuth token at <home>/.grok/auth.json.
     case "grok":
       return join(home, ".grok");
-  }
-};
-
-/**
- * Env knobs for a HOST (non-isolated) vendor install — `ensureHostCli` merges
- * these onto the default env so the official installer lands the binary in
- * its default location WITHOUT editing the user's shell rc files. The OS
- * sandbox no longer grants the rc files (`working-set.ts` — they were the
- * single worst tamper lever), so an unsuppressed PATH edit would EACCES and,
- * for kimi (whose `_update_path` runs under `set -e` BEFORE its final
- * summary), could fail an otherwise-successful install. Per provider
- * (verified against the live installers 2026-07-03):
- *   - kimi  → `KIMI_NO_MODIFY_PATH=1`, the documented skip knob.
- *   - codex → `CODEX_NON_INTERACTIVE=1` skips prompts only — there is NO
- *     PATH-suppression knob; its `add_to_path` early-returns when BIN_DIR
- *     (~/.local/bin) is ALREADY on PATH, which `ensureHostCli`'s
- *     DEFAULT_BIN_DIRS PATH-prepend guarantees. The knob here is for the
- *     `Start Codex now?` prompt (pipes hang without it).
- *   - claude → edits no rc file at all (verified) — nothing to suppress.
- *   - grok  → no knob; its rc append runs AFTER the binary lands, so under
- *     the sandbox it EACCESes harmlessly (install still succeeds — the
- *     binary-presence check is what `ensureHostCli` keys off).
- */
-export const hostInstallEnv = (
-  provider: TCliProvider,
-): Record<string, string> => {
-  switch (provider) {
-    case "chatgpt":
-      return { CODEX_NON_INTERACTIVE: "1" };
-    case "kimi_code":
-      return { KIMI_NO_MODIFY_PATH: "1" };
-    case "claude_code":
-    case "grok":
-      return {};
   }
 };
 
@@ -210,12 +176,9 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
       };
     // grok is HOME-rooted (like claude): it reads/writes its config +
     // `auth.json` under <home>/.grok, so pinning HOME isolates it from the
-    // user's real ~/.grok. The x.ai/cli installer DOES expose a GROK_BIN_DIR
-    // knob, but we deliberately don't set it: like every provider here the host
-    // binary installs to its DEFAULT location (~/.grok/bin) via `ensureHostCli`
-    // (which runs with the default env, not `cliEnv`) and the isolated path is a
-    // symlink to it — there is no isolated install for an install-dir knob to
-    // redirect.
+    // user's real ~/.grok. The host binary lives at its DEFAULT location
+    // (~/.grok/bin, installed out of band by the user-run installer) and the
+    // isolated path is a symlink to it — the daemon only runs it, never installs.
     case "grok":
       return {
         HOME: home,

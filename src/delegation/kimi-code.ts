@@ -549,7 +549,8 @@ const connectDevice = makeDeviceCodeConnect({
   provider: PROVIDER,
   slot,
   installed: async () => (await cliInstallState(PROVIDER)).installed,
-  installHint: "Install the Kimi CLI from the Providers tab first.",
+  installHint:
+    "Kimi CLI not found — re-run the OpenLLM daemon installer to add it.",
   connected: async () => (await readToken()) !== null,
   connectedDetail: "signed in via Kimi Code",
   inProgressDetail:
