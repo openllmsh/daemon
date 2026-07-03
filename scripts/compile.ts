@@ -47,9 +47,10 @@ const DEFAULT_CLOUD_ORIGIN = "https://openllm.sh";
  * - empty / missing  → the public default (`https://openllm.sh`).
  * - the default      → accepted verbatim.
  * - `https://` with a hostname that is `openllm.sh`, a `*.openllm.sh`
- *   subdomain (e.g. `dev.openllm.sh` staging), or a `*.vercel.app` preview →
- *   accepted (the documented dev/preview/self-host workflow; `dist.ts` bakes
- *   whatever `OPENLLM_CLOUD_ORIGIN` is set when packaging a self-host build).
+ *   subdomain (e.g. `dev.openllm.sh` staging), or an OpenLLM-owned
+ *   `openllm-<...>-quantide.vercel.app` preview → accepted (the documented
+ *   dev/preview/self-host workflow; `dist.ts` bakes whatever
+ *   `OPENLLM_CLOUD_ORIGIN` is set when packaging a self-host build).
  * - `http://` ONLY for `localhost` / `127.0.0.1` (local dev).
  * - anything else (a remote non-allow-listed host, or a non-http(s) scheme) →
  *   THROW, failing the compile.
@@ -58,12 +59,20 @@ const DEFAULT_CLOUD_ORIGIN = "https://openllm.sh";
  * `OPENLLM_CLOUD_ORIGIN` env var win (`packages/daemon/src/env.ts`), so dev /
  * preview daemons are normally re-pointed at runtime, not via the bake.
  */
-const isAllowedCloudHost = (host: string): boolean =>
+// OpenLLM's own Vercel preview deployments, anchored to the `openllm` project +
+// `quantide` team — the hostname-level twin of `PREVIEW_ORIGIN` in
+// `packages/daemon/src/cors.ts` (keep the two in sync). A bare
+// `.endsWith(".vercel.app")` would let a poisoned build env bake ANY stranger's
+// `*.vercel.app` origin into shipped binaries.
+export const OPENLLM_PREVIEW_HOST =
+  /^openllm-[a-z0-9-]+-quantide\.vercel\.app$/;
+
+export const isAllowedCloudHost = (host: string): boolean =>
   host === "localhost" ||
   host === "127.0.0.1" ||
   host === "openllm.sh" ||
   host.endsWith(".openllm.sh") ||
-  host.endsWith(".vercel.app");
+  OPENLLM_PREVIEW_HOST.test(host);
 
 const resolveCloudOrigin = (): string => {
   const raw = process.env.OPENLLM_CLOUD_ORIGIN;
@@ -84,14 +93,13 @@ const resolveCloudOrigin = (): string => {
   if (!schemeOk || !isAllowedCloudHost(url.hostname)) {
     throw new Error(
       `OPENLLM_CLOUD_ORIGIN (${raw}) is not allow-listed — must be https://openllm.sh, ` +
-        `a *.openllm.sh / *.vercel.app host, or http://localhost|127.0.0.1; ` +
+        `a *.openllm.sh subdomain, an openllm-<...>-quantide.vercel.app preview, ` +
+        `or http://localhost|127.0.0.1; ` +
         `refusing to bake an unrecognised cloud origin into the daemon binary`,
     );
   }
   return raw;
 };
-
-const CLOUD_ORIGIN = resolveCloudOrigin();
 
 const TARGETS = [
   "bun-darwin-arm64",
@@ -119,7 +127,10 @@ const outfileFor = (target: string): string => {
   return `${OUT_DIR}/openllmd-${suffix}`;
 };
 
-const buildOne = async (target: string | null): Promise<string> => {
+const buildOne = async (
+  target: string | null,
+  cloudOrigin: string,
+): Promise<string> => {
   const outfile = target === null ? `${OUT_DIR}/openllmd` : outfileFor(target);
   const targetArgs = target === null ? [] : ["--target", target];
   await $`bun build ${ENTRY} \
@@ -127,7 +138,7 @@ const buildOne = async (target: string | null): Promise<string> => {
     --minify \
     --sourcemap=none \
     --bytecode \
-    --define ${`__OPENLLM_CLOUD_ORIGIN_DEFAULT__=${JSON.stringify(CLOUD_ORIGIN)}`} \
+    --define ${`__OPENLLM_CLOUD_ORIGIN_DEFAULT__=${JSON.stringify(cloudOrigin)}`} \
     --define ${`__OPENLLM_DAEMON_VERSION__=${JSON.stringify(version)}`} \
     ${targetArgs} \
     --outfile ${outfile}`;
@@ -142,9 +153,12 @@ const buildOne = async (target: string | null): Promise<string> => {
 };
 
 const main = async (): Promise<void> => {
+  // Resolve (+ validate) the bake origin lazily inside main so importing this
+  // module (e.g. from a unit test of `isAllowedCloudHost`) has no side effects.
+  const cloudOrigin = resolveCloudOrigin();
   await $`mkdir -p ${OUT_DIR}`;
   if (hostOnly) {
-    const out = await buildOne(null);
+    const out = await buildOne(null, cloudOrigin);
     console.log(`built host binary → ${out}`);
     return;
   }
@@ -156,11 +170,16 @@ const main = async (): Promise<void> => {
   const t0 = Date.now();
   await Promise.all(
     TARGETS.map(async (target) => {
-      const out = await buildOne(target);
+      const out = await buildOne(target, cloudOrigin);
       console.log(`built ${target} → ${out}`);
     }),
   );
   console.log(`compiled ${TARGETS.length} targets in ${Date.now() - t0}ms`);
 };
 
-await main();
+// Only run the build when executed directly (`bun compile.ts`), not when
+// imported by a test. Keeps the module import-safe for unit testing the pure
+// host allow-list above.
+if (import.meta.main) {
+  await main();
+}
