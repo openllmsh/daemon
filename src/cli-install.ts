@@ -15,6 +15,7 @@
  *   codex  → https://chatgpt.com/codex/install.sh
  *   kimi   → https://code.kimi.com/kimi-code/install.sh
  */
+import { spawn } from "node:child_process";
 import { existsSync, lstatSync, symlinkSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -35,6 +36,10 @@ const INSTALL_SCRIPT: Readonly<Record<TCliProvider, string>> = {
   claude_code: "https://claude.ai/install.sh",
   chatgpt: "https://chatgpt.com/codex/install.sh",
   kimi_code: "https://code.kimi.com/kimi-code/install.sh",
+  // The official Grok Build curl installer. Verified live (2026-06-30): the URL
+  // serves the real install script over HTTP 200 — it is NOT Cloudflare-walled,
+  // and grok ships no npm package, so curl is the only install path.
+  grok: "https://x.ai/cli/install.sh",
 };
 
 /** Hard ceiling for a vendor install — a stalled download/install is killed so
@@ -80,6 +85,113 @@ export type TEnsureHostResult = {
   readonly output: string;
 };
 
+type TInstallRun = {
+  readonly timedOut: boolean;
+  readonly output: string;
+};
+
+/**
+ * Run a vendor installer pipeline (`curl … | bash`) under a HARD timeout that
+ * can actually reap it.
+ *
+ * The installer is a shell PIPELINE that spawns more processes (curl, an inner
+ * `bash`, the vendor installer's own children). Killing only the DIRECT child
+ * (the `bash -c` wrapper) leaves those orphaned, and a single survivor that
+ * inherited the stdout/stderr pipe keeps it open — so an EOF-bounded
+ * `await stream.text()` NEVER returns, `installCli` never resolves, the
+ * `cli_install` handler's `finally` never clears `installing`, and the dashboard
+ * card wedges on "Installing…" forever (past the timeout). Two defences make the
+ * bound real:
+ *   1. `detached: true` runs the pipeline in its OWN process group, so a SIGKILL
+ *      to `-pid` (the group) reaps the WHOLE tree — curl, both bashes, and the
+ *      installer's children — closing every inherited pipe.
+ *   2. We resolve off the wrapper's `exit` (the authoritative "finished"), NOT
+ *      off stream EOF, then kill the group to sweep any leaked descendant — so a
+ *      survivor holding the pipe can never defer resolution.
+ *
+ * Exported for the regression test, which points `url` at a `file://` fake
+ * installer that backgrounds a pipe-holding survivor (the production wedge).
+ */
+export const runInstallScript = (
+  url: string,
+  env: NodeJS.ProcessEnv,
+): Promise<TInstallRun> =>
+  new Promise<TInstallRun>((resolve) => {
+    // Pass the URL through an ENV VAR referenced as a quoted `"$INSTALL_URL"`
+    // rather than interpolating it into the command string. `runInstallScript`
+    // is exported (for the regression test), so a caller-supplied `url` must
+    // never be able to break out of the `bash -c` and inject shell — the env-var
+    // indirection makes that impossible regardless of the url's contents.
+    const child = spawn("bash", ["-c", 'curl -fsSL "$INSTALL_URL" | bash'], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...env, INSTALL_URL: url },
+      // Run in the daemon-owned temp dir, never the daemon's inherited cwd `/`:
+      // a vendor installer launched at `/` walks the filesystem root (tripping
+      // macOS's TCC network-volume prompt on `/Volumes/*`). The dir is granted
+      // read-write by the sandbox working set.
+      cwd: daemonTempDir(),
+      detached: true,
+    });
+
+    let output = "";
+    const append = (b: Buffer): void => {
+      output += b.toString();
+    };
+    child.stdout?.on("data", append);
+    child.stderr?.on("data", append);
+    // A broken pipe after we kill the group must not throw out of the stream.
+    child.stdout?.on("error", () => {});
+    child.stderr?.on("error", () => {});
+
+    let settled = false;
+    let timedOut = false;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Kill the ENTIRE process group, not just the wrapper. With `detached` the
+    // child is its group leader, so `-pid` addresses the whole pipeline. ESRCH
+    // (already reaped) is expected and ignored.
+    const killGroup = (): void => {
+      if (typeof child.pid !== "number") return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // group already gone
+      }
+    };
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer !== null) clearTimeout(killTimer);
+      if (graceTimer !== null) clearTimeout(graceTimer);
+      // Sweep any leaked background descendant so nothing lingers on the pipe.
+      killGroup();
+      resolve({ timedOut, output: output.trim() });
+    };
+
+    // Schedule the post-exit / post-timeout resolution, replacing any prior arm.
+    const armFinish = (ms: number): void => {
+      if (graceTimer !== null) clearTimeout(graceTimer);
+      graceTimer = setTimeout(finish, ms);
+    };
+
+    killTimer = setTimeout(() => {
+      timedOut = true;
+      killGroup(); // forces the wrapper's `exit`, which calls `finish`…
+      armFinish(2_000); // …belt-and-braces if `exit` somehow never fires.
+    }, INSTALL_TIMEOUT_MS);
+
+    // spawn itself failed (e.g. no `bash` on PATH) — return with the buffer.
+    child.on("error", finish);
+    // Resolve off `exit` (process done) not `close` (waits for stream EOF, which
+    // a pipe-holding survivor can defer forever). A short grace drains already-
+    // buffered `data` before we read `output`.
+    child.on("exit", () => {
+      armFinish(250);
+    });
+  });
+
 /**
  * Ensure the user's NON-isolated vendor CLI exists, returning its binary path.
  * The SINGLE install path: if the CLI is already present (the user had it, or
@@ -99,35 +211,20 @@ export const ensureHostCli = async (
   const present = candidates.find((c) => existsSync(c));
   if (present !== undefined) return { path: present, output: "" };
 
-  const url = INSTALL_SCRIPT[provider];
-  const proc = Bun.spawn(["bash", "-c", `curl -fsSL ${url} | bash`], {
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, TMPDIR: daemonTempDir() },
-  });
-  // Bound the installer so a stalled download/install can't wedge the
-  // serial control loop forever — kill it and surface a timeout.
-  let timedOut = false;
-  const killTimer = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // already exited
-    }
-  }, INSTALL_TIMEOUT_MS);
-  let output: string;
-  try {
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-    await proc.exited;
-    output = `${stdout}${stderr}`.trim();
-  } finally {
-    clearTimeout(killTimer);
-  }
+  // Run the vendor installer in its own process group under a HARD,
+  // group-killing timeout (see `runInstallScript`): a stalled download/install —
+  // or a survivor descendant holding the pipe — can't wedge the serial control
+  // loop forever, so the `cli_install` handler always returns and clears the
+  // card's "Installing…" state. `runInstallScript` also pins the child cwd to
+  // the daemon temp dir so the installer never walks the daemon's inherited `/`
+  // (which trips macOS's TCC network-volume prompt on `/Volumes/*`).
+  const { timedOut, output } = await runInstallScript(
+    INSTALL_SCRIPT[provider],
+    {
+      ...process.env,
+      TMPDIR: daemonTempDir(),
+    },
+  );
   if (timedOut) {
     return {
       path: null,

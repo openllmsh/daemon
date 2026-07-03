@@ -26,26 +26,28 @@
  *     2023-06-01`, `User-Agent: claude-cli/<version>`.
  *   - Usage: GET https://api.anthropic.com/api/oauth/usage.
  */
-import { rename, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
-import { logDebug, logWarn } from "../logger";
+import { logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
-  setPendingAuth,
 } from "../pending-auth";
 import {
   ensureAuthConfig,
-  oauthConfig,
+  resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
+import { makePasteBackDevice } from "./login-device";
+import { makeBlockingConnect } from "./login-direct";
+import { loginSlot } from "./login-flow";
+import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
-import type { THeadlessLogin } from "./util";
 import {
   cliVersion,
   ensureIsolatedKeychain,
@@ -53,45 +55,26 @@ import {
   readIsolatedKeychain,
   readJsonFile,
   runCapture,
-  spawnHeadlessLogin,
-  spawnLogin,
   toEpochMs,
-  writeIsolatedKeychain,
 } from "./util";
 
 const PROVIDER = "claude_code" as const;
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 const OAUTH_BETA = "oauth-2025-04-20";
-const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+// Usage endpoint LEAF path — the host is derived from the captured inference
+// endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
+const USAGE_PATH = "/api/oauth/usage";
 
-// The OAuth token endpoint + public client id used to refresh the access
-// token with the stored refresh token. This is the SAME flow the CLI runs —
-// done here on its behalf, locally, when the daemon needs a token and the CLI
-// hasn't refreshed (the CLI only refreshes mid-inference, which the daemon
-// never triggers; there is no `claude auth refresh` command). The rotated
-// token is written back to the CLI's store so the two stay in sync.
-//
-// Both values are Anthropic's and DRIFT on CLI updates (the token host moved
-// console.anthropic.com → platform.claude.com), so they are NOT hardcoded
-// here — `oauthConfig()` reads them from the installed CLI binary or a valid
-// cache entry; when neither exists, refresh is SKIPPED (no hardcoded fallback).
-// See `auth-config.ts`.
-//
-// Refresh proactively when within this window of expiry (hides clock skew
-// + avoids a guaranteed 401 → refresh → retry on the next call).
+// The daemon does NOT refresh the token itself. When the access token is within
+// this window of expiry, `readToken` TRIGGERS the `claude` CLI's OWN native
+// refresh (a minimal `claude -p` query — the CLI refreshes mid-request and
+// persists the rotated token to its store); there is no `claude auth refresh`
+// command. No token endpoint or client id lives here. See `triggerRefresh`.
 const REFRESH_LEEWAY_MS = 60_000;
-// Hard cap on the token-refresh request so a hung endpoint can't stall the
-// readToken critical path (inference + usage await it).
-const REFRESH_FETCH_TIMEOUT_MS = 10_000;
 
 // Run the isolated `claude` binary with its isolated home/config env.
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
-
-// A live headless paste-back login (remote box): the spawned `claude auth login`
-// is held open on a writable stdin until the user pastes the code (or cancels /
-// it expires). Single-flight — one in-flight login per daemon at a time.
-let inFlightLogin: THeadlessLogin | null = null;
 
 type TClaudeOAuth = {
   readonly accessToken?: string;
@@ -121,166 +104,51 @@ const loadStore = async (): Promise<TClaudeStore | null> => {
   );
 };
 
-// Persist a refreshed blob back to the CLI's store so the isolated CLI
-// reads the same (rotated) token next time. macOS → keychain (in-place
-// update, no ACL change/prompt); Linux/Windows → the credentials file.
-const writeStore = async (store: TClaudeStore): Promise<void> => {
-  const payload = JSON.stringify(store);
-  if (platform() === "darwin") {
-    await writeIsolatedKeychain(cliHome(PROVIDER), KEYCHAIN_SERVICE, payload);
-    return;
-  }
-  // Atomic write (temp + rename) — the isolated `claude` CLI writes the SAME
-  // file via its OWN atomic temp+rename, so a plain overwrite here could be lost
-  // to / interleave with the CLI's write. rename(2) on the same dir is atomic,
-  // so a concurrent reader always sees either the old or the new file whole.
-  const path = join(cliConfigDir(PROVIDER), ".credentials.json");
-  const tmp = `${path}.openllmd.tmp`;
-  await Bun.write(tmp, payload);
-  await rename(tmp, path);
+/**
+ * Trigger the `claude` CLI's OWN native token refresh: a minimal headless
+ * query. The CLI refreshes its OAuth access token mid-request and PERSISTS the
+ * rotated token to its store — the daemon never touches the token. macOS: the
+ * isolated login keychain must be unlocked first so the CLI can READ the
+ * credential to make the call (and WRITE the rotated one back). Output ignored;
+ * bounded. Rotating the refresh token here is fine — this is now the SINGLE
+ * refresher (no race with a daemon-side refresh), which is why claude's URL
+ * capture stays disabled (`liveCapture:false`).
+ */
+const triggerRefresh = async (): Promise<void> => {
+  await ensureIsolatedKeychain(cliHome(PROVIDER));
+  await spawnRefresh([bin(), "-p", "ping"], env());
 };
 
-// Exchange the stored refresh token for a fresh access token (+ possibly
-// rotated refresh token). Returns null on any failure — caller falls back
-// to the existing (stale) token, surfacing the upstream's own 401.
-const refreshOAuth = async (
-  refreshToken: string,
-): Promise<{
-  access: string;
-  refresh: string;
-  expiresAtMs: number | null;
-} | null> => {
-  try {
-    // Read the (drift-prone) endpoint + client id from the CLI binary, not a
-    // hardcoded literal. NULL when extraction failed AND nothing valid is
-    // cached — skip the refresh (no hardcoded fallback to fall back to); the
-    // stale access token then surfaces the vendor's own 401 → re-login.
-    const cfg = await oauthConfig(PROVIDER);
-    if (cfg === null) {
-      // `oauthConfig`/`extractOAuthFromBinary` already WARNed the root cause
-      // (extraction drift). Just note that this refresh is being skipped.
-      logDebug(
-        "claude-code",
-        "token refresh skipped — no OAuth config available",
-      );
-      return null;
-    }
-    const { token_url, client_id } = cfg;
-    const resp = await fetch(token_url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        // CLI meta, used ONLY here (the token endpoint is the one call the
-        // daemon legitimately makes AS the CLI). Derived live from the
-        // installed binary's version.
-        "user-agent": await userAgent(),
-      },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-        client_id,
-      }),
-      // Bound the refresh so a hung token endpoint can't stall readToken (and
-      // thus every inference/usage call that awaits it) — abort → caught → null.
-      signal: AbortSignal.timeout(REFRESH_FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) {
-      // A 400/401 here means the stored REFRESH token was rejected (expired or
-      // already rotated away) — every later refresh fails too, so the access
-      // token stays stale and usage/inference 401/429. Surface it loudly: this
-      // is a re-login situation, not a transient blip.
-      const reLogin = resp.status === 400 || resp.status === 401;
-      logWarn("claude-code", "OAuth token refresh rejected by token endpoint", {
-        status: resp.status,
-        hint: reLogin
-          ? "stored refresh token is invalid — re-sign in via `openllmd connect claude_code` / `claude` login"
-          : "transient token-endpoint error — will retry on the next stale read",
-      });
-      return null;
-    }
-    const d = (await resp.json()) as {
-      access_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-    if (typeof d.access_token !== "string" || d.access_token.length === 0) {
-      return null;
-    }
-    return {
-      access: d.access_token,
-      // Anthropic rotates refresh tokens; keep the old one if absent OR empty.
-      // An empty `refresh_token` would otherwise OVERWRITE a working one with
-      // "", permanently stranding the credential (readToken won't refresh a ""),
-      // so treat "" exactly like absent.
-      refresh:
-        typeof d.refresh_token === "string" && d.refresh_token.length > 0
-          ? d.refresh_token
-          : refreshToken,
-      expiresAtMs:
-        typeof d.expires_in === "number"
-          ? Date.now() + d.expires_in * 1000
-          : null,
-    };
-  } catch (err) {
-    // Network error or the REFRESH_FETCH_TIMEOUT abort — transient; the stale
-    // access token surfaces the vendor's own 401 and we retry next stale read.
-    logDebug("claude-code", "OAuth token refresh failed (network/timeout)", {
-      err: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
-};
-
-// Single-flight guard: concurrent callers that all see an expired token
-// share ONE refresh (refresh-token rotation means parallel refreshes
-// would invalidate each other).
-let inFlightRefresh: Promise<void> | null = null;
+// Within the leeway window → fire the CLI refresh in the background (still
+// valid, no stall); hard-expired → await it. Single-flight per provider.
+const refresh = makeRefresher({
+  leewayMs: REFRESH_LEEWAY_MS,
+  trigger: triggerRefresh,
+});
 
 /**
- * The current access token, refreshed + persisted if it's within the
- * leeway of expiry. Used by `credentialForUpstream` (inference) and
- * `usage` so both always carry a live token.
+ * The current access token, triggering the CLI's native refresh if it's within
+ * the leeway of expiry. Used by `credentialForUpstream` (inference) and `usage`
+ * so both carry a live token.
  */
 const readToken = async (): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
 } | null> => {
-  const store = await loadStore();
-  const oauth = store?.claudeAiOauth;
+  const oauth = (await loadStore())?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
     return null;
   }
   const expiresAtMs = toEpochMs(oauth.expiresAt);
-  const stale =
-    expiresAtMs !== null && expiresAtMs - Date.now() < REFRESH_LEEWAY_MS;
-  // An empty refreshToken is as un-refreshable as a missing one — don't waste
-  // a doomed refresh round-trip on "".
-  if (!stale || !oauth.refreshToken) {
+  // Only trigger when the credential CAN be refreshed — an empty/missing refresh
+  // token can't (and the CLI can't either), so don't waste a spawn.
+  const outcome = oauth.refreshToken ? await refresh(expiresAtMs) : "fresh";
+  if (outcome !== "awaited") {
     return { accessToken: oauth.accessToken, expiresAtMs };
   }
-
-  if (inFlightRefresh === null) {
-    const rt = oauth.refreshToken;
-    inFlightRefresh = (async () => {
-      const refreshed = await refreshOAuth(rt);
-      if (refreshed === null) return;
-      await writeStore({
-        claudeAiOauth: {
-          ...oauth,
-          accessToken: refreshed.access,
-          refreshToken: refreshed.refresh,
-          expiresAt: refreshed.expiresAtMs ?? oauth.expiresAt,
-        },
-      });
-    })().finally(() => {
-      inFlightRefresh = null;
-    });
-  }
-  await inFlightRefresh;
-
-  // Re-read the (now-rotated) store. Falls back to the stale token if the
-  // refresh failed — the upstream then 401s and the UI says re-sign-in.
+  // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
+  // store. Falls back to the stale token if it failed (the upstream then 401s
+  // and the UI says re-sign-in).
   const fresh = (await loadStore())?.claudeAiOauth;
   if (fresh?.accessToken !== undefined && fresh.accessToken.length > 0) {
     return {
@@ -344,8 +212,114 @@ const credentialRefreshable = async (): Promise<boolean | null> => {
 const NO_REFRESH_HINT =
   "signed in via Claude Code — warning: this credential has no refresh token and can't auto-refresh; you may need to re-sign in when it expires";
 
+// ─── Login wiring ────────────────────────────────────────────────────────
+//
+// `connect` is a SYNCHRONOUS browser login (it blocks in `claude auth login`),
+// so it carries no single-flight slot. `connectDeviceCode` is the headless
+// paste-back (remote box) and shares the `slot` with `submitLoginCode` +
+// `cancelConnect`. All paths flag a credential that can't auto-refresh (no
+// refresh token) at sign-in, so the card doesn't silently die ~8h later.
+
+const slot = loginSlot(PROVIDER);
+const INSTALL_HINT =
+  "Install the Claude Code CLI from the Providers tab first.";
+const CONNECTED_DETAIL = "signed in via Claude Code";
+const LOGIN_ARGV = (): ReadonlyArray<string> => [
+  bin(),
+  "auth",
+  "login",
+  "--claudeai",
+];
+
+const isInstalled = async (): Promise<boolean> =>
+  (await cliInstallState(PROVIDER)).installed;
+// Authoritative connection check: prefer `claude auth status`, fall back to the
+// store read when it's unavailable (the store read is fragile on macOS).
+const isConnected = async (): Promise<boolean> => {
+  const viaAuth = await authStatusLoggedIn();
+  return viaAuth !== null ? viaAuth : (await readToken()) !== null;
+};
+// Refresh the auth config now the identity / CLI may have changed (a CLI update
+// can rotate the upstream URL / token endpoint / client id). Best-effort.
+const refreshConfig = (): void => {
+  void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
+};
+// The success `detail`: a credential with no refresh token works now but can't
+// be renewed — log `warning` + return the persistent NO_REFRESH_HINT so the
+// dashboard shows a "re-sign in" hint instead of a card that dies at expiry.
+const signedInDetail = async (warning: string): Promise<string> => {
+  if ((await credentialRefreshable()) === false) {
+    logWarn("claude-code", warning);
+    return NO_REFRESH_HINT;
+  }
+  return CONNECTED_DETAIL;
+};
+
+// Native browser login: `claude auth login --claudeai` opens the browser and
+// BLOCKS until its own localhost callback completes; the token then lands in
+// the isolated CLI's store. (macOS keychain ensured before / granted after.)
+const connectDirect = makeBlockingConnect({
+  provider: PROVIDER,
+  installed: isInstalled,
+  installHint: INSTALL_HINT,
+  beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
+  argv: LOGIN_ARGV,
+  env,
+  afterLogin: () => grantKeychainToolAccess(cliHome(PROVIDER)),
+  verifyConnected: isConnected,
+  onConnected: refreshConfig,
+  successDetail: () =>
+    signedInDetail(
+      "signed in (browser) but the stored credential has NO refresh token — it cannot auto-refresh; re-login will be needed at access-token expiry",
+    ),
+  failDetail: (result) =>
+    result.output.length > 0
+      ? result.output.slice(0, 300)
+      : `claude auth login exited ${result.code} without a stored credential`,
+});
+
+// Headless paste-back login (remote box): spawn `claude auth login --claudeai`
+// with the browser suppressed, surface the hosted-callback URL (paste mode),
+// and hold the process open on stdin until the user pastes the code.
+const device = makePasteBackDevice({
+  provider: PROVIDER,
+  slot,
+  installed: isInstalled,
+  installHint: INSTALL_HINT,
+  // Authoritative check: `claude auth status` first, the (fragile, macOS-shape-
+  // sensitive) store read only as fallback — same as `status()`/`connect()`.
+  connected: isConnected,
+  connectedDetail: CONNECTED_DETAIL,
+  inProgressDetail:
+    "Claude sign-in already in progress — finish in your browser, then paste the code.",
+  beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
+  argv: LOGIN_ARGV,
+  env,
+  onConnected: async () => {
+    if ((await credentialRefreshable()) === false) {
+      logWarn(
+        "claude-code",
+        "headless login landed a credential with NO refresh token — it cannot auto-refresh (re-login will be needed at access-token expiry)",
+      );
+    }
+    refreshConfig();
+  },
+  onCodeAccepted: () => grantKeychainToolAccess(cliHome(PROVIDER)),
+  verifyAfterSubmit: async () =>
+    (await authStatusLoggedIn()) === true || (await readToken()) !== null,
+  submitSuccessDetail: () =>
+    signedInDetail(
+      "signed in but the stored credential has NO refresh token — it cannot auto-refresh; the access token will expire (~8h) and require re-login",
+    ),
+});
+
 export const claudeCodeDelegate: TProviderDelegate = {
   slug: "claude_code",
+
+  connect: connectDirect,
+  connectDeviceCode: device.connectDeviceCode,
+  submitLoginCode: device.submitLoginCode,
+  cancelConnect: device.cancelConnect,
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
@@ -404,175 +378,13 @@ export const claudeCodeDelegate: TProviderDelegate = {
     };
   },
 
-  connect: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Claude Code CLI from the Providers tab first.",
-      };
-    }
-    // macOS: ensure the isolated HOME has its own (unlocked) login
-    // keychain BEFORE login, or `claude auth login`'s credential WRITE
-    // fails with the system "Keychain Not Found" dialog. No-op elsewhere.
-    await ensureIsolatedKeychain(cliHome(PROVIDER));
-    // Native subscription login. `claude auth login --claudeai` is the
-    // real CLI subcommand (NOT the REPL `/login` slash command, which
-    // errors with "isn't available in this environment" when spawned).
-    // It opens the user's browser and BLOCKS until the user signs in and
-    // the CLI's own localhost callback completes ("you can close this
-    // page"); the token then lands in the isolated CLI's own store.
-    const result = await spawnLogin(
-      [bin(), "auth", "login", "--claudeai"],
-      env(),
-    );
-    // macOS: grant CLI tools prompt-free access to the just-written
-    // keychain item so our later credential reads don't pop a GUI prompt.
-    await grantKeychainToolAccess(cliHome(PROVIDER));
-    // Verify via the SAME authoritative check `status()` uses
-    // (`claude auth status`), not a raw credential-store read — the store
-    // read is fragile (macOS Keychain shape varies) and can report a
-    // false negative even when the CLI is correctly signed in. Fall back
-    // to the store read only if `auth status` is unavailable.
-    const viaAuth = await authStatusLoggedIn();
-    const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
-    if (connected) {
-      // Refresh the auth config now that the identity / CLI may have changed
-      // (a CLI update can rotate the upstream URL, token endpoint, or client
-      // id). Best-effort + non-blocking.
-      void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-      // Loud-fail: a no-refresh credential works now but can't be renewed —
-      // flag it at login instead of letting the card die ~8h later. (Same guard
-      // as the headless paste-back paths; the local browser flow can land one
-      // too.)
-      if ((await credentialRefreshable()) === false) {
-        logWarn(
-          "claude-code",
-          "signed in (browser) but the stored credential has NO refresh token — it cannot auto-refresh; re-login will be needed at access-token expiry",
-        );
-        return { connected: true, detail: NO_REFRESH_HINT };
-      }
-      return { connected: true, detail: "signed in via Claude Code" };
-    }
-    return {
-      connected: false,
-      detail:
-        result.output.length > 0
-          ? result.output.slice(0, 300)
-          : `claude auth login exited ${result.code} without a stored credential`,
-    };
-  },
-
-  // Headless paste-back login for a REMOTE box (remote Claude auth): spawn
-  // `claude auth login --claudeai` with DISPLAY stripped + the browser
-  // suppressed, surface the hosted authorize URL via pending-auth (status →
-  // dashboard paste panel), and hold the process open on stdin until the user
-  // pastes the code (`submitLoginCode`) or cancels. The credential that lands is
-  // the real refreshable claude.ai OAuth one. Reuses the `connect_device_code`
-  // control command + hook.
-  connectDeviceCode: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Claude Code CLI from the Providers tab first.",
-      };
-    }
-    if ((await readToken()) !== null) {
-      clearPendingAuth(PROVIDER);
-      return { connected: true, detail: "signed in via Claude Code" };
-    }
-    // Single-flight: re-surface the live URL instead of spawning a second login
-    // (a new PKCE session would orphan the first).
-    if (inFlightLogin !== null) {
-      const p = getPendingAuth(PROVIDER);
-      return {
-        connected: false,
-        pending: true,
-        detail:
-          p !== null
-            ? pendingAuthDetail(p)
-            : "Claude sign-in already in progress — finish in your browser, then paste the code.",
-      };
-    }
-    // macOS: the isolated login keychain must exist before the credential write.
-    await ensureIsolatedKeychain(cliHome(PROVIDER));
-    const login = await spawnHeadlessLogin(
-      [bin(), "auth", "login", "--claudeai"],
-      env(),
-    );
-    if ("error" in login) {
-      return { connected: false, detail: login.error };
-    }
-    inFlightLogin = login;
-    const auth = { url: login.url, code: "", mode: "paste_code" as const };
-    setPendingAuth(PROVIDER, auth);
-    // On exit (success, cancel, or expiry) drop the in-flight handle + the
-    // stale pending URL; on success also refresh the auth config (the CLI /
-    // identity just changed), best-effort + non-blocking.
-    void login.done.then(async () => {
-      inFlightLogin = null;
-      clearPendingAuth(PROVIDER);
-      if ((await readToken()) !== null) {
-        if ((await credentialRefreshable()) === false) {
-          logWarn(
-            "claude-code",
-            "headless login landed a credential with NO refresh token — it cannot auto-refresh (re-login will be needed at access-token expiry)",
-          );
-        }
-        void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-      }
-    });
-    return { connected: false, pending: true, detail: pendingAuthDetail(auth) };
-  },
-
-  // Feed the pasted authorization code into the in-flight headless login. A
-  // valid code completes the in-process PKCE exchange (the CLI exits, the
-  // refreshable credential lands); an invalid one leaves the flow alive to
-  // retry. On success grant prompt-free keychain access (mirrors `connect`).
-  submitLoginCode: async (code: string) => {
-    if (inFlightLogin === null) {
-      return { ok: false, detail: "no Claude sign-in is awaiting a code." };
-    }
-    const r = await inFlightLogin.submitCode(code);
-    if (!r.ok) return { ok: false, detail: r.detail };
-    await grantKeychainToolAccess(cliHome(PROVIDER));
-    const connected =
-      (await authStatusLoggedIn()) === true || (await readToken()) !== null;
-    if (!connected) {
-      return {
-        ok: false,
-        detail: "code accepted but no credential was stored.",
-      };
-    }
-    // Loud-fail: a credential with no refresh token works now but can't be
-    // renewed — flag it at login instead of letting the card die ~8h later.
-    if ((await credentialRefreshable()) === false) {
-      logWarn(
-        "claude-code",
-        "signed in but the stored credential has NO refresh token — it cannot auto-refresh; the access token will expire (~8h) and require re-login",
-      );
-      return { ok: true, detail: NO_REFRESH_HINT };
-    }
-    return { ok: true, detail: "signed in via Claude Code" };
-  },
-
-  // Cancel an in-flight headless paste-back login: kill the process + drop the
-  // pending URL so the card returns to Not signed in.
-  cancelConnect: async () => {
-    if (inFlightLogin !== null) {
-      inFlightLogin.cancel();
-      inFlightLogin = null;
-    }
-    clearPendingAuth(PROVIDER);
-    return { ok: true, detail: "sign-in cancelled" };
-  },
-
   usage: async (): Promise<TProviderUsageSnapshot> => {
     const token = await readToken();
     if (token === null) {
       return { kind: "unavailable", reason: "not signed in to Claude Code" };
     }
     try {
-      const resp = await fetch(OAUTH_USAGE_URL, {
+      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
         method: "GET",
         headers: {
           authorization: `Bearer ${token.accessToken}`,
