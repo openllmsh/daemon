@@ -3,7 +3,7 @@
  *
  * The daemon supervises ITSELF: registering, starting, stopping, and querying
  * its own background service (a macOS launch agent / a Linux systemd --user
- * unit). The install script (`packages/setup/daemon/install.sh`) downloads the
+ * unit). The install script (`packages/registry/setup/daemon/install.sh`) downloads the
  * binary, puts it on PATH, and then delegates to `openllmd start` — so the same
  * code path the installer uses is the one a user runs by hand.
  *

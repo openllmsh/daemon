@@ -3,7 +3,7 @@
 /**
  * `bun run daemon:dist` — build the daemon for every target and emit a
  * SELF-CONTAINED installer per target: the real setup installer
- * (`packages/setup/daemon/install.sh`) embedded VERBATIM, with the
+ * (`packages/registry/setup/daemon/install.sh`) embedded VERBATIM, with the
  * locally-built, gzipped binary appended (base64). Copy ONE file to any machine
  * of that os/arch and run it to replicate the real app install flow offline —
  * no gateway, no network for the binary. A tiny `curl` shim in the wrapper

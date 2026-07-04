@@ -16,7 +16,7 @@
  * (`/api/daemon/integrity`) and compare. On any mismatch — or if no digest is
  * available — we abort and log (fail closed), and the key is placed into the
  * executed environment ONLY after verification passes. Mirrors the daemon
- * binary's checksum gate in `packages/setup/daemon/install.sh`.
+ * binary's checksum gate in `packages/registry/setup/daemon/install.sh`.
  */
 import { createHash } from "node:crypto";
 import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";

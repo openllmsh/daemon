@@ -379,8 +379,8 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // ── Integration / setup workflow targets ──────────────────────────
     // The SHA-gated plugin/setup scripts the daemon runs (via `bash -s`)
     // configure the user's CLIs IN PLACE — including the NON-isolated codex /
-    // kimi / claude setups (`packages/setup/{codex,kimi-code,claude-code}`)
-    // and the plugin installers (`packages/plugin`). Every path
+    // kimi / claude setups (`packages/registry/setup/{codex,kimi-code,claude-code}`)
+    // and the plugin installers (`packages/registry/plugin`). Every path
     // they write MUST be granted or the install fails under the sandbox.
     //   claude-code: SCOPED to the subtrees the scripts + installer write —
     //   NEVER the whole ~/.claude, whose root holds the user's real OAuth

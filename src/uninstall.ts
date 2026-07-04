@@ -1,6 +1,6 @@
 /**
  * `openllmd uninstall` — completely remove the OpenLLM daemon from this
- * machine. The inverse of `packages/setup/daemon/install.sh`: it leaves
+ * machine. The inverse of `packages/registry/setup/daemon/install.sh`: it leaves
  * NOTHING behind.
  *
  * Order matters — we STOP the self-restoring service FIRST (so launchd /
