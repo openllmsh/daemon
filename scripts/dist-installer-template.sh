@@ -9,12 +9,12 @@
 # The ONLY change from a production install is transport: a tiny `curl` shim
 # feeds the embedded binary + its sha256 to the unchanged download+verify step,
 # so the binary needs no gateway/network. Every other step — checksum verify,
-# install to ~/.openllm/bin, PATH symlink, daemon.env, macOS codesign,
+# install to ~/.openllm/bin, PATH symlink, the shared .env, macOS codesign,
 # `openllmd start`, shell completion — runs EXACTLY as in production.
 #
-# Usage on a __TARGET__ machine (env names match the real install + daemon.env):
+# Usage on a __TARGET__ machine (env names match the real install + the shared .env):
 #   OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... bash "$0"
-# Both are optional when ~/.openllm/daemon.env already exists — its values are
+# Both are optional when ~/.openllm/.env already exists — its values are
 # reused. OPENLLM_CLOUD_ORIGIN otherwise defaults to __CLOUD_DEFAULT__.
 #
 # NOTE: a dist install DISABLES daemon self-update by default, so a reachable
@@ -84,17 +84,21 @@ export OPENLLMD_DIST_REALPATH="$PATH"
 export OPENLLMD_DIST_PAYLOAD="$OPENLLMD_DIST_WORK/payload"
 export PATH="$OPENLLMD_DIST_WORK/shim:$PATH"
 
-# --- credentials: same OPENLLM_* names as the real install + daemon.env ------
+# --- credentials: same OPENLLM_* names as the real install + the shared .env ---
 # The production setup flow pipes the key as OPENLLM_API_KEY (the daemon's
 # config_var) and the daemon boots from OPENLLM_CLOUD_ORIGIN; accept the SAME
 # names here. Precedence:
 #   1. an explicit OPENLLM_* value in the environment;
-#   2. the value already in ~/.openllm/daemon.env (re-run / re-pair in place);
+#   2. the value already in ~/.openllm/.env (re-run / re-pair in place);
 #   3. the baked default origin (the key stays empty if nothing supplies it).
-# install.sh always reads/writes $HOME/.openllm/daemon.env, so reuse from there;
+# install.sh always reads/writes $HOME/.openllm/.env, so reuse from there;
 # install.sh itself separately preserves the minted OPENLLM_DEVICE_ID.
-OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/daemon.env"
-_openllmd_dist_reuse() {  # $1=key → its value in the existing daemon.env (or "")
+OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/.env"
+# Pre-rename fallback: reuse values from a legacy daemon.env when .env is absent.
+if [ ! -f "$OPENLLMD_DIST_ENV_FILE" ] && [ -f "$HOME/.openllm/daemon.env" ]; then
+  OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/daemon.env"
+fi
+_openllmd_dist_reuse() {  # $1=key → its value in the existing env file (or "")
   [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
   grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true
 }
@@ -110,7 +114,7 @@ export GATEWAY_ORIGIN="$OPENLLM_CLOUD_ORIGIN"
 export API_KEY="$OPENLLM_API_KEY"
 export USAGE_URL="${USAGE_URL:-}"
 if [ -z "$API_KEY" ]; then
-  echo "Note: no OPENLLM_API_KEY set and none in daemon.env — the daemon will install and run locally but won't pair with a cloud." >&2
+  echo "Note: no OPENLLM_API_KEY set and none in the shared .env — the daemon will install and run locally but won't pair with a cloud." >&2
 fi
 
 # --- disable daemon self-update for this dist install (default) --------------
@@ -119,7 +123,7 @@ fi
 # lower) version, the daemon's automatic self-update would OVERWRITE this just-
 # installed local binary on its first tick. Default the opt-out and EXPORT it:
 # the embedded installer's `openllmd start` persists OPENLLM_DAEMON_AUTO_UPDATE
-# into daemon.env BEFORE the service first boots (see service.ts), so it's in
+# into the env file BEFORE the service first boots (see service.ts), so it's in
 # effect before the first self-update check — no separate flag file. Opt back in
 # by running with OPENLLM_DAEMON_AUTO_UPDATE=1.
 export OPENLLM_DAEMON_AUTO_UPDATE="${OPENLLM_DAEMON_AUTO_UPDATE:-0}"

@@ -1,6 +1,6 @@
 /**
  * Daemon auto-update opt-out preference — stored in the single config file
- * `daemon.env` as `OPENLLM_DAEMON_AUTO_UPDATE` (`1`/`0`), alongside every other
+ * the shared env file (`~/.openllm/.env`) as `OPENLLM_DAEMON_AUTO_UPDATE` (`1`/`0`), alongside every other
  * daemon config (no separate flag file).
  *
  * Self-update is OPT-OUT (on by default): a freshly installed daemon keeps
@@ -8,14 +8,14 @@
  * dashboard's daemon section, `openllmd auto-update off`, or
  * `OPENLLM_DAEMON_AUTO_UPDATE=0`) to pin the installed version. The value is
  * read fresh on every self-update check + status push — `setAutoUpdate` keeps
- * both `daemon.env` and the in-process env in sync, so a toggle takes effect on
+ * both the env file and the in-process env in sync, so a toggle takes effect on
  * the next tick without a restart.
  *
  * Precedence: an explicit `OPENLLM_DAEMON_AUTO_UPDATE` (set in the environment,
- * or loaded from `daemon.env` by `loadEnvFile`) decides; absent it, ON.
+ * or loaded from the env file by `loadEnvFile`) decides; absent it, ON.
  *
- * Legacy: a pre-`daemon.env` standalone `~/.openllm/auto-update` flag file is
- * migrated into `daemon.env` and removed — lazily on first read, and proactively
+ * Legacy: a pre-single-file standalone `~/.openllm/auto-update` flag file is
+ * migrated into the env file and removed — lazily on first read, and proactively
  * at boot via {@link migrateLegacyAutoUpdate}. Mirrors the `api-key` /
  * `device-id` migrations in `env.ts`.
  */
@@ -24,10 +24,10 @@ import { join } from "node:path";
 import { loadEnvFile, stateDir, writeEnvFileVars } from "./env";
 import { logWarn } from "./logger";
 
-/** The daemon.env key the preference lives under. */
+/** The env-file key the preference lives under. */
 const AUTO_UPDATE_KEY = "OPENLLM_DAEMON_AUTO_UPDATE";
 
-/** The legacy standalone flag file (pre-`daemon.env` installs). */
+/** The legacy standalone flag file (pre-single-file installs). */
 const legacyPrefFile = (): string => join(stateDir(), "auto-update");
 
 /** Parse a flag value to bool; null when unrecognized/absent. */
@@ -39,8 +39,8 @@ const parseFlag = (raw: string | undefined): boolean | null => {
 };
 
 /**
- * Migrate a legacy `~/.openllm/auto-update` flag file INTO `daemon.env`
- * (`OPENLLM_DAEMON_AUTO_UPDATE`) and remove it, so `daemon.env` stays the single
+ * Migrate a legacy `~/.openllm/auto-update` flag file INTO the env file
+ * (`OPENLLM_DAEMON_AUTO_UPDATE`) and remove it, so the env file stays the single
  * config source. Returns the migrated value, or null when there's no (valid)
  * legacy file. Best-effort + idempotent — safe to call on every boot.
  */
@@ -74,24 +74,24 @@ export const migrateLegacyAutoUpdate = (): boolean | null => {
 
 /** Whether automatic daemon self-update is enabled. Default TRUE (opt-out). */
 export const autoUpdateEnabled = (): boolean => {
-  loadEnvFile(); // pull daemon.env into process.env (idempotent; sets unset only)
+  loadEnvFile(); // pull the env file into process.env (idempotent; sets unset only)
   const fromEnv = parseFlag(process.env[AUTO_UPDATE_KEY]);
   if (fromEnv !== null) return fromEnv;
-  // No value in daemon.env yet — adopt a legacy standalone file if present.
+  // No value in the env file yet — adopt a legacy standalone file if present.
   const migrated = migrateLegacyAutoUpdate();
   if (migrated !== null) return migrated;
   return true; // default ON until explicitly opted out
 };
 
 /**
- * Persist the auto-update opt-in into `daemon.env` (`0600`, merge) and update
+ * Persist the auto-update opt-in into the env file (`0600`, merge) and update
  * the in-process env so the next check sees it immediately. Drops any legacy
- * standalone flag file so `daemon.env` stays the single source.
+ * standalone flag file so the env file stays the single source.
  */
 export const setAutoUpdate = (enabled: boolean): void => {
   const value = enabled ? "1" : "0";
   if (!writeEnvFileVars({ [AUTO_UPDATE_KEY]: value })) {
-    logWarn("auto-update", "failed to persist preference to daemon.env");
+    logWarn("auto-update", "failed to persist preference to the env file");
   }
   process.env[AUTO_UPDATE_KEY] = value;
   try {

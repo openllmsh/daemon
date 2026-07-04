@@ -1,21 +1,23 @@
 /**
  * Daemon runtime configuration.
  *
- * Everything lives in ONE file — `~/.openllm/daemon.env` (resolved via
- * `envFilePath()`). It's the single source both dev (`bun dev:daemon`,
- * which auto-loads it) and the installed service (systemd `EnvironmentFile=`
- * / the macOS launch agent's `OPENLLM_DAEMON_ENV_FILE`) boot from. The
- * keys it holds:
+ * Everything lives in ONE file — `~/.openllm/.env` (resolved via
+ * `envFilePath()`; legacy `daemon.env` is renamed in at boot). It's the
+ * single source both dev (`bun dev:daemon`, which auto-loads it) and the
+ * installed service (systemd `EnvironmentFile=` / the macOS launch agent's
+ * `OPENLLM_DAEMON_ENV_FILE`) boot from — and it is SHARED with the other
+ * OpenLLM tools on the box: the CLI (`openllmc`) reads the same file for
+ * the cloud origin + API key. The keys it holds:
  *
  * - `OPENLLM_API_KEY`     — the user's `sk-llm-...` key. Authenticates
  *                            every cloud control-plane call. OPTIONAL at
  *                            boot: the daemon installs WITHOUT a key and
  *                            the dashboard sets it afterwards via the
  *                            control surface (`POST /config/api-key`).
- *                            Persisted to daemon.env so it survives
+ *                            Persisted to the env file so it survives
  *                            restarts / HMR. Never leaves the box.
  * - `OPENLLM_DEVICE_ID`   — stable opaque per-machine UUID, minted into
- *                            daemon.env on first boot. Carries no PII.
+ *                            the env file on first boot. Carries no PII.
  * - `OPENLLM_CLOUD_ORIGIN`— openllm.sh origin for config pull + request
  *                            recording + API-key-hop forwarding. Baked in
  *                            at compile time via --define, overridable.
@@ -24,7 +26,7 @@
  *                            cloud origin. Access control is the
  *                            localhost bind + this origin lock; there is
  *                            no separate control token at this stage.
- * - `OPENLLM_DAEMON_STATE_DIR` — where daemon.env + state live
+ * - `OPENLLM_DAEMON_STATE_DIR` — where .env + state live
  *                            (default `~/.openllm`).
  * - `OPENLLM_DAEMON_AUTO_UPDATE` — self-update opt-out flag (`1`/`0`,
  *                            default ON). Read/written by
@@ -32,11 +34,19 @@
  *                            config is in the one file.
  *
  * Legacy standalone `api-key` / `device-id` / `auto-update` files
- * (pre-single-file installs) are migrated INTO daemon.env and then removed —
- * lazily on first read, and proactively at boot via `migrateLegacyConfig`.
+ * (pre-single-file installs) are migrated INTO the env file and then removed —
+ * lazily on first read, and proactively at boot via `migrateLegacyConfig`;
+ * the pre-rename `daemon.env` itself migrates to `.env` the same way.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -82,7 +92,7 @@ export const isDevMode = (): boolean => process.env.OPENLLM_DAEMON_DEV === "1";
 const DEV_CLOUD_ORIGIN = "http://127.0.0.1:3000";
 
 /**
- * Root for the daemon's local state (`daemon.env`, the isolated vendor CLIs
+ * Root for the daemon's local state (`.env`, the isolated vendor CLIs
  * under `cli/<provider>/`, …). Defaults to `~/.openllm`; override with
  * `OPENLLM_DAEMON_STATE_DIR`. Exported so cli-paths.ts nests under it.
  */
@@ -90,14 +100,39 @@ export const stateDir = (): string =>
   process.env.OPENLLM_DAEMON_STATE_DIR ?? join(homedir(), ".openllm");
 
 /**
- * The daemon's single env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the
+ * The SHARED OpenLLM env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the
  * macOS launch agent points us here because launchd can't read a native
- * `EnvironmentFile`); otherwise it's `daemon.env` under the state dir — the
- * same path systemd's `EnvironmentFile=` and the installer write to, and the
- * one `bun dev:daemon` auto-loads.
+ * `EnvironmentFile`); otherwise it's `.env` under the state dir — the same
+ * path systemd's `EnvironmentFile=` and the installer write to, and the one
+ * `bun dev:daemon` auto-loads. Shared product-wide: the CLI (`openllmc`)
+ * reads the same file for `OPENLLM_CLOUD_ORIGIN` / `OPENLLM_API_KEY`, so a
+ * re-pair or a custom origin applies to every OpenLLM tool on the box.
  */
 export const envFilePath = (): string =>
-  process.env.OPENLLM_DAEMON_ENV_FILE ?? join(stateDir(), "daemon.env");
+  process.env.OPENLLM_DAEMON_ENV_FILE ?? join(stateDir(), ".env");
+
+/** The pre-rename config file (`daemon.env`) — migrated to `.env` at boot. */
+const legacyEnvFilePath = (): string => join(stateDir(), "daemon.env");
+
+/**
+ * One-shot migration: rename a legacy `~/.openllm/daemon.env` to the shared
+ * `~/.openllm/.env`. Runs lazily from {@link loadEnvFile} (every boot path
+ * goes through it) so old installs converge without a separate step. No-op
+ * when the new file already exists (never clobber), when an explicit
+ * `OPENLLM_DAEMON_ENV_FILE` is in force, or on any fs error (best-effort —
+ * the daemon still boots keyless and the dashboard re-pairs it).
+ */
+const migrateLegacyEnvFile = (): void => {
+  if (process.env.OPENLLM_DAEMON_ENV_FILE !== undefined) return;
+  const next = envFilePath();
+  const legacy = legacyEnvFilePath();
+  try {
+    if (existsSync(next) || !existsSync(legacy)) return;
+    renameSync(legacy, next);
+  } catch {
+    // best-effort — fall through to whatever exists
+  }
+};
 
 /**
  * Load the daemon's `KEY=value` env file into `process.env` (without
@@ -108,6 +143,7 @@ export const envFilePath = (): string =>
  * missing. Synchronous (boot-time, before anything reads env).
  */
 export const loadEnvFile = (): void => {
+  migrateLegacyEnvFile();
   let text: string;
   try {
     text = readFileSync(envFilePath(), "utf-8");
@@ -126,7 +162,7 @@ export const loadEnvFile = (): void => {
 };
 
 /**
- * Upsert `KEY=value` pairs into daemon.env, preserving every other line
+ * Upsert `KEY=value` pairs into the env file, preserving every other line
  * (comments, unrelated keys, ordering). Creates the file `0600` when absent.
  * This is how runtime-resolved secrets/ids (`OPENLLM_API_KEY`,
  * `OPENLLM_DEVICE_ID`) and re-pointed config (`OPENLLM_CLOUD_ORIGIN`,
@@ -214,12 +250,12 @@ const loadPersistedCloudOrigin = (): string | null => {
 let cachedDeviceId: string | null = null;
 
 /**
- * A stable per-machine id, minted once and persisted in daemon.env as
+ * A stable per-machine id, minted once and persisted in the env file as
  * `OPENLLM_DEVICE_ID`. Opaque (a random uuid) — carries no PII. Used to bind
  * the daemon's presence token to this device
  * (`docs/proposals/daemon-presence-without-heartbeat.md`); survives restarts
  * so the token stays constant. A legacy standalone `device-id` file (older
- * installs) is migrated into daemon.env and removed.
+ * installs) is migrated into the env file and removed.
  */
 export const deviceId = (): string => {
   if (cachedDeviceId !== null) return cachedDeviceId;
@@ -230,7 +266,7 @@ export const deviceId = (): string => {
     return fromEnv;
   }
   // Adopt a legacy standalone file if present, else mint a fresh id. Either
-  // way it lives in daemon.env afterwards (single source).
+  // way it lives in the env file afterwards (single source).
   let id: string | null = null;
   try {
     const legacy = readFileSync(deviceIdFile(), "utf-8").trim();
@@ -253,10 +289,10 @@ export const deviceId = (): string => {
 };
 
 /**
- * The persisted API key, if any. `OPENLLM_API_KEY` (loaded from daemon.env by
+ * The persisted API key, if any. `OPENLLM_API_KEY` (loaded from the env file by
  * `loadEnvFile`, or set explicitly in the environment) wins; otherwise a
  * legacy standalone `api-key` file (older installs) is migrated into
- * daemon.env, removed, and used. Returns null when neither is present — the
+ * the env file, removed, and used. Returns null when neither is present — the
  * daemon runs keyless until the dashboard sets one. Callers run `loadEnvFile`
  * before this (via `daemonEnv`).
  */
@@ -309,10 +345,10 @@ export const daemonEnv = (): TDaemonEnv => {
 };
 
 /**
- * Persist a new API key (set from the dashboard) into daemon.env (`0600`) and
+ * Persist a new API key (set from the dashboard) into the env file (`0600`) and
  * update the in-memory cache so the next cloud call uses it immediately. Pass
  * `null`/empty to clear it. Removes any legacy standalone `api-key` file so
- * daemon.env stays the single source.
+ * the env file stays the single source.
  */
 export const setApiKey = (key: string | null): void => {
   const trimmed = key?.trim() ?? "";

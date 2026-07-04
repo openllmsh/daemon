@@ -55,7 +55,7 @@ daemon/
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
     cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
-    auto-update-pref.ts     self-update opt-out flag in daemon.env (`OPENLLM_DAEMON_AUTO_UPDATE`, default ON; legacy `~/.openllm/auto-update` file migrated in); gates self-update.ts + reported on DaemonStatus.auto_update
+    auto-update-pref.ts     self-update opt-out flag in the shared .env (`OPENLLM_DAEMON_AUTO_UPDATE`, default ON; legacy `~/.openllm/auto-update` file migrated in); gates self-update.ts + reported on DaemonStatus.auto_update
     integrations.ts         shared executor: fetch a gateway install.sh (mode=install|uninstall|state) → verify SHA-256 (fail-closed) → bash. Behind the CLI verbs + the relay's install/uninstall_integration kinds
     device-state.ts         manifest-driven probe: run each integration's `install.sh?mode=state` (`{"installed":bool,…}`) → cached DaemonStatus.integrations (stateful dashboard buttons)
     service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable; serviceUninstall = stop + delete registration)
@@ -253,7 +253,7 @@ and sends the one-time plaintext to localhost — never to the cloud; revoke
 it on the Keys page). The daemon still needs this DEK-bearing key for its
 cloud control-plane calls AND for forwarding API-key hops — the `?__plan=`
 HMAC secures the plan, not the daemon's identity. `env.ts` persists it as
-`OPENLLM_API_KEY` in `~/.openllm/daemon.env` (`0600`) — the single config
+`OPENLLM_API_KEY` in `~/.openllm/.env` (`0600`) — the single config
 file — so it
 survives restarts / HMR, and re-bootstraps in-request so a valid key
 flips `cloud_state` to `ok` immediately. Until a key is set the daemon
@@ -517,11 +517,11 @@ the `packages/setup/daemon` install target (`includeBundle:false`,
 no key piped in): `install.sh` downloads the binary from
 `/api/daemon/binary/<target>` and verifies it against the published
 `.sha256` (a checksum sidecar, not a detached signature), symlinks it onto
-`PATH` as `openllmd`, writes the single config file `~/.openllm/daemon.env`
+`PATH` as `openllmd`, writes the shared config file `~/.openllm/.env`
 (`0600`) with `OPENLLM_CLOUD_ORIGIN` + `OPENLLM_DAEMON_PORT` +
 `OPENLLM_API_KEY` (the daemon mints `OPENLLM_DEVICE_ID` into the same file
 on first boot; legacy standalone `api-key` / `device-id` files from older
-installs are migrated into daemon.env and removed), then hands off to
+installs are migrated into the env file and removed), then hands off to
 `openllmd start`. That one file is what both the installed service
 (systemd `EnvironmentFile=` / the macOS launch agent's
 `OPENLLM_DAEMON_ENV_FILE`) and `bun dev:daemon` boot from.
@@ -569,7 +569,7 @@ replicates the exact production install flow offline. `scripts/dist-install.ts`
 (`bun run daemon:dist:install -- <target>`, default: this host) runs the
 emitted installer without copying a dist path. Credentials use the same
 OpenLLM-prefixed env as the real install — `OPENLLM_CLOUD_ORIGIN` +
-`OPENLLM_API_KEY` — and an existing `~/.openllm/daemon.env` is reused when
+`OPENLLM_API_KEY` — and an existing `~/.openllm/.env` is reused when
 present (a re-run re-pairs in place; the minted `OPENLLM_DEVICE_ID` is kept).
 
 ## Layering rules

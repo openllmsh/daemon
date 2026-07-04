@@ -77,7 +77,7 @@ const capture = (cmd: string, args: readonly string[]): string => {
 };
 
 /**
- * Ensure daemon.env carries the cloud origin + port the service reads at boot.
+ * Ensure the env file carries the cloud origin + port the service reads at boot.
  * Written when absent so a standalone `openllmd start` works without the
  * installer; also (re)written when `OPENLLM_CLOUD_ORIGIN` or
  * `OPENLLM_DAEMON_PORT` is set explicitly, so `OPENLLM_CLOUD_ORIGIN=… openllmd
@@ -451,7 +451,7 @@ export const serviceStart = (): void => {
   const binPath = process.execPath;
   writeEnvFileIfNeeded();
   // An explicit OPENLLM_DAEMON_AUTO_UPDATE at registration is persisted to
-  // daemon.env BEFORE the service first boots — so a `daemon:dist` install that
+  // the env file BEFORE the service first boots — so a `daemon:dist` install that
   // sets it `0` can't be clobbered by a self-update on the daemon's first tick.
   // Mirrors how writeEnvFileIfNeeded persists an explicit cloud-origin/port.
   const autoUpdateEnv = process.env.OPENLLM_DAEMON_AUTO_UPDATE;

@@ -8,7 +8,7 @@
  * of that os/arch and run it to replicate the real app install flow offline —
  * no gateway, no network for the binary. A tiny `curl` shim in the wrapper
  * feeds the embedded binary + its sha256 to the unchanged download+verify step,
- * so EVERY other install.sh step (checksum, install, daemon.env, codesign,
+ * so EVERY other install.sh step (checksum, install, the .env write, codesign,
  * `openllmd start`, completion) runs exactly as in production.
  *
  * Build only — it NEVER installs. The native build is the existing
@@ -20,7 +20,7 @@
  *   bun run daemon:dist -- --target linux-x64 # only wrap one target (still builds all)
  *
  * Run an emitted installer on a target box (OPENLLM_* names match the real
- * install + daemon.env; both are reused from an existing ~/.openllm/daemon.env
+ * install + the shared .env; both are reused from an existing ~/.openllm/.env
  * when present, so a re-run needs neither):
  *   OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... \
  *     bash packages/daemon/dist/openllmd-<target>.install.sh
@@ -64,7 +64,7 @@ const flagValue = (name: string): string | undefined => {
 };
 
 /** The cloud origin baked into the installer as the GATEWAY_ORIGIN default —
- *  the same default `compile.ts` bakes into the binary, so daemon.env and the
+ *  the same default `compile.ts` bakes into the binary, so the env file and the
  *  binary agree when the runner doesn't override it. */
 const cloudDefault = (): string =>
   process.env.OPENLLM_CLOUD_ORIGIN ?? "https://openllm.sh";

@@ -62,7 +62,7 @@ const main = async (): Promise<void> => {
   // resolved before the sandbox decision.
   const port = daemonPort();
 
-  // Fold any pre-`daemon.env` legacy config into the single config file (and
+  // Fold any pre-single-file legacy config into the shared env file (and
   // remove the stray files) before anything reads it — the `auto-update` flag
   // here; `api-key` / `device-id` migrate lazily in env.ts on first read.
   migrateLegacyAutoUpdate();
