@@ -23,7 +23,13 @@
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { guardCrashLoop } from "./boot-guard";
 import { runCli } from "./cli";
-import { getCloudState, latestVersion, refreshBootstrap } from "./config";
+import { maybeUpdateCli } from "./cli-self-update";
+import {
+  getCloudState,
+  latestCliVersion,
+  latestVersion,
+  refreshBootstrap,
+} from "./config";
 import {
   pushStatusIfChanged,
   startControlChannel,
@@ -128,6 +134,10 @@ const main = async (): Promise<void> => {
   // already current). Fire-and-forget: it self-guards and, when it updates,
   // swaps the binary + exits once `/v1` is idle so the supervisor relaunches.
   void maybeSelfUpdate(latestVersion());
+  // Converge the installed openllmc CLI too — same toggle, same tick. Daemon
+  // first: if the daemon swaps + exits mid-flight, the relaunch's boot call
+  // finishes the CLI converge within seconds.
+  void maybeUpdateCli(latestCliVersion());
   // Eager manifest-driven device-state walk (`install.sh -s` per registry item)
   // once the cloud is reachable, so the dashboard's Integrations tab paints
   // installed-state on first connect. Fire-and-forget + cloud-gated; the status
@@ -159,6 +169,7 @@ const main = async (): Promise<void> => {
         }
         // Periodic version check — picks up a release published while running.
         void maybeSelfUpdate(latestVersion());
+        void maybeUpdateCli(latestCliVersion());
       } catch (err) {
         // setTimeout doesn't observe the async callback's promise, so an
         // unguarded throw here is an unhandled rejection AND skips the reschedule

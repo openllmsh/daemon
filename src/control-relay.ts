@@ -10,7 +10,8 @@
 
 import type { TDaemonCommand, TDaemonCommandAck } from "@quantidexyz/openllmp";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
-import { latestVersion, refreshBootstrap } from "./config";
+import { maybeUpdateCli } from "./cli-self-update";
+import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { probeIntegration } from "./device-state";
 import { runIntegration } from "./integrations";
@@ -204,6 +205,10 @@ export const runCommandInner = async (
       case "update":
         void (async () => {
           await refreshBootstrap();
+          // CLI first: converging openllmc is a plain file swap, while a daemon
+          // update EXITS the process — anything after it would never run (and
+          // with auto-update toggled off, the relaunched boot wouldn't force it).
+          await maybeUpdateCli(latestCliVersion(), { force: true });
           await maybeSelfUpdate(latestVersion(), { force: true });
         })();
         return { id: cmd.id, status: "done", result: { checking: true } };
@@ -234,6 +239,10 @@ export const runCommandInner = async (
         if (enabled) {
           void (async () => {
             await refreshBootstrap();
+            // CLI first — a daemon update exits the process (see "update" above;
+            // here the toggle is on, so the relaunched boot would catch up, but
+            // converging both now avoids the extra tick).
+            await maybeUpdateCli(latestCliVersion());
             await maybeSelfUpdate(latestVersion());
           })();
         }

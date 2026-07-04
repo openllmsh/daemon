@@ -140,7 +140,8 @@ const recordAttempt = (version: string): void => {
   }
 };
 
-const fetchBinary = async (url: string): Promise<Buffer> => {
+/** Shared by the daemon self-updater and the CLI converger (`cli-self-update.ts`). */
+export const fetchBinary = async (url: string): Promise<Buffer> => {
   const res = await fetch(url, {
     redirect: "follow",
     signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
@@ -158,7 +159,8 @@ const fetchBinary = async (url: string): Promise<Buffer> => {
 };
 
 // The `.sha256` endpoint returns `"<hex>  openllmd-<target>\n"` — take the hex.
-const fetchDigest = async (url: string): Promise<string> => {
+// Shared by the daemon self-updater and the CLI converger (`cli-self-update.ts`).
+export const fetchDigest = async (url: string): Promise<string> => {
   const res = await fetch(url, {
     redirect: "follow",
     signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),

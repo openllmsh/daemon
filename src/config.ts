@@ -88,6 +88,15 @@ export const latestVersion = (): string | null =>
   snapshot.latest_version ?? null;
 
 /**
+ * The `openllmc` CLI version the cloud currently publishes (bare semver),
+ * from the last bootstrap. Null when unpublished or the cloud is too old to
+ * advertise it. The CLI converger compares it to the installed binary's
+ * version. See `cli-self-update.ts`.
+ */
+export const latestCliVersion = (): string | null =>
+  snapshot.latest_cli_version ?? null;
+
+/**
  * Look up a model id in the cached catalog → its `{ provider,
  * provider_model_id }` row. The walker uses this to resolve each `__plan`
  * hop to its concrete upstream model id (falling back to splitting the
