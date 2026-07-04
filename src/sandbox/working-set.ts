@@ -192,13 +192,16 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude", "plugin-state"),
     join(home, ".codex"),
     join(home, ".kimi-code"),
-    // grok (x.ai/cli): the daemon EXECS ~/.grok/bin/grok (the isolated CLI is a
-    // symlink to it), so pre-create the bin dir for the READ+EXEC grant below to
-    // land on a real leaf (NOT bare ~/.grok — `existing()` won't widen to $HOME;
-    // the user's real ~/.grok/auth.json stays out of the working set). The
-    // installer's ~/.grok/downloads staging dir is NOT granted — installs are
-    // user-run + unsandboxed now.
+    // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
+    // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch> (the
+    // installer drops the binary in downloads/ and links bin/grok → it). So
+    // EXEC reads through to downloads/, and BOTH need READ+EXEC below. Pre-create
+    // both so the grants land on real leaves (NOT bare ~/.grok — `existing()`
+    // won't widen to $HOME; the user's real ~/.grok/auth.json stays out of the
+    // working set). They are read+exec only — the daemon runs grok but never
+    // installs/updates it (that's user-run + unsandboxed).
     join(home, ".grok", "bin"),
+    join(home, ".grok", "downloads"),
     // raycast (non-isolated setup): the setup writes ~/.config/raycast/ai/
     // providers.yaml (+ its .openllm-bak backup). Pre-create the `ai` leaf so
     // the SCOPED grant below lands on a real path (NOT bare ~/.config —
@@ -377,13 +380,23 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //                         this one, unsandboxed; the daemon only reads it);
     //   ~/.local/share/claude — the claude launcher resolves to
     //                         `versions/<v>` here; exec reads through to it;
-    //   ~/.grok/bin         — grok's binary; the isolated grok symlink execs it.
-    // The user's real ~/.grok/auth.json stays UNgranted (it's a sibling file,
-    // not under ~/.grok/bin). `cliInstallState`'s auto-link writes only the
+    //   ~/.grok/bin         — the grok launcher SYMLINK (bin/grok →
+    //                         ../downloads/grok-<arch>); the isolated grok
+    //                         symlink execs it;
+    //   ~/.grok/downloads   — the REAL grok ELF the bin/grok symlink points at.
+    //                         Exec of grok reads THROUGH bin/grok to this dir, so
+    //                         it must be read+exec too (a dropped grant here
+    //                         EACCESes every `grok` spawn — the connect/login
+    //                         flow then never emits its device URL). Holds the
+    //                         binary only, no credentials (auth.json is a sibling
+    //                         under ~/.grok, left UNgranted).
+    // The user's real ~/.grok/auth.json stays UNgranted (it's a sibling file, not
+    // under bin/ or downloads/). `cliInstallState`'s auto-link writes only the
     // isolated symlink under the state dir (read-write), never these dirs.
     join(home, ".local", "bin"),
     join(home, ".local", "share", "claude"),
     join(home, ".grok", "bin"),
+    join(home, ".grok", "downloads"),
     // bun's BINARY dir — read+exec only (the split ~/.bun grant, audit §5-B):
     // the plugin install must EXEC `bun`, but a write grant here would let a
     // compromised daemon replace the user's `bun` launcher. The cache half
