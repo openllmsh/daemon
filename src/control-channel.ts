@@ -155,6 +155,29 @@ const stopWatcher = (): void => {
 const commandResults = new Map<string, TDaemonCommandAck | null>();
 const PROCESSED_CAP = 500;
 
+/** Max chars of error detail carried into the log line — enough to name the
+ *  failing step (integration output ends with the failing command), never a
+ *  full transcript dump. */
+const ERROR_DETAIL_MAX = 600;
+
+/** Extract a loggable diagnostic from an error ack's `result`: prefer its
+ *  `error` field, else the TAIL of its `output` (integration failures put the
+ *  failing step last), else a compact JSON of the result. Never used for
+ *  successful acks — success results can carry control-plane secrets. */
+const ackErrorDetail = (result: unknown): string => {
+  if (result === null || typeof result !== "object") return String(result);
+  const r = result as { error?: unknown; output?: unknown };
+  const detail =
+    typeof r.error === "string" && r.error.length > 0
+      ? r.error
+      : typeof r.output === "string" && r.output.length > 0
+        ? r.output
+        : JSON.stringify(result);
+  return detail.length > ERROR_DETAIL_MAX
+    ? `…${detail.slice(-ERROR_DETAIL_MAX)}`
+    : detail;
+};
+
 const onCommand = async (command: TRelayFrame): Promise<void> => {
   if (command.type !== "command") return;
   const id = command.command.id;
@@ -191,10 +214,16 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
   });
   const ack = await runCommandInner(command.command);
   commandResults.set(id, ack);
+  // On SUCCESS the result stays out of the log (it can carry control-plane
+  // secrets — see the received-side note above). On ERROR, surface the
+  // diagnostic fields (`error` / the tail of `output`) — without them a
+  // failed command logs only `status: "error"`, which is undebuggable from
+  // the daemon log alone (field-reported). Truncated: diagnostics, not dumps.
   logInfo("control-channel", "command done", {
     kind: command.command.kind,
     id: command.command.id,
     status: ack.status,
+    ...(ack.status === "error" ? { error: ackErrorDetail(ack.result) } : {}),
   });
   send({ type: "ack", ack });
   // Carry a fresh snapshot back so the dashboard reflects the result.
