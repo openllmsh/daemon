@@ -51,7 +51,7 @@ export const runCommandInner = async (
       }
       case "install_integration":
       case "uninstall_integration": {
-        // Run a skill/plugin/setup install or uninstall on THIS machine via the
+        // Run a plugin/setup install or uninstall on THIS machine via the
         // same shared executor the CLI uses. The dashboard enqueues this against
         // the selected daemon key; the executor fetches the gateway script,
         // verifies it (fail-closed), and shells out. See

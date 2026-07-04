@@ -13,7 +13,6 @@
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
  *   openllmd logs [-f] [-n N]     show or follow the daemon log
- *   openllmd skill  <install|uninstall|list> [slug]   manage a Claude Code skill
  *   openllmd plugin <install|uninstall|list> [slug]   manage a Claude Code plugin
  *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
@@ -98,7 +97,6 @@ const runAutoUpdate = (args: readonly string[]): never => {
 
 // The `list` endpoint per integration group (setup is singular + keyed by id).
 const LIST_PATH: Record<TIntegrationKind, string> = {
-  skill: "/api/skills",
   plugin: "/api/plugins",
   setup: "/api/setup/options",
 };
@@ -111,7 +109,7 @@ const integrationUsage = (kind: TIntegrationKind): never => {
 };
 
 /**
- * Run a `skill|plugin|setup` subcommand. Foreground one-shot (no server boot):
+ * Run a `plugin|setup` subcommand. Foreground one-shot (no server boot):
  * `list` prints the catalog; `install|uninstall <slug>` runs the shared
  * executor and exits with its status. Exits the process in every branch.
  */
@@ -189,7 +187,7 @@ export const runCli = (): boolean => {
       break;
     case "status":
       // Async (it probes the running daemon's /status over loopback). Mirror the
-      // skill/plugin/setup pattern: the promise process.exit()s when done and
+      // plugin/setup pattern: the promise process.exit()s when done and
       // returning true prevents the server boot path.
       serviceStatus()
         .then(() => process.exit(0))
@@ -201,7 +199,6 @@ export const runCli = (): boolean => {
     case "logs":
       runLogs(rest);
       break;
-    case "skill":
     case "plugin":
     case "setup":
       // Foreground one-shot: the async executor process.exit()s when done; the

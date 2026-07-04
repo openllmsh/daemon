@@ -1,5 +1,5 @@
 /**
- * Manifest-driven device-state — which skills/plugins/setups are installed on
+ * Manifest-driven device-state — which plugins/setups are installed on
  * THIS box, computed by running each registry item's own `install.sh -s` (the
  * unified state probe) and parsing its one-line JSON. Replaces the hardcoded
  * `integrations-detect.ts` filesystem scan: detection now lives in the BUNDLE
@@ -24,7 +24,6 @@ import { logDebug, logWarn } from "./logger";
 /** The cloud catalog endpoint per area — the registry manifest, served live, so
  *  the walk discovers exactly the items the gateway publishes. */
 const CATALOG_PATH: Record<TDaemonIntegrationKind, string> = {
-  skill: "/api/skills",
   plugin: "/api/plugins",
   setup: "/api/setup/options",
 };
@@ -110,7 +109,7 @@ export const probeIntegration = async (
 export const refreshDeviceState = async (): Promise<
   TDaemonInstalledIntegration[]
 > => {
-  const kinds: TDaemonIntegrationKind[] = ["skill", "plugin", "setup"];
+  const kinds: TDaemonIntegrationKind[] = ["plugin", "setup"];
   const perArea = await Promise.all(
     kinds.map(async (kind) => {
       const slugs = await fetchCatalogSlugs(kind);

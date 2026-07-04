@@ -17,7 +17,7 @@
  *     - the executable's real directory (belt-and-braces when `execPath`
  *       lives outside the state dir — a manual install);
  *     - the claude-code integration footprint — SCOPED to the subtrees the
- *       SHA-gated skill/plugin/setup scripts actually write
+ *       SHA-gated plugin/setup scripts actually write
  *       (`~/.claude/{skills,plugins,commands,hooks,plugin-state,downloads}`
  *       + the `settings.json` FILE + `~/.claude.json`), NEVER the whole
  *       `~/.claude`: the user's real Claude OAuth token
@@ -284,7 +284,7 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // user's real OAuth token (`~/.claude/.credentials.json` on Linux) lives
     // at the root and must stay outside the working set (audit §5-A). These
     // are exactly what the SHA-gated scripts + the official installer write:
-    //   skills/commands/hooks/plugins/plugin-state — skill+plugin installs;
+    //   skills/commands/hooks/plugins/plugin-state — plugin installs;
     //   downloads — claude.ai/install.sh's staging dir.
     join(home, ".claude", "skills"),
     join(home, ".claude", "plugins"),
@@ -377,10 +377,10 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // real directory must be writable.
     dirname(process.execPath),
     // ── Integration / setup workflow targets ──────────────────────────
-    // The SHA-gated skill/plugin/setup scripts the daemon runs (via `bash -s`)
+    // The SHA-gated plugin/setup scripts the daemon runs (via `bash -s`)
     // configure the user's CLIs IN PLACE — including the NON-isolated codex /
     // kimi / claude setups (`packages/setup/{codex,kimi-code,claude-code}`)
-    // and the plugin/skill installers (`packages/{plugin,skill}`). Every path
+    // and the plugin installers (`packages/plugin`). Every path
     // they write MUST be granted or the install fails under the sandbox.
     //   claude-code: SCOPED to the subtrees the scripts + installer write —
     //   NEVER the whole ~/.claude, whose root holds the user's real OAuth

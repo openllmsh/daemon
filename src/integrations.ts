@@ -1,5 +1,5 @@
 /**
- * The single executor behind BOTH the daemon CLI (`openllmd skill install …`)
+ * The single executor behind BOTH the daemon CLI (`openllmd plugin install …`)
  * and the relay command (`install_integration` from the dashboard). Coreless —
  * fetch + `Bun.spawn`. See `docs/proposals/daemon-integration-triggers.md` §4.
  *
@@ -34,7 +34,6 @@ export type TIntegrationKind = TDaemonIntegrationKind;
 export type TIntegrationMode = "install" | "uninstall" | "state";
 
 const AREA: Record<TIntegrationKind, string> = {
-  skill: "skills",
   plugin: "plugins",
   setup: "setup", // singular route, keyed by id
 };
