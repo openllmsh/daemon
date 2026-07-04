@@ -165,14 +165,18 @@ const ERROR_DETAIL_MAX = 600;
  *  failing step last), else a compact JSON of the result. Never used for
  *  successful acks — success results can carry control-plane secrets. */
 const ackErrorDetail = (result: unknown): string => {
-  if (result === null || typeof result !== "object") return String(result);
-  const r = result as { error?: unknown; output?: unknown };
-  const detail =
-    typeof r.error === "string" && r.error.length > 0
-      ? r.error
-      : typeof r.output === "string" && r.output.length > 0
-        ? r.output
-        : JSON.stringify(result);
+  let detail: string;
+  if (result === null || typeof result !== "object") {
+    detail = String(result);
+  } else {
+    const r = result as { error?: unknown; output?: unknown };
+    detail =
+      typeof r.error === "string" && r.error.length > 0
+        ? r.error
+        : typeof r.output === "string" && r.output.length > 0
+          ? r.output
+          : JSON.stringify(result);
+  }
   return detail.length > ERROR_DETAIL_MAX
     ? `…${detail.slice(-ERROR_DETAIL_MAX)}`
     : detail;
