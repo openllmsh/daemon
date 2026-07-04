@@ -46,6 +46,13 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   grok: { binRel: "home/.local/bin/grok" },
 };
 
+/** The closed runtime list of CLI providers — derived from `SPECS` keys so it
+ *  can never drift from the `Record<TCliProvider, …>` (adding a provider to the
+ *  type forces a `SPECS` entry, which appears here automatically). Consumers that
+ *  must iterate every provider (e.g. the sandbox exec-dir resolver in
+ *  `working-set.ts`) use this instead of re-listing the slugs. */
+export const CLI_PROVIDERS = Object.keys(SPECS) as readonly TCliProvider[];
+
 export const cliRoot = (provider: TCliProvider): string =>
   join(stateDir(), "cli", provider);
 

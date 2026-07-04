@@ -54,9 +54,17 @@
  * codex/kimi installers' `mktemp -d` stages inside the working set rather than
  * EACCESing on the ungranted `/tmp`.
  */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../cli-paths";
 import { stateDir } from "../env";
 import { DAEMON_VERSION } from "../version";
 
@@ -81,27 +89,26 @@ export type TWorkingSet = {
  *  target is missing (e.g. `/lib64`, absent on arm64 Linux, would otherwise
  *  climb to `/` and grant the whole root tree). Callers must pre-create
  *  bootstrap targets or handle the grant failure. */
+/** Secret-bearing `$HOME` roots whose contents must NEVER be granted wholesale.
+ *  A scoped grant like `~/.bun/install/cache`, `~/.grok/{bin,downloads}`,
+ *  `~/.config/raycast/ai`, or any `~/.claude/*` subtree is fine, but the BARE
+ *  root holds the secrets the scoping exists to keep out: `~/.bun/bin` (write =
+ *  §5-B launcher trojan), `~/.grok/auth.json`, `~/.config`'s gcloud/gh tokens,
+ *  and `~/.claude/.credentials.json` (the §5-A Linux OAuth token). Shared by
+ *  `existing()` (no-climb into a root when a scoped leaf is missing) and
+ *  `resolveCliExecDirs()` (never grant a bare root a symlink chain resolves
+ *  into). `~/.cache`/`~/.local` are deliberately NOT here — `~/.cache/openllm`
+ *  legitimately climbs to `~/.cache` (documented + tested, no secrets). */
+const SENSITIVE_ROOTS = (home: string): readonly string[] => [
+  join(home, ".bun"),
+  join(home, ".grok"),
+  join(home, ".config"),
+  join(home, ".claude"),
+];
+
 const existing = (paths: readonly string[]): string[] => {
   const home = homedir();
-  // Secret-bearing roots whose SCOPED children must resolve EXACTLY — never by
-  // climbing. A grant like `~/.bun/install/cache`, `~/.bun/bin`,
-  // `~/.grok/{bin,downloads}`, `~/.config/raycast/ai`, or any `~/.claude/*`
-  // subtree is pre-created best-effort in `daemonWorkingSet()`; if that
-  // pre-create failed and the leaf is missing, DROP the grant rather than let
-  // the ancestor-walk widen it back onto the parent, which holds the very
-  // secrets the scoping exists to keep out: `~/.bun/bin` (write = §5-B
-  // launcher trojan), `~/.grok/auth.json`, `~/.config`'s gcloud/gh tokens, and
-  // `~/.claude/.credentials.json` (the §5-A Linux OAuth token at the
-  // `~/.claude` root). `~/.cache`/`~/.local` are deliberately NOT sensitive —
-  // `~/.cache/openllm` legitimately climbs to `~/.cache` (documented + tested,
-  // no secrets there). The roots themselves are never grant entries, so this
-  // only ever affects their children.
-  const sensitiveRoots = [
-    join(home, ".bun"),
-    join(home, ".grok"),
-    join(home, ".config"),
-    join(home, ".claude"),
-  ];
+  const sensitiveRoots = SENSITIVE_ROOTS(home);
   const underSensitiveRoot = (p: string): boolean =>
     sensitiveRoots.some((root) => p.startsWith(`${root}/`));
   return paths.map((p) => {
@@ -126,6 +133,100 @@ const existing = (paths: readonly string[]): string[] => {
     }
     return candidate;
   });
+};
+
+/** Max symlink hops to follow before giving up — bounds a pathological or
+ *  cyclic chain (a real launcher is 0-2 hops). */
+const MAX_SYMLINK_HOPS = 16;
+
+/**
+ * Resolve the directories a spawned vendor CLI must be able to READ+EXEC, by
+ * FOLLOWING the launcher's symlink chain from `seed`. The daemon execs the
+ * launcher and the kernel reads THROUGH every symlink to the real ELF, so each
+ * dir along the way must be granted or the spawn EACCESes. Hardcoding these is
+ * brittle — each vendor buries its real binary in a different, sometimes
+ * version-specific, dir (claude `~/.local/share/claude/versions/<v>`, codex
+ * `~/.codex/packages/standalone/releases/<v>-<arch>/bin` behind a `current` DIR
+ * symlink, grok `~/.grok/downloads/grok-<arch>` behind `~/.grok/bin/grok`), and
+ * a custom install dir (`GROK_BIN_DIR`, `CODEX_HOME`, …) moves them anywhere.
+ * Following the ACTUAL chain is self-correcting.
+ *
+ * Two passes, both needed:
+ *   1. per-hop walk (`lstat`→`readlink`) collecting `dirname()` of every node —
+ *      catches FILE-symlink chains;
+ *   2. `dirname(realpath(seed))` — catches INTERMEDIATE DIR symlinks a file walk
+ *      steps over (codex's `current → releases/<v>`).
+ *
+ * SECURITY: emits READ+EXEC dir grants only (binaries, never credentials — auth
+ * stores like `~/.grok/auth.json` are SIBLINGS, not under any bin/downloads
+ * dir). Every candidate must EXIST and must not be `/`, `$HOME`, an ancestor of
+ * `$HOME`, or a bare `SENSITIVE_ROOTS` entry — so a bare/broken/hostile chain can
+ * never widen the grant onto the home tree, the filesystem root, or a
+ * secret-bearing root. All fs reads are best-effort: a missing/broken/looping
+ * link just stops the walk with whatever was safely collected (never throws).
+ */
+export const resolveCliExecDirs = (seed: string, home: string): string[] => {
+  const out = new Set<string>();
+  // Canonicalize the reference roots so the bound checks below survive
+  // realpath-canonicalization of the CANDIDATE dirs (macOS resolves
+  // `/var → /private/var`, and any tmp/home may itself sit behind a symlink — so
+  // a raw-vs-realpath string compare would silently miss `$HOME`/a sensitive
+  // root and wrongly grant it). Compare canonical-to-canonical throughout.
+  const canon = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p; // missing — keep raw; existsSync check below drops it anyway
+    }
+  };
+  const canonHome = canon(home);
+  const forbidden = new Set<string>([canonHome, "/"]);
+  for (let a = dirname(canonHome); a !== dirname(a); a = dirname(a)) {
+    forbidden.add(a); // ancestors of home: /Users, / (mac); /home, / (linux)
+  }
+  for (const root of SENSITIVE_ROOTS(home)) forbidden.add(canon(root));
+  const addExecDir = (dir: string): void => {
+    if (!existsSync(dir)) return; // Landlock can't grant a missing path
+    const real = canon(dir);
+    // Reject $HOME, filesystem root, any ancestor of $HOME, or a bare
+    // secret-bearing root — a bare/broken/hostile chain must never widen the
+    // grant onto the home tree, `/`, or a credential root. Grant the CANONICAL
+    // path (what the kernel actually enforces on).
+    if (forbidden.has(real)) return;
+    out.add(real);
+  };
+
+  // Pass 1: per-hop symlink walk (does NOT follow — inspects each link itself).
+  const seen = new Set<string>();
+  let cur = seed;
+  for (let hop = 0; hop < MAX_SYMLINK_HOPS; hop++) {
+    if (seen.has(cur)) break; // cycle
+    seen.add(cur);
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      break; // missing / broken — stop; whatever was collected stands
+    }
+    addExecDir(dirname(cur));
+    if (!st.isSymbolicLink()) break; // reached the real node
+    let target: string;
+    try {
+      target = readlinkSync(cur);
+    } catch {
+      break;
+    }
+    cur = isAbsolute(target) ? target : resolve(dirname(cur), target);
+  }
+
+  // Pass 2: fully-resolved realpath (catches intermediate DIR symlinks).
+  try {
+    addExecDir(dirname(realpathSync(seed)));
+  } catch {
+    // seed missing / broken chain — pass 1 already collected what it could.
+  }
+
+  return [...out];
 };
 
 /**
@@ -419,6 +520,22 @@ export const daemonWorkingSet = (): TWorkingSet => {
     "/run",
     "/var",
   ]);
+  // DYNAMIC exec-dir resolution — the robustness backstop for the hardcoded
+  // provider bin grants above. For every provider, FOLLOW the symlink chain of
+  // its isolated run-view (`cliBin`, seeded lazily by `cliInstallState`) AND its
+  // host launcher candidates (`hostCliCandidates`, present as soon as the CLI is
+  // installed), and grant the real dir of every node read+exec. Self-correcting:
+  // whatever non-standard / version-specific / custom-install dir a vendor buries
+  // the ELF in (the grok `~/.grok/downloads` regression, codex's version dir
+  // behind `current`, a user's `GROK_BIN_DIR`), exec-through is granted because
+  // we followed the ACTUAL link. Additive — never removes the hardcoded floor;
+  // `resolveCliExecDirs` bounds every grant (existing dirs only, never $HOME/root/
+  // a bare sensitive root). Absent CLIs contribute nothing (missing seeds skip).
+  for (const provider of CLI_PROVIDERS) {
+    for (const seed of [...hostCliCandidates(provider), cliBin(provider)]) {
+      for (const dir of resolveCliExecDirs(seed, home)) readOnly.add(dir);
+    }
+  }
   // A read-write grant subsumes a read-only one — keep the lists disjoint.
   for (const rw of readWrite) readOnly.delete(rw);
   return {
