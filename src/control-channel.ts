@@ -12,6 +12,7 @@ import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
+import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import { computeStatus } from "./status";
@@ -163,7 +164,13 @@ const ERROR_DETAIL_MAX = 600;
 /** Extract a loggable diagnostic from an error ack's `result`: prefer its
  *  `error` field, else the TAIL of its `output` (integration failures put the
  *  failing step last), else a compact JSON of the result. Never used for
- *  successful acks — success results can carry control-plane secrets. */
+ *  successful acks — success results can carry control-plane secrets.
+ *
+ *  Redacted before it hits the daemon log: `integrations.ts` returns the
+ *  RAW `output` in the ack (it goes to the dashboard over the authed socket)
+ *  and only redacts its own openllmd.err.log tail — so THIS log path must
+ *  scrub the API key itself, or a failing script that echoes its env would
+ *  persist the key to disk here. */
 const ackErrorDetail = (result: unknown): string => {
   let detail: string;
   if (result === null || typeof result !== "object") {
@@ -177,6 +184,13 @@ const ackErrorDetail = (result: unknown): string => {
           ? r.output
           : JSON.stringify(result);
   }
+  const apiKey = daemonEnv().apiKey;
+  if (apiKey !== null && apiKey.length > 0) {
+    detail = detail.split(apiKey).join("[REDACTED_OPENLLM_API_KEY]");
+  }
+  // Belt-and-suspenders: scrub anything shaped like a gateway key even if it
+  // isn't THIS daemon's (a script may print another key it was handed).
+  detail = detail.replace(/sk-llm-[A-Za-z0-9._-]+/g, "sk-llm-[REDACTED]");
   return detail.length > ERROR_DETAIL_MAX
     ? `…${detail.slice(-ERROR_DETAIL_MAX)}`
     : detail;
