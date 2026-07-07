@@ -3,7 +3,7 @@
  */
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 /**
  * Standard user bin dirs the daemon prepends to a spawned integration's PATH.
@@ -34,7 +34,7 @@ export const DEFAULT_BIN_DIRS: readonly string[] = [
  */
 export const resolveOnPath = (cmd: string): string[] => {
   const dirs = [
-    ...(process.env.PATH?.split(":") ?? []),
+    ...(process.env.PATH?.split(delimiter) ?? []),
     ...DEFAULT_BIN_DIRS,
     "/usr/bin",
     "/bin",
