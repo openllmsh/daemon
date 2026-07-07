@@ -333,8 +333,12 @@ export const wssOrigin = (url: string): string | null => {
 export const migrateIfRelayMoved = async (): Promise<void> => {
   // Only act on a HEALTHY connection: while disconnected/reconnecting,
   // partysocket already re-fetches the channel itself — probing here would
-  // double-dial and could hand the pending reconnect a stale ticket.
-  if (ws === null || ws.readyState !== ws.OPEN) return;
+  // double-dial and could hand the pending reconnect a stale ticket. Capture
+  // the socket locally: `stopControlChannel` nulls the module binding, and a
+  // shutdown racing the await below must not turn `ws.reconnect()` into a
+  // null deref (a reconnect on a manually-closed partysocket is a no-op).
+  const socket = ws;
+  if (socket === null || socket.readyState !== socket.OPEN) return;
   const current = connectedWssOrigin;
   if (current === null) return;
   let freshUrl: string;
@@ -349,7 +353,7 @@ export const migrateIfRelayMoved = async (): Promise<void> => {
     from: current,
     to: fresh,
   });
-  ws.reconnect();
+  socket.reconnect();
 };
 
 /** Start the WebSocket control loop (idempotent). */
