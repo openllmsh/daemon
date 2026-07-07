@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@quantidexyz/openllmp";
 import { stateDir } from "./env";
+import { resolveOnPath } from "./path-utils";
 import { daemonTempDir } from "./sandbox/working-set";
 
 /** The providers with an isolated CLI — exactly the closed
@@ -25,25 +26,27 @@ import { daemonTempDir } from "./sandbox/working-set";
 export type TCliProvider = TSubscriptionProviderSlug;
 
 // Where the vendor installer drops the binary, RELATIVE to the provider
-// root. (Run/install env knobs live in `cliEnv` below, not here.)
+// root, plus the CLI's command name as invoked from a shell (what a PATH
+// scan looks for). (Run/install env knobs live in `cliEnv` below, not here.)
 type TCliSpec = {
   readonly binRel: string;
+  readonly cmd: string;
 };
 
 const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   // `claude install` (run by claude.ai/install.sh under our HOME) places
   // the launcher at $HOME/.local/bin/claude.
-  claude_code: { binRel: "home/.local/bin/claude" },
+  claude_code: { binRel: "home/.local/bin/claude", cmd: "claude" },
   // codex install.sh with CODEX_INSTALL_DIR=<root>/bin → <root>/bin/codex.
-  chatgpt: { binRel: "bin/codex" },
+  chatgpt: { binRel: "bin/codex", cmd: "codex" },
   // kimi install.sh with KIMI_INSTALL_DIR=<root> → <root>/bin/kimi.
-  kimi_code: { binRel: "bin/kimi" },
+  kimi_code: { binRel: "bin/kimi", cmd: "kimi" },
   // grok (Grok Build, x.ai/cli) is HOME-rooted like claude, so its isolated
   // symlink lives under the isolated HOME's bin, paralleling claude's launcher.
   // NB: this is only where the ISOLATED SYMLINK is created — the real installer
   // drops the host launcher at ~/.grok/bin/grok (see `hostCliCandidates`), and
   // that is what gets symlinked here.
-  grok: { binRel: "home/.local/bin/grok" },
+  grok: { binRel: "home/.local/bin/grok", cmd: "grok" },
 };
 
 /** The closed runtime list of CLI providers — derived from `SPECS` keys so it
@@ -71,39 +74,61 @@ export const cliBin = (provider: TCliProvider): string =>
  * NEVER installs the CLI; installs are user-run + unsandboxed. The single binary
  * on disk is the non-isolated one; the isolated CLI is always a link to it.
  *
+ * Static vendor-default locations come FIRST (the official installer's drop
+ * point wins), then a generic PATH scan (`resolveOnPath`) appended as the
+ * fallback — so a CLI installed anywhere else (system-wide `/usr/bin`,
+ * Homebrew, an npm-prefix global, `claude migrate-installer`, a distro
+ * package) is still found instead of being reported not-installed. The scan
+ * is generic across every provider, closing the class of bug rather than one
+ * path (see issue #203).
+ *
  * The symlink target must be EXEC-able under the OS sandbox: the codex
  * (`~/.codex`) + kimi (`~/.kimi-code`) homes (read-write working set) and
  * claude's binary dir (`~/.local/share/claude`, read+exec in `working-set.ts`)
- * + anything outside `$HOME` all qualify.
+ * + anything outside `$HOME` all qualify. A non-standard in-`$HOME` location a
+ * PATH scan surfaces is covered too: `working-set.ts` seeds
+ * `resolveCliExecDirs` from THIS list and follows the real symlink chain,
+ * granting read+exec on whatever dirs the binary actually lives in (bounded —
+ * never `$HOME`/root/a sensitive root).
  */
 export const hostCliCandidates = (provider: TCliProvider): string[] => {
   const home = homedir();
-  switch (provider) {
-    case "claude_code":
-      // The official installer's launcher → resolves to
-      // ~/.local/share/claude/versions/<v> (the self-contained binary).
-      return [join(home, ".local", "bin", "claude")];
-    case "chatgpt":
-      return [
-        join(home, ".local", "bin", "codex"),
-        join(home, ".codex", "bin", "codex"),
-      ];
-    case "kimi_code":
-      return [
-        join(home, ".kimi-code", "bin", "kimi"),
-        join(home, ".local", "bin", "kimi"),
-      ];
-    // The official x.ai/cli installer's default BIN_DIR is ~/.grok/bin
-    // (`BIN_DIR="${GROK_BIN_DIR:-$HOME/.grok/bin}"`), and it only adds a
-    // ~/.local/bin/grok symlink WHEN ~/.grok/bin isn't already on PATH — so the
-    // primary location must come first, with ~/.local/bin/grok as the
-    // conditional fallback. (Verified against the live installer 2026-06-30.)
-    case "grok":
-      return [
-        join(home, ".grok", "bin", "grok"),
-        join(home, ".local", "bin", "grok"),
-      ];
+  const vendorDefaults = ((): string[] => {
+    switch (provider) {
+      case "claude_code":
+        // The official installer's launcher → resolves to
+        // ~/.local/share/claude/versions/<v> (the self-contained binary).
+        return [join(home, ".local", "bin", "claude")];
+      case "chatgpt":
+        return [
+          join(home, ".local", "bin", "codex"),
+          join(home, ".codex", "bin", "codex"),
+        ];
+      case "kimi_code":
+        return [
+          join(home, ".kimi-code", "bin", "kimi"),
+          join(home, ".local", "bin", "kimi"),
+        ];
+      // The official x.ai/cli installer's default BIN_DIR is ~/.grok/bin
+      // (`BIN_DIR="${GROK_BIN_DIR:-$HOME/.grok/bin}"`), and it only adds a
+      // ~/.local/bin/grok symlink WHEN ~/.grok/bin isn't already on PATH — so
+      // the primary location must come first, with ~/.local/bin/grok as the
+      // conditional fallback. (Verified against the live installer 2026-06-30.)
+      case "grok":
+        return [
+          join(home, ".grok", "bin", "grok"),
+          join(home, ".local", "bin", "grok"),
+        ];
+    }
+  })();
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of [...vendorDefaults, ...resolveOnPath(SPECS[provider].cmd)]) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
   }
+  return out;
 };
 
 /**
