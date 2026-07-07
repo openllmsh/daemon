@@ -61,6 +61,10 @@ const heartbeat = createHeartbeat({
 });
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
+/** Origin of the wss url the CURRENT connection dialed (set by `channelUrl`).
+ *  `migrateIfRelayMoved` compares it to a fresh channel fetch to detect a
+ *  deploy that moved the relay to a new content-addressed sandbox. */
+let connectedWssOrigin: string | null = null;
 let lastFingerprint = "";
 /** Whether THIS connection's `hello` has been sent. The relay 4001-closes any
  *  connection whose FIRST frame isn't a hello, and an out-of-band status push
@@ -292,7 +296,60 @@ const channelUrl = async (): Promise<string> => {
   if (hasConnected) await sleep(Math.random() * RECONNECT_JITTER_MS);
   const channel = await fetchChannel();
   ticket = channel.ticket;
+  connectedWssOrigin = wssOrigin(channel.wss_url);
   return channel.wss_url;
+};
+
+/** Origin of a ws(s) url (`wss://host[:port]`), or null when unparseable. */
+export const wssOrigin = (url: string): string | null => {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Detect a relay that MOVED and reconnect to it. Relay sandboxes are
+ * content-addressed (name = bundle hash), so a deploy whose relay bundle
+ * changed provisions a NEW box at a new origin — but a daemon with a healthy
+ * socket to the OLD box never re-fetches the channel on its own (partysocket
+ * only calls `channelUrl` before a (re)connect), so it stays parked on the
+ * superseded box while fresh dashboard connections land on the new one and
+ * see this daemon as offline. Called on each healthy bootstrap tick
+ * (`main.ts`), bounding that split-brain window to ~one tick (5 min).
+ *
+ * Best-effort: a failed channel fetch is swallowed (the next tick retries).
+ * The fetch's side effects are free-or-useful — the minted ticket is a
+ * stateless short-lived signature (unused when the origin matches), and the
+ * cloud handler provisions + TTL-extends the CURRENT box, keeping the
+ * successor warm before we (and the fleet) reconnect to it.
+ *
+ * Mid-command race: `reconnect()` can close the socket while a command runs;
+ * its ack `send()` silently drops (socket not OPEN), the relay's
+ * at-least-once redelivery re-pushes the command, and `commandResults` dedup
+ * re-acks with the stored terminal result — no extra handling needed.
+ */
+export const migrateIfRelayMoved = async (): Promise<void> => {
+  // Only act on a HEALTHY connection: while disconnected/reconnecting,
+  // partysocket already re-fetches the channel itself — probing here would
+  // double-dial and could hand the pending reconnect a stale ticket.
+  if (ws === null || ws.readyState !== ws.OPEN) return;
+  const current = connectedWssOrigin;
+  if (current === null) return;
+  let freshUrl: string;
+  try {
+    freshUrl = (await fetchChannel()).wss_url;
+  } catch {
+    return; // keyless / cloud unreachable — nothing to migrate to
+  }
+  const fresh = wssOrigin(freshUrl);
+  if (fresh === null || fresh === current) return;
+  logInfo("control-channel", "relay moved to a new box; reconnecting", {
+    from: current,
+    to: fresh,
+  });
+  ws.reconnect();
 };
 
 /** Start the WebSocket control loop (idempotent). */

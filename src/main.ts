@@ -31,6 +31,7 @@ import {
   refreshBootstrap,
 } from "./config";
 import {
+  migrateIfRelayMoved,
   pushStatusIfChanged,
   startControlChannel,
   stopControlChannel,
@@ -170,6 +171,12 @@ const main = async (): Promise<void> => {
         // Periodic version check — picks up a release published while running.
         void maybeSelfUpdate(latestVersion());
         void maybeUpdateCli(latestCliVersion());
+        // A deploy that changed the relay bundle provisions a NEW
+        // content-addressed box; a healthy socket to the OLD box never
+        // re-fetches the channel on its own, leaving this daemon invisible to
+        // dashboards on the new box. Check + migrate each healthy tick, so
+        // the split-brain window is at most ~one TTL (5 min).
+        void migrateIfRelayMoved();
       } catch (err) {
         // setTimeout doesn't observe the async callback's promise, so an
         // unguarded throw here is an unhandled rejection AND skips the reschedule

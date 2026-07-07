@@ -69,6 +69,7 @@ daemon/
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
     control.ts              localhost control surface (/status,/events,/connect,/usage,/config)
+    control-channel.ts      outbound relay WebSocket (partysocket) — hello/status/ack frames, heartbeat, and migrateIfRelayMoved (bootstrap-tick channel re-fetch: reconnect when a deploy moved the relay to a new content-addressed box)
     status.ts               computeStatus() — shared snapshot for /status + /events
     usage-cache.ts          per-provider TTL cache over delegate.usage() (rate-limit safe)
     events.ts               /events SSE: push status on change (replaces polling)
