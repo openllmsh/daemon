@@ -271,6 +271,30 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // Best-effort — if creation fails, `existing()` still climbs to whatever
     // ancestor DOES exist (or returns the leaf, which fails to grant safely).
   }
+  // The write-once original-config backups the integration scripts take
+  // (`backup_once` in packages/api/lib/scripts.ts) — hardcoded to
+  // $HOME/.openllm/backups in the scripts, so it must be granted explicitly:
+  // it coincides with the state dir's subtree only when
+  // OPENLLM_DAEMON_STATE_DIR is unset. Pre-created (0700 — backups may carry
+  // credentials from previously-installed configs) so the grant lands on the
+  // real leaf. Without this, a daemon-driven install's backup_once silently
+  // no-ops under confinement (its best-effort posture swallows the EACCES).
+  const backupsDir = join(home, ".openllm", "backups");
+  try {
+    mkdirSync(backupsDir, { recursive: true, mode: 0o700 });
+  } catch {
+    // Best-effort — same posture as integrationTmp above.
+  }
+  // The install stamps the wrapper scripts record/compare/clear
+  // (`record_install_stamp` / `state_with_divergence` in
+  // packages/api/lib/scripts.ts) — hardcoded to $HOME/.openllm/installed like
+  // the backups dir above; same rationale + posture.
+  const stampsDir = join(home, ".openllm", "installed");
+  try {
+    mkdirSync(stampsDir, { recursive: true, mode: 0o700 });
+  } catch {
+    // Best-effort — same posture as integrationTmp above.
+  }
   // Pre-create the vendor CLI install/config dirs the host-install + setup flows
   // write into (claude / codex / kimi). REQUIRED on Linux: Landlock can only
   // grant an EXISTING path (`existing()` drops a non-existent leaf rather than
@@ -373,6 +397,13 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
     // + the installed binary and its self-update temp (`<state>/bin`).
     state,
+    // The scripts' write-once original-config backups ($HOME/.openllm/backups
+    // — hardcoded in backup_once, NOT derived from the state dir; pre-created
+    // above). Redundant with `state` in the default layout, load-bearing when
+    // OPENLLM_DAEMON_STATE_DIR points elsewhere.
+    backupsDir,
+    // The install stamps the wrappers record/compare/clear — same rationale.
+    stampsDir,
     // Belt-and-braces for a binary installed OUTSIDE the state dir (manual
     // placement): self-update renames a temp over `process.execPath`, so its
     // real directory must be writable.

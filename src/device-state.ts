@@ -38,23 +38,41 @@ let cache: TDaemonInstalledIntegration[] = [];
 export const getInstalledIntegrations = (): TDaemonInstalledIntegration[] =>
   cache;
 
-/** Parse the `installed` flag out of an `install.sh -s` run's output. The probe
- *  prints one JSON line (`{"installed":bool,…}`) on stdout; the wrapper's own
- *  diagnostics go to stderr, but `runIntegration` returns them concatenated, so
- *  scan for the JSON line. Null when no parseable verdict is present. */
-export const parseInstalled = (output: string): boolean | null => {
+/** A parsed state-probe verdict: `installed` plus the optional `diverged`
+ *  flag (installed but the managed config no longer matches what the current
+ *  bundle would write — absent on older bundles that don't report it). */
+export type TProbeVerdict = {
+  readonly installed: boolean;
+  readonly diverged?: boolean;
+};
+
+/** Parse the state verdict out of an `install.sh -s` run's output. The probe
+ *  prints one JSON line (`{"installed":bool,"version":…,"diverged":bool?}`) on
+ *  stdout; the wrapper's own diagnostics go to stderr, but `runIntegration`
+ *  returns them concatenated, so scan for the JSON line. Null when no
+ *  parseable verdict is present. `diverged` is carried through only when the
+ *  script reported a boolean (older bundles omit it). */
+export const parseState = (output: string): TProbeVerdict | null => {
   for (const line of output.split("\n").reverse()) {
     const t = line.trim();
     if (!t.startsWith("{") || !t.includes('"installed"')) continue;
     try {
-      const j = JSON.parse(t) as { installed?: unknown };
-      if (typeof j.installed === "boolean") return j.installed;
+      const j = JSON.parse(t) as { installed?: unknown; diverged?: unknown };
+      if (typeof j.installed === "boolean") {
+        return typeof j.diverged === "boolean"
+          ? { installed: j.installed, diverged: j.diverged }
+          : { installed: j.installed };
+      }
     } catch {
       // not the JSON line — keep scanning
     }
   }
   return null;
 };
+
+/** Back-compat boolean view of `parseState` (kept for existing tests). */
+export const parseInstalled = (output: string): boolean | null =>
+  parseState(output)?.installed ?? null;
 
 /** Fetch the slugs/ids the gateway catalogs for one area. */
 const fetchCatalogSlugs = async (
@@ -89,8 +107,8 @@ export const probeIntegration = async (
   target = "claude-code",
 ): Promise<void> => {
   const r = await runIntegration(kind, "state", slug, target);
-  const installed = parseInstalled(r.output);
-  if (installed === null) {
+  const verdict = parseState(r.output);
+  if (verdict === null) {
     logWarn(
       "device-state",
       `state probe for ${kind}/${slug} returned no verdict`,
@@ -98,7 +116,7 @@ export const probeIntegration = async (
     return;
   }
   const next = cache.filter((i) => !(i.kind === kind && i.slug === slug));
-  next.push({ kind, slug, installed });
+  next.push({ kind, slug, ...verdict });
   cache = next;
 };
 
@@ -116,10 +134,14 @@ export const refreshDeviceState = async (): Promise<
       return Promise.all(
         slugs.map(async (slug) => {
           const r = await runIntegration(kind, "state", slug);
-          const installed = parseInstalled(r.output);
-          return installed === null
+          const verdict = parseState(r.output);
+          return verdict === null
             ? null
-            : ({ kind, slug, installed } satisfies TDaemonInstalledIntegration);
+            : ({
+                kind,
+                slug,
+                ...verdict,
+              } satisfies TDaemonInstalledIntegration);
         }),
       );
     }),
