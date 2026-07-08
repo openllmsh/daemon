@@ -355,6 +355,18 @@ export const daemonWorkingSet = (): TWorkingSet => {
   } catch {
     // exists already — the grant lands on the real file.
   }
+  // Same for ~/.claude/CLAUDE.md (the user-level memory file the plugin's
+  // install merges its managed guidance region into): FILE grant, so it must
+  // exist first. Seed EMPTY (not "{}"): the install script treats an empty
+  // file as "fresh" and writes the region as the whole file. `wx` never
+  // touches an existing (user-authored) CLAUDE.md.
+  const claudeMd = join(home, ".claude", "CLAUDE.md");
+  try {
+    writeFileSync(claudeMd, "", { flag: "wx", mode: 0o600 });
+  } catch {
+    // exists already (user-authored) or ~/.claude couldn't be made — either
+    // way the grant below lands on whatever is really there.
+  }
   // bun's global install cache — the RW half of the split ~/.bun grant (bin is
   // read+exec only, below). Only pre-create it when bun IS installed: absent
   // bun means the plugin install fails its own `command -v bun` check, and
@@ -396,6 +408,9 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude", "hooks"),
     join(home, ".claude", "plugin-state"),
     claudeSettings,
+    //   ~/.claude/CLAUDE.md is a FILE grant too (pre-created above) — the
+    //   plugin install merges its managed guidance region in place.
+    claudeMd,
     join(home, ".claude.json"),
     //   codex (non-isolated setup): ~/.codex/config.toml + catalog json.
     join(home, ".codex"),
