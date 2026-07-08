@@ -10,7 +10,7 @@
  *
  *   read-write
  *     - the state dir (`~/.openllm`): the shared .env (0600, holds the key + device
- *       id + config) and update-state, logs, the isolated vendor CLIs under `cli/<provider>/`
+ *       id + config) and state.json, logs, the isolated vendor CLIs under `cli/<provider>/`
  *       (homes + binaries + config), AND the daemon binary itself + its
  *       atomic-swap temp (`bin/openllmd`, `.openllmd.update.<pid>.tmp` —
  *       the installer places the binary inside the state dir);

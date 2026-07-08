@@ -33,10 +33,11 @@
  *                            `auto-update-pref.ts`; lives here so ALL daemon
  *                            config is in the one file.
  *
- * Legacy standalone `api-key` / `device-id` / `auto-update` files
- * (pre-single-file installs) are migrated INTO the env file and then removed —
- * lazily on first read, and proactively at boot via `migrateLegacyConfig`;
- * the pre-rename `daemon.env` itself migrates to `.env` the same way.
+ * Legacy standalone `api-key` / `device-id` / `auto-update` / `cloud-origin`
+ * files (pre-single-file installs) are migrated INTO the env file and then
+ * removed — lazily on first read (and `auto-update` proactively at boot via
+ * `migrateLegacyAutoUpdate`); the pre-rename `daemon.env` itself migrates to
+ * `.env` the same way.
  */
 import { randomUUID } from "node:crypto";
 import {
@@ -229,22 +230,37 @@ const apiKeyFile = (): string => join(stateDir(), "api-key");
 
 const deviceIdFile = (): string => join(stateDir(), "device-id");
 
+/** The pre-consolidation standalone origin file — migrated to `.env`. */
 const cloudOriginFile = (): string => join(stateDir(), "cloud-origin");
 
 /**
  * A cloud origin the daemon ADOPTED at runtime (dev only — see
- * `setCloudOrigin`), persisted so it survives a restart. Lets a dev daemon
- * keep serving whatever deployment's dashboard it last followed instead of
- * snapping back to the local-Next default (which may be unreachable when
- * you're testing a preview/prod). Null when none was adopted.
+ * `setCloudOrigin`), persisted in the env file as `OPENLLM_CLOUD_ORIGIN` so
+ * it survives a restart. Lets a dev daemon keep serving whatever deployment's
+ * dashboard it last followed instead of snapping back to the local-Next
+ * default (which may be unreachable when you're testing a preview/prod).
+ * A legacy standalone `cloud-origin` file (older installs) is migrated into
+ * the env file and removed. Null when none was adopted — callers only reach
+ * here when `OPENLLM_CLOUD_ORIGIN` itself is unset.
  */
 const loadPersistedCloudOrigin = (): string | null => {
+  let legacy: string;
   try {
-    const v = readFileSync(cloudOriginFile(), "utf-8").trim();
-    return v.length > 0 ? v : null;
+    legacy = readFileSync(cloudOriginFile(), "utf-8").trim();
   } catch {
     return null;
   }
+  if (legacy.length === 0) return null;
+  const written = writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: legacy });
+  process.env.OPENLLM_CLOUD_ORIGIN = legacy;
+  if (written) {
+    try {
+      rmSync(cloudOriginFile(), { force: true });
+    } catch {
+      // best-effort cleanup of the now-migrated legacy file
+    }
+  }
+  return legacy;
 };
 
 let cachedDeviceId: string | null = null;
@@ -377,11 +393,16 @@ export const hasApiKey = (): boolean => daemonEnv().apiKey !== null;
 export const setCloudOrigin = (origin: string): void => {
   const trimmed = origin.replace(/\/+$/, "");
   if (trimmed.length === 0) return;
+  // Persist into the shared env file (single source; `loadEnvFile` never
+  // overwrites set vars, so mirror into process.env too) and drop any legacy
+  // standalone `cloud-origin` file. Best-effort — the in-memory update below
+  // still applies either way.
+  writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: trimmed });
+  process.env.OPENLLM_CLOUD_ORIGIN = trimmed;
   try {
-    mkdirSync(stateDir(), { recursive: true });
-    writeFileSync(cloudOriginFile(), trimmed, { mode: 0o600 });
+    rmSync(cloudOriginFile(), { force: true });
   } catch {
-    // best-effort persistence; the in-memory update below still applies
+    // best-effort cleanup of the now-migrated legacy file
   }
   const current = daemonEnv();
   cached = { ...current, cloudOrigin: trimmed, dashboardOrigin: trimmed };

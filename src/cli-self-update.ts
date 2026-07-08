@@ -17,7 +17,7 @@
  *     `cli-install.ts`. Manual `openllmc self-update` also still works; both
  *     paths write verified bytes via distinct pid-suffixed temps, so a race is
  *     last-writer-wins with a complete binary either way.
- *   - Its own attempt cooldown file (`cli-update-state.json`) so a daemon
+ *   - Its own attempt SLOT (`cli`) in the shared `state.json` so a daemon
  *     attempt never masks a CLI attempt (or vice versa).
  */
 
@@ -25,7 +25,6 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
-  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -37,38 +36,10 @@ import { daemonEnv, stateDir } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn } from "./logger";
 import { currentTarget, fetchBinary, fetchDigest } from "./self-update";
-
-// Don't retry the SAME target version within this window after a swap that
-// didn't converge (a mis-published release) — bounds repeated downloads.
-const ATTEMPT_COOLDOWN_MS = 60 * 60 * 1000;
+import { recentlyAttempted, recordAttempt } from "./state-file";
 
 /** Where the install script places the CLI (`~/.openllm/bin/openllmc`). */
 export const cliBinaryPath = (): string => join(stateDir(), "bin", "openllmc");
-
-type TAttempt = { readonly version: string; readonly ts: number };
-
-const attemptFile = (): string => join(stateDir(), "cli-update-state.json");
-
-const recentlyAttempted = (version: string): boolean => {
-  try {
-    const raw = JSON.parse(readFileSync(attemptFile(), "utf-8")) as TAttempt;
-    return raw.version === version && Date.now() - raw.ts < ATTEMPT_COOLDOWN_MS;
-  } catch {
-    return false;
-  }
-};
-
-const recordAttempt = (version: string): void => {
-  try {
-    writeFileSync(
-      attemptFile(),
-      JSON.stringify({ version, ts: Date.now() } satisfies TAttempt),
-      { mode: 0o600 },
-    );
-  } catch {
-    // best-effort — the in-memory `updating` guard still prevents a tight loop
-  }
-};
 
 /**
  * The installed CLI's version, probed by spawning `openllmc --version`
@@ -121,7 +92,7 @@ export const maybeUpdateCli = async (
     logWarn("cli-update", `unknown target ${process.platform}-${process.arch}`);
     return;
   }
-  if (recentlyAttempted(latest)) return;
+  if (recentlyAttempted("cli", latest)) return;
 
   updating = true;
   const tmp = join(dirname(bin), `.openllmc.update.${process.pid}.tmp`);
@@ -149,7 +120,7 @@ export const maybeUpdateCli = async (
     // Record only AFTER a successful swap — a transient download failure should
     // retry on the next tick, but a swap that doesn't converge (mis-publish)
     // must back off.
-    recordAttempt(latest);
+    recordAttempt("cli", latest);
     logInfo("cli-update", `updated openllmc ${current} → ${latest}`);
   } catch (err) {
     logError("cli-update", err, { target, latest });

@@ -22,26 +22,18 @@
  */
 
 import { createHash } from "node:crypto";
-import {
-  chmodSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
-import { daemonEnv, stateDir } from "./env";
+import { daemonEnv } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn } from "./logger";
+import { recentlyAttempted, recordAttempt } from "./state-file";
 import { DAEMON_VERSION } from "./version";
 
-// Don't retry the SAME target version within this window if a relaunch didn't
-// converge (a mis-published release) — bounds restart loops across relaunches.
-const ATTEMPT_COOLDOWN_MS = 60 * 60 * 1000;
 // Cap on how long we hold the restart waiting for `/v1` requests to drain.
 const DRAIN_MAX_MS = 30_000;
 const DRAIN_POLL_MS = 250;
@@ -111,33 +103,6 @@ export const currentTarget = (): TDaemonTarget | null => {
   return (DAEMON_TARGETS as readonly string[]).includes(t)
     ? (t as TDaemonTarget)
     : null;
-};
-
-type TAttempt = { readonly version: string; readonly ts: number };
-
-const attemptFile = (): string => join(stateDir(), "update-state.json");
-
-// True when we already tried to converge to `version` recently — so a relaunch
-// that still isn't on it (bad publish) backs off instead of looping.
-const recentlyAttempted = (version: string): boolean => {
-  try {
-    const raw = JSON.parse(readFileSync(attemptFile(), "utf-8")) as TAttempt;
-    return raw.version === version && Date.now() - raw.ts < ATTEMPT_COOLDOWN_MS;
-  } catch {
-    return false;
-  }
-};
-
-const recordAttempt = (version: string): void => {
-  try {
-    writeFileSync(
-      attemptFile(),
-      JSON.stringify({ version, ts: Date.now() } satisfies TAttempt),
-      { mode: 0o600 },
-    );
-  } catch {
-    // best-effort — the in-memory `updating` guard still prevents a tight loop
-  }
 };
 
 /** Shared by the daemon self-updater and the CLI converger (`cli-self-update.ts`). */
@@ -219,7 +184,7 @@ export const maybeSelfUpdate = async (
     );
     return;
   }
-  if (recentlyAttempted(latest)) return;
+  if (recentlyAttempted("daemon", latest)) return;
 
   updating = true;
   const dest = process.execPath;
@@ -249,7 +214,7 @@ export const maybeSelfUpdate = async (
     // Record only AFTER a successful swap — a transient download/rename failure
     // should retry on the next tick, but a swap that doesn't converge (the
     // relaunched binary still reports the old version) must back off.
-    recordAttempt(latest);
+    recordAttempt("daemon", latest);
     logInfo(
       "self-update",
       `updated ${DAEMON_VERSION} → ${latest}; restarting when idle`,

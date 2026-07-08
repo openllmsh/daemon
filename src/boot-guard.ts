@@ -9,21 +9,19 @@
  * forever: each boot re-runs the sandbox/FFI setup and writes log lines, so the
  * loop floods `openllmd.log` and pegs the CPU with nothing to show for it.
  *
- * `guardCrashLoop()` records each boot's timestamp in a small state file and, if
+ * `guardCrashLoop()` records each boot's timestamp in `state.json` and, if
  * too many boots land inside a short window, declares a crash loop: it disables
  * self-restore (so the supervisor stops relaunching) and exits cleanly. Recover
  * by fixing the cause and running `openllmd restart`. The decision is a pure
  * function (`shouldPark`) so the threshold is unit-testable without a real boot.
  *
  * Best-effort + never throws on its OWN I/O (mirrors `logger.ts`): if the
- * history file can't be read/written the guard simply can't fire — the daemon
+ * boot history can't be read/written the guard simply can't fire — the daemon
  * boots anyway and, on Linux, systemd's start-limit still bounds the churn.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { stateDir } from "./env";
 import { logError } from "./logger";
 import { serviceStop } from "./service";
+import { readBootHistory, writeBootHistory } from "./state-file";
 
 /** How far back a boot counts toward the crash-loop tally. */
 export const CRASH_WINDOW_MS = 3 * 60 * 1000;
@@ -52,38 +50,17 @@ export const shouldPark = (
   return { recent, park: recent.length >= CRASH_LIMIT };
 };
 
-const historyFile = (): string => join(stateDir(), "boot-history.json");
-
-const readHistory = (): number[] => {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(historyFile(), "utf-8"));
-    return Array.isArray(parsed)
-      ? parsed.filter((n): n is number => typeof n === "number")
-      : [];
-  } catch {
-    return []; // no file yet / unparseable — start fresh
-  }
-};
-
-const writeHistory = (timestamps: readonly number[]): void => {
-  try {
-    mkdirSync(stateDir(), { recursive: true });
-    writeFileSync(historyFile(), JSON.stringify(timestamps), { mode: 0o600 });
-  } catch {
-    // best-effort: a write failure just means the guard can't detect a loop.
-  }
-};
-
 /**
  * Record this boot and, if we've crash-looped, disable self-restore + exit so
  * the supervisor stops relaunching us. Call ONCE at the very start of boot,
  * before the sandbox + listener. Either returns (boot proceeds) or exits the
- * process (loop broken).
+ * process (loop broken). As the first `state.json` reader each boot, this is
+ * also what triggers the one-shot legacy-file migration (`state-file.ts`).
  */
 export const guardCrashLoop = (): void => {
   const now = Date.now();
-  const { recent, park } = shouldPark(readHistory(), now);
-  writeHistory(recent);
+  const { recent, park } = shouldPark(readBootHistory(), now);
+  writeBootHistory(recent);
   if (!park) return;
   logError(
     "boot-guard",
@@ -100,6 +77,6 @@ export const guardCrashLoop = (): void => {
   }
   // Clear the window so the eventual `openllmd restart` starts from a clean
   // slate rather than re-tripping the guard on its first boot.
-  writeHistory([]);
+  writeBootHistory([]);
   process.exit(0);
 };
