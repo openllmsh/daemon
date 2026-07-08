@@ -399,7 +399,12 @@ export const chatgptDelegate: TProviderDelegate = {
     const token = await readToken();
     if (token === null) return null;
     try {
-      const ver = (await cliVersion(bin(), env())) ?? "0.0.0";
+      // The backend wants a BARE semver (the CLI's own cache stores
+      // `"0.142.0"`); `codex --version` prints `codex-cli 0.142.0`, and
+      // sending that verbatim is a 400 (verified live). Extract the
+      // x.y.z.
+      const raw = (await cliVersion(bin(), env())) ?? "";
+      const ver = raw.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.0.0";
       const resp = await fetch(
         await resolveProviderUrl(
           PROVIDER,
