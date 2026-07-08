@@ -38,12 +38,23 @@ export const resetModelReportThrottle = (): void => {
 export const maybeReportModels = async (
   now: number = Date.now(),
 ): Promise<void> => {
+  const due = Object.entries(DELEGATES).filter(
+    ([slug, delegate]) =>
+      delegate.listModels !== undefined &&
+      now - (lastReportedAtMs.get(slug) ?? 0) >= REPORT_TTL_MS,
+  );
+  // Fetch concurrently — each delegate's call is individually bounded
+  // (`fetchModelList`), but sequential awaits would still let one slow
+  // vendor delay every other provider's report.
+  const results = await Promise.all(
+    due.map(async ([slug, delegate]) => ({
+      slug,
+      models: await (delegate.listModels?.().catch(() => null) ??
+        Promise.resolve(null)),
+    })),
+  );
   const entries: TDaemonModelReportEntry[] = [];
-  for (const [slug, delegate] of Object.entries(DELEGATES)) {
-    if (delegate.listModels === undefined) continue;
-    const last = lastReportedAtMs.get(slug) ?? 0;
-    if (now - last < REPORT_TTL_MS) continue;
-    const models = await delegate.listModels().catch(() => null);
+  for (const { slug, models } of results) {
     if (models === null || models.length === 0) continue;
     entries.push({ provider: slug, models });
     // Stamp on successful FETCH, not successful report — if the report

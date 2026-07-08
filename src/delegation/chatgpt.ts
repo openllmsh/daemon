@@ -33,6 +33,7 @@ import {
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
+import { fetchModelList } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -398,53 +399,45 @@ export const chatgptDelegate: TProviderDelegate = {
     // on any failure (never an empty list).
     const token = await readToken();
     if (token === null) return null;
-    try {
-      // The backend wants a BARE semver (the CLI's own cache stores
-      // `"0.142.0"`); `codex --version` prints `codex-cli 0.142.0`, and
-      // sending that verbatim is a 400 (verified live). Extract the
-      // x.y.z.
-      const raw = (await cliVersion(bin(), env())) ?? "";
-      const ver = raw.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.0.0";
-      const resp = await fetch(
-        await resolveProviderUrl(
-          PROVIDER,
-          `/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
-        ),
-        {
-          method: "GET",
-          headers: {
-            authorization: `Bearer ${token.accessToken}`,
-            ...(token.accountId !== null
-              ? { "chatgpt-account-id": token.accountId }
-              : {}),
-            accept: "application/json",
-          },
-        },
-      );
-      if (!resp.ok) return null;
-      const body = (await resp.json()) as {
-        models?: ReadonlyArray<Record<string, unknown>>;
-      };
-      const entries = (body.models ?? []).flatMap((m) => {
-        if (typeof m.slug !== "string" || m.slug.length === 0) return [];
-        if (m.visibility !== "list") return [];
-        const ctx = Number(m.context_window);
-        return [
-          {
-            provider_model_id: m.slug,
-            ...(typeof m.display_name === "string"
-              ? { display_name: m.display_name }
-              : {}),
-            ...(Number.isInteger(ctx) && ctx > 0
-              ? { context_window: ctx }
-              : {}),
-          },
-        ];
-      });
-      return entries.length > 0 ? entries : null;
-    } catch {
-      return null;
-    }
+    // The backend wants a BARE semver (the CLI's own cache stores
+    // `"0.142.0"`); `codex --version` prints `codex-cli 0.142.0`, and
+    // sending that verbatim is a 400 (verified live). Extract the x.y.z.
+    const raw = (await cliVersion(bin(), env())) ?? "";
+    const ver = raw.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.0.0";
+    return fetchModelList(
+      await resolveProviderUrl(
+        PROVIDER,
+        `/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
+      ),
+      {
+        authorization: `Bearer ${token.accessToken}`,
+        ...(token.accountId !== null
+          ? { "chatgpt-account-id": token.accountId }
+          : {}),
+        accept: "application/json",
+      },
+      (body) => {
+        const models = (
+          body as { models?: ReadonlyArray<Record<string, unknown>> }
+        ).models;
+        return (models ?? []).flatMap((m) => {
+          if (typeof m.slug !== "string" || m.slug.length === 0) return [];
+          if (m.visibility !== "list") return [];
+          const ctx = Number(m.context_window);
+          return [
+            {
+              provider_model_id: m.slug,
+              ...(typeof m.display_name === "string"
+                ? { display_name: m.display_name }
+                : {}),
+              ...(Number.isInteger(ctx) && ctx > 0
+                ? { context_window: ctx }
+                : {}),
+            },
+          ];
+        });
+      },
+    );
   },
 
   credentialForUpstream: async () => {

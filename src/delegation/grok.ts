@@ -58,6 +58,7 @@ import {
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
+import { fetchModelList } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -434,44 +435,37 @@ export const grokDelegate: TProviderDelegate = {
     // (never an empty list).
     const token = await readToken();
     if (token === null) return null;
-    try {
-      const resp = await fetch(
-        await resolveProviderUrl(PROVIDER, "/v1/models"),
-        {
-          method: "GET",
-          headers: {
-            authorization: `Bearer ${token.accessToken}`,
-            "x-grok-client-version": await clientVersion(),
-            "x-grok-client-identifier": "xai-grok-cli",
-            accept: "application/json",
-          },
-        },
-      );
-      if (!resp.ok) return null;
-      // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
-      const body = (await resp.json()) as {
-        data?: ReadonlyArray<Record<string, unknown>>;
-        models?: ReadonlyArray<Record<string, unknown>>;
-      };
-      const entries = (body.data ?? body.models ?? []).flatMap((m) => {
-        if (typeof m.id !== "string" || m.id.length === 0) return [];
-        const ctx = Number(m.context_window ?? m.context_length);
-        return [
-          {
-            provider_model_id: m.id,
-            ...(typeof m.display_name === "string"
-              ? { display_name: m.display_name }
-              : {}),
-            ...(Number.isInteger(ctx) && ctx > 0
-              ? { context_window: ctx }
-              : {}),
-          },
-        ];
-      });
-      return entries.length > 0 ? entries : null;
-    } catch {
-      return null;
-    }
+    return fetchModelList(
+      await resolveProviderUrl(PROVIDER, "/v1/models"),
+      {
+        authorization: `Bearer ${token.accessToken}`,
+        "x-grok-client-version": await clientVersion(),
+        "x-grok-client-identifier": "xai-grok-cli",
+        accept: "application/json",
+      },
+      (body) => {
+        // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
+        const b = body as {
+          data?: ReadonlyArray<Record<string, unknown>>;
+          models?: ReadonlyArray<Record<string, unknown>>;
+        };
+        return (b.data ?? b.models ?? []).flatMap((m) => {
+          if (typeof m.id !== "string" || m.id.length === 0) return [];
+          const ctx = Number(m.context_window ?? m.context_length);
+          return [
+            {
+              provider_model_id: m.id,
+              ...(typeof m.display_name === "string"
+                ? { display_name: m.display_name }
+                : {}),
+              ...(Number.isInteger(ctx) && ctx > 0
+                ? { context_window: ctx }
+                : {}),
+            },
+          ];
+        });
+      },
+    );
   },
 
   credentialForUpstream: async () => {
