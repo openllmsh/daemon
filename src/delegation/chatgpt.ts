@@ -386,6 +386,62 @@ export const chatgptDelegate: TProviderDelegate = {
     }
   },
 
+  listModels: async () => {
+    // Codex's own models endpoint (`GET <base>/models?client_version=…` —
+    // `ref/codex/codex-rs/codex-api/src/endpoint/models.rs`), returning
+    // `{ models: [{ slug, display_name, visibility, context_window }] }`.
+    // Host derived from the CAPTURED inference URL via
+    // `resolveProviderUrl`; only the stable leaf path is a constant. The
+    // `client_version` query mirrors the CLI's own call (the installed
+    // codex version). Picker-visible models only (`visibility: "list"`)
+    // — same filter the CLI's model picker applies. Metadata only; null
+    // on any failure (never an empty list).
+    const token = await readToken();
+    if (token === null) return null;
+    try {
+      const ver = (await cliVersion(bin(), env())) ?? "0.0.0";
+      const resp = await fetch(
+        await resolveProviderUrl(
+          PROVIDER,
+          `/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
+        ),
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${token.accessToken}`,
+            ...(token.accountId !== null
+              ? { "chatgpt-account-id": token.accountId }
+              : {}),
+            accept: "application/json",
+          },
+        },
+      );
+      if (!resp.ok) return null;
+      const body = (await resp.json()) as {
+        models?: ReadonlyArray<Record<string, unknown>>;
+      };
+      const entries = (body.models ?? []).flatMap((m) => {
+        if (typeof m.slug !== "string" || m.slug.length === 0) return [];
+        if (m.visibility !== "list") return [];
+        const ctx = Number(m.context_window);
+        return [
+          {
+            provider_model_id: m.slug,
+            ...(typeof m.display_name === "string"
+              ? { display_name: m.display_name }
+              : {}),
+            ...(Number.isInteger(ctx) && ctx > 0
+              ? { context_window: ctx }
+              : {}),
+          },
+        ];
+      });
+      return entries.length > 0 ? entries : null;
+    } catch {
+      return null;
+    }
+  },
+
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {

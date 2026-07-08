@@ -425,6 +425,55 @@ export const grokDelegate: TProviderDelegate = {
     }
   },
 
+  listModels: async () => {
+    // The CLI chat proxy's own `GET /v1/models` (the call the grok CLI's
+    // model picker makes — both Grok Build models report `api_backend`
+    // through it). Host derived from the CAPTURED inference URL via
+    // `resolveProviderUrl`; bearer + the CLI's genuine identity headers,
+    // mirroring the usage read. Metadata only; null on any failure
+    // (never an empty list).
+    const token = await readToken();
+    if (token === null) return null;
+    try {
+      const resp = await fetch(
+        await resolveProviderUrl(PROVIDER, "/v1/models"),
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${token.accessToken}`,
+            "x-grok-client-version": await clientVersion(),
+            "x-grok-client-identifier": "xai-grok-cli",
+            accept: "application/json",
+          },
+        },
+      );
+      if (!resp.ok) return null;
+      // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
+      const body = (await resp.json()) as {
+        data?: ReadonlyArray<Record<string, unknown>>;
+        models?: ReadonlyArray<Record<string, unknown>>;
+      };
+      const entries = (body.data ?? body.models ?? []).flatMap((m) => {
+        if (typeof m.id !== "string" || m.id.length === 0) return [];
+        const ctx = Number(m.context_window ?? m.context_length);
+        return [
+          {
+            provider_model_id: m.id,
+            ...(typeof m.display_name === "string"
+              ? { display_name: m.display_name }
+              : {}),
+            ...(Number.isInteger(ctx) && ctx > 0
+              ? { context_window: ctx }
+              : {}),
+          },
+        ];
+      });
+      return entries.length > 0 ? entries : null;
+    } catch {
+      return null;
+    }
+  },
+
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {

@@ -465,6 +465,54 @@ export const claudeCodeDelegate: TProviderDelegate = {
     }
   },
 
+  listModels: async () => {
+    // Anthropic's `GET /v1/models` accepts the subscription OAuth bearer
+    // (same auth shape as the usage read above). Host derived from the
+    // CAPTURED inference URL via `resolveProviderUrl` — no hardcoded
+    // origin; only the stable leaf path is a constant. Metadata only;
+    // null on any failure (never an empty list).
+    const token = await readToken();
+    if (token === null) return null;
+    try {
+      const resp = await fetch(
+        await resolveProviderUrl(PROVIDER, "/v1/models?limit=1000"),
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${token.accessToken}`,
+            "user-agent": await userAgent(),
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": OAUTH_BETA,
+            accept: "application/json",
+          },
+        },
+      );
+      if (!resp.ok) return null;
+      const body = (await resp.json()) as {
+        data?: ReadonlyArray<Record<string, unknown>>;
+      };
+      const entries = (body.data ?? []).flatMap((m) => {
+        if (typeof m.id !== "string" || m.id.length === 0) return [];
+        const createdMs =
+          typeof m.created_at === "string" ? Date.parse(m.created_at) : NaN;
+        return [
+          {
+            provider_model_id: m.id,
+            ...(typeof m.display_name === "string"
+              ? { display_name: m.display_name }
+              : {}),
+            ...(Number.isFinite(createdMs)
+              ? { created: Math.floor(createdMs / 1000) }
+              : {}),
+          },
+        ];
+      });
+      return entries.length > 0 ? entries : null;
+    } catch {
+      return null;
+    }
+  },
+
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
