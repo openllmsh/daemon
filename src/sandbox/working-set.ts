@@ -326,47 +326,36 @@ export const daemonWorkingSet = (): TWorkingSet => {
       // back / fails visibly, not a daemon-boot failure.
     }
   }
-  // ~/.claude/settings.json is granted as a FILE (never the whole ~/.claude —
-  // see the scoped subtrees above). A Landlock file rule needs the file to
-  // EXIST, and a file-scoped grant cannot authorize creating it (open(O_CREAT)
-  // needs MAKE_REG on the PARENT dir, which stays ungranted) — so pre-create
-  // an empty JSON object when absent. Every settings-merge script branches on
-  // `[ -f ]` / parses the file, and `{}` merges cleanly on all of them. `wx`
-  // never touches an existing file, so a populated settings.json is untouched.
+  // FILE-scoped grants need the file to EXIST (a Landlock file rule can't
+  // grant a missing path, and open(O_CREAT) needs MAKE_REG on the PARENT dir,
+  // which stays ungranted) — so pre-create each when absent. `wx` never
+  // touches an existing file; explicit 0o600 (not the process umask) because
+  // these seed user-config files that may carry the gateway API key — keep
+  // them private from group/other regardless of the daemon's inherited umask.
+  // A pre-create failure (~/.claude itself couldn't be made) is fine: the
+  // grant below just lands on whatever is really there.
+  const seedFileIfMissing = (path: string, content: string): void => {
+    try {
+      writeFileSync(path, content, { flag: "wx", mode: 0o600 });
+    } catch {
+      // exists already (the common case) or the parent couldn't be made.
+    }
+  };
+  // ~/.claude/settings.json (never the whole ~/.claude — see the scoped
+  // subtrees above). Every settings-merge script branches on `[ -f ]` /
+  // parses the file, and `{}` merges cleanly on all of them.
   const claudeSettings = join(home, ".claude", "settings.json");
-  try {
-    // Explicit 0o600, not the process umask: these seed a user-config file
-    // that carries the gateway API key once the setup merge runs — keep it
-    // private from group/other regardless of the daemon's inherited umask.
-    writeFileSync(claudeSettings, "{}\n", { flag: "wx", mode: 0o600 });
-  } catch {
-    // exists already (the common case) or ~/.claude itself couldn't be made —
-    // either way the grant below lands on whatever is really there.
-  }
-  // Same for ~/.claude.json (the MCP-server registry the plugin installs merge
-  // into): it's a FILE grant at the $HOME root, so a confined child can never
-  // CREATE it (that needs MAKE_REG on the ungranted $HOME) and Landlock can't
-  // grant a missing path. `wx` never touches an existing file.
+  seedFileIfMissing(claudeSettings, "{}\n");
+  // ~/.claude.json (the MCP-server registry the plugin installs merge into):
+  // a FILE grant at the $HOME root, so a confined child can never CREATE it.
   const claudeJson = join(home, ".claude.json");
-  try {
-    // 0o600 for the same reason as settings.json above — private by mode, not
-    // by inherited umask.
-    writeFileSync(claudeJson, "{}\n", { flag: "wx", mode: 0o600 });
-  } catch {
-    // exists already — the grant lands on the real file.
-  }
-  // Same for ~/.claude/CLAUDE.md (the user-level memory file the plugin's
-  // install merges its managed guidance region into): FILE grant, so it must
-  // exist first. Seed EMPTY (not "{}"): the install script treats an empty
-  // file as "fresh" and writes the region as the whole file. `wx` never
-  // touches an existing (user-authored) CLAUDE.md.
+  seedFileIfMissing(claudeJson, "{}\n");
+  // ~/.claude/CLAUDE.md (the user-level memory file the plugin's install
+  // merges its managed guidance region into). Seed EMPTY (not "{}"): the
+  // install script treats an empty file as "fresh" and writes the region as
+  // the whole file. An existing user-authored CLAUDE.md is untouched.
   const claudeMd = join(home, ".claude", "CLAUDE.md");
-  try {
-    writeFileSync(claudeMd, "", { flag: "wx", mode: 0o600 });
-  } catch {
-    // exists already (user-authored) or ~/.claude couldn't be made — either
-    // way the grant below lands on whatever is really there.
-  }
+  seedFileIfMissing(claudeMd, "");
   // bun's global install cache — the RW half of the split ~/.bun grant (bin is
   // read+exec only, below). Only pre-create it when bun IS installed: absent
   // bun means the plugin install fails its own `command -v bun` check, and
