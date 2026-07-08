@@ -2,8 +2,8 @@
  * Daemon runtime configuration.
  *
  * Everything lives in ONE file — `~/.openllm/.env` (resolved via
- * `envFilePath()`; legacy `daemon.env` is renamed in at boot). It's the
- * single source both dev (`bun dev:daemon`, which auto-loads it) and the
+ * `envFilePath()`). It's the single source both dev (`bun dev:daemon`,
+ * which auto-loads it) and the
  * installed service (systemd `EnvironmentFile=` / the macOS launch agent's
  * `OPENLLM_DAEMON_ENV_FILE`) boot from — and it is SHARED with the other
  * OpenLLM tools on the box: the CLI (`openllmc`) reads the same file for
@@ -33,21 +33,13 @@
  *                            `auto-update-pref.ts`; lives here so ALL daemon
  *                            config is in the one file.
  *
- * Legacy standalone `api-key` / `device-id` / `auto-update` / `cloud-origin`
- * files (pre-single-file installs) are migrated INTO the env file and then
- * removed — lazily on first read (and `auto-update` proactively at boot via
- * `migrateLegacyAutoUpdate`); the pre-rename `daemon.env` itself migrates to
- * `.env` the same way.
+ * Legacy standalone `api-key` / `device-id` / `auto-update` files
+ * (pre-single-file installs) are migrated INTO the env file and then removed —
+ * lazily on first read, and `auto-update` proactively at boot via
+ * `migrateLegacyAutoUpdate`.
  */
 import { randomUUID } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -112,29 +104,6 @@ export const stateDir = (): string =>
 export const envFilePath = (): string =>
   process.env.OPENLLM_DAEMON_ENV_FILE ?? join(stateDir(), ".env");
 
-/** The pre-rename config file (`daemon.env`) — migrated to `.env` at boot. */
-const legacyEnvFilePath = (): string => join(stateDir(), "daemon.env");
-
-/**
- * One-shot migration: rename a legacy `~/.openllm/daemon.env` to the shared
- * `~/.openllm/.env`. Runs lazily from {@link loadEnvFile} (every boot path
- * goes through it) so old installs converge without a separate step. No-op
- * when the new file already exists (never clobber), when an explicit
- * `OPENLLM_DAEMON_ENV_FILE` is in force, or on any fs error (best-effort —
- * the daemon still boots keyless and the dashboard re-pairs it).
- */
-const migrateLegacyEnvFile = (): void => {
-  if (process.env.OPENLLM_DAEMON_ENV_FILE !== undefined) return;
-  const next = envFilePath();
-  const legacy = legacyEnvFilePath();
-  try {
-    if (existsSync(next) || !existsSync(legacy)) return;
-    renameSync(legacy, next);
-  } catch {
-    // best-effort — fall through to whatever exists
-  }
-};
-
 /**
  * Load the daemon's `KEY=value` env file into `process.env` (without
  * overwriting already-set vars). Resolved via `envFilePath()` — the single
@@ -144,7 +113,6 @@ const migrateLegacyEnvFile = (): void => {
  * missing. Synchronous (boot-time, before anything reads env).
  */
 export const loadEnvFile = (): void => {
-  migrateLegacyEnvFile();
   let text: string;
   try {
     text = readFileSync(envFilePath(), "utf-8");
@@ -230,39 +198,6 @@ const apiKeyFile = (): string => join(stateDir(), "api-key");
 
 const deviceIdFile = (): string => join(stateDir(), "device-id");
 
-/** The pre-consolidation standalone origin file — migrated to `.env`. */
-const cloudOriginFile = (): string => join(stateDir(), "cloud-origin");
-
-/**
- * A cloud origin the daemon ADOPTED at runtime (dev only — see
- * `setCloudOrigin`), persisted in the env file as `OPENLLM_CLOUD_ORIGIN` so
- * it survives a restart. Lets a dev daemon keep serving whatever deployment's
- * dashboard it last followed instead of snapping back to the local-Next
- * default (which may be unreachable when you're testing a preview/prod).
- * A legacy standalone `cloud-origin` file (older installs) is migrated into
- * the env file and removed. Null when none was adopted — callers only reach
- * here when `OPENLLM_CLOUD_ORIGIN` itself is unset.
- */
-const loadPersistedCloudOrigin = (): string | null => {
-  let legacy: string;
-  try {
-    legacy = readFileSync(cloudOriginFile(), "utf-8").trim();
-  } catch {
-    return null;
-  }
-  if (legacy.length === 0) return null;
-  const written = writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: legacy });
-  process.env.OPENLLM_CLOUD_ORIGIN = legacy;
-  if (written) {
-    try {
-      rmSync(cloudOriginFile(), { force: true });
-    } catch {
-      // best-effort cleanup of the now-migrated legacy file
-    }
-  }
-  return legacy;
-};
-
 let cachedDeviceId: string | null = null;
 
 /**
@@ -343,12 +278,11 @@ export const daemonEnv = (): TDaemonEnv => {
   // In dev, default the cloud origin to the local Next server rather than
   // the compiled-in production origin.
   const originDefault = isDevMode() ? DEV_CLOUD_ORIGIN : compiledCloudOrigin();
-  // Precedence: an explicit env var (the installed prod daemon sets it) wins;
-  // then a dev-adopted origin persisted across restart; then the default.
+  // Precedence: an explicit env var (the installed prod daemon sets it, and a
+  // dev-adopted origin persists here via `setCloudOrigin`) wins; then the
+  // default.
   const cloudOrigin = (
-    process.env.OPENLLM_CLOUD_ORIGIN ??
-    loadPersistedCloudOrigin() ??
-    originDefault
+    process.env.OPENLLM_CLOUD_ORIGIN ?? originDefault
   ).replace(/\/+$/, "");
   cached = {
     apiKey: loadApiKey(),
@@ -394,16 +328,10 @@ export const setCloudOrigin = (origin: string): void => {
   const trimmed = origin.replace(/\/+$/, "");
   if (trimmed.length === 0) return;
   // Persist into the shared env file (single source; `loadEnvFile` never
-  // overwrites set vars, so mirror into process.env too) and drop any legacy
-  // standalone `cloud-origin` file. Best-effort — the in-memory update below
-  // still applies either way.
+  // overwrites set vars, so mirror into process.env too). Best-effort — the
+  // in-memory update below still applies either way.
   writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: trimmed });
   process.env.OPENLLM_CLOUD_ORIGIN = trimmed;
-  try {
-    rmSync(cloudOriginFile(), { force: true });
-  } catch {
-    // best-effort cleanup of the now-migrated legacy file
-  }
   const current = daemonEnv();
   cached = { ...current, cloudOrigin: trimmed, dashboardOrigin: trimmed };
 };

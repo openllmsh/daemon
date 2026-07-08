@@ -9,7 +9,7 @@
  *
  * Credentials pass through unchanged — same OPENLLM_* names as the real install:
  *   OPENLLM_CLOUD_ORIGIN=… OPENLLM_API_KEY=… bun run daemon:dist:install -- linux-arm64
- * (both are optional when ~/.openllm/daemon.env already exists — it's reused.)
+ * (both are optional when ~/.openllm/.env already exists — it's reused.)
  *
  * Build the artifacts first with `bun run daemon:dist`; this only runs them.
  */

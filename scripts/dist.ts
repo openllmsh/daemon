@@ -141,7 +141,7 @@ const main = async (): Promise<void> => {
     `\nEmitted ${wrapTargets.length} self-contained installer(s) → ${DIST_DIR}`,
   );
   console.log(
-    "Run on a target machine (reuses ~/.openllm/daemon.env when present):\n  OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... \\\n    bash openllmd-<target>.install.sh",
+    "Run on a target machine (reuses ~/.openllm/.env when present):\n  OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... \\\n    bash openllmd-<target>.install.sh",
   );
 };
 

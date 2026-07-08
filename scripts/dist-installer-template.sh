@@ -94,10 +94,6 @@ export PATH="$OPENLLMD_DIST_WORK/shim:$PATH"
 # install.sh always reads/writes $HOME/.openllm/.env, so reuse from there;
 # install.sh itself separately preserves the minted OPENLLM_DEVICE_ID.
 OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/.env"
-# Pre-rename fallback: reuse values from a legacy daemon.env when .env is absent.
-if [ ! -f "$OPENLLMD_DIST_ENV_FILE" ] && [ -f "$HOME/.openllm/daemon.env" ]; then
-  OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/daemon.env"
-fi
 _openllmd_dist_reuse() {  # $1=key → its value in the existing env file (or "")
   [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
   grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true
