@@ -58,7 +58,7 @@ import {
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
-import { fetchModelList } from "./fetch-model-list";
+import { fetchModelList, positiveInt } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -451,16 +451,14 @@ export const grokDelegate: TProviderDelegate = {
         };
         return (b.data ?? b.models ?? []).flatMap((m) => {
           if (typeof m.id !== "string" || m.id.length === 0) return [];
-          const ctx = Number(m.context_window ?? m.context_length);
+          const ctx = positiveInt(m.context_window ?? m.context_length);
           return [
             {
               provider_model_id: m.id,
               ...(typeof m.display_name === "string"
                 ? { display_name: m.display_name }
                 : {}),
-              ...(Number.isInteger(ctx) && ctx > 0
-                ? { context_window: ctx }
-                : {}),
+              ...(ctx !== undefined ? { context_window: ctx } : {}),
             },
           ];
         });

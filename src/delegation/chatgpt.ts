@@ -33,7 +33,7 @@ import {
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
-import { fetchModelList } from "./fetch-model-list";
+import { fetchModelList, positiveInt } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -423,16 +423,14 @@ export const chatgptDelegate: TProviderDelegate = {
         return (models ?? []).flatMap((m) => {
           if (typeof m.slug !== "string" || m.slug.length === 0) return [];
           if (m.visibility !== "list") return [];
-          const ctx = Number(m.context_window);
+          const ctx = positiveInt(m.context_window);
           return [
             {
               provider_model_id: m.slug,
               ...(typeof m.display_name === "string"
                 ? { display_name: m.display_name }
                 : {}),
-              ...(Number.isInteger(ctx) && ctx > 0
-                ? { context_window: ctx }
-                : {}),
+              ...(ctx !== undefined ? { context_window: ctx } : {}),
             },
           ];
         });

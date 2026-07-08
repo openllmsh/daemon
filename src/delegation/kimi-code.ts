@@ -47,7 +47,7 @@ import {
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
-import { fetchModelList } from "./fetch-model-list";
+import { fetchModelList, positiveInt } from "./fetch-model-list";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
@@ -697,13 +697,11 @@ export const kimiCodeDelegate: TProviderDelegate = {
           .data;
         return (data ?? []).flatMap((m) => {
           if (typeof m.id !== "string" || m.id.length === 0) return [];
-          const ctx = Number(m.context_length);
+          const ctx = positiveInt(m.context_length);
           return [
             {
               provider_model_id: m.id,
-              ...(Number.isInteger(ctx) && ctx > 0
-                ? { context_window: ctx }
-                : {}),
+              ...(ctx !== undefined ? { context_window: ctx } : {}),
             },
           ];
         });

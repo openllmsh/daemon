@@ -23,12 +23,27 @@ import { DELEGATES } from "./delegation";
 
 /** Mirrors the cloud's `MODEL_CACHE_TTL_MS` (1h, enforced on read). */
 const REPORT_TTL_MS = 60 * 60 * 1000;
+/**
+ * A null/empty fetch (signed out, vendor error) retries on THIS slower
+ * cadence instead of every 5-min bootstrap tick — a persistently failing
+ * provider must not burn a vendor call per tick forever. Reset per slug
+ * on a successful connect so a fresh login reports immediately.
+ */
+const FAILURE_RETRY_MS = 15 * 60 * 1000;
 
-const lastReportedAtMs = new Map<string, number>();
+type TAttempt = { readonly at: number; readonly ok: boolean };
+const lastAttempt = new Map<string, TAttempt>();
 
-/** Test-only: reset the per-provider throttle. */
-export const resetModelReportThrottle = (): void => {
-  lastReportedAtMs.clear();
+/** Reset the throttle — all slugs, or one (post-connect / tests). */
+export const resetModelReportThrottle = (slug?: string): void => {
+  if (slug === undefined) lastAttempt.clear();
+  else lastAttempt.delete(slug);
+};
+
+const isDue = (slug: string, now: number): boolean => {
+  const prev = lastAttempt.get(slug);
+  if (prev === undefined) return true;
+  return now - prev.at >= (prev.ok ? REPORT_TTL_MS : FAILURE_RETRY_MS);
 };
 
 /**
@@ -39,9 +54,7 @@ export const maybeReportModels = async (
   now: number = Date.now(),
 ): Promise<void> => {
   const due = Object.entries(DELEGATES).filter(
-    ([slug, delegate]) =>
-      delegate.listModels !== undefined &&
-      now - (lastReportedAtMs.get(slug) ?? 0) >= REPORT_TTL_MS,
+    ([slug, delegate]) => delegate.listModels !== undefined && isDue(slug, now),
   );
   // Fetch concurrently — each delegate's call is individually bounded
   // (`fetchModelList`), but sequential awaits would still let one slow
@@ -55,13 +68,14 @@ export const maybeReportModels = async (
   );
   const entries: TDaemonModelReportEntry[] = [];
   for (const { slug, models } of results) {
-    if (models === null || models.length === 0) continue;
-    entries.push({ provider: slug, models });
-    // Stamp on successful FETCH, not successful report — if the report
-    // POST fails the next tick retries (reportModels swallows errors,
-    // so stamp before the send and accept a lost hour on cloud failure;
-    // the cloud row just goes stale → catalog fallback, not corruption).
-    lastReportedAtMs.set(slug, now);
+    // EVERY attempt stamps — a failed/empty fetch backs off on
+    // FAILURE_RETRY_MS rather than re-firing each bootstrap tick.
+    const ok = models !== null && models.length > 0;
+    // Stamp on FETCH, not successful report — if the report POST fails
+    // the next TTL tick retries (reportModels swallows errors; the
+    // cloud row just goes stale → catalog fallback, not corruption).
+    lastAttempt.set(slug, { at: now, ok });
+    if (ok) entries.push({ provider: slug, models });
   }
   if (entries.length === 0) return;
   await reportModels({ entries });

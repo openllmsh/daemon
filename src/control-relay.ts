@@ -16,7 +16,7 @@ import { getDelegate } from "./delegation";
 import { probeIntegration } from "./device-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
-import { maybeReportModels } from "./model-report";
+import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
@@ -50,10 +50,12 @@ export const runCommandInner = async (
         }
         const r = await delegate.connect();
         // A login that just landed is the freshest moment to report this
-        // provider's live model list to the cloud's model cache (the
-        // throttle is per-provider, so a first-time connect reports
-        // immediately). Fire-and-forget — never delays the ack.
+        // provider's live model list to the cloud's model cache. Clear
+        // THIS slug's throttle first — pre-login attempts stamped it
+        // with a failure backoff, and a fresh credential must report
+        // immediately. Fire-and-forget — never delays the ack.
         if (r.connected) {
+          resetModelReportThrottle(cmd.payload.slug);
           void maybeReportModels().catch(() => {});
         }
         return { id: cmd.id, status: "done", result: r };

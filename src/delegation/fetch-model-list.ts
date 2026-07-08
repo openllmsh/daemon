@@ -1,12 +1,15 @@
 import type { TProviderModelEntry } from "@quantidexyz/openllmp";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@quantidexyz/openllmp";
 
 /**
- * Bound on a delegate's vendor model-list fetch — matches the
- * cloud-side refresher (`packages/api/lib/model-list-refresh.ts`).
- * Without it a half-open connection would hang the daemon's report
- * path indefinitely instead of degrading to catalog fallback.
+ * Coerce a provider-reported value into a positive integer, or
+ * `undefined` — the shared shape check for `context_window` /
+ * `context_length` fields across the delegate parsers.
  */
-export const MODEL_LIST_FETCH_TIMEOUT_MS = 10_000;
+export const positiveInt = (v: unknown): number | undefined => {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+};
 
 /**
  * Shared fetch for delegate `listModels()` implementations: bounded
