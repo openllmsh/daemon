@@ -42,6 +42,9 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+// NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
+// both sides only dereference the other's exports lazily inside functions.
+import { logWarn } from "./logger";
 
 export type TDaemonEnv = {
   /** The user's `sk-llm-...` key, or null until the dashboard sets it. */
@@ -328,9 +331,12 @@ export const setCloudOrigin = (origin: string): void => {
   const trimmed = origin.replace(/\/+$/, "");
   if (trimmed.length === 0) return;
   // Persist into the shared env file (single source; `loadEnvFile` never
-  // overwrites set vars, so mirror into process.env too). Best-effort — the
-  // in-memory update below still applies either way.
-  writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: trimmed });
+  // overwrites set vars, so mirror into process.env too). A failed write is
+  // surfaced but non-fatal — the in-memory update below still applies for
+  // this process; only restart durability is lost.
+  if (!writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: trimmed })) {
+    logWarn("env", "failed to persist OPENLLM_CLOUD_ORIGIN to the env file");
+  }
   process.env.OPENLLM_CLOUD_ORIGIN = trimmed;
   const current = daemonEnv();
   cached = { ...current, cloudOrigin: trimmed, dashboardOrigin: trimmed };
