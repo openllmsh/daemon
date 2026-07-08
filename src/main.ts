@@ -42,6 +42,7 @@ import { daemonPort, deviceId, hasApiKey, isDevMode, stateDir } from "./env";
 import { buildHealth } from "./health";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
+import { maybeReportModels } from "./model-report";
 import { applyDaemonSandbox, sandboxState } from "./sandbox/landlock";
 import {
   beginRequest,
@@ -148,6 +149,9 @@ const main = async (): Promise<void> => {
     void refreshDeviceState()
       .then(() => pushStatusIfChanged())
       .catch((err) => logError("main", err));
+    // First model-list report — connected delegates' live lists reach
+    // the cloud's model cache at boot instead of on the first 5-min tick.
+    void maybeReportModels().catch((err) => logError("main", err));
   }
   const scheduleBootstrap = (): void => {
     const delay =
@@ -171,6 +175,13 @@ const main = async (): Promise<void> => {
         // Periodic version check — picks up a release published while running.
         void maybeSelfUpdate(latestVersion());
         void maybeUpdateCli(latestCliVersion());
+        // Report connected delegates' live model lists to the cloud's
+        // model cache (throttled internally to the cache TTL, so this
+        // 5-min tick costs at most one vendor list call per provider
+        // per hour). Cloud-gated: keyless/unreachable ticks are skipped.
+        if (getCloudState() === "ok") {
+          void maybeReportModels().catch((err) => logError("main", err));
+        }
         // A deploy that changed the relay bundle provisions a NEW
         // content-addressed box; a healthy socket to the OLD box never
         // re-fetches the channel on its own, leaving this daemon invisible to

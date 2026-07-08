@@ -13,6 +13,7 @@
 import { hostname } from "node:os";
 import type {
   TDaemonBootstrap,
+  TDaemonModelReport,
   TDaemonRecordRequest,
   TDaemonSearchResponse,
   TRelayChannelResponse,
@@ -166,6 +167,27 @@ export const recordRequest = async (
     });
   } catch {
     // swallow — usage recording is non-critical telemetry
+  }
+};
+
+/**
+ * Report the live model lists this daemon's connected delegates observed
+ * (`POST /api/daemon/models` — live-provider-model-catalog proposal §4).
+ * Metadata only (model ids + optional display/context data, never a
+ * credential). Best-effort: a failed report just leaves the cloud's
+ * model-cache row stale → static-catalog fallback.
+ */
+export const reportModels = async (
+  report: TDaemonModelReport,
+): Promise<void> => {
+  try {
+    await cloudFetch(cloudUrl("/api/daemon/models"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(report),
+    });
+  } catch {
+    // swallow — model-list reporting is non-critical metadata
   }
 };
 

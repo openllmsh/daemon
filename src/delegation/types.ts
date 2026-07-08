@@ -1,5 +1,6 @@
 import type {
   TDaemonProviderConnection,
+  TProviderModelEntry,
   TProviderUsageSnapshot,
 } from "@quantidexyz/openllmp";
 
@@ -80,6 +81,18 @@ export type TProviderDelegate = {
    * credential + identity. Metadata only.
    */
   usage: () => Promise<TProviderUsageSnapshot>;
+
+  /**
+   * Fetch the vendor's LIVE model list using the official CLI's own
+   * credential (e.g. Kimi's `GET /coding/v1/models`). Metadata only —
+   * model ids + optional display/context data, reported to the cloud's
+   * `POST /api/daemon/models` so `/v1/models` reflects what this
+   * subscription actually serves (live-provider-model-catalog proposal
+   * §4). Absent on providers without a listing endpoint (they keep the
+   * static-catalog fallback). Returns `null` on any failure — never an
+   * empty list.
+   */
+  listModels?: () => Promise<ReadonlyArray<TProviderModelEntry> | null>;
 
   /**
    * Produce, for ONE inference call: the bearer (from the official CLI's store),

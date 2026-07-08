@@ -16,6 +16,7 @@ import { getDelegate } from "./delegation";
 import { probeIntegration } from "./device-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
+import { maybeReportModels } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
@@ -48,6 +49,13 @@ export const runCommandInner = async (
           };
         }
         const r = await delegate.connect();
+        // A login that just landed is the freshest moment to report this
+        // provider's live model list to the cloud's model cache (the
+        // throttle is per-provider, so a first-time connect reports
+        // immediately). Fire-and-forget — never delays the ack.
+        if (r.connected) {
+          void maybeReportModels().catch(() => {});
+        }
         return { id: cmd.id, status: "done", result: r };
       }
       case "install_integration":

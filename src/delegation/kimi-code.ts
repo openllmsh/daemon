@@ -675,6 +675,45 @@ export const kimiCodeDelegate: TProviderDelegate = {
     }
   },
 
+  listModels: async () => {
+    // Same `GET /coding/v1/models` call `provisionModelConfig` makes —
+    // the vendor's per-subscription list (ids + `context_length`),
+    // reported to the cloud's model cache so `/v1/models` reflects what
+    // THIS subscription actually serves. Metadata only; null on any
+    // failure (never an empty list).
+    const token = await readToken();
+    if (token === null) return null;
+    try {
+      const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
+      const resp = await fetch(`${base}/models`, {
+        headers: {
+          authorization: `Bearer ${token.accessToken}`,
+          ...(await identityHeaders()),
+          accept: "application/json",
+        },
+      });
+      if (!resp.ok) return null;
+      const body = (await resp.json()) as {
+        data?: ReadonlyArray<Record<string, unknown>>;
+      };
+      const entries = (body.data ?? []).flatMap((m) => {
+        if (typeof m.id !== "string" || m.id.length === 0) return [];
+        const ctx = Number(m.context_length);
+        return [
+          {
+            provider_model_id: m.id,
+            ...(Number.isInteger(ctx) && ctx > 0
+              ? { context_window: ctx }
+              : {}),
+          },
+        ];
+      });
+      return entries.length > 0 ? entries : null;
+    } catch {
+      return null;
+    }
+  },
+
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
