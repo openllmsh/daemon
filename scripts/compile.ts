@@ -12,10 +12,7 @@
  * shipping the proprietary pipeline + decoupling the daemon's release
  * cadence from `core`, not raw bytes.)
  *
- * Targets (no Windows): darwin-{arm64,x64-baseline}, linux-{x64-baseline,arm64}.
- * x64 uses the `baseline` (Nehalem) tier — no AVX/AVX2/FMA required, runs on
- * any x86_64 CPU from 2008 onward. Slightly slower than `haswell` on modern
- * silicon, but the daemon's I/O-bound workload makes the difference negligible.
+ * Targets (no Windows): darwin-{arm64,x64}, linux-{x64,arm64}.
  *
  * Usage:
  *   bun run packages/daemon/scripts/compile.ts            # all targets
@@ -106,8 +103,8 @@ const resolveCloudOrigin = (): string => {
 
 const TARGETS = [
   "bun-darwin-arm64",
-  "bun-darwin-x64-baseline",
-  "bun-linux-x64-baseline",
+  "bun-darwin-x64",
+  "bun-linux-x64",
   "bun-linux-arm64",
 ] as const;
 
