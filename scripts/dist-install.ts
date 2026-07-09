@@ -23,8 +23,8 @@ const DIST_DIR = join(REPO_ROOT, "packages", "daemon", "dist");
 
 const ALL_TARGETS = [
   "darwin-arm64",
-  "darwin-x64",
-  "linux-x64",
+  "darwin-x64-baseline",
+  "linux-x64-baseline",
   "linux-arm64",
 ] as const;
 type TTarget = (typeof ALL_TARGETS)[number];
@@ -41,10 +41,14 @@ const hostTarget = (): TTarget => {
         ? "linux"
         : null;
   const arch =
-    process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
+    process.arch === "arm64"
+      ? "arm64"
+      : process.arch === "x64"
+        ? "x64-baseline"
+        : null;
   if (os === null || arch === null) {
     throw new Error(
-      `unsupported host ${process.platform}/${process.arch} (daemon targets are macOS/Linux on arm64/x64)`,
+      `unsupported host ${process.platform}/${process.arch} (daemon targets are macOS/Linux on arm64/x64-baseline)`,
     );
   }
   return `${os}-${arch}` as TTarget;

@@ -94,12 +94,16 @@ export const trackBodyDone = (
 };
 
 /**
- * This host's release target (`darwin-arm64` / `darwin-x64` / `linux-x64` /
- * `linux-arm64`), or null if it isn't one we publish. `process.arch` reports
- * `arm64` / `x64`, matching the server's `DAEMON_TARGETS` naming.
+ * This host's release target (`darwin-arm64` / `darwin-x64-baseline` /
+ * `linux-x64-baseline` / `linux-arm64`), or null if it isn't one we publish.
+ * `process.arch` reports `arm64` / `x64`; x64 maps to the `-baseline` variant
+ * (the single x64 release target).
  */
 export const currentTarget = (): TDaemonTarget | null => {
-  const t = `${process.platform}-${process.arch}`;
+  const arch =
+    process.arch === "x64" ? "x64-baseline" : process.arch === "arm64" ? "arm64" : null;
+  if (arch === null) return null;
+  const t = `${process.platform}-${arch}`;
   return (DAEMON_TARGETS as readonly string[]).includes(t)
     ? (t as TDaemonTarget)
     : null;
