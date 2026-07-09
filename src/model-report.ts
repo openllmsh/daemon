@@ -14,6 +14,8 @@
  * so re-reporting on the same period keeps the row perpetually fresh
  * with the minimum number of vendor calls. Per-provider throttle: one
  * delegate's failure (returns null) doesn't block another's cadence.
+ * A vendor CLI version change bypasses the TTL because some providers
+ * gate model visibility by client version (Codex does this today).
  * Metadata only — model ids + optional display/context data; failures
  * are silently dropped (the cloud falls back to the static catalog).
  */
@@ -21,8 +23,8 @@ import type { TDaemonModelReportEntry } from "@quantidexyz/openllmp";
 import { reportModels } from "./cloud-client";
 import { DELEGATES } from "./delegation";
 
-/** Mirrors the cloud's `MODEL_CACHE_TTL_MS` (1h, enforced on read). */
-const REPORT_TTL_MS = 60 * 60 * 1000;
+/** Mirrors the cloud's `MODEL_CACHE_TTL_MS` (30m, enforced on read). */
+const REPORT_TTL_MS = 30 * 60 * 1000;
 /**
  * A null/empty fetch (signed out, vendor error) retries on THIS slower
  * cadence instead of every 5-min bootstrap tick — a persistently failing
@@ -31,7 +33,11 @@ const REPORT_TTL_MS = 60 * 60 * 1000;
  */
 const FAILURE_RETRY_MS = 15 * 60 * 1000;
 
-type TAttempt = { readonly at: number; readonly ok: boolean };
+type TAttempt = {
+  readonly at: number;
+  readonly ok: boolean;
+  readonly cliVersion?: string;
+};
 const lastAttempt = new Map<string, TAttempt>();
 
 /** Reset the throttle — all slugs, or one (post-connect / tests). */
@@ -40,9 +46,14 @@ export const resetModelReportThrottle = (slug?: string): void => {
   else lastAttempt.delete(slug);
 };
 
-const isDue = (slug: string, now: number): boolean => {
+const isDue = (
+  slug: string,
+  now: number,
+  cliVersion: string | undefined,
+): boolean => {
   const prev = lastAttempt.get(slug);
   if (prev === undefined) return true;
+  if (cliVersion !== undefined && cliVersion !== prev.cliVersion) return true;
   return now - prev.at >= (prev.ok ? REPORT_TTL_MS : FAILURE_RETRY_MS);
 };
 
@@ -53,28 +64,43 @@ const isDue = (slug: string, now: number): boolean => {
 export const maybeReportModels = async (
   now: number = Date.now(),
 ): Promise<void> => {
-  const due = Object.entries(DELEGATES).filter(
-    ([slug, delegate]) => delegate.listModels !== undefined && isDue(slug, now),
+  const candidates = await Promise.all(
+    Object.entries(DELEGATES)
+      .filter(([, delegate]) => delegate.listModels !== undefined)
+      .map(async ([slug, delegate]) => {
+        const conn = await delegate.status().catch(() => null);
+        const cliVersion = conn?.cli_version;
+        return isDue(slug, now, cliVersion)
+          ? { slug, delegate, cliVersion }
+          : null;
+      }),
   );
+  const due = candidates.filter((c) => c !== null);
+
   // Fetch concurrently — each delegate's call is individually bounded
   // (`fetchModelList`), but sequential awaits would still let one slow
   // vendor delay every other provider's report.
   const results = await Promise.all(
-    due.map(async ([slug, delegate]) => ({
+    due.map(async ({ slug, delegate, cliVersion }) => ({
       slug,
+      cliVersion,
       models: await (delegate.listModels?.().catch(() => null) ??
         Promise.resolve(null)),
     })),
   );
   const entries: TDaemonModelReportEntry[] = [];
-  for (const { slug, models } of results) {
+  for (const { slug, cliVersion, models } of results) {
     // EVERY attempt stamps — a failed/empty fetch backs off on
     // FAILURE_RETRY_MS rather than re-firing each bootstrap tick.
     const ok = models !== null && models.length > 0;
     // Stamp on FETCH, not successful report — if the report POST fails
     // the next TTL tick retries (reportModels swallows errors; the
     // cloud row just goes stale → catalog fallback, not corruption).
-    lastAttempt.set(slug, { at: now, ok });
+    lastAttempt.set(slug, {
+      at: now,
+      ok,
+      ...(cliVersion ? { cliVersion } : {}),
+    });
     if (ok) entries.push({ provider: slug, models });
   }
   if (entries.length === 0) return;
