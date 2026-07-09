@@ -430,10 +430,13 @@ const spliceAnthropicWebSearchBlocks = (
  * headers + the subscription bearer layered on top. The wire-derived headers
  * (anthropic-version / anthropic-beta / content-type) are layered last by
  * `buildUpstreamRequest`/`buildUpstreamHeaders`. So a genuine vendor-CLI request
- * reaches the vendor with ITS real identity; the daemon forges nothing and only
- * swaps in the bearer (+ the user's own account id where required). Returns
- * "retry" when no usable local credential is available, so the walker falls
- * through.
+ * reaches the vendor with ITS real identity; the daemon swaps in the bearer
+ * (+ the user's own account id where required) and never overrides an identity
+ * the originator already presents. The delegate receives the inbound headers so
+ * it can BACKFILL a vendor-CLI identity the originator lacks — chatgpt does this
+ * for models the Codex backend gates on `originator: codex_cli_rs` (see its
+ * `credentialForUpstream`). Returns "retry" when no usable local credential is
+ * available, so the walker falls through.
  */
 const acquireUpstream = async (
   provider: string,
@@ -442,7 +445,7 @@ const acquireUpstream = async (
   const delegate = getDelegate(provider);
   if (delegate === null) return "retry";
   try {
-    const cred = await delegate.credentialForUpstream();
+    const cred = await delegate.credentialForUpstream(args.req.headers);
     return {
       headers: {
         ...originatorHeadersFrom(args.req.headers),

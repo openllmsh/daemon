@@ -99,12 +99,18 @@ export type TProviderDelegate = {
    * the request TARGET `url` (captured from a real CLI request, or the default),
    * and only the CREDENTIAL-INTRINSIC `headers` — the small set the request can't
    * work without and that is genuinely the user's own (e.g. chatgpt's
-   * `chatgpt-account-id`), NOT a synthesized CLI identity. The walker layers the
-   * ORIGINATOR's own headers underneath and the wire-derived headers on top, so
-   * a genuine vendor-CLI request reaches the vendor verbatim. Used ONLY by the
-   * local runner; never leaves the machine.
+   * `chatgpt-account-id`). The walker layers the ORIGINATOR's own headers
+   * underneath and the wire-derived headers on top, so a genuine vendor-CLI
+   * request reaches the vendor verbatim. Used ONLY by the local runner; never
+   * leaves the machine.
+   *
+   * `inbound` is the originator's own request headers, so a delegate can tell
+   * whether the caller ALREADY presents the vendor CLI's identity and only fill
+   * in what's missing (chatgpt does this: some models are gated on a
+   * `codex_cli_rs` originator + user-agent). A delegate that needs no such
+   * backfill ignores it.
    */
-  credentialForUpstream: () => Promise<{
+  credentialForUpstream: (inbound?: Headers) => Promise<{
     readonly access_token: string;
     readonly headers: Readonly<Record<string, string>>;
     readonly url: string;

@@ -14,7 +14,9 @@
  *     auth_mode:"chatgpt".
  *   - Upstream identity: originator `codex_cli_rs`, User-Agent
  *     `codex_cli_rs/<ver> (<os>; <arch>) <terminal>`, plus
- *     `ChatGPT-Account-Id: <account_id>`.
+ *     `ChatGPT-Account-Id: <account_id>`. On inference the first two are
+ *     BACKFILLED only when the originator doesn't already present them —
+ *     the backend gates some models (gpt-5.6-luna) on that identity.
  *   - Usage: GET https://chatgpt.com/backend-api/wham/usage.
  */
 import { rm } from "node:fs/promises";
@@ -192,6 +194,20 @@ const userAgent = async (): Promise<string> => {
   return `codex_cli_rs/${semver} (${process.platform}; ${process.arch}) openllmd`;
 };
 
+/** The originator string the Codex CLI stamps on its own requests. */
+const CODEX_ORIGINATOR = "codex_cli_rs";
+/** A Codex user-agent is `codex_cli_rs/<ver> …` — the product token is the gate;
+ *  a codex originator paired with a generic UA is still rejected upstream. */
+const CODEX_UA_PREFIX = /^codex_cli_rs\//;
+
+/** The originator already identifies itself as codex (a real `codex` request
+ *  proxied through the daemon) — nothing to backfill. */
+const hasCodexOriginator = (inbound?: Headers): boolean =>
+  inbound?.get("originator") === CODEX_ORIGINATOR;
+
+const hasCodexUserAgent = (inbound?: Headers): boolean =>
+  CODEX_UA_PREFIX.test(inbound?.get("user-agent") ?? "");
+
 // ─── Login wiring ────────────────────────────────────────────────────────
 //
 // codex's browser `connect` and device-code `connectDeviceCode` share ONE
@@ -323,7 +339,7 @@ export const chatgptDelegate: TProviderDelegate = {
             ? { "chatgpt-account-id": token.accountId }
             : {}),
           "user-agent": await userAgent(),
-          originator: "codex_cli_rs",
+          originator: CODEX_ORIGINATOR,
           accept: "application/json",
         },
       });
@@ -438,20 +454,30 @@ export const chatgptDelegate: TProviderDelegate = {
     );
   },
 
-  credentialForUpstream: async () => {
+  credentialForUpstream: async (inbound?: Headers) => {
     const token = await readToken();
     if (token === null) {
       throw new Error("chatgpt: not signed in (no stored credential)");
     }
     // Resolve only the request TARGET URL (captured from the genuine `codex`
-    // request, or the default). The ONE credential-intrinsic header injected is
-    // `chatgpt-account-id` — the user's OWN account, read from the store, which
-    // routes the request to their subscription (not a synthesized CLI identity).
-    // Everything else (user-agent, originator, …) rides through from the
-    // originator's own request.
+    // request, or the default). `chatgpt-account-id` is the credential-intrinsic
+    // header — the user's OWN account, read from the store, which routes the
+    // request to their subscription.
     const url = await resolveUpstreamUrl(PROVIDER);
     const headers: Record<string, string> =
       token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
+
+    // Codex-CLI identity BACKFILL. The Codex backend gates some models on the
+    // caller being codex: `gpt-5.6-luna` 404s ("Model not found") unless the
+    // request carries BOTH `originator: codex_cli_rs` AND a `codex_cli_rs/<ver>`
+    // user-agent (verified live — a codex originator with a generic UA still
+    // 404s; gpt-5.6-sol/terra have no such gate). We only fill in what the
+    // originator does NOT already present, so a genuine `codex` request still
+    // reaches the vendor with ITS own identity byte-for-byte and keeps its
+    // upstream request-correlation.
+    if (!hasCodexOriginator(inbound)) headers.originator = CODEX_ORIGINATOR;
+    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = await userAgent();
+
     return { access_token: token.accessToken, headers, url };
   },
 
