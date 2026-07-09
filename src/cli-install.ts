@@ -66,19 +66,69 @@ export const linkIsolatedCli = async (
  * (`hostCliCandidates`), link it first, then probe. A user who installs the CLI
  * out of band (the daemon install script, or by hand) therefore shows as
  * installed on the next status read with no command. Best-effort version read.
+ *
+ * Results are cached for `CLI_INSTALL_STATE_TTL_MS` (default 30 s) so the
+ * 2.5 s status watcher does not spawn `--version` on every tick. The version
+ * of an installed CLI only changes on self-update, which restarts the daemon
+ * anyway — so a short cache is safe for status accuracy.
  */
+
+/** Cache TTL — 30 s balances accuracy against the 2.5 s status watcher. */
+const CLI_INSTALL_STATE_TTL_MS = 30_000;
+
+interface CliInstallCacheEntry {
+  readonly result: TCliInstallState;
+  readonly expiresAt: number;
+}
+
+/** Per-provider cache of `cliInstallState` results. */
+const cliInstallStateCache = new Map<TCliProvider, CliInstallCacheEntry>();
+
+/**
+ * Clear the `cliInstallState` cache — used by tests that change
+ * `OPENLLM_DAEMON_STATE_DIR` between calls, and by the self-update handler
+ * after a CLI binary is swapped on disk.
+ */
+export const clearCliInstallStateCache = (): void => {
+  cliInstallStateCache.clear();
+};
+
 export const cliInstallState = async (
   provider: TCliProvider,
 ): Promise<TCliInstallState> => {
+  const cached = cliInstallStateCache.get(provider);
+  if (cached !== undefined && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
   const bin = cliBin(provider);
   if (!existsSync(bin)) {
     // No isolated run-view yet — link it from the host binary if that exists.
     const host = hostCliCandidates(provider).find((c) => existsSync(c));
-    if (host === undefined) return { installed: false, version: null };
+    if (host === undefined) {
+      const result: TCliInstallState = { installed: false, version: null };
+      cliInstallStateCache.set(provider, {
+        result,
+        expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+      });
+      return result;
+    }
     await linkIsolatedCli(provider, host);
   }
-  if (!existsSync(bin)) return { installed: false, version: null };
+  const notInstalled: TCliInstallState = { installed: false, version: null };
+  if (!existsSync(bin)) {
+    cliInstallStateCache.set(provider, {
+      result: notInstalled,
+      expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+    });
+    return notInstalled;
+  }
   const out = await runCapture([bin, "--version"], cliEnv(provider));
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
-  return { installed: true, version };
+  const result: TCliInstallState = { installed: true, version };
+  cliInstallStateCache.set(provider, {
+    result,
+    expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+  });
+  return result;
 };
