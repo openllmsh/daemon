@@ -12,8 +12,8 @@
 
 export const DAEMON_TARGETS = [
   "darwin-arm64",
-  "darwin-x64",
-  "linux-x64",
+  "darwin-x64-baseline",
+  "linux-x64-baseline",
   "linux-arm64",
 ] as const;
 

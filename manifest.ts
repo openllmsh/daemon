@@ -8,18 +8,12 @@
 
 import type { TDaemonRelease } from "./release-types";
 
+// TODO: re-run release pipeline to generate correct baseline binaries + checksums
 export const DAEMON_RELEASE: TDaemonRelease = {
   repo: "quantidexyz/openllmd",
-  tag: "v1.6.15",
-  targets: ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"],
+  tag: "", // empty until baseline binaries published — API returns 503
+  targets: ["darwin-arm64", "darwin-x64-baseline", "linux-x64-baseline", "linux-arm64"],
   sha256: {
-    "darwin-arm64":
-      "eba2d9270bdf986ed6b510be254fea720cc773809a94bca0e0003d35217787c5",
-    "darwin-x64":
-      "c92413e1f78538f99211020242bbbd2c438b1b8d6d5a28080eeb95030195548d",
-    "linux-x64":
-      "da7cf9d1d2663f91ee00c3bc86bd88931e23f2f326f12f5437af42bf65829b1c",
-    "linux-arm64":
-      "a5046485c11034175415ebacca4bf7b4afe90ac3aa42de8334fc7e3e0662a0c5",
+    // TODO: fill with actual baseline binary checksums after release
   },
 };
