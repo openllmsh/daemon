@@ -25,6 +25,7 @@ import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import { logError, logInfo } from "../logger";
+import { accountHash } from "./account-id";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -321,7 +322,15 @@ export const chatgptDelegate: TProviderDelegate = {
                   ? "codex CLI installed but not signed in"
                   : "codex CLI not installed",
           }
-        : { last_login_at_ms: null }),
+        : {
+            last_login_at_ms: null,
+            // Stable ChatGPT account identity, hashed (`account-id.ts`) —
+            // `tokens.account_id` in auth.json (the same uuid as the
+            // id_token's `chatgpt_account_id` claim; survives refresh).
+            ...(token.accountId !== null
+              ? { account_hash: accountHash(PROVIDER, token.accountId) }
+              : {}),
+          }),
     };
   },
 

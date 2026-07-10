@@ -38,6 +38,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { accountHash, nonEmpty } from "./account-id";
 import {
   ensureAuthConfig,
   resolveProviderUrl,
@@ -103,6 +104,20 @@ const loadStore = async (): Promise<TClaudeStore | null> => {
   return readJsonFile<TClaudeStore>(
     join(cliConfigDir(PROVIDER), ".credentials.json"),
   );
+};
+
+/**
+ * Stable Anthropic account identity, hashed (`account_hash` — see
+ * `account-id.ts`). The CLI records the signed-in account in its config file
+ * (`<CLAUDE_CONFIG_DIR>/.claude.json` → `oauthAccount.accountUuid`), which
+ * survives token refresh. NOT `machineID`/`userID` — those are per-device.
+ */
+const readAccountHash = async (): Promise<string | null> => {
+  const cfg = await readJsonFile<{
+    readonly oauthAccount?: { readonly accountUuid?: string };
+  }>(join(cliConfigDir(PROVIDER), ".claude.json"));
+  const id = nonEmpty(cfg?.oauthAccount?.accountUuid);
+  return id === null ? null : accountHash(PROVIDER, id);
 };
 
 /**
@@ -351,6 +366,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // green card that silently dies at access-token expiry.
     const unrefreshable =
       connected && (await credentialRefreshable()) === false;
+    const acct = connected ? await readAccountHash() : null;
     return {
       provider: PROVIDER,
       connected,
@@ -359,6 +375,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       ...(connected
         ? {
             last_login_at_ms: null,
+            ...(acct !== null ? { account_hash: acct } : {}),
             ...(unrefreshable
               ? {
                   detail:

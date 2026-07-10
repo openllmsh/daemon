@@ -53,6 +53,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { accountHash, nonEmpty } from "./account-id";
 import {
   ensureAuthConfig,
   resolveProviderUrl,
@@ -131,6 +132,9 @@ type TGrokSession = {
   readonly expires_at?: string;
   /** ISO-8601 session creation time — used to pick the newest session. */
   readonly create_time?: string;
+  /** The xAI account uuid (= `principal_id`) — stable across sessions;
+   *  feeds `account_hash`. NOT `agent_id`, which is per-device. */
+  readonly user_id?: string;
 };
 type TGrokStore = Readonly<Record<string, TGrokSession>>;
 
@@ -385,7 +389,17 @@ export const grokDelegate: TProviderDelegate = {
                   ? "grok CLI installed but not signed in"
                   : "grok CLI not installed",
           }
-        : { last_login_at_ms: null }),
+        : {
+            last_login_at_ms: null,
+            // Stable xAI account identity, hashed (`account-id.ts`) — the
+            // newest session's `user_id` (= `principal_id`) in auth.json.
+            ...(await (async (): Promise<{ account_hash?: string }> => {
+              const id = nonEmpty((await newestSession())?.user_id);
+              return id === null
+                ? {}
+                : { account_hash: accountHash(PROVIDER, id) };
+            })()),
+          }),
     };
   },
 
