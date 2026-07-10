@@ -197,9 +197,12 @@ box. Non-stream messages responses get the native `server_tool_use` /
 its metadata row (`POST /api/daemon/requests`); the cloud's
 `daemonRecordHandler` recomputes `cost_usd` from those tokens (the single
 pricing source of truth — no pricing table is shipped to the box, and
-`cost_usd` is not even on the daemon→cloud wire). Token counts are accurate
-for streaming too: the walker tees the canonical-chunk stream and
-accumulates usage off one branch while the client reads the other.
+`cost_usd` is not even on the daemon→cloud wire). The row carries the
+prompt-cache split (`cached_tokens` / `cache_creation_tokens`, both optional
+so an older daemon still records) because `tokens_in` INCLUDES those tokens
+and the cloud prices them at the cache rates, not the input rate. Token
+counts are accurate for streaming too: the walker tees the canonical-chunk
+stream and accumulates usage off one branch while the client reads the other.
 
 **Validated live** (`RUN_DAEMON_LIVE=1`, `tests/server/daemon-walker-live
 .e2e.test.ts`) against the real authenticated CLIs, through the full

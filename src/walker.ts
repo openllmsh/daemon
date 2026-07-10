@@ -379,11 +379,29 @@ const decodeUpstreamJson = (
   return { ...(json as TChatCompletionResponse), model: providerModelId };
 };
 
-const tokensFromCanonical = (
-  resp: TChatCompletionResponse,
-): { tokens_in: number; tokens_out: number } => ({
+// runtime-only: the token counts the daemon reports to the cloud. `tokens_in`
+// is the canonical prompt-token total and INCLUDES the two cache fields; the
+// cloud prices the split at the cache rates rather than the input rate.
+type TWalkerTokens = {
+  readonly tokens_in: number;
+  readonly tokens_out: number;
+  readonly cached_tokens: number;
+  readonly cache_creation_tokens: number;
+};
+
+const ZERO_TOKENS: TWalkerTokens = {
+  tokens_in: 0,
+  tokens_out: 0,
+  cached_tokens: 0,
+  cache_creation_tokens: 0,
+};
+
+const tokensFromCanonical = (resp: TChatCompletionResponse): TWalkerTokens => ({
   tokens_in: resp.usage?.prompt_tokens ?? 0,
   tokens_out: resp.usage?.completion_tokens ?? 0,
+  cached_tokens: resp.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+  cache_creation_tokens:
+    resp.usage?.prompt_tokens_details?.cache_creation_tokens ?? 0,
 });
 
 // ─── web_search (§5) ──────────────────────────────────────────────────
@@ -743,14 +761,8 @@ const serveSubscription = async (
     latency_ms: Date.now() - args.startedAt,
     endpoint: args.endpoint,
   } satisfies Partial<TDaemonRecordRequest>;
-  const recordTokens = (u: {
-    readonly tokens_in: number;
-    readonly tokens_out: number;
-  }): void =>
-    report(
-      { ...baseRow, tokens_in: u.tokens_in, tokens_out: u.tokens_out },
-      args.originParam,
-    );
+  const recordTokens = (u: TWalkerTokens): void =>
+    report({ ...baseRow, ...u }, args.originParam);
 
   // ── Client wants a live stream ──────────────────────────────────────
   // First-class path: stream chunk-by-chunk, re-encoding to the client's
@@ -781,7 +793,7 @@ const serveSubscription = async (
     const meter = (chunks: ReadableStream<TChatCompletionChunk>): void => {
       void accumulateChunksToResponse(chunks, hop.providerModelId)
         .then((r) => recordTokens(tokensFromCanonical(r)))
-        .catch(() => recordTokens({ tokens_in: 0, tokens_out: 0 }));
+        .catch(() => recordTokens(ZERO_TOKENS));
     };
     if (passthrough) {
       // Same wire in and out — the client gets the upstream bytes verbatim
@@ -834,7 +846,7 @@ const serveSubscription = async (
         hop.providerModelId,
       );
     } catch {
-      recordTokens({ tokens_in: 0, tokens_out: 0 });
+      recordTokens(ZERO_TOKENS);
       return errorJson(502, "upstream stream ended before producing output");
     }
     recordTokens(tokensFromCanonical(canonical));
@@ -852,7 +864,7 @@ const serveSubscription = async (
   try {
     upstreamJson = JSON.parse(text);
   } catch {
-    recordTokens({ tokens_in: 0, tokens_out: 0 });
+    recordTokens(ZERO_TOKENS);
     return new Response(text, {
       status: resp.status,
       headers: passthroughHeaders(resp),
@@ -862,7 +874,7 @@ const serveSubscription = async (
   try {
     canonical = decodeUpstreamJson(wire, upstreamJson, hop.providerModelId);
   } catch {
-    recordTokens({ tokens_in: 0, tokens_out: 0 });
+    recordTokens(ZERO_TOKENS);
     return new Response(text, {
       status: resp.status,
       headers: passthroughHeaders(resp),
