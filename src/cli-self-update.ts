@@ -89,7 +89,12 @@ export const maybeUpdateCli = async (
   if (current === latest) return; // already converged
   const target = currentTarget();
   if (target === null) {
-    logWarn("cli-update", `unknown target ${process.platform}-${process.arch}`);
+    // No prebuilt binary for this arch — the openllmc repo README documents
+    // building the host binary (`bun run compile:host`).
+    logWarn(
+      "cli-update",
+      `unsupported host ${process.platform}-${process.arch} — no prebuilt openllmc for this arch; build from source: https://github.com/quantidexyz/openllmc#build-from-source`,
+    );
     return;
   }
   if (recentlyAttempted("cli", latest)) return;

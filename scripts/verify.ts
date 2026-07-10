@@ -27,7 +27,7 @@
  * Usage (via `bun run verify`):
  *   bun run verify                       # every published target vs the manifest
  *   bun run verify -- --host             # only this host's target
- *   bun run verify -- --target linux-x64 # one target
+ *   bun run verify -- --target linux-x64-baseline # one target
  *   bun run verify -- --file ./openllmd  # a local binary you have (installed/downloaded)
  *   bun run verify -- --installed        # the `openllmd` found on $PATH
  *
@@ -47,9 +47,17 @@ import { DAEMON_TARGETS } from "../release-types";
 const DOWNLOAD_TIMEOUT_MS = 60_000;
 
 /** This host's release target, or null when the platform/arch isn't one we
- *  publish. `process.arch` reports `arm64`/`x64`, matching `DAEMON_TARGETS`. */
+ *  publish. `process.arch` reports `arm64`/`x64`; x64 maps to the `-baseline`
+ *  variant (the single x64 release target), matching `DAEMON_TARGETS`. */
 const hostTarget = (): TDaemonTarget | null => {
-  const t = `${process.platform}-${process.arch}`;
+  const arch =
+    process.arch === "x64"
+      ? "x64-baseline"
+      : process.arch === "arm64"
+        ? "arm64"
+        : null;
+  if (arch === null) return null;
+  const t = `${process.platform}-${arch}`;
   return (DAEMON_TARGETS as readonly string[]).includes(t)
     ? (t as TDaemonTarget)
     : null;

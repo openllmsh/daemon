@@ -44,7 +44,14 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url)); // packages/daemon/s
 const REPO_ROOT = resolve(SCRIPT_DIR, "..", "..", "..");
 const DIST_DIR = join(REPO_ROOT, "packages", "daemon", "dist");
 const COMPILE_SCRIPT = join(SCRIPT_DIR, "compile.ts");
-const INSTALL_SH = join(REPO_ROOT, "packages", "setup", "daemon", "install.sh");
+const INSTALL_SH = join(
+  REPO_ROOT,
+  "packages",
+  "registry",
+  "setup",
+  "daemon",
+  "install.sh",
+);
 const TEMPLATE = join(SCRIPT_DIR, "dist-installer-template.sh");
 
 const ALL_TARGETS = [

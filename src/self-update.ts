@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
+import { DAEMON_RELEASE } from "../manifest";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
@@ -182,9 +183,11 @@ export const maybeSelfUpdate = async (
   if (latest === DAEMON_VERSION) return; // already converged
   const target = currentTarget();
   if (target === null) {
+    // No prebuilt binary for this arch — point at the source repo (build from
+    // source / request the arch) via DAEMON_RELEASE.repo.
     logWarn(
       "self-update",
-      `unknown target ${process.platform}-${process.arch}`,
+      `unsupported host ${process.platform}-${process.arch} — no prebuilt openllmd for this arch; see https://github.com/${DAEMON_RELEASE.repo}`,
     );
     return;
   }

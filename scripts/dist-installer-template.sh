@@ -31,7 +31,7 @@ OPENLLMD_DIST_SHA="__SHA__"
 # --- guard: refuse the wrong-arch installer (the embedded binary wouldn't run) ---
 _d_os=$(uname -s); _d_arch=$(uname -m)
 case "$_d_os" in Darwin) _d_os=darwin ;; Linux) _d_os=linux ;; *) echo "Unsupported OS: $_d_os" >&2; exit 1 ;; esac
-case "$_d_arch" in arm64|aarch64) _d_arch=arm64 ;; x86_64|amd64) _d_arch=x64 ;; *) echo "Unsupported arch: $_d_arch" >&2; exit 1 ;; esac
+case "$_d_arch" in arm64|aarch64) _d_arch=arm64 ;; x86_64|amd64) _d_arch=x64-baseline ;; *) echo "Unsupported arch: $_d_arch" >&2; exit 1 ;; esac
 if [ "${_d_os}-${_d_arch}" != "$OPENLLMD_DIST_TARGET" ]; then
   echo "This installer is built for ${OPENLLMD_DIST_TARGET}, but this machine is ${_d_os}-${_d_arch}." >&2
   echo "Copy openllmd-${_d_os}-${_d_arch}.install.sh to this machine instead." >&2
