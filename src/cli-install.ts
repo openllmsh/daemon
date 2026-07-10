@@ -85,12 +85,19 @@ interface CliInstallCacheEntry {
 const cliInstallStateCache = new Map<TCliProvider, CliInstallCacheEntry>();
 
 /**
+ * Generation token to invalidate in-flight probes. Incremented on each clear
+ * so concurrent probes that started before the clear do not write stale results.
+ */
+let cacheGeneration = 0;
+
+/**
  * Clear the `cliInstallState` cache — used by tests that change
  * `OPENLLM_DAEMON_STATE_DIR` between calls, and by the self-update handler
  * after a CLI binary is swapped on disk.
  */
 export const clearCliInstallStateCache = (): void => {
   cliInstallStateCache.clear();
+  cacheGeneration++;
 };
 
 export const cliInstallState = async (
@@ -101,34 +108,46 @@ export const cliInstallState = async (
     return cached.result;
   }
 
+  // Capture generation at probe start to guard against stale writes after clear.
+  const generation = cacheGeneration;
+
   const bin = cliBin(provider);
   if (!existsSync(bin)) {
     // No isolated run-view yet — link it from the host binary if that exists.
     const host = hostCliCandidates(provider).find((c) => existsSync(c));
     if (host === undefined) {
       const result: TCliInstallState = { installed: false, version: null };
-      cliInstallStateCache.set(provider, {
-        result,
-        expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
-      });
+      // Only write to cache if generation hasn't changed (cache not cleared).
+      if (generation === cacheGeneration) {
+        cliInstallStateCache.set(provider, {
+          result,
+          expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+        });
+      }
       return result;
     }
     await linkIsolatedCli(provider, host);
   }
   const notInstalled: TCliInstallState = { installed: false, version: null };
   if (!existsSync(bin)) {
-    cliInstallStateCache.set(provider, {
-      result: notInstalled,
-      expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
-    });
+    // Only write to cache if generation hasn't changed (cache not cleared).
+    if (generation === cacheGeneration) {
+      cliInstallStateCache.set(provider, {
+        result: notInstalled,
+        expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+      });
+    }
     return notInstalled;
   }
   const out = await runCapture([bin, "--version"], cliEnv(provider));
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };
-  cliInstallStateCache.set(provider, {
-    result,
-    expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
-  });
+  // Only write to cache if generation hasn't changed (cache not cleared).
+  if (generation === cacheGeneration) {
+    cliInstallStateCache.set(provider, {
+      result,
+      expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+    });
+  }
   return result;
 };
