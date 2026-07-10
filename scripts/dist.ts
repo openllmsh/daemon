@@ -17,7 +17,7 @@
  * Usage:
  *   bun run daemon:dist                       # all targets, version = package.json
  *   bun run daemon:dist -- --version 1.2.3    # stamp a specific version
- *   bun run daemon:dist -- --target linux-x64 # only wrap one target (still builds all)
+ *   bun run daemon:dist -- --target linux-x64-baseline # only wrap one target (still builds all)
  *
  * Run an emitted installer on a target box (OPENLLM_* names match the real
  * install + the shared .env; both are reused from an existing ~/.openllm/.env
@@ -49,8 +49,8 @@ const TEMPLATE = join(SCRIPT_DIR, "dist-installer-template.sh");
 
 const ALL_TARGETS = [
   "darwin-arm64",
-  "darwin-x64",
-  "linux-x64",
+  "darwin-x64-baseline",
+  "linux-x64-baseline",
   "linux-arm64",
 ] as const;
 type TTarget = (typeof ALL_TARGETS)[number];
