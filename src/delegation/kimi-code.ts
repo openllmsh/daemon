@@ -42,7 +42,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { accountHash, jwtClaims, nonEmpty } from "./account-id";
+import { accountHashField, jwtClaims } from "./account-id";
 import {
   ensureAuthConfig,
   resolveProviderUrl,
@@ -611,12 +611,10 @@ export const kimiCodeDelegate: TProviderDelegate = {
             // Stable Kimi account identity, hashed (`account-id.ts`) — the
             // `user_id` (= `sub`) claim of the stored access-token JWT. NOT
             // `device_id` (per-device) or `token_id`/`jti` (per-token).
-            ...((): { account_hash?: string } => {
-              const id = nonEmpty(jwtClaims(token.accessToken)?.user_id);
-              return id === null
-                ? {}
-                : { account_hash: accountHash(PROVIDER, id) };
-            })(),
+            ...accountHashField(
+              PROVIDER,
+              jwtClaims(token.accessToken)?.user_id,
+            ),
           }),
     };
   },

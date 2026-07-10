@@ -53,7 +53,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { accountHash, nonEmpty } from "./account-id";
+import { accountHashField } from "./account-id";
 import {
   ensureAuthConfig,
   resolveProviderUrl,
@@ -197,22 +197,24 @@ const refresh = makeRefresher({
 });
 
 /** Read the stored access token, triggering the CLI's native refresh near
- *  expiry (the CLI owns the store; we just re-read after a hard-expired await). */
-const readToken = async (): Promise<{ accessToken: string } | null> => {
+ *  expiry (the CLI owns the store; we just re-read after a hard-expired await).
+ *  Also returns the session the token came from, so callers (e.g. `status`'s
+ *  `account_hash`) don't re-read the store. */
+const readToken = async (): Promise<{
+  accessToken: string;
+  session: TGrokSession;
+} | null> => {
   const session = await newestSession();
   if (session?.key === undefined || session.key.length === 0) return null;
   const expiresAtMs = parseExpiryMs(session.expires_at);
   // Only trigger when the credential CAN be refreshed (a refresh token exists).
   const outcome = session.refresh_token ? await refresh(expiresAtMs) : "fresh";
-  if (outcome !== "awaited") return { accessToken: session.key };
+  if (outcome !== "awaited") return { accessToken: session.key, session };
   // Hard-expired path: the CLI refresh was awaited — re-read the rotated store.
   const fresh = await newestSession();
-  return {
-    accessToken:
-      fresh?.key !== undefined && fresh.key.length > 0
-        ? fresh.key
-        : session.key,
-  };
+  return fresh?.key !== undefined && fresh.key.length > 0
+    ? { accessToken: fresh.key, session: fresh }
+    : { accessToken: session.key, session };
 };
 
 // ─── Login wiring ────────────────────────────────────────────────────────
@@ -392,13 +394,9 @@ export const grokDelegate: TProviderDelegate = {
         : {
             last_login_at_ms: null,
             // Stable xAI account identity, hashed (`account-id.ts`) — the
-            // newest session's `user_id` (= `principal_id`) in auth.json.
-            ...(await (async (): Promise<{ account_hash?: string }> => {
-              const id = nonEmpty((await newestSession())?.user_id);
-              return id === null
-                ? {}
-                : { account_hash: accountHash(PROVIDER, id) };
-            })()),
+            // `user_id` (= `principal_id`) of the session `readToken`
+            // resolved, reused so the store isn't read twice.
+            ...accountHashField(PROVIDER, token.session.user_id),
           }),
     };
   },

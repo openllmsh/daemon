@@ -46,3 +46,16 @@ export const jwtClaims = (token: string): Record<string, unknown> | null => {
 /** A non-empty string claim/field, or null. */
 export const nonEmpty = (value: unknown): string | null =>
   typeof value === "string" && value.length > 0 ? value : null;
+
+/**
+ * Optional `account_hash` status field from a raw vendor id — `{}` when the
+ * id is missing/empty, so it composes into a status spread without emitting
+ * an empty hash.
+ */
+export const accountHashField = (
+  provider: string,
+  rawId: unknown,
+): { account_hash?: string } => {
+  const id = nonEmpty(rawId);
+  return id === null ? {} : { account_hash: accountHash(provider, id) };
+};
