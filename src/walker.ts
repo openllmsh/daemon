@@ -459,7 +459,10 @@ const spliceAnthropicWebSearchBlocks = (
 const acquireUpstream = async (
   provider: string,
   args: TWalkArgs,
-): Promise<{ headers: Record<string, string>; url: string } | "retry"> => {
+): Promise<
+  | { headers: Record<string, string>; url: string; accountHash: string | null }
+  | "retry"
+> => {
   const delegate = getDelegate(provider);
   if (delegate === null) return "retry";
   try {
@@ -471,6 +474,9 @@ const acquireUpstream = async (
         authorization: `Bearer ${cred.access_token}`,
       },
       url: cred.url,
+      // Rides onto the recorded row so the cloud attributes this hop's
+      // cost to the right vendor-account meter series.
+      accountHash: cred.account_hash ?? null,
     };
   } catch {
     return "retry";
@@ -499,7 +505,7 @@ const serveWithWebSearch = async (
 ): Promise<Response | "retry"> => {
   const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return "retry";
-  const { headers: baseHeaders, url } = acquired;
+  const { headers: baseHeaders, url, accountHash } = acquired;
   // Headers are computed once; the body is rebuilt per round from the
   // accumulated canonical (web_search appends tool results between rounds).
   const headers = buildUpstreamHeaders({
@@ -637,6 +643,7 @@ const serveWithWebSearch = async (
       status: statusFor(200),
       latency_ms: Date.now() - args.startedAt,
       endpoint: args.endpoint,
+      ...(accountHash !== null ? { account_hash: accountHash } : {}),
       ...tokensFromCanonical(final),
     },
     args.originParam,
@@ -693,7 +700,7 @@ const serveSubscription = async (
 ): Promise<Response | "retry"> => {
   const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return "retry";
-  const { headers: baseHeaders, url } = acquired;
+  const { headers: baseHeaders, url, accountHash } = acquired;
 
   const clientWantsStream =
     (args.rawBody as { stream?: unknown } | null)?.stream === true;
@@ -760,6 +767,7 @@ const serveSubscription = async (
     status: statusFor(resp.status),
     latency_ms: Date.now() - args.startedAt,
     endpoint: args.endpoint,
+    ...(accountHash !== null ? { account_hash: accountHash } : {}),
   } satisfies Partial<TDaemonRecordRequest>;
   const recordTokens = (u: TWalkerTokens): void =>
     report({ ...baseRow, ...u }, args.originParam);

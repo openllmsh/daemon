@@ -534,7 +534,14 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // the OAuth `anthropic-beta` + `anthropic-version` on top (isOAuth). Claude
     // has no per-credential header to add, so `headers` is empty.
     const url = await resolveUpstreamUrl(PROVIDER, { captureIfMissing: true });
-    return { access_token: token.accessToken, headers: {}, url };
+    const acct = await readAccountHash();
+    return {
+      access_token: token.accessToken,
+      headers: {},
+      url,
+      // Which account this hop's cost attributes to (recorded on the row).
+      ...(acct !== null ? { account_hash: acct } : {}),
+    };
   },
 
   logout: async () => {

@@ -496,6 +496,8 @@ export const grokDelegate: TProviderDelegate = {
         "x-grok-client-identifier": "xai-grok-cli",
       },
       url,
+      // Which account this hop's cost attributes to (recorded on the row).
+      ...accountHashField(PROVIDER, token.session.user_id),
     };
   },
 

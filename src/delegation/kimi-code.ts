@@ -742,6 +742,8 @@ export const kimiCodeDelegate: TProviderDelegate = {
       access_token: token.accessToken,
       headers: await identityHeaders(),
       url,
+      // Which account this hop's cost attributes to (recorded on the row).
+      ...accountHashField(PROVIDER, jwtClaims(token.accessToken)?.user_id),
     };
   },
 

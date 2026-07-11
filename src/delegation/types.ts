@@ -114,6 +114,16 @@ export type TProviderDelegate = {
     readonly access_token: string;
     readonly headers: Readonly<Record<string, string>>;
     readonly url: string;
+    /**
+     * `account_hash` of the credential serving THIS hop (same digest the
+     * status frame reports — `account-id.ts`), stamped onto the recorded
+     * request row so the cloud's usage-calibration estimator attributes
+     * the cost to the right meter series. Derived from the same token
+     * that serves the request, so it tracks a mid-session account switch
+     * where a status cache would not. Absent when the stable id is
+     * unreadable.
+     */
+    readonly account_hash?: string;
   }>;
 
   /**

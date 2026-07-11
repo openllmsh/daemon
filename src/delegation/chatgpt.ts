@@ -25,12 +25,12 @@ import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import { logError, logInfo } from "../logger";
-import { accountHash } from "./account-id";
 import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { accountHash } from "./account-id";
 import {
   ensureAuthConfig,
   resolveProviderUrl,
@@ -487,7 +487,15 @@ export const chatgptDelegate: TProviderDelegate = {
     if (!hasCodexOriginator(inbound)) headers.originator = CODEX_ORIGINATOR;
     if (!hasCodexUserAgent(inbound)) headers["user-agent"] = await userAgent();
 
-    return { access_token: token.accessToken, headers, url };
+    return {
+      access_token: token.accessToken,
+      headers,
+      url,
+      // Which account this hop's cost attributes to (recorded on the row).
+      ...(token.accountId !== null
+        ? { account_hash: accountHash(PROVIDER, token.accountId) }
+        : {}),
+    };
   },
 
   logout: async () => {
