@@ -325,6 +325,14 @@ export const sampleUsageAfterRequest = (
   requestSamples.set(slug, sample);
 };
 
+/** Test-only cleanup for the module-global request sampler. */
+export const clearRequestUsageSamples = (): void => {
+  for (const sample of requestSamples.values()) {
+    if (sample.timer !== null) clearTimeout(sample.timer);
+  }
+  requestSamples.clear();
+};
+
 /**
  * Drop the cached snapshot so the next {@link cachedUsage} call re-hits the
  * vendor LIVE — the deliberate override behind a manual refresh. With no
