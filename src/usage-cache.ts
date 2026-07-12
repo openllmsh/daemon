@@ -1,13 +1,13 @@
 /**
  * Per-provider usage-snapshot cache.
  *
- * Usage is read ON DEMAND, never on a timer. The vendor usage endpoint (e.g.
- * Claude's `api/oauth/usage`) has its OWN low rate limit, separate from
- * inference — reading it on the status-push cadence 429'd it after ~5 min
- * ("Claude usage is rate-limited right now") on a daemon nobody was even
- * looking at. So the ONLY path that hits the vendor is {@link cachedUsage},
- * driven by the `refresh` command (the manual "Refresh usage" button or the
- * providers page mounting for this device). The background status push reads
+ * Usage reads never run on the status-push cadence or request path. The vendor
+ * usage endpoint (e.g. Claude's `api/oauth/usage`) has its OWN low rate limit,
+ * separate from inference — reading it on the status-push cadence 429'd it
+ * after ~5 min ("Claude usage is rate-limited right now") on a daemon nobody
+ * was even looking at. `cachedUsage` is reached only by a manual `refresh`
+ * command or by {@link sampleUsageAfterRequest}, which coalesces successful
+ * real user request bursts and runs detached. The background status push reads
  * the cache PASSIVELY via {@link peekUsage}, which NEVER calls the vendor — it
  * just attaches whatever was last fetched. See `status.ts` / `control-relay.ts`.
  *
@@ -61,11 +61,17 @@ const STALE_TTL_MS = 30 * 60_000;
 // When there's NO good snapshot to serve (only a failure, or nothing yet), an
 // on-demand read retries after just this — much shorter than FRESH_TTL_MS — so
 // the UI recovers quickly once a transient failure clears (e.g. a token that was
-// briefly expired and has since refreshed). Safe because `cachedUsage` is only
-// called on-demand (the `refresh` command), NEVER on the 2.5s status push (that
-// reads the cache passively via `peekUsage`), so a short retry can't hammer the
-// rate-limited endpoint the way the old per-push read did.
+// briefly expired and has since refreshed). Manual refreshes may retry quickly;
+// request-driven samples are separately coalesced and capped below, and status
+// pushes only read the cache passively via `peekUsage`.
 const FAILURE_RETRY_MS = 20_000;
+// Real gateway requests are naturally bursty. Wait for a burst to settle, then
+// capture one fresh meter boundary without placing a vendor usage read on the
+// request/streaming path.
+const REQUEST_SAMPLE_DEBOUNCE_MS = 60_000;
+// The vendor usage endpoint has a separate, tight rate limit. Request-driven
+// samples therefore remain capped even during a long coding session.
+const REQUEST_SAMPLE_MIN_INTERVAL_MS = 2 * 60_000;
 
 type TUsageEntry = {
   // The last USABLE snapshot + when we obtained it (drives the "last known
@@ -80,6 +86,14 @@ type TUsageEntry = {
 };
 
 const cache = new Map<string, TUsageEntry>();
+
+type TRequestSample = {
+  fetcher: () => Promise<TProviderUsageSnapshot>;
+  timer: ReturnType<typeof setTimeout> | null;
+  lastSampleAtMs: number;
+};
+
+const requestSamples = new Map<string, TRequestSample>();
 
 const isUsable = (s: TProviderUsageSnapshot): boolean =>
   s.kind !== "unavailable";
@@ -188,12 +202,14 @@ const servable = (entry: TUsageEntry, now: number): TProviderUsageSnapshot => {
 export const cachedUsage = async (
   slug: string,
   fetcher: () => Promise<TProviderUsageSnapshot>,
+  options: { readonly force?: boolean } = {},
 ): Promise<TProviderUsageSnapshot> => {
   const now = Date.now();
   const entry = cache.get(slug);
   if (entry !== undefined) {
     // Fresh, usable snapshot — serve it with no upstream call.
     if (
+      !options.force &&
       entry.good !== null &&
       now - entry.good.atMs < FRESH_TTL_MS &&
       isUsable(entry.good.snapshot)
@@ -217,7 +233,7 @@ export const cachedUsage = async (
     const goodServable =
       entry.good !== null && now - entry.good.atMs < STALE_TTL_MS;
     const backoff = goodServable ? FRESH_TTL_MS : FAILURE_RETRY_MS;
-    if (now - entry.lastAttemptAtMs < backoff) {
+    if (!options.force && now - entry.lastAttemptAtMs < backoff) {
       return servable(entry, now);
     }
   }
@@ -278,6 +294,35 @@ export const peekUsage = (slug: string): TProviderUsageSnapshot | null => {
     return stampStale(entry.good.snapshot, entry.good.atMs, now);
   }
   return entry.failure;
+};
+
+/**
+ * Schedule one detached usage refresh after a burst of successful real user
+ * requests. This never awaits, retries, or changes the request itself; it only
+ * improves the next passive calibration boundary when the vendor allows it.
+ */
+export const sampleUsageAfterRequest = (
+  slug: string,
+  fetcher: () => Promise<TProviderUsageSnapshot>,
+): void => {
+  const current = requestSamples.get(slug);
+  const sample: TRequestSample = current ?? {
+    fetcher,
+    timer: null,
+    lastSampleAtMs: 0,
+  };
+  sample.fetcher = fetcher;
+  if (sample.timer !== null) clearTimeout(sample.timer);
+  sample.timer = setTimeout(() => {
+    sample.timer = null;
+    const now = Date.now();
+    if (now - sample.lastSampleAtMs < REQUEST_SAMPLE_MIN_INTERVAL_MS) return;
+    sample.lastSampleAtMs = now;
+    // Request-driven sampling intentionally asks for a fresh boundary while
+    // preserving the prior good snapshot as a fallback if the read is limited.
+    void cachedUsage(slug, sample.fetcher, { force: true });
+  }, REQUEST_SAMPLE_DEBOUNCE_MS);
+  requestSamples.set(slug, sample);
 };
 
 /**

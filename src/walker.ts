@@ -100,6 +100,7 @@ import { lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import { forwardToCloud } from "./forward";
+import { sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
 // the one constant that stays in the walker. The upstream URL is no longer
@@ -313,6 +314,17 @@ const passthroughHeaders = (resp: Response): Headers => {
 
 const report = (row: TDaemonRecordRequest, origin: string | null): void => {
   void recordRequest(row, origin);
+  if (
+    row.status !== "success" ||
+    !isSubscriptionSlug(row.provider) ||
+    row.tokens_in + row.tokens_out <= 0
+  ) {
+    return;
+  }
+  const delegate = getDelegate(row.provider);
+  if (delegate !== null) {
+    sampleUsageAfterRequest(row.provider, () => delegate.usage());
+  }
 };
 
 const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
