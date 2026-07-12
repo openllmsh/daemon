@@ -101,7 +101,16 @@ export const maybeReportModels = async (
       ok,
       ...(cliVersion ? { cliVersion } : {}),
     });
-    if (ok) entries.push({ provider: slug, models });
+    // `cli_version` rides along so the cloud can refuse a write from a
+    // device whose CLI is OLDER than the one that produced the current
+    // row (version-gated model lists must not shrink cross-device).
+    if (ok) {
+      entries.push({
+        provider: slug,
+        models,
+        ...(cliVersion ? { cli_version: cliVersion } : {}),
+      });
+    }
   }
   if (entries.length === 0) return;
   await reportModels({ entries });
