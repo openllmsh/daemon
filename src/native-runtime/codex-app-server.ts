@@ -353,6 +353,9 @@ export type TCodexNativeParams = {
   /** Canonical `reasoning_effort`, forwarded when the runtime supports it. */
   readonly reasoningEffort: string | null;
   readonly signal: AbortSignal;
+  /** Override the pre-commit deadline (default 60s). Tests use a small value to
+   *  exercise the timeout→interrupt path without a real 60s wait. */
+  readonly precommitMs?: number;
 };
 
 /** Canonical `reasoning_effort` → app-server effort (same narrowing as the
@@ -505,7 +508,10 @@ export const runCodexNative = async (
   const first = await Promise.race([
     nextItem(),
     new Promise<"timeout">((resolve) =>
-      setTimeout(() => resolve("timeout"), PRE_COMMIT_TIMEOUT_MS),
+      setTimeout(
+        () => resolve("timeout"),
+        params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS,
+      ),
     ),
   ]);
   const failedBeforeOutput =
