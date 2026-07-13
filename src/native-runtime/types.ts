@@ -24,6 +24,7 @@ import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
 } from "@quantidexyz/openllmp";
+import { stateDir } from "../env";
 
 /**
  * The subscription providers whose ONLY daemon data path is the native
@@ -82,7 +83,18 @@ export const cleanNativeSpawnEnv = (
     if (POISON_PREFIX.test(key) || POISON_KEYS.has(key)) continue;
     base[key] = value;
   }
-  return { ...base, ...cliEnv };
+  return {
+    ...base,
+    // Pin the daemon's REAL state dir so any openllm daemon code the child
+    // (or a child's child) runs resolves `~/.openllm` to the real location —
+    // NOT `<isolated HOME>/.openllm`. Without this, a child computing
+    // `stateDir()` under the isolated HOME recursively creates
+    // `<iso home>/.openllm/cli/<provider>/home`. (openllmc uses `homedir()`
+    // directly and ignores this — the `--strict-mcp-config`/`--setting-sources
+    // ""` flags keep the openllm MCP from loading on the inference path.)
+    OPENLLM_DAEMON_STATE_DIR: stateDir(),
+    ...cliEnv,
+  };
 };
 
 /** The single-shot prompt a native runtime executes for an eligible request. */

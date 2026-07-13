@@ -91,6 +91,11 @@ export const runClaudeNative = async (
     "--verbose",
     "--setting-sources",
     "",
+    // Belt-and-suspenders with `--setting-sources ""`: never load an MCP
+    // server (e.g. the user's global openllm MCP) — a loaded openllm MCP would
+    // run `openllmc` under the isolated HOME and recursively create
+    // `<iso home>/.openllm/...`.
+    "--strict-mcp-config",
     "--tools",
     "",
     "--max-turns",
