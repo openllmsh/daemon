@@ -7,7 +7,7 @@
  */
 
 import type { TDaemonCommandAck, TRelayFrame } from "@quantidexyz/openllmp";
-import { RelayFrame } from "@quantidexyz/openllmp";
+import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@quantidexyz/openllmp";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { fetchChannel } from "./cloud-client";
@@ -37,12 +37,19 @@ const LIVENESS_TIMEOUT_MS = 70_000;
 // connect stays immediate). Small vs the 35s presence grace, so it never surfaces
 // as a flap. See `docs/audit/presence-reconnect-prior-art.md` §3.
 const RECONNECT_JITTER_MS = 3_000;
+/** Check a healthy relay connection for a deploy handoff without waiting for
+ * the five-minute bootstrap loop. Small jitter prevents fleet lockstep. */
+const MIGRATION_CHECK_MS = 45_000;
+const MIGRATION_JITTER_MS = 5_000;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 let ws: ReconnectingWebSocket | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
+let migrationTimer: ReturnType<typeof setTimeout> | null = null;
+let migrationInFlight: Promise<void> | null = null;
+let migrationEnabled = false;
 // The daemon's liveness heartbeat. `sendPing` and `onSilent` close over `ws`,
 // which is reassigned per connection, so they read the live binding at call
 // time. partysocket reuses one instance across reconnects, so this one heartbeat
@@ -66,6 +73,12 @@ let ticket = "";
  *  deploy that moved the relay to a new content-addressed sandbox. */
 let connectedWssOrigin: string | null = null;
 let lastFingerprint = "";
+/** Relay session negotiated by the current connection. Null until welcome. */
+let daemonSessionId: string | null = null;
+/** Null while handshake is pending; false for an older relay welcome. */
+let supportsOrderedStatus: boolean | null = null;
+let statusSeq = 0;
+let statusPublishTail: Promise<void> = Promise.resolve();
 /** Whether THIS connection's `hello` has been sent. The relay 4001-closes any
  *  connection whose FIRST frame isn't a hello, and an out-of-band status push
  *  (the bootstrap scheduler fires `pushStatusIfChanged` the moment
@@ -106,26 +119,58 @@ const send = (frame: TRelayFrame): void => {
   }
 };
 
-const pushStatus = async (active?: boolean): Promise<void> => {
-  const status = await computeStatus();
-  lastFingerprint = JSON.stringify(status);
-  send(
-    active === undefined
-      ? { type: "status", status }
-      : { type: "status", active, status },
-  );
+const enqueueStatusPublish = (
+  compute: () => Promise<{ status: unknown; fingerprint: string } | null>,
+  active?: boolean,
+): Promise<void> => {
+  const generation = connectionGeneration;
+  statusPublishTail = statusPublishTail
+    .catch(() => {})
+    .then(async () => {
+      const snapshot = await compute();
+      if (snapshot === null) return;
+      // A reconnect or an un-negotiated legacy session cannot receive ordered
+      // state from work that began on a prior socket.
+      if (
+        generation !== connectionGeneration ||
+        supportsOrderedStatus === null ||
+        ws === null ||
+        ws.readyState !== ws.OPEN
+      )
+        return;
+      const ordered = supportsOrderedStatus && daemonSessionId !== null;
+      if (ordered) statusSeq += 1;
+      send({
+        type: "status",
+        ...(active === undefined ? {} : { active }),
+        status: snapshot.status,
+        ...(ordered && daemonSessionId !== null
+          ? { daemon_session_id: daemonSessionId, status_seq: statusSeq }
+          : {}),
+      });
+      lastFingerprint = snapshot.fingerprint;
+    });
+  return statusPublishTail;
 };
+
+const pushStatus = async (active?: boolean): Promise<void> =>
+  enqueueStatusPublish(async () => {
+    const status = await computeStatus();
+    return { status, fingerprint: JSON.stringify(status) };
+  }, active);
 
 /** Send a fresh snapshot only when it changed — surfaces out-of-band flips
  *  (a device-code login completing) while a command isn't in flight. Exported
  *  so the bootstrap scheduler can push a `cloud_state` change immediately. */
-export const pushStatusIfChanged = async (): Promise<void> => {
-  const status = await computeStatus();
-  const fp = JSON.stringify(status);
-  if (fp === lastFingerprint) return;
-  lastFingerprint = fp;
-  send({ type: "status", status });
-};
+export const pushStatusIfChanged = async (): Promise<void> =>
+  enqueueStatusPublish(async () => {
+    const status = await computeStatus();
+    const fingerprint = JSON.stringify(status);
+    // Check inside the serialized publisher so concurrent probes cannot both
+    // decide they are the next changed snapshot.
+    if (fingerprint === lastFingerprint) return null;
+    return { status, fingerprint };
+  }).then(() => {});
 
 const startWatcher = (): void => {
   if (watchTimer !== null) return;
@@ -144,6 +189,38 @@ const stopWatcher = (): void => {
   }
 };
 
+const scheduleMigrationCheck = (): void => {
+  if (!migrationEnabled || migrationTimer !== null) return;
+  migrationTimer = setTimeout(
+    () => {
+      migrationTimer = null;
+      if (migrationInFlight === null) {
+        // Fence the check to the generation it starts under — a reconnect while
+        // its channel fetch is in flight must not bounce the newer session.
+        migrationInFlight = migrateIfRelayMoved(connectionGeneration).finally(
+          () => {
+            migrationInFlight = null;
+          },
+        );
+      }
+      void migrationInFlight.finally(scheduleMigrationCheck);
+    },
+    MIGRATION_CHECK_MS + Math.random() * MIGRATION_JITTER_MS,
+  );
+  migrationTimer.unref?.();
+};
+
+const stopMigrationCheck = (): void => {
+  migrationEnabled = false;
+  if (migrationTimer !== null) clearTimeout(migrationTimer);
+  migrationTimer = null;
+};
+
+const startMigrationCheck = (): void => {
+  migrationEnabled = true;
+  scheduleMigrationCheck();
+};
+
 // Command dedup. The SAME command id can arrive more than once: the relay's
 // delivery is at-least-once — its connect-time replay can overlap a live push,
 // and its periodic sweep re-pushes any row that hasn't reached a terminal ack
@@ -158,6 +235,9 @@ const stopWatcher = (): void => {
 // — by design (the command never completed; the cloud's stale reaper is the
 // give-up bound).
 const commandResults = new Map<string, TDaemonCommandAck | null>();
+/** Commands change shared vendor CLI and integration state. Keep execution FIFO so
+ * competing browser tabs cannot race login, logout, or install operations. */
+let commandTail: Promise<void> = Promise.resolve();
 const PROCESSED_CAP = 500;
 
 /** Max chars of error detail carried into the log line — enough to name the
@@ -202,6 +282,10 @@ const ackErrorDetail = (result: unknown): string => {
 
 const onCommand = async (command: TRelayFrame): Promise<void> => {
   if (command.type !== "command") return;
+  // The relay session this command arrived on. A reconnect can happen while
+  // the command waits in the FIFO queue; work owned by that obsolete session
+  // must not execute or ack through the replacement session.
+  const generation = connectionGeneration;
   const id = command.command.id;
   const prior = commandResults.get(id);
   if (prior !== undefined) {
@@ -227,29 +311,46 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
       }
     }
   }
-  // Log only non-sensitive metadata — a command `payload` (e.g. `set_config`)
-  // and an ack `result` can carry control-plane secrets, so they must not land
-  // in the daemon's logs. Kind + id + status are enough to trace a command.
-  logInfo("control-channel", "command received", {
-    kind: command.command.kind,
-    id: command.command.id,
-  });
-  const ack = await runCommandInner(command.command);
-  commandResults.set(id, ack);
-  // On SUCCESS the result stays out of the log (it can carry control-plane
-  // secrets — see the received-side note above). On ERROR, surface the
-  // diagnostic fields (`error` / the tail of `output`) — without them a
-  // failed command logs only `status: "error"`, which is undebuggable from
-  // the daemon log alone (field-reported). Truncated: diagnostics, not dumps.
-  logInfo("control-channel", "command done", {
-    kind: command.command.kind,
-    id: command.command.id,
-    status: ack.status,
-    ...(ack.status === "error" ? { error: ackErrorDetail(ack.result) } : {}),
-  });
-  send({ type: "ack", ack });
-  // Carry a fresh snapshot back so the dashboard reflects the result.
-  await pushStatus();
+  const run = async (): Promise<void> => {
+    // Queued under a replaced session — skip, and drop the in-flight dedup
+    // marker so the relay's redelivery of this id can run on the CURRENT
+    // session (a retained `null` entry would suppress that valid redelivery).
+    if (generation !== connectionGeneration) {
+      commandResults.delete(id);
+      logDebug("control-channel", "stale-session command dropped", {
+        kind: command.command.kind,
+        id,
+      });
+      return;
+    }
+    // Log only non-sensitive metadata — a command `payload` (e.g. `set_config`)
+    // and an ack `result` can carry control-plane secrets, so they must not land
+    // in the daemon's logs. Kind + id + status are enough to trace a command.
+    logInfo("control-channel", "command received", {
+      kind: command.command.kind,
+      id: command.command.id,
+    });
+    // This daemon, not the relay's socket send, confirms execution has started.
+    send({ type: "ack", ack: { id, status: "ack" } });
+    const ack = await runCommandInner(command.command);
+    commandResults.set(id, ack);
+    // On SUCCESS the result stays out of the log (it can carry control-plane
+    // secrets — see the received-side note above). On ERROR, surface the
+    // diagnostic fields (`error` / the tail of `output`) — without them a
+    // failed command logs only `status: "error"`, which is undebuggable from
+    // the daemon log alone (field-reported). Truncated: diagnostics, not dumps.
+    logInfo("control-channel", "command done", {
+      kind: command.command.kind,
+      id: command.command.id,
+      status: ack.status,
+      ...(ack.status === "error" ? { error: ackErrorDetail(ack.result) } : {}),
+    });
+    send({ type: "ack", ack });
+    // Carry a fresh snapshot back so the dashboard reflects the result.
+    await pushStatus();
+  };
+  commandTail = commandTail.catch(() => {}).then(run);
+  await commandTail;
 };
 
 const onFrame = (frame: TRelayFrame): void => {
@@ -258,6 +359,15 @@ const onFrame = (frame: TRelayFrame): void => {
       onCommand(frame).catch(() => {
         // best-effort: a command failure is reflected by the next status push
       });
+      return;
+    case "welcome":
+      daemonSessionId = frame.daemon_session_id ?? null;
+      supportsOrderedStatus = frame.daemon_session_id !== undefined;
+      // Sequence 1 of the session is reserved for the hello snapshot the relay
+      // publishes on this daemon's behalf, so our own publisher starts above it.
+      statusSeq = 1;
+      startMigrationCheck();
+      void pushStatus();
       return;
     case "ping":
       // The relay's keepalive ping → answer so its missed-pong reap stays happy.
@@ -329,8 +439,16 @@ export const wssOrigin = (url: string): string | null => {
  * its ack `send()` silently drops (socket not OPEN), the relay's
  * at-least-once redelivery re-pushes the command, and `commandResults` dedup
  * re-acks with the stored terminal result — no extra handling needed.
+ *
+ * `generation` fences a SCHEDULED check to the connection it was started
+ * under: the socket can be replaced while `fetchChannel` is awaited (the
+ * liveness check above only runs before it), and a stale check must not
+ * `reconnect()` a newer healthy session. Callers without a generation (tests,
+ * ad-hoc probes) keep the unfenced behavior.
  */
-export const migrateIfRelayMoved = async (): Promise<void> => {
+export const migrateIfRelayMoved = async (
+  generation?: number,
+): Promise<void> => {
   // Only act on a HEALTHY connection: while disconnected/reconnecting,
   // partysocket already re-fetches the channel itself — probing here would
   // double-dial and could hand the pending reconnect a stale ticket. Capture
@@ -349,6 +467,7 @@ export const migrateIfRelayMoved = async (): Promise<void> => {
   }
   const fresh = wssOrigin(freshUrl);
   if (fresh === null || fresh === current) return;
+  if (generation !== undefined && generation !== connectionGeneration) return;
   logInfo("control-channel", "relay moved to a new box; reconnecting", {
     from: current,
     to: fresh,
@@ -376,20 +495,26 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
+    daemonSessionId = null;
+    supportsOrderedStatus = null;
+    statusSeq = 0;
+    // Drop the previous generation's publish queue: a slow probe it queued can
+    // no longer send (its captured generation mismatches), so keeping it as
+    // the tail would only delay this session's first status behind dead work.
+    statusPublishTail = Promise.resolve();
     const generation = connectionGeneration;
     heartbeat.start(); // begin pinging + arm the liveness window off pong receipt
-    void (async () => {
-      const status = await computeStatus();
-      // A close+reopen superseded this connection while the snapshot was in
-      // flight — the NEW open's own continuation owns the hello now.
-      if (generation !== connectionGeneration) return;
-      lastFingerprint = JSON.stringify(status);
-      helloSent = true; // open the gate exactly as the hello goes out
-      send({ type: "hello", ticket, status });
+    // Do not block registration on provider/CLI probes. The relay needs identity
+    // first; welcome supplies this connection's session before status starts.
+    if (generation === connectionGeneration) {
+      helloSent = true;
+      send({
+        type: "hello",
+        ticket,
+        protocol_version: RELAY_PROTOCOL_VERSION,
+      });
       startWatcher();
-    })().catch(() => {
-      // best-effort: partysocket reconnects if the hello never lands
-    });
+    }
   };
   socket.onmessage = (ev: MessageEvent): void => {
     onMessage(ev.data);
@@ -414,6 +539,7 @@ export const startControlChannel = (): void => {
   };
   socket.onclose = (ev): void => {
     stopWatcher();
+    stopMigrationCheck();
     helloSent = false; // the next connection must lead with its own hello
     heartbeat.stop(); // disarm until the next open re-starts it
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
@@ -438,6 +564,7 @@ export const startControlChannel = (): void => {
 export const stopControlChannel = async (): Promise<void> => {
   if (ws === null) return;
   stopWatcher();
+  stopMigrationCheck();
   heartbeat.stop();
   if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
   ws.close(); // partysocket: a manual close() disables further reconnection
