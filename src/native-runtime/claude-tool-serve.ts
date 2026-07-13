@@ -129,8 +129,10 @@ export const tryServeClaudeTools = async (
     return { declined: result.reason };
   }
 
-  // Metadata-only token row (the SDK path doesn't surface token counts yet).
-  params.record(ZERO_TOKENS);
+  // Record THIS turn's token row. The Claude SDK path surfaces per-turn usage
+  // (`result.usage`, folded to the same shape as the plain-text native path);
+  // the gated Codex tool path doesn't yet, so it falls back to zero.
+  params.record(result.usage ?? ZERO_TOKENS);
 
   const canonicalResp = toolTurnToResponse(result, params.providerModelId);
   const clientWire = clientWireOf(params.surface);

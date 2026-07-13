@@ -6,18 +6,21 @@
  *
  * Protocol facts pinned against `codex-cli 0.144.0` (`codex app-server
  * generate-ts`): newline-delimited JSON-RPC over stdio WITHOUT the "jsonrpc"
- * field; `initialize` → `initialized` handshake; `thread/start` (ephemeral,
- * approvalPolicy "never", sandbox "read-only") + `turn/start`; text deltas as
- * `item/agentMessage/delta`; usage as `thread/tokenUsage/updated`
- * (`{total,last}` breakdowns); terminal `turn/completed`. The runtime owns
- * auth, refresh, identity headers, request shape, and cache affinity — none
- * of that is reproduced here.
+ * field; `initialize` → `initialized` handshake; `thread/start`
+ * (approvalPolicy "never", sandbox "read-only") + `turn/start`; text deltas as
+ * `item/agentMessage/delta`; usage as `thread/tokenUsage/updated`, which
+ * carries BOTH a `total` (cumulative since thread creation) and a `last`
+ * (this-turn-only) breakdown — we report `last` (see `route`). The runtime
+ * owns auth, refresh, identity headers, request shape, and cache affinity —
+ * none of that is reproduced here.
  *
- * ONE app-server child serves the whole daemon (lazy spawn, respawn on
- * exit); each gateway request gets a fresh EPHEMERAL thread, so no state
- * survives on disk and requests can't leak into each other. Server→client
- * requests (approvals — impossible under "never"+read-only, but fail safe)
- * are answered with a JSON-RPC error so the runtime never blocks on us.
+ * ONE app-server child serves the whole daemon (lazy spawn, respawn on exit).
+ * Threads are PERSISTENT and resumed across turns (`thread/resume`) so only
+ * the delta turn is fed to the runtime; the conversation→thread map lives in
+ * the session store (`serve.ts`), and distinct conversations get distinct
+ * threads so requests can't leak into each other. Server→client requests
+ * (approvals — impossible under "never"+read-only, but fail safe) are answered
+ * with a JSON-RPC error so the runtime never blocks on us.
  */
 
 import { existsSync } from "node:fs";
@@ -42,19 +45,22 @@ type TInbound = {
   readonly error?: { readonly message?: string };
 };
 
-/** `thread/tokenUsage/updated` → the canonical usage the daemon reports.
- *  `total` on a fresh ephemeral thread IS this request's usage; cached input
- *  is a SUBSET of inputTokens (never re-added — cache-usage invariant). */
-const usageFromBreakdown = (total: {
+/** `thread/tokenUsage/updated` → the canonical usage the daemon reports. Fed
+ *  the `last` (THIS-turn) breakdown, NOT the thread's cumulative `total` —
+ *  threads resume across turns, so `total` grows every turn and would
+ *  over-report on turn 2+. Cached input is a SUBSET of inputTokens (never
+ *  re-added — cache-usage invariant), so this mirrors the manual chatgpt
+ *  path's non-folding convention exactly. */
+const usageFromBreakdown = (breakdown: {
   readonly totalTokens?: number;
   readonly inputTokens?: number;
   readonly cachedInputTokens?: number;
   readonly outputTokens?: number;
 }): TUsage => ({
-  prompt_tokens: total.inputTokens ?? 0,
-  completion_tokens: total.outputTokens ?? 0,
-  total_tokens: total.totalTokens ?? 0,
-  prompt_tokens_details: { cached_tokens: total.cachedInputTokens ?? 0 },
+  prompt_tokens: breakdown.inputTokens ?? 0,
+  completion_tokens: breakdown.outputTokens ?? 0,
+  total_tokens: breakdown.totalTokens ?? 0,
+  prompt_tokens_details: { cached_tokens: breakdown.cachedInputTokens ?? 0 },
 });
 
 /** Per-request listener the app-server client routes thread events to. */
@@ -254,7 +260,10 @@ class CodexAppServerClient {
           readonly threadId?: string;
           readonly delta?: unknown;
           readonly item?: { readonly type?: string; readonly text?: unknown };
-          readonly tokenUsage?: { readonly total?: unknown };
+          readonly tokenUsage?: {
+            readonly total?: unknown;
+            readonly last?: unknown;
+          };
           readonly turn?: {
             readonly status?: string;
             readonly error?: { readonly message?: string } | null;
@@ -278,17 +287,23 @@ class CodexAppServerClient {
           sink.onAgentMessage(params.item.text);
         }
         return;
-      case "thread/tokenUsage/updated":
-        if (params?.tokenUsage?.total !== undefined) {
+      case "thread/tokenUsage/updated": {
+        // Report THIS turn's usage (`last`), never the thread's cumulative
+        // `total` — a resumed thread's `total` sums every prior turn, which
+        // would over-report tokens/cache on turn 2+ (the manual, stateless
+        // path always reports per-request). Fall back to `total` only when the
+        // runtime omits `last` (a fresh thread's first update).
+        const breakdown =
+          params?.tokenUsage?.last ?? params?.tokenUsage?.total;
+        if (breakdown !== undefined) {
           sink.onUsage(
             usageFromBreakdown(
-              params.tokenUsage.total as Parameters<
-                typeof usageFromBreakdown
-              >[0],
+              breakdown as Parameters<typeof usageFromBreakdown>[0],
             ),
           );
         }
         return;
+      }
       case "turn/completed":
         sink.onCompleted(
           params?.turn?.status ?? "completed",

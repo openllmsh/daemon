@@ -29,6 +29,7 @@ import {
 import type { TChatCompletionResponse } from "@quantidexyz/openllmp";
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
+import type { TNativeTokens } from "./serve";
 import { cleanNativeSpawnEnv } from "./types";
 
 /** Idle TTL for a held (paused) query before it's force-closed. */
@@ -39,6 +40,55 @@ const MCP_PREFIX = "mcp__openllm__";
 
 const sanitize = (name: string): string => name.replace(/[^a-zA-Z0-9_-]/g, "_");
 const nowMs = (): number => Date.now();
+
+/** SDK assistant-message usage (Anthropic `BetaUsage`) → the daemon token row,
+ *  using the SAME additive fold as every other Anthropic path (prompt_tokens =
+ *  input + cache_read + cache_creation; the two cache fields ride the details),
+ *  so a tool completion's usage aligns with a plain-text native completion and
+ *  the cloud prices both identically. */
+export const betaUsageToTokens = (
+  usage:
+    | {
+        readonly input_tokens?: number;
+        readonly output_tokens?: number;
+        readonly cache_read_input_tokens?: number | null;
+        readonly cache_creation_input_tokens?: number | null;
+      }
+    | null
+    | undefined,
+): TNativeTokens => {
+  const cacheRead = usage?.cache_read_input_tokens ?? 0;
+  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
+  return {
+    tokens_in: (usage?.input_tokens ?? 0) + cacheRead + cacheCreation,
+    tokens_out: usage?.output_tokens ?? 0,
+    cached_tokens: cacheRead,
+    cache_creation_tokens: cacheCreation,
+  };
+};
+
+/** The allow/deny decision the SDK's `canUseTool` returns. */
+type TPermission =
+  | {
+      readonly behavior: "allow";
+      readonly updatedInput: Record<string, unknown>;
+    }
+  | { readonly behavior: "deny"; readonly message: string };
+
+/** Permit ONLY the client's registered tools (by full MCP name); deny anything
+ *  else. Built-in tools are already stripped via `tools: []` on the query, so
+ *  this is defense-in-depth — even if a built-in (Bash/Edit/…) were somehow
+ *  surfaced, it can never execute on the user's machine on this passthrough
+ *  path, whose whole contract is that the CLIENT runs its own tools. */
+export const buildPermit =
+  (allowed: ReadonlySet<string>) =>
+  async (name: string, input: Record<string, unknown>): Promise<TPermission> =>
+    allowed.has(name)
+      ? { behavior: "allow", updatedInput: input }
+      : {
+          behavior: "deny",
+          message: `tool ${name} is not permitted on the gateway tool-passthrough path`,
+        };
 
 /** A client-supplied function tool (canonical `tools[].function`). */
 export type TClientTool = {
@@ -101,14 +151,22 @@ export type TToolCallOut = {
   readonly argumentsJson: string;
 };
 
-/** The outcome of driving the query to its next boundary. */
+/** The outcome of driving the query to its next boundary. `usage` is THIS
+ *  turn's token counts (from the assistant message driven in this call — never
+ *  cumulative across rounds); optional because the gated Codex tool path does
+ *  not surface usage yet. */
 export type TToolTurnResult =
   | {
       readonly kind: "tool_calls";
       readonly text: string;
       readonly toolCalls: ReadonlyArray<TToolCallOut>;
+      readonly usage?: TNativeTokens;
     }
-  | { readonly kind: "final"; readonly text: string }
+  | {
+      readonly kind: "final";
+      readonly text: string;
+      readonly usage?: TNativeTokens;
+    }
   | { readonly kind: "declined"; readonly reason: string };
 
 /** Shared channel between the paused tool handlers and the driver: fired
@@ -176,6 +234,11 @@ const buildIterator = (
       { alwaysLoad: true },
     ),
   );
+  // The full MCP names the SDK presents to `canUseTool` — the ONLY tools
+  // permitted to run. Everything else (every built-in) is denied.
+  const allowed = new Set(
+    params.tools.map((t) => `${MCP_PREFIX}${sanitize(t.name)}`),
+  );
   const q = query({
     prompt: params.userText,
     options: {
@@ -184,6 +247,12 @@ const buildIterator = (
       env: cleanNativeSpawnEnv(params.env),
       cwd: spawnCwd(params.env),
       settingSources: [],
+      // Strip ALL built-in tools (Bash/Read/Write/Edit/…): a completion
+      // passthrough must NEVER execute a tool on the user's machine — the
+      // CLIENT runs its own tools. Only the client's function tools (the MCP
+      // server below) reach the model. Mirrors `claude-native.ts`'s
+      // `--tools ""`, which the plain-text path relies on for the same reason.
+      tools: [],
       mcpServers: {
         openllm: createSdkMcpServer({
           name: "openllm",
@@ -191,10 +260,9 @@ const buildIterator = (
           tools: sdkTools,
         }),
       },
-      // Grant the client tools (headless auto-denies un-permitted MCP tools);
-      // no built-in tools are registered, so nothing else can run.
-      canUseTool: async (_n: string, input: Record<string, unknown>) =>
-        ({ behavior: "allow", updatedInput: input }) as never,
+      // Grant ONLY the registered client tools; deny anything else (built-ins
+      // are already gone via `tools: []` — this is the defense-in-depth guard).
+      canUseTool: buildPermit(allowed) as never,
       ...(params.systemText !== null
         ? { systemPrompt: params.systemText }
         : {}),
@@ -271,6 +339,7 @@ export const continueToolTurn = async (
 const drive = async (h: THeld): Promise<TToolTurnResult> => {
   let text = "";
   let toolUse: Array<{ id: string; name: string; input: unknown }> = [];
+  let usage: TNativeTokens | undefined;
   const deadline = nowMs() + DRIVE_TIMEOUT_MS;
 
   for (;;) {
@@ -296,23 +365,36 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     }
 
     // A handler paused → the model called tool(s); pair them and return.
-    if (step === "fired") return pauseAndReturn(h, text, toolUse);
+    if (step === "fired") return pauseAndReturn(h, text, toolUse, usage);
 
     const msg = step.value as
       | {
           type?: string;
           session_id?: string;
-          message?: { content?: ReadonlyArray<Record<string, unknown>> };
+          message?: {
+            content?: ReadonlyArray<Record<string, unknown>>;
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_read_input_tokens?: number | null;
+              cache_creation_input_tokens?: number | null;
+            };
+          };
         }
       | undefined;
     if (step.done === true || msg === undefined) {
       dropIndex(h);
-      return { kind: "final", text };
+      return { kind: "final", text, usage };
     }
     if (typeof msg.session_id === "string") h.sessionId = msg.session_id;
     if (msg.type === "assistant") {
-      // Fresh tool_use set per assistant message.
+      // Fresh tool_use set per assistant message; capture THIS turn's usage
+      // (the SDK carries it on each assistant message — it is not cumulative,
+      // so recording per drive() call can't double-count across tool rounds).
       toolUse = [];
+      if (msg.message?.usage !== undefined) {
+        usage = betaUsageToTokens(msg.message.usage);
+      }
       for (const block of msg.message?.content ?? []) {
         if (block.type === "text" && typeof block.text === "string") {
           text += block.text;
@@ -328,7 +410,7 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     }
     if (msg.type === "result") {
       dropIndex(h);
-      return { kind: "final", text };
+      return { kind: "final", text, usage };
     }
     // system / partial / other frames — ignore.
   }
@@ -338,6 +420,7 @@ const pauseAndReturn = (
   h: THeld,
   text: string,
   toolUse: ReadonlyArray<{ id: string; name: string; input: unknown }>,
+  usage: TNativeTokens | undefined,
 ): TToolTurnResult => {
   const toolCalls: TToolCallOut[] = [];
   for (const b of toolUse) {
@@ -356,7 +439,7 @@ const pauseAndReturn = (
     closeHeld(h);
     return { kind: "declined", reason: "tool pause produced no tool calls" };
   }
-  return { kind: "tool_calls", text, toolCalls };
+  return { kind: "tool_calls", text, toolCalls, usage };
 };
 
 /** Build a canonical response envelope from a completed tool turn. */
@@ -372,12 +455,21 @@ export const toolTurnToResponse = (
           function: { name: c.name, arguments: c.argumentsJson },
         }))
       : undefined;
+  const u = result.usage;
   return {
     id: `chatcmpl-${nowMs()}`,
     object: "chat.completion",
     created: Math.floor(nowMs() / 1000),
     model,
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: {
+      prompt_tokens: u?.tokens_in ?? 0,
+      completion_tokens: u?.tokens_out ?? 0,
+      total_tokens: (u?.tokens_in ?? 0) + (u?.tokens_out ?? 0),
+      prompt_tokens_details: {
+        cached_tokens: u?.cached_tokens ?? 0,
+        cache_creation_tokens: u?.cache_creation_tokens ?? 0,
+      },
+    },
     choices: [
       {
         index: 0,

@@ -27,6 +27,7 @@ import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/
 import { chunksToSseBytes } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
+import { functionNameUsesWebSearch } from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { cliBin, cliEnv } from "../cli-paths";
 import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
@@ -88,6 +89,12 @@ const ZERO: TNativeTokens = {
   cache_creation_tokens: 0,
 };
 
+/** Does the request declare the openllm-managed web_search function tool?
+ *  (Mirrors the walker's own gate — the gateway runs this tool, not the
+ *  client, so it must NOT enter the native tool-passthrough path.) */
+const requestDeclaresWebSearch = (req: TChatCompletionRequest): boolean =>
+  req.tools?.some((t) => functionNameUsesWebSearch(t.function.name)) === true;
+
 const tokensOf = (resp: {
   readonly usage?: {
     readonly prompt_tokens: number;
@@ -126,6 +133,18 @@ export const tryServeNativeRuntime = async (
 ): Promise<TNativeServeOutcome> => {
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
+  }
+  // openllm-managed web_search is executed by the GATEWAY — the walker's
+  // agentic `serveWithWebSearch` loop (cross-wire) or Anthropic's own native
+  // search (messages passthrough) — never by the client. The native tool path
+  // would instead register web_search as a client tool and hand the caller a
+  // `web_search` tool_call it has no implementation for, stalling the turn. So
+  // decline here and let the manual transport (which routes web_search
+  // correctly via `shouldInterceptWebSearch`) serve the hop.
+  if (requestDeclaresWebSearch(params.canonical)) {
+    return {
+      declined: "web_search runs on the gateway's managed loop (manual transport)",
+    };
   }
   // Tool-bearing requests use completion tool-passthrough. claude_code: the
   // held-open SDK query (works). chatgpt: the Codex app-server's native
