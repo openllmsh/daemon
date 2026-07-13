@@ -36,6 +36,11 @@ import { cleanNativeSpawnEnv } from "./types";
 const HELD_TTL_MS = 10 * 60 * 1000;
 /** How long to wait for the model's first output / next pause. */
 const DRIVE_TIMEOUT_MS = 120_000;
+/** After the FIRST tool handler fires, how long to keep collecting the rest of
+ *  a parallel tool_use burst before returning. Parallel handlers fire within
+ *  milliseconds; this only bounds a pathological unpaired block so it can't
+ *  wait out the whole drive deadline. */
+const FIRE_SETTLE_MS = 2_000;
 const MCP_PREFIX = "mcp__openllm__";
 
 const sanitize = (name: string): string => name.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -208,6 +213,14 @@ const evictStale = (): void => {
   for (const h of stale) closeHeld(h);
 };
 
+// Sweep abandoned held queries even when no further tool request arrives — a
+// client that never returns its tool_result would otherwise leak the live
+// `claude` subprocess until daemon restart (eviction was previously only
+// opportunistic, on the next start/continue call). `.unref()` so the timer
+// never keeps the daemon process alive on its own.
+const sweep = setInterval(evictStale, HELD_TTL_MS);
+sweep.unref?.();
+
 const buildIterator = (
   params: TStartToolTurnParams,
   chan: TChannel,
@@ -364,8 +377,24 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
       };
     }
 
-    // A handler paused → the model called tool(s); pair them and return.
-    if (step === "fired") return pauseAndReturn(h, text, toolUse, usage);
+    // A handler paused → the model called tool(s). Parallel tool_use emits N
+    // handlers that the SDK invokes in a burst; wait until every block has a
+    // fired resolver before returning, so none is dropped — a dropped block
+    // would leave the model awaiting a tool_result the client was never asked
+    // to produce, hanging the turn to the drive deadline. Bounded by a short
+    // settle window (the 10ms poll re-checks even if a wake is missed).
+    if (step === "fired") {
+      const settleBy = nowMs() + FIRE_SETTLE_MS;
+      while (h.chan.fired.length < toolUse.length && nowMs() < settleBy) {
+        await Promise.race([
+          new Promise<void>((resolve) => {
+            h.chan.wake = () => resolve();
+          }),
+          new Promise<void>((resolve) => setTimeout(resolve, 10)),
+        ]);
+      }
+      return pauseAndReturn(h, text, toolUse, usage);
+    }
 
     const msg = step.value as
       | {

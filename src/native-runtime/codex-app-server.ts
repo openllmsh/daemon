@@ -516,6 +516,16 @@ export const runCodexNative = async (
       (terminal as { status: string }).status === "failed" &&
       !sawDelta);
   if (failedBeforeOutput) {
+    // A pre-commit TIMEOUT means the turn is still running server-side (no
+    // terminal event arrived) — interrupt it before we fall back to the manual
+    // transport, or the vendor keeps generating an answer we've abandoned
+    // (duplicate subscription-quota burn, never recorded). The `end`/`failed`
+    // sub-cases already saw `turn/completed`, so they need no interrupt.
+    if (first === "timeout" && turnId !== null) {
+      void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
+        // best-effort; we're declining regardless
+      });
+    }
     client.removeSink(threadId);
     const reason =
       first === "timeout"

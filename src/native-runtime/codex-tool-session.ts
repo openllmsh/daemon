@@ -61,10 +61,28 @@ const evictStale = (): void => {
   const stale = new Set<THeld>();
   for (const [, h] of held) if (h.lastUsed < cutoff) stale.add(h);
   for (const h of stale) {
+    // Unblock the SHARED app-server before detaching: answer any paused
+    // `item/tool/call` with a failure so the turn ends server-side instead of
+    // hanging in the one process all codex traffic shares (a worse blast radius
+    // than Claude's per-session subprocess).
+    for (const [, requestId] of h.pending) {
+      h.client.respondToServer(requestId, {
+        contentItems: [{ type: "inputText", text: "(cancelled)" }],
+        success: false,
+      });
+    }
+    h.pending.clear();
     h.client.removeSink(h.threadId);
     dropIndex(h);
   }
 };
+
+// Background sweep (parity with the Claude tool path): reclaim abandoned held
+// turns even when no further codex tool request arrives. `.unref()` so the
+// timer never keeps the daemon alive on its own. (Dormant until
+// CODEX_TOOLS_READY flips; harmless while `held` is empty.)
+const sweep = setInterval(evictStale, HELD_TTL_MS);
+sweep.unref?.();
 
 const effortOf = (raw: string | null): string | null => {
   if (raw === null || raw === "none") return null;

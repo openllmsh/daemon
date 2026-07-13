@@ -113,7 +113,7 @@ export const tryServeClaudeTools = async (
             tools: clientToolsOf(params.canonical),
             systemText: systemTextOf(params.canonical),
             resumeSessionId: null,
-            userText: lastUserText(params.canonical),
+            userText: seedFromHistory(params.canonical),
           })
         : await startCodexToolTurn({
             bin: params.bin,
@@ -122,7 +122,7 @@ export const tryServeClaudeTools = async (
             tools: clientToolsOf(params.canonical),
             systemText: systemTextOf(params.canonical),
             reasoningEffort: params.canonical.reasoning_effort ?? null,
-            userText: lastUserText(params.canonical),
+            userText: seedFromHistory(params.canonical),
           });
 
   if (result.kind === "declined") {
@@ -148,10 +148,60 @@ export const tryServeClaudeTools = async (
   });
 };
 
-const lastUserText = (canonical: TChatCompletionRequest): string => {
-  for (let i = canonical.messages.length - 1; i >= 0; i--) {
-    const m = canonical.messages[i];
-    if (m?.role === "user") return plainText(m.content);
+/** Render one prior message into the lossy multi-turn seed transcript. */
+const renderToolMessage = (
+  m: TChatCompletionRequest["messages"][number],
+): string => {
+  if (m.role === "user") return `User: ${plainText(m.content)}`;
+  if (m.role === "tool") return `Tool result: ${plainText(m.content)}`;
+  if (m.role === "assistant") {
+    const calls = (
+      m as {
+        tool_calls?: ReadonlyArray<{
+          function: { name: string; arguments: string };
+        }>;
+      }
+    ).tool_calls;
+    const called =
+      calls !== undefined && calls.length > 0
+        ? ` [called: ${calls
+            .map((c) => `${c.function.name}(${c.function.arguments})`)
+            .join(", ")}]`
+        : "";
+    return `Assistant: ${plainText(m.content)}${called}`;
   }
   return "";
+};
+
+/**
+ * Seed text for a NEW tool turn (the trailing message is a user turn, not a
+ * tool result). A genuine first turn — no prior non-system messages — just
+ * feeds the user text. A FOLLOW-UP question after a completed tool answer has
+ * no live held query to resume, so replay the prior transcript into the seed
+ * (the tool-path analogue of the text path's `renderSeed`) — the model stays
+ * grounded instead of losing every prior turn the client dutifully resent.
+ * Lossy (no session/cache reuse), but no amnesia.
+ */
+export const seedFromHistory = (canonical: TChatCompletionRequest): string => {
+  const msgs = canonical.messages;
+  let lastUser = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  const delta = lastUser >= 0 ? plainText(msgs[lastUser]?.content) : "";
+  // Everything before the delta user turn, minus system (rides `systemText`).
+  const prior = msgs
+    .slice(0, Math.max(lastUser, 0))
+    .filter((m) => m.role !== "system");
+  if (prior.length === 0) return delta;
+  const transcript = prior
+    .map(renderToolMessage)
+    .filter((s) => s.length > 0)
+    .join("\n\n");
+  return transcript.length === 0
+    ? delta
+    : `Continue this conversation. Prior transcript:\n\n${transcript}\n\nUser: ${delta}`;
 };
