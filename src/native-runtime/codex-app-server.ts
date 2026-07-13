@@ -25,7 +25,7 @@ import type { TChatCompletionChunk, TUsage } from "@quantidexyz/openllmp";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { DAEMON_VERSION } from "../version";
-import type { TNativePrompt, TNativeRunResult } from "./types";
+import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv } from "./types";
 
 /** Pre-commit budget: handshake + thread/start + first turn output. */
@@ -280,7 +280,15 @@ export type TCodexNativeParams = {
   /** Isolated run env (`cliEnv("chatgpt")`), merged onto process.env. */
   readonly env: Record<string, string>;
   readonly providerModelId: string;
-  readonly prompt: TNativePrompt;
+  /** System prompt — applied ONLY on a fresh `thread/start` (a resumed thread
+   *  already carries it). Null when the client sent none. */
+  readonly systemText: string | null;
+  /** The turn text to feed: the delta user turn on resume, or the seed prompt
+   *  on a fresh start. */
+  readonly userText: string;
+  /** Resume this app-server thread id (feed only `userText`), or null → a
+   *  fresh persistent thread. */
+  readonly resumeThreadId: string | null;
   /** Canonical `reasoning_effort`, forwarded when the runtime supports it. */
   readonly reasoningEffort: string | null;
   readonly signal: AbortSignal;
@@ -306,19 +314,32 @@ export const runCodexNative = async (
   let turnId: string | null = null;
   try {
     await client.ensureStarted();
-    const started = (await client.request("thread/start", {
+    // Resume the persisted thread when we have its id (it already holds prior
+    // turns + instructions); otherwise start a fresh NON-ephemeral thread so
+    // it survives on disk to be resumed next turn. `thread/resume` falls back
+    // to `thread/start` when the id is unknown (daemon restart evicted it).
+    const startParams = {
       model: params.providerModelId,
-      ephemeral: true,
       approvalPolicy: "never",
       sandbox: "read-only",
-      ...(params.prompt.systemText !== null
-        ? { developerInstructions: params.prompt.systemText }
+      ...(params.systemText !== null
+        ? { developerInstructions: params.systemText }
         : {}),
-    })) as { thread?: { id?: string } };
-    if (typeof started.thread?.id !== "string") {
+    };
+    const opened = (await (params.resumeThreadId !== null
+      ? client
+          .request("thread/resume", {
+            threadId: params.resumeThreadId,
+            ...startParams,
+          })
+          .catch(() => client.request("thread/start", startParams))
+      : client.request("thread/start", startParams))) as {
+      thread?: { id?: string };
+    };
+    if (typeof opened.thread?.id !== "string") {
       return { kind: "declined", reason: "thread/start returned no thread id" };
     }
-    threadId = started.thread.id;
+    threadId = opened.thread.id;
   } catch (error) {
     return {
       kind: "declined",
@@ -397,9 +418,7 @@ export const runCodexNative = async (
   try {
     const turn = (await client.request("turn/start", {
       threadId,
-      input: [
-        { type: "text", text: params.prompt.userText, text_elements: [] },
-      ],
+      input: [{ type: "text", text: params.userText, text_elements: [] }],
       ...(effort !== null ? { effort } : {}),
     })) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
@@ -464,5 +483,5 @@ export const runCodexNative = async (
       abort();
     },
   });
-  return { kind: "committed", chunks };
+  return { kind: "committed", chunks, sessionId: () => threadId };
 };

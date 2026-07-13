@@ -105,6 +105,72 @@ export type TNativePrompt = {
   readonly userText: string;
 };
 
+/** One text turn of a canonical conversation (Phase 1 = text only). */
+export type TNativeTurn = {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+};
+
+/**
+ * A native-eligible request decomposed for session-resume execution: the
+ * system prompt plus the ordered user/assistant TEXT turns. The session store
+ * derives the conversation identity + the delta turn to feed from `turns`.
+ */
+export type TNativeRequest = {
+  readonly systemText: string | null;
+  readonly turns: ReadonlyArray<TNativeTurn>;
+};
+
+/**
+ * Phase-1 capability gate: decompose a canonical request into `{ systemText,
+ * turns }` when it's a plain multi-turn TEXT conversation the native runtimes
+ * can serve via session resume, or null when it isn't yet supported (tools /
+ * tool_choice / response_format / non-text content / `tool`-role messages —
+ * those are Phase 2). Unlike `nativePromptOf` this accepts prior assistant
+ * turns: the session store feeds only the NEW turn to a resumed session.
+ */
+export const nativeRequestOf = (
+  canonical: TChatCompletionRequest,
+): TNativeRequest | null => {
+  if ((canonical.tools?.length ?? 0) > 0) return null;
+  if (canonical.tool_choice !== undefined && canonical.tool_choice !== null) {
+    return null;
+  }
+  if (
+    canonical.response_format !== undefined &&
+    canonical.response_format !== null
+  ) {
+    return null;
+  }
+  const systemParts: string[] = [];
+  const turns: TNativeTurn[] = [];
+  for (const message of canonical.messages) {
+    if (message.role === "system") {
+      const text = plainTextOf(message.content);
+      if (text === null) return null;
+      if (text.length > 0) systemParts.push(text);
+      continue;
+    }
+    if (message.role === "user" || message.role === "assistant") {
+      const text = plainTextOf(message.content);
+      if (text === null) return null; // non-text content (image/file) → Phase 2
+      turns.push({ role: message.role, text });
+      continue;
+    }
+    return null; // `tool` role → Phase 2 (tool-passthrough)
+  }
+  // The final turn must be a user turn (the thing to answer), and there must
+  // be at least one.
+  const last = turns.at(-1);
+  if (last === undefined || last.role !== "user" || last.text.length === 0) {
+    return null;
+  }
+  return {
+    systemText: systemParts.length > 0 ? systemParts.join("\n\n") : null,
+    turns,
+  };
+};
+
 /** Plain text of a canonical message content, or null when non-text parts
  *  (images/files) are present — those are out of trial scope. */
 const plainTextOf = (
@@ -189,5 +255,11 @@ export type TNativeRunResult =
   | {
       readonly kind: "committed";
       readonly chunks: ReadableStream<TChatCompletionChunk>;
+      /** The provider session id to resume next turn — Claude's stream-json
+       *  `session_id`, or Codex's app-server thread id. A GETTER because
+       *  Claude's authoritative id may only settle on the terminal `result`
+       *  line; the serve adapter reads it AFTER the stream drains. Null when
+       *  the runtime produced none (→ the session isn't recorded). */
+      readonly sessionId: () => string | null;
     }
   | { readonly kind: "declined"; readonly reason: string };

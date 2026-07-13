@@ -41,7 +41,7 @@ import {
 } from "@quantidexyz/openllmw/providers/anthropic/streaming";
 import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
-import type { TNativePrompt, TNativeRunResult } from "./types";
+import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv } from "./types";
 
 const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
@@ -56,7 +56,14 @@ export type TClaudeNativeParams = {
   /** Isolated run env (`cliEnv("claude_code")`), merged onto process.env. */
   readonly env: Record<string, string>;
   readonly providerModelId: string;
-  readonly prompt: TNativePrompt;
+  /** System prompt — applied ONLY when starting a fresh session (a resumed
+   *  session already carries it). Null when the client sent none. */
+  readonly systemText: string | null;
+  /** The turn text to feed: the delta user turn on resume, or the seed prompt
+   *  on a fresh start. */
+  readonly userText: string;
+  /** Resume this session id (feed only `userText`), or null → fresh session. */
+  readonly resumeSessionId: string | null;
   readonly signal: AbortSignal;
 };
 
@@ -67,6 +74,7 @@ type TClaudeStreamLine = {
   readonly subtype?: unknown;
   readonly is_error?: unknown;
   readonly result?: unknown;
+  readonly session_id?: unknown;
 };
 
 export const runClaudeNative = async (
@@ -102,14 +110,19 @@ export const runClaudeNative = async (
     "1",
     "--model",
     params.providerModelId,
-    ...(params.prompt.systemText !== null
-      ? ["--system-prompt", params.prompt.systemText]
-      : []),
+    // Resume feeds ONLY the delta turn into the persisted session (which
+    // already holds prior history + the system prompt). A fresh start applies
+    // the system prompt and seeds with `userText`.
+    ...(params.resumeSessionId !== null
+      ? ["--resume", params.resumeSessionId]
+      : params.systemText !== null
+        ? ["--system-prompt", params.systemText]
+        : []),
   ];
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(argv, {
-      stdin: new TextEncoder().encode(params.prompt.userText),
+      stdin: new TextEncoder().encode(params.userText),
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(params.env),
@@ -141,6 +154,12 @@ export const runClaudeNative = async (
   const lines = ndjsonLines(proc.stdout as ReadableStream<Uint8Array>);
   const reader = lines.getReader();
 
+  // Captured from every line that carries a `session_id` — the `system`/init
+  // line (available at commit) and the terminal `result` line (authoritative
+  // for the NEXT resume, in case Claude rotated the id mid-turn). The serve
+  // adapter reads this AFTER the stream drains.
+  let capturedSessionId: string | null = params.resumeSessionId;
+
   /** Pull NDJSON lines until the next canonical chunk (or end/failure). */
   const nextChunk = async (): Promise<
     TChatCompletionChunk | "end" | { error: string }
@@ -153,6 +172,9 @@ export const runClaudeNative = async (
         line = JSON.parse(value) as TClaudeStreamLine;
       } catch {
         continue; // non-JSON noise (debug output) — skip
+      }
+      if (typeof line.session_id === "string" && line.session_id.length > 0) {
+        capturedSessionId = line.session_id;
       }
       if (line.type === "stream_event" && line.event !== undefined) {
         const event = decodeStreamEvent(line.event);
@@ -224,7 +246,7 @@ export const runClaudeNative = async (
       kill();
     },
   });
-  return { kind: "committed", chunks };
+  return { kind: "committed", chunks, sessionId: () => capturedSessionId };
 };
 
 /** Split a byte stream into NDJSON lines (no trailing-newline loss). */

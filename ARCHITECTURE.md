@@ -239,22 +239,34 @@ and `isNativeRuntimeProvider` routes them to the bridge instead:
   Usage maps from `thread/tokenUsage/updated` (`total`; cached input stays a
   SUBSET of `tokens_in`).
 
-Current native scope is gated by `nativePromptOf`: plain single-shot
-generation (no client tools, no assistant/tool history, text-only). Since
-these providers have no manual fallback anymore, an ineligible request — or
-ANY pre-commit failure (spawn, protocol, vendor refusal before output) — is
-a pre-stream hop decline: the walker advances to the next PLAN hop (so a
-fallback chain still catches it) and surfaces the decline reason if the
-whole plan fails. Cloud plan signing, model pins, mixed-chain BYOK
-forwarding, and metadata-only token reporting are unchanged; the recorder
-rides the walker's own `report`. Offline coverage:
-`tests/transport/native-runtime.test.ts` (fixture runtimes). See
-`docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
+**Multi-turn via session resume (`session-store.ts`).** OpenLLM is a
+STATELESS gateway (the client resends the full history every request); the
+native runtimes are STATEFUL agents that only accept the NEW turn. The
+session store bridges them the way T3 does: it correlates a conversation to
+a provider session and feeds only the delta. Correlation is content-derived
+(the gateway carries no session id) — the conversation is keyed by a hash of
+its "consumed prefix" (system + turns up to and including the last assistant
+turn); the DELTA (the new user turn after it) is fed to the resumed session
+(`claude -p --resume <session_id>` / `thread/resume` + `turn/start`). After
+the runtime answers, the store re-keys the session under `hash(prefix +
+delta + response)` so the NEXT request — which carries exactly those messages
+plus its own new user turn — matches and resumes. First turn / unmatched
+history (daemon restart, client compaction) starts fresh; an unmatched
+mid-conversation join renders the transcript as a lossy seed. State is
+daemon-resident (the resume files/threads are daemon-local); in-memory LRU +
+TTL, per-conversation lock. Verified live: a follow-up recalled a codeword
+set in turn 1 while only the new question was fed.
 
-> **Scope caveat.** Multi-turn conversations, tool use, and image/file
-> inputs to `claude_code` / `chatgpt` currently decline (no native mapping
-> yet) — extending the bridges to full conversations/tools is the next step
-> before this is a complete replacement for the removed manual transport.
+Current native scope (`nativeRequestOf`): multi-turn TEXT (system +
+user/assistant text). Tools, images, and structured output decline (Phase 2:
+SDK tool-passthrough). Since these providers have no manual fallback, an
+ineligible request — or ANY pre-commit failure — is a pre-stream hop decline:
+the walker advances to the next PLAN hop and surfaces the reason if the whole
+plan fails. Cloud plan signing, model pins, mixed-chain BYOK forwarding, and
+metadata-only token reporting are unchanged; the recorder rides the walker's
+own `report`. Offline coverage: `tests/transport/native-runtime.test.ts`
+(fixture runtimes). See
+`docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
 
 ## Two localhost surfaces
 

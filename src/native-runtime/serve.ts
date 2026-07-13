@@ -31,8 +31,21 @@ import { cliBin, cliEnv } from "../cli-paths";
 import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
 import { runCodexNative } from "./codex-app-server";
-import type { TNativeRunResult } from "./types";
-import { isNativeRuntimeProvider, nativePromptOf } from "./types";
+import {
+  deriveConversation,
+  NativeSessionStore,
+  nextPrefixHash,
+  renderSeed,
+} from "./session-store";
+import type { TNativeRunResult, TNativeRuntimeProvider } from "./types";
+import { isNativeRuntimeProvider, nativeRequestOf } from "./types";
+
+/** One conversation→session map per native provider (daemon-resident; the
+ *  live resume files/threads are daemon-local, so the map is too). */
+const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
+  claude_code: new NativeSessionStore(),
+  chatgpt: new NativeSessionStore(),
+};
 
 /**
  * A native serve either COMMITS (a `Response` — the vendor runtime produced
@@ -91,6 +104,13 @@ const tokensOf = (resp: {
  * are injectable for tests (fixture runtimes); production callers omit them
  * and get the daemon's isolated CLI paths.
  */
+const textOf = (
+  resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
+): string => {
+  const content = resp.choices[0]?.message.content;
+  return typeof content === "string" ? content : "";
+};
+
 export const tryServeNativeRuntime = async (
   params: TNativeServeParams,
   overrides?: {
@@ -101,43 +121,98 @@ export const tryServeNativeRuntime = async (
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
   }
-  const prompt = nativePromptOf(params.canonical);
-  if (prompt === null) {
+  const req = nativeRequestOf(params.canonical);
+  if (req === null) {
     return {
       declined:
-        "native runtime supports single-shot text generation only (no tools, images, or prior assistant/tool turns)",
+        "native runtime supports text conversations only (tools, images, and structured output are Phase 2)",
     };
   }
 
+  // Correlate to a persisted session and compute the delta turn to feed.
+  const store = stores[params.provider];
+  const { prefixHash, deltaText, hasPrior } = deriveConversation(
+    req.systemText,
+    req.turns,
+  );
+  if (deltaText.length === 0) return { declined: "no user turn to answer" };
+  const lease = await store.lease(prefixHash);
+  const resumeId = lease.sessionId; // null → fresh session
+  // Resume feeds ONLY the delta. A fresh session with unmatched prior history
+  // renders the transcript as a seed (lossy fallback); a true first turn feeds
+  // the delta (which is all the user text) directly.
+  const userText =
+    resumeId !== null
+      ? deltaText
+      : hasPrior
+        ? renderSeed(req.turns, deltaText)
+        : deltaText;
+  // A resumed session already carries the system prompt; only a fresh start
+  // applies it.
+  const systemText = resumeId !== null ? null : req.systemText;
+
   const bin = overrides?.bin ?? cliBin(params.provider);
   const env = overrides?.env ?? cliEnv(params.provider);
-  const run: TNativeRunResult =
-    params.provider === "claude_code"
-      ? await runClaudeNative({
-          bin,
-          env,
-          providerModelId: params.providerModelId,
-          prompt,
-          signal: params.signal,
-        })
-      : await runCodexNative({
-          bin,
-          env,
-          providerModelId: params.providerModelId,
-          prompt,
-          reasoningEffort: params.canonical.reasoning_effort ?? null,
-          signal: params.signal,
-        });
-  if (run.kind === "declined") return { declined: run.reason };
+  let run: TNativeRunResult;
+  try {
+    run =
+      params.provider === "claude_code"
+        ? await runClaudeNative({
+            bin,
+            env,
+            providerModelId: params.providerModelId,
+            systemText,
+            userText,
+            resumeSessionId: resumeId,
+            signal: params.signal,
+          })
+        : await runCodexNative({
+            bin,
+            env,
+            providerModelId: params.providerModelId,
+            systemText,
+            userText,
+            resumeThreadId: resumeId,
+            reasoningEffort: params.canonical.reasoning_effort ?? null,
+            signal: params.signal,
+          });
+  } catch (error) {
+    lease.abandon();
+    return {
+      declined: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (run.kind === "declined") {
+    lease.abandon();
+    return { declined: run.reason };
+  }
+
+  const committed = run;
+  // After the response is accumulated, record tokens AND advance the session:
+  // re-key it under `hash(inbound turns + assistant response)` so the NEXT
+  // request resumes it. On accumulation failure, abandon (next turn re-seeds).
+  const settle = (
+    resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
+  ): void => {
+    params.record(tokensOf(resp));
+    lease.commit(
+      nextPrefixHash(req.systemText, req.turns, textOf(resp)),
+      committed.sessionId(),
+    );
+  };
+  const fail = (): void => {
+    params.record(ZERO);
+    lease.abandon();
+  };
 
   const clientWire = clientWireOf(params.surface);
 
   // ── Streaming client: tee → meter + encode (walker parity) ──────────
   if (params.wantsStream) {
-    const [toClient, toMeter] = run.chunks.tee();
+    const [toClient, toMeter] = committed.chunks.tee();
     void accumulateChunksToResponse(toMeter, params.providerModelId)
-      .then((resp) => params.record(tokensOf(resp)))
-      .catch(() => params.record(ZERO));
+      .then(settle)
+      .catch(fail);
     const clientBytes =
       params.surface === "responses"
         ? chunksToResponsesSseBytes(toClient)
@@ -160,18 +235,18 @@ export const tryServeNativeRuntime = async (
     );
   }
 
-  // ── JSON client: accumulate → record → re-encode per surface ────────
+  // ── JSON client: accumulate → record + advance session → re-encode ──
   let canonical: Awaited<ReturnType<typeof accumulateChunksToResponse>>;
   try {
     canonical = await accumulateChunksToResponse(
-      run.chunks,
+      committed.chunks,
       params.providerModelId,
     );
   } catch {
-    params.record(ZERO);
+    fail();
     return errorJson(502, "native runtime stream ended before output");
   }
-  params.record(tokensOf(canonical));
+  settle(canonical);
   const body =
     params.surface === "responses"
       ? toResponsesResponse(canonical)
@@ -186,4 +261,4 @@ export const tryServeNativeRuntime = async (
 
 export type { TChatCompletionChunk };
 /** Re-exported for the walker + tests. */
-export { isNativeRuntimeProvider, nativePromptOf };
+export { isNativeRuntimeProvider, nativeRequestOf };
