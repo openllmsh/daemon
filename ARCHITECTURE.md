@@ -211,6 +211,35 @@ providers + cross-wire, stream + non-stream, the web_search loop, and the
 forged-signature → 403 gate. The remaining §8 byte-identical-upstream diff
 is a belt-and-braces confidence check, not a ship gate.
 
+**Native-runtime trial (`src/native-runtime/`, opt-in, default OFF).** With
+`OPENLLM_NATIVE_RUNTIME=1|all|<csv>` the walker first offers an eligible
+`claude_code` / `chatgpt` hop to the OFFICIAL vendor runtime instead of the
+manual transport above:
+
+- `claude_code` → the isolated Claude Code CLI in headless stream-json mode
+  (`claude -p --output-format stream-json --include-partial-messages`, under
+  `cliEnv("claude_code")`). The runtime owns auth/refresh/identity and the
+  upstream request; the daemon never reads the credential store on this
+  path. Its `stream_event` lines carry the raw Anthropic SSE events, decoded
+  by the SAME `fromAnthropicStreamEvent` the manual wire uses.
+- `chatgpt` → `codex app-server` JSON-RPC over stdio (one child per daemon,
+  fresh EPHEMERAL thread per request, `approvalPolicy: "never"` + read-only
+  sandbox, under `cliEnv("chatgpt")`). The runtime owns auth.json parsing,
+  refresh, endpoint discovery, Codex identity headers, request shape, and
+  cache/thread affinity — the manual path's whole private-API surface.
+  Usage maps from `thread/tokenUsage/updated` (`total`; cached input stays a
+  SUBSET of `tokens_in`).
+
+Trial scope is gated by `nativePromptOf`: plain single-shot generation only
+(no client tools, no assistant/tool history, text-only). Anything else —
+and ANY pre-commit failure (spawn, protocol, vendor refusal before output)
+— falls back to the manual transport on the SAME hop, so the bridge cannot
+regress unsupported behavior. Cloud plan signing, model pins, mixed-chain
+BYOK forwarding, and metadata-only token reporting are unchanged; the
+recorder rides the walker's own `report`. Offline coverage:
+`tests/transport/native-runtime.test.ts` (fixture runtimes). See
+`docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
+
 ## Two localhost surfaces
 
 `Bun.serve` on `127.0.0.1:<port>` (default 8787) routes by path:

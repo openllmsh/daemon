@@ -100,6 +100,10 @@ import { lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import { forwardToCloud } from "./forward";
+import {
+  nativeRuntimeEnabledFor,
+  tryServeNativeRuntime,
+} from "./native-runtime/serve";
 import { sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
@@ -965,6 +969,34 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   for (const hop of hops) {
     const wire = UPSTREAM_WIRE[hop.provider];
     if (wire !== undefined) {
+      // Native-runtime trial (opt-in via OPENLLM_NATIVE_RUNTIME): execute an
+      // eligible hop through the OFFICIAL vendor runtime (Claude Code
+      // stream-json / codex app-server). Any pre-commit decline falls back to
+      // the manual transport on this SAME hop — never a behavior regression.
+      if (nativeRuntimeEnabledFor(hop.provider)) {
+        const native = await tryServeNativeRuntime({
+          provider: hop.provider,
+          providerModelId: hop.providerModelId,
+          surface: args.surface,
+          canonical,
+          wantsStream:
+            (args.rawBody as { stream?: unknown } | null)?.stream === true,
+          signal: args.req.signal,
+          record: (tokens) =>
+            report(
+              {
+                model: hop.modelId,
+                provider: hop.provider,
+                status: "success",
+                latency_ms: Date.now() - args.startedAt,
+                endpoint: args.endpoint,
+                ...tokens,
+              },
+              args.originParam,
+            ),
+        });
+        if (native !== "fallback") return native; // committed
+      }
       const served = shouldInterceptWebSearch(wire, args.surface, canonical)
         ? await serveWithWebSearch(hop, wire, args, canonical)
         : await serveSubscription(hop, wire, args);
