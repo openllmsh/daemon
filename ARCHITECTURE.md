@@ -257,12 +257,28 @@ daemon-resident (the resume files/threads are daemon-local); in-memory LRU +
 TTL, per-conversation lock. Verified live: a follow-up recalled a codeword
 set in turn 1 while only the new question was fed.
 
-Current native scope (`nativeRequestOf`): multi-turn TEXT (system +
-user/assistant text). Tools, images, and structured output decline (Phase 2:
-SDK tool-passthrough). Since these providers have no manual fallback, an
-ineligible request — or ANY pre-commit failure — is a pre-stream hop decline:
-the walker advances to the next PLAN hop and surfaces the reason if the whole
-plan fails. Cloud plan signing, model pins, mixed-chain BYOK forwarding, and
+**Claude tool-passthrough (`claude-tool-session.ts` + `claude-tool-serve.ts`).**
+A tool-bearing `claude_code` request (client function tools present) is served
+through the `@anthropic-ai/claude-agent-sdk` `query()` in a completion shape,
+so a `/v1/*` client that runs its OWN tools can use the subscription. The
+client's function tools become in-process SDK MCP tools (`alwaysLoad`, granted
+via `canUseTool`); the tool HANDLER PAUSES awaiting the client's result, so the
+model's `tool_use` is returned to the client (as OpenAI `tool_calls` /
+Anthropic `tool_use`) instead of executed. The live `query()` is held (indexed
+by its pending tool-call ids); the client's `tool_result` on the next request
+resolves the paused handler and drives the query to its next tool call or final
+text. A whole agentic task is ONE held query: the opening user turn starts it,
+each tool round-trip continues it. Verified live: `get_weather("Paris")` →
+client supplies "21C and sunny" → "The weather in Paris is currently 21°C and
+sunny." (`chatgpt` tools still decline — Codex `app-server` has no
+completion-tool mode; Phase 3.)
+
+Current text scope (`nativeRequestOf`): multi-turn TEXT (system +
+user/assistant text) via the CLI resume path; tool requests take the SDK path
+above. Images and structured output still decline. Since these providers have
+no manual fallback, an ineligible request — or ANY pre-commit failure — is a
+pre-stream hop decline: the walker advances to the next PLAN hop and surfaces
+the reason if the whole plan fails. Cloud plan signing, model pins, mixed-chain BYOK forwarding, and
 metadata-only token reporting are unchanged; the recorder rides the walker's
 own `report`. Offline coverage: `tests/transport/native-runtime.test.ts`
 (fixture runtimes). See

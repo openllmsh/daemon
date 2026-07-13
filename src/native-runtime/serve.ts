@@ -30,6 +30,7 @@ import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
 import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
+import { hasClientTools, tryServeClaudeTools } from "./claude-tool-serve";
 import { runCodexNative } from "./codex-app-server";
 import {
   deriveConversation,
@@ -120,6 +121,25 @@ export const tryServeNativeRuntime = async (
 ): Promise<TNativeServeOutcome> => {
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
+  }
+  // Tool-bearing requests: claude_code uses the held-query SDK passthrough
+  // (completion tool semantics). chatgpt tools remain Phase 3 (no app-server
+  // completion-tool mode) — they decline here.
+  if (hasClientTools(params.canonical)) {
+    if (params.provider !== "claude_code") {
+      return {
+        declined:
+          "native tool passthrough is claude_code-only (Phase 3: codex)",
+      };
+    }
+    return tryServeClaudeTools({
+      providerModelId: params.providerModelId,
+      surface: params.surface,
+      canonical: params.canonical,
+      bin: overrides?.bin ?? cliBin(params.provider),
+      env: overrides?.env ?? cliEnv(params.provider),
+      record: params.record,
+    });
   }
   const req = nativeRequestOf(params.canonical);
   if (req === null) {
