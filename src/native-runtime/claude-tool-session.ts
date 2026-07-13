@@ -175,17 +175,26 @@ export type TToolTurnResult =
   | { readonly kind: "declined"; readonly reason: string };
 
 /** Shared channel between the paused tool handlers and the driver: fired
- *  handler resolvers, plus a one-shot wake for the driver. */
-type TChannel = {
+ *  handler resolvers, plus a one-shot wake for the driver. Exported so tests
+ *  can inject a scripted fake iterator (see `TIteratorFactory`) that drives it
+ *  without the real `claude` SDK. */
+export type TChannel = {
   readonly fired: Array<(result: string) => void>;
   wake: (() => void) | null;
 };
+
+type TStep = { done?: boolean; value?: unknown };
 
 type THeld = {
   readonly it: AsyncIterator<unknown>;
   readonly chan: TChannel;
   /** client tool-call id → the paused handler's resolver. */
   readonly pending: Map<string, (result: string) => void>;
+  /** A `next()` left IN-FLIGHT when a pause (`fired`) won the race — retained so
+   *  the next `drive()` reuses it instead of calling `next()` again, which would
+   *  let the abandoned promise eat the first message after the resume (the final
+   *  assistant text would silently vanish). */
+  nextP: Promise<TStep> | null;
   sessionId: string | null;
   lastUsed: number;
 };
@@ -202,6 +211,10 @@ const closeHeld = (h: THeld): void => {
   for (const r of h.chan.fired.splice(0)) r("(cancelled)");
   for (const [, resolve] of h.pending) resolve("(cancelled)");
   h.pending.clear();
+  // Settle any retained in-flight next() so it can't surface as an unhandled
+  // rejection once we stop draining the iterator.
+  h.nextP?.catch(() => undefined);
+  h.nextP = null;
   void h.it.return?.(undefined).catch(() => undefined);
   dropIndex(h);
 };
@@ -297,15 +310,24 @@ export type TStartToolTurnParams = {
   readonly userText: string;
 };
 
+/** Builds the message-iterator for a tool turn. The production default is
+ *  `buildIterator` (the real `@anthropic-ai/claude-agent-sdk` `query()`);
+ *  tests inject a scripted fake to drive the orchestration deterministically. */
+export type TIteratorFactory = (
+  params: TStartToolTurnParams,
+  chan: TChannel,
+) => AsyncIterator<unknown>;
+
 /** Start a NEW tool-bearing turn: run to the first tool call or final text. */
 export const startToolTurn = async (
   params: TStartToolTurnParams,
+  makeIterator: TIteratorFactory = buildIterator,
 ): Promise<TToolTurnResult> => {
   evictStale();
   const chan: TChannel = { fired: [], wake: null };
   let it: AsyncIterator<unknown>;
   try {
-    it = buildIterator(params, chan);
+    it = makeIterator(params, chan);
   } catch (error) {
     return {
       kind: "declined",
@@ -316,6 +338,7 @@ export const startToolTurn = async (
     it,
     chan,
     pending: new Map(),
+    nextP: null,
     sessionId: params.resumeSessionId,
     lastUsed: nowMs(),
   };
@@ -363,12 +386,14 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     const firePromise = new Promise<"fired">((resolve) => {
       h.chan.wake = () => resolve("fired");
     });
-    let step: { done?: boolean; value?: unknown } | "fired";
+    // Reuse a next() retained by a prior pause (see THeld.nextP) so the message
+    // after a resume isn't lost to an abandoned promise; otherwise fetch one.
+    const nextP =
+      h.nextP ?? h.it.next().then((r) => r as TStep);
+    h.nextP = null;
+    let step: TStep | "fired";
     try {
-      step = await Promise.race([
-        h.it.next().then((r) => r as { done?: boolean; value?: unknown }),
-        firePromise,
-      ]);
+      step = await Promise.race([nextP, firePromise]);
     } catch (error) {
       closeHeld(h);
       return {
@@ -384,6 +409,9 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     // to produce, hanging the turn to the drive deadline. Bounded by a short
     // settle window (the 10ms poll re-checks even if a wake is missed).
     if (step === "fired") {
+      // The next() we started is still in flight (the resume message hasn't
+      // arrived); retain it so the continuation's drive() consumes it.
+      h.nextP = nextP;
       const settleBy = nowMs() + FIRE_SETTLE_MS;
       while (h.chan.fired.length < toolUse.length && nowMs() < settleBy) {
         await Promise.race([
