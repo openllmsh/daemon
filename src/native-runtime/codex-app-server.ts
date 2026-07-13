@@ -26,6 +26,7 @@ import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import type { TNativePrompt, TNativeRunResult } from "./types";
+import { cleanNativeSpawnEnv } from "./types";
 
 /** Pre-commit budget: handshake + thread/start + first turn output. */
 const PRE_COMMIT_TIMEOUT_MS = 60_000;
@@ -94,7 +95,7 @@ class CodexAppServerClient {
       stdout: "pipe",
       stderr: "ignore",
       cwd: spawnCwd(this.env),
-      env: { ...process.env, ...this.env },
+      env: cleanNativeSpawnEnv(this.env),
     });
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;

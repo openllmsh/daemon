@@ -25,7 +25,21 @@ import type {
   TChatCompletionRequest,
 } from "@quantidexyz/openllmp";
 
-/** The two providers with a native runtime bridge in the trial. */
+/**
+ * The subscription providers whose ONLY daemon data path is the native
+ * runtime — `claude_code` (Claude Code CLI, `claude -p` stream-json) and
+ * `chatgpt` (Codex `app-server` JSON-RPC). Both verified live against the
+ * daemon's ISOLATED credential: the official runtime owns auth/refresh/identity
+ * and the upstream request. The manual upstream-HTTP transport was removed for
+ * these two; the walker routes them here unconditionally. (kimi_code + grok
+ * keep the manual wire.)
+ *
+ * Two non-obvious requirements make `claude -p` work with the isolated home
+ * (see `claude-native.ts` + `cleanNativeSpawnEnv`): NO `--bare` flag (it drops
+ * the setting sources that carry the subscription credential → "Not logged
+ * in"), and the FULL session env minus auth-poison (macOS keychain access
+ * needs the real env, not an `env -i` minimal one).
+ */
 export type TNativeRuntimeProvider = "claude_code" | "chatgpt";
 
 const NATIVE_PROVIDERS: ReadonlySet<string> = new Set([
@@ -33,26 +47,42 @@ const NATIVE_PROVIDERS: ReadonlySet<string> = new Set([
   "chatgpt",
 ]);
 
-/**
- * Opt-in gate — the trial ships OFF. `OPENLLM_NATIVE_RUNTIME` values:
- *   - unset / "0" / "off" / "false"    → disabled (default)
- *   - "1" / "all" / "true"             → both bridges
- *   - "claude_code,chatgpt" (csv)      → per-provider selection
- */
-export const nativeRuntimeEnabledFor = (
+/** Whether a plan hop's provider is served exclusively by a native runtime. */
+export const isNativeRuntimeProvider = (
   provider: string,
-  raw: string | undefined = process.env.OPENLLM_NATIVE_RUNTIME,
-): provider is TNativeRuntimeProvider => {
-  if (!NATIVE_PROVIDERS.has(provider)) return false;
-  const value = (raw ?? "").trim().toLowerCase();
-  if (value === "" || value === "0" || value === "off" || value === "false") {
-    return false;
+): provider is TNativeRuntimeProvider => NATIVE_PROVIDERS.has(provider);
+
+/** Env-var name prefixes/keys that override a vendor runtime's OWN
+ *  subscription credential resolution — dropping them forces the runtime onto
+ *  its official login (keychain / auth.json) instead of an ambient API key or
+ *  a redirected base URL that would 401 as "Not logged in". */
+const POISON_PREFIX = /^(ANTHROPIC_|OPENAI_)/;
+const POISON_KEYS: ReadonlySet<string> = new Set([
+  "CLAUDE_CODE_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CODEX_API_KEY",
+]);
+
+/**
+ * The spawn env for a native vendor runtime: INHERIT the full `process.env`
+ * (macOS keychain access needs the real session env — an `env -i`-style
+ * minimal env breaks `claude -p`'s credential read), then DROP the auth
+ * poison (`ANTHROPIC_*` / `OPENAI_*` / token keys that Bun's auto-loaded
+ * `.env*` or the ambient shell can inject and which would override the
+ * runtime's subscription login), and finally overlay the isolated CLI env
+ * (`cliEnv(...)`: HOME, config-dir, TMPDIR) so the runtime uses the daemon's
+ * OWN account state, not the user's interactive one.
+ */
+export const cleanNativeSpawnEnv = (
+  cliEnv: Record<string, string>,
+): Record<string, string> => {
+  const base: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (POISON_PREFIX.test(key) || POISON_KEYS.has(key)) continue;
+    base[key] = value;
   }
-  if (value === "1" || value === "all" || value === "true") return true;
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .includes(provider);
+  return { ...base, ...cliEnv };
 };
 
 /** The single-shot prompt a native runtime executes for an eligible request. */

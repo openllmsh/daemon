@@ -101,7 +101,7 @@ import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import { forwardToCloud } from "./forward";
 import {
-  nativeRuntimeEnabledFor,
+  isNativeRuntimeProvider,
   tryServeNativeRuntime,
 } from "./native-runtime/serve";
 import { sampleUsageAfterRequest } from "./usage-cache";
@@ -111,10 +111,15 @@ import { sampleUsageAfterRequest } from "./usage-cache";
 // hardcoded here: it's resolved per hop from the delegate's auth config
 // (`credentialForUpstream().url`), captured from the real CLI request. See
 // `packages/daemon/src/delegation/auth-config.ts`.
+// The MANUAL upstream-HTTP transport now serves only kimi_code + grok:
+// claude_code + chatgpt moved to the native-runtime path exclusively
+// (`isNativeRuntimeProvider` — Claude Code `claude -p` / Codex app-server), so
+// their hand-built Anthropic/Codex request serialization is no longer reached
+// here. (The `"anthropic"` wire stays in the union: the shared decode/re-encode
+// helpers below still branch on it for Anthropic-wire CLIENTS of the manual
+// grok/kimi paths.)
 type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
 const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
-  claude_code: "anthropic",
-  chatgpt: "chatgpt",
   // Kimi's managed "Kimi For Coding" subscription speaks the OpenAI wire
   // (`/coding/v1/chat/completions`) — exactly what the official `kimi-code-cli`
   // sends. So we delegate over the openai wire with the CLI's genuine identity
@@ -132,9 +137,9 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
 
 // The Codex system preamble ("You are Codex…") is a Codex IDENTITY the ChatGPT
 // backend requires — but WRONG for other providers that merely share the
-// Responses wire. Inject it ONLY for the real `chatgpt` provider, so xAI Grok
-// (and any future Responses-wire subscription provider) is never told it's
-// Codex. The encode reads this via `toChatGptRequest`'s `codexInstructions`.
+// Responses wire (xAI Grok). The real `chatgpt` provider is served natively
+// now, so on the manual path this is always false; kept as the guard for any
+// future Responses-wire subscription provider added to `UPSTREAM_WIRE`.
 const wantsCodexPreamble = (provider: string): boolean =>
   provider === "chatgpt";
 
@@ -239,6 +244,7 @@ export const verifyPlanSignature = (
 export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
   for (const hop of hops) {
     if (!isSubscriptionSlug(hop.provider)) continue; // API-key → forwardable
+    if (isNativeRuntimeProvider(hop.provider)) continue; // native runtime path
     if (UPSTREAM_WIRE[hop.provider] === undefined) return false;
   }
   return true;
@@ -967,36 +973,39 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
 
   let lastError: string | null = null;
   for (const hop of hops) {
+    // Native-runtime providers (claude_code, chatgpt) — the SOLE data path:
+    // execute through the OFFICIAL vendor runtime (Claude Code stream-json /
+    // Codex app-server). A decline is a pre-stream hop failure → advance to
+    // the next plan hop (so a fallback chain still catches it).
+    if (isNativeRuntimeProvider(hop.provider)) {
+      const native = await tryServeNativeRuntime({
+        provider: hop.provider,
+        providerModelId: hop.providerModelId,
+        surface: args.surface,
+        canonical,
+        wantsStream:
+          (args.rawBody as { stream?: unknown } | null)?.stream === true,
+        signal: args.req.signal,
+        record: (tokens) =>
+          report(
+            {
+              model: hop.modelId,
+              provider: hop.provider,
+              status: "success",
+              latency_ms: Date.now() - args.startedAt,
+              endpoint: args.endpoint,
+              ...tokens,
+            },
+            args.originParam,
+          ),
+      });
+      if (native instanceof Response) return native; // committed
+      lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
+      continue;
+    }
     const wire = UPSTREAM_WIRE[hop.provider];
     if (wire !== undefined) {
-      // Native-runtime trial (opt-in via OPENLLM_NATIVE_RUNTIME): execute an
-      // eligible hop through the OFFICIAL vendor runtime (Claude Code
-      // stream-json / codex app-server). Any pre-commit decline falls back to
-      // the manual transport on this SAME hop — never a behavior regression.
-      if (nativeRuntimeEnabledFor(hop.provider)) {
-        const native = await tryServeNativeRuntime({
-          provider: hop.provider,
-          providerModelId: hop.providerModelId,
-          surface: args.surface,
-          canonical,
-          wantsStream:
-            (args.rawBody as { stream?: unknown } | null)?.stream === true,
-          signal: args.req.signal,
-          record: (tokens) =>
-            report(
-              {
-                model: hop.modelId,
-                provider: hop.provider,
-                status: "success",
-                latency_ms: Date.now() - args.startedAt,
-                endpoint: args.endpoint,
-                ...tokens,
-              },
-              args.originParam,
-            ),
-        });
-        if (native !== "fallback") return native; // committed
-      }
+      // Manual subscription transport — kimi_code + grok only.
       const served = shouldInterceptWebSearch(wire, args.surface, canonical)
         ? await serveWithWebSearch(hop, wire, args, canonical)
         : await serveSubscription(hop, wire, args);

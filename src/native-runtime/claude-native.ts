@@ -15,11 +15,17 @@
  * shape the walker already decodes for the manual anthropic wire — so this
  * bridge reuses `fromAnthropicStreamEvent` verbatim and emits the same
  * canonical chunks the rest of the pipeline consumes. Flags:
- *   --bare --setting-sources ""  isolated, hook/plugin-free run
- *   --tools ""                   no built-in tools (plain generation; a
- *                                tool-needing request never reaches this
- *                                bridge — `nativePromptOf` gates it out)
+ *   --tools ""                   no built-in tools — the init frame reports
+ *                                an EMPTY tool set, so the model can't run
+ *                                bash/edits on the user's machine for a
+ *                                gateway text request (`nativePromptOf` also
+ *                                gates out tool-bearing requests upstream)
+ *   --setting-sources ""         hermetic: ignore user/project/local settings
+ *                                (e.g. a stray ANTHROPIC_BASE_URL redirect)
  *   --max-turns 1                single-shot; no agentic loop
+ * NB: NO `--bare` — it disables the setting sources that carry the Claude
+ * subscription credential, so `claude -p --bare` reports "Not logged in"
+ * even when logged in. Verified empirically against the isolated CLI.
  * Any flag the installed CLI rejects surfaces as an early exit with no
  * output → the bridge DECLINES and the manual transport serves the hop.
  */
@@ -36,6 +42,7 @@ import {
 import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
 import type { TNativePrompt, TNativeRunResult } from "./types";
+import { cleanNativeSpawnEnv } from "./types";
 
 const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
 
@@ -68,6 +75,13 @@ export const runClaudeNative = async (
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "claude CLI not installed" };
   }
+  // NB: the bridge deliberately does NOT unlock or re-partition the isolated
+  // keychain. `claude` reads its OWN keychain item (resolved from the isolated
+  // HOME), and the daemon's status watcher already keeps that keychain
+  // unlocked; a `set-key-partition-list` here would RESTRICT claude's access
+  // and break auth. The load-bearing prep is the SCRUBBED env below —
+  // `cleanNativeSpawnEnv` drops `ANTHROPIC_*`/`CLAUDE_CODE_*` auth vars that
+  // would otherwise override the subscription credential.
   const argv = [
     params.bin,
     "-p",
@@ -75,7 +89,6 @@ export const runClaudeNative = async (
     "stream-json",
     "--include-partial-messages",
     "--verbose",
-    "--bare",
     "--setting-sources",
     "",
     "--tools",
@@ -95,7 +108,7 @@ export const runClaudeNative = async (
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(params.env),
-      env: { ...process.env, ...params.env },
+      env: cleanNativeSpawnEnv(params.env),
     });
   } catch (error) {
     return {

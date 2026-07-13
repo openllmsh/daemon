@@ -6,9 +6,11 @@
  * response is indistinguishable from a manual-served one downstream
  * (dashboard rows included — token counts ride the same recorder).
  *
- * Returns "fallback" for ANY pre-commit condition (disabled, ineligible,
- * bridge declined) — the walker then serves the SAME hop over the manual
- * transport. Post-commit the response is final (commit-on-first-byte).
+ * `claude_code` / `chatgpt` have NO manual transport — this is their sole
+ * path. Returns a `Response` on commit, or `{ declined }` for any pre-commit
+ * condition (ineligible request / bridge decline). The walker treats a decline
+ * as a pre-stream hop failure and advances the plan. Post-commit the response
+ * is final (commit-on-first-byte).
  */
 
 import type {
@@ -30,7 +32,16 @@ import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
 import { runCodexNative } from "./codex-app-server";
 import type { TNativeRunResult } from "./types";
-import { nativePromptOf, nativeRuntimeEnabledFor } from "./types";
+import { isNativeRuntimeProvider, nativePromptOf } from "./types";
+
+/**
+ * A native serve either COMMITS (a `Response` — the vendor runtime produced
+ * output) or DECLINES with a reason. Since the manual transport was removed
+ * for `claude_code` / `chatgpt`, a decline is a pre-stream hop failure: the
+ * walker records the reason and advances to the next plan hop (so a fallback
+ * chain still catches it), and surfaces the reason if the whole plan fails.
+ */
+export type TNativeServeOutcome = Response | { readonly declined: string };
 
 /** The walker-owned token row the recorder consumes (mirrors its shape). */
 export type TNativeTokens = {
@@ -86,10 +97,17 @@ export const tryServeNativeRuntime = async (
     readonly bin?: string;
     readonly env?: Record<string, string>;
   },
-): Promise<Response | "fallback"> => {
-  if (!nativeRuntimeEnabledFor(params.provider)) return "fallback";
+): Promise<TNativeServeOutcome> => {
+  if (!isNativeRuntimeProvider(params.provider)) {
+    return { declined: `${params.provider} has no native runtime` };
+  }
   const prompt = nativePromptOf(params.canonical);
-  if (prompt === null) return "fallback";
+  if (prompt === null) {
+    return {
+      declined:
+        "native runtime supports single-shot text generation only (no tools, images, or prior assistant/tool turns)",
+    };
+  }
 
   const bin = overrides?.bin ?? cliBin(params.provider);
   const env = overrides?.env ?? cliEnv(params.provider);
@@ -110,7 +128,7 @@ export const tryServeNativeRuntime = async (
           reasoningEffort: params.canonical.reasoning_effort ?? null,
           signal: params.signal,
         });
-  if (run.kind === "declined") return "fallback";
+  if (run.kind === "declined") return { declined: run.reason };
 
   const clientWire = clientWireOf(params.surface);
 
@@ -168,4 +186,4 @@ export const tryServeNativeRuntime = async (
 
 export type { TChatCompletionChunk };
 /** Re-exported for the walker + tests. */
-export { nativePromptOf, nativeRuntimeEnabledFor };
+export { isNativeRuntimeProvider, nativePromptOf };

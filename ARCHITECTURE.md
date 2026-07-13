@@ -211,17 +211,26 @@ providers + cross-wire, stream + non-stream, the web_search loop, and the
 forged-signature → 403 gate. The remaining §8 byte-identical-upstream diff
 is a belt-and-braces confidence check, not a ship gate.
 
-**Native-runtime trial (`src/native-runtime/`, opt-in, default OFF).** With
-`OPENLLM_NATIVE_RUNTIME=1|all|<csv>` the walker first offers an eligible
-`claude_code` / `chatgpt` hop to the OFFICIAL vendor runtime instead of the
-manual transport above:
+**Native runtime path (`src/native-runtime/`).** `claude_code` and `chatgpt`
+are served EXCLUSIVELY through the OFFICIAL vendor runtime — the manual
+upstream-HTTP transport (bearer export + hand-built request + direct
+`fetch`) was removed for these two, so `UPSTREAM_WIRE` no longer lists them
+and `isNativeRuntimeProvider` routes them to the bridge instead:
 
 - `claude_code` → the isolated Claude Code CLI in headless stream-json mode
   (`claude -p --output-format stream-json --include-partial-messages`, under
   `cliEnv("claude_code")`). The runtime owns auth/refresh/identity and the
   upstream request; the daemon never reads the credential store on this
   path. Its `stream_event` lines carry the raw Anthropic SSE events, decoded
-  by the SAME `fromAnthropicStreamEvent` the manual wire uses.
+  by the SAME `fromAnthropicStreamEvent` the manual wire uses. **Two
+  non-obvious requirements** (verified live against the isolated home, both
+  load-bearing): (1) NO `--bare` — that flag disables the setting sources
+  that carry the Claude subscription credential, so `claude -p --bare`
+  reports "Not logged in" even when logged in; `--tools ""` alone gives the
+  empty tool set safely. (2) the spawn env INHERITS the full session env
+  (macOS keychain access needs it — an `env -i` minimal env breaks the
+  credential read) minus the `ANTHROPIC_*` auth-poison keys
+  (`cleanNativeSpawnEnv`).
 - `chatgpt` → `codex app-server` JSON-RPC over stdio (one child per daemon,
   fresh EPHEMERAL thread per request, `approvalPolicy: "never"` + read-only
   sandbox, under `cliEnv("chatgpt")`). The runtime owns auth.json parsing,
@@ -230,15 +239,22 @@ manual transport above:
   Usage maps from `thread/tokenUsage/updated` (`total`; cached input stays a
   SUBSET of `tokens_in`).
 
-Trial scope is gated by `nativePromptOf`: plain single-shot generation only
-(no client tools, no assistant/tool history, text-only). Anything else —
-and ANY pre-commit failure (spawn, protocol, vendor refusal before output)
-— falls back to the manual transport on the SAME hop, so the bridge cannot
-regress unsupported behavior. Cloud plan signing, model pins, mixed-chain
-BYOK forwarding, and metadata-only token reporting are unchanged; the
-recorder rides the walker's own `report`. Offline coverage:
+Current native scope is gated by `nativePromptOf`: plain single-shot
+generation (no client tools, no assistant/tool history, text-only). Since
+these providers have no manual fallback anymore, an ineligible request — or
+ANY pre-commit failure (spawn, protocol, vendor refusal before output) — is
+a pre-stream hop decline: the walker advances to the next PLAN hop (so a
+fallback chain still catches it) and surfaces the decline reason if the
+whole plan fails. Cloud plan signing, model pins, mixed-chain BYOK
+forwarding, and metadata-only token reporting are unchanged; the recorder
+rides the walker's own `report`. Offline coverage:
 `tests/transport/native-runtime.test.ts` (fixture runtimes). See
 `docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
+
+> **Scope caveat.** Multi-turn conversations, tool use, and image/file
+> inputs to `claude_code` / `chatgpt` currently decline (no native mapping
+> yet) — extending the bridges to full conversations/tools is the next step
+> before this is a complete replacement for the removed manual transport.
 
 ## Two localhost surfaces
 
