@@ -55,10 +55,10 @@ const CODEX_TOOLS_READY = false;
 
 /**
  * A native serve either COMMITS (a `Response` — the vendor runtime produced
- * output) or DECLINES with a reason. Since the manual transport was removed
- * for `claude_code` / `chatgpt`, a decline is a pre-stream hop failure: the
- * walker records the reason and advances to the next plan hop (so a fallback
- * chain still catches it), and surfaces the reason if the whole plan fails.
+ * output) or DECLINES with a reason. A decline means the request is outside the
+ * native path's scope (tools/images/structured-output, or a pre-commit
+ * failure); the walker then falls back to the MANUAL transport on the SAME hop
+ * (`UPSTREAM_WIRE`) so no workflow is blocked.
  */
 export type TNativeServeOutcome = Response | { readonly declined: string };
 

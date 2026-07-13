@@ -27,13 +27,14 @@ import type {
 import { stateDir } from "../env";
 
 /**
- * The subscription providers whose ONLY daemon data path is the native
- * runtime — `claude_code` (Claude Code CLI, `claude -p` stream-json) and
- * `chatgpt` (Codex `app-server` JSON-RPC). Both verified live against the
- * daemon's ISOLATED credential: the official runtime owns auth/refresh/identity
- * and the upstream request. The manual upstream-HTTP transport was removed for
- * these two; the walker routes them here unconditionally. (kimi_code + grok
- * keep the manual wire.)
+ * The subscription providers served by the native runtime FIRST — `claude_code`
+ * (Claude Code CLI, `claude -p` stream-json) and `chatgpt` (Codex `app-server`
+ * JSON-RPC). Both verified live against the daemon's ISOLATED credential: the
+ * official runtime owns auth/refresh/identity and the upstream request. The
+ * walker falls back to the MANUAL transport when the native path declines
+ * (tools/images/structured-output/native gaps), so no workflow is blocked;
+ * auth/refresh flow through the CLI on both paths. (kimi_code + grok are
+ * manual-only.)
  *
  * Two non-obvious requirements make `claude -p` work with the isolated home
  * (see `claude-native.ts` + `cleanNativeSpawnEnv`): NO `--bare` flag (it drops

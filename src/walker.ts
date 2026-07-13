@@ -111,15 +111,21 @@ import { sampleUsageAfterRequest } from "./usage-cache";
 // hardcoded here: it's resolved per hop from the delegate's auth config
 // (`credentialForUpstream().url`), captured from the real CLI request. See
 // `packages/daemon/src/delegation/auth-config.ts`.
-// The MANUAL upstream-HTTP transport now serves only kimi_code + grok:
-// claude_code + chatgpt moved to the native-runtime path exclusively
-// (`isNativeRuntimeProvider` — Claude Code `claude -p` / Codex app-server), so
-// their hand-built Anthropic/Codex request serialization is no longer reached
-// here. (The `"anthropic"` wire stays in the union: the shared decode/re-encode
-// helpers below still branch on it for Anthropic-wire CLIENTS of the manual
-// grok/kimi paths.)
+// The MANUAL upstream-HTTP transport. `claude_code` + `chatgpt` are served by
+// the native-runtime path FIRST (`isNativeRuntimeProvider`); the manual entries
+// here are the FALLBACK the walker uses when native declines (tools/images/
+// structured-output/native gaps), so no workflow is blocked. Auth + refresh
+// still flow through the CLIs — the manual path reads the credential via the
+// delegate's `credentialForUpstream` (isolated CLI store + CLI-driven refresh),
+// exactly like kimi_code + grok.
 type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
 const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
+  // Claude Pro/Max via the isolated Claude Code OAuth bearer + the
+  // `anthropic-beta: oauth-2025-04-20` header on the Anthropic Messages wire.
+  claude_code: "anthropic",
+  // ChatGPT/Codex subscription via the Codex Responses wire
+  // (`/backend-api/codex/responses`) with the Codex identity preamble.
+  chatgpt: "chatgpt",
   // Kimi's managed "Kimi For Coding" subscription speaks the OpenAI wire
   // (`/coding/v1/chat/completions`) — exactly what the official `kimi-code-cli`
   // sends. So we delegate over the openai wire with the CLI's genuine identity
@@ -137,9 +143,8 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
 
 // The Codex system preamble ("You are Codex…") is a Codex IDENTITY the ChatGPT
 // backend requires — but WRONG for other providers that merely share the
-// Responses wire (xAI Grok). The real `chatgpt` provider is served natively
-// now, so on the manual path this is always false; kept as the guard for any
-// future Responses-wire subscription provider added to `UPSTREAM_WIRE`.
+// Responses wire (xAI Grok). Injected only for the real `chatgpt` provider on
+// the manual FALLBACK path.
 const wantsCodexPreamble = (provider: string): boolean =>
   provider === "chatgpt";
 
@@ -973,10 +978,12 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
 
   let lastError: string | null = null;
   for (const hop of hops) {
-    // Native-runtime providers (claude_code, chatgpt) — the SOLE data path:
-    // execute through the OFFICIAL vendor runtime (Claude Code stream-json /
-    // Codex app-server). A decline is a pre-stream hop failure → advance to
-    // the next plan hop (so a fallback chain still catches it).
+    // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
+    // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
+    // DECLINE (unsupported request — tools/images/structured-output — or a
+    // pre-commit failure) fall through to the MANUAL transport on the SAME hop
+    // (below) so no workflow is blocked; auth/refresh still run through the CLI
+    // via the delegate either way.
     if (isNativeRuntimeProvider(hop.provider)) {
       const native = await tryServeNativeRuntime({
         provider: hop.provider,
@@ -999,13 +1006,14 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
             args.originParam,
           ),
       });
-      if (native instanceof Response) return native; // committed
+      if (native instanceof Response) return native; // committed natively
       lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
-      continue;
+      // ↓ fall through to the manual transport for this hop (no `continue`).
     }
     const wire = UPSTREAM_WIRE[hop.provider];
     if (wire !== undefined) {
-      // Manual subscription transport — kimi_code + grok only.
+      // Manual subscription transport — the fallback for native declines
+      // (claude_code + chatgpt) and the sole path for kimi_code + grok.
       const served = shouldInterceptWebSearch(wire, args.surface, canonical)
         ? await serveWithWebSearch(hop, wire, args, canonical)
         : await serveSubscription(hop, wire, args);

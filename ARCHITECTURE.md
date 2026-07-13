@@ -212,10 +212,12 @@ forged-signature → 403 gate. The remaining §8 byte-identical-upstream diff
 is a belt-and-braces confidence check, not a ship gate.
 
 **Native runtime path (`src/native-runtime/`).** `claude_code` and `chatgpt`
-are served EXCLUSIVELY through the OFFICIAL vendor runtime — the manual
-upstream-HTTP transport (bearer export + hand-built request + direct
-`fetch`) was removed for these two, so `UPSTREAM_WIRE` no longer lists them
-and `isNativeRuntimeProvider` routes them to the bridge instead:
+are served through the OFFICIAL vendor runtime FIRST
+(`isNativeRuntimeProvider`), with the MANUAL upstream-HTTP transport (bearer
+export + hand-built request + direct `fetch`, still in `UPSTREAM_WIRE`) as the
+fallback when the native path declines — see "Native decline → manual
+fallback" below. Both paths authenticate + refresh through the CLI via the
+delegate. The native bridges:
 
 - `claude_code` → the isolated Claude Code CLI in headless stream-json mode
   (`claude -p --output-format stream-json --include-partial-messages`, under
@@ -272,27 +274,33 @@ each tool round-trip continues it. Verified live: `get_weather("Paris")` →
 client supplies "21C and sunny" → "The weather in Paris is currently 21°C and
 sunny."
 
-**Codex tools (`codex-tool-session.ts`) — built, gated OFF.** Codex's protocol
-DOES have a native completion-tool mechanism: `thread/start.dynamicTools`
-(client function tools, `inputSchema` = raw JSON) + the server→client
-`item/tool/call` request (the app-server asks US to run the tool, we respond
-with the client's result). The full held-turn orchestrator is implemented and
-mirrors the Claude path — NO manual Responses path. But codex-cli **0.144.0**'s
-app-server does not actually emit `item/tool/call` for `dynamicTools` (the
-schema ships only under `--experimental`; a dynamic tool call fails with
-"execution host is missing"). So `chatgpt` tool requests DECLINE
-(`CODEX_TOOLS_READY = false` in `serve.ts`) until a codex-cli activates the
-routing — then flip the flag; the code is ready.
+**Codex tools (`codex-tool-session.ts`) — built, gated OFF (falls back to
+manual).** Codex's protocol DOES have a native completion-tool mechanism:
+`thread/start.dynamicTools` (client function tools, `inputSchema` = raw JSON) +
+the server→client `item/tool/call` request (the app-server asks US to run the
+tool, we respond with the client's result). The full held-turn orchestrator is
+implemented and mirrors the Claude path. But codex-cli **0.144.0**'s app-server
+does not actually emit `item/tool/call` for `dynamicTools` (the schema ships
+only under `--experimental`; a dynamic tool call fails "execution host is
+missing"). So the native codex-tool path is gated (`CODEX_TOOLS_READY = false`
+in `serve.ts`) — `chatgpt` tool requests decline natively and fall back to the
+MANUAL Codex Responses path (which forwards `function_call` for client
+execution). Flip the flag when a codex-cli activates the routing; the code is
+ready.
 
-Current text scope (`nativeRequestOf`): multi-turn TEXT (system +
-user/assistant text) via the CLI resume path; tool requests take the SDK path
-above. Images and structured output still decline. Since these providers have
-no manual fallback, an ineligible request — or ANY pre-commit failure — is a
-pre-stream hop decline: the walker advances to the next PLAN hop and surfaces
-the reason if the whole plan fails. Cloud plan signing, model pins, mixed-chain BYOK forwarding, and
-metadata-only token reporting are unchanged; the recorder rides the walker's
-own `report`. Offline coverage: `tests/transport/native-runtime.test.ts`
-(fixture runtimes). See
+Current native scope (`nativeRequestOf`): multi-turn TEXT (system +
+user/assistant text) via the CLI resume path; claude_code tool requests take
+the SDK tool path. **Native decline → manual fallback.** Anything the native
+path declines — images, structured output, chatgpt tools (until Codex
+activates), or ANY pre-commit failure — falls through to the MANUAL transport
+on the SAME hop (`claude_code` → Anthropic Messages with the OAuth bearer,
+`chatgpt` → Codex Responses), so no client workflow is blocked. Auth + refresh
+run through the CLI (the delegate's `credentialForUpstream`) on both paths.
+Only if the manual transport ALSO fails pre-stream does the walker advance to
+the next PLAN hop. Cloud plan signing, model pins, mixed-chain BYOK forwarding,
+and metadata-only token reporting are unchanged; the recorder rides the
+walker's own `report`. Offline coverage:
+`tests/transport/native-runtime.test.ts` (fixture runtimes). See
 `docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
 
 ## Two localhost surfaces
