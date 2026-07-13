@@ -18,7 +18,7 @@
  *   --tools ""                   no built-in tools — the init frame reports
  *                                an EMPTY tool set, so the model can't run
  *                                bash/edits on the user's machine for a
- *                                gateway text request (`nativePromptOf` also
+ *                                gateway text request (`nativeRequestOf` also
  *                                gates out tool-bearing requests upstream)
  *   --setting-sources ""         hermetic: ignore user/project/local settings
  *                                (e.g. a stray ANTHROPIC_BASE_URL redirect)

@@ -6,29 +6,25 @@
  * response is indistinguishable from a manual-served one downstream
  * (dashboard rows included — token counts ride the same recorder).
  *
- * `claude_code` / `chatgpt` have NO manual transport — this is their sole
- * path. Returns a `Response` on commit, or `{ declined }` for any pre-commit
- * condition (ineligible request / bridge decline). The walker treats a decline
- * as a pre-stream hop failure and advances the plan. Post-commit the response
- * is final (commit-on-first-byte).
+ * The native path is PRIMARY for `claude_code` / `chatgpt`; the walker's
+ * MANUAL transport is the FALLBACK. Returns a `Response` on commit, or
+ * `{ declined }` for any pre-commit condition (ineligible request — tools the
+ * native path can't serve, images, structured output — or a bridge decline).
+ * A decline falls through to the manual transport on the SAME hop; the walker
+ * only advances the plan if the manual transport ALSO fails pre-stream.
+ * Post-commit the response is final (commit-on-first-byte).
  */
 
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
 } from "@quantidexyz/openllmp";
-import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
-import { chunksToMessagesSseBytes } from "@quantidexyz/openllmw/adapters/messages/streaming";
-import {
-  chunksToResponsesSseBytes,
-  toResponsesResponse,
-} from "@quantidexyz/openllmw/adapters/responses";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
-import { chunksToSseBytes } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
 import { functionNameUsesWebSearch } from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { cliBin, cliEnv } from "../cli-paths";
+import { jsonBodyForClient, sseBytesForClient } from "../client-encode";
 import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
 import { hasClientTools, tryServeClaudeTools } from "./claude-tool-serve";
@@ -39,8 +35,17 @@ import {
   nextPrefixHash,
   renderSeed,
 } from "./session-store";
-import type { TNativeRunResult, TNativeRuntimeProvider } from "./types";
-import { isNativeRuntimeProvider, nativeRequestOf } from "./types";
+import type {
+  TNativeRunResult,
+  TNativeRuntimeProvider,
+  TNativeTokens,
+} from "./types";
+import {
+  isNativeRuntimeProvider,
+  nativeRequestOf,
+  tokensFromResponse,
+  ZERO_TOKENS,
+} from "./types";
 
 /** One conversation→session map per native provider (daemon-resident; the
  *  live resume files/threads are daemon-local, so the map is too). */
@@ -49,9 +54,13 @@ const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   chatgpt: new NativeSessionStore(),
 };
 
-/** Flip to true once codex-cli's app-server emits `item/tool/call` for
- *  `dynamicTools` — the completion tool-passthrough is already built in
- *  `codex-tool-session.ts`; only the CLI runtime support is missing. */
+/** Flip to true ONLY once codex-cli's app-server actually emits `item/tool/call`
+ *  for `dynamicTools` (as of 0.144.0 it doesn't — the schema ships under
+ *  `--experimental` but the call never fires). The codex tool-passthrough in
+ *  `codex-tool-session.ts` is written and protocol-correct but UNVALIDATED: no
+ *  fixture/live coverage, and it still lacks the Claude-side fixes from Batch B
+ *  (per-turn usage is a no-op; the tool drive() timeout doesn't interrupt the
+ *  turn). Pre-flip checklist lives in that file's header — do NOT flip without it. */
 const CODEX_TOOLS_READY = false;
 
 /**
@@ -62,14 +71,6 @@ const CODEX_TOOLS_READY = false;
  * (`UPSTREAM_WIRE`) so no workflow is blocked.
  */
 export type TNativeServeOutcome = Response | { readonly declined: string };
-
-/** The walker-owned token row the recorder consumes (mirrors its shape). */
-export type TNativeTokens = {
-  readonly tokens_in: number;
-  readonly tokens_out: number;
-  readonly cached_tokens: number;
-  readonly cache_creation_tokens: number;
-};
 
 export type TNativeServeParams = {
   readonly provider: string;
@@ -82,35 +83,11 @@ export type TNativeServeParams = {
   readonly record: (tokens: TNativeTokens) => void;
 };
 
-const ZERO: TNativeTokens = {
-  tokens_in: 0,
-  tokens_out: 0,
-  cached_tokens: 0,
-  cache_creation_tokens: 0,
-};
-
 /** Does the request declare the openllm-managed web_search function tool?
  *  (Mirrors the walker's own gate — the gateway runs this tool, not the
  *  client, so it must NOT enter the native tool-passthrough path.) */
 const requestDeclaresWebSearch = (req: TChatCompletionRequest): boolean =>
   req.tools?.some((t) => functionNameUsesWebSearch(t.function.name)) === true;
-
-const tokensOf = (resp: {
-  readonly usage?: {
-    readonly prompt_tokens: number;
-    readonly completion_tokens: number;
-    readonly prompt_tokens_details?: {
-      readonly cached_tokens?: number;
-      readonly cache_creation_tokens?: number;
-    };
-  } | null;
-}): TNativeTokens => ({
-  tokens_in: resp.usage?.prompt_tokens ?? 0,
-  tokens_out: resp.usage?.completion_tokens ?? 0,
-  cached_tokens: resp.usage?.prompt_tokens_details?.cached_tokens ?? 0,
-  cache_creation_tokens:
-    resp.usage?.prompt_tokens_details?.cache_creation_tokens ?? 0,
-});
 
 /**
  * Try to serve one subscription hop through its native runtime. `bin`/`env`
@@ -143,7 +120,8 @@ export const tryServeNativeRuntime = async (
   // correctly via `shouldInterceptWebSearch`) serve the hop.
   if (requestDeclaresWebSearch(params.canonical)) {
     return {
-      declined: "web_search runs on the gateway's managed loop (manual transport)",
+      declined:
+        "web_search runs on the gateway's managed loop (manual transport)",
     };
   }
   // Tool-bearing requests use completion tool-passthrough. claude_code: the
@@ -243,14 +221,14 @@ export const tryServeNativeRuntime = async (
   const settle = (
     resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
   ): void => {
-    params.record(tokensOf(resp));
+    params.record(tokensFromResponse(resp));
     lease.commit(
       nextPrefixHash(req.systemText, req.turns, textOf(resp)),
       committed.sessionId(),
     );
   };
   const fail = (): void => {
-    params.record(ZERO);
+    params.record(ZERO_TOKENS);
     lease.abandon();
   };
 
@@ -262,12 +240,7 @@ export const tryServeNativeRuntime = async (
     void accumulateChunksToResponse(toMeter, params.providerModelId)
       .then(settle)
       .catch(fail);
-    const clientBytes =
-      params.surface === "responses"
-        ? chunksToResponsesSseBytes(toClient)
-        : clientWire === "anthropic"
-          ? chunksToMessagesSseBytes(toClient)
-          : chunksToSseBytes(toClient);
+    const clientBytes = sseBytesForClient(toClient, params.surface, clientWire);
     return new Response(
       withFrameAlignedHeartbeat(clientBytes, {
         intervalMs: 15_000,
@@ -296,12 +269,7 @@ export const tryServeNativeRuntime = async (
     return errorJson(502, "native runtime stream ended before output");
   }
   settle(canonical);
-  const body =
-    params.surface === "responses"
-      ? toResponsesResponse(canonical)
-      : clientWire === "anthropic"
-        ? toAnthropicMessagesResponse(canonical)
-        : canonical;
+  const body = jsonBodyForClient(canonical, params.surface, clientWire);
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" },

@@ -29,7 +29,7 @@ import {
 import type { TChatCompletionResponse } from "@quantidexyz/openllmp";
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
-import type { TNativeTokens } from "./serve";
+import type { TNativeTokens } from "./types";
 import { cleanNativeSpawnEnv } from "./types";
 
 /** Idle TTL for a held (paused) query before it's force-closed. */

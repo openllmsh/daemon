@@ -11,9 +11,8 @@
  */
 
 import type { TChatCompletionRequest } from "@quantidexyz/openllmp";
-import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
-import { toResponsesResponse } from "@quantidexyz/openllmw/adapters/responses";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
+import { jsonBodyForClient } from "../client-encode";
 import {
   continueToolTurn,
   startToolTurn,
@@ -24,7 +23,8 @@ import {
   continueCodexToolTurn,
   startCodexToolTurn,
 } from "./codex-tool-session";
-import type { TNativeTokens } from "./serve";
+import type { TNativeTokens } from "./types";
+import { ZERO_TOKENS } from "./types";
 
 export type TToolServeOutcome = Response | { readonly declined: string };
 
@@ -73,13 +73,6 @@ export type TClaudeToolServeParams = {
   readonly bin: string;
   readonly env: Record<string, string>;
   readonly record: (tokens: TNativeTokens) => void;
-};
-
-const ZERO_TOKENS: TNativeTokens = {
-  tokens_in: 0,
-  tokens_out: 0,
-  cached_tokens: 0,
-  cache_creation_tokens: 0,
 };
 
 /** Serve a tool-bearing claude_code request through the held-query orchestrator. */
@@ -136,12 +129,7 @@ export const tryServeClaudeTools = async (
 
   const canonicalResp = toolTurnToResponse(result, params.providerModelId);
   const clientWire = clientWireOf(params.surface);
-  const body =
-    params.surface === "responses"
-      ? toResponsesResponse(canonicalResp)
-      : clientWire === "anthropic"
-        ? toAnthropicMessagesResponse(canonicalResp)
-        : canonicalResp;
+  const body = jsonBodyForClient(canonicalResp, params.surface, clientWire);
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" },

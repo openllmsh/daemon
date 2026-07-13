@@ -293,8 +293,7 @@ class CodexAppServerClient {
         // would over-report tokens/cache on turn 2+ (the manual, stateless
         // path always reports per-request). Fall back to `total` only when the
         // runtime omits `last` (a fresh thread's first update).
-        const breakdown =
-          params?.tokenUsage?.last ?? params?.tokenUsage?.total;
+        const breakdown = params?.tokenUsage?.last ?? params?.tokenUsage?.total;
         if (breakdown !== undefined) {
           sink.onUsage(
             usageFromBreakdown(
@@ -358,7 +357,7 @@ export type TCodexNativeParams = {
 
 /** Canonical `reasoning_effort` → app-server effort (same narrowing as the
  *  manual chatgpt encoder: minimal/low→low, medium→medium, rest→high). */
-const effortOf = (raw: string | null): string | null => {
+export const effortOf = (raw: string | null): string | null => {
   if (raw === null || raw === "none") return null;
   if (raw === "minimal" || raw === "low") return "low";
   if (raw === "medium") return "medium";

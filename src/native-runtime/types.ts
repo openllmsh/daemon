@@ -13,11 +13,12 @@
  * pre-commit failure falls back to the existing manual transport on the SAME
  * hop. See docs/audit/2026-07-13-t3code-provider-routing-comparison.md §5.
  *
- * Scope is deliberately narrow for the trial (see `nativePromptOf`): a hop is
- * native-eligible only when the request is a plain single-shot generation —
- * no client tools, no prior assistant/tool turns, text-only content. Anything
- * else declines up front and the manual path serves it, so the bridge can
- * never regress behavior it does not support.
+ * Scope (see `nativeRequestOf`): a hop is native-eligible when the request is a
+ * plain multi-turn TEXT conversation (served via session resume — only the
+ * delta turn is fed), plus tool-bearing `claude_code` requests (the held-open
+ * SDK query). Images, structured output, and (for now) chatgpt tools decline
+ * up front and the MANUAL transport serves them on the same hop, so the bridge
+ * can never regress behavior it does not support.
  */
 
 import type {
@@ -98,13 +99,46 @@ export const cleanNativeSpawnEnv = (
   };
 };
 
-/** The single-shot prompt a native runtime executes for an eligible request. */
-export type TNativePrompt = {
-  /** Concatenated system-message text, or null when the client sent none. */
-  readonly systemText: string | null;
-  /** The one user turn's text. */
-  readonly userText: string;
+/**
+ * The daemon's per-hop token row (what the recorder + cloud consume).
+ * `tokens_in` is the canonical prompt-token total and INCLUDES the two cache
+ * fields; the cloud prices the split at cache rates. Shared by BOTH the native
+ * path (serve + tool bridges) and the walker's manual transport so the two
+ * can't drift.
+ */
+export type TNativeTokens = {
+  readonly tokens_in: number;
+  readonly tokens_out: number;
+  readonly cached_tokens: number;
+  readonly cache_creation_tokens: number;
 };
+
+/** The all-zero token row (pre-output failures, un-metered fallbacks). */
+export const ZERO_TOKENS: TNativeTokens = {
+  tokens_in: 0,
+  tokens_out: 0,
+  cached_tokens: 0,
+  cache_creation_tokens: 0,
+};
+
+/** Extract the token row from a canonical response's usage — the SINGLE mapper
+ *  both the native and manual paths use (identical field folding). */
+export const tokensFromResponse = (resp: {
+  readonly usage?: {
+    readonly prompt_tokens: number;
+    readonly completion_tokens: number;
+    readonly prompt_tokens_details?: {
+      readonly cached_tokens?: number;
+      readonly cache_creation_tokens?: number;
+    };
+  } | null;
+}): TNativeTokens => ({
+  tokens_in: resp.usage?.prompt_tokens ?? 0,
+  tokens_out: resp.usage?.completion_tokens ?? 0,
+  cached_tokens: resp.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+  cache_creation_tokens:
+    resp.usage?.prompt_tokens_details?.cache_creation_tokens ?? 0,
+});
 
 /** One text turn of a canonical conversation (Phase 1 = text only). */
 export type TNativeTurn = {
@@ -127,8 +161,8 @@ export type TNativeRequest = {
  * turns }` when it's a plain multi-turn TEXT conversation the native runtimes
  * can serve via session resume, or null when it isn't yet supported (tools /
  * tool_choice / response_format / non-text content / `tool`-role messages —
- * those are Phase 2). Unlike `nativePromptOf` this accepts prior assistant
- * turns: the session store feeds only the NEW turn to a resumed session.
+ * those are Phase 2). It accepts prior assistant turns: the session store
+ * feeds only the NEW turn to a resumed session.
  */
 export const nativeRequestOf = (
   canonical: TChatCompletionRequest,
@@ -193,56 +227,6 @@ const plainTextOf = (
     parts.push((part as { text: string }).text);
   }
   return parts.join("");
-};
-
-/**
- * The trial capability gate: return the native prompt when the canonical
- * request is a plain single-shot generation the vendor runtimes can execute
- * faithfully, or null → the walker keeps the manual transport.
- *
- * Eligible = no tools / tool_choice / response_format, and the messages are
- * exactly (any number of) system turns plus ONE user turn, all text-only.
- * Multi-turn histories are out: the vendor runtimes own their session state,
- * and replaying a foreign assistant/tool transcript through them is not a
- * supported operation (see audit §5.4 — unsupported must be explicit, never
- * approximated).
- */
-export const nativePromptOf = (
-  canonical: TChatCompletionRequest,
-): TNativePrompt | null => {
-  if ((canonical.tools?.length ?? 0) > 0) return null;
-  if (canonical.tool_choice !== undefined && canonical.tool_choice !== null) {
-    return null;
-  }
-  if (
-    canonical.response_format !== undefined &&
-    canonical.response_format !== null
-  ) {
-    return null;
-  }
-  const systemParts: string[] = [];
-  let userText: string | null = null;
-  for (const message of canonical.messages) {
-    if (message.role === "system") {
-      const text = plainTextOf(message.content);
-      if (text === null) return null;
-      if (text.length > 0) systemParts.push(text);
-      continue;
-    }
-    if (message.role === "user") {
-      if (userText !== null) return null; // second user turn → multi-turn
-      const text = plainTextOf(message.content);
-      if (text === null || text.length === 0) return null;
-      userText = text;
-      continue;
-    }
-    return null; // assistant / tool history → out of trial scope
-  }
-  if (userText === null) return null;
-  return {
-    systemText: systemParts.length > 0 ? systemParts.join("\n\n") : null,
-    userText,
-  };
 };
 
 /**

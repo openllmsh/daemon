@@ -15,6 +15,20 @@
  *
  * A full agentic task is ONE held app-server turn. Shares the result shape +
  * canonical encoder with the Claude tool path (`claude-tool-session.ts`).
+ *
+ * ⚠️ NOT READY — gated OFF by `CODEX_TOOLS_READY` in serve.ts. codex-cli 0.144.0
+ * does not emit `item/tool/call` for `dynamicTools` (the schema is behind
+ * `--experimental`; the call never fires), so this path is UNREACHABLE and
+ * UNVALIDATED — no fixture or live coverage exists. Before flipping the flag:
+ *   1. Add a fixture test of the `dynamicTools` + `item/tool/call` round-trip
+ *      (start → tool call → client result → continue → final).
+ *   2. Wire per-turn usage — `onUsage` is a no-op here; mirror
+ *      `usageFromBreakdown` so tool turns are billed like the text path.
+ *   3. Interrupt the turn on the drive() timeout (parity with the Batch B
+ *      fix in `runCodexNative`) so a stalled turn doesn't leak in the shared
+ *      app-server process.
+ * Parallel tool calls are already handled (pairing is by protocol `callId`,
+ * not positional — unlike the Claude path's pre-Batch-B bug).
  */
 
 import type {
@@ -22,7 +36,11 @@ import type {
   TToolCallOut,
   TToolTurnResult,
 } from "./claude-tool-session";
-import { type CodexAppServerClient, clientFor } from "./codex-app-server";
+import {
+  type CodexAppServerClient,
+  clientFor,
+  effortOf,
+} from "./codex-app-server";
 
 const HELD_TTL_MS = 10 * 60 * 1000;
 const DRIVE_TIMEOUT_MS = 120_000;
@@ -83,13 +101,6 @@ const evictStale = (): void => {
 // CODEX_TOOLS_READY flips; harmless while `held` is empty.)
 const sweep = setInterval(evictStale, HELD_TTL_MS);
 sweep.unref?.();
-
-const effortOf = (raw: string | null): string | null => {
-  if (raw === null || raw === "none") return null;
-  if (raw === "minimal" || raw === "low") return "low";
-  if (raw === "medium") return "medium";
-  return "high";
-};
 
 const push = (h: THeld, e: TEvent): void => {
   h.queue.push(e);

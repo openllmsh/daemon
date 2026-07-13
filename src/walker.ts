@@ -52,18 +52,11 @@ import {
   type TToolCall,
 } from "@quantidexyz/openllmp";
 import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
-import { chunksToMessagesSseBytes } from "@quantidexyz/openllmw/adapters/messages/streaming";
-import {
-  chunksToResponsesSseBytes,
-  toResponsesResponse,
-} from "@quantidexyz/openllmw/adapters/responses";
+import { toResponsesResponse } from "@quantidexyz/openllmw/adapters/responses";
 import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
 import { originatorHeadersFrom } from "@quantidexyz/openllmw/lib/forwarded-headers";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
-import {
-  chunksToSseBytes,
-  decodeProviderEventStream,
-} from "@quantidexyz/openllmw/lib/streaming/provider-decode";
+import { decodeProviderEventStream } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
 import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { fromAnthropicResponse } from "@quantidexyz/openllmw/providers/anthropic/response";
@@ -95,6 +88,7 @@ import {
   toolCallUsesWebSearch,
 } from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { Schema } from "effect";
+import { jsonBodyForClient, sseBytesForClient } from "./client-encode";
 import { recordRequest, searchViaCloud } from "./cloud-client";
 import { lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
@@ -104,6 +98,8 @@ import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
 } from "./native-runtime/serve";
+import type { TNativeTokens } from "./native-runtime/types";
+import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
@@ -406,30 +402,11 @@ const decodeUpstreamJson = (
   return { ...(json as TChatCompletionResponse), model: providerModelId };
 };
 
-// runtime-only: the token counts the daemon reports to the cloud. `tokens_in`
-// is the canonical prompt-token total and INCLUDES the two cache fields; the
-// cloud prices the split at the cache rates rather than the input rate.
-type TWalkerTokens = {
-  readonly tokens_in: number;
-  readonly tokens_out: number;
-  readonly cached_tokens: number;
-  readonly cache_creation_tokens: number;
-};
-
-const ZERO_TOKENS: TWalkerTokens = {
-  tokens_in: 0,
-  tokens_out: 0,
-  cached_tokens: 0,
-  cache_creation_tokens: 0,
-};
-
-const tokensFromCanonical = (resp: TChatCompletionResponse): TWalkerTokens => ({
-  tokens_in: resp.usage?.prompt_tokens ?? 0,
-  tokens_out: resp.usage?.completion_tokens ?? 0,
-  cached_tokens: resp.usage?.prompt_tokens_details?.cached_tokens ?? 0,
-  cache_creation_tokens:
-    resp.usage?.prompt_tokens_details?.cache_creation_tokens ?? 0,
-});
+// The daemon's per-hop token row (`TNativeTokens`) + its mapper + zero value
+// are shared with the native path (`./native-runtime/types`) so the manual and
+// native transports report identically. `tokens_in` is the canonical
+// prompt-token total and INCLUDES the two cache fields; the cloud prices the
+// split at the cache rates rather than the input rate.
 
 // ─── web_search (§5) ──────────────────────────────────────────────────
 // The agentic round cap (`MAX_WEB_SEARCH_ROUNDS`) is shared with the cloud
@@ -671,7 +648,7 @@ const serveWithWebSearch = async (
       latency_ms: Date.now() - args.startedAt,
       endpoint: args.endpoint,
       ...(accountHash !== null ? { account_hash: accountHash } : {}),
-      ...tokensFromCanonical(final),
+      ...tokensFromResponse(final),
     },
     args.originParam,
   );
@@ -680,12 +657,11 @@ const serveWithWebSearch = async (
   const wantsStream =
     (args.rawBody as { stream?: unknown } | null)?.stream === true;
   if (wantsStream) {
-    const bytes =
-      args.surface === "responses"
-        ? chunksToResponsesSseBytes(responseToChunkStream(final))
-        : clientWire === "anthropic"
-          ? chunksToMessagesSseBytes(responseToChunkStream(final))
-          : chunksToSseBytes(responseToChunkStream(final));
+    const bytes = sseBytesForClient(
+      responseToChunkStream(final),
+      args.surface,
+      clientWire,
+    );
     return new Response(bytes, {
       status: 200,
       headers: {
@@ -796,7 +772,7 @@ const serveSubscription = async (
     endpoint: args.endpoint,
     ...(accountHash !== null ? { account_hash: accountHash } : {}),
   } satisfies Partial<TDaemonRecordRequest>;
-  const recordTokens = (u: TWalkerTokens): void =>
+  const recordTokens = (u: TNativeTokens): void =>
     report({ ...baseRow, ...u }, args.originParam);
 
   // ── Client wants a live stream ──────────────────────────────────────
@@ -827,7 +803,7 @@ const serveSubscription = async (
     // client; accurate counts come from the final chunk's usage).
     const meter = (chunks: ReadableStream<TChatCompletionChunk>): void => {
       void accumulateChunksToResponse(chunks, hop.providerModelId)
-        .then((r) => recordTokens(tokensFromCanonical(r)))
+        .then((r) => recordTokens(tokensFromResponse(r)))
         .catch(() => recordTokens(ZERO_TOKENS));
     };
     if (passthrough) {
@@ -848,12 +824,7 @@ const serveSubscription = async (
       hop.providerModelId,
     ).tee();
     meter(toMeter);
-    const clientBytes =
-      args.surface === "responses"
-        ? chunksToResponsesSseBytes(toClient)
-        : clientWire === "anthropic"
-          ? chunksToMessagesSseBytes(toClient)
-          : chunksToSseBytes(toClient);
+    const clientBytes = sseBytesForClient(toClient, args.surface, clientWire);
     return new Response(heartbeat(clientBytes), {
       status: resp.status,
       headers: sseHeaders,
@@ -863,13 +834,7 @@ const serveSubscription = async (
   // ── Client wants a single JSON response ─────────────────────────────
   const jsonHeaders = { "content-type": "application/json" } as const;
   const reencodeJson = (canonical: TChatCompletionResponse): string =>
-    JSON.stringify(
-      args.surface === "responses"
-        ? toResponsesResponse(canonical)
-        : clientWire === "anthropic"
-          ? toAnthropicMessagesResponse(canonical)
-          : canonical,
-    );
+    JSON.stringify(jsonBodyForClient(canonical, args.surface, clientWire));
 
   if (upstreamStreams) {
     // The upstream streamed but the client wants JSON (chatgpt, whose Codex
@@ -884,7 +849,7 @@ const serveSubscription = async (
       recordTokens(ZERO_TOKENS);
       return errorJson(502, "upstream stream ended before producing output");
     }
-    recordTokens(tokensFromCanonical(canonical));
+    recordTokens(tokensFromResponse(canonical));
     return new Response(reencodeJson(canonical), {
       status: resp.status,
       headers: jsonHeaders,
@@ -915,7 +880,7 @@ const serveSubscription = async (
       headers: passthroughHeaders(resp),
     });
   }
-  recordTokens(tokensFromCanonical(canonical));
+  recordTokens(tokensFromResponse(canonical));
   // Passthrough returns the upstream bytes verbatim; cross-wire re-encodes.
   return new Response(passthrough ? text : reencodeJson(canonical), {
     status: resp.status,
