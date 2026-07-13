@@ -64,6 +64,14 @@ type TThreadSink = {
   onAgentMessage: (text: string) => void;
   onUsage: (usage: TUsage) => void;
   onCompleted: (status: string, errorMessage: string | null) => void;
+  /** A dynamic-tool call the model made (`item/tool/call` server request) —
+   *  `requestId` is the JSON-RPC id to respond to with the client's result. */
+  onToolCall?: (
+    requestId: number,
+    callId: string,
+    tool: string,
+    args: unknown,
+  ) => void;
 };
 
 class CodexAppServerClient {
@@ -111,7 +119,9 @@ class CodexAppServerClient {
         title: "OpenLLM Daemon",
         version: DAEMON_VERSION,
       },
-      capabilities: null,
+      // experimentalApi enables `thread/start.dynamicTools` (the completion
+      // tool-passthrough via `item/tool/call`).
+      capabilities: { experimentalApi: true, requestAttestation: false },
     });
     this.notify("initialized");
   }
@@ -147,6 +157,16 @@ class CodexAppServerClient {
     });
     this.send({ id, method, params });
     return result;
+  }
+
+  /** Respond to a held server→client request (a dynamic-tool call) with the
+   *  client's result, letting the paused turn continue. */
+  respondToServer(id: number, result: unknown): void {
+    try {
+      this.send({ id, result });
+    } catch {
+      // child gone — the sink's terminal event ends the turn
+    }
   }
 
   addSink(sink: TThreadSink): void {
@@ -195,9 +215,33 @@ class CodexAppServerClient {
       entry.resolve(message.result);
       return;
     }
-    // Server→client REQUEST (approval etc.) — refuse; never executes under
-    // approvalPolicy "never" + read-only sandbox, but must not block.
+    // Server→client REQUEST.
     if (message.id !== undefined && message.method !== undefined) {
+      // A dynamic-tool call → hand to the thread's sink to relay to the CLIENT
+      // (completion tool semantics); we respond later via `respondToServer`.
+      if (message.method === "item/tool/call") {
+        const p = message.params as
+          | {
+              threadId?: string;
+              callId?: string;
+              tool?: string;
+              arguments?: unknown;
+            }
+          | undefined;
+        const sink =
+          p?.threadId !== undefined ? this.sinks.get(p.threadId) : undefined;
+        if (sink?.onToolCall !== undefined && typeof p?.callId === "string") {
+          sink.onToolCall(
+            message.id,
+            p.callId,
+            String(p.tool ?? ""),
+            p.arguments,
+          );
+          return;
+        }
+      }
+      // Everything else (approvals etc.) — refuse; never executes under
+      // approvalPolicy "never" + read-only sandbox, but must not block.
       this.send({
         id: message.id,
         error: { code: -32601, message: "not supported by openllmd" },
@@ -263,7 +307,10 @@ class CodexAppServerClient {
 // ONE client per daemon process; keyed by binary path so tests can run a
 // fixture server side-by-side with a real install.
 const clients = new Map<string, CodexAppServerClient>();
-const clientFor = (
+
+export type { TThreadSink };
+export { CodexAppServerClient };
+export const clientFor = (
   bin: string,
   env: Record<string, string>,
 ): CodexAppServerClient => {

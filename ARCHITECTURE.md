@@ -270,8 +270,19 @@ resolves the paused handler and drives the query to its next tool call or final
 text. A whole agentic task is ONE held query: the opening user turn starts it,
 each tool round-trip continues it. Verified live: `get_weather("Paris")` →
 client supplies "21C and sunny" → "The weather in Paris is currently 21°C and
-sunny." (`chatgpt` tools still decline — Codex `app-server` has no
-completion-tool mode; Phase 3.)
+sunny."
+
+**Codex tools (`codex-tool-session.ts`) — built, gated OFF.** Codex's protocol
+DOES have a native completion-tool mechanism: `thread/start.dynamicTools`
+(client function tools, `inputSchema` = raw JSON) + the server→client
+`item/tool/call` request (the app-server asks US to run the tool, we respond
+with the client's result). The full held-turn orchestrator is implemented and
+mirrors the Claude path — NO manual Responses path. But codex-cli **0.144.0**'s
+app-server does not actually emit `item/tool/call` for `dynamicTools` (the
+schema ships only under `--experimental`; a dynamic tool call fails with
+"execution host is missing"). So `chatgpt` tool requests DECLINE
+(`CODEX_TOOLS_READY = false` in `serve.ts`) until a codex-cli activates the
+routing — then flip the flag; the code is ready.
 
 Current text scope (`nativeRequestOf`): multi-turn TEXT (system +
 user/assistant text) via the CLI resume path; tool requests take the SDK path

@@ -20,6 +20,10 @@ import {
   type TClientTool,
   toolTurnToResponse,
 } from "./claude-tool-session";
+import {
+  continueCodexToolTurn,
+  startCodexToolTurn,
+} from "./codex-tool-session";
 import type { TNativeTokens } from "./serve";
 
 export type TToolServeOutcome = Response | { readonly declined: string };
@@ -62,6 +66,7 @@ const systemTextOf = (canonical: TChatCompletionRequest): string | null => {
 };
 
 export type TClaudeToolServeParams = {
+  readonly provider: "claude_code" | "chatgpt";
   readonly providerModelId: string;
   readonly surface: "chat_completions" | "messages" | "responses";
   readonly canonical: TChatCompletionRequest;
@@ -92,20 +97,33 @@ export const tryServeClaudeTools = async (
     }
   }
 
+  const isClaude = params.provider === "claude_code";
   const result =
     trailingToolResults.length > 0
-      ? // CONTINUE: feed the client's tool results into the paused held query.
-        await continueToolTurn(trailingToolResults)
-      : // START: the last user turn opens a new held query.
-        await startToolTurn({
-          bin: params.bin,
-          env: params.env,
-          providerModelId: params.providerModelId,
-          tools: clientToolsOf(params.canonical),
-          systemText: systemTextOf(params.canonical),
-          resumeSessionId: null,
-          userText: lastUserText(params.canonical),
-        });
+      ? // CONTINUE: feed the client's tool results into the paused held turn.
+        isClaude
+        ? await continueToolTurn(trailingToolResults)
+        : await continueCodexToolTurn(trailingToolResults)
+      : // START: the last user turn opens a new held turn.
+        isClaude
+        ? await startToolTurn({
+            bin: params.bin,
+            env: params.env,
+            providerModelId: params.providerModelId,
+            tools: clientToolsOf(params.canonical),
+            systemText: systemTextOf(params.canonical),
+            resumeSessionId: null,
+            userText: lastUserText(params.canonical),
+          })
+        : await startCodexToolTurn({
+            bin: params.bin,
+            env: params.env,
+            providerModelId: params.providerModelId,
+            tools: clientToolsOf(params.canonical),
+            systemText: systemTextOf(params.canonical),
+            reasoningEffort: params.canonical.reasoning_effort ?? null,
+            userText: lastUserText(params.canonical),
+          });
 
   if (result.kind === "declined") {
     return { declined: result.reason };

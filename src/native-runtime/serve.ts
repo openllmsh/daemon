@@ -48,6 +48,11 @@ const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   chatgpt: new NativeSessionStore(),
 };
 
+/** Flip to true once codex-cli's app-server emits `item/tool/call` for
+ *  `dynamicTools` — the completion tool-passthrough is already built in
+ *  `codex-tool-session.ts`; only the CLI runtime support is missing. */
+const CODEX_TOOLS_READY = false;
+
 /**
  * A native serve either COMMITS (a `Response` — the vendor runtime produced
  * output) or DECLINES with a reason. Since the manual transport was removed
@@ -122,17 +127,22 @@ export const tryServeNativeRuntime = async (
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
   }
-  // Tool-bearing requests: claude_code uses the held-query SDK passthrough
-  // (completion tool semantics). chatgpt tools remain Phase 3 (no app-server
-  // completion-tool mode) — they decline here.
+  // Tool-bearing requests use completion tool-passthrough. claude_code: the
+  // held-open SDK query (works). chatgpt: the Codex app-server's native
+  // dynamic-tool protocol (`dynamicTools` + `item/tool/call`) is IMPLEMENTED
+  // (`codex-tool-session.ts`) but codex-cli 0.144.0's runtime doesn't route
+  // dynamic tool calls to the client yet (the schema ships under
+  // `--experimental`; `item/tool/call` never fires) — so chatgpt tools decline
+  // until the CLI activates it. Flip `CODEX_TOOLS_READY` when it does.
   if (hasClientTools(params.canonical)) {
-    if (params.provider !== "claude_code") {
+    if (params.provider === "chatgpt" && !CODEX_TOOLS_READY) {
       return {
         declined:
-          "native tool passthrough is claude_code-only (Phase 3: codex)",
+          "codex dynamic-tool routing not available in this codex-cli (item/tool/call not emitted)",
       };
     }
     return tryServeClaudeTools({
+      provider: params.provider,
       providerModelId: params.providerModelId,
       surface: params.surface,
       canonical: params.canonical,
