@@ -29,10 +29,8 @@ import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import type { TNativeRunResult } from "./types";
-import { cleanNativeSpawnEnv } from "./types";
+import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
-/** Pre-commit budget: handshake + thread/start + first turn output. */
-const PRE_COMMIT_TIMEOUT_MS = 60_000;
 /** Handshake / thread-start RPC budget. */
 const RPC_TIMEOUT_MS = 30_000;
 
@@ -135,6 +133,18 @@ class CodexAppServerClient {
   private teardown(reason: string): void {
     for (const [, entry] of this.pending) entry.reject(new Error(reason));
     this.pending.clear();
+    // Active turns die as "failed" completions — surface WHY server-side; the
+    // sink's terminal event only carries the reason to the client stream.
+    if (this.sinks.size > 0) {
+      logError(
+        "native-runtime",
+        "codex app-server teardown failed live turns",
+        {
+          reason,
+          turns: this.sinks.size,
+        },
+      );
+    }
     for (const [, sink] of this.sinks) sink.onCompleted("failed", reason);
     this.sinks.clear();
     this.stdin = null;
@@ -153,16 +163,35 @@ class CodexAppServerClient {
 
   request(method: string, params: unknown): Promise<unknown> {
     const id = this.nextId++;
-    const result = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      setTimeout(() => {
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
         if (this.pending.delete(id)) {
           reject(new Error(`codex app-server ${method} timed out`));
         }
       }, RPC_TIMEOUT_MS);
+      // Wrap both settle paths so the timeout can't outlive the response (a
+      // settled RPC's timer would otherwise stay armed for the full budget).
+      this.pending.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+      // A synchronous send failure (child gone) must reject THIS promise and
+      // drop its pending entry now — thrown, it would leave the entry to time
+      // out and reject a promise nobody holds (unhandled rejection).
+      try {
+        this.send({ id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
-    this.send({ id, method, params });
-    return result;
   }
 
   /** Respond to a held server→client request (a dynamic-tool call) with the
@@ -520,15 +549,17 @@ export const runCodexNative = async (
   };
 
   // ── Pre-commit: first output, terminal, or deadline ─────────────────
+  let precommitTimer: ReturnType<typeof setTimeout> | undefined;
   const first = await Promise.race([
     nextItem(),
-    new Promise<"timeout">((resolve) =>
-      setTimeout(
+    new Promise<"timeout">((resolve) => {
+      precommitTimer = setTimeout(
         () => resolve("timeout"),
         params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS,
-      ),
-    ),
+      );
+    }),
   ]);
+  clearTimeout(precommitTimer);
   const failedBeforeOutput =
     first === "timeout" ||
     (first === "end" && !sawDelta) ||

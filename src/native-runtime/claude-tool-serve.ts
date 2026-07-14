@@ -14,12 +14,15 @@ import type { TChatCompletionRequest } from "@quantidexyz/openllmp";
 import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
-import { jsonBodyForClient, sseBytesForClient } from "../client-encode";
+import {
+  heartbeatOptionsFor,
+  jsonBodyForClient,
+  sseBytesForClient,
+} from "../client-encode";
+import type { TClientTool, TIteratorFactory } from "./claude-tool-session";
 import {
   continueToolTurn,
   startToolTurn,
-  type TClientTool,
-  type TIteratorFactory,
   toolTurnToResponse,
 } from "./claude-tool-session";
 import {
@@ -78,13 +81,14 @@ export type TClaudeToolServeParams = {
   readonly wantsStream: boolean;
   readonly bin: string;
   readonly env: Record<string, string>;
-  readonly record: (tokens: TNativeTokens) => void;
+  readonly record: (tokens: TNativeTokens, status: "success" | "error") => void;
   /** Test seam: inject a fake SDK query iterator (default = the real SDK). */
   readonly makeIterator?: TIteratorFactory;
 };
 
-/** Serve a tool-bearing claude_code request through the held-query orchestrator. */
-export const tryServeClaudeTools = async (
+/** Serve a tool-bearing native request (claude_code held-query orchestrator,
+ *  or the gated codex dynamic-tool session). */
+export const tryServeNativeToolTurn = async (
   params: TClaudeToolServeParams,
 ): Promise<TToolServeOutcome> => {
   const messages = params.canonical.messages;
@@ -136,7 +140,7 @@ export const tryServeClaudeTools = async (
   // Record THIS turn's token row. The Claude SDK path surfaces per-turn usage
   // (`result.usage`, folded to the same shape as the plain-text native path);
   // the gated Codex tool path doesn't yet, so it falls back to zero.
-  params.record(result.usage ?? ZERO_TOKENS);
+  params.record(result.usage ?? ZERO_TOKENS, "success");
 
   const canonicalResp = toolTurnToResponse(result, params.providerModelId);
   const clientWire = clientWireOf(params.surface);
@@ -153,10 +157,7 @@ export const tryServeClaudeTools = async (
       clientWire,
     );
     return new Response(
-      withFrameAlignedHeartbeat(bytes, {
-        intervalMs: 15_000,
-        kind: params.surface === "messages" ? "anthropic_ping" : "comment",
-      }),
+      withFrameAlignedHeartbeat(bytes, heartbeatOptionsFor(params.surface)),
       {
         status: 200,
         headers: {

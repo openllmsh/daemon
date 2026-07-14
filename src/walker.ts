@@ -88,7 +88,11 @@ import {
   toolCallUsesWebSearch,
 } from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { Schema } from "effect";
-import { jsonBodyForClient, sseBytesForClient } from "./client-encode";
+import {
+  heartbeatOptionsFor,
+  jsonBodyForClient,
+  sseBytesForClient,
+} from "./client-encode";
 import { recordRequest, searchViaCloud } from "./cloud-client";
 import { lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
@@ -795,10 +799,7 @@ const serveSubscription = async (
     const heartbeat = (
       bytes: ReadableStream<Uint8Array>,
     ): ReadableStream<Uint8Array> =>
-      withFrameAlignedHeartbeat(bytes, {
-        intervalMs: 15_000,
-        kind: args.surface === "messages" ? "anthropic_ping" : "comment",
-      });
+      withFrameAlignedHeartbeat(bytes, heartbeatOptionsFor(args.surface));
     // Meter token usage off a tee'd canonical branch (never blocks the
     // client; accurate counts come from the final chunk's usage).
     const meter = (chunks: ReadableStream<TChatCompletionChunk>): void => {
@@ -958,12 +959,12 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         wantsStream:
           (args.rawBody as { stream?: unknown } | null)?.stream === true,
         signal: args.req.signal,
-        record: (tokens) =>
+        record: (tokens, status) =>
           report(
             {
               model: hop.modelId,
               provider: hop.provider,
-              status: "success",
+              status,
               latency_ms: Date.now() - args.startedAt,
               endpoint: args.endpoint,
               ...tokens,

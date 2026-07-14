@@ -45,6 +45,12 @@ import { stateDir } from "../env";
  */
 export type TNativeRuntimeProvider = "claude_code" | "chatgpt";
 
+/** Pre-commit budget shared by BOTH native bridges: how long a runtime may
+ *  stay silent (spawn/handshake + thread start + first model output) before
+ *  the bridge declines to the manual transport. After commit there is
+ *  deliberately no deadline (mirrors the walker's commit-on-first-byte). */
+export const PRE_COMMIT_TIMEOUT_MS = 60_000;
+
 const NATIVE_PROVIDERS: ReadonlySet<string> = new Set([
   "claude_code",
   "chatgpt",

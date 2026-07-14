@@ -24,10 +24,14 @@ import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/s
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
 import { functionNameUsesWebSearch } from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { cliBin, cliEnv } from "../cli-paths";
-import { jsonBodyForClient, sseBytesForClient } from "../client-encode";
+import {
+  heartbeatOptionsFor,
+  jsonBodyForClient,
+  sseBytesForClient,
+} from "../client-encode";
 import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
-import { hasClientTools, tryServeClaudeTools } from "./claude-tool-serve";
+import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
 import { runCodexNative } from "./codex-app-server";
 import {
   deriveConversation,
@@ -80,8 +84,10 @@ export type TNativeServeParams = {
   readonly canonical: TChatCompletionRequest;
   readonly wantsStream: boolean;
   readonly signal: AbortSignal;
-  /** Report the hop's token counts to the cloud (walker's `report`). */
-  readonly record: (tokens: TNativeTokens) => void;
+  /** Report the hop's token counts + outcome to the cloud (walker's `report`):
+   *  "success" with the accumulated tokens, or "error" with ZERO_TOKENS when
+   *  the committed stream failed before accumulating. */
+  readonly record: (tokens: TNativeTokens, status: "success" | "error") => void;
 };
 
 /** Does the request declare the openllm-managed web_search function tool?
@@ -151,7 +157,7 @@ export const tryServeNativeRuntime = async (
           "codex dynamic-tool routing not available in this codex-cli (item/tool/call not emitted)",
       };
     }
-    return tryServeClaudeTools({
+    return tryServeNativeToolTurn({
       provider: params.provider,
       providerModelId: params.providerModelId,
       surface: params.surface,
@@ -235,14 +241,14 @@ export const tryServeNativeRuntime = async (
   const settle = (
     resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
   ): void => {
-    params.record(tokensFromResponse(resp));
+    params.record(tokensFromResponse(resp), "success");
     lease.commit(
       nextPrefixHash(req.systemText, req.turns, textOf(resp)),
       committed.sessionId(),
     );
   };
   const fail = (): void => {
-    params.record(ZERO_TOKENS);
+    params.record(ZERO_TOKENS, "error");
     lease.abandon();
   };
 
@@ -256,10 +262,10 @@ export const tryServeNativeRuntime = async (
       .catch(fail);
     const clientBytes = sseBytesForClient(toClient, params.surface, clientWire);
     return new Response(
-      withFrameAlignedHeartbeat(clientBytes, {
-        intervalMs: 15_000,
-        kind: params.surface === "messages" ? "anthropic_ping" : "comment",
-      }),
+      withFrameAlignedHeartbeat(
+        clientBytes,
+        heartbeatOptionsFor(params.surface),
+      ),
       {
         status: 200,
         headers: {

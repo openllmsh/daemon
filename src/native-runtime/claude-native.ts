@@ -31,24 +31,19 @@
  */
 
 import { existsSync } from "node:fs";
-import {
-  AnthropicStreamEvent,
-  type TChatCompletionChunk,
-} from "@quantidexyz/openllmp";
+import type { TChatCompletionChunk } from "@quantidexyz/openllmp";
+import { AnthropicStreamEvent } from "@quantidexyz/openllmp";
 import {
   fromAnthropicStreamEvent,
   newAnthropicStreamState,
 } from "@quantidexyz/openllmw/providers/anthropic/streaming";
 import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
+import { logError } from "../logger";
 import type { TNativeRunResult } from "./types";
-import { cleanNativeSpawnEnv } from "./types";
+import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
 const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
-
-/** How long the runtime may stay silent BEFORE first model output. After
- *  commit there is deliberately no deadline (mirrors the walker). */
-const PRE_COMMIT_TIMEOUT_MS = 60_000;
 
 export type TClaudeNativeParams = {
   /** Absolute path to the isolated claude binary (`cliBin("claude_code")`). */
@@ -202,27 +197,34 @@ export const runClaudeNative = async (
   };
 
   // ── Pre-commit: wait for the FIRST model output ─────────────────────
+  let precommitTimer: ReturnType<typeof setTimeout> | undefined;
   const first = await Promise.race([
     nextChunk(),
-    new Promise<"timeout">((resolve) =>
-      setTimeout(() => resolve("timeout"), PRE_COMMIT_TIMEOUT_MS),
-    ),
+    new Promise<"timeout">((resolve) => {
+      precommitTimer = setTimeout(
+        () => resolve("timeout"),
+        PRE_COMMIT_TIMEOUT_MS,
+      );
+    }),
   ]);
+  clearTimeout(precommitTimer);
   if (first === "timeout" || first === "end" || typeof first !== "object") {
     kill();
     const stderr = await new Response(proc.stderr as ReadableStream<Uint8Array>)
       .text()
       .catch(() => "");
-    return {
-      kind: "declined",
-      reason:
-        first === "timeout"
-          ? "claude runtime produced no output before the pre-commit deadline"
-          : `claude runtime exited before producing output${stderr.length > 0 ? `: ${stderr.slice(0, 300)}` : ""}`,
-    };
+    const reason =
+      first === "timeout"
+        ? "claude runtime produced no output before the pre-commit deadline"
+        : `claude runtime exited before producing output${stderr.length > 0 ? `: ${stderr.slice(0, 300)}` : ""}`;
+    logError("native-runtime", "claude hop declined pre-commit", { reason });
+    return { kind: "declined", reason };
   }
   if ("error" in first) {
     kill();
+    logError("native-runtime", "claude hop declined pre-commit", {
+      reason: first.error,
+    });
     return { kind: "declined", reason: first.error };
   }
 
@@ -236,6 +238,11 @@ export const runClaudeNative = async (
       if (next === "end" || typeof next !== "object" || "error" in next) {
         // Post-commit failure can't re-route (commit-on-first-byte): end the
         // stream; the accumulated usage/finish state is whatever arrived.
+        if (typeof next === "object" && "error" in next) {
+          logError("native-runtime", "claude stream failed post-commit", {
+            reason: next.error,
+          });
+        }
         controller.close();
         kill();
         return;

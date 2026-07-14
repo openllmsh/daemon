@@ -12,6 +12,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
+  THeartbeatOptions,
 } from "@quantidexyz/openllmp";
 import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
 import { chunksToMessagesSseBytes } from "@quantidexyz/openllmw/adapters/messages/streaming";
@@ -22,6 +23,16 @@ import {
 import { chunksToSseBytes } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
 
 export type TClientSurface = "chat_completions" | "messages" | "responses";
+
+/** Frame-aligned heartbeat options for a client surface — ONE literal shared
+ *  by the walker's manual transport and the native serve/tool bridges so the
+ *  interval + per-surface beat kind can't drift. */
+export const heartbeatOptionsFor = (
+  surface: TClientSurface,
+): THeartbeatOptions => ({
+  intervalMs: 15_000,
+  kind: surface === "messages" ? "anthropic_ping" : "comment",
+});
 /** Matches `clientWireOf`'s return (`TUpstreamWire`). Only `anthropic`/`openai`
  *  occur for a real client wire; the `=== "anthropic"` branch handles both. */
 export type TClientWire = "anthropic" | "chatgpt" | "openai";
