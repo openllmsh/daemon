@@ -378,6 +378,46 @@ let modelRowsCache: {
   at: number;
   rows: ReadonlyArray<TGrokModelRow>;
 } | null = null;
+// Single-flight: concurrent cold/expired callers (the walker calls
+// `supportsReasoningEffort` per request) share ONE in-flight `/v1/models`
+// fetch instead of each spawning their own. Cleared when it settles.
+let modelRowsInflight: Promise<ReadonlyArray<TGrokModelRow> | null> | null =
+  null;
+
+const fetchModelRows =
+  async (): Promise<ReadonlyArray<TGrokModelRow> | null> => {
+    const token = await readToken();
+    if (token === null) return null;
+    try {
+      // Host derived from the CAPTURED inference URL via `resolveProviderUrl`;
+      // bearer + the CLI's genuine identity headers, mirroring the usage read.
+      const resp = await fetch(
+        await resolveProviderUrl(PROVIDER, "/v1/models"),
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${token.accessToken}`,
+            "x-grok-client-version": await clientVersion(),
+            "x-grok-client-identifier": "xai-grok-cli",
+            accept: "application/json",
+          },
+          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+        },
+      );
+      if (!resp.ok) return null;
+      // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
+      const b = (await resp.json()) as {
+        data?: ReadonlyArray<TGrokModelRow>;
+        models?: ReadonlyArray<TGrokModelRow>;
+      };
+      const rows = b.data ?? b.models ?? [];
+      if (rows.length === 0) return null;
+      modelRowsCache = { at: Date.now(), rows };
+      return rows;
+    } catch {
+      return null;
+    }
+  };
 
 const modelRows = async (): Promise<ReadonlyArray<TGrokModelRow> | null> => {
   if (
@@ -386,34 +426,12 @@ const modelRows = async (): Promise<ReadonlyArray<TGrokModelRow> | null> => {
   ) {
     return modelRowsCache.rows;
   }
-  const token = await readToken();
-  if (token === null) return null;
-  try {
-    // Host derived from the CAPTURED inference URL via `resolveProviderUrl`;
-    // bearer + the CLI's genuine identity headers, mirroring the usage read.
-    const resp = await fetch(await resolveProviderUrl(PROVIDER, "/v1/models"), {
-      method: "GET",
-      headers: {
-        authorization: `Bearer ${token.accessToken}`,
-        "x-grok-client-version": await clientVersion(),
-        "x-grok-client-identifier": "xai-grok-cli",
-        accept: "application/json",
-      },
-      signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+  if (modelRowsInflight === null) {
+    modelRowsInflight = fetchModelRows().finally(() => {
+      modelRowsInflight = null;
     });
-    if (!resp.ok) return null;
-    // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
-    const b = (await resp.json()) as {
-      data?: ReadonlyArray<TGrokModelRow>;
-      models?: ReadonlyArray<TGrokModelRow>;
-    };
-    const rows = b.data ?? b.models ?? [];
-    if (rows.length === 0) return null;
-    modelRowsCache = { at: Date.now(), rows };
-    return rows;
-  } catch {
-    return null;
   }
+  return modelRowsInflight;
 };
 
 /**

@@ -396,6 +396,28 @@ export const effortOf = (raw: string | null): string | null => {
   return "high";
 };
 
+/**
+ * The `thread/start` fields shared by the text bridge ({@link runCodexNative})
+ * and the tool bridge (`codex-tool-session.ts`). We serve inference for an
+ * external client that asked for a plain model, so: read-only sandbox +
+ * `approvalPolicy:"never"` (never touch the filesystem / never block on an
+ * approval), and `personality:"none"` to suppress the runtime's built-in "Codex
+ * the coding agent" persona (mirrors the Codex CLI when a developer prompt is
+ * supplied). The client's system prompt rides in `developerInstructions` on a
+ * fresh start (a resumed thread already carries it). Each caller layers its own
+ * unique fields (effort/tools/features) on top.
+ */
+export const codexBaseStartParams = (
+  providerModelId: string,
+  systemText: string | null,
+): Record<string, unknown> => ({
+  model: providerModelId,
+  approvalPolicy: "never",
+  sandbox: "read-only",
+  personality: "none",
+  ...(systemText !== null ? { developerInstructions: systemText } : {}),
+});
+
 export const runCodexNative = async (
   params: TCodexNativeParams,
 ): Promise<TNativeRunResult> => {
@@ -411,19 +433,10 @@ export const runCodexNative = async (
     // turns + instructions); otherwise start a fresh NON-ephemeral thread so
     // it survives on disk to be resumed next turn. `thread/resume` falls back
     // to `thread/start` when the id is unknown (daemon restart evicted it).
-    const startParams = {
-      model: params.providerModelId,
-      approvalPolicy: "never",
-      sandbox: "read-only",
-      // Suppress the runtime's built-in persona — we serve inference for an
-      // external client that asked for a plain model, not "Codex the coding
-      // agent". Mirrors the Codex CLI when a developer prompt is supplied and
-      // openclaw's `personality:"none"` on every start/resume.
-      personality: "none",
-      ...(params.systemText !== null
-        ? { developerInstructions: params.systemText }
-        : {}),
-    };
+    const startParams = codexBaseStartParams(
+      params.providerModelId,
+      params.systemText,
+    );
     const opened = (await (params.resumeThreadId !== null
       ? client
           .request("thread/resume", {

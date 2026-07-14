@@ -33,6 +33,7 @@ import type {
 import {
   type CodexAppServerClient,
   clientFor,
+  codexBaseStartParams,
   effortOf,
 } from "./codex-app-server";
 import type { TNativeTokens } from "./types";
@@ -162,11 +163,7 @@ export const startCodexToolTurn = async (
   try {
     await client.ensureStarted();
     const started = (await client.request("thread/start", {
-      model: params.providerModelId,
-      approvalPolicy: "never",
-      sandbox: "read-only",
-      // Suppress the built-in persona (parity with the text path).
-      personality: "none",
+      ...codexBaseStartParams(params.providerModelId, params.systemText),
       // Route dynamic-tool calls to US via `item/tool/call` instead of the
       // `codex-code-mode-host` sidecar (which the isolated install doesn't
       // ship). Verified live 2026-07-14: with code-mode ON the call never
@@ -181,9 +178,6 @@ export const startCodexToolTurn = async (
         description: t.description ?? t.name,
         inputSchema: t.parameters ?? { type: "object", properties: {} },
       })),
-      ...(params.systemText !== null
-        ? { developerInstructions: params.systemText }
-        : {}),
     })) as { thread?: { id?: string } };
     if (typeof started.thread?.id !== "string") {
       return { kind: "declined", reason: "thread/start returned no thread id" };
