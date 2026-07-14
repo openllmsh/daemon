@@ -274,19 +274,19 @@ each tool round-trip continues it. Verified live: `get_weather("Paris")` →
 client supplies "21C and sunny" → "The weather in Paris is currently 21°C and
 sunny."
 
-**Codex tools (`codex-tool-session.ts`) — built, gated OFF (falls back to
-manual).** Codex's protocol DOES have a native completion-tool mechanism:
-`thread/start.dynamicTools` (client function tools, `inputSchema` = raw JSON) +
-the server→client `item/tool/call` request (the app-server asks US to run the
-tool, we respond with the client's result). The full held-turn orchestrator is
-implemented and mirrors the Claude path. But codex-cli **0.144.0**'s app-server
-does not actually emit `item/tool/call` for `dynamicTools` (the schema ships
-only under `--experimental`; a dynamic tool call fails "execution host is
-missing"). So the native codex-tool path is gated (`CODEX_TOOLS_READY = false`
-in `serve.ts`) — `chatgpt` tool requests decline natively and fall back to the
-MANUAL Codex Responses path (which forwards `function_call` for client
-execution). Flip the flag when a codex-cli activates the routing; the code is
-ready.
+**Codex tools (`codex-tool-session.ts`) — NATIVE.** Codex's protocol has a
+completion-tool mechanism: `thread/start.dynamicTools` (client function tools,
+`inputSchema` = raw JSON) + the server→client `item/tool/call` request (the
+app-server asks US to run the tool, we respond with the client's result). The
+held-turn orchestrator mirrors the Claude path. A 2026-07-14 live probe (audit
+`docs/audit/2026-07-14-codex-upstream-wire-openclaw-comparison.md` §6) settled
+the one non-obvious protocol fact: dynamic tools default to Codex **code-mode**
+(a `codex-code-mode-host` sidecar the isolated install doesn't ship), so with
+code-mode ON `item/tool/call` never reaches the client (once misread as
+"0.144.0 doesn't emit it"). Setting `features.code_mode:false` on `thread/start`
+routes the call to us and the turn completes. A native decline still falls back
+to the MANUAL Codex Responses path (`function_call` for client execution), so a
+protocol mismatch degrades to slower, never broken.
 
 Current native scope (`nativeRequestOf`): multi-turn TEXT (system +
 user/assistant text) via the CLI resume path; claude_code tool requests take

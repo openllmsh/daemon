@@ -18,7 +18,8 @@
  *      the paused handler(s) and drive the query to its next pause (another
  *      tool call) or final text — which ends the turn.
  *
- * Only `claude_code`. Codex `app-server` has no completion-tool mode (Phase 3).
+ * `claude_code` only. The Codex `app-server` completion-tool path is its own
+ * sibling (`codex-tool-session.ts`), routed by `tryServeNativeToolTurn`.
  */
 
 import {

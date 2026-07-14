@@ -59,17 +59,6 @@ const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   chatgpt: new NativeSessionStore(),
 };
 
-/** Native codex tool-passthrough. ENABLED: a 2026-07-14 live probe (audit
- *  2026-07-14-codex-upstream-wire §6) confirmed codex-cli 0.144.0 DOES emit
- *  `item/tool/call` for `dynamicTools` — the earlier "never fires" belief was
- *  wrong; the real blocker was code-mode (a `codex-code-mode-host` sidecar the
- *  isolated install lacks), which `codex-tool-session.ts` now disables via
- *  `features.code_mode:false`. Batch B is done there (per-turn usage wired,
- *  drive() timeout interrupts the turn). A native decline still falls through
- *  to the manual transport, so the worst case of a protocol mismatch is a
- *  slower path, not a broken one. */
-const CODEX_TOOLS_READY = true;
-
 /**
  * A native serve either COMMITS (a `Response` — the vendor runtime produced
  * output) or DECLINES with a reason. A decline means the request is outside the
@@ -148,13 +137,10 @@ export const tryServeNativeRuntime = async (
   // Tool-bearing requests use completion tool-passthrough. claude_code: the
   // held-open SDK query. chatgpt: the Codex app-server's native dynamic-tool
   // protocol (`dynamicTools` + `item/tool/call` with code-mode disabled —
-  // `codex-tool-session.ts`), gated on `CODEX_TOOLS_READY`.
+  // `codex-tool-session.ts`). A native decline still falls through to the
+  // manual transport on the same hop, so an unexpected protocol mismatch just
+  // routes slower, never breaks.
   if (hasClientTools(params.canonical)) {
-    if (params.provider === "chatgpt" && !CODEX_TOOLS_READY) {
-      return {
-        declined: "codex native dynamic-tool passthrough disabled",
-      };
-    }
     return tryServeNativeToolTurn({
       provider: params.provider,
       providerModelId: params.providerModelId,
@@ -168,9 +154,12 @@ export const tryServeNativeRuntime = async (
   }
   const req = nativeRequestOf(params.canonical);
   if (req === null) {
+    // Tool-bearing requests were handled above; this is a non-tool request the
+    // native text path still can't represent (image parts, structured output,
+    // a tool-role message) — the manual transport serves it.
     return {
       declined:
-        "native runtime supports text conversations only (tools, images, and structured output are Phase 2)",
+        "native runtime serves text + tool conversations; images and structured output fall to the manual transport",
     };
   }
 

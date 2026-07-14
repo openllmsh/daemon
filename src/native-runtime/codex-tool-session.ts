@@ -16,14 +16,13 @@
  * A full agentic task is ONE held app-server turn. Shares the result shape +
  * canonical encoder with the Claude tool path (`claude-tool-session.ts`).
  *
- * ENABLED (`CODEX_TOOLS_READY` in serve.ts). A 2026-07-14 live probe settled
- * the protocol facts this path relies on (audit 2026-07-14-codex-upstream-wire
- * §6): with `features.code_mode:false` on `thread/start`, codex-cli 0.144.0
- * emits `item/tool/call` and the turn completes after we answer with
- * `{ callId, contentItems:[…], success }`. Batch B is done: per-turn usage is
- * folded from `thread/tokenUsage/updated`, and a drive() timeout interrupts the
- * still-running turn. Parallel tool calls pair by protocol `callId` (not
- * positional — unlike the Claude path's pre-Batch-B bug).
+ * A 2026-07-14 live probe settled the protocol facts this path relies on (audit
+ * 2026-07-14-codex-upstream-wire §6): with `features.code_mode:false` on
+ * `thread/start`, codex-cli 0.144.0 emits `item/tool/call` and the turn
+ * completes after we answer with `{ callId, contentItems:[…], success }`.
+ * Per-turn usage is folded from `thread/tokenUsage/updated`, and a drive()
+ * timeout interrupts the still-running turn. Parallel tool calls pair by
+ * protocol `callId` (not positional — unlike the Claude path's earlier bug).
  */
 
 import type {
@@ -107,8 +106,8 @@ const evictStale = (): void => {
 
 // Background sweep (parity with the Claude tool path): reclaim abandoned held
 // turns even when no further codex tool request arrives. `.unref()` so the
-// timer never keeps the daemon alive on its own. (Dormant until
-// CODEX_TOOLS_READY flips; harmless while `held` is empty.)
+// timer never keeps the daemon alive on its own (harmless while `held` is
+// empty).
 const sweep = setInterval(evictStale, HELD_TTL_MS);
 sweep.unref?.();
 
@@ -171,10 +170,9 @@ export const startCodexToolTurn = async (
       // Route dynamic-tool calls to US via `item/tool/call` instead of the
       // `codex-code-mode-host` sidecar (which the isolated install doesn't
       // ship). Verified live 2026-07-14: with code-mode ON the call never
-      // reaches the client (the gate the old `CODEX_TOOLS_READY` comment
-      // misread as "0.144.0 doesn't emit item/tool/call"); with it OFF the
-      // call fires and the turn completes. `experimentalRawEvents` matches
-      // openclaw's thread/start.
+      // reaches the client (once misread as "0.144.0 doesn't emit
+      // item/tool/call"); with it OFF the call fires and the turn completes.
+      // `experimentalRawEvents` matches openclaw's thread/start.
       features: { code_mode: false, code_mode_only: false },
       experimentalRawEvents: true,
       dynamicTools: params.tools.map((t) => ({
