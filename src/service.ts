@@ -222,7 +222,10 @@ RestrictSUIDSGID=yes
 # the belt-and-braces: a blocked syscall returns EPERM (the daemon's sandbox
 # apply fails OPEN) instead of crash-looping — so a future syscall gap degrades,
 # never kills.
-SystemCallFilter=@system-service @sandbox landlock_create_ruleset landlock_add_rule landlock_restrict_self
+# GNU tar on current glibc uses openat2() while extracting verified integration
+# bundles. Name it explicitly because @system-service on supported systemd
+# releases does not consistently include it.
+SystemCallFilter=@system-service @sandbox landlock_create_ruleset landlock_add_rule landlock_restrict_self openat2
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 `;
