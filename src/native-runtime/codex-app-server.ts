@@ -415,6 +415,11 @@ export const runCodexNative = async (
       model: params.providerModelId,
       approvalPolicy: "never",
       sandbox: "read-only",
+      // Suppress the runtime's built-in persona — we serve inference for an
+      // external client that asked for a plain model, not "Codex the coding
+      // agent". Mirrors the Codex CLI when a developer prompt is supplied and
+      // openclaw's `personality:"none"` on every start/resume.
+      personality: "none",
       ...(params.systemText !== null
         ? { developerInstructions: params.systemText }
         : {}),

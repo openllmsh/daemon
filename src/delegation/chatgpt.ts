@@ -461,14 +461,15 @@ export const chatgptDelegate: TProviderDelegate = {
     const headers: Record<string, string> =
       token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
 
-    // Codex-CLI identity BACKFILL. The Codex backend gates some models on the
-    // caller being codex: `gpt-5.6-luna` 404s ("Model not found") unless the
-    // request carries BOTH `originator: codex_cli_rs` AND a `codex_cli_rs/<ver>`
-    // user-agent (verified live — a codex originator with a generic UA still
-    // 404s; gpt-5.6-sol/terra have no such gate). We only fill in what the
-    // originator does NOT already present, so a genuine `codex` request still
-    // reaches the vendor with ITS own identity byte-for-byte and keeps its
-    // upstream request-correlation.
+    // Codex-CLI identity BACKFILL. Historically the Codex backend gated some
+    // models on the caller being codex (`gpt-5.6-luna` 404'd without
+    // `originator: codex_cli_rs` + a `codex_cli_rs/<ver>` user-agent). A
+    // 2026-07-14 live probe found luna now 200s with a generic originator, so
+    // that gate appears lifted or moved — but presenting the delegated CLI's
+    // genuine identity is correct for our posture regardless (we ARE that CLI's
+    // credential), and it preserves upstream request-correlation. We only fill
+    // in what the originator does NOT already present, so a genuine `codex`
+    // request still reaches the vendor byte-for-byte.
     if (!hasCodexOriginator(inbound)) headers.originator = CODEX_ORIGINATOR;
     if (!hasCodexUserAgent(inbound)) headers["user-agent"] = await userAgent();
 

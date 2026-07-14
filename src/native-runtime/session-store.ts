@@ -35,21 +35,30 @@ const MAX_ENTRIES = 500;
 const TTL_MS = 60 * 60 * 1000;
 
 const hashConversation = (
+  model: string,
   systemText: string | null,
   turns: ReadonlyArray<TNativeTurn>,
 ): string => {
   const h = createHash("sha256");
   // Length-prefixed JSON so no field concatenation can collide across turns.
-  h.update(JSON.stringify({ systemText, turns }));
+  // `model` is in the key so a fallback that switches models mid-conversation
+  // gets a DIFFERENT hash → a fresh vendor thread, never a resume of a thread
+  // started with another model. Codex's own GPT-5.6 Sol/Terra (V2) and Luna
+  // (V1) cannot share a resumed thread; resuming across a model change would
+  // feed the wrong-model thread (audit 2026-07-14 §F3).
+  h.update(JSON.stringify({ model, systemText, turns }));
   return h.digest("hex");
 };
 
 /**
  * Decompose a conversation into the resume decision: the identity of the
  * consumed prefix, the delta turn to feed, and whether there IS a prior
- * (assistant) turn (→ attempt resume) or not (→ fresh session).
+ * (assistant) turn (→ attempt resume) or not (→ fresh session). `model` is
+ * folded into the prefix identity so a model switch never resumes another
+ * model's thread.
  */
 export const deriveConversation = (
+  model: string,
   systemText: string | null,
   turns: ReadonlyArray<TNativeTurn>,
 ): {
@@ -68,7 +77,7 @@ export const deriveConversation = (
     .map((t) => t.text)
     .join("\n\n");
   return {
-    prefixHash: hashConversation(systemText, prefixTurns),
+    prefixHash: hashConversation(model, systemText, prefixTurns),
     deltaText,
     hasPrior: lastAssistant >= 0,
   };
@@ -81,11 +90,12 @@ export const deriveConversation = (
  * this — and resumes the same session.
  */
 export const nextPrefixHash = (
+  model: string,
   systemText: string | null,
   turns: ReadonlyArray<TNativeTurn>,
   assistantResponse: string,
 ): string =>
-  hashConversation(systemText, [
+  hashConversation(model, systemText, [
     ...turns,
     { role: "assistant", text: assistantResponse },
   ]);

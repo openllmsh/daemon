@@ -59,14 +59,16 @@ const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   chatgpt: new NativeSessionStore(),
 };
 
-/** Flip to true ONLY once codex-cli's app-server actually emits `item/tool/call`
- *  for `dynamicTools` (as of 0.144.0 it doesn't — the schema ships under
- *  `--experimental` but the call never fires). The codex tool-passthrough in
- *  `codex-tool-session.ts` is written and protocol-correct but UNVALIDATED: no
- *  fixture/live coverage, and it still lacks the Claude-side fixes from Batch B
- *  (per-turn usage is a no-op; the tool drive() timeout doesn't interrupt the
- *  turn). Pre-flip checklist lives in that file's header — do NOT flip without it. */
-const CODEX_TOOLS_READY = false;
+/** Native codex tool-passthrough. ENABLED: a 2026-07-14 live probe (audit
+ *  2026-07-14-codex-upstream-wire §6) confirmed codex-cli 0.144.0 DOES emit
+ *  `item/tool/call` for `dynamicTools` — the earlier "never fires" belief was
+ *  wrong; the real blocker was code-mode (a `codex-code-mode-host` sidecar the
+ *  isolated install lacks), which `codex-tool-session.ts` now disables via
+ *  `features.code_mode:false`. Batch B is done there (per-turn usage wired,
+ *  drive() timeout interrupts the turn). A native decline still falls through
+ *  to the manual transport, so the worst case of a protocol mismatch is a
+ *  slower path, not a broken one. */
+const CODEX_TOOLS_READY = true;
 
 /**
  * A native serve either COMMITS (a `Response` — the vendor runtime produced
@@ -144,17 +146,13 @@ export const tryServeNativeRuntime = async (
     };
   }
   // Tool-bearing requests use completion tool-passthrough. claude_code: the
-  // held-open SDK query (works). chatgpt: the Codex app-server's native
-  // dynamic-tool protocol (`dynamicTools` + `item/tool/call`) is IMPLEMENTED
-  // (`codex-tool-session.ts`) but codex-cli 0.144.0's runtime doesn't route
-  // dynamic tool calls to the client yet (the schema ships under
-  // `--experimental`; `item/tool/call` never fires) — so chatgpt tools decline
-  // until the CLI activates it. Flip `CODEX_TOOLS_READY` when it does.
+  // held-open SDK query. chatgpt: the Codex app-server's native dynamic-tool
+  // protocol (`dynamicTools` + `item/tool/call` with code-mode disabled —
+  // `codex-tool-session.ts`), gated on `CODEX_TOOLS_READY`.
   if (hasClientTools(params.canonical)) {
     if (params.provider === "chatgpt" && !CODEX_TOOLS_READY) {
       return {
-        declined:
-          "codex dynamic-tool routing not available in this codex-cli (item/tool/call not emitted)",
+        declined: "codex native dynamic-tool passthrough disabled",
       };
     }
     return tryServeNativeToolTurn({
@@ -179,6 +177,7 @@ export const tryServeNativeRuntime = async (
   // Correlate to a persisted session and compute the delta turn to feed.
   const store = stores[params.provider];
   const { prefixHash, deltaText, hasPrior } = deriveConversation(
+    params.providerModelId,
     req.systemText,
     req.turns,
   );
@@ -243,7 +242,12 @@ export const tryServeNativeRuntime = async (
   ): void => {
     params.record(tokensFromResponse(resp), "success");
     lease.commit(
-      nextPrefixHash(req.systemText, req.turns, textOf(resp)),
+      nextPrefixHash(
+        params.providerModelId,
+        req.systemText,
+        req.turns,
+        textOf(resp),
+      ),
       committed.sessionId(),
     );
   };

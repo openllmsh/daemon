@@ -53,6 +53,11 @@ import {
 } from "@quantidexyz/openllmp";
 import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
 import { toResponsesResponse } from "@quantidexyz/openllmw/adapters/responses";
+import {
+  isEncryptedContentError,
+  responsesBodyHasEncryptedContent,
+  stripResponsesEncryptedContent,
+} from "@quantidexyz/openllmw/lib/encrypted-content";
 import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
 import { originatorHeadersFrom } from "@quantidexyz/openllmw/lib/forwarded-headers";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
@@ -343,6 +348,54 @@ export const postUpstream = async (
   } catch {
     return first;
   }
+};
+
+/**
+ * POST a Responses-wire (chatgpt + grok) body, plus ONE same-hop retry that
+ * STRIPS replayed `reasoning.encrypted_content` when the upstream rejects it
+ * as undecryptable. A fallback that switched account/model replays the prior
+ * hop's encrypted reasoning into a hop that can't decrypt it → a 400; stripping
+ * the ciphertext lets the model re-reason instead of the client seeing a hard
+ * error (audit 2026-07-14-codex-upstream-wire §F2). Non-Responses wires and
+ * bodies without encrypted state fall straight through to {@link postUpstream}.
+ */
+const postWithDecryptRetry = async (
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  wire: TUpstreamWire,
+  finalHop: boolean,
+  signal: AbortSignal,
+): Promise<Response | null> => {
+  const send = (b: unknown): Promise<Response | null> =>
+    postUpstream(
+      url,
+      { method: "POST", headers, body: JSON.stringify(b), signal },
+      finalHop,
+      signal,
+    );
+  const first = await send(body);
+  // `chatgpt` is the only encrypted-content-bearing upstream wire (grok maps to
+  // it in UPSTREAM_WIRE). Anything else, an OK response, a non-400, or a body
+  // with no encrypted state → nothing to strip.
+  if (
+    first === null ||
+    first.ok ||
+    first.status !== 400 ||
+    wire !== "chatgpt" ||
+    !responsesBodyHasEncryptedContent(body)
+  ) {
+    return first;
+  }
+  // Peek the error body via `clone()` so the caller can still read `first` on
+  // the terminal path if this turns out NOT to be a decrypt failure.
+  const raw = await first
+    .clone()
+    .text()
+    .catch(() => "");
+  if (!isEncryptedContentError(raw)) return first;
+  const retried = await send(stripResponsesEncryptedContent(body));
+  return retried ?? first;
 };
 
 /** Map the daemon's upstream wire to the classifier's provider format
@@ -879,14 +932,11 @@ const serveSubscription = async (
     hop.providerModelId,
     built.body,
   );
-  const resp = await postUpstream(
+  const resp = await postWithDecryptRetry(
     url,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: args.req.signal,
-    },
+    headers,
+    body,
+    wire,
     finalHop,
     args.req.signal,
   );

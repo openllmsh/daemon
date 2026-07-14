@@ -16,19 +16,14 @@
  * A full agentic task is ONE held app-server turn. Shares the result shape +
  * canonical encoder with the Claude tool path (`claude-tool-session.ts`).
  *
- * ⚠️ NOT READY — gated OFF by `CODEX_TOOLS_READY` in serve.ts. codex-cli 0.144.0
- * does not emit `item/tool/call` for `dynamicTools` (the schema is behind
- * `--experimental`; the call never fires), so this path is UNREACHABLE and
- * UNVALIDATED — no fixture or live coverage exists. Before flipping the flag:
- *   1. Add a fixture test of the `dynamicTools` + `item/tool/call` round-trip
- *      (start → tool call → client result → continue → final).
- *   2. Wire per-turn usage — `onUsage` is a no-op here; mirror
- *      `usageFromBreakdown` so tool turns are billed like the text path.
- *   3. Interrupt the turn on the drive() timeout (parity with the Batch B
- *      fix in `runCodexNative`) so a stalled turn doesn't leak in the shared
- *      app-server process.
- * Parallel tool calls are already handled (pairing is by protocol `callId`,
- * not positional — unlike the Claude path's pre-Batch-B bug).
+ * ENABLED (`CODEX_TOOLS_READY` in serve.ts). A 2026-07-14 live probe settled
+ * the protocol facts this path relies on (audit 2026-07-14-codex-upstream-wire
+ * §6): with `features.code_mode:false` on `thread/start`, codex-cli 0.144.0
+ * emits `item/tool/call` and the turn completes after we answer with
+ * `{ callId, contentItems:[…], success }`. Batch B is done: per-turn usage is
+ * folded from `thread/tokenUsage/updated`, and a drive() timeout interrupts the
+ * still-running turn. Parallel tool calls pair by protocol `callId` (not
+ * positional — unlike the Claude path's pre-Batch-B bug).
  */
 
 import type {
@@ -41,6 +36,8 @@ import {
   clientFor,
   effortOf,
 } from "./codex-app-server";
+import type { TNativeTokens } from "./types";
+import { tokensFromResponse } from "./types";
 
 const HELD_TTL_MS = 10 * 60 * 1000;
 const DRIVE_TIMEOUT_MS = 120_000;
@@ -60,10 +57,23 @@ type TEvent =
 type THeld = {
   readonly client: CodexAppServerClient;
   readonly threadId: string;
+  /** The live turn id (from `turn/start`) — needed to `turn/interrupt` a
+   *  stalled turn so it doesn't keep generating in the SHARED app-server
+   *  process (Batch B). */
+  turnId: string | null;
   /** callId → the JSON-RPC request id of the paused `item/tool/call`. */
   readonly pending: Map<string, number>;
   readonly queue: TEvent[];
   wake: (() => void) | null;
+  /** THIS turn's usage (`thread/tokenUsage/updated.last`), folded to the daemon
+   *  row shape so a tool turn is billed like the text path (Batch B). */
+  usage: TNativeTokens | undefined;
+  /** Whether any `item/agentMessage/delta` arrived for the CURRENT message.
+   *  The runtime emits BOTH streamed deltas AND a terminal `item/completed`
+   *  full message; without this guard both get appended and the text doubles
+   *  (parity with runCodexNative's `sawDelta`). Reset when a tool call splits
+   *  the turn into a new message. */
+  sawDelta: boolean;
   lastUsed: number;
 };
 
@@ -112,9 +122,21 @@ const push = (h: THeld, e: TEvent): void => {
 const attachSink = (h: THeld): void => {
   h.client.addSink({
     threadId: h.threadId,
-    onDelta: (t) => push(h, { kind: "text", text: t }),
-    onAgentMessage: (t) => push(h, { kind: "text", text: t }),
-    onUsage: () => undefined,
+    onDelta: (t) => {
+      h.sawDelta = true;
+      push(h, { kind: "text", text: t });
+    },
+    // Full-message completion — skip if deltas already streamed it, or the
+    // text doubles.
+    onAgentMessage: (t) => {
+      if (h.sawDelta) return;
+      push(h, { kind: "text", text: t });
+    },
+    // Fold the app-server's per-turn usage to the daemon row shape (Batch B —
+    // was a no-op, so tool turns recorded ZERO tokens).
+    onUsage: (u) => {
+      h.usage = tokensFromResponse({ usage: u });
+    },
     onCompleted: (status, error) => push(h, { kind: "done", status, error }),
     onToolCall: (requestId, callId, tool, args) =>
       push(h, { kind: "tool", requestId, callId, tool, args }),
@@ -144,6 +166,17 @@ export const startCodexToolTurn = async (
       model: params.providerModelId,
       approvalPolicy: "never",
       sandbox: "read-only",
+      // Suppress the built-in persona (parity with the text path).
+      personality: "none",
+      // Route dynamic-tool calls to US via `item/tool/call` instead of the
+      // `codex-code-mode-host` sidecar (which the isolated install doesn't
+      // ship). Verified live 2026-07-14: with code-mode ON the call never
+      // reaches the client (the gate the old `CODEX_TOOLS_READY` comment
+      // misread as "0.144.0 doesn't emit item/tool/call"); with it OFF the
+      // call fires and the turn completes. `experimentalRawEvents` matches
+      // openclaw's thread/start.
+      features: { code_mode: false, code_mode_only: false },
+      experimentalRawEvents: true,
       dynamicTools: params.tools.map((t) => ({
         type: "function",
         name: t.name,
@@ -168,20 +201,24 @@ export const startCodexToolTurn = async (
   const h: THeld = {
     client,
     threadId,
+    turnId: null,
     pending: new Map(),
     queue: [],
     wake: null,
+    usage: undefined,
+    sawDelta: false,
     lastUsed: nowMs(),
   };
   attachSink(h);
 
   const effort = effortOf(params.reasoningEffort);
   try {
-    await client.request("turn/start", {
+    const turn = (await client.request("turn/start", {
       threadId,
       input: [{ type: "text", text: params.userText, text_elements: [] }],
       ...(effort !== null ? { effort } : {}),
-    });
+    })) as { turn?: { id?: string } };
+    h.turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {
     client.removeSink(threadId);
     return {
@@ -230,6 +267,17 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
       // otherwise wait for the next event (bounded).
       if (toolCalls.length > 0) return pauseReturn(h, text, toolCalls);
       if (nowMs() > deadline) {
+        // Interrupt the still-running turn before detaching, or the vendor keeps
+        // generating in the shared app-server process (Batch B — parity with
+        // runCodexNative's abort). Best-effort.
+        if (h.turnId !== null) {
+          void h.client
+            .request("turn/interrupt", {
+              threadId: h.threadId,
+              turnId: h.turnId,
+            })
+            .catch(() => undefined);
+        }
         h.client.removeSink(h.threadId);
         dropIndex(h);
         return { kind: "declined", reason: "codex tool turn timed out" };
@@ -249,6 +297,9 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     if (e.kind === "tool") {
       h.pending.set(e.callId, e.requestId);
       held.set(e.callId, h);
+      // A tool call ends the current assistant message; the post-tool-result
+      // message is fresh, so re-arm the delta/full-message dedup guard.
+      h.sawDelta = false;
       toolCalls.push({
         id: e.callId,
         name: e.tool,
@@ -261,7 +312,7 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     h.client.removeSink(h.threadId);
     dropIndex(h);
     if (toolCalls.length > 0) return pauseReturn(h, text, toolCalls);
-    return { kind: "final", text };
+    return { kind: "final", text, ...(h.usage ? { usage: h.usage } : {}) };
   }
 };
 
@@ -271,5 +322,10 @@ const pauseReturn = (
   toolCalls: ReadonlyArray<TToolCallOut>,
 ): TToolTurnResult => {
   h.lastUsed = nowMs();
-  return { kind: "tool_calls", text, toolCalls };
+  return {
+    kind: "tool_calls",
+    text,
+    toolCalls,
+    ...(h.usage ? { usage: h.usage } : {}),
+  };
 };
