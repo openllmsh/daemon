@@ -45,6 +45,7 @@
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import { logError, logInfo } from "../logger";
@@ -59,7 +60,7 @@ import {
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
-import { fetchModelList, positiveInt } from "./fetch-model-list";
+import { positiveInt } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -362,6 +363,77 @@ export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot => {
   };
 };
 
+// ─── Live model rows (shared by listModels + per-hop capability reads) ─────
+//
+// The CLI chat proxy's own `GET /v1/models` (the call the grok CLI's model
+// picker makes). Cached briefly because the walker consults per-hop model
+// capabilities (`supports_reasoning_effort`) and must not pay a network
+// round-trip per request. `null` on ANY failure — callers treat unknown as
+// "leave the request untouched" / keep the cached catalog.
+
+type TGrokModelRow = Readonly<Record<string, unknown>>;
+
+const MODEL_ROWS_TTL_MS = 5 * 60_000;
+let modelRowsCache: {
+  at: number;
+  rows: ReadonlyArray<TGrokModelRow>;
+} | null = null;
+
+const modelRows = async (): Promise<ReadonlyArray<TGrokModelRow> | null> => {
+  if (
+    modelRowsCache !== null &&
+    Date.now() - modelRowsCache.at < MODEL_ROWS_TTL_MS
+  ) {
+    return modelRowsCache.rows;
+  }
+  const token = await readToken();
+  if (token === null) return null;
+  try {
+    // Host derived from the CAPTURED inference URL via `resolveProviderUrl`;
+    // bearer + the CLI's genuine identity headers, mirroring the usage read.
+    const resp = await fetch(await resolveProviderUrl(PROVIDER, "/v1/models"), {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${token.accessToken}`,
+        "x-grok-client-version": await clientVersion(),
+        "x-grok-client-identifier": "xai-grok-cli",
+        accept: "application/json",
+      },
+      signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
+    const b = (await resp.json()) as {
+      data?: ReadonlyArray<TGrokModelRow>;
+      models?: ReadonlyArray<TGrokModelRow>;
+    };
+    const rows = b.data ?? b.models ?? [];
+    if (rows.length === 0) return null;
+    modelRowsCache = { at: Date.now(), rows };
+    return rows;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Whether ONE model row advertises a configurable `reasoning.effort`. Only
+ * current flagship Grok Build models set `supports_reasoning_effort` — the
+ * partner client (openclaw) strips the reasoning params for the rest, and the
+ * walker mirrors that via `TProviderDelegate.supportsReasoningEffort` (audit
+ * 2026-07-14 §F2). Pure (no network) so it can be unit-tested; tolerates both
+ * snake and camel casing like the partner's reader.
+ */
+export const reasoningEffortFromRows = (
+  rows: ReadonlyArray<TGrokModelRow>,
+  providerModelId: string,
+): boolean | null => {
+  const row = rows.find((m) => m.id === providerModelId);
+  if (row === undefined) return null;
+  const v = row.supports_reasoning_effort ?? row.supportsReasoningEffort;
+  return typeof v === "boolean" ? v : null;
+};
+
 export const grokDelegate: TProviderDelegate = {
   slug: PROVIDER,
 
@@ -439,44 +511,37 @@ export const grokDelegate: TProviderDelegate = {
   },
 
   listModels: async () => {
-    // The CLI chat proxy's own `GET /v1/models` (the call the grok CLI's
-    // model picker makes — both Grok Build models report `api_backend`
-    // through it). Host derived from the CAPTURED inference URL via
-    // `resolveProviderUrl`; bearer + the CLI's genuine identity headers,
-    // mirroring the usage read. Metadata only; null on any failure
-    // (never an empty list).
-    const token = await readToken();
-    if (token === null) return null;
-    return fetchModelList(
-      await resolveProviderUrl(PROVIDER, "/v1/models"),
-      {
-        authorization: `Bearer ${token.accessToken}`,
-        "x-grok-client-version": await clientVersion(),
-        "x-grok-client-identifier": "xai-grok-cli",
-        accept: "application/json",
-      },
-      (body) => {
-        // OpenAI-wire `{ data: [...] }`; tolerate `{ models: [...] }` too.
-        const b = body as {
-          data?: ReadonlyArray<Record<string, unknown>>;
-          models?: ReadonlyArray<Record<string, unknown>>;
-        };
-        return (b.data ?? b.models ?? []).flatMap((m) => {
-          if (typeof m.id !== "string" || m.id.length === 0) return [];
-          const ctx = positiveInt(m.context_window ?? m.context_length);
-          return [
-            {
-              provider_model_id: m.id,
-              ...(typeof m.display_name === "string"
-                ? { display_name: m.display_name }
-                : {}),
-              ...(ctx !== undefined ? { context_window: ctx } : {}),
-            },
-          ];
-        });
-      },
-    );
+    // Live `/v1/models` rows via the shared cached fetch (both Grok Build
+    // models report `api_backend` through it). Metadata only; null on any
+    // failure (never an empty list).
+    const rows = await modelRows();
+    if (rows === null) return null;
+    const entries = rows.flatMap((m) => {
+      if (typeof m.id !== "string" || m.id.length === 0) return [];
+      const ctx = positiveInt(m.context_window ?? m.context_length);
+      return [
+        {
+          provider_model_id: m.id,
+          ...(typeof m.display_name === "string"
+            ? { display_name: m.display_name }
+            : {}),
+          ...(ctx !== undefined ? { context_window: ctx } : {}),
+        },
+      ];
+    });
+    return entries.length > 0 ? entries : null;
   },
+
+  supportsReasoningEffort: async (providerModelId) => {
+    const rows = await modelRows();
+    if (rows === null) return null;
+    return reasoningEffortFromRows(rows, providerModelId);
+  },
+
+  // xAI rejects contains-count bounds in tool schemas (partner compat:
+  // openclaw `model-compat.ts` — audit 2026-07-14 §F7); the walker strips
+  // them recursively from every tool's `parameters`.
+  unsupportedToolSchemaKeywords: ["minContains", "maxContains"],
 
   credentialForUpstream: async () => {
     const token = await readToken();

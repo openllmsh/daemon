@@ -59,6 +59,7 @@ import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/
 import { decodeProviderEventStream } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
 import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
+import { stripSchemaKeywords } from "@quantidexyz/openllmw/lib/tool-schema";
 import { fromAnthropicResponse } from "@quantidexyz/openllmw/providers/anthropic/response";
 import {
   fromAnthropicStreamEvent,
@@ -97,6 +98,7 @@ import { recordRequest, searchViaCloud } from "./cloud-client";
 import { lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
+import type { TProviderDelegate } from "./delegation/types";
 import { forwardToCloud } from "./forward";
 import {
   isNativeRuntimeProvider,
@@ -268,6 +270,80 @@ export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
  */
 export const retryable = (status: number): boolean =>
   status === 429 || status === 408 || (status >= 500 && status <= 599);
+
+// Final-hop in-place retry bounds: ONE retry, delay from a bounded
+// `Retry-After` (else 1s). Mid-chain hops never retry in place — the walk IS
+// the retry — but with no next hop a transient 429/5xx would otherwise
+// surface immediately, where partner clients absorb the same blip with SDK
+// backoff (audit 2026-07-14 §F6).
+const FINAL_HOP_RETRY_DELAY_MS = 1_000;
+const FINAL_HOP_RETRY_AFTER_CAP_MS = 10_000;
+
+/** Bounded delay from a 429/5xx response's `Retry-After` (seconds or
+ *  HTTP-date), falling back to {@link FINAL_HOP_RETRY_DELAY_MS}. */
+const retryAfterDelayMs = (resp: Response): number => {
+  const raw = resp.headers.get("retry-after");
+  if (raw !== null) {
+    const secs = Number(raw);
+    if (!Number.isNaN(secs)) {
+      return Math.max(0, Math.min(secs * 1000, FINAL_HOP_RETRY_AFTER_CAP_MS));
+    }
+    const at = Date.parse(raw);
+    if (!Number.isNaN(at)) {
+      return Math.max(
+        0,
+        Math.min(at - Date.now(), FINAL_HOP_RETRY_AFTER_CAP_MS),
+      );
+    }
+  }
+  return FINAL_HOP_RETRY_DELAY_MS;
+};
+
+/** Resolve after `ms` — or immediately once the client disconnects, so a
+ *  final-hop backoff never outlives the request it serves. */
+const abortableDelay = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+
+/**
+ * POST the built request upstream — plus, on the plan's FINAL hop, ONE
+ * bounded in-place retry when the failure is pre-stream retryable (a network
+ * error or a 429/408/5xx). Returns `null` when every attempt failed at the
+ * network layer (no `Response` to surface).
+ */
+export const postUpstream = async (
+  url: string,
+  init: RequestInit,
+  finalHop: boolean,
+  signal: AbortSignal,
+): Promise<Response | null> => {
+  let first: Response | null = null;
+  try {
+    first = await fetch(url, init);
+  } catch {
+    first = null;
+  }
+  const failedRetryable =
+    first === null || (!first.ok && retryable(first.status));
+  if (!failedRetryable || !finalHop || signal.aborted) return first;
+  await abortableDelay(
+    first === null ? FINAL_HOP_RETRY_DELAY_MS : retryAfterDelayMs(first),
+    signal,
+  );
+  if (signal.aborted) return first;
+  try {
+    return await fetch(url, init);
+  } catch {
+    return first;
+  }
+};
 
 /** Map the daemon's upstream wire to the classifier's provider format
  *  (chatgpt + kimi both speak the OpenAI error-envelope shape). */
@@ -497,6 +573,64 @@ const inboundBetaOf = (args: TWalkArgs): string | null =>
   args.surface === "messages" ? args.req.headers.get("anthropic-beta") : null;
 
 /**
+ * Delegate-owned per-model request compat, applied to the BUILT upstream body
+ * (grok today; a no-op for delegates that declare neither knob — audit
+ * 2026-07-14 §F2/§F7):
+ *   - `reasoning` dropped when the vendor's live model row says configurable
+ *     effort is unsupported (`supportsReasoningEffort` → `false`; `null` =
+ *     unknown leaves the request untouched) — the shared wire builder can't
+ *     know this, only the delegate sees the vendor's `/v1/models`;
+ *   - tool-schema keywords the endpoint rejects stripped recursively from
+ *     every tool's `parameters`.
+ * The delegate rides in as a parameter (callers pass `getDelegate(...)`) so
+ * the offline suite can exercise the policy with a stub.
+ */
+export const applyDelegateModelCompat = async (
+  delegate: TProviderDelegate | null,
+  providerModelId: string,
+  body: unknown,
+): Promise<unknown> => {
+  if (delegate === null || body === null || typeof body !== "object") {
+    return body;
+  }
+  let out = body as Record<string, unknown>;
+  if (
+    out.reasoning !== undefined &&
+    delegate.supportsReasoningEffort !== undefined
+  ) {
+    const supported = await delegate
+      .supportsReasoningEffort(providerModelId)
+      .catch((): null => null);
+    if (supported === false) {
+      const { reasoning: _dropped, ...rest } = out;
+      out = rest;
+    }
+  }
+  const keywords = delegate.unsupportedToolSchemaKeywords;
+  if (
+    keywords !== undefined &&
+    keywords.length > 0 &&
+    Array.isArray(out.tools)
+  ) {
+    out = {
+      ...out,
+      tools: out.tools.map((tool) =>
+        tool !== null && typeof tool === "object" && "parameters" in tool
+          ? {
+              ...(tool as Record<string, unknown>),
+              parameters: stripSchemaKeywords(
+                (tool as Record<string, unknown>).parameters,
+                keywords,
+              ),
+            }
+          : tool,
+      ),
+    };
+  }
+  return out;
+};
+
+/**
  * Serve a subscription hop that runs openllm-managed web_search (§5): the
  * agentic loop. Each round calls the vendor (ACCUMULATED — we must read the
  * whole response to spot tool calls), and for every `web_search` tool call
@@ -510,6 +644,7 @@ const serveWithWebSearch = async (
   wire: TUpstreamWire,
   args: TWalkArgs,
   initialCanonical: TChatCompletionRequest,
+  finalHop: boolean,
 ): Promise<Response | "retry"> => {
   const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return "retry";
@@ -535,33 +670,46 @@ const serveWithWebSearch = async (
   let final: TChatCompletionResponse | null = null;
 
   for (let round = 0; round < MAX_WEB_SEARCH_ROUNDS; round++) {
-    // Accumulated cross-wire body (chatgpt still streams + is drained).
-    const body = canonicalToUpstreamBody(
-      wire,
-      canonical,
+    // Accumulated cross-wire body (chatgpt still streams + is drained),
+    // then the delegate's per-model compat (reasoning gate + schema strip).
+    const body = await applyDelegateModelCompat(
+      getDelegate(hop.provider),
       hop.providerModelId,
-      false,
-      wantsCodexPreamble(hop.provider),
+      canonicalToUpstreamBody(
+        wire,
+        canonical,
+        hop.providerModelId,
+        false,
+        wantsCodexPreamble(hop.provider),
+      ),
     );
-    let resp: Response;
-    try {
-      resp = await fetch(url, {
+    // Rounds > 0 are committed to this hop — no in-place retry there either.
+    const resp = await postUpstream(
+      url,
+      {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         signal: args.req.signal,
-      });
-    } catch {
-      if (round === 0) return "retry";
+      },
+      finalHop && round === 0,
+      args.req.signal,
+    );
+    if (resp === null) {
+      if (round === 0 && !finalHop) return "retry";
       return errorJson(502, "web_search: upstream request failed");
     }
     if (!resp.ok) {
-      if (round === 0 && retryable(resp.status)) return "retry";
+      // Round-0 pre-stream failure: mid-chain walks (the walk IS the retry);
+      // the final hop has nothing to walk to — surface the upstream error
+      // verbatim (post in-place retry) instead of the generic all-hops 502.
+      if (round === 0 && !finalHop && retryable(resp.status)) return "retry";
       const detail = await resp.text().catch(() => "");
       // Parity with serveSubscription: a content-filter / context-length /
       // capability 400 is transient — walk to the next hop (round 0 only).
       if (
         round === 0 &&
+        !finalHop &&
         resp.status === 400 &&
         transient400Envelope(detail, wire)
       ) {
@@ -704,6 +852,7 @@ const serveSubscription = async (
   hop: THop,
   wire: TUpstreamWire,
   args: TWalkArgs,
+  finalHop: boolean,
 ): Promise<Response | "retry"> => {
   const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return "retry";
@@ -713,7 +862,7 @@ const serveSubscription = async (
     (args.rawBody as { stream?: unknown } | null)?.stream === true;
   // ONE shared recipe — body + headers — for the (clientWire × upstreamWire)
   // pairing (the cloud runner calls the same builder).
-  const { body, headers } = buildUpstreamRequest({
+  const built = buildUpstreamRequest({
     surface: args.surface,
     upstreamWire: wire,
     rawBody: args.rawBody,
@@ -724,23 +873,34 @@ const serveSubscription = async (
     isOAuth: wire === "anthropic",
     codexInstructions: wantsCodexPreamble(hop.provider),
   });
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
+  const headers = built.headers;
+  const body = await applyDelegateModelCompat(
+    getDelegate(hop.provider),
+    hop.providerModelId,
+    built.body,
+  );
+  const resp = await postUpstream(
+    url,
+    {
       method: "POST",
       headers,
       body: JSON.stringify(body),
       signal: args.req.signal,
-    });
-  } catch {
-    return "retry"; // network error — pre-stream, fall through
-  }
+    },
+    finalHop,
+    args.req.signal,
+  );
+  if (resp === null) return "retry"; // network error — pre-stream, fall through
   if (!resp.ok) {
-    if (retryable(resp.status)) return "retry";
+    // Pre-stream failure. Mid-chain: walk on retryable / transient-400 (the
+    // walk IS the retry). Final hop: nothing left to walk to — surface the
+    // upstream error verbatim (post in-place retry) instead of the generic
+    // all-hops 502, so the client sees the real status + `Retry-After`.
+    if (!finalHop && retryable(resp.status)) return "retry";
     const raw = await resp.text().catch(() => "");
     // A content-filter / context-length / capability 400 is transient — walk
     // to the next hop like the cloud does.
-    if (resp.status === 400 && transient400Envelope(raw, wire)) {
+    if (!finalHop && resp.status === 400 && transient400Envelope(raw, wire)) {
       return "retry";
     }
     // Every other non-OK is terminal: surface the upstream error verbatim.
@@ -943,7 +1103,8 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
 
   let lastError: string | null = null;
-  for (const hop of hops) {
+  for (const [hopIndex, hop] of hops.entries()) {
+    const finalHop = hopIndex === hops.length - 1;
     // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
     // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
     // DECLINE (unsupported request — tools/images/structured-output — or a
@@ -981,8 +1142,8 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
       const served = shouldInterceptWebSearch(wire, args.surface, canonical)
-        ? await serveWithWebSearch(hop, wire, args, canonical)
-        : await serveSubscription(hop, wire, args);
+        ? await serveWithWebSearch(hop, wire, args, canonical, finalHop)
+        : await serveSubscription(hop, wire, args, finalHop);
       if (served !== "retry") return served; // committed
       lastError = `subscription hop ${hop.modelId} failed pre-stream`;
       continue;

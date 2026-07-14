@@ -95,6 +95,27 @@ export type TProviderDelegate = {
   listModels?: () => Promise<ReadonlyArray<TProviderModelEntry> | null>;
 
   /**
+   * Whether ONE model accepts a configurable `reasoning.effort` on this
+   * provider's wire, read from the vendor's live model list (grok's
+   * `/v1/models` rows carry `supports_reasoning_effort`; only current
+   * flagship models set it — the partner client strips the param for the
+   * rest, and so does the walker). `null` = unknown (row missing, list
+   * unreachable, or field absent) — the walker then leaves the request
+   * untouched. Absent on providers whose wire has no such per-model gate.
+   */
+  supportsReasoningEffort?: (
+    providerModelId: string,
+  ) => Promise<boolean | null>;
+
+  /**
+   * JSON-Schema keywords this provider's endpoint REJECTS in tool
+   * `parameters` (xAI: `minContains`/`maxContains`). The walker strips them
+   * recursively from every tool schema before the upstream call. Absent =
+   * forward schemas verbatim.
+   */
+  readonly unsupportedToolSchemaKeywords?: ReadonlyArray<string>;
+
+  /**
    * Produce, for ONE inference call: the bearer (from the official CLI's store),
    * the request TARGET `url` (captured from a real CLI request, or the default),
    * and only the CREDENTIAL-INTRINSIC `headers` — the small set the request can't
