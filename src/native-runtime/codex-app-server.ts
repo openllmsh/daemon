@@ -464,7 +464,9 @@ export const runCodexNative = async (
   };
   client.addSink(sink);
 
+  let aborted = false;
   const abort = (): void => {
+    aborted = true;
     if (turnId !== null) {
       void client.request("turn/interrupt", { threadId, turnId }).catch(() => {
         // interrupt is best-effort; the sink terminal event still ends us
@@ -492,6 +494,19 @@ export const runCodexNative = async (
       kind: "declined",
       reason: error instanceof Error ? error.message : String(error),
     };
+  }
+
+  // If the client aborted WHILE turn/start was in flight, the abort closure saw
+  // a null turnId and couldn't interrupt — do it now that the id has arrived, or
+  // the vendor keeps generating an answer nobody reads (silent quota burn).
+  if (aborted) {
+    if (turnId !== null) {
+      void client
+        .request("turn/interrupt", { threadId, turnId })
+        .catch(() => undefined);
+    }
+    client.removeSink(threadId);
+    return { kind: "declined", reason: "client aborted" };
   }
 
   const nextItem = async (): Promise<TChatCompletionChunk | "end"> => {

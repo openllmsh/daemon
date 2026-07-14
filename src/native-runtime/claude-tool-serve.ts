@@ -11,12 +11,15 @@
  */
 
 import type { TChatCompletionRequest } from "@quantidexyz/openllmp";
+import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
+import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
-import { jsonBodyForClient } from "../client-encode";
+import { jsonBodyForClient, sseBytesForClient } from "../client-encode";
 import {
   continueToolTurn,
   startToolTurn,
   type TClientTool,
+  type TIteratorFactory,
   toolTurnToResponse,
 } from "./claude-tool-session";
 import {
@@ -70,9 +73,14 @@ export type TClaudeToolServeParams = {
   readonly providerModelId: string;
   readonly surface: "chat_completions" | "messages" | "responses";
   readonly canonical: TChatCompletionRequest;
+  /** The client asked for SSE — the completion (with tool_calls) is streamed,
+   *  not returned as a single JSON body. */
+  readonly wantsStream: boolean;
   readonly bin: string;
   readonly env: Record<string, string>;
   readonly record: (tokens: TNativeTokens) => void;
+  /** Test seam: inject a fake SDK query iterator (default = the real SDK). */
+  readonly makeIterator?: TIteratorFactory;
 };
 
 /** Serve a tool-bearing claude_code request through the held-query orchestrator. */
@@ -99,15 +107,18 @@ export const tryServeClaudeTools = async (
         : await continueCodexToolTurn(trailingToolResults)
       : // START: the last user turn opens a new held turn.
         isClaude
-        ? await startToolTurn({
-            bin: params.bin,
-            env: params.env,
-            providerModelId: params.providerModelId,
-            tools: clientToolsOf(params.canonical),
-            systemText: systemTextOf(params.canonical),
-            resumeSessionId: null,
-            userText: seedFromHistory(params.canonical),
-          })
+        ? await startToolTurn(
+            {
+              bin: params.bin,
+              env: params.env,
+              providerModelId: params.providerModelId,
+              tools: clientToolsOf(params.canonical),
+              systemText: systemTextOf(params.canonical),
+              resumeSessionId: null,
+              userText: seedFromHistory(params.canonical),
+            },
+            params.makeIterator,
+          )
         : await startCodexToolTurn({
             bin: params.bin,
             env: params.env,
@@ -129,6 +140,34 @@ export const tryServeClaudeTools = async (
 
   const canonicalResp = toolTurnToResponse(result, params.providerModelId);
   const clientWire = clientWireOf(params.surface);
+
+  // Streaming client: encode the completion (tool_calls or final text) as SSE
+  // so a `stream: true` client gets the wire it expects — a JSON body here
+  // breaks/hangs streaming SDK clients (real Claude Code streams). Each request
+  // is independent (the client sends its tool results in the NEXT request), so
+  // streaming a single completion is correct.
+  if (params.wantsStream) {
+    const bytes = sseBytesForClient(
+      responseToChunkStream(canonicalResp),
+      params.surface,
+      clientWire,
+    );
+    return new Response(
+      withFrameAlignedHeartbeat(bytes, {
+        intervalMs: 15_000,
+        kind: params.surface === "messages" ? "anthropic_ping" : "comment",
+      }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        },
+      },
+    );
+  }
+
   const body = jsonBodyForClient(canonicalResp, params.surface, clientWire);
   return new Response(JSON.stringify(body), {
     status: 200,

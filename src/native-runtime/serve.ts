@@ -44,6 +44,7 @@ import {
   isNativeRuntimeProvider,
   nativeRequestOf,
   tokensFromResponse,
+  unsupportedNativeControl,
   ZERO_TOKENS,
 } from "./types";
 
@@ -124,6 +125,18 @@ export const tryServeNativeRuntime = async (
         "web_search runs on the gateway's managed loop (manual transport)",
     };
   }
+  // Generation controls the native runtimes can't honor (non-default
+  // temperature/top_p/penalties, stop, seed, n, logprobs, logit_bias,
+  // response_format, forced tool_choice) → decline so the manual transport
+  // applies them, instead of silently serving at the runtime's defaults. Guards
+  // BOTH the tool and text paths. (max_tokens is a documented carve-out — see
+  // `unsupportedNativeControl`.)
+  const unsupported = unsupportedNativeControl(params.canonical);
+  if (unsupported !== null) {
+    return {
+      declined: `native runtime can't honor ${unsupported} — served by the manual transport`,
+    };
+  }
   // Tool-bearing requests use completion tool-passthrough. claude_code: the
   // held-open SDK query (works). chatgpt: the Codex app-server's native
   // dynamic-tool protocol (`dynamicTools` + `item/tool/call`) is IMPLEMENTED
@@ -143,6 +156,7 @@ export const tryServeNativeRuntime = async (
       providerModelId: params.providerModelId,
       surface: params.surface,
       canonical: params.canonical,
+      wantsStream: params.wantsStream,
       bin: overrides?.bin ?? cliBin(params.provider),
       env: overrides?.env ?? cliEnv(params.provider),
       record: params.record,

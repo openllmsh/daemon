@@ -195,8 +195,34 @@ type THeld = {
    *  let the abandoned promise eat the first message after the resume (the final
    *  assistant text would silently vanish). */
   nextP: Promise<TStep> | null;
+  /** Serializes `drive()` for this session — two continuation requests that
+   *  reference the same held query (e.g. parallel tool results split across
+   *  concurrent HTTP calls) must not race the single iterator + its mutable
+   *  `nextP`/`chan`/`pending` state. */
+  lock: Promise<void>;
   sessionId: string | null;
   lastUsed: number;
+};
+
+/** Run `fn` after any in-flight `drive()` for this session completes, chaining
+ *  the next waiter behind it. Callers MUST resolve any tool-result handlers
+ *  BEFORE awaiting the lock, so a sibling continuation can unblock the SDK while
+ *  this one waits (else a split parallel-result submission would deadlock). */
+const withSessionLock = async <T>(
+  h: THeld,
+  fn: () => Promise<T>,
+): Promise<T> => {
+  const prev = h.lock;
+  let release!: () => void;
+  h.lock = new Promise<void>((r) => {
+    release = r;
+  });
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
 };
 
 /** Held (paused) queries, indexed by EACH pending tool-call id so a
@@ -339,6 +365,7 @@ export const startToolTurn = async (
     chan,
     pending: new Map(),
     nextP: null,
+    lock: Promise.resolve(),
     sessionId: params.resumeSessionId,
     lastUsed: nowMs(),
   };
@@ -355,6 +382,11 @@ export const continueToolTurn = async (
   if (h === undefined) {
     return { kind: "declined", reason: "no held tool session for these ids" };
   }
+  // Resolve the provided handlers IMMEDIATELY (concurrent-safe: distinct ids),
+  // BEFORE awaiting the drive lock — so a sibling request delivering the other
+  // parallel results can unblock the SDK even while this one waits, instead of
+  // deadlocking (this drive would otherwise stall waiting for a result the
+  // lock-blocked sibling holds).
   for (const r of toolResults) {
     const resolve = h.pending.get(r.id);
     if (resolve !== undefined) {
@@ -364,7 +396,7 @@ export const continueToolTurn = async (
     }
   }
   h.lastUsed = nowMs();
-  return drive(h);
+  return withSessionLock(h, () => drive(h));
 };
 
 /**
@@ -388,8 +420,7 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     });
     // Reuse a next() retained by a prior pause (see THeld.nextP) so the message
     // after a resume isn't lost to an abandoned promise; otherwise fetch one.
-    const nextP =
-      h.nextP ?? h.it.next().then((r) => r as TStep);
+    const nextP = h.nextP ?? h.it.next().then((r) => r as TStep);
     h.nextP = null;
     let step: TStep | "fired";
     try {

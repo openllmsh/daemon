@@ -164,6 +164,53 @@ export type TNativeRequest = {
  * those are Phase 2). It accepts prior assistant turns: the session store
  * feeds only the NEW turn to a resumed session.
  */
+/**
+ * A generation control the native runtimes CANNOT honor, or null when the
+ * request is servable natively. The vendor CLIs / app-server accept only model
+ * + system + input (plus codex `reasoning_effort`); there is no mapping for the
+ * sampling / penalty / decoding / structured-output controls, so a non-default
+ * value must DECLINE to the manual transport (which passes them through) rather
+ * than be silently served at the runtime's own defaults. Applies to BOTH the
+ * text path and the tool path.
+ *
+ * Two deliberate carve-outs keep the PRIMARY native path (Claude Code on the
+ * Anthropic wire) alive:
+ *   - `max_tokens`/`max_completion_tokens` are NOT decline triggers: max_tokens
+ *     is REQUIRED on the Anthropic Messages wire, so every claude_code request
+ *     carries it — declining would abandon native for ALL of them. The native
+ *     runtime IS Claude Code, capping output at its own equivalent budget, so
+ *     the client's cap is a documented best-effort gap, not a manual fallback.
+ *   - `temperature`/`top_p` decline only when NON-DEFAULT (≠ 1): Claude Code
+ *     sends `temperature: 1` (the wire default the runtime also uses, so
+ *     ignoring it changes nothing); `temperature: 0` DOES change sampling and
+ *     must decline.
+ */
+export const unsupportedNativeControl = (
+  req: TChatCompletionRequest,
+): string | null => {
+  const set = (v: unknown): boolean => v !== undefined && v !== null;
+  if (set(req.temperature) && req.temperature !== 1) return "temperature";
+  if (set(req.top_p) && req.top_p !== 1) return "top_p";
+  if (set(req.frequency_penalty) && req.frequency_penalty !== 0) {
+    return "frequency_penalty";
+  }
+  if (set(req.presence_penalty) && req.presence_penalty !== 0) {
+    return "presence_penalty";
+  }
+  if (typeof req.n === "number" && req.n !== 1) return "n";
+  if (set(req.stop)) return "stop";
+  if (set(req.seed)) return "seed";
+  if (set(req.logit_bias)) return "logit_bias";
+  if (req.logprobs === true) return "logprobs";
+  if (set(req.top_logprobs)) return "top_logprobs";
+  if (set(req.response_format)) return "response_format";
+  // tool_choice "auto" (or absent) = the native default (the model decides). A
+  // forced / "none" / specific choice can't be enforced by the SDK query or the
+  // app-server → decline so the manual transport applies it.
+  if (set(req.tool_choice) && req.tool_choice !== "auto") return "tool_choice";
+  return null;
+};
+
 export const nativeRequestOf = (
   canonical: TChatCompletionRequest,
 ): TNativeRequest | null => {
