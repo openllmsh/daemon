@@ -29,7 +29,10 @@
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
+import type {
+  TProviderUsageSnapshot,
+  TProviderUsageWindow,
+} from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logWarn } from "../logger";
@@ -438,7 +441,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
         label: string,
         raw: { utilization?: number; resets_at?: string | null } | null,
         windowMs: number,
-      ) => ({
+      ): TProviderUsageWindow => ({
         label,
         percent_used:
           typeof raw?.utilization === "number" ? raw.utilization : 0,
