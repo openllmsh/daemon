@@ -42,7 +42,12 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
-import { reduceChatgptWindows, reduceQuotaStatus } from "./usage-reduce";
+import {
+  reduceChatgptCredits,
+  reduceChatgptPools,
+  reduceChatgptWindows,
+  reduceQuotaStatus,
+} from "./usage-reduce";
 import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "chatgpt" as const;
@@ -362,20 +367,26 @@ export const chatgptDelegate: TProviderDelegate = {
               : `ChatGPT couldn't report usage (HTTP ${resp.status}).`;
         return { kind: "unavailable", reason };
       }
-      // Reduced by the pure, payload-shape-agnostic reducer — OpenAI has
+      // Reduced by the pure, payload-shape-agnostic reducers — OpenAI has
       // already reshaped `rate_limit` once (5h primary + weekly secondary
       // → a single weekly primary with `limit_window_seconds`), and the
       // generic reduction absorbs the next reshape without a code change.
+      // Per-feature pools + credits ride along display-only.
       const data = (await resp.json()) as {
         plan_type?: string;
         rate_limit?: unknown;
+        additional_rate_limits?: unknown;
       };
       const windows = reduceChatgptWindows(data.rate_limit);
+      const extraPools = reduceChatgptPools(data.additional_rate_limits);
+      const credits = reduceChatgptCredits(data);
       return {
         kind: "quota",
         status: reduceQuotaStatus(data.rate_limit, windows),
         ...(typeof data.plan_type === "string" ? { plan: data.plan_type } : {}),
         windows,
+        ...(extraPools.length > 0 ? { extra_pools: extraPools } : {}),
+        ...(credits !== undefined ? { credits } : {}),
         note: "ChatGPT Codex — read locally via Codex CLI",
       };
     } catch (err) {

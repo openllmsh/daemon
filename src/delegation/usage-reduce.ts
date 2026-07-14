@@ -80,6 +80,72 @@ export const reduceChatgptWindows = (
 };
 
 /**
+ * Reduce Codex's `additional_rate_limits` — per-feature pools (e.g. the
+ * GPT-5.3-Codex-Spark promo pool) that meter DIFFERENT usage than the
+ * main windows — into display-only `extra_pools`. Each entry's nested
+ * `rate_limit` reduces through the same generic window walk; the pool's
+ * `limit_name` becomes (or prefixes) the label. These must never join
+ * `windows`: calibration and the card's tightest-window meter both
+ * assume one provider's windows meter the SAME usage.
+ */
+export const reduceChatgptPools = (
+  additionalRateLimits: unknown,
+): TProviderUsageWindow[] => {
+  if (!Array.isArray(additionalRateLimits)) return [];
+  const pools: TProviderUsageWindow[] = [];
+  for (const entry of additionalRateLimits as ReadonlyArray<unknown>) {
+    if (!isRecord(entry)) continue;
+    const name =
+      typeof entry.limit_name === "string" && entry.limit_name.length > 0
+        ? entry.limit_name
+        : typeof entry.metered_feature === "string"
+          ? entry.metered_feature
+          : "Feature pool";
+    const windows = reduceChatgptWindows(entry.rate_limit);
+    for (const w of windows) {
+      pools.push({
+        ...w,
+        label: windows.length === 1 ? name : `${name} · ${w.label}`,
+      });
+    }
+  }
+  return pools;
+};
+
+/** Credit state carried on the canonical quota snapshot, when reported. */
+export type TReducedCredits = {
+  readonly balance: string;
+  readonly unlimited?: boolean;
+  readonly reset_credits?: number;
+};
+
+/**
+ * Reduce Codex's `credits` + `rate_limit_reset_credits` into the
+ * canonical credit state — capacity that exists OUTSIDE the quota
+ * windows (a purchasable balance; limit-reset credits that lift a hit
+ * limit). Returns undefined when the payload reports neither.
+ */
+export const reduceChatgptCredits = (
+  payload: unknown,
+): TReducedCredits | undefined => {
+  if (!isRecord(payload)) return undefined;
+  const credits = isRecord(payload.credits) ? payload.credits : null;
+  const resets = isRecord(payload.rate_limit_reset_credits)
+    ? payload.rate_limit_reset_credits
+    : null;
+  if (credits === null && resets === null) return undefined;
+  const resetCount =
+    resets !== null && typeof resets.available_count === "number"
+      ? resets.available_count
+      : undefined;
+  return {
+    balance: typeof credits?.balance === "string" ? credits.balance : "0",
+    ...(credits?.unlimited === true ? { unlimited: true } : {}),
+    ...(resetCount !== undefined ? { reset_credits: resetCount } : {}),
+  };
+};
+
+/**
  * Overall quota status. The vendor's own verdict (`limit_reached` /
  * `allowed`) wins when it ships one — percent thresholds are only the
  * fallback, since a vendor can reject before any meter reads 100.
