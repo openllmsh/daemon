@@ -431,24 +431,31 @@ export const claudeCodeDelegate: TProviderDelegate = {
         string,
         { utilization?: number; resets_at?: string | null } | null
       >;
+      // Durations are implied by Anthropic's payload keys (`five_hour`,
+      // `seven_day*`) — stated on the canonical window so downstream
+      // consumers never have to parse them back out of the label.
       const win = (
         label: string,
         raw: { utilization?: number; resets_at?: string | null } | null,
+        windowMs: number,
       ) => ({
         label,
         percent_used:
           typeof raw?.utilization === "number" ? raw.utilization : 0,
         reset_at_ms:
           typeof raw?.resets_at === "string" ? toEpochMs(raw.resets_at) : null,
+        window_ms: windowMs,
       });
+      const FIVE_HOURS_MS = 5 * 3_600_000;
+      const SEVEN_DAYS_MS = 7 * 86_400_000;
       // The two core windows are always shown. The model-scoped 7-day
       // windows (`seven_day_opus` / `seven_day_sonnet`) are shown ONLY
       // when the account actually has them — Anthropic returns `null` for
       // a scope with no usage in the period, and the payload also carries
       // several internal/experimental codename keys we deliberately skip.
       const windows = [
-        win("5-hour", data.five_hour ?? null),
-        win("7-day", data.seven_day ?? null),
+        win("5-hour", data.five_hour ?? null, FIVE_HOURS_MS),
+        win("7-day", data.seven_day ?? null, SEVEN_DAYS_MS),
       ];
       const scoped: ReadonlyArray<readonly [string, string]> = [
         ["seven_day_opus", "7-day · Opus"],
@@ -457,7 +464,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       for (const [key, label] of scoped) {
         const raw = data[key];
         if (raw != null && typeof raw.utilization === "number") {
-          windows.push(win(label, raw));
+          windows.push(win(label, raw, SEVEN_DAYS_MS));
         }
       }
       const maxPct = windows.reduce(

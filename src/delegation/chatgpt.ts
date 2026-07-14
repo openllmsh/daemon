@@ -42,6 +42,7 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
+import { reduceChatgptWindows, reduceQuotaStatus } from "./usage-reduce";
 import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "chatgpt" as const;
@@ -361,45 +362,18 @@ export const chatgptDelegate: TProviderDelegate = {
               : `ChatGPT couldn't report usage (HTTP ${resp.status}).`;
         return { kind: "unavailable", reason };
       }
+      // Reduced by the pure, payload-shape-agnostic reducer — OpenAI has
+      // already reshaped `rate_limit` once (5h primary + weekly secondary
+      // → a single weekly primary with `limit_window_seconds`), and the
+      // generic reduction absorbs the next reshape without a code change.
       const data = (await resp.json()) as {
         plan_type?: string;
-        rate_limit?: {
-          primary_window?: { used_percent?: number; reset_at?: number } | null;
-          secondary_window?: {
-            used_percent?: number;
-            reset_at?: number;
-          } | null;
-        };
+        rate_limit?: unknown;
       };
-      const win = (
-        label: string,
-        raw: { used_percent?: number; reset_at?: number } | null | undefined,
-      ) => ({
-        label,
-        percent_used:
-          typeof raw?.used_percent === "number" ? raw.used_percent : 0,
-        reset_at_ms:
-          typeof raw?.reset_at === "number" ? raw.reset_at * 1000 : null,
-      });
-      const windows = [];
-      if (data.rate_limit?.primary_window) {
-        windows.push(win("Primary", data.rate_limit.primary_window));
-      }
-      if (data.rate_limit?.secondary_window) {
-        windows.push(win("Secondary", data.rate_limit.secondary_window));
-      }
-      const maxPct = windows.reduce(
-        (a, w) => (w.percent_used > a ? w.percent_used : a),
-        0,
-      );
+      const windows = reduceChatgptWindows(data.rate_limit);
       return {
         kind: "quota",
-        status:
-          maxPct >= 100
-            ? "rejected"
-            : maxPct >= 80
-              ? "allowed_warning"
-              : "allowed",
+        status: reduceQuotaStatus(data.rate_limit, windows),
         ...(typeof data.plan_type === "string" ? { plan: data.plan_type } : {}),
         windows,
         note: "ChatGPT Codex — read locally via Codex CLI",
