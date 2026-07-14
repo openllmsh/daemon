@@ -102,7 +102,11 @@ export const trackBodyDone = (
  */
 export const currentTarget = (): TDaemonTarget | null => {
   const arch =
-    process.arch === "x64" ? "x64-baseline" : process.arch === "arm64" ? "arm64" : null;
+    process.arch === "x64"
+      ? "x64-baseline"
+      : process.arch === "arm64"
+        ? "arm64"
+        : null;
   if (arch === null) return null;
   const t = `${process.platform}-${arch}`;
   return (DAEMON_TARGETS as readonly string[]).includes(t)
