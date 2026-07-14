@@ -423,6 +423,14 @@ const modelRows = async (): Promise<ReadonlyArray<TGrokModelRow> | null> => {
  * walker mirrors that via `TProviderDelegate.supportsReasoningEffort` (audit
  * 2026-07-14 §F2). Pure (no network) so it can be unit-tested; tolerates both
  * snake and camel casing like the partner's reader.
+ *
+ * A row that EXISTS but lacks the field counts as `false`, not unknown: the
+ * live `/v1/models` omits false-y fields proto3-style (verified live
+ * 2026-07-14 — composer's row carries no `supports_reasoning_effort`, the
+ * CLI's own models_cache materializes it as `false`, and sending effort
+ * anyway 400s "does not support parameter reasoningEffort"). Only a MISSING
+ * row is unknown (`null` → leave the request untouched); wrongly stripping
+ * degrades to default effort, wrongly sending hard-fails the request.
  */
 export const reasoningEffortFromRows = (
   rows: ReadonlyArray<TGrokModelRow>,
@@ -431,7 +439,7 @@ export const reasoningEffortFromRows = (
   const row = rows.find((m) => m.id === providerModelId);
   if (row === undefined) return null;
   const v = row.supports_reasoning_effort ?? row.supportsReasoningEffort;
-  return typeof v === "boolean" ? v : null;
+  return v === true;
 };
 
 export const grokDelegate: TProviderDelegate = {
