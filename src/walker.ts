@@ -64,6 +64,10 @@ import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/
 import { decodeProviderEventStream } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
 import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
+import {
+  UpstreamStreamError,
+  upstreamErrorFrom,
+} from "@quantidexyz/openllmw/lib/streaming/upstream-error";
 import { stripSchemaKeywords } from "@quantidexyz/openllmw/lib/tool-schema";
 import { fromAnthropicResponse } from "@quantidexyz/openllmw/providers/anthropic/response";
 import {
@@ -105,6 +109,7 @@ import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
 import { forwardToCloud } from "./forward";
+import { logWarn } from "./logger";
 import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
@@ -125,7 +130,7 @@ import { sampleUsageAfterRequest } from "./usage-cache";
 // still flow through the CLIs — the manual path reads the credential via the
 // delegate's `credentialForUpstream` (isolated CLI store + CLI-driven refresh),
 // exactly like kimi_code + grok.
-type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
+export type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
 const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   // Claude Pro/Max via the isolated Claude Code OAuth bearer + the
   // `anthropic-beta: oauth-2025-04-20` header on the Anthropic Messages wire.
@@ -480,7 +485,7 @@ const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
 // re-derives the recipe (that fork caused two regressions).
 
 /** Decode an upstream SSE stream into canonical chunks, per upstream wire. */
-const decodeUpstreamStream = (
+export const decodeUpstreamStream = (
   wire: TUpstreamWire,
   body: ReadableStream<Uint8Array>,
   providerModelId: string,
@@ -558,7 +563,7 @@ const requestDeclaresWebSearch = (req: TChatCompletionRequest): boolean =>
  * search itself (no DEK / vault credential needed). Mirrors the cloud's
  * `webSearchTool.appliesTo` (all combos but `messages.anthropic.passthrough`).
  */
-const shouldInterceptWebSearch = (
+export const shouldInterceptWebSearch = (
   wire: TUpstreamWire,
   surface: TWalkArgs["surface"],
   canonical: TChatCompletionRequest,
@@ -683,6 +688,97 @@ export const applyDelegateModelCompat = async (
   return out;
 };
 
+// ── web_search decode-failure diagnostics (issue #274) ────────────────
+// The accumulate/decode step inside the agentic loop used to funnel EVERY
+// throw — including the vendor's own terminal error events
+// (`response.failed` / `response.incomplete` / `error`, thrown as
+// `UpstreamStreamError` by the chatgpt decoder) — into one generic
+// "could not decode upstream response" 502 that discarded the cause.
+// This classifier keeps a sanitized, actionable single line: the failure
+// STAGE plus the error's name and FIRST line, hard-truncated — never the
+// upstream body, prompt, or search results.
+
+/** Where in the round's decode pipeline the failure happened. */
+type TWebSearchDecodeStage =
+  | "upstream_error" // the vendor reported an error mid-stream (not a decode bug)
+  | "json_parse" // non-streaming body was not JSON
+  | "schema_decode" // JSON parsed but failed the wire schema
+  | "stream_decode"; // SSE drain / event conversion / accumulation failed
+
+export type TWebSearchDecodeContext = {
+  readonly provider: string;
+  readonly modelId: string;
+  readonly providerModelId: string;
+  readonly wire: TUpstreamWire;
+  readonly round: number;
+  readonly upstreamStatus: number;
+  readonly upstreamContentType: string | null;
+};
+
+export type TWebSearchDecodeFailure = {
+  readonly stage: TWebSearchDecodeStage;
+  /** Sanitized error name + first line, hard-truncated. */
+  readonly detail: string;
+  /** The full single-line 502 body (also what the recorded row carries). */
+  readonly clientMessage: string;
+};
+
+const sanitizeErrorLine = (err: unknown, max: number): string => {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  const line = raw.split("\n", 1)[0] ?? "";
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+};
+
+/**
+ * Classify a `serveWithWebSearch` round decode failure into a sanitized
+ * diagnostic. `upstream_error` keeps the vendor's own error type + message
+ * verbatim (that IS the diagnostic the user needs — a usage cap, a
+ * max_output_tokens truncation, a rate limit); everything else keeps only
+ * the error's first line so no response content can leak.
+ */
+export const describeWebSearchDecodeFailure = (
+  err: unknown,
+  ctx: TWebSearchDecodeContext,
+): TWebSearchDecodeFailure => {
+  let stage: TWebSearchDecodeStage;
+  let detail: string;
+  if (err instanceof UpstreamStreamError) {
+    stage = "upstream_error";
+    const { type, message } = upstreamErrorFrom(err);
+    detail = sanitizeErrorLine(
+      message.startsWith(type) ? message : `${type}: ${message}`,
+      300,
+    );
+  } else if (err instanceof SyntaxError) {
+    stage = "json_parse";
+    detail = sanitizeErrorLine(err, 160);
+  } else if (
+    err instanceof Error &&
+    (err.name === "ParseError" ||
+      (err as { _tag?: unknown })._tag === "ParseError")
+  ) {
+    // effect Schema decode failure — its message tree embeds actual
+    // values, so keep only the first line.
+    stage = "schema_decode";
+    detail = sanitizeErrorLine(err, 160);
+  } else {
+    stage = ctx.wire === "chatgpt" ? "stream_decode" : "schema_decode";
+    detail = sanitizeErrorLine(err, 160);
+  }
+  const headline =
+    stage === "upstream_error"
+      ? "upstream reported an error during a managed web_search round"
+      : "could not decode upstream response";
+  const clientMessage =
+    `web_search: ${headline} ` +
+    `(provider=${ctx.provider} model=${ctx.modelId} wire=${ctx.wire} ` +
+    `round=${ctx.round} stage=${stage} upstream_status=${ctx.upstreamStatus}` +
+    `${ctx.upstreamContentType !== null ? ` content_type=${ctx.upstreamContentType}` : ""}): ` +
+    detail;
+  return { stage, detail, clientMessage };
+};
+
 /**
  * Serve a subscription hop that runs openllm-managed web_search (§5): the
  * agentic loop. Each round calls the vendor (ACCUMULATED — we must read the
@@ -790,8 +886,48 @@ const serveWithWebSearch = async (
               JSON.parse(await resp.text()),
               hop.providerModelId,
             );
-    } catch {
-      return errorJson(502, "web_search: could not decode upstream response");
+    } catch (err) {
+      // Issue #274: this used to be a bare catch → one generic 502 that
+      // erased the vendor's own error (usage caps, max_output_tokens, rate
+      // limits all read as "could not decode"). Keep a sanitized
+      // classification, log it, and record the failed hop so the turn can
+      // be correlated with gateway telemetry.
+      const failure = describeWebSearchDecodeFailure(err, {
+        provider: hop.provider,
+        modelId: hop.modelId,
+        providerModelId: hop.providerModelId,
+        wire,
+        round,
+        upstreamStatus: resp.status,
+        upstreamContentType: resp.headers.get("content-type"),
+      });
+      logWarn("walker", "web_search round decode failed", {
+        provider: hop.provider,
+        model: hop.modelId,
+        provider_model_id: hop.providerModelId,
+        wire,
+        round,
+        surface: args.surface,
+        endpoint: args.endpoint,
+        upstream_status: resp.status,
+        upstream_content_type: resp.headers.get("content-type"),
+        stage: failure.stage,
+        detail: failure.detail,
+      });
+      report(
+        {
+          model: hop.modelId,
+          provider: hop.provider,
+          status: statusFor(502),
+          latency_ms: Date.now() - args.startedAt,
+          endpoint: args.endpoint,
+          error: failure.clientMessage,
+          ...(accountHash !== null ? { account_hash: accountHash } : {}),
+          ...ZERO_TOKENS,
+        },
+        args.originParam,
+      );
+      return errorJson(502, failure.clientMessage);
     }
 
     const webCalls: TToolCall[] = (
@@ -1056,9 +1192,15 @@ const serveSubscription = async (
         decodeUpstreamStream(wire, resp.body, hop.providerModelId),
         hop.providerModelId,
       );
-    } catch {
+    } catch (err) {
       recordTokens(ZERO_TOKENS);
-      return errorJson(502, "upstream stream ended before producing output");
+      // Same erasure class as the web_search decode 502 (issue #274): keep
+      // the vendor's terminal error / the drain failure's first line instead
+      // of a bare generic message.
+      return errorJson(
+        502,
+        `upstream stream ended before producing output: ${sanitizeErrorLine(err, 300)}`,
+      );
     }
     recordTokens(tokensFromResponse(canonical));
     return new Response(reencodeJson(canonical), {
