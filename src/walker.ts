@@ -48,7 +48,9 @@ import {
   type TDaemonRecordRequest,
   type TErrorEnvelope,
   type TRequestStatus,
+  type TServerSearchCall,
 } from "@quantidexyz/openllmp";
+import { declaresAnthropicServerSearchTool } from "@quantidexyz/openllmw/adapters/messages/request";
 import {
   isEncryptedContentError,
   responsesBodyHasEncryptedContent,
@@ -58,6 +60,7 @@ import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
 import { originatorHeadersFrom } from "@quantidexyz/openllmw/lib/forwarded-headers";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
 import { decodeProviderEventStream } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
+import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import {
   UpstreamStreamError,
@@ -74,6 +77,13 @@ import {
   newChatGptStreamState,
   type TChatGptStreamEvent,
 } from "@quantidexyz/openllmw/providers/chatgpt/streaming";
+import { withGrokNativeSearch } from "@quantidexyz/openllmw/providers/grok/web-search";
+import {
+  KIMI_SEARCH_MAX_ROUNDS,
+  kimiBuiltinSearchCalls,
+  kimiSearchEchoMessages,
+  withKimiBuiltinSearch,
+} from "@quantidexyz/openllmw/providers/kimi/web-search";
 // The SINGLE (clientWire × upstreamWire) request recipe — shared with the
 // cloud runner so the two can't drift (this fork caused two regressions). See
 // `docs/proposals/unified-upstream-request-builder.md`.
@@ -678,11 +688,41 @@ const serveSubscription = async (
     codexInstructions: wantsCodexPreamble(hop.provider),
   });
   const headers = built.headers;
-  const body = await applyDelegateModelCompat(
+  let body = await applyDelegateModelCompat(
     getDelegate(hop.provider),
     hop.providerModelId,
     built.body,
   );
+  // Provider-native search: the client DECLARED the Anthropic
+  // `web_search_*` server tool — an explicit platform-executes-search
+  // contract (Claude Code's WebSearch). A bare `web_search`-NAMED function
+  // tool never triggers either branch.
+  //
+  //   - grok: xAI's Responses proxy runs web + X search fully server-side
+  //     within ONE request. Swap the canonicalised `web_search` function
+  //     tool for the native `web_search`/`x_search` tools (one search owner
+  //     per turn); the chatgpt stream decoder re-emits the executed
+  //     searches as canonical `server_search_calls` → blocks + usage.
+  //   - kimi_code: Moonshot's builtin `$web_search` also executes
+  //     server-side, but its protocol pauses for a verbatim ARGUMENT ECHO
+  //     per search — served by `serveKimiBuiltinSearch` below (a protocol
+  //     echo, not gateway agency: nothing is extracted, executed, or
+  //     synthesized on this box).
+  const declaredSearch =
+    args.surface === "messages" &&
+    declaresAnthropicServerSearchTool(args.rawBody);
+  if (declaredSearch && hop.provider === "grok") {
+    body = withGrokNativeSearch(body);
+  }
+  if (declaredSearch && hop.provider === "kimi_code") {
+    return serveKimiBuiltinSearch(
+      hop,
+      args,
+      finalHop,
+      { url, headers, accountHash },
+      withKimiBuiltinSearch(body),
+    );
+  }
   const resp = await postWithDecryptRetry(
     url,
     headers,
@@ -856,6 +896,184 @@ const serveSubscription = async (
     status: resp.status,
     headers: jsonHeaders,
   });
+};
+
+/**
+ * Serve a kimi_code hop whose client declared the Anthropic server search
+ * tool, over Moonshot's builtin `$web_search` PROTOCOL ECHO (see
+ * `@quantidexyz/openllmw/providers/kimi/web-search`): each round's builtin
+ * tool calls are answered by echoing their opaque arguments back verbatim —
+ * the search already ran server-side; Moonshot injects the stored results
+ * into context on the next round. The walker extracts nothing, executes
+ * nothing, and synthesizes nothing. Rounds are read in full (a `stream:
+ * true` client gets the final answer as a one-shot SSE re-encode); each
+ * echoed search is reported as a canonical `ServerSearchCall` (opaque —
+ * Moonshot never exposes the query) so the client's search counter works.
+ * ONE usage row is recorded, summed across rounds.
+ */
+const serveKimiBuiltinSearch = async (
+  hop: THop,
+  args: TWalkArgs,
+  finalHop: boolean,
+  acquired: {
+    readonly url: string;
+    readonly headers: Record<string, string>;
+    readonly accountHash: string | null;
+  },
+  initialBody: unknown,
+): Promise<Response | "retry"> => {
+  const wire: TUpstreamWire = "openai";
+  const clientWantsStream =
+    (args.rawBody as { stream?: unknown } | null)?.stream === true;
+  const clientWire = clientWireOf(args.surface);
+  let body = initialBody as Record<string, unknown>;
+  // Rounds must be read in full to see the builtin calls.
+  body = { ...body, stream: false };
+  const executed: TServerSearchCall[] = [];
+  const totals = { ...ZERO_TOKENS };
+  const addTokens = (raw: unknown): void => {
+    const usage =
+      raw !== null && typeof raw === "object"
+        ? (raw as { readonly usage?: Record<string, unknown> }).usage
+        : undefined;
+    if (usage === undefined) return;
+    totals.tokens_in += Number(usage.prompt_tokens ?? 0) || 0;
+    totals.tokens_out += Number(usage.completion_tokens ?? 0) || 0;
+  };
+  const recordOnce = (status: TRequestStatus): void =>
+    report(
+      {
+        model: hop.modelId,
+        provider: hop.provider,
+        status,
+        latency_ms: Date.now() - args.startedAt,
+        endpoint: args.endpoint,
+        ...(acquired.accountHash !== null
+          ? { account_hash: acquired.accountHash }
+          : {}),
+        ...totals,
+      },
+      args.originParam,
+    );
+
+  for (let round = 0; ; round++) {
+    const resp = await postWithDecryptRetry(
+      acquired.url,
+      acquired.headers,
+      body,
+      wire,
+      finalHop,
+      args.req.signal,
+    );
+    if (resp === null) return "retry"; // pre-commit on every round: nothing sent
+    if (!resp.ok) {
+      const raw = await resp.text().catch(() => "");
+      if (
+        !finalHop &&
+        classifyPrecommitResponse(
+          resp.status,
+          raw,
+          wire,
+          args.req.signal.aborted,
+        ).kind === "transient"
+      ) {
+        return "retry";
+      }
+      recordOnce(statusFor(resp.status));
+      return new Response(raw.length > 0 ? raw : null, {
+        status: resp.status,
+        headers: passthroughHeaders(resp),
+      });
+    }
+    const text = await resp.text();
+    let rawJson: unknown;
+    try {
+      rawJson = JSON.parse(text);
+    } catch {
+      recordOnce("error");
+      return new Response(text, {
+        status: resp.status,
+        headers: passthroughHeaders(resp),
+      });
+    }
+    addTokens(rawJson);
+
+    const builtinCalls =
+      round < KIMI_SEARCH_MAX_ROUNDS ? kimiBuiltinSearchCalls(rawJson) : null;
+    if (builtinCalls === null) {
+      // FINAL round — decode canonically, attach the executed searches, and
+      // re-encode for the client.
+      let canonical: TChatCompletionResponse;
+      try {
+        canonical = decodeUpstreamJson(wire, rawJson, hop.providerModelId);
+      } catch {
+        recordOnce("error");
+        return new Response(text, {
+          status: resp.status,
+          headers: passthroughHeaders(resp),
+        });
+      }
+      const choice = canonical.choices[0];
+      const final: TChatCompletionResponse =
+        executed.length > 0 && choice !== undefined
+          ? {
+              ...canonical,
+              usage: {
+                ...canonical.usage,
+                prompt_tokens: totals.tokens_in,
+                completion_tokens: totals.tokens_out,
+                total_tokens: totals.tokens_in + totals.tokens_out,
+              },
+              choices: [
+                {
+                  ...choice,
+                  message: {
+                    ...choice.message,
+                    server_search_calls: executed,
+                  },
+                },
+                ...canonical.choices.slice(1),
+              ],
+            }
+          : canonical;
+      recordOnce(statusFor(resp.status));
+      if (clientWantsStream) {
+        const bytes = sseBytesForClient(
+          responseToChunkStream(final),
+          args.surface,
+          clientWire,
+        );
+        return new Response(
+          withFrameAlignedHeartbeat(bytes, heartbeatOptionsFor(args.surface)),
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+              connection: "keep-alive",
+            },
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify(jsonBodyForClient(final, args.surface, clientWire)),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    // Echo round: report each server-executed search (query is opaque to
+    // this box) and feed the arguments back verbatim.
+    for (const call of builtinCalls) {
+      executed.push({ id: call.id, query: "" });
+    }
+    body = {
+      ...body,
+      messages: [
+        ...((body.messages as unknown[] | undefined) ?? []),
+        ...kimiSearchEchoMessages(rawJson, builtinCalls),
+      ],
+    };
+  }
 };
 
 /**
