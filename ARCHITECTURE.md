@@ -132,8 +132,11 @@ only via the gateway's 307.) The walker makes **zero** routing decisions —
 the cloud already resolved the alias + cooldowns — it walks the ordered
 plan, serving each subscription hop locally (delegate credential injected,
 vendor called directly) and forwarding each API-key hop to the cloud
-(`forward.ts`, pinned), classifying pre-stream errors with a ~10-line
-`retryable()` and committing on first byte.
+(`forward.ts`, pinned). Every non-abort candidate failure before commitment
+walks via the same `@quantidexyz/openllmw/lib/error-class` policy as the cloud;
+routing never depends on provider-specific status/message allow-lists. The
+walker commits on first output, after which switching models is intentionally
+unsafe. On chain exhaustion the final hop's real upstream response is preserved.
 
 **Serves all three subscription providers + cross-wire** (§9(a)) — a tiny
 per-hop mini-runner built from the `@quantidexyz/openllmw` transforms:
