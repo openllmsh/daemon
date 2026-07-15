@@ -121,7 +121,17 @@ export const tryServeNativeRuntime = async (
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
   }
-  if (hasAnthropicNativeServerTool(params)) {
+  // claude_code ONLY: an Anthropic-native server tool must reach Anthropic
+  // byte-verbatim (the manual transport IS the Anthropic wire there), so the
+  // provider runs it and the client gets authentic server_tool_use blocks.
+  // On a chatgpt hop the manual transport is CROSS-WIRE — declining would
+  // leak an unexecutable `web_search` tool_use to the client; instead the
+  // codex path serves it with HOSTED search (the canonicalised `web_search`
+  // function is suppressed from dynamicTools — one search owner per turn).
+  if (
+    params.provider === "claude_code" &&
+    hasAnthropicNativeServerTool(params)
+  ) {
     return {
       declined:
         "Anthropic native server tools use the byte-verbatim manual transport",
