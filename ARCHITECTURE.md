@@ -76,7 +76,7 @@ daemon/
     cors.ts                 shared CORS + PNA preflight for both surfaces
     cli-paths.ts            isolated-CLI paths + per-provider run env
     cli-install.ts          link the isolated run-view symlink + probe state (the daemon NEVER installs a vendor CLI — installs are user-run, unsandboxed, via the daemon install script; cliInstallState auto-links lazily)
-    cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record + web_search callback)
+    cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record)
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
     record.ts/version/env   request recording, version, env (+ env-file loader)
@@ -185,16 +185,11 @@ chain is never half-attempted then bailed.
 > recipe. A new provider/wire pairing is added in `upstream-request.ts`
 > once, not in two places.
 
-**web_search (§5).** When a request declares the openllm `web_search`
-function tool on a TRANSFORM path (every wire combo but the
-Anthropic→Anthropic passthrough, where the native server tool forwards
-verbatim + Anthropic runs it), the walker runs the agentic loop: call the
-vendor accumulated, and for each `web_search` tool call POST ONLY the query
-to `POST /api/daemon/search` (the cloud recovers the DEK from the daemon's
-key + runs the user's vault search credential), append the results as a
-follow-up turn, re-call — bounded to 4 rounds. Only the query leaves the
-box. Non-stream messages responses get the native `server_tool_use` /
-`web_search_tool_result` blocks spliced in for Claude Code's parser.
+**Tool boundary.** The walker does not execute model-emitted function tools or
+create hidden follow-up turns. Search-shaped function calls follow ordinary tool
+behavior and are returned to the client. Exact Anthropic native server-tool
+descriptors remain available only on the byte-verbatim Anthropic passthrough path;
+the daemon does not claim native Claude Code or Codex search support.
 
 **Cost is computed cloud-side.** The daemon reports only TOKEN COUNTS in
 its metadata row (`POST /api/daemon/requests`); the cloud's
@@ -210,7 +205,7 @@ stream and accumulates usage off one branch while the client reads the other.
 **Validated live** (`RUN_DAEMON_LIVE=1`, `tests/server/daemon-walker-live
 .e2e.test.ts`) against the real authenticated CLIs, through the full
 production flow (client → cloud → signed 307 → walker → vendor): all three
-providers + cross-wire, stream + non-stream, the web_search loop, and the
+providers + cross-wire, stream + non-stream, and the
 forged-signature → 403 gate. The remaining §8 byte-identical-upstream diff
 is a belt-and-braces confidence check, not a ship gate.
 
