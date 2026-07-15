@@ -28,6 +28,7 @@ import type { TChatCompletionChunk, TUsage } from "@quantidexyz/openllmp";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { DAEMON_VERSION } from "../version";
+import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
@@ -406,6 +407,10 @@ export const effortOf = (raw: string | null): string | null => {
  * supplied). The client's system prompt rides in `developerInstructions` on a
  * fresh start (a resumed thread already carries it). Each caller layers its own
  * unique fields (effort/tools/features) on top.
+ *
+ * Hosted web search rides `config` here so BOTH callers get it: search is
+ * provider-owned on Codex native hops (always-on), and Codex resolves the
+ * requested `live` mode against its own permission profile.
  */
 export const codexBaseStartParams = (
   providerModelId: string,
@@ -415,6 +420,7 @@ export const codexBaseStartParams = (
   approvalPolicy: "never",
   sandbox: "read-only",
   personality: "none",
+  config: CODEX_HOSTED_WEB_SEARCH_CONFIG,
   ...(systemText !== null ? { developerInstructions: systemText } : {}),
 });
 

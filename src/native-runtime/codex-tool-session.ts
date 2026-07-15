@@ -36,6 +36,7 @@ import {
   codexBaseStartParams,
   effortOf,
 } from "./codex-app-server";
+import { suppressHostedSearchClientTool } from "./codex-web-search";
 import type { TNativeTokens } from "./types";
 import { tokensFromResponse } from "./types";
 
@@ -158,6 +159,11 @@ export const startCodexToolTurn = async (
   params: TStartCodexToolTurnParams,
 ): Promise<TToolTurnResult> => {
   evictStale();
+  // Hosted search (thread config, always-on) and a client-executed
+  // `web_search` function are mutually exclusive on one turn — drop the
+  // client copy so it can't shadow the provider-owned tool. An empty
+  // remainder still starts the turn: the model answers via hosted search.
+  const dynamicClientTools = suppressHostedSearchClientTool(params.tools);
   const client = clientFor(params.bin, params.env);
   let threadId: string;
   try {
@@ -172,7 +178,7 @@ export const startCodexToolTurn = async (
       // `experimentalRawEvents` matches openclaw's thread/start.
       features: { code_mode: false, code_mode_only: false },
       experimentalRawEvents: true,
-      dynamicTools: params.tools.map((t) => ({
+      dynamicTools: dynamicClientTools.map((t) => ({
         type: "function",
         name: t.name,
         description: t.description ?? t.name,

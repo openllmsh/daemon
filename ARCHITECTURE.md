@@ -188,8 +188,14 @@ chain is never half-attempted then bailed.
 **Tool boundary.** The walker does not execute model-emitted function tools or
 create hidden follow-up turns. Search-shaped function calls follow ordinary tool
 behavior and are returned to the client. Exact Anthropic native server-tool
-descriptors remain available only on the byte-verbatim Anthropic passthrough path;
-the daemon does not claim native Claude Code or Codex search support.
+descriptors remain available only on the byte-verbatim Anthropic passthrough
+path. Codex native hops run with PROVIDER-HOSTED web search enabled always-on
+via `thread/start.config` (`codex-web-search.ts` — Codex owns execution and
+continuation; a client function tool literally named `web_search` is dropped
+from `dynamicTools` so the turn has exactly one search owner). Hosted-search
+lifecycle items are not yet re-emitted onto client wires; the grounded answer
+streams normally. The Claude native runtime still strips tools on the text path
+and claims no search support.
 
 **Cost is computed cloud-side.** The daemon reports only TOKEN COUNTS in
 its metadata row (`POST /api/daemon/requests`); the cloud's
