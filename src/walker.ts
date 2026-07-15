@@ -413,6 +413,23 @@ const errorEnvelopeFrom = (raw: string): TErrorEnvelope | undefined => {
   }
 };
 
+/** Classify a raw upstream error response: best-effort envelope parse, then
+ *  the shared cloud/daemon policy. The single call point for every
+ *  daemon-served hop — subscription (wire-derived format) and cloud-forward
+ *  ("openai": forwarded responses are normalized to the shared envelope). */
+const classifyRawResponse = (
+  status: number,
+  raw: string,
+  providerFormat: "openai" | "anthropic",
+  aborted: boolean,
+): ReturnType<typeof classifyHopError> =>
+  classifyHopError({
+    status,
+    envelope: errorEnvelopeFrom(raw),
+    providerFormat,
+    aborted,
+  });
+
 /** Shared pre-commit candidate decision used for every daemon-served hop. */
 export const classifyPrecommitResponse = (
   status: number,
@@ -420,12 +437,7 @@ export const classifyPrecommitResponse = (
   wire: TUpstreamWire,
   aborted: boolean,
 ): ReturnType<typeof classifyHopError> =>
-  classifyHopError({
-    status,
-    envelope: errorEnvelopeFrom(raw),
-    providerFormat: hopFormat(wire),
-    aborted,
-  });
+  classifyRawResponse(status, raw, hopFormat(wire), aborted);
 
 const statusFor = (httpStatus: number): TRequestStatus =>
   httpStatus < 400
@@ -1211,14 +1223,14 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         .clone()
         .text()
         .catch(() => "");
-      const cls = classifyHopError({
-        status: resp.status,
-        envelope: errorEnvelopeFrom(raw),
-        // Forwarded cloud responses are normalized to the shared envelope;
-        // provider format only affects reason tagging, never walk eligibility.
-        providerFormat: "openai",
-        aborted: args.req.signal.aborted,
-      });
+      // Forwarded cloud responses are normalized to the shared envelope;
+      // provider format only affects reason tagging, never walk eligibility.
+      const cls = classifyRawResponse(
+        resp.status,
+        raw,
+        "openai",
+        args.req.signal.aborted,
+      );
       if (cls.kind === "transient") {
         lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
         continue;
