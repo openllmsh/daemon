@@ -786,6 +786,24 @@ export const describeWebSearchDecodeFailure = (
 };
 
 /**
+ * The candidate-agnostic invariant applied to the agentic loop's DECODE step:
+ * a ROUND-0 decode failure has committed nothing — the client got no bytes
+ * (this path fully accumulates before responding) and no search side effects
+ * ran (searches run only after a successful round decode) — so mid-chain it
+ * walks like any pre-commit candidate failure. This is what turns an
+ * in-stream vendor error (context overflow, usage cap, rate limit — HTTP 200
+ * followed by a terminal error event, the issue #274 incident shape) into a
+ * fallback instead of a dead turn. Later rounds are committed to the hop by
+ * the preceding tool exchange, the final hop has nowhere to walk, and an
+ * aborted client never walks.
+ */
+export const shouldWalkOnWebSearchDecodeFailure = (
+  round: number,
+  finalHop: boolean,
+  aborted: boolean,
+): boolean => round === 0 && !finalHop && !aborted;
+
+/**
  * Serve a subscription hop that runs openllm-managed web_search (§5): the
  * agentic loop. Each round calls the vendor (ACCUMULATED — we must read the
  * whole response to spot tool calls), and for every `web_search` tool call
@@ -896,9 +914,11 @@ const serveWithWebSearch = async (
     } catch (err) {
       // Issue #274: this used to be a bare catch → one generic 502 that
       // erased the vendor's own error (usage caps, max_output_tokens, rate
-      // limits all read as "could not decode"). Keep a sanitized
-      // classification, log it, and record the failed hop so the turn can
-      // be correlated with gateway telemetry.
+      // limits all read as "could not decode"). Classify sanitized, log it,
+      // walk mid-chain when nothing is committed yet (round 0 — see
+      // shouldWalkOnWebSearchDecodeFailure), and otherwise record the failed
+      // hop + surface the diagnostic so the turn can be correlated with
+      // gateway telemetry.
       const failure = describeWebSearchDecodeFailure(err, {
         provider: hop.provider,
         modelId: hop.modelId,
@@ -908,6 +928,11 @@ const serveWithWebSearch = async (
         upstreamStatus: resp.status,
         upstreamContentType: resp.headers.get("content-type"),
       });
+      const walk = shouldWalkOnWebSearchDecodeFailure(
+        round,
+        finalHop,
+        args.req.signal.aborted,
+      );
       logWarn("walker", "web_search round decode failed", {
         provider: hop.provider,
         model: hop.modelId,
@@ -920,7 +945,9 @@ const serveWithWebSearch = async (
         upstream_content_type: resp.headers.get("content-type"),
         stage: failure.stage,
         detail: failure.detail,
+        walked: walk,
       });
+      if (walk) return "retry";
       report(
         {
           model: hop.modelId,
