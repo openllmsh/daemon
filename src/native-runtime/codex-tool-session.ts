@@ -233,25 +233,36 @@ export const startCodexToolTurn = async (
 };
 
 /** Continue a HELD Codex turn: answer the paused dynamic-tool calls with the
- *  client's results, then drive to the next tool call or final text. */
+ *  client's results, then drive to the next tool call or final text.
+ *  `injectedContext` is conversation context the client added alongside the
+ *  results (e.g. loaded Skill instructions) — the paused `item/tool/call` is
+ *  the only channel back into the live turn, so it rides the LAST answer as
+ *  an extra `inputText` content item instead of being dropped. */
 export const continueCodexToolTurn = async (
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
+  injectedContext: string | null = null,
 ): Promise<TToolTurnResult> => {
   evictStale();
   const h = toolResults.map((r) => held.get(r.id)).find((x) => x !== undefined);
   if (h === undefined) {
     return { kind: "declined", reason: "no held codex tool session" };
   }
-  for (const r of toolResults) {
+  const matched = toolResults.filter((r) => h.pending.has(r.id));
+  for (const [index, r] of matched.entries()) {
     const requestId = h.pending.get(r.id);
-    if (requestId !== undefined) {
-      h.pending.delete(r.id);
-      held.delete(r.id);
-      h.client.respondToServer(requestId, {
-        contentItems: [{ type: "inputText", text: r.content }],
-        success: true,
-      });
-    }
+    if (requestId === undefined) continue;
+    h.pending.delete(r.id);
+    held.delete(r.id);
+    const last = index === matched.length - 1;
+    h.client.respondToServer(requestId, {
+      contentItems: [
+        { type: "inputText", text: r.content },
+        ...(last && injectedContext !== null
+          ? [{ type: "inputText" as const, text: injectedContext }]
+          : []),
+      ],
+      success: true,
+    });
   }
   h.lastUsed = nowMs();
   return drive(h);

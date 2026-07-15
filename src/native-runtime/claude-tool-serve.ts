@@ -4,10 +4,11 @@
  * (`claude-tool-session.ts`), and re-encode the result onto the client's wire.
  *
  * A full agentic task maps to ONE held query: the first request (ending in a
- * user turn) STARTS it; each tool round-trip (ending in `tool` results)
- * CONTINUES it until the model answers with final text. (Cross-user-turn
- * resume — a brand-new question after a completed tool answer — currently
- * starts fresh; that's the documented follow-up.)
+ * user turn) STARTS it; each tool round-trip (its tail carrying `tool`
+ * results, plus any context the client injected alongside them — e.g. loaded
+ * Skill instructions) CONTINUES it until the model answers with final text.
+ * (Cross-user-turn resume — a brand-new question after a completed tool
+ * answer — currently starts fresh; that's the documented follow-up.)
  */
 
 import type { TChatCompletionRequest } from "@quantidexyz/openllmp";
@@ -86,29 +87,59 @@ export type TClaudeToolServeParams = {
   readonly makeIterator?: TIteratorFactory;
 };
 
+/** Everything the client appended since the model's pending tool call: the
+ *  tool RESULTS that answer it, plus any context messages injected alongside
+ *  them. Claude Code delivers loaded-skill instructions as a user message
+ *  right next to the Skill tool_result (and mid-conversation system turns can
+ *  land here too) — a continuation that forwards only the results silently
+ *  severs that context, so the model answers the bare "Launching skill: …"
+ *  acknowledgement and ends the turn (the Skill-halt incident). */
+export const splitContinuationTail = (
+  messages: TChatCompletionRequest["messages"],
+): {
+  readonly toolResults: ReadonlyArray<{ id: string; content: string }>;
+  readonly injectedContext: string | null;
+} => {
+  const toolResults: Array<{ id: string; content: string }> = [];
+  const injectedParts: string[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m === undefined || m.role === "assistant") break;
+    if (m.role === "tool") {
+      const id = (m as { tool_call_id?: string }).tool_call_id;
+      if (typeof id === "string") {
+        toolResults.unshift({ id, content: plainText(m.content) });
+      }
+      continue;
+    }
+    const text = plainText(m.content);
+    if (text.length > 0) injectedParts.unshift(text);
+  }
+  return {
+    toolResults,
+    injectedContext:
+      toolResults.length > 0 && injectedParts.length > 0
+        ? `[context added by the client after this tool call — treat it as conversation context, not tool output]\n${injectedParts.join("\n\n")}`
+        : null,
+  };
+};
+
 /** Serve a tool-bearing native request (claude_code held-query orchestrator,
  *  or the gated codex dynamic-tool session). */
 export const tryServeNativeToolTurn = async (
   params: TClaudeToolServeParams,
 ): Promise<TToolServeOutcome> => {
-  const messages = params.canonical.messages;
-  const trailingToolResults: Array<{ id: string; content: string }> = [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m?.role !== "tool") break;
-    const id = (m as { tool_call_id?: string }).tool_call_id;
-    if (typeof id === "string") {
-      trailingToolResults.unshift({ id, content: plainText(m.content) });
-    }
-  }
+  const { toolResults: trailingToolResults, injectedContext } =
+    splitContinuationTail(params.canonical.messages);
 
   const isClaude = params.provider === "claude_code";
   const result =
     trailingToolResults.length > 0
-      ? // CONTINUE: feed the client's tool results into the paused held turn.
+      ? // CONTINUE: feed the client's tool results — and any context the
+        // client injected alongside them — into the paused held turn.
         isClaude
-        ? await continueToolTurn(trailingToolResults)
-        : await continueCodexToolTurn(trailingToolResults)
+        ? await continueToolTurn(trailingToolResults, injectedContext)
+        : await continueCodexToolTurn(trailingToolResults, injectedContext)
       : // START: the last user turn opens a new held turn.
         isClaude
         ? await startToolTurn(

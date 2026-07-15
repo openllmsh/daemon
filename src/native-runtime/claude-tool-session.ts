@@ -381,9 +381,14 @@ export const startToolTurn = async (
 };
 
 /** Continue a HELD turn: resolve the paused handlers with the client's tool
- *  results, then drive to the next tool call or final text. */
+ *  results, then drive to the next tool call or final text. `injectedContext`
+ *  is conversation context the client added alongside the results (e.g.
+ *  loaded Skill instructions) — a paused `query()` offers no way to add a
+ *  fresh user/system message, so it rides the LAST handler's tool output
+ *  instead of being dropped. */
 export const continueToolTurn = async (
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
+  injectedContext: string | null = null,
 ): Promise<TToolTurnResult> => {
   evictStale();
   const h = toolResults.map((r) => held.get(r.id)).find((x) => x !== undefined);
@@ -395,13 +400,18 @@ export const continueToolTurn = async (
   // parallel results can unblock the SDK even while this one waits, instead of
   // deadlocking (this drive would otherwise stall waiting for a result the
   // lock-blocked sibling holds).
-  for (const r of toolResults) {
+  const matched = toolResults.filter((r) => h.pending.has(r.id));
+  for (const [index, r] of matched.entries()) {
     const resolve = h.pending.get(r.id);
-    if (resolve !== undefined) {
-      h.pending.delete(r.id);
-      held.delete(r.id);
-      resolve(r.content);
-    }
+    if (resolve === undefined) continue;
+    h.pending.delete(r.id);
+    held.delete(r.id);
+    const last = index === matched.length - 1;
+    resolve(
+      last && injectedContext !== null
+        ? `${r.content}\n\n${injectedContext}`
+        : r.content,
+    );
   }
   h.lastUsed = nowMs();
   return withSessionLock(h, () => drive(h));
