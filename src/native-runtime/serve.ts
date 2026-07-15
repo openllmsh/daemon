@@ -22,7 +22,6 @@ import type {
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
-import { functionNameUsesWebSearch } from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { cliBin, cliEnv } from "../cli-paths";
 import {
   heartbeatOptionsFor,
@@ -72,6 +71,7 @@ export type TNativeServeParams = {
   readonly provider: string;
   readonly providerModelId: string;
   readonly surface: "chat_completions" | "messages" | "responses";
+  readonly rawBody: unknown;
   readonly canonical: TChatCompletionRequest;
   readonly wantsStream: boolean;
   readonly signal: AbortSignal;
@@ -80,12 +80,6 @@ export type TNativeServeParams = {
    *  the committed stream failed before accumulating. */
   readonly record: (tokens: TNativeTokens, status: "success" | "error") => void;
 };
-
-/** Does the request declare the openllm-managed web_search function tool?
- *  (Mirrors the walker's own gate — the gateway runs this tool, not the
- *  client, so it must NOT enter the native tool-passthrough path.) */
-const requestDeclaresWebSearch = (req: TChatCompletionRequest): boolean =>
-  req.tools?.some((t) => functionNameUsesWebSearch(t.function.name)) === true;
 
 /**
  * Try to serve one subscription hop through its native runtime. `bin`/`env`
@@ -99,6 +93,24 @@ const textOf = (
   return typeof content === "string" ? content : "";
 };
 
+const hasAnthropicNativeServerTool = (params: TNativeServeParams): boolean => {
+  if (params.surface !== "messages") return false;
+  const tools =
+    params.rawBody !== null && typeof params.rawBody === "object"
+      ? (params.rawBody as { readonly tools?: unknown }).tools
+      : undefined;
+  return (
+    Array.isArray(tools) &&
+    tools.some(
+      (tool) =>
+        tool !== null &&
+        typeof tool === "object" &&
+        typeof (tool as { readonly type?: unknown }).type === "string" &&
+        (tool as { readonly type: string }).type.startsWith("web_search_"),
+    )
+  );
+};
+
 export const tryServeNativeRuntime = async (
   params: TNativeServeParams,
   overrides?: {
@@ -109,19 +121,15 @@ export const tryServeNativeRuntime = async (
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
   }
-  // openllm-managed web_search is executed by the GATEWAY — the walker's
-  // agentic `serveWithWebSearch` loop (cross-wire) or Anthropic's own native
-  // search (messages passthrough) — never by the client. The native tool path
-  // would instead register web_search as a client tool and hand the caller a
-  // `web_search` tool_call it has no implementation for, stalling the turn. So
-  // decline here and let the manual transport (which routes web_search
-  // correctly via `shouldInterceptWebSearch`) serve the hop.
-  if (requestDeclaresWebSearch(params.canonical)) {
+  if (hasAnthropicNativeServerTool(params)) {
     return {
       declined:
-        "web_search runs on the gateway's managed loop (manual transport)",
+        "Anthropic native server tools use the byte-verbatim manual transport",
     };
   }
+  // Requests with client-defined tools use the native runtime's ordinary
+  // tool passthrough when supported. Search-shaped function tools are not
+  // special-cased or executed by the daemon.
   // Generation controls the native runtimes can't honor (non-default
   // temperature/top_p/penalties, stop, seed, n, logprobs, logit_bias,
   // response_format, forced tool_choice) → decline so the manual transport

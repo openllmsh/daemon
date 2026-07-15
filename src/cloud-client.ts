@@ -5,7 +5,6 @@
  *
  *   GET  /api/daemon/bootstrap  — catalog + provider prefixes + routing
  *   POST /api/daemon/requests   — record one subscription-hop usage row
- *   POST /api/daemon/search     — content-free web_search callback
  *
  * No subscription token or user content ever appears in these payloads
  * (the no-off-box-exfiltration invariant — see the proposal §6).
@@ -15,7 +14,6 @@ import type {
   TDaemonBootstrap,
   TDaemonModelReport,
   TDaemonRecordRequest,
-  TDaemonSearchResponse,
   TRelayChannelResponse,
 } from "@quantidexyz/openllmp";
 import {
@@ -188,34 +186,5 @@ export const reportModels = async (
     });
   } catch {
     // swallow — model-list reporting is non-critical metadata
-  }
-};
-
-/**
- * The content-free web_search callback (coreless proposal §5). The daemon
- * holds no DEK, so when a subscription model it's serving calls the openllm
- * web_search tool, the daemon POSTs ONLY the query here; the cloud recovers
- * the DEK from the daemon's `sk-llm` key, runs the search with the user's
- * vault search credential, and returns the tool-result content + native
- * Anthropic blocks. The conversation never crosses. Returns null on any
- * failure (keyless / unreachable / non-2xx) — the caller surfaces a search
- * error to the model rather than failing the turn.
- */
-export const searchViaCloud = async (
-  query: string,
-  origin?: string | null,
-  signal?: AbortSignal,
-): Promise<TDaemonSearchResponse | null> => {
-  try {
-    const resp = await cloudFetch(cloudUrl("/api/daemon/search", origin), {
-      method: "POST",
-      headers: authHeaders(),
-      body: JSON.stringify({ query }),
-      ...(signal !== undefined ? { signal } : {}),
-    });
-    if (!resp.ok) return null;
-    return (await resp.json()) as TDaemonSearchResponse;
-  } catch {
-    return null;
   }
 };

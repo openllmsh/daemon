@@ -44,15 +44,11 @@ import {
   daemonPlanSigningPayload,
   type TAnthropicResponse,
   type TChatCompletionChunk,
-  type TChatCompletionRequest,
   type TChatCompletionResponse,
   type TDaemonRecordRequest,
   type TErrorEnvelope,
   type TRequestStatus,
-  type TToolCall,
 } from "@quantidexyz/openllmp";
-import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
-import { toResponsesResponse } from "@quantidexyz/openllmw/adapters/responses";
 import {
   isEncryptedContentError,
   responsesBodyHasEncryptedContent,
@@ -62,7 +58,6 @@ import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
 import { originatorHeadersFrom } from "@quantidexyz/openllmw/lib/forwarded-headers";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
 import { decodeProviderEventStream } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
-import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import {
   UpstreamStreamError,
@@ -83,33 +78,22 @@ import {
 // cloud runner so the two can't drift (this fork caused two regressions). See
 // `docs/proposals/unified-upstream-request-builder.md`.
 import {
-  buildUpstreamHeaders,
   buildUpstreamRequest,
   canonicalFromInbound,
-  canonicalToUpstreamBody,
   clientWireOf,
 } from "@quantidexyz/openllmw/providers/upstream-request";
-import {
-  buildAssistantToolCallMessage,
-  buildToolResultMessages,
-  extractQueryFromToolCall,
-  functionNameUsesWebSearch,
-  MAX_WEB_SEARCH_ROUNDS,
-  toolCallUsesWebSearch,
-} from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { Schema } from "effect";
 import {
   heartbeatOptionsFor,
   jsonBodyForClient,
   sseBytesForClient,
 } from "./client-encode";
-import { recordRequest, searchViaCloud } from "./cloud-client";
+import { recordRequest } from "./cloud-client";
 import { lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
 import { forwardToCloud } from "./forward";
-import { logWarn } from "./logger";
 import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
@@ -552,44 +536,6 @@ const decodeUpstreamJson = (
 // prompt-token total and INCLUDES the two cache fields; the cloud prices the
 // split at the cache rates rather than the input rate.
 
-// ─── web_search (§5) ──────────────────────────────────────────────────
-// The agentic round cap (`MAX_WEB_SEARCH_ROUNDS`) is shared with the cloud
-// orchestrator via `@quantidexyz/openllmw/tools/web-search/helpers` so both paths
-// agent the same depth.
-
-/** Does the request ask the gateway to run web_search (an openllm function
- *  tool, NOT a vendor-native server tool)? */
-const requestDeclaresWebSearch = (req: TChatCompletionRequest): boolean =>
-  req.tools?.some((t) => functionNameUsesWebSearch(t.function.name)) === true;
-
-/**
- * The gateway runs openllm-managed web_search on every wire path EXCEPT the
- * Anthropic→Anthropic passthrough — there the request's native
- * `web_search_*` server tool is forwarded verbatim and Anthropic runs the
- * search itself (no DEK / vault credential needed). Mirrors the cloud's
- * `webSearchTool.appliesTo` (all combos but `messages.anthropic.passthrough`).
- */
-export const shouldInterceptWebSearch = (
-  wire: TUpstreamWire,
-  surface: TWalkArgs["surface"],
-  canonical: TChatCompletionRequest,
-): boolean =>
-  requestDeclaresWebSearch(canonical) &&
-  !(wire === "anthropic" && clientWireOf(surface) === "anthropic");
-
-/** Splice native `server_tool_use` + `web_search_tool_result` blocks to the
- *  front of an Anthropic response's content so Claude Code's WebSearch
- *  parser recognises the search ran (non-streaming messages surface). */
-const spliceAnthropicWebSearchBlocks = (
-  resp: Record<string, unknown>,
-  blocks: ReadonlyArray<{ server_tool_use: unknown; tool_result: unknown }>,
-): Record<string, unknown> => {
-  if (blocks.length === 0) return resp;
-  const native = blocks.flatMap((b) => [b.server_tool_use, b.tool_result]);
-  const existing = Array.isArray(resp.content) ? resp.content : [];
-  return { ...resp, content: [...native, ...existing] };
-};
-
 /**
  * Build the BASE upstream headers for a hop: the ORIGINATOR's own headers
  * (denylist passthrough — `originatorHeadersFrom`), then the credential-intrinsic
@@ -694,41 +640,6 @@ export const applyDelegateModelCompat = async (
   return out;
 };
 
-// ── web_search decode-failure diagnostics (issue #274) ────────────────
-// The accumulate/decode step inside the agentic loop used to funnel EVERY
-// throw — including the vendor's own terminal error events
-// (`response.failed` / `response.incomplete` / `error`, thrown as
-// `UpstreamStreamError` by the chatgpt decoder) — into one generic
-// "could not decode upstream response" 502 that discarded the cause.
-// This classifier keeps a sanitized, actionable single line: the failure
-// STAGE plus the error's name and FIRST line, hard-truncated — never the
-// upstream body, prompt, or search results.
-
-/** Where in the round's decode pipeline the failure happened. */
-type TWebSearchDecodeStage =
-  | "upstream_error" // the vendor reported an error mid-stream (not a decode bug)
-  | "json_parse" // non-streaming body was not JSON
-  | "schema_decode" // JSON parsed but failed the wire schema
-  | "stream_decode"; // SSE drain / event conversion / accumulation failed
-
-export type TWebSearchDecodeContext = {
-  readonly provider: string;
-  readonly modelId: string;
-  readonly providerModelId: string;
-  readonly wire: TUpstreamWire;
-  readonly round: number;
-  readonly upstreamStatus: number;
-  readonly upstreamContentType: string | null;
-};
-
-export type TWebSearchDecodeFailure = {
-  readonly stage: TWebSearchDecodeStage;
-  /** Sanitized error name + first line, hard-truncated. */
-  readonly detail: string;
-  /** The full single-line 502 body (also what the recorded row carries). */
-  readonly clientMessage: string;
-};
-
 const sanitizeErrorLine = (err: unknown, max: number): string => {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
@@ -736,346 +647,11 @@ const sanitizeErrorLine = (err: unknown, max: number): string => {
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
 
-/** The vendor's error line with its type code preserved (the anthropic
- *  decoder throws a plain message; the chatgpt decoder already embeds the
- *  code — don't double it). */
 const upstreamErrorLine = (err: UpstreamStreamError): string => {
   const { type, message } = upstreamErrorFrom(err);
   return message.startsWith(type) ? message : `${type}: ${message}`;
 };
 
-/**
- * Classify a `serveWithWebSearch` round decode failure into a sanitized
- * diagnostic. `upstream_error` keeps the vendor's own error type + message
- * verbatim (that IS the diagnostic the user needs — a usage cap, a
- * max_output_tokens truncation, a rate limit); everything else keeps only
- * the error's first line so no response content can leak.
- */
-export const describeWebSearchDecodeFailure = (
-  err: unknown,
-  ctx: TWebSearchDecodeContext,
-): TWebSearchDecodeFailure => {
-  let stage: TWebSearchDecodeStage;
-  let detail: string;
-  if (err instanceof UpstreamStreamError) {
-    stage = "upstream_error";
-    detail = sanitizeErrorLine(upstreamErrorLine(err), 300);
-  } else if (err instanceof SyntaxError) {
-    stage = "json_parse";
-    detail = sanitizeErrorLine(err, 160);
-  } else if (
-    err instanceof Error &&
-    (err.name === "ParseError" ||
-      (err as { _tag?: unknown })._tag === "ParseError")
-  ) {
-    // effect Schema decode failure — its message tree embeds actual
-    // values, so keep only the first line.
-    stage = "schema_decode";
-    detail = sanitizeErrorLine(err, 160);
-  } else {
-    stage = ctx.wire === "chatgpt" ? "stream_decode" : "schema_decode";
-    detail = sanitizeErrorLine(err, 160);
-  }
-  const headline =
-    stage === "upstream_error"
-      ? "upstream reported an error during a managed web_search round"
-      : "could not decode upstream response";
-  const clientMessage =
-    `web_search: ${headline} ` +
-    `(provider=${ctx.provider} model=${ctx.modelId} wire=${ctx.wire} ` +
-    `round=${ctx.round} stage=${stage} upstream_status=${ctx.upstreamStatus}` +
-    `${ctx.upstreamContentType !== null ? ` content_type=${ctx.upstreamContentType}` : ""}): ` +
-    detail;
-  return { stage, detail, clientMessage };
-};
-
-/**
- * The candidate-agnostic invariant applied to the agentic loop's DECODE step:
- * a ROUND-0 decode failure has committed nothing — the client got no bytes
- * (this path fully accumulates before responding) and no search side effects
- * ran (searches run only after a successful round decode) — so mid-chain it
- * walks like any pre-commit candidate failure. This is what turns an
- * in-stream vendor error (context overflow, usage cap, rate limit — HTTP 200
- * followed by a terminal error event, the issue #274 incident shape) into a
- * fallback instead of a dead turn. Later rounds are committed to the hop by
- * the preceding tool exchange, the final hop has nowhere to walk, and an
- * aborted client never walks.
- */
-export const shouldWalkOnWebSearchDecodeFailure = (
-  round: number,
-  finalHop: boolean,
-  aborted: boolean,
-): boolean => round === 0 && !finalHop && !aborted;
-
-/**
- * Serve a subscription hop that runs openllm-managed web_search (§5): the
- * agentic loop. Each round calls the vendor (ACCUMULATED — we must read the
- * whole response to spot tool calls), and for every `web_search` tool call
- * POSTs only the QUERY to the cloud (`searchViaCloud`), appends the results
- * as a follow-up turn, and re-calls — until the model answers without
- * searching (or the round cap). The conversation never leaves the box; only
- * the query crosses (to a third-party engine the user already authorized).
- */
-const serveWithWebSearch = async (
-  hop: THop,
-  wire: TUpstreamWire,
-  args: TWalkArgs,
-  initialCanonical: TChatCompletionRequest,
-  finalHop: boolean,
-): Promise<Response | "retry"> => {
-  const acquired = await acquireUpstream(hop.provider, args);
-  if (acquired === "retry") return "retry";
-  const { headers: baseHeaders, url, accountHash } = acquired;
-  // Headers are computed once; the body is rebuilt per round from the
-  // accumulated canonical (web_search appends tool results between rounds).
-  const headers = buildUpstreamHeaders({
-    surface: args.surface,
-    upstreamWire: wire,
-    rawBody: args.rawBody,
-    providerModelId: hop.providerModelId,
-    stream: false,
-    baseHeaders,
-    inboundBeta: inboundBetaOf(args),
-    isOAuth: wire === "anthropic",
-  });
-
-  let canonical = initialCanonical;
-  const collectedBlocks: Array<{
-    server_tool_use: unknown;
-    tool_result: unknown;
-  }> = [];
-  let final: TChatCompletionResponse | null = null;
-
-  for (let round = 0; round < MAX_WEB_SEARCH_ROUNDS; round++) {
-    // Accumulated cross-wire body (chatgpt still streams + is drained),
-    // then the delegate's per-model compat (reasoning gate + schema strip).
-    const body = await applyDelegateModelCompat(
-      getDelegate(hop.provider),
-      hop.providerModelId,
-      canonicalToUpstreamBody(
-        wire,
-        canonical,
-        hop.providerModelId,
-        false,
-        wantsCodexPreamble(hop.provider),
-      ),
-    );
-    // Rounds > 0 are committed to this hop — no in-place retry there either.
-    const resp = await postUpstream(
-      url,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: args.req.signal,
-      },
-      finalHop && round === 0,
-      args.req.signal,
-    );
-    if (resp === null) {
-      if (round === 0 && !finalHop) return "retry";
-      return errorJson(502, "web_search: upstream request failed");
-    }
-    if (!resp.ok) {
-      const detail = await resp.text().catch(() => "");
-      // Round zero has not committed this turn to the candidate, so every
-      // non-abort upstream rejection can walk. Later rounds are logically
-      // committed to this hop by the preceding tool exchange.
-      if (
-        round === 0 &&
-        !finalHop &&
-        classifyPrecommitResponse(
-          resp.status,
-          detail,
-          wire,
-          args.req.signal.aborted,
-        ).kind === "transient"
-      ) {
-        return "retry";
-      }
-      return new Response(detail.length > 0 ? detail : null, {
-        status: resp.status,
-        headers: { "content-type": "application/json" },
-      });
-    }
-    if (resp.body === null) {
-      if (round === 0) return "retry";
-      return errorJson(502, "web_search: empty upstream response");
-    }
-    let roundResp: TChatCompletionResponse;
-    try {
-      roundResp =
-        wire === "chatgpt"
-          ? await accumulateChunksToResponse(
-              decodeUpstreamStream(wire, resp.body, hop.providerModelId),
-              hop.providerModelId,
-            )
-          : decodeUpstreamJson(
-              wire,
-              JSON.parse(await resp.text()),
-              hop.providerModelId,
-            );
-    } catch (err) {
-      // Issue #274: this used to be a bare catch → one generic 502 that
-      // erased the vendor's own error (usage caps, max_output_tokens, rate
-      // limits all read as "could not decode"). Classify sanitized, log it,
-      // walk mid-chain when nothing is committed yet (round 0 — see
-      // shouldWalkOnWebSearchDecodeFailure), and otherwise record the failed
-      // hop + surface the diagnostic so the turn can be correlated with
-      // gateway telemetry.
-      const failure = describeWebSearchDecodeFailure(err, {
-        provider: hop.provider,
-        modelId: hop.modelId,
-        providerModelId: hop.providerModelId,
-        wire,
-        round,
-        upstreamStatus: resp.status,
-        upstreamContentType: resp.headers.get("content-type"),
-      });
-      const walk = shouldWalkOnWebSearchDecodeFailure(
-        round,
-        finalHop,
-        args.req.signal.aborted,
-      );
-      logWarn("walker", "web_search round decode failed", {
-        provider: hop.provider,
-        model: hop.modelId,
-        provider_model_id: hop.providerModelId,
-        wire,
-        round,
-        surface: args.surface,
-        endpoint: args.endpoint,
-        upstream_status: resp.status,
-        upstream_content_type: resp.headers.get("content-type"),
-        stage: failure.stage,
-        detail: failure.detail,
-        walked: walk,
-      });
-      if (walk) return "retry";
-      report(
-        {
-          model: hop.modelId,
-          provider: hop.provider,
-          status: statusFor(502),
-          latency_ms: Date.now() - args.startedAt,
-          endpoint: args.endpoint,
-          error: failure.clientMessage,
-          ...(accountHash !== null ? { account_hash: accountHash } : {}),
-          ...ZERO_TOKENS,
-        },
-        args.originParam,
-      );
-      return errorJson(502, failure.clientMessage);
-    }
-
-    const webCalls: TToolCall[] = (
-      roundResp.choices[0]?.message.tool_calls ?? []
-    ).filter(toolCallUsesWebSearch);
-    const assistantMsg =
-      webCalls.length > 0
-        ? buildAssistantToolCallMessage({
-            response: roundResp,
-            toolCalls: webCalls,
-          })
-        : null;
-    if (assistantMsg === null) {
-      final = roundResp; // model answered without searching → done
-      break;
-    }
-
-    const contentsById = new Map<string, string>();
-    for (const call of webCalls) {
-      const query = extractQueryFromToolCall(call);
-      const result =
-        query.length === 0
-          ? null
-          : await searchViaCloud(query, args.originParam, args.req.signal);
-      contentsById.set(
-        call.id,
-        result?.content ??
-          "Search error: web_search is unavailable (no result from the gateway)",
-      );
-      if (result !== null && result.server_tool_use !== null) {
-        collectedBlocks.push({
-          server_tool_use: result.server_tool_use,
-          tool_result: result.tool_result,
-        });
-      }
-    }
-    canonical = {
-      ...canonical,
-      messages: [
-        ...canonical.messages,
-        assistantMsg,
-        ...buildToolResultMessages({ calls: webCalls, contentsById }),
-      ],
-    };
-  }
-
-  if (final === null) {
-    return errorJson(
-      502,
-      `web_search: exceeded ${MAX_WEB_SEARCH_ROUNDS} rounds without a final answer`,
-    );
-  }
-
-  report(
-    {
-      model: hop.modelId,
-      provider: hop.provider,
-      status: statusFor(200),
-      latency_ms: Date.now() - args.startedAt,
-      endpoint: args.endpoint,
-      ...(accountHash !== null ? { account_hash: accountHash } : {}),
-      ...tokensFromResponse(final),
-    },
-    args.originParam,
-  );
-
-  const clientWire = clientWireOf(args.surface);
-  const wantsStream =
-    (args.rawBody as { stream?: unknown } | null)?.stream === true;
-  if (wantsStream) {
-    const bytes = sseBytesForClient(
-      responseToChunkStream(final),
-      args.surface,
-      clientWire,
-    );
-    return new Response(bytes, {
-      status: 200,
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
-      },
-    });
-  }
-  const clientBody =
-    args.surface === "responses"
-      ? toResponsesResponse(final)
-      : clientWire === "anthropic"
-        ? spliceAnthropicWebSearchBlocks(
-            toAnthropicMessagesResponse(final) as unknown as Record<
-              string,
-              unknown
-            >,
-            collectedBlocks,
-          )
-        : final;
-  return new Response(JSON.stringify(clientBody), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
-};
-
-/**
- * Serve one subscription hop locally: inject the official CLI's bearer +
- * real identity headers, adapt the request to the provider's wire, call
- * the vendor, and re-encode the response back to the client's wire. The
- * conversation goes only to the vendor; the token never leaves the box.
- * Returns "retry" on any non-abort pre-commit candidate failure so the
- * walker advances.
- */
 const serveSubscription = async (
   hop: THop,
   wire: TUpstreamWire,
@@ -1231,8 +807,7 @@ const serveSubscription = async (
       );
     } catch (err) {
       recordTokens(ZERO_TOKENS);
-      // Same erasure class as the web_search decode 502 (issue #274): keep
-      // the vendor's terminal error (with its upstreamType code, not the
+      // Keep the vendor's terminal error (with its upstreamType code, not the
       // UpstreamStreamError class name) / the drain failure's first line
       // instead of a bare generic message.
       const detail =
@@ -1332,8 +907,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     );
   }
 
-  // Canonical view of the inbound — used to detect openllm-managed
-  // web_search on the transform paths (§5).
+  // Canonical view of the inbound for native-runtime eligibility and encoding.
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
 
   let lastError: string | null = null;
@@ -1350,6 +924,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         provider: hop.provider,
         providerModelId: hop.providerModelId,
         surface: args.surface,
+        rawBody: args.rawBody,
         canonical,
         wantsStream:
           (args.rawBody as { stream?: unknown } | null)?.stream === true,
@@ -1375,9 +950,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     if (wire !== undefined) {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
-      const served = shouldInterceptWebSearch(wire, args.surface, canonical)
-        ? await serveWithWebSearch(hop, wire, args, canonical, finalHop)
-        : await serveSubscription(hop, wire, args, finalHop);
+      const served = await serveSubscription(hop, wire, args, finalHop);
       if (served !== "retry") return served; // committed
       lastError = `subscription hop ${hop.modelId} failed pre-stream`;
       continue;
