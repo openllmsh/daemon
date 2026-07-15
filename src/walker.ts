@@ -51,6 +51,8 @@ import {
   type TServerSearchCall,
 } from "@quantidexyz/openllmp";
 import { declaresAnthropicServerSearchTool } from "@quantidexyz/openllmw/adapters/messages/request";
+import { compactToolOutputsToBudget } from "@quantidexyz/openllmw/features/compaction/tool-output-compact";
+import { estimateBodyTokens } from "@quantidexyz/openllmw/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
   responsesBodyHasEncryptedContent,
@@ -484,6 +486,82 @@ const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
 // canonicalFromInbound / clientWireOf). The walker is a thin caller; it never
 // re-derives the recipe (that fork caused two regressions).
 
+/** Outcome of peeking a decoded upstream stream's first event before
+ *  committing the client response: the (replayable) chunk stream, or the
+ *  rejection that arrived before any output. */
+export type TPeekedChunks<T> =
+  | { readonly kind: "chunks"; readonly chunks: ReadableStream<T> }
+  | { readonly kind: "error"; readonly error: unknown };
+
+/** How long a streaming subscription hop holds the client response
+ *  uncommitted waiting for the upstream's first decoded event. In-stream
+ *  rejections (context overflow) arrive as the very first event right after
+ *  the 200 headers; a healthy turn that stays quiet longer (cold start, long
+ *  prompt processing) commits at the deadline and streams exactly as before. */
+export const FIRST_EVENT_PEEK_MS = 2_000;
+
+/** Tool-output compaction (Plan B) targets this fraction of the hop's input
+ *  budget — the chars/4 estimator can UNDER-count real BPE tokens (code runs
+ *  ~3.2 chars/token), so landing at 80% keeps the compacted request safely
+ *  inside the window the vendor actually enforces. */
+export const COMPACT_TARGET_FACTOR = 0.8;
+
+/**
+ * Wait (bounded) for the FIRST event of a decoded upstream stream, so an
+ * in-stream rejection that precedes any output — the overflow incident
+ * shape: HTTP 200, then a first event `error: Your input exceeds the
+ * context window` — surfaces while the hop is still an UNCOMMITTED
+ * candidate and the caller can walk the plan, instead of failing inside an
+ * already-committed 200 stream. Every other outcome (first chunk arrived,
+ * stream ended, deadline passed while quiet) returns a stream that replays
+ * the in-flight read: no event is lost or duplicated, and a rejection that
+ * arrives after the deadline still propagates mid-stream as today.
+ */
+export const peekFirstChunk = <T>(
+  source: ReadableStream<T>,
+  deadlineMs: number,
+): Promise<TPeekedChunks<T>> => {
+  const reader = source.getReader();
+  const firstRead = reader.read();
+  let pendingFirst: ReturnType<typeof reader.read> | null = firstRead;
+  const replayed = (): ReadableStream<T> =>
+    new ReadableStream<T>({
+      pull: async (controller) => {
+        const read = pendingFirst ?? reader.read();
+        pendingFirst = null;
+        const r = await read;
+        if (r.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(r.value);
+      },
+      cancel: (reason) => reader.cancel(reason),
+    });
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (v: TPeekedChunks<T>): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const timer = setTimeout(
+      () => settle({ kind: "chunks", chunks: replayed() }),
+      deadlineMs,
+    );
+    firstRead.then(
+      () => {
+        clearTimeout(timer);
+        settle({ kind: "chunks", chunks: replayed() });
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        settle({ kind: "error", error });
+      },
+    );
+  });
+};
+
 /** Decode an upstream SSE stream into canonical chunks, per upstream wire. */
 export const decodeUpstreamStream = (
   wire: TUpstreamWire,
@@ -817,12 +895,28 @@ const serveSubscription = async (
         headers: passthroughHeaders(resp),
       });
     }
-    // Cross-wire (or chatgpt): decode → tee → re-encode + meter.
-    const [toClient, toMeter] = decodeUpstreamStream(
-      wire,
-      resp.body,
-      hop.providerModelId,
-    ).tee();
+    // Cross-wire (or chatgpt): decode → peek → tee → re-encode + meter.
+    // The bounded first-event peek keeps the response uncommitted long
+    // enough for a pre-output in-stream rejection (context overflow) to
+    // WALK a non-final hop instead of dying inside a committed stream; a
+    // quiet-but-healthy turn commits at the deadline and streams as before.
+    const peeked = await peekFirstChunk(
+      decodeUpstreamStream(wire, resp.body, hop.providerModelId),
+      FIRST_EVENT_PEEK_MS,
+    );
+    if (peeked.kind === "error") {
+      if (!finalHop && !args.req.signal.aborted) return "retry";
+      const detail =
+        peeked.error instanceof UpstreamStreamError
+          ? sanitizeErrorLine(upstreamErrorLine(peeked.error), 300)
+          : sanitizeErrorLine(peeked.error, 300);
+      report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
+      return errorJson(
+        502,
+        `upstream stream ended before producing output: ${detail}`,
+      );
+    }
+    const [toClient, toMeter] = peeked.chunks.tee();
     meter(toMeter);
     const clientBytes = sseBytesForClient(toClient, args.surface, clientWire);
     return new Response(heartbeat(clientBytes), {
@@ -846,14 +940,24 @@ const serveSubscription = async (
         hop.providerModelId,
       );
     } catch (err) {
-      recordTokens(ZERO_TOKENS);
+      // The drain threw before ANY output reached the client, so the hop is
+      // still an uncommitted candidate in JSON mode — a non-final hop WALKS
+      // (the gpt-5.6 overflow incident shape: HTTP 200, then a first event
+      // `error: Your input exceeds the context window`). Zero tokens were
+      // metered on the failed attempt, so the walk cannot double-bill;
+      // nothing is recorded for a walked hop (parity with the pre-commit
+      // non-ok path).
+      if (!finalHop && !args.req.signal.aborted) return "retry";
       // Keep the vendor's terminal error (with its upstreamType code, not the
       // UpstreamStreamError class name) / the drain failure's first line
-      // instead of a bare generic message.
+      // instead of a bare generic message. Recorded as an ERROR row — the
+      // client receives a 502, so `statusFor(resp.status)`'s "success" (from
+      // the upstream 200) would misreport the outcome.
       const detail =
         err instanceof UpstreamStreamError
           ? sanitizeErrorLine(upstreamErrorLine(err), 300)
           : sanitizeErrorLine(err, 300);
+      report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
       return errorJson(
         502,
         `upstream stream ended before producing output: ${detail}`,
@@ -1149,10 +1253,43 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
 
   // Canonical view of the inbound for native-runtime eligibility and encoding.
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
+  const baseEstimate = estimateBodyTokens(args.rawBody);
 
   let lastError: string | null = null;
   for (const [hopIndex, hop] of hops.entries()) {
     const finalHop = hopIndex === hops.length - 1;
+    // ── Context-overflow ladder, per hop ─────────────────────────────
+    // Plan A already happened (the catalog served correct budgets; the
+    // client should have compacted). When the request still exceeds THIS
+    // hop's input budget: Plan B — compact tool outputs (codex per-output
+    // truncation + microcompact clear-oldest) until it fits; only when
+    // even full compaction can't fit does Plan C apply — walk to the next
+    // (larger-context) hop. The final hop serves the best-effort compacted
+    // body regardless (never-drop-all), and the pre-output overflow walk
+    // below remains the backstop for estimate misses.
+    let hopArgs = args;
+    let hopCanonical = canonical;
+    const inputLimit = lookupCatalogEntry(hop.modelId)?.input_token_limit;
+    if (typeof inputLimit === "number" && baseEstimate > inputLimit) {
+      const compacted = compactToolOutputsToBudget(
+        args.surface,
+        args.rawBody,
+        Math.floor(inputLimit * COMPACT_TARGET_FACTOR),
+      );
+      if (!compacted.fits && !finalHop) {
+        lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request exceeds its ${inputLimit}-token window even after tool-output compaction`;
+        continue;
+      }
+      if (compacted.changed) {
+        hopArgs = {
+          ...args,
+          rawBody: compacted.body,
+          rawBytes: new TextEncoder().encode(JSON.stringify(compacted.body))
+            .buffer as ArrayBuffer,
+        };
+        hopCanonical = canonicalFromInbound(args.surface, compacted.body);
+      }
+    }
     // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
     // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
     // DECLINE (unsupported request — tools/images/structured-output — or a
@@ -1164,10 +1301,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         provider: hop.provider,
         providerModelId: hop.providerModelId,
         surface: args.surface,
-        rawBody: args.rawBody,
-        canonical,
+        rawBody: hopArgs.rawBody,
+        canonical: hopCanonical,
         wantsStream:
-          (args.rawBody as { stream?: unknown } | null)?.stream === true,
+          (hopArgs.rawBody as { stream?: unknown } | null)?.stream === true,
         signal: args.req.signal,
         record: (tokens, status) =>
           report(
@@ -1190,7 +1327,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     if (wire !== undefined) {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
-      const served = await serveSubscription(hop, wire, args, finalHop);
+      const served = await serveSubscription(hop, wire, hopArgs, finalHop);
       if (served !== "retry") return served; // committed
       lastError = `subscription hop ${hop.modelId} failed pre-stream`;
       continue;
@@ -1200,7 +1337,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     try {
       resp = await forwardToCloud(
         args.req,
-        args.rawBytes,
+        hopArgs.rawBytes,
         hop.modelId,
         args.originParam,
       );
