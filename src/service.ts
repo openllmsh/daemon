@@ -210,7 +210,9 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# Do not enable RestrictSUIDSGID here: on Ubuntu systemd 259 it makes GNU tar's
+# openat2(RESOLVE_BENEATH) extraction path fail with ENOSYS. Landlock remains
+# the daemon's filesystem boundary.
 # The daemon self-restricts via Landlock at boot, so the seccomp allow-list MUST
 # keep those syscalls callable. The \`@sandbox\` GROUP only exists on systemd
 # >= 257 — on Debian 12 / Ubuntu 22.04|24.04 (systemd <= 256, most production
