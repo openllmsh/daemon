@@ -14,9 +14,16 @@
  * user just installed shows up on the next status push with no command. The
  * host-binary candidate paths live in `cli-paths.ts` (`hostCliCandidates`).
  */
-import { existsSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { TCliProvider } from "./cli-paths";
 import {
   cliBin,
@@ -57,6 +64,48 @@ export const linkIsolatedCli = async (
   await mkdir(dirname(dst), { recursive: true });
   await rm(dst, { force: true });
   symlinkSync(hostBin, dst);
+  linkSidecars(dst);
+};
+
+/**
+ * Link executable SIDECARS that ship NEXT TO THE REAL host binary (the
+ * resolved end of the symlink chain) into the isolated bin dir, alongside the
+ * main link. Codex's tool router spawns `codex-code-mode-host` — the
+ * 5.6-family web-search / code-mode host — from the INVOKED binary's own
+ * directory (our isolated `bin/`), NOT the resolved target's; without the
+ * sidecar link, web search on gpt-5.6-* dies with "failed to spawn code-mode
+ * host … No such file or directory" (observed live 2026-07-15) while 5.4
+ * (hosted-tool route) keeps working. Generic: every sibling named
+ * `<binary>-*` is linked, so a future vendor sidecar is picked up without a
+ * code change. Idempotent (an up-to-date link is left alone — safe on the
+ * 30s `cliInstallState` self-heal path) and best-effort per entry: a sidecar
+ * failure must never break the main CLI link.
+ */
+const linkSidecars = (isolatedBin: string): void => {
+  try {
+    const real = realpathSync(isolatedBin);
+    const realDir = dirname(real);
+    const prefix = `${basename(isolatedBin)}-`;
+    for (const entry of readdirSync(realDir)) {
+      if (!entry.startsWith(prefix)) continue;
+      const target = join(realDir, entry);
+      const link = join(dirname(isolatedBin), entry);
+      try {
+        if (readlinkSync(link) === target) continue; // already current
+      } catch {
+        // absent or not a symlink — (re)create below
+      }
+      try {
+        rmSync(link, { force: true });
+        symlinkSync(target, link);
+      } catch {
+        // per-sidecar best effort — the main CLI still runs without it
+      }
+    }
+  } catch {
+    // unresolvable host binary / unreadable dir — main-link errors surface
+    // through the install-state probe; sidecars just stay absent
+  }
 };
 
 /**
@@ -139,6 +188,10 @@ export const cliInstallState = async (
     }
     return notInstalled;
   }
+  // Self-heal SIDECARS for installs whose main link predates sidecar linking
+  // (the main link existing skips `linkIsolatedCli` above forever). Idempotent
+  // — an up-to-date link is a readlink+compare, so the 30s probe stays cheap.
+  linkSidecars(bin);
   const out = await runCapture([bin, "--version"], cliEnv(provider));
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };
