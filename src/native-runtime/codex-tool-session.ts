@@ -25,6 +25,7 @@
  * protocol `callId` (not positional — unlike the Claude path's earlier bug).
  */
 
+import type { TServerSearchCall } from "@quantidexyz/openllmp";
 import type {
   TClientTool,
   TToolCallOut,
@@ -53,6 +54,7 @@ type TEvent =
       tool: string;
       args: unknown;
     }
+  | { kind: "search"; call: TServerSearchCall }
   | { kind: "done"; status: string; error: string | null };
 
 type THeld = {
@@ -141,6 +143,9 @@ const attachSink = (h: THeld): void => {
     onCompleted: (status, error) => push(h, { kind: "done", status, error }),
     onToolCall: (requestId, callId, tool, args) =>
       push(h, { kind: "tool", requestId, callId, tool, args }),
+    // Hosted web search completed inside the held turn — surfaced on the
+    // result so the serve layer re-encodes the lifecycle on the client wire.
+    onWebSearch: (call) => push(h, { kind: "search", call }),
   });
 };
 
@@ -257,13 +262,16 @@ export const continueCodexToolTurn = async (
 const drive = async (h: THeld): Promise<TToolTurnResult> => {
   let text = "";
   const toolCalls: TToolCallOut[] = [];
+  const serverSearchCalls: TServerSearchCall[] = [];
   const deadline = nowMs() + DRIVE_TIMEOUT_MS;
   for (;;) {
     const e = h.queue.shift();
     if (e === undefined) {
       // No pending event: if we've already collected tool calls, return them;
       // otherwise wait for the next event (bounded).
-      if (toolCalls.length > 0) return pauseReturn(h, text, toolCalls);
+      if (toolCalls.length > 0) {
+        return pauseReturn(h, text, toolCalls, serverSearchCalls);
+      }
       if (nowMs() > deadline) {
         // Interrupt the still-running turn before detaching, or the vendor keeps
         // generating in the shared app-server process (Batch B — parity with
@@ -292,6 +300,10 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
       text += e.text;
       continue;
     }
+    if (e.kind === "search") {
+      serverSearchCalls.push(e.call);
+      continue;
+    }
     if (e.kind === "tool") {
       h.pending.set(e.callId, e.requestId);
       held.set(e.callId, h);
@@ -309,8 +321,15 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     // done
     h.client.removeSink(h.threadId);
     dropIndex(h);
-    if (toolCalls.length > 0) return pauseReturn(h, text, toolCalls);
-    return { kind: "final", text, ...(h.usage ? { usage: h.usage } : {}) };
+    if (toolCalls.length > 0) {
+      return pauseReturn(h, text, toolCalls, serverSearchCalls);
+    }
+    return {
+      kind: "final",
+      text,
+      ...(h.usage ? { usage: h.usage } : {}),
+      ...(serverSearchCalls.length > 0 ? { serverSearchCalls } : {}),
+    };
   }
 };
 
@@ -318,6 +337,7 @@ const pauseReturn = (
   h: THeld,
   text: string,
   toolCalls: ReadonlyArray<TToolCallOut>,
+  serverSearchCalls: ReadonlyArray<TServerSearchCall>,
 ): TToolTurnResult => {
   h.lastUsed = nowMs();
   return {
@@ -325,5 +345,6 @@ const pauseReturn = (
     text,
     toolCalls,
     ...(h.usage ? { usage: h.usage } : {}),
+    ...(serverSearchCalls.length > 0 ? { serverSearchCalls } : {}),
   };
 };

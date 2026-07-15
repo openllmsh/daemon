@@ -24,7 +24,11 @@
  */
 
 import { existsSync } from "node:fs";
-import type { TChatCompletionChunk, TUsage } from "@quantidexyz/openllmp";
+import type {
+  TChatCompletionChunk,
+  TServerSearchCall,
+  TUsage,
+} from "@quantidexyz/openllmp";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { DAEMON_VERSION } from "../version";
@@ -77,6 +81,10 @@ type TThreadSink = {
     tool: string,
     args: unknown,
   ) => void;
+  /** A HOSTED web search completed inside the turn (`item/completed` with
+   *  `item.type: "webSearch"`) — the provider ran it; we only report it so
+   *  client wires can re-encode the lifecycle (Claude Code counts these). */
+  onWebSearch?: (call: TServerSearchCall) => void;
 };
 
 class CodexAppServerClient {
@@ -289,7 +297,18 @@ class CodexAppServerClient {
       | {
           readonly threadId?: string;
           readonly delta?: unknown;
-          readonly item?: { readonly type?: string; readonly text?: unknown };
+          readonly item?: {
+            readonly type?: string;
+            readonly text?: unknown;
+            /** hosted webSearch items (`type: "webSearch"`) */
+            readonly id?: unknown;
+            readonly query?: unknown;
+            readonly action?: {
+              readonly type?: unknown;
+              readonly query?: unknown;
+              readonly queries?: unknown;
+            };
+          };
           readonly tokenUsage?: {
             readonly total?: unknown;
             readonly last?: unknown;
@@ -315,6 +334,37 @@ class CodexAppServerClient {
           typeof params.item.text === "string"
         ) {
           sink.onAgentMessage(params.item.text);
+        }
+        // HOSTED web search completed (config-enabled; see codex-web-search.ts).
+        // Only the COMPLETED item carries the real query (`item/started` has an
+        // empty one). Report it so the serve layer re-encodes the lifecycle on
+        // the client's wire; a query-less item is noise, not a search.
+        if (params?.item?.type === "webSearch") {
+          const item = params.item;
+          const queries = Array.isArray(item.action?.queries)
+            ? item.action.queries.filter(
+                (q): q is string => typeof q === "string" && q.length > 0,
+              )
+            : [];
+          // Model families report the query differently: 5.4 puts it on BOTH
+          // `item.query` and `action.query`; 5.6 (sol) fills `item.query` but
+          // nulls `action.query` and reports the fan-out only in
+          // `action.queries`. Fall through all three so no family's search
+          // silently drops.
+          const query =
+            typeof item.query === "string" && item.query.length > 0
+              ? item.query
+              : typeof item.action?.query === "string" &&
+                  item.action.query.length > 0
+                ? item.action.query
+                : (queries[0] ?? "");
+          if (typeof item.id === "string" && query.length > 0) {
+            sink.onWebSearch?.({
+              id: item.id,
+              query,
+              ...(queries.length > 0 ? { queries } : {}),
+            });
+          }
         }
         return;
       case "thread/tokenUsage/updated": {
@@ -508,6 +558,12 @@ export const runCodexNative = async (
     },
     onUsage: (u) => {
       usage = u;
+    },
+    // A hosted web search completed inside the turn — ride it on the canonical
+    // chunk stream so the client-wire encoders re-emit the lifecycle
+    // (Anthropic: server_tool_use + web_search_tool_result blocks + usage).
+    onWebSearch: (call) => {
+      push(baseChunk({ server_search_calls: [call] }, null));
     },
     onCompleted: (status, errorMessage) => {
       terminal = { status, error: errorMessage };

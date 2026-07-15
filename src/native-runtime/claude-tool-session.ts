@@ -27,7 +27,10 @@ import {
   query,
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { TChatCompletionResponse } from "@quantidexyz/openllmp";
+import type {
+  TChatCompletionResponse,
+  TServerSearchCall,
+} from "@quantidexyz/openllmp";
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
 import type { TNativeTokens } from "./types";
@@ -160,18 +163,22 @@ export type TToolCallOut = {
 /** The outcome of driving the query to its next boundary. `usage` is THIS
  *  turn's token counts (from the assistant message driven in this call — never
  *  cumulative across rounds); optional because the gated Codex tool path does
- *  not surface usage yet. */
+ *  not surface usage yet. `serverSearchCalls` reports HOSTED web searches the
+ *  provider ran inside the turn (Codex path only) so the serve layer can
+ *  re-encode the lifecycle on the client wire. */
 export type TToolTurnResult =
   | {
       readonly kind: "tool_calls";
       readonly text: string;
       readonly toolCalls: ReadonlyArray<TToolCallOut>;
       readonly usage?: TNativeTokens;
+      readonly serverSearchCalls?: ReadonlyArray<TServerSearchCall>;
     }
   | {
       readonly kind: "final";
       readonly text: string;
       readonly usage?: TNativeTokens;
+      readonly serverSearchCalls?: ReadonlyArray<TServerSearchCall>;
     }
   | { readonly kind: "declined"; readonly reason: string };
 
@@ -567,6 +574,10 @@ export const toolTurnToResponse = (
           content: result.text.length > 0 ? result.text : null,
           ...(toolCalls !== undefined && toolCalls.length > 0
             ? { tool_calls: toolCalls }
+            : {}),
+          ...(result.serverSearchCalls !== undefined &&
+          result.serverSearchCalls.length > 0
+            ? { server_search_calls: result.serverSearchCalls }
             : {}),
         },
         finish_reason: result.kind === "tool_calls" ? "tool_calls" : "stop",
