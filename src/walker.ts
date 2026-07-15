@@ -51,7 +51,7 @@ import {
   type TServerSearchCall,
 } from "@quantidexyz/openllmp";
 import { declaresAnthropicServerSearchTool } from "@quantidexyz/openllmw/adapters/messages/request";
-import { compactToolOutputsToBudget } from "@quantidexyz/openllmw/features/compaction/tool-output-compact";
+import { fitRequestToHopBudget } from "@quantidexyz/openllmw/features/compaction/tool-output-compact";
 import { estimateBodyTokens } from "@quantidexyz/openllmw/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
@@ -499,12 +499,6 @@ export type TPeekedChunks<T> =
  *  the 200 headers; a healthy turn that stays quiet longer (cold start, long
  *  prompt processing) commits at the deadline and streams exactly as before. */
 export const FIRST_EVENT_PEEK_MS = 2_000;
-
-/** Tool-output compaction (Plan B) targets this fraction of the hop's input
- *  budget — the chars/4 estimator can UNDER-count real BPE tokens (code runs
- *  ~3.2 chars/token), so landing at 80% keeps the compacted request safely
- *  inside the window the vendor actually enforces. */
-export const COMPACT_TARGET_FACTOR = 0.8;
 
 /**
  * Wait (bounded) for the FIRST event of a decoded upstream stream, so an
@@ -1258,37 +1252,38 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   let lastError: string | null = null;
   for (const [hopIndex, hop] of hops.entries()) {
     const finalHop = hopIndex === hops.length - 1;
-    // ── Context-overflow ladder, per hop ─────────────────────────────
+    // ── Context-overflow ladder, per hop (shared with the cloud chain —
+    // `fitRequestToHopBudget`) ────────────────────────────────────────
     // Plan A already happened (the catalog served correct budgets; the
     // client should have compacted). When the request still exceeds THIS
-    // hop's input budget: Plan B — compact tool outputs (codex per-output
-    // truncation + microcompact clear-oldest) until it fits; only when
-    // even full compaction can't fit does Plan C apply — walk to the next
-    // (larger-context) hop. The final hop serves the best-effort compacted
-    // body regardless (never-drop-all), and the pre-output overflow walk
-    // below remains the backstop for estimate misses.
+    // hop's input budget: Plan B — compact tool outputs until it fits;
+    // only when even full compaction can't fit does Plan C apply — walk
+    // to the next (larger-context) hop. The final hop serves the
+    // best-effort compacted body regardless (never-drop-all), and the
+    // pre-output overflow walk below remains the backstop for estimate
+    // misses.
     let hopArgs = args;
     let hopCanonical = canonical;
-    const inputLimit = lookupCatalogEntry(hop.modelId)?.input_token_limit;
-    if (typeof inputLimit === "number" && baseEstimate > inputLimit) {
-      const compacted = compactToolOutputsToBudget(
-        args.surface,
-        args.rawBody,
-        Math.floor(inputLimit * COMPACT_TARGET_FACTOR),
-      );
-      if (!compacted.fits && !finalHop) {
-        lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request exceeds its ${inputLimit}-token window even after tool-output compaction`;
-        continue;
-      }
-      if (compacted.changed) {
-        hopArgs = {
-          ...args,
-          rawBody: compacted.body,
-          rawBytes: new TextEncoder().encode(JSON.stringify(compacted.body))
-            .buffer as ArrayBuffer,
-        };
-        hopCanonical = canonicalFromInbound(args.surface, compacted.body);
-      }
+    const fit = fitRequestToHopBudget({
+      surface: args.surface,
+      body: args.rawBody,
+      estimatedTokens: baseEstimate,
+      inputTokenLimit:
+        lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null,
+      finalHop,
+    });
+    if (fit.kind === "skip") {
+      lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request exceeds its input window even after tool-output compaction`;
+      continue;
+    }
+    if (fit.changed) {
+      hopArgs = {
+        ...args,
+        rawBody: fit.body,
+        rawBytes: new TextEncoder().encode(JSON.stringify(fit.body))
+          .buffer as ArrayBuffer,
+      };
+      hopCanonical = canonicalFromInbound(args.surface, fit.body);
     }
     // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
     // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
