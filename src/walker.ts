@@ -10,7 +10,7 @@
  *                           vendor upstream
  *     - API-key hop       → forward inbound to the cloud, pinned to the hop
  *                           (the cloud decrypts the BYOK credential + runs)
- *     - PRE-STREAM error + retryable → next hop
+ *     - PRE-STREAM candidate failure → next hop (unless client aborted)
  *     - committed (response received, ok) → stream straight to the client
  *
  * Coreless: imports `@quantidexyz/openllmw` + `@quantidexyz/openllmp` + local modules
@@ -268,17 +268,13 @@ export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
 };
 
 /**
- * Pre-stream retry classifier — the thin, DELIBERATELY narrow daemon policy
- * (the cloud's full `classifyHopError` treats most 4xx as transient; the
- * daemon does not). 429 / 408 / 5xx fall through to the next hop; everything
- * else (incl. 401 — the delegate refreshes the token on read, so a 401 here
- * is post-refresh and terminal) commits. The ONE exception, handled
- * separately via `transient400Envelope`, is a 400 whose envelope is a
- * content-filter / context-length / capability refusal — there a different
- * model on the chain may accept the request, so we walk like the cloud.
- * Mid-stream failure is intentionally out of scope (commit-on-first-byte).
+ * Final-hop in-place retry policy. Chain routing does NOT use this status
+ * allow-list: every non-abort pre-commit candidate failure walks via the shared
+ * `classifyHopError` policy below. The final hop has nowhere to walk, so it gets
+ * one bounded retry only for transport/rate/server failures before its original
+ * response is surfaced verbatim.
  */
-export const retryable = (status: number): boolean =>
+export const shouldRetryFinalHopInPlace = (status: number): boolean =>
   status === 429 || status === 408 || (status >= 500 && status <= 599);
 
 // Final-hop in-place retry bounds: ONE retry, delay from a bounded
@@ -341,7 +337,7 @@ export const postUpstream = async (
     first = null;
   }
   const failedRetryable =
-    first === null || (!first.ok && retryable(first.status));
+    first === null || (!first.ok && shouldRetryFinalHopInPlace(first.status));
   if (!failedRetryable || !finalHop || signal.aborted) return first;
   await abortableDelay(
     first === null ? FINAL_HOP_RETRY_DELAY_MS : retryAfterDelayMs(first),
@@ -408,35 +404,45 @@ const postWithDecryptRetry = async (
 const hopFormat = (wire: TUpstreamWire): "openai" | "anthropic" =>
   wire === "anthropic" ? "anthropic" : "openai";
 
-/**
- * Is a 400's error body a transient refusal (content-filter / context-length
- * / capability) that a different chain hop might accept? Defers to the shared
- * `classifyHopError` so the daemon and cloud agree on what a transient 400
- * looks like. `raw` is the upstream error body (best-effort JSON parse).
- */
-export const transient400Envelope = (
-  raw: string,
-  wire: TUpstreamWire,
-): boolean => {
-  let envelope: TErrorEnvelope | undefined;
+/** Best-effort error-envelope extraction for reason tagging. Parsing is never
+ * a routing gate: an unknown provider body still represents an uncommitted
+ * candidate failure and therefore walks. */
+const errorEnvelopeFrom = (raw: string): TErrorEnvelope | undefined => {
   try {
     const json = JSON.parse(raw) as { error?: unknown };
-    envelope =
-      json.error !== null && typeof json.error === "object"
-        ? { error: json.error as TErrorEnvelope["error"] }
-        : undefined;
+    return json.error !== null && typeof json.error === "object"
+      ? { error: json.error as TErrorEnvelope["error"] }
+      : undefined;
   } catch {
-    envelope = undefined;
+    return undefined;
   }
-  return (
-    classifyHopError({
-      status: 400,
-      envelope,
-      providerFormat: hopFormat(wire),
-      aborted: false,
-    }).kind === "transient"
-  );
 };
+
+/** Classify a raw upstream error response: best-effort envelope parse, then
+ *  the shared cloud/daemon policy. The single call point for every
+ *  daemon-served hop — subscription (wire-derived format) and cloud-forward
+ *  ("openai": forwarded responses are normalized to the shared envelope). */
+const classifyRawResponse = (
+  status: number,
+  raw: string,
+  providerFormat: "openai" | "anthropic",
+  aborted: boolean,
+): ReturnType<typeof classifyHopError> =>
+  classifyHopError({
+    status,
+    envelope: errorEnvelopeFrom(raw),
+    providerFormat,
+    aborted,
+  });
+
+/** Shared pre-commit candidate decision used for every daemon-served hop. */
+export const classifyPrecommitResponse = (
+  status: number,
+  raw: string,
+  wire: TUpstreamWire,
+  aborted: boolean,
+): ReturnType<typeof classifyHopError> =>
+  classifyRawResponse(status, raw, hopFormat(wire), aborted);
 
 const statusFor = (httpStatus: number): TRequestStatus =>
   httpStatus < 400
@@ -849,18 +855,19 @@ const serveWithWebSearch = async (
       return errorJson(502, "web_search: upstream request failed");
     }
     if (!resp.ok) {
-      // Round-0 pre-stream failure: mid-chain walks (the walk IS the retry);
-      // the final hop has nothing to walk to — surface the upstream error
-      // verbatim (post in-place retry) instead of the generic all-hops 502.
-      if (round === 0 && !finalHop && retryable(resp.status)) return "retry";
       const detail = await resp.text().catch(() => "");
-      // Parity with serveSubscription: a content-filter / context-length /
-      // capability 400 is transient — walk to the next hop (round 0 only).
+      // Round zero has not committed this turn to the candidate, so every
+      // non-abort upstream rejection can walk. Later rounds are logically
+      // committed to this hop by the preceding tool exchange.
       if (
         round === 0 &&
         !finalHop &&
-        resp.status === 400 &&
-        transient400Envelope(detail, wire)
+        classifyPrecommitResponse(
+          resp.status,
+          detail,
+          wire,
+          args.req.signal.aborted,
+        ).kind === "transient"
       ) {
         return "retry";
       }
@@ -1035,7 +1042,8 @@ const serveWithWebSearch = async (
  * real identity headers, adapt the request to the provider's wire, call
  * the vendor, and re-encode the response back to the client's wire. The
  * conversation goes only to the vendor; the token never leaves the box.
- * Returns "retry" on a pre-stream retryable error so the walker advances.
+ * Returns "retry" on any non-abort pre-commit candidate failure so the
+ * walker advances.
  */
 const serveSubscription = async (
   hop: THop,
@@ -1078,21 +1086,19 @@ const serveSubscription = async (
   );
   if (resp === null) return "retry"; // network error — pre-stream, fall through
   if (!resp.ok) {
-    // Pre-stream failure. Mid-chain: walk on retryable / transient-400 (the
-    // walk IS the retry). Final hop: nothing left to walk to — surface the
-    // upstream error verbatim (post in-place retry) instead of the generic
-    // all-hops 502, so the client sees the real status + `Retry-After`.
-    if (!finalHop && retryable(resp.status)) return "retry";
     const raw = await resp.text().catch(() => "");
-    // A content-filter / context-length / capability 400 is transient — walk
-    // to the next hop like the cloud does.
-    if (!finalHop && resp.status === 400 && transient400Envelope(raw, wire)) {
+    // No output has been committed yet. A different configured candidate may
+    // accept the same canonical request regardless of this provider's status
+    // code or envelope shape, so use the shared cloud/daemon policy.
+    if (
+      !finalHop &&
+      classifyPrecommitResponse(resp.status, raw, wire, args.req.signal.aborted)
+        .kind === "transient"
+    ) {
       return "retry";
     }
-    // Every other non-OK is terminal: surface the upstream error verbatim.
-    // Returning here (instead of falling through) keeps an error body out of
-    // the success path, which would otherwise try to decode it as a chat
-    // response or stream it as SSE.
+    // The final hop has nowhere to walk (or the caller aborted): surface the
+    // upstream response verbatim, including status and Retry-After.
     return new Response(raw.length > 0 ? raw : null, {
       status: resp.status,
       headers: passthroughHeaders(resp),
@@ -1351,11 +1357,26 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       );
     } catch {
       lastError = `forward of ${hop.modelId} to cloud failed`;
+      if (args.req.signal.aborted) break;
       continue;
     }
-    if (!resp.ok && retryable(resp.status)) {
-      lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
-      continue;
+    if (!resp.ok && !finalHop) {
+      const raw = await resp
+        .clone()
+        .text()
+        .catch(() => "");
+      // Forwarded cloud responses are normalized to the shared envelope;
+      // provider format only affects reason tagging, never walk eligibility.
+      const cls = classifyRawResponse(
+        resp.status,
+        raw,
+        "openai",
+        args.req.signal.aborted,
+      );
+      if (cls.kind === "transient") {
+        lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
+        continue;
+      }
     }
     return new Response(resp.body, {
       status: resp.status,
