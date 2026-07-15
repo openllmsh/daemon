@@ -8,9 +8,12 @@
  * continuation, and the daemon never runs a managed search loop (see
  * `docs/refactor/2026-07-15-web-search-agent-boundary.md`).
  *
- * Scope is execution-only: the model may search server-side and the grounded
- * answer streams normally; hosted `webSearch` lifecycle items are NOT yet
- * re-emitted onto client wires (no canonical chunk/wire schema change).
+ * The model searches server-side and the grounded answer streams normally.
+ * Completed hosted `webSearch` lifecycle items are RE-EMITTED through the
+ * canonical chunk stream (`server_search_calls`) and re-encoded on client
+ * wires (Anthropic: `server_tool_use` + `web_search_tool_result` blocks +
+ * `usage.server_tool_use.web_search_requests`) — see the sinks in
+ * `codex-app-server.ts` / `codex-tool-session.ts` and the messages encoders.
  *
  * Because this config is a compile-time constant, one conversation can never
  * flip between hosted-search-on and hosted-search-off across requests — so

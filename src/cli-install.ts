@@ -85,11 +85,14 @@ const linkSidecars = (isolatedBin: string): void => {
   try {
     const real = realpathSync(isolatedBin);
     const realDir = dirname(real);
+    const isolatedDir = dirname(isolatedBin);
     const prefix = `${basename(isolatedBin)}-`;
+    const current = new Set<string>();
     for (const entry of readdirSync(realDir)) {
       if (!entry.startsWith(prefix)) continue;
+      current.add(entry);
       const target = join(realDir, entry);
-      const link = join(dirname(isolatedBin), entry);
+      const link = join(isolatedDir, entry);
       try {
         if (readlinkSync(link) === target) continue; // already current
       } catch {
@@ -100,6 +103,17 @@ const linkSidecars = (isolatedBin: string): void => {
         symlinkSync(target, link);
       } catch {
         // per-sidecar best effort — the main CLI still runs without it
+      }
+    }
+    // Reconcile: drop managed sidecar links whose target no longer ships
+    // beside the real binary (a host update that removed/renamed one) — a
+    // dangling link would otherwise shadow the vendor's own resolution.
+    for (const entry of readdirSync(isolatedDir)) {
+      if (!entry.startsWith(prefix) || current.has(entry)) continue;
+      try {
+        rmSync(join(isolatedDir, entry), { force: true });
+      } catch {
+        // best effort — a stale link is degraded behaviour, not a crash
       }
     }
   } catch {

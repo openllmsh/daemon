@@ -19,6 +19,7 @@ import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
 } from "@quantidexyz/openllmp";
+import { declaresAnthropicServerSearchTool } from "@quantidexyz/openllmw/adapters/messages/request";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
 import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
 import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
@@ -93,23 +94,9 @@ const textOf = (
   return typeof content === "string" ? content : "";
 };
 
-const hasAnthropicNativeServerTool = (params: TNativeServeParams): boolean => {
-  if (params.surface !== "messages") return false;
-  const tools =
-    params.rawBody !== null && typeof params.rawBody === "object"
-      ? (params.rawBody as { readonly tools?: unknown }).tools
-      : undefined;
-  return (
-    Array.isArray(tools) &&
-    tools.some(
-      (tool) =>
-        tool !== null &&
-        typeof tool === "object" &&
-        typeof (tool as { readonly type?: unknown }).type === "string" &&
-        (tool as { readonly type: string }).type.startsWith("web_search_"),
-    )
-  );
-};
+const hasAnthropicNativeServerTool = (params: TNativeServeParams): boolean =>
+  params.surface === "messages" &&
+  declaresAnthropicServerSearchTool(params.rawBody);
 
 export const tryServeNativeRuntime = async (
   params: TNativeServeParams,

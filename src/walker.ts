@@ -965,10 +965,23 @@ const serveKimiBuiltinSearch = async (
       finalHop,
       args.req.signal,
     );
-    if (resp === null) return "retry"; // pre-commit on every round: nothing sent
+    // Round 0 keeps `serveSubscription`'s walk semantics (nothing consumed
+    // yet). A LATER round already burned echo rounds + tokens on this hop —
+    // walking to another provider would silently discard that usage and
+    // re-run the whole conversation, so surface the continuation failure
+    // instead and record what was consumed.
+    if (resp === null) {
+      if (round === 0) return "retry";
+      recordOnce("error");
+      return errorJson(
+        502,
+        "kimi built-in web search: continuation round failed (network)",
+      );
+    }
     if (!resp.ok) {
       const raw = await resp.text().catch(() => "");
       if (
+        round === 0 &&
         !finalHop &&
         classifyPrecommitResponse(
           resp.status,
@@ -998,8 +1011,17 @@ const serveKimiBuiltinSearch = async (
     }
     addTokens(rawJson);
 
-    const builtinCalls =
-      round < KIMI_SEARCH_MAX_ROUNDS ? kimiBuiltinSearchCalls(rawJson) : null;
+    const builtinCalls = kimiBuiltinSearchCalls(rawJson);
+    // Round ceiling: a model STILL searching at the cap cannot be decoded as
+    // a final answer (its builtin tool_calls would fail the canonical decode
+    // and leak raw kimi JSON to the client) — fail explicitly instead.
+    if (builtinCalls !== null && round >= KIMI_SEARCH_MAX_ROUNDS) {
+      recordOnce("error");
+      return errorJson(
+        502,
+        `kimi built-in web search exceeded the round limit (${KIMI_SEARCH_MAX_ROUNDS})`,
+      );
+    }
     if (builtinCalls === null) {
       // FINAL round — decode canonically, attach the executed searches, and
       // re-encode for the client.
