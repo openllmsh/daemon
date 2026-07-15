@@ -736,6 +736,14 @@ const sanitizeErrorLine = (err: unknown, max: number): string => {
   return line.length > max ? `${line.slice(0, max)}…` : line;
 };
 
+/** The vendor's error line with its type code preserved (the anthropic
+ *  decoder throws a plain message; the chatgpt decoder already embeds the
+ *  code — don't double it). */
+const upstreamErrorLine = (err: UpstreamStreamError): string => {
+  const { type, message } = upstreamErrorFrom(err);
+  return message.startsWith(type) ? message : `${type}: ${message}`;
+};
+
 /**
  * Classify a `serveWithWebSearch` round decode failure into a sanitized
  * diagnostic. `upstream_error` keeps the vendor's own error type + message
@@ -751,11 +759,7 @@ export const describeWebSearchDecodeFailure = (
   let detail: string;
   if (err instanceof UpstreamStreamError) {
     stage = "upstream_error";
-    const { type, message } = upstreamErrorFrom(err);
-    detail = sanitizeErrorLine(
-      message.startsWith(type) ? message : `${type}: ${message}`,
-      300,
-    );
+    detail = sanitizeErrorLine(upstreamErrorLine(err), 300);
   } else if (err instanceof SyntaxError) {
     stage = "json_parse";
     detail = sanitizeErrorLine(err, 160);
@@ -1228,11 +1232,16 @@ const serveSubscription = async (
     } catch (err) {
       recordTokens(ZERO_TOKENS);
       // Same erasure class as the web_search decode 502 (issue #274): keep
-      // the vendor's terminal error / the drain failure's first line instead
-      // of a bare generic message.
+      // the vendor's terminal error (with its upstreamType code, not the
+      // UpstreamStreamError class name) / the drain failure's first line
+      // instead of a bare generic message.
+      const detail =
+        err instanceof UpstreamStreamError
+          ? sanitizeErrorLine(upstreamErrorLine(err), 300)
+          : sanitizeErrorLine(err, 300);
       return errorJson(
         502,
-        `upstream stream ended before producing output: ${sanitizeErrorLine(err, 300)}`,
+        `upstream stream ended before producing output: ${detail}`,
       );
     }
     recordTokens(tokensFromResponse(canonical));
