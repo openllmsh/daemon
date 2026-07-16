@@ -878,12 +878,40 @@ const serveSubscription = async (
         .then((r) => recordTokens(tokensFromResponse(r)))
         .catch(() => recordTokens(ZERO_TOKENS));
     };
+    // Shared terminal handling for a FIRST-event in-stream rejection
+    // caught by the pre-commit peek (both branches below): a non-final
+    // hop WALKS; the final hop surfaces a 502 recorded as an ERROR row.
+    const peekedError = (error: unknown): Response | "retry" => {
+      if (!finalHop && !args.req.signal.aborted) return "retry";
+      const detail =
+        error instanceof UpstreamStreamError
+          ? sanitizeErrorLine(upstreamErrorLine(error), 300)
+          : sanitizeErrorLine(error, 300);
+      report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
+      return errorJson(
+        502,
+        `upstream stream ended before producing output: ${detail}`,
+      );
+    };
     if (passthrough) {
       // Same wire in and out — the client gets the upstream bytes verbatim
       // (no transform round-trip that could alter them); a tee'd copy is
-      // decoded purely to meter.
+      // decoded purely to meter. The meter branch doubles as the
+      // pre-commit peek: an in-stream rejection that precedes any output
+      // (Anthropic emits `event: error` on a 200 for overloaded_error
+      // etc.) surfaces BEFORE the byte-verbatim response is committed, so
+      // a non-final hop can walk instead of dying inside a committed
+      // stream. The client branch stays byte-verbatim either way.
       const [toClient, toMeter] = resp.body.tee();
-      meter(decodeUpstreamStream(wire, toMeter, hop.providerModelId));
+      const peeked = await peekFirstChunk(
+        decodeUpstreamStream(wire, toMeter, hop.providerModelId),
+        FIRST_EVENT_PEEK_MS,
+      );
+      if (peeked.kind === "error") {
+        void toClient.cancel().catch(() => undefined);
+        return peekedError(peeked.error);
+      }
+      meter(peeked.chunks);
       return new Response(heartbeat(toClient), {
         status: resp.status,
         headers: passthroughHeaders(resp),
@@ -898,18 +926,7 @@ const serveSubscription = async (
       decodeUpstreamStream(wire, resp.body, hop.providerModelId),
       FIRST_EVENT_PEEK_MS,
     );
-    if (peeked.kind === "error") {
-      if (!finalHop && !args.req.signal.aborted) return "retry";
-      const detail =
-        peeked.error instanceof UpstreamStreamError
-          ? sanitizeErrorLine(upstreamErrorLine(peeked.error), 300)
-          : sanitizeErrorLine(peeked.error, 300);
-      report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
-      return errorJson(
-        502,
-        `upstream stream ended before producing output: ${detail}`,
-      );
-    }
+    if (peeked.kind === "error") return peekedError(peeked.error);
     const [toClient, toMeter] = peeked.chunks.tee();
     meter(toMeter);
     const clientBytes = sseBytesForClient(toClient, args.surface, clientWire);
