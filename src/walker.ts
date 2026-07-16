@@ -850,6 +850,24 @@ const serveSubscription = async (
   const recordTokens = (u: TNativeTokens): void =>
     report({ ...baseRow, ...u }, args.originParam);
 
+  // Shared terminal handling for a FIRST-event in-stream rejection caught
+  // by the pre-commit peek (streaming passthrough, streaming cross-wire,
+  // and the JSON drain): a non-final hop WALKS — nothing was generated,
+  // so the walk cannot double-spend; the final hop surfaces a 502
+  // recorded as an ERROR row.
+  const peekedError = (error: unknown): Response | "retry" => {
+    if (!finalHop && !args.req.signal.aborted) return "retry";
+    const detail =
+      error instanceof UpstreamStreamError
+        ? sanitizeErrorLine(upstreamErrorLine(error), 300)
+        : sanitizeErrorLine(error, 300);
+    report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
+    return errorJson(
+      502,
+      `upstream stream ended before producing output: ${detail}`,
+    );
+  };
+
   // ── Client wants a live stream ──────────────────────────────────────
   // First-class path: stream chunk-by-chunk, re-encoding to the client's
   // wire as bytes arrive. (upstreamStreams is always true here — chatgpt
@@ -877,21 +895,6 @@ const serveSubscription = async (
       void accumulateChunksToResponse(chunks, hop.providerModelId)
         .then((r) => recordTokens(tokensFromResponse(r)))
         .catch(() => recordTokens(ZERO_TOKENS));
-    };
-    // Shared terminal handling for a FIRST-event in-stream rejection
-    // caught by the pre-commit peek (both branches below): a non-final
-    // hop WALKS; the final hop surfaces a 502 recorded as an ERROR row.
-    const peekedError = (error: unknown): Response | "retry" => {
-      if (!finalHop && !args.req.signal.aborted) return "retry";
-      const detail =
-        error instanceof UpstreamStreamError
-          ? sanitizeErrorLine(upstreamErrorLine(error), 300)
-          : sanitizeErrorLine(error, 300);
-      report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
-      return errorJson(
-        502,
-        `upstream stream ended before producing output: ${detail}`,
-      );
     };
     if (passthrough) {
       // Same wire in and out — the client gets the upstream bytes verbatim
@@ -943,27 +946,32 @@ const serveSubscription = async (
 
   if (upstreamStreams) {
     // The upstream streamed but the client wants JSON (chatgpt, whose Codex
-    // endpoint always streams): DRAIN the SSE → accumulate → one response.
+    // endpoint always streams): peek the first event, then DRAIN → one
+    // response. The peek splits the two failure classes: a FIRST-event
+    // rejection (the gpt-5.6 overflow incident shape: HTTP 200, then
+    // `error: Your input exceeds the context window`) arrives before the
+    // vendor generated anything, so a non-final hop WALKS without
+    // double-generation; a failure AFTER output began is terminal — the
+    // vendor already spent tokens on this turn, so it is never
+    // re-dispatched.
+    const peeked = await peekFirstChunk(
+      decodeUpstreamStream(wire, resp.body, hop.providerModelId),
+      FIRST_EVENT_PEEK_MS,
+    );
+    if (peeked.kind === "error") return peekedError(peeked.error);
     let canonical: TChatCompletionResponse;
     try {
       canonical = await accumulateChunksToResponse(
-        decodeUpstreamStream(wire, resp.body, hop.providerModelId),
+        peeked.chunks,
         hop.providerModelId,
       );
     } catch (err) {
-      // The drain threw before ANY output reached the client, so the hop is
-      // still an uncommitted candidate in JSON mode — a non-final hop WALKS
-      // (the gpt-5.6 overflow incident shape: HTTP 200, then a first event
-      // `error: Your input exceeds the context window`). Zero tokens were
-      // metered on the failed attempt, so the walk cannot double-bill;
-      // nothing is recorded for a walked hop (parity with the pre-commit
-      // non-ok path).
-      if (!finalHop && !args.req.signal.aborted) return "retry";
-      // Keep the vendor's terminal error (with its upstreamType code, not the
-      // UpstreamStreamError class name) / the drain failure's first line
-      // instead of a bare generic message. Recorded as an ERROR row — the
-      // client receives a 502, so `statusFor(resp.status)`'s "success" (from
-      // the upstream 200) would misreport the outcome.
+      // Mid-drain failure (output had begun): terminal, never retried.
+      // Keep the vendor's terminal error (with its upstreamType code, not
+      // the UpstreamStreamError class name) / the drain failure's first
+      // line instead of a bare generic message. Recorded as an ERROR row —
+      // the client receives a 502, so `statusFor(resp.status)`'s "success"
+      // (from the upstream 200) would misreport the outcome.
       const detail =
         err instanceof UpstreamStreamError
           ? sanitizeErrorLine(upstreamErrorLine(err), 300)
@@ -971,7 +979,7 @@ const serveSubscription = async (
       report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
       return errorJson(
         502,
-        `upstream stream ended before producing output: ${detail}`,
+        `upstream stream failed after output began: ${detail}`,
       );
     }
     recordTokens(tokensFromResponse(canonical));
