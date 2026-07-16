@@ -27,8 +27,8 @@ API-key (BYOK) providers keep running on the hosted gateway; only
 subscription chains need the daemon.
 
 Coreless by construction: links only
-[`@quantidexyz/openllmw`](https://github.com/quantidexyz/openllmw) +
-[`@quantidexyz/openllmp`](https://github.com/quantidexyz/openllmp) — never the
+[`@openllmsh/wire`](https://github.com/openllmsh/wire) +
+[`@openllmsh/protocol`](https://github.com/openllmsh/protocol) — never the
 proprietary cloud pipeline.
 
 ## Install
@@ -45,7 +45,7 @@ openllmd status
 Or consume the source as a package:
 
 ```sh
-bun install github:quantidexyz/openllmd # latest
+bun install github:openllmsh/daemon # latest
 ```
 
 ## Verify

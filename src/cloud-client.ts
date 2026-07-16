@@ -15,12 +15,12 @@ import type {
   TDaemonModelReport,
   TDaemonRecordRequest,
   TRelayChannelResponse,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import {
   DAEMON_DEVICE_ID_HEADER,
   DAEMON_DEVICE_LABEL_HEADER,
   RelayChannelResponse,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
 

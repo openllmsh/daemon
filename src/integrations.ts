@@ -19,7 +19,7 @@
  * binary's checksum gate in `packages/registry/setup/daemon/install.sh`.
  */
 import { createHash } from "node:crypto";
-import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";
+import type { TDaemonIntegrationKind } from "@openllmsh/protocol";
 import { daemonEnv } from "./env";
 import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";

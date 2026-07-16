@@ -8,7 +8,7 @@
  * long-poll anymore — the relay socket is the daemon's only control transport.
  */
 
-import type { TDaemonCommand, TDaemonCommandAck } from "@quantidexyz/openllmp";
+import type { TDaemonCommand, TDaemonCommandAck } from "@openllmsh/protocol";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";

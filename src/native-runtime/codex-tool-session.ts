@@ -25,7 +25,7 @@
  * protocol `callId` (not positional — unlike the Claude path's earlier bug).
  */
 
-import type { TServerSearchCall } from "@quantidexyz/openllmp";
+import type { TServerSearchCall } from "@openllmsh/protocol";
 import type {
   TClientTool,
   TToolCallOut,

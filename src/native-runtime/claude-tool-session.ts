@@ -30,7 +30,7 @@ import {
 import type {
   TChatCompletionResponse,
   TServerSearchCall,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
 import type { TNativeTokens } from "./types";

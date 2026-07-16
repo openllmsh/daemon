@@ -16,7 +16,7 @@
 import type {
   TDaemonInstalledIntegration,
   TDaemonIntegrationKind,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { daemonEnv } from "./env";
 import { runIntegration } from "./integrations";
 import { logDebug, logWarn } from "./logger";

@@ -9,7 +9,7 @@
  * (relay persistence, the calibration estimator, the UI all consume only
  * the canonical struct).
  */
-import type { TProviderUsageWindow } from "@quantidexyz/openllmp";
+import type { TProviderUsageWindow } from "@openllmsh/protocol";
 
 /**
  * Duration label for a vendor-stated quota window — "5-hour", "7-day",

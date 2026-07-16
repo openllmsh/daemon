@@ -11,10 +11,10 @@
  * answer — currently starts fresh; that's the documented follow-up.)
  */
 
-import type { TChatCompletionRequest } from "@quantidexyz/openllmp";
-import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
-import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
-import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
+import type { TChatCompletionRequest } from "@openllmsh/protocol";
+import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
+import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
+import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import {
   heartbeatOptionsFor,
   jsonBodyForClient,

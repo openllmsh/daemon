@@ -15,7 +15,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { TSubscriptionProviderSlug } from "@quantidexyz/openllmp";
+import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
 import { stateDir } from "./env";
 import { resolveOnPath } from "./path-utils";
 import { daemonTempDir } from "./sandbox/working-set";

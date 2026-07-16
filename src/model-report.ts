@@ -19,7 +19,7 @@
  * Metadata only — model ids + optional display/context data; failures
  * are silently dropped (the cloud falls back to the static catalog).
  */
-import type { TDaemonModelReportEntry } from "@quantidexyz/openllmp";
+import type { TDaemonModelReportEntry } from "@openllmsh/protocol";
 import { reportModels } from "./cloud-client";
 import { DELEGATES } from "./delegation";
 

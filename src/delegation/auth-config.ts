@@ -15,7 +15,7 @@
  *
  * Bright line (terms-compliance): NOTHING here is replayed as inference
  * identity. The daemon serves each request with the ORIGINATOR's own headers
- * (`@quantidexyz/openllmw/lib/forwarded-headers`) + the injected bearer; this config
+ * (`@openllmsh/wire/lib/forwarded-headers`) + the injected bearer; this config
  * supplies only the request TARGET URL. The volatile/secret `authorization`
  * header is never captured or stored.
  *

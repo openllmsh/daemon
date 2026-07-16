@@ -24,7 +24,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { stateDir } from "../env";
 
 /**

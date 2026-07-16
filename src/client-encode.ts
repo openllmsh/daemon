@@ -13,14 +13,14 @@ import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
   THeartbeatOptions,
-} from "@quantidexyz/openllmp";
-import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
-import { chunksToMessagesSseBytes } from "@quantidexyz/openllmw/adapters/messages/streaming";
+} from "@openllmsh/protocol";
+import { toAnthropicMessagesResponse } from "@openllmsh/wire/adapters/messages/response";
+import { chunksToMessagesSseBytes } from "@openllmsh/wire/adapters/messages/streaming";
 import {
   chunksToResponsesSseBytes,
   toResponsesResponse,
-} from "@quantidexyz/openllmw/adapters/responses";
-import { chunksToSseBytes } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
+} from "@openllmsh/wire/adapters/responses";
+import { chunksToSseBytes } from "@openllmsh/wire/lib/streaming/provider-decode";
 
 export type TClientSurface = "chat_completions" | "messages" | "responses";
 

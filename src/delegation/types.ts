@@ -2,7 +2,7 @@ import type {
   TDaemonProviderConnection,
   TProviderModelEntry,
   TProviderUsageSnapshot,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 /**
  * A provider delegate wraps ONE official vendor CLI (Claude Code, Codex,

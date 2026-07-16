@@ -31,12 +31,12 @@
  */
 
 import { existsSync } from "node:fs";
-import type { TChatCompletionChunk } from "@quantidexyz/openllmp";
-import { AnthropicStreamEvent } from "@quantidexyz/openllmp";
+import type { TChatCompletionChunk } from "@openllmsh/protocol";
+import { AnthropicStreamEvent } from "@openllmsh/protocol";
 import {
   fromAnthropicStreamEvent,
   newAnthropicStreamState,
-} from "@quantidexyz/openllmw/providers/anthropic/streaming";
+} from "@openllmsh/wire/providers/anthropic/streaming";
 import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";

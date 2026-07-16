@@ -32,7 +32,7 @@ import { join } from "node:path";
 import type {
   TProviderUsageSnapshot,
   TProviderUsageWindow,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logWarn } from "../logger";

@@ -13,11 +13,11 @@
  *     - PRE-STREAM candidate failure → next hop (unless client aborted)
  *     - committed (response received, ok) → stream straight to the client
  *
- * Coreless: imports `@quantidexyz/openllmw` + `@quantidexyz/openllmp` + local modules
+ * Coreless: imports `@openllmsh/wire` + `@openllmsh/protocol` + local modules
  * only — NEVER `@openllm/core`. The pure provider wire transforms
  * (request/response/streaming for anthropic + chatgpt, the canonical
  * message adapters, and the SSE decode/encode primitives) all live in
- * `@quantidexyz/openllmw`; the walker wires them into a tiny per-hop mini-runner.
+ * `@openllmsh/wire`; the walker wires them into a tiny per-hop mini-runner.
  *
  * Serves all three subscription providers + cross-wire:
  *   - claude_code (Anthropic upstream): passthrough for an Anthropic-wire
@@ -49,43 +49,43 @@ import {
   type TErrorEnvelope,
   type TRequestStatus,
   type TServerSearchCall,
-} from "@quantidexyz/openllmp";
-import { declaresAnthropicServerSearchTool } from "@quantidexyz/openllmw/adapters/messages/request";
-import { fitRequestToHopBudget } from "@quantidexyz/openllmw/features/compaction/tool-output-compact";
-import { estimateBodyTokens } from "@quantidexyz/openllmw/lib/canonical/token-estimate";
+} from "@openllmsh/protocol";
+import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
+import { fitRequestToHopBudget } from "@openllmsh/wire/features/compaction/tool-output-compact";
+import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
   responsesBodyHasEncryptedContent,
   stripResponsesEncryptedContent,
-} from "@quantidexyz/openllmw/lib/encrypted-content";
-import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
-import { originatorHeadersFrom } from "@quantidexyz/openllmw/lib/forwarded-headers";
-import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
-import { decodeProviderEventStream } from "@quantidexyz/openllmw/lib/streaming/provider-decode";
-import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
-import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
+} from "@openllmsh/wire/lib/encrypted-content";
+import { classifyHopError } from "@openllmsh/wire/lib/error-class";
+import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
+import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
+import { decodeProviderEventStream } from "@openllmsh/wire/lib/streaming/provider-decode";
+import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
+import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
 import {
   UpstreamStreamError,
   upstreamErrorFrom,
-} from "@quantidexyz/openllmw/lib/streaming/upstream-error";
-import { stripSchemaKeywords } from "@quantidexyz/openllmw/lib/tool-schema";
-import { fromAnthropicResponse } from "@quantidexyz/openllmw/providers/anthropic/response";
+} from "@openllmsh/wire/lib/streaming/upstream-error";
+import { stripSchemaKeywords } from "@openllmsh/wire/lib/tool-schema";
+import { fromAnthropicResponse } from "@openllmsh/wire/providers/anthropic/response";
 import {
   fromAnthropicStreamEvent,
   newAnthropicStreamState,
-} from "@quantidexyz/openllmw/providers/anthropic/streaming";
+} from "@openllmsh/wire/providers/anthropic/streaming";
 import {
   chatGptEventToChunk,
   newChatGptStreamState,
   type TChatGptStreamEvent,
-} from "@quantidexyz/openllmw/providers/chatgpt/streaming";
-import { withGrokNativeSearch } from "@quantidexyz/openllmw/providers/grok/web-search";
+} from "@openllmsh/wire/providers/chatgpt/streaming";
+import { withGrokNativeSearch } from "@openllmsh/wire/providers/grok/web-search";
 import {
   KIMI_SEARCH_MAX_ROUNDS,
   kimiBuiltinSearchCalls,
   kimiSearchEchoMessages,
   withKimiBuiltinSearch,
-} from "@quantidexyz/openllmw/providers/kimi/web-search";
+} from "@openllmsh/wire/providers/kimi/web-search";
 // The SINGLE (clientWire × upstreamWire) request recipe — shared with the
 // cloud runner so the two can't drift (this fork caused two regressions). See
 // `docs/proposals/unified-upstream-request-builder.md`.
@@ -93,7 +93,7 @@ import {
   buildUpstreamRequest,
   canonicalFromInbound,
   clientWireOf,
-} from "@quantidexyz/openllmw/providers/upstream-request";
+} from "@openllmsh/wire/providers/upstream-request";
 import { Schema } from "effect";
 import {
   heartbeatOptionsFor,
@@ -481,7 +481,7 @@ const report = (row: TDaemonRecordRequest, origin: string | null): void => {
 const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
 
 // The (clientWire × upstreamWire) request recipe — body + headers — lives in
-// `@quantidexyz/openllmw/providers/upstream-request` (buildUpstreamRequest /
+// `@openllmsh/wire/providers/upstream-request` (buildUpstreamRequest /
 // buildUpstreamHeaders / buildUpstreamBody / canonicalToUpstreamBody /
 // canonicalFromInbound / clientWireOf). The walker is a thin caller; it never
 // re-derives the recipe (that fork caused two regressions).
@@ -1024,7 +1024,7 @@ const serveSubscription = async (
 /**
  * Serve a kimi_code hop whose client declared the Anthropic server search
  * tool, over Moonshot's builtin `$web_search` PROTOCOL ECHO (see
- * `@quantidexyz/openllmw/providers/kimi/web-search`): each round's builtin
+ * `@openllmsh/wire/providers/kimi/web-search`): each round's builtin
  * tool calls are answered by echoing their opaque arguments back verbatim —
  * the search already ran server-side; Moonshot injects the stored results
  * into context on the next round. The walker extracts nothing, executes

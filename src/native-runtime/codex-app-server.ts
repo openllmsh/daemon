@@ -28,7 +28,7 @@ import type {
   TChatCompletionChunk,
   TServerSearchCall,
   TUsage,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { DAEMON_VERSION } from "../version";

@@ -93,7 +93,7 @@ export const maybeUpdateCli = async (
     // building the host binary (`bun run compile:host`).
     logWarn(
       "cli-update",
-      `unsupported host ${process.platform}-${process.arch} — no prebuilt openllmc for this arch; build from source: https://github.com/quantidexyz/openllmc#build-from-source`,
+      `unsupported host ${process.platform}-${process.arch} — no prebuilt openllmc for this arch; build from source: https://github.com/openllmsh/cli#build-from-source`,
     );
     return;
   }

@@ -9,7 +9,7 @@
 import type { TDaemonRelease } from "./release-types";
 
 export const DAEMON_RELEASE: TDaemonRelease = {
-  repo: "quantidexyz/openllmd",
+  repo: "openllmsh/daemon",
   tag: "v1.6.32",
   targets: [
     "darwin-arm64",

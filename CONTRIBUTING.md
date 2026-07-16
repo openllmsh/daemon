@@ -1,4 +1,4 @@
-# Contributing to `@quantidexyz/openllmd`
+# Contributing to `@openllmsh/daemon`
 
 This repository is a **read-only mirror**, regenerated from the OpenLLM
 monorepo on every release. Do not expect merges here to stick — the mirror's

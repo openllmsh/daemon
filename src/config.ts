@@ -17,7 +17,7 @@
 import type {
   TDaemonBootstrap,
   TDaemonCatalogEntry,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import {
   fetchBootstrap,
   InvalidApiKeyError,

@@ -1,5 +1,5 @@
-import type { TProviderModelEntry } from "@quantidexyz/openllmp";
-import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@quantidexyz/openllmp";
+import type { TProviderModelEntry } from "@openllmsh/protocol";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 
 /**
  * Coerce a provider-reported value into a positive integer, or

@@ -7,7 +7,7 @@
  * + reflect an allowed origin. Access control stays the localhost bind +
  * this origin lock — no control token.
  */
-import { NO_DAEMON_HEADER } from "@quantidexyz/openllmp";
+import { NO_DAEMON_HEADER } from "@openllmsh/protocol";
 import { daemonEnv, isDevMode } from "./env";
 
 /**

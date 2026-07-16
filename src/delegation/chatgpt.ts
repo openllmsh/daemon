@@ -21,7 +21,7 @@
  */
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
+import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import { logError, logInfo } from "../logger";

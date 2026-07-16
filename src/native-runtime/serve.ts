@@ -18,11 +18,11 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
-} from "@quantidexyz/openllmp";
-import { declaresAnthropicServerSearchTool } from "@quantidexyz/openllmw/adapters/messages/request";
-import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
-import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
-import { clientWireOf } from "@quantidexyz/openllmw/providers/upstream-request";
+} from "@openllmsh/protocol";
+import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
+import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
+import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
+import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
 import {
   heartbeatOptionsFor,
