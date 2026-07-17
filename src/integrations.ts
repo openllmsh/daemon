@@ -34,6 +34,20 @@ const fail = (output: string): TIntegrationResult => {
   return { ok: false, code: 1, output };
 };
 
+/** A loopback gateway (local `vercel dev`/`next dev`) — the ONLY origin whose
+ *  pointer may name a same-origin dev script URL instead of an immutable
+ *  raw-GitHub commit URL. Any non-loopback origin keeps the strict contract. */
+const isLoopbackOrigin = (origin: string): boolean => {
+  try {
+    const { hostname } = new URL(origin);
+    return (
+      hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1"
+    );
+  } catch {
+    return false;
+  }
+};
+
 const fetchPointer = async (
   cloudOrigin: string,
   area: "plugin" | "setup",
@@ -63,11 +77,14 @@ const fetchPointer = async (
     ) {
       return null;
     }
-    validateRegistryRawUrl(body.script_url, {
-      area,
-      slug,
-      filename: "install.sh",
-    });
+    const devScriptUrl = `${cloudOrigin}/api/${routeArea}/${encodeURIComponent(slug)}/local-script`;
+    if (!(isLoopbackOrigin(cloudOrigin) && body.script_url === devScriptUrl)) {
+      validateRegistryRawUrl(body.script_url, {
+        area,
+        slug,
+        filename: "install.sh",
+      });
+    }
     return {
       scriptUrl: body.script_url,
       scriptSha256: body.script_sha256,
