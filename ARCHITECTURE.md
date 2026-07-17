@@ -72,6 +72,12 @@ daemon/
                             of the cloud's bootstrap-published ACTIVE_SUB_METHOD preference — a
                             `handrolled` selection never probes/spawns the native bridge
                             (docs/proposals/active-sub-method.md)
+    plan-cache.ts           flag-gated signed-plan cache (bootstrap `plan_cache`, default off): a
+                            direct plan-less /v1/* request replays the last cloud-signed tuple for
+                            its alias within a short TTL — signature still verified per request
+    client-encode.ts        client-wire encoders + the SHARED DELIVERY TAIL both execution methods
+                            end in (deliverChunkStream: tee → meter → encode + heartbeat;
+                            deliverJsonResponse; sseResponseForClient for pre-metered turns)
     control.ts              localhost control surface (/status,/events,/connect,/usage,/config)
     control-channel.ts      outbound relay WebSocket (partysocket) — hello/status/ack frames, heartbeat, and migrateIfRelayMoved (bootstrap-tick channel re-fetch: reconnect when a deploy moved the relay to a new content-addressed box)
     status.ts               computeStatus() — shared snapshot for /status + /events

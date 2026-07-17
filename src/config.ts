@@ -24,6 +24,7 @@ import {
   InvalidApiKeyError,
   NoApiKeyError,
 } from "./cloud-client";
+import { clearPlanCache } from "./plan-cache";
 
 const EMPTY: TDaemonBootstrap = {
   catalog: [],
@@ -64,6 +65,9 @@ export const refreshBootstrap = async (): Promise<boolean> => {
     snapshot = await fetchBootstrap();
     byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
     cloudState = "ok";
+    // A fresh snapshot may carry new routing config — drop any cached signed
+    // plans so a stale chain never outlives the config that produced it.
+    clearPlanCache();
   } catch (err) {
     if (err instanceof NoApiKeyError) cloudState = "no_key";
     else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
@@ -91,6 +95,12 @@ export const planSigningKey = (): string | null =>
  */
 export const activeSubMethod = (): TSubMethod | null =>
   snapshot.active_sub_method ?? null;
+
+/**
+ * Cloud-controlled opt-in for the daemon's signed-plan cache (default off —
+ * absent on older clouds keeps the rider inert). See `plan-cache.ts`.
+ */
+export const planCacheEnabled = (): boolean => snapshot.plan_cache === true;
 
 /**
  * The daemon version the cloud currently publishes (bare semver), from the last

@@ -20,7 +20,9 @@ import {
   ResponsesRequest,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
+import { planCacheEnabled } from "./config";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
+import { lookupPlan, storePlan } from "./plan-cache";
 import { runWalker } from "./walker";
 
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
@@ -83,6 +85,28 @@ export const handleInference = async (req: Request): Promise<Response> => {
     );
   }
 
+  // Signed-plan cache (flag-gated rider — `plan-cache.ts`, default off). A
+  // 307-borne request remembers its signed tuple per model alias; a DIRECT
+  // request (no `?__plan=`) within the TTL replays it, skipping the cloud
+  // round trip. The walker verifies the signature either way, so the flag
+  // being off (or a cache miss) is exactly the pre-rider flow: no plan → the
+  // walker's clean 400.
+  let planParam = url.searchParams.get("__plan");
+  let pmidsParam = url.searchParams.get("__pmids");
+  let originParam = url.searchParams.get("__origin");
+  let sigParam = url.searchParams.get("__sig");
+  const alias = (rawBody as { model?: unknown } | null)?.model;
+  if (planCacheEnabled() && typeof alias === "string" && alias.length > 0) {
+    if (planParam !== null) {
+      storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
+    } else {
+      const cached = lookupPlan(alias);
+      if (cached !== null) {
+        ({ planParam, pmidsParam, originParam, sigParam } = cached);
+      }
+    }
+  }
+
   return withCors(
     req,
     await runWalker({
@@ -91,10 +115,10 @@ export const handleInference = async (req: Request): Promise<Response> => {
       endpoint,
       rawBody,
       rawBytes,
-      planParam: url.searchParams.get("__plan"),
-      pmidsParam: url.searchParams.get("__pmids"),
-      originParam: url.searchParams.get("__origin"),
-      sigParam: url.searchParams.get("__sig"),
+      planParam,
+      pmidsParam,
+      originParam,
+      sigParam,
       startedAt,
     }),
   );
