@@ -21,14 +21,9 @@ import type {
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
-import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
-import {
-  heartbeatOptionsFor,
-  jsonBodyForClient,
-  sseBytesForClient,
-} from "../client-encode";
+import { deliverChunkStream, deliverJsonResponse } from "../client-encode";
 import { errorJson } from "../cors";
 import { runClaudeNative } from "./claude-native";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
@@ -252,27 +247,15 @@ export const tryServeNativeRuntime = async (
 
   const clientWire = clientWireOf(params.surface);
 
-  // ── Streaming client: tee → meter + encode (walker parity) ──────────
+  // ── Streaming client: the shared delivery tail (walker parity) ──────
   if (params.wantsStream) {
-    const [toClient, toMeter] = committed.chunks.tee();
-    void accumulateChunksToResponse(toMeter, params.providerModelId)
-      .then(settle)
-      .catch(fail);
-    const clientBytes = sseBytesForClient(toClient, params.surface, clientWire);
-    return new Response(
-      withFrameAlignedHeartbeat(
-        clientBytes,
-        heartbeatOptionsFor(params.surface),
-      ),
-      {
-        status: 200,
-        headers: {
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache",
-          connection: "keep-alive",
-        },
-      },
-    );
+    return deliverChunkStream(committed.chunks, {
+      surface: params.surface,
+      clientWire,
+      providerModelId: params.providerModelId,
+      onResponse: settle,
+      onError: fail,
+    });
   }
 
   // ── JSON client: accumulate → record + advance session → re-encode ──
@@ -287,11 +270,7 @@ export const tryServeNativeRuntime = async (
     return errorJson(502, "native runtime stream ended before output");
   }
   settle(canonical);
-  const body = jsonBodyForClient(canonical, params.surface, clientWire);
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  return deliverJsonResponse(canonical, params.surface, clientWire);
 };
 
 export type { TChatCompletionChunk };

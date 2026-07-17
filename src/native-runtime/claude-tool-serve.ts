@@ -13,12 +13,10 @@
 
 import type { TChatCompletionRequest } from "@openllmsh/protocol";
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
-import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import {
-  heartbeatOptionsFor,
-  jsonBodyForClient,
-  sseBytesForClient,
+  deliverJsonResponse,
+  sseResponseForClient,
 } from "../client-encode";
 import type { TClientTool, TIteratorFactory } from "./claude-tool-session";
 import {
@@ -182,29 +180,15 @@ export const tryServeNativeToolTurn = async (
   // is independent (the client sends its tool results in the NEXT request), so
   // streaming a single completion is correct.
   if (params.wantsStream) {
-    const bytes = sseBytesForClient(
+    // Tokens were already recorded above — encode-only, no meter tee.
+    return sseResponseForClient(
       responseToChunkStream(canonicalResp),
       params.surface,
       clientWire,
     );
-    return new Response(
-      withFrameAlignedHeartbeat(bytes, heartbeatOptionsFor(params.surface)),
-      {
-        status: 200,
-        headers: {
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache",
-          connection: "keep-alive",
-        },
-      },
-    );
   }
 
-  const body = jsonBodyForClient(canonicalResp, params.surface, clientWire);
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  return deliverJsonResponse(canonicalResp, params.surface, clientWire);
 };
 
 /** Render one prior message into the lossy multi-turn seed transcript. */

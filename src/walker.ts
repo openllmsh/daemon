@@ -96,9 +96,10 @@ import {
 } from "@openllmsh/wire/providers/upstream-request";
 import { Schema } from "effect";
 import {
+  deliverChunkStream,
+  deliverJsonResponse,
   heartbeatOptionsFor,
-  jsonBodyForClient,
-  sseBytesForClient,
+  sseResponseForClient,
 } from "./client-encode";
 import { recordRequest } from "./cloud-client";
 import { activeSubMethod, lookupCatalogEntry, planSigningKey } from "./config";
@@ -874,11 +875,6 @@ const serveSubscription = async (
   // wire as bytes arrive. (upstreamStreams is always true here — chatgpt
   // always streams; anthropic/kimi stream because the client asked.)
   if (clientWantsStream) {
-    const sseHeaders = {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    } as const;
     // Keep the (localhost) client connection warm while the upstream is
     // quiet during a long reasoning / tool run — the same "chat stopped
     // while it was actually doing something" symptom the cloud guards. The
@@ -921,29 +917,30 @@ const serveSubscription = async (
         headers: passthroughHeaders(resp),
       });
     }
-    // Cross-wire (or chatgpt): decode → peek → tee → re-encode + meter.
-    // The bounded first-event peek keeps the response uncommitted long
-    // enough for a pre-output in-stream rejection (context overflow) to
-    // WALK a non-final hop instead of dying inside a committed stream; a
-    // quiet-but-healthy turn commits at the deadline and streams as before.
+    // Cross-wire (or chatgpt): decode → peek → the shared delivery tail
+    // (tee → meter + re-encode + heartbeat — `deliverChunkStream`, the same
+    // tail the native bridge uses). The bounded first-event peek keeps the
+    // response uncommitted long enough for a pre-output in-stream rejection
+    // (context overflow) to WALK a non-final hop instead of dying inside a
+    // committed stream; a quiet-but-healthy turn commits at the deadline and
+    // streams as before.
     const peeked = await peekFirstChunk(
       decodeUpstreamStream(wire, resp.body, hop.providerModelId),
       FIRST_EVENT_PEEK_MS,
     );
     if (peeked.kind === "error") return peekedError(peeked.error);
-    const [toClient, toMeter] = peeked.chunks.tee();
-    meter(toMeter);
-    const clientBytes = sseBytesForClient(toClient, args.surface, clientWire);
-    return new Response(heartbeat(clientBytes), {
+    return deliverChunkStream(peeked.chunks, {
+      surface: args.surface,
+      clientWire,
+      providerModelId: hop.providerModelId,
       status: resp.status,
-      headers: sseHeaders,
+      onResponse: (r) => recordTokens(tokensFromResponse(r)),
+      onError: () => recordTokens(ZERO_TOKENS),
     });
   }
 
   // ── Client wants a single JSON response ─────────────────────────────
   const jsonHeaders = { "content-type": "application/json" } as const;
-  const reencodeJson = (canonical: TChatCompletionResponse): string =>
-    JSON.stringify(jsonBodyForClient(canonical, args.surface, clientWire));
 
   if (upstreamStreams) {
     // The upstream streamed but the client wants JSON (chatgpt, whose Codex
@@ -984,10 +981,7 @@ const serveSubscription = async (
       );
     }
     recordTokens(tokensFromResponse(canonical));
-    return new Response(reencodeJson(canonical), {
-      status: resp.status,
-      headers: jsonHeaders,
-    });
+    return deliverJsonResponse(canonical, args.surface, clientWire, resp.status);
   }
 
   // Upstream returned JSON + client wants JSON (anthropic/kimi non-stream).
@@ -1015,11 +1009,11 @@ const serveSubscription = async (
     });
   }
   recordTokens(tokensFromResponse(canonical));
-  // Passthrough returns the upstream bytes verbatim; cross-wire re-encodes.
-  return new Response(passthrough ? text : reencodeJson(canonical), {
-    status: resp.status,
-    headers: jsonHeaders,
-  });
+  // Passthrough returns the upstream bytes verbatim; cross-wire re-encodes
+  // through the shared delivery tail.
+  return passthrough
+    ? new Response(text, { status: resp.status, headers: jsonHeaders })
+    : deliverJsonResponse(canonical, args.surface, clientWire, resp.status);
 };
 
 /**
@@ -1183,28 +1177,14 @@ const serveKimiBuiltinSearch = async (
             }
           : canonical;
       recordOnce(statusFor(resp.status));
-      if (clientWantsStream) {
-        const bytes = sseBytesForClient(
-          responseToChunkStream(final),
-          args.surface,
-          clientWire,
-        );
-        return new Response(
-          withFrameAlignedHeartbeat(bytes, heartbeatOptionsFor(args.surface)),
-          {
-            status: 200,
-            headers: {
-              "content-type": "text/event-stream; charset=utf-8",
-              "cache-control": "no-cache",
-              connection: "keep-alive",
-            },
-          },
-        );
-      }
-      return new Response(
-        JSON.stringify(jsonBodyForClient(final, args.surface, clientWire)),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      // Tokens already recorded — encode-only via the shared delivery tail.
+      return clientWantsStream
+        ? sseResponseForClient(
+            responseToChunkStream(final),
+            args.surface,
+            clientWire,
+          )
+        : deliverJsonResponse(final, args.surface, clientWire);
     }
 
     // Echo round: report each server-executed search (query is opaque to
