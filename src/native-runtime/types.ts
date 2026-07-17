@@ -357,12 +357,22 @@ export const normalizeNativeTerminalResult = (
   value: unknown,
 ): TNativeTerminalResult => {
   const result = terminalRecord(value);
-  const status = result?.api_error_status;
+  const apiErrorStatus = result?.api_error_status;
   const hasEmbeddedHttpFailure =
-    typeof status === "number" && Number.isFinite(status) && status >= 400;
+    typeof apiErrorStatus === "number" &&
+    Number.isFinite(apiErrorStatus) &&
+    apiErrorStatus >= 400;
   const subtype = terminalString(result?.subtype);
   const terminalStatus = terminalString(result?.status);
   const state = subtype ?? terminalStatus;
+  const hasInvalidDiagnosticField =
+    (result !== null && Object.hasOwn(result, "subtype") && subtype === null) ||
+    (result !== null &&
+      Object.hasOwn(result, "status") &&
+      terminalStatus === null) ||
+    (result !== null &&
+      Object.hasOwn(result, "api_error_status") &&
+      (typeof apiErrorStatus !== "number" || !Number.isFinite(apiErrorStatus)));
   const hasConflictingState =
     subtype !== null && terminalStatus !== null && subtype !== terminalStatus;
   const hasStructuredErrors =
@@ -372,6 +382,7 @@ export const normalizeNativeTerminalResult = (
     state === "success" &&
     result?.is_error === false &&
     !hasEmbeddedHttpFailure &&
+    !hasInvalidDiagnosticField &&
     !hasConflictingState &&
     !hasStructuredErrors
   ) {
