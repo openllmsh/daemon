@@ -68,6 +68,10 @@ daemon/
       seatbelt.ts           macOS Seatbelt backend — in-process sandbox_init() deny-by-default profile (bun:ffi, inherited by children)
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
+    sub-method.ts           per-provider execution-method table (bridge|handrolled) + per-hop selection
+                            of the cloud's bootstrap-published ACTIVE_SUB_METHOD preference — a
+                            `handrolled` selection never probes/spawns the native bridge
+                            (docs/proposals/active-sub-method.md)
     control.ts              localhost control surface (/status,/events,/connect,/usage,/config)
     control-channel.ts      outbound relay WebSocket (partysocket) — hello/status/ack frames, heartbeat, and migrateIfRelayMoved (bootstrap-tick channel re-fetch: reconnect when a deploy moved the relay to a new content-addressed box)
     status.ts               computeStatus() — shared snapshot for /status + /events

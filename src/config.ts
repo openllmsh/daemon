@@ -17,6 +17,7 @@
 import type {
   TDaemonBootstrap,
   TDaemonCatalogEntry,
+  TSubMethod,
 } from "@openllmsh/protocol";
 import {
   fetchBootstrap,
@@ -78,6 +79,18 @@ export const refreshBootstrap = async (): Promise<boolean> => {
  */
 export const planSigningKey = (): string | null =>
   snapshot.plan_signing_key ?? null;
+
+/**
+ * The cloud's resolved `ACTIVE_SUB_METHOD` preference from the last
+ * bootstrap (`bridge` | `handrolled` | null = no preference). The daemon
+ * NEVER reads an `ACTIVE_SUB_METHOD` env of its own — this snapshot field
+ * is the only source; a daemon that has never bootstrapped has no
+ * preference, and a stale snapshot keeps the last-known value. Sampled
+ * once per hop at selection time (`sub-method.ts`) so it never switches
+ * mid-hop. See `docs/proposals/active-sub-method.md`.
+ */
+export const activeSubMethod = (): TSubMethod | null =>
+  snapshot.active_sub_method ?? null;
 
 /**
  * The daemon version the cloud currently publishes (bare semver), from the last

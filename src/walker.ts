@@ -101,7 +101,7 @@ import {
   sseBytesForClient,
 } from "./client-encode";
 import { recordRequest } from "./cloud-client";
-import { lookupCatalogEntry, planSigningKey } from "./config";
+import { activeSubMethod, lookupCatalogEntry, planSigningKey } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
@@ -112,6 +112,7 @@ import {
 } from "./native-runtime/serve";
 import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
+import { selectSubMethod } from "./sub-method";
 import { sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
@@ -1274,6 +1275,12 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
   const baseEstimate = estimateBodyTokens(args.rawBody);
 
+  // The cloud's execution preference, sampled ONCE per request from the
+  // cached bootstrap snapshot so it can never switch mid-hop (a bootstrap
+  // refresh landing mid-walk applies to the NEXT request). Resolved per
+  // hop against the provider's declared methods in `selectSubMethod`.
+  const requestedSubMethod = activeSubMethod();
+
   let lastError: string | null = null;
   for (const [hopIndex, hop] of hops.entries()) {
     const finalHop = hopIndex === hops.length - 1;
@@ -1316,7 +1323,18 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     // pre-commit failure) fall through to the MANUAL transport on the SAME hop
     // (below) so no workflow is blocked; auth/refresh still run through the CLI
     // via the delegate either way.
-    if (isNativeRuntimeProvider(hop.provider)) {
+    //
+    // The cloud's `active_sub_method` preference gates the attempt: a
+    // `handrolled` selection executes the manual transport ONLY — it never
+    // probes or spawns the bridge; a `bridge` selection (or no preference,
+    // since bridge is those providers' default) keeps the pre-commit
+    // fallback above. Selection is per hop, deterministic
+    // (`selectSubMethod`), and never switches after first committed output
+    // (the commit rule below is method-agnostic).
+    if (
+      isNativeRuntimeProvider(hop.provider) &&
+      selectSubMethod(hop.provider, requestedSubMethod) === "bridge"
+    ) {
       const native = await tryServeNativeRuntime({
         provider: hop.provider,
         providerModelId: hop.providerModelId,
