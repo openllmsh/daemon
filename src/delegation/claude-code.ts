@@ -44,6 +44,7 @@ import {
 import { accountHash, nonEmpty } from "./account-id";
 import {
   ensureAuthConfig,
+  resolveIdentityHeaders,
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
@@ -538,16 +539,21 @@ export const claudeCodeDelegate: TProviderDelegate = {
     if (token === null) {
       throw new Error("claude_code: not signed in (no stored credential)");
     }
-    // Resolve only the request TARGET URL (captured from the genuine `claude`
-    // request, or the default). NO identity headers are injected here — the
-    // walker carries the originator's own headers, and the wire builder layers
-    // the OAuth `anthropic-beta` + `anthropic-version` on top (isOAuth). Claude
-    // has no per-credential header to add, so `headers` is empty.
+    // Resolve the request TARGET URL (captured from the genuine `claude`
+    // request, or the default) + the isolated CLI's own IDENTITY HEADERS
+    // (handrolled/bridge parity — active-sub-method.md): the walker layers
+    // them over the originator's headers so the vendor sees the same identity
+    // whether the hop ran through the native CLI (bridge) or this manual
+    // transport, and the wire builder still layers the OAuth `anthropic-beta`
+    // + `anthropic-version` last (isOAuth). Identity comes from the shape-only
+    // fixture capture (never `authorization`); an absent fixture serves
+    // originator-only, the pre-parity behavior.
     const url = await resolveUpstreamUrl(PROVIDER, { captureIfMissing: true });
+    const identity = await resolveIdentityHeaders(PROVIDER);
     const acct = await readAccountHash();
     return {
       access_token: token.accessToken,
-      headers: {},
+      headers: identity ?? {},
       url,
       // Which account this hop's cost attributes to (recorded on the row).
       ...(acct !== null ? { account_hash: acct } : {}),

@@ -13,11 +13,20 @@
  * refresh (see `delegation/refresh.ts`), so no OAuth `client_id`/`token_url` is
  * extracted or stored.
  *
- * Bright line (terms-compliance): NOTHING here is replayed as inference
- * identity. The daemon serves each request with the ORIGINATOR's own headers
- * (`@openllmsh/wire/lib/forwarded-headers`) + the injected bearer; this config
- * supplies only the request TARGET URL. The volatile/secret `authorization`
- * header is never captured or stored.
+ * Bright line (terms-compliance), amended for `claude_code` by
+ * `docs/proposals/active-sub-method.md` §claude_code handrolled parity: for
+ * every provider EXCEPT `claude_code`, nothing here is replayed as inference
+ * identity — the daemon serves each request with the ORIGINATOR's own headers
+ * (`@openllmsh/wire/lib/forwarded-headers`) + the injected bearer, and this
+ * config supplies only the request TARGET URL. For `claude_code` the config
+ * ALSO persists the isolated CLI's own IDENTITY HEADERS (`identity_headers`,
+ * captured from the CLI's real request shape — killed before it reaches the
+ * vendor, zero token cost) so the HANDROLLED transport presents the same
+ * identity the BRIDGE (the genuine CLI) presents — a sub-method toggle must
+ * never change which requests the vendor accepts. The daemon still genuinely
+ * holds that CLI + its subscription credential, so this replays the daemon's
+ * OWN identity, never a forged third-party one. The volatile/secret
+ * `authorization` header is never captured or stored.
  *
  * Plain JSON (read via `readJsonFile`, written via `Bun.write` + `JSON.stringify`)
  * — always fresh on re-read after a re-capture, no runtime transpiler, works
@@ -42,6 +51,13 @@ export type TAuthConfig = {
   readonly cli_version?: string;
   /** Epoch ms of the last URL capture; older than the TTL re-captures. */
   readonly captured_at_ms?: number;
+  /** The isolated CLI's own identity headers (filtered — never authorization /
+   *  cookies / entity headers), captured from its real request shape by the
+   *  SAME recorder run that captures the URL (one capture, one freshness key:
+   *  `cli_version` + `captured_at_ms`). Replayed ONLY on the `claude_code`
+   *  handrolled transport for bridge parity (see the bright-line note above).
+   *  Absent for every other provider. */
+  readonly identity_headers?: Readonly<Record<string, string>>;
 };
 
 /** Re-capture / re-extract once older than this, even when neither the CLI
@@ -106,6 +122,13 @@ type TCaptureSpec = {
   /** Run the headless CLI under a pseudo-terminal (`script(1)`) — set for a CLI
    *  whose print/exec mode is gated on a real TTY (kimi's `-p`). */
   readonly usePty?: boolean;
+  /** Capture + persist the CLI's IDENTITY HEADERS from the matched inference
+   *  request (claude_code only — handrolled/bridge parity, see the bright-line
+   *  note at the top). Orthogonal to `liveCapture` (which gates the URL
+   *  capture): an identity capture spawns the same shape-only recorder run —
+   *  the request is killed before it reaches the vendor — and is triggered by
+   *  `resolveIdentityHeaders`, not by URL resolution. */
+  readonly captureIdentity?: boolean;
   /** When `false`, NEVER spawn a live `-p ping` capture for this provider —
    *  serve the default endpoint verbatim instead. Set for a provider whose
    *  capture does more harm than good: the `-p ping` is a REAL inference, which
@@ -130,6 +153,15 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     argv: (bin) => [bin, "-p", "ping"],
     env: (base) => ({ ANTHROPIC_BASE_URL: base }),
     liveCapture: false,
+    // Handrolled/bridge parity (active-sub-method.md): capture the CLI's own
+    // identity headers so the manual transport presents what the genuine CLI
+    // presents. The capture's `-p ping` never reaches the vendor (recorder
+    // kills it at the matched request — zero token cost), and a mid-capture
+    // token refresh is the CLI's OWN native refresh — the same mechanism
+    // `delegation/refresh.ts` already spawns deliberately, so the old
+    // rotation RACE (two competing refreshers) does not return: the CLI
+    // remains the single refresher on every path.
+    captureIdentity: true,
   },
   chatgpt: {
     // NOTE: codex's `/responses` endpoint genuinely DRIFTS on CLI updates
@@ -253,9 +285,54 @@ const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
     );
   });
 
+/**
+ * Headers NEVER retained by the identity capture: credentials (`authorization`
+ * / `x-api-key` / `cookie`), transport + entity headers the rebuilt request
+ * derives itself, and `anthropic-beta` — that one is composed separately by
+ * the wire builder (`buildUpstreamHeaders` merges the OAuth beta + the
+ * client's inbound beta), so replaying a captured copy would fight it.
+ */
+const IDENTITY_DENY: ReadonlySet<string> = new Set([
+  "authorization",
+  "x-api-key",
+  "cookie",
+  "host",
+  "content-length",
+  "content-type",
+  "accept",
+  "accept-encoding",
+  "connection",
+  "transfer-encoding",
+  "keep-alive",
+  "expect",
+  "anthropic-beta",
+]);
+
+/**
+ * Filter a captured request's headers down to the CLI's IDENTITY set:
+ * everything except credentials / transport / entity headers (deny-listed
+ * above), lower-cased. Exported for the parity tests.
+ */
+export const filterIdentityHeaders = (
+  headers: Headers,
+): Readonly<Record<string, string>> => {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    const name = key.toLowerCase();
+    if (IDENTITY_DENY.has(name)) return;
+    out[name] = value;
+  });
+  return out;
+};
+
+type TCapturedRequest = {
+  readonly path: string;
+  readonly identityHeaders: Readonly<Record<string, string>>;
+};
+
 type TRecorder = {
   readonly base: string;
-  readonly first: Promise<{ path: string }>;
+  readonly first: Promise<TCapturedRequest>;
   readonly stop: () => void;
 };
 
@@ -265,13 +342,15 @@ type TRecorder = {
  * INFERENCE call) — replying 204, after which the caller kills the CLI. Every
  * OTHER (preamble) request is FORWARDED to the real vendor so the CLI proceeds
  * far enough to issue its inference call. The inference request itself is
- * captured-then-killed and never forwarded, so it never reaches the vendor. Only
- * the request PATH is read — no identity headers are retained.
+ * captured-then-killed and never forwarded, so it never reaches the vendor. The
+ * request PATH is read, plus — for `captureIdentity` providers — the FILTERED
+ * identity headers (never `authorization`; see `IDENTITY_DENY`). URL-only
+ * captures discard the header set.
  */
 const startRecorder = (spec: TCaptureSpec): TRecorder => {
-  let resolveFirst!: (v: { path: string }) => void;
+  let resolveFirst!: (v: TCapturedRequest) => void;
   let captured = false;
-  const first = new Promise<{ path: string }>((resolve) => {
+  const first = new Promise<TCapturedRequest>((resolve) => {
     resolveFirst = resolve;
   });
   const server = Bun.serve({
@@ -281,7 +360,13 @@ const startRecorder = (spec: TCaptureSpec): TRecorder => {
       const url = new URL(req.url);
       if (!captured && spec.match(url.pathname)) {
         captured = true;
-        resolveFirst({ path: url.pathname });
+        resolveFirst({
+          path: url.pathname,
+          identityHeaders:
+            spec.captureIdentity === true
+              ? filterIdentityHeaders(req.headers)
+              : {},
+        });
         return new Response(null, { status: 204 });
       }
       // Preamble — forward to the real vendor so the CLI continues to the
@@ -311,14 +396,18 @@ const startRecorder = (spec: TCaptureSpec): TRecorder => {
 
 /**
  * Run the CLI's headless `exec` against the recorder, capture the INFERENCE
- * request PATH (preamble calls forwarded so the CLI gets there), and return the
- * full upstream URL. Null on any failure (CLI absent, never issued a matching
- * request within the timeout, spawn error) — the caller falls back to the
- * default URL.
+ * request (preamble calls forwarded so the CLI gets there), and return the
+ * full upstream URL + the filtered identity headers (empty unless the
+ * provider declares `captureIdentity`). Null on any failure (CLI absent,
+ * never issued a matching request within the timeout, spawn error) — the
+ * caller falls back to the default URL / no identity.
  */
-const captureUpstreamUrl = async (
+const captureInferenceRequest = async (
   provider: TCliProvider,
-): Promise<string | null> => {
+): Promise<{
+  readonly url: string;
+  readonly identityHeaders: Readonly<Record<string, string>>;
+} | null> => {
   const spec = CAPTURE[provider];
   const bin = cliBin(provider);
   const recorder = startRecorder(spec);
@@ -349,10 +438,10 @@ const captureUpstreamUrl = async (
   const captured = await withTimeout(
     Promise.race([
       recorder.first,
-      proc.exited.then(() => null as { path: string } | null),
+      proc.exited.then(() => null as TCapturedRequest | null),
     ]),
     CAPTURE_TIMEOUT_MS,
-    null as { path: string } | null,
+    null as TCapturedRequest | null,
   );
   proc.kill();
   recorder.stop();
@@ -361,18 +450,70 @@ const captureUpstreamUrl = async (
     logDebug("auth-config", `capture yielded no request for ${provider}`);
     return null;
   }
-  return spec.origin + captured.path;
+  return {
+    url: spec.origin + captured.path,
+    identityHeaders: captured.identityHeaders,
+  };
 };
 
-// One URL capture in flight per provider — concurrent serve requests that all
-// find a stale/missing URL share ONE capture rather than racing the recorder.
-const urlInFlight = new Map<TCliProvider, Promise<string | null>>();
+// ONE capture in flight per provider — URL and identity callers share the same
+// recorder run rather than racing it; the run patches every field the
+// provider's spec captures under the ONE freshness key.
+const captureInFlight = new Map<
+  TCliProvider,
+  Promise<{
+    readonly url: string;
+    readonly identityHeaders: Readonly<Record<string, string>>;
+  } | null>
+>();
 
-const urlFresh = (cfg: TAuthConfig, cliVer: string | null): boolean =>
-  cfg.upstream_url !== undefined &&
+const runCaptureOnce = (
+  provider: TCliProvider,
+): Promise<{
+  readonly url: string;
+  readonly identityHeaders: Readonly<Record<string, string>>;
+} | null> => {
+  const existing = captureInFlight.get(provider);
+  if (existing !== undefined) return existing;
+  const spec = CAPTURE[provider];
+  const run = (async () => {
+    const captured = await captureInferenceRequest(provider);
+    if (captured === null) return null;
+    const ver = await cliVersion(cliBin(provider), cliEnv(provider));
+    await patchConfig(provider, {
+      // `liveCapture: false` providers keep their URL policy (serve the
+      // stable default) — a run for them exists for IDENTITY only, so no
+      // URL is persisted that `ensureUpstreamUrl` would then start serving.
+      ...(spec.liveCapture !== false ? { upstream_url: captured.url } : {}),
+      ...(spec.captureIdentity === true &&
+      Object.keys(captured.identityHeaders).length > 0
+        ? { identity_headers: captured.identityHeaders }
+        : {}),
+      cli_version: ver ?? "",
+      captured_at_ms: Date.now(),
+    });
+    logInfo("auth-config", `captured ${provider} inference request`, {
+      url: captured.url,
+      ...(spec.captureIdentity === true
+        ? {
+            identity: Object.keys(captured.identityHeaders).sort().join(","),
+          }
+        : {}),
+    });
+    return captured;
+  })().finally(() => captureInFlight.delete(provider));
+  captureInFlight.set(provider, run);
+  return run;
+};
+
+/** Version match + within TTL — the shared freshness of the last capture. */
+const captureFresh = (cfg: TAuthConfig, cliVer: string | null): boolean =>
   cfg.cli_version === (cliVer ?? "") &&
   typeof cfg.captured_at_ms === "number" &&
   Date.now() - cfg.captured_at_ms < TTL_MS;
+
+const urlFresh = (cfg: TAuthConfig, cliVer: string | null): boolean =>
+  cfg.upstream_url !== undefined && captureFresh(cfg, cliVer);
 
 /**
  * Ensure (and return) the captured upstream URL for a provider: the stored URL
@@ -406,24 +547,35 @@ const ensureUpstreamUrl = async (
     if (urlFresh(cfg, ver)) return stored;
   }
   if (opts?.captureIfMissing === false) return stored;
-  const existing = urlInFlight.get(provider);
-  if (existing !== undefined) return existing;
-  const run = (async () => {
-    const captured = await captureUpstreamUrl(provider);
-    if (captured === null) return stored;
+  const captured = await runCaptureOnce(provider);
+  return captured?.url ?? stored;
+};
+
+/**
+ * The isolated CLI's own identity headers for a HANDROLLED hop — the stored
+ * set if fresh (the shared `cli_version` + TTL key), else re-captured by the
+ * SAME shape-only recorder run the URL capture uses (killed before the
+ * vendor; zero token cost; shared single-flight). Returns null for providers
+ * without `captureIdentity` (everyone but claude_code — their handrolled hops
+ * keep pure originator passthrough), and the stale/absent stored value on
+ * capture failure (the hop then serves originator-only, today's pre-parity
+ * behavior — never a hard break). `force` bypasses freshness (post-re-login).
+ */
+export const resolveIdentityHeaders = async (
+  provider: TCliProvider,
+  opts?: { readonly force?: boolean },
+): Promise<Readonly<Record<string, string>> | null> => {
+  if (CAPTURE[provider].captureIdentity !== true) return null;
+  const cfg = (await readConfig(provider)) ?? {};
+  const stored = cfg.identity_headers ?? null;
+  if (opts?.force !== true && stored !== null) {
     const ver = await cliVersion(cliBin(provider), cliEnv(provider));
-    await patchConfig(provider, {
-      upstream_url: captured,
-      cli_version: ver ?? "",
-      captured_at_ms: Date.now(),
-    });
-    logInfo("auth-config", `captured ${provider} upstream URL`, {
-      url: captured,
-    });
-    return captured;
-  })().finally(() => urlInFlight.delete(provider));
-  urlInFlight.set(provider, run);
-  return run;
+    if (captureFresh(cfg, ver)) return stored;
+  }
+  const captured = await runCaptureOnce(provider);
+  return captured !== null && Object.keys(captured.identityHeaders).length > 0
+    ? captured.identityHeaders
+    : stored;
 };
 
 /**
@@ -477,4 +629,13 @@ export const ensureAuthConfig = async (
   opts?: { readonly force?: boolean; readonly captureIfMissing?: boolean },
 ): Promise<void> => {
   await ensureUpstreamUrl(provider, opts).catch(() => null);
+  // Refresh the identity fixture on the same trigger (a re-login may change
+  // the CLI's identity). Never spawns for providers without `captureIdentity`,
+  // and respects `captureIfMissing: false` (a possibly logged-out CLI must not
+  // be spawned).
+  if (opts?.captureIfMissing !== false) {
+    await resolveIdentityHeaders(provider, { force: opts?.force }).catch(
+      () => null,
+    );
+  }
 };
