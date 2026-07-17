@@ -19,12 +19,11 @@ import {
   ChatCompletionRequest,
   ResponsesRequest,
 } from "@openllmsh/protocol";
-import { daemonPlanSigningPayload } from "@openllmsh/protocol";
 import { Schema } from "effect";
-import { planCacheEnabled, planSigningKey } from "./config";
+import { planCacheEnabled } from "./config";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { lookupPlan, storePlan } from "./plan-cache";
-import { runWalker, verifyPlanSignature } from "./walker";
+import { planSignatureOk, runResponsesCompact, runWalker } from "./walker";
 
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
@@ -52,10 +51,14 @@ export const handleInference = async (req: Request): Promise<Response> => {
 
   const startedAt = Date.now();
   const url = new URL(req.url);
+  // Codex's own compaction endpoint rides the responses surface but is a
+  // verbatim vendor passthrough (`runResponsesCompact`) — no surface
+  // schema, no walk.
+  const isResponsesCompact = url.pathname.endsWith("/responses/compact");
   const surface: "chat_completions" | "messages" | "responses" =
     url.pathname.endsWith("/messages")
       ? "messages"
-      : url.pathname.endsWith("/responses")
+      : url.pathname.endsWith("/responses") || isResponsesCompact
         ? "responses"
         : "chat_completions";
   const endpoint = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
@@ -72,8 +75,13 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // Validate against the surface schema for a clean 400 — the walker
   // passes the body through (passthrough) or adapts it, so a malformed
   // body would otherwise surface as an opaque upstream/transform failure.
+  // Compact bodies skip this: the vendor owns that contract and the call
+  // is forwarded verbatim (strictness here would 400 shapes the upstream
+  // accepts).
   try {
-    if (surface === "messages") parseAnthropicRequest(rawBody);
+    if (isResponsesCompact) {
+      // no-op — verbatim vendor passthrough
+    } else if (surface === "messages") parseAnthropicRequest(rawBody);
     else if (surface === "responses") parseResponsesRequest(rawBody);
     else parseOpenAIRequest(rawBody);
   } catch (err) {
@@ -109,19 +117,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
   const alias = (rawBody as { model?: unknown } | null)?.model;
   if (planCacheEnabled() && typeof alias === "string" && alias.length > 0) {
     if (planParam !== null) {
-      const sigKey = planSigningKey();
-      const verified =
-        sigKey === null ||
-        verifyPlanSignature(
-          daemonPlanSigningPayload(
-            planParam,
-            pmidsParam ?? "",
-            originParam ?? "",
-          ),
-          sigParam,
-          sigKey,
-        );
-      if (verified) {
+      if (planSignatureOk(planParam, pmidsParam, originParam, sigParam)) {
         storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
       }
     } else {
@@ -132,19 +128,22 @@ export const handleInference = async (req: Request): Promise<Response> => {
     }
   }
 
+  const walkArgs = {
+    req,
+    surface,
+    endpoint,
+    rawBody,
+    rawBytes,
+    planParam,
+    pmidsParam,
+    originParam,
+    sigParam,
+    startedAt,
+  };
   return withCors(
     req,
-    await runWalker({
-      req,
-      surface,
-      endpoint,
-      rawBody,
-      rawBytes,
-      planParam,
-      pmidsParam,
-      originParam,
-      sigParam,
-      startedAt,
-    }),
+    await (isResponsesCompact
+      ? runResponsesCompact(walkArgs)
+      : runWalker(walkArgs)),
   );
 };

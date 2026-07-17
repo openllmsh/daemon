@@ -39,7 +39,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   AnthropicResponse,
-  AnthropicStreamEvent,
   ChatCompletionChunk,
   daemonPlanSigningPayload,
   type TAnthropicResponse,
@@ -51,7 +50,7 @@ import {
   type TServerSearchCall,
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
-import { fitRequestToHopBudget } from "@openllmsh/wire/features/compaction/tool-output-compact";
+import { shouldSkipHopForContext } from "@openllmsh/wire/features/context-skip";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
@@ -61,6 +60,10 @@ import {
 import { classifyHopError } from "@openllmsh/wire/lib/error-class";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
+import {
+  isMeaningfulChunk,
+  peekFirstChunk,
+} from "@openllmsh/wire/lib/streaming/peek";
 import { decodeProviderEventStream } from "@openllmsh/wire/lib/streaming/provider-decode";
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
@@ -70,10 +73,7 @@ import {
 } from "@openllmsh/wire/lib/streaming/upstream-error";
 import { stripSchemaKeywords } from "@openllmsh/wire/lib/tool-schema";
 import { fromAnthropicResponse } from "@openllmsh/wire/providers/anthropic/response";
-import {
-  fromAnthropicStreamEvent,
-  newAnthropicStreamState,
-} from "@openllmsh/wire/providers/anthropic/streaming";
+import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
 import {
   chatGptEventToChunk,
   newChatGptStreamState,
@@ -250,6 +250,33 @@ export const verifyPlanSignature = (
   } catch {
     return false;
   }
+};
+
+/**
+ * Verify a signed `(plan, pmids, origin)` tuple against the bootstrap
+ * signing key — the ONE check shared by the walker's 403 gate, the
+ * listener's plan-cache admission, and the compact passthrough's
+ * model-pin trust. True in unsigned dev mode (no key configured).
+ */
+export const planSignatureOk = (
+  planParam: string | null,
+  pmidsParam: string | null,
+  originParam: string | null,
+  sigParam: string | null,
+): boolean => {
+  const sigKey = planSigningKey();
+  return (
+    sigKey === null ||
+    verifyPlanSignature(
+      daemonPlanSigningPayload(
+        planParam ?? "",
+        pmidsParam ?? "",
+        originParam ?? "",
+      ),
+      sigParam,
+      sigKey,
+    )
+  );
 };
 
 /**
@@ -493,75 +520,15 @@ const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
 // canonicalFromInbound / clientWireOf). The walker is a thin caller; it never
 // re-derives the recipe (that fork caused two regressions).
 
-/** Outcome of peeking a decoded upstream stream's first event before
- *  committing the client response: the (replayable) chunk stream, or the
- *  rejection that arrived before any output. */
-export type TPeekedChunks<T> =
-  | { readonly kind: "chunks"; readonly chunks: ReadableStream<T> }
-  | { readonly kind: "error"; readonly error: unknown };
-
-/** How long a streaming subscription hop holds the client response
- *  uncommitted waiting for the upstream's first decoded event. In-stream
- *  rejections (context overflow) arrive as the very first event right after
- *  the 200 headers; a healthy turn that stays quiet longer (cold start, long
- *  prompt processing) commits at the deadline and streams exactly as before. */
-export const FIRST_EVENT_PEEK_MS = 2_000;
-
-/**
- * Wait (bounded) for the FIRST event of a decoded upstream stream, so an
- * in-stream rejection that precedes any output — the overflow incident
- * shape: HTTP 200, then a first event `error: Your input exceeds the
- * context window` — surfaces while the hop is still an UNCOMMITTED
- * candidate and the caller can walk the plan, instead of failing inside an
- * already-committed 200 stream. Every other outcome (first chunk arrived,
- * stream ended, deadline passed while quiet) returns a stream that replays
- * the in-flight read: no event is lost or duplicated, and a rejection that
- * arrives after the deadline still propagates mid-stream as today.
- */
-export const peekFirstChunk = <T>(
-  source: ReadableStream<T>,
-  deadlineMs: number,
-): Promise<TPeekedChunks<T>> => {
-  const reader = source.getReader();
-  const firstRead = reader.read();
-  let pendingFirst: ReturnType<typeof reader.read> | null = firstRead;
-  const replayed = (): ReadableStream<T> =>
-    new ReadableStream<T>({
-      pull: async (controller) => {
-        const read = pendingFirst ?? reader.read();
-        pendingFirst = null;
-        const r = await read;
-        if (r.done) {
-          controller.close();
-          return;
-        }
-        controller.enqueue(r.value);
-      },
-      cancel: (reason) => reader.cancel(reason),
-    });
-  return new Promise((resolve) => {
-    let settled = false;
-    const settle = (v: TPeekedChunks<T>): void => {
-      if (settled) return;
-      settled = true;
-      resolve(v);
-    };
-    const timer = setTimeout(
-      () => settle({ kind: "chunks", chunks: replayed() }),
-      deadlineMs,
-    );
-    firstRead.then(
-      () => {
-        clearTimeout(timer);
-        settle({ kind: "chunks", chunks: replayed() });
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        settle({ kind: "error", error });
-      },
-    );
-  });
-};
+export type { TPeekedChunks } from "@openllmsh/wire/lib/streaming/peek";
+// The pre-commit first-event peek is a SHARED wire primitive (one
+// implementation for the daemon walker and the cloud dispatch chain, like
+// the context ladder — see `@openllmsh/wire/lib/streaming/peek`).
+// Re-exported here so the walker's callers/tests keep one import surface.
+export {
+  isMeaningfulChunk,
+  peekFirstChunk,
+} from "@openllmsh/wire/lib/streaming/peek";
 
 /** Decode an upstream SSE stream into canonical chunks, per upstream wire. */
 export const decodeUpstreamStream = (
@@ -571,15 +538,7 @@ export const decodeUpstreamStream = (
 ): ReadableStream<TChatCompletionChunk> => {
   const options = { providerModelId };
   if (wire === "anthropic") {
-    return decodeProviderEventStream(
-      body,
-      {
-        eventSchema: AnthropicStreamEvent,
-        initialState: newAnthropicStreamState,
-        eventToChunk: fromAnthropicStreamEvent,
-      },
-      options,
-    );
+    return decodeAnthropicEventStream(body, providerModelId);
   }
   if (wire === "chatgpt") {
     return decodeProviderEventStream(
@@ -910,7 +869,11 @@ const serveSubscription = async (
       const [toClient, toMeter] = resp.body.tee();
       const peeked = await peekFirstChunk(
         decodeUpstreamStream(wire, toMeter, hop.providerModelId),
-        FIRST_EVENT_PEEK_MS,
+        isMeaningfulChunk,
+        // The meter's decoded view is LOSSY (schema-unknown frames are
+        // dropped): an empty decode of a byte-verbatim passthrough must
+        // commit, not walk — the client's bytes ride `toClient` untouched.
+        { emptyStreamIsError: false },
       );
       if (peeked.kind === "error") {
         void toClient.cancel().catch(() => undefined);
@@ -924,14 +887,14 @@ const serveSubscription = async (
     }
     // Cross-wire (or chatgpt): decode → peek → the shared delivery tail
     // (tee → meter + re-encode + heartbeat — `deliverChunkStream`, the same
-    // tail the native bridge uses). The bounded first-event peek keeps the
-    // response uncommitted long enough for a pre-output in-stream rejection
-    // (context overflow) to WALK a non-final hop instead of dying inside a
-    // committed stream; a quiet-but-healthy turn commits at the deadline and
-    // streams as before.
+    // tail the native bridge uses). The signal-bounded first-event peek
+    // keeps the response uncommitted until the first meaningful chunk, so a
+    // pre-output in-stream rejection (context overflow) WALKS a non-final
+    // hop instead of dying inside a committed stream — however long the
+    // vendor's prefill takes to produce it.
     const peeked = await peekFirstChunk(
       decodeUpstreamStream(wire, resp.body, hop.providerModelId),
-      FIRST_EVENT_PEEK_MS,
+      isMeaningfulChunk,
     );
     if (peeked.kind === "error") return peekedError(peeked.error);
     return deliverChunkStream(peeked.chunks, {
@@ -959,7 +922,7 @@ const serveSubscription = async (
     // re-dispatched.
     const peeked = await peekFirstChunk(
       decodeUpstreamStream(wire, resp.body, hop.providerModelId),
-      FIRST_EVENT_PEEK_MS,
+      isMeaningfulChunk,
     );
     if (peeked.kind === "error") return peekedError(peeked.error);
     let canonical: TChatCompletionResponse;
@@ -1233,17 +1196,12 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   // handed us a per-user key at bootstrap), the 307 MUST carry a valid `__sig`
   // over the full canonical payload (plan + pmids + origin). No key → unsigned
   // mode (dev), accept. (§9 + daemon-presence-without-heartbeat)
-  const sigKey = planSigningKey();
   if (
-    sigKey !== null &&
-    !verifyPlanSignature(
-      daemonPlanSigningPayload(
-        args.planParam ?? "",
-        args.pmidsParam ?? "",
-        args.originParam ?? "",
-      ),
+    !planSignatureOk(
+      args.planParam,
+      args.pmidsParam,
+      args.originParam,
       args.sigParam,
-      sigKey,
     )
   ) {
     return errorJson(403, "invalid or missing __plan signature");
@@ -1277,38 +1235,24 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   let lastError: string | null = null;
   for (const [hopIndex, hop] of hops.entries()) {
     const finalHop = hopIndex === hops.length - 1;
-    // ── Context-overflow ladder, per hop (shared with the cloud chain —
-    // `fitRequestToHopBudget`) ────────────────────────────────────────
-    // Plan A already happened (the catalog served correct budgets; the
-    // client should have compacted). When the request still exceeds THIS
-    // hop's input budget: Plan B — compact tool outputs until it fits;
-    // only when even full compaction can't fit does Plan C apply — walk
-    // to the next (larger-context) hop. The final hop serves the
-    // best-effort compacted body regardless (never-drop-all), and the
-    // pre-output overflow walk below remains the backstop for estimate
-    // misses.
-    let hopArgs = args;
-    let hopCanonical = canonical;
-    const fit = fitRequestToHopBudget({
-      surface: args.surface,
-      body: args.rawBody,
-      estimatedTokens: baseEstimate,
-      inputTokenLimit:
-        lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null,
-      finalHop,
-    });
-    if (fit.kind === "skip") {
-      lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request exceeds its input window even after tool-output compaction`;
+    // ── Context gate, per hop (shared with the cloud chain —
+    // `shouldSkipHopForContext`) ──────────────────────────────────────
+    // Plan A already happened (the catalog served correct budgets +
+    // `/responses/compact` passes through, so the client compacts
+    // itself). Skip this hop only when the estimate CLEARLY exceeds its
+    // window; borderline cases dispatch — the real upstream tokenizer
+    // gets the final word, and the pre-output peek walk below is the
+    // backstop for estimate misses.
+    if (
+      shouldSkipHopForContext({
+        estimatedTokens: baseEstimate,
+        inputTokenLimit:
+          lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null,
+        finalHop,
+      })
+    ) {
+      lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request clearly exceeds its input window`;
       continue;
-    }
-    if (fit.changed) {
-      hopArgs = {
-        ...args,
-        rawBody: fit.body,
-        rawBytes: new TextEncoder().encode(JSON.stringify(fit.body))
-          .buffer as ArrayBuffer,
-      };
-      hopCanonical = canonicalFromInbound(args.surface, fit.body);
     }
     // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
     // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
@@ -1335,10 +1279,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         provider: hop.provider,
         providerModelId: hop.providerModelId,
         surface: args.surface,
-        rawBody: hopArgs.rawBody,
-        canonical: hopCanonical,
+        rawBody: args.rawBody,
+        canonical,
         wantsStream:
-          (hopArgs.rawBody as { stream?: unknown } | null)?.stream === true,
+          (args.rawBody as { stream?: unknown } | null)?.stream === true,
         signal: args.req.signal,
         record: (tokens, status) =>
           report(
@@ -1361,7 +1305,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     if (wire !== undefined) {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
-      const served = await serveSubscription(hop, wire, hopArgs, finalHop);
+      const served = await serveSubscription(hop, wire, args, finalHop);
       if (served !== "retry") return served; // committed
       lastError = `subscription hop ${hop.modelId} failed pre-stream`;
       continue;
@@ -1371,7 +1315,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     try {
       resp = await forwardToCloud(
         args.req,
-        hopArgs.rawBytes,
+        args.rawBytes,
         hop.modelId,
         args.originParam,
       );
@@ -1408,4 +1352,113 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     502,
     `all hops in the plan failed${lastError !== null ? ` (last: ${lastError})` : ""}`,
   );
+};
+
+/** Upstream compact endpoint for a Codex `/responses` URL — codex-rs calls
+ *  `<base>/responses/compact`, so the delegate's captured inference URL
+ *  (`…/backend-api/codex/responses`) just gains the `/compact` suffix. */
+export const compactUpstreamUrl = (responsesUrl: string): string =>
+  `${responsesUrl.replace(/\/+$/, "")}/compact`;
+
+/**
+ * The provider model id a `/responses/compact` call should pin: the
+ * plan's first chatgpt hop when a (cloud-resolved) plan rode in via the
+ * 307 or the signed-plan cache — the same alias→pmid authority every
+ * inference call uses — else the body's own model id forwarded verbatim
+ * (a client naming a concrete Codex model needs no translation).
+ */
+export const resolveCompactModelId = (
+  planParam: string | null,
+  pmidsParam: string | null,
+  rawBody: unknown,
+): string => {
+  const planModelIds = parsePlan(planParam);
+  const pmids = pmidsParam === null ? [] : pmidsParam.split(",");
+  for (const [i, m] of planModelIds.entries()) {
+    const hop = resolveHop(m, pmids[i]);
+    if (hop.provider === "chatgpt") return hop.providerModelId;
+  }
+  const model = (rawBody as { model?: unknown } | null)?.model;
+  return typeof model === "string" ? model : "";
+};
+
+/**
+ * Serve `POST /v1/responses/compact` — the Codex CLI's OWN compaction
+ * call (Plan A of the context ladder: the client compacts itself).
+ * Without this passthrough a Codex client pointed at openllm gets a 404
+ * from its `/responses/compact` call, its self-compaction silently
+ * breaks, and sessions balloon until the gateway-side overflow ladder
+ * has to intervene every turn. Mirrors ref/CLIProxyAPI's
+ * `executeCompact`: build the normal Codex upstream request (identity
+ * headers + preamble via `buildUpstreamRequest`), pin the resolved
+ * model, POST non-streaming to `<responses-url>/compact`, and return
+ * the upstream JSON verbatim. chatgpt-only — no other provider exposes
+ * the endpoint.
+ */
+export const runResponsesCompact = async (
+  args: TWalkArgs,
+): Promise<Response> => {
+  // A forged plan must not steer the model id: honour the plan only when
+  // it verifies (same rule as `runWalker`); an invalid plan falls back to
+  // the body's own model rather than 403ing — compact works planless.
+  const planTrusted = planSignatureOk(
+    args.planParam,
+    args.pmidsParam,
+    args.originParam,
+    args.sigParam,
+  );
+  const providerModelId = resolveCompactModelId(
+    planTrusted ? args.planParam : null,
+    planTrusted ? args.pmidsParam : null,
+    args.rawBody,
+  );
+  const acquired = await acquireUpstream("chatgpt", args);
+  if (acquired === "retry") {
+    return errorJson(
+      502,
+      "no usable chatgpt credential on this daemon — connect the Codex CLI on /providers first",
+    );
+  }
+  const built = buildUpstreamRequest({
+    surface: "responses",
+    upstreamWire: "chatgpt",
+    rawBody: args.rawBody,
+    providerModelId,
+    stream: false,
+    baseHeaders: acquired.headers,
+    inboundBeta: null,
+    isOAuth: false,
+    codexInstructions: wantsCodexPreamble("chatgpt"),
+  });
+  // Compact is strictly non-streaming — codex-rs DELETES the stream flag
+  // rather than sending `stream: false`.
+  const body =
+    built.body !== null && typeof built.body === "object"
+      ? (({ stream: _stream, ...rest }): Record<string, unknown> => rest)(
+          built.body as Record<string, unknown>,
+        )
+      : built.body;
+  let resp: Response;
+  try {
+    resp = await fetch(compactUpstreamUrl(acquired.url), {
+      method: "POST",
+      headers: built.headers,
+      body: JSON.stringify(body),
+      signal: args.req.signal,
+    });
+  } catch (err) {
+    return errorJson(
+      502,
+      `compact upstream unreachable: ${sanitizeErrorLine(err, 300)}`,
+    );
+  }
+  // Verbatim passthrough — the Codex client owns the compact protocol;
+  // no usage row (the vendor bills compaction as part of the session).
+  const text = await resp.text();
+  return new Response(text, {
+    status: resp.status,
+    headers: {
+      "content-type": resp.headers.get("content-type") ?? "application/json",
+    },
+  });
 };
