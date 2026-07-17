@@ -34,7 +34,7 @@ import type {
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
 import type { TNativeTokens } from "./types";
-import { cleanNativeSpawnEnv } from "./types";
+import { cleanNativeSpawnEnv, normalizeNativeTerminalResult } from "./types";
 
 /** Idle TTL for a held (paused) query before it's force-closed. */
 const HELD_TTL_MS = 10 * 60 * 1000;
@@ -474,7 +474,7 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     }
 
     const msg = step.value as
-      | {
+      | (Record<string, unknown> & {
           type?: string;
           session_id?: string;
           message?: {
@@ -486,11 +486,14 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
               cache_creation_input_tokens?: number | null;
             };
           };
-        }
+        })
       | undefined;
     if (step.done === true || msg === undefined) {
-      dropIndex(h);
-      return { kind: "final", text, usage };
+      closeHeld(h);
+      return {
+        kind: "declined",
+        reason: "native runtime ended without a successful terminal result",
+      };
     }
     if (typeof msg.session_id === "string") h.sessionId = msg.session_id;
     if (msg.type === "assistant") {
@@ -515,6 +518,11 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
       continue;
     }
     if (msg.type === "result") {
+      const terminal = normalizeNativeTerminalResult(msg);
+      if (terminal.kind === "failure") {
+        closeHeld(h);
+        return { kind: "declined", reason: terminal.reason };
+      }
       dropIndex(h);
       return { kind: "final", text, usage };
     }

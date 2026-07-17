@@ -41,7 +41,11 @@ import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import type { TNativeRunResult } from "./types";
-import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+import {
+  cleanNativeSpawnEnv,
+  normalizeNativeTerminalResult,
+  PRE_COMMIT_TIMEOUT_MS,
+} from "./types";
 
 const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
 
@@ -63,7 +67,7 @@ export type TClaudeNativeParams = {
 };
 
 /** One NDJSON line of `claude -p --output-format stream-json` output. */
-type TClaudeStreamLine = {
+type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
   readonly type?: unknown;
   readonly event?: unknown;
   readonly subtype?: unknown;
@@ -154,6 +158,7 @@ export const runClaudeNative = async (
   // for the NEXT resume, in case Claude rotated the id mid-turn). The serve
   // adapter reads this AFTER the stream drains.
   let capturedSessionId: string | null = params.resumeSessionId;
+  let terminalSucceeded = false;
 
   /** Pull NDJSON lines until the next canonical chunk (or end/failure). */
   const nextChunk = async (): Promise<
@@ -161,7 +166,14 @@ export const runClaudeNative = async (
   > => {
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) return "end";
+      if (done) {
+        return terminalSucceeded
+          ? "end"
+          : {
+              error:
+                "native runtime ended without a successful terminal result",
+            };
+      }
       let line: TClaudeStreamLine;
       try {
         line = JSON.parse(value) as TClaudeStreamLine;
@@ -181,14 +193,9 @@ export const runClaudeNative = async (
         continue;
       }
       if (line.type === "result") {
-        if (line.is_error === true) {
-          return {
-            error:
-              typeof line.result === "string"
-                ? line.result
-                : "claude runtime reported an error result",
-          };
-        }
+        const terminal = normalizeNativeTerminalResult(line);
+        if (terminal.kind === "failure") return { error: terminal.reason };
+        terminalSucceeded = true;
         return "end";
       }
       // "system" (init) / "assistant" (full-message echo) lines — the

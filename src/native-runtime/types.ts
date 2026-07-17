@@ -301,3 +301,87 @@ export type TNativeRunResult =
       readonly sessionId: () => string | null;
     }
   | { readonly kind: "declined"; readonly reason: string };
+
+export type TNativeTerminalResult =
+  | { readonly kind: "success" }
+  | { readonly kind: "failure"; readonly reason: string };
+
+const terminalRecord = (
+  value: unknown,
+): Readonly<Record<string, unknown>> | null =>
+  typeof value === "object" && value !== null
+    ? (value as Readonly<Record<string, unknown>>)
+    : null;
+
+const terminalString = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const terminalFailureReason = (
+  result: Readonly<Record<string, unknown>>,
+): string => {
+  const errors = Array.isArray(result.errors)
+    ? result.errors
+        .map(terminalString)
+        .filter((value): value is string => value !== null)
+    : [];
+  if (errors.length > 0) return errors.join("; ");
+
+  const legacyResult = terminalString(result.result);
+  if (legacyResult !== null) return legacyResult;
+
+  const status =
+    typeof result.api_error_status === "number" &&
+    Number.isFinite(result.api_error_status)
+      ? result.api_error_status
+      : null;
+  const state = terminalString(result.subtype) ?? terminalString(result.status);
+  if (status !== null && state !== null) {
+    return `native runtime reported terminal failure ${status} (${state})`;
+  }
+  if (status !== null)
+    return `native runtime reported terminal failure ${status}`;
+  return state === null
+    ? "native runtime reported an unsuccessful terminal result"
+    : `native runtime reported an unsuccessful terminal result (${state})`;
+};
+
+/**
+ * Interpret a native runtime's structured terminal frame without inspecting
+ * generated assistant text. Success must be explicit; embedded HTTP failures,
+ * error flags, malformed frames, and future terminal states fail closed.
+ */
+export const normalizeNativeTerminalResult = (
+  value: unknown,
+): TNativeTerminalResult => {
+  const result = terminalRecord(value);
+  const status = result?.api_error_status;
+  const hasEmbeddedHttpFailure =
+    typeof status === "number" && Number.isFinite(status) && status >= 400;
+  const subtype = terminalString(result?.subtype);
+  const terminalStatus = terminalString(result?.status);
+  const state = subtype ?? terminalStatus;
+  const hasConflictingState =
+    subtype !== null && terminalStatus !== null && subtype !== terminalStatus;
+  const hasStructuredErrors =
+    result?.errors !== undefined &&
+    (!Array.isArray(result.errors) || result.errors.length > 0);
+  if (
+    state === "success" &&
+    result?.is_error === false &&
+    !hasEmbeddedHttpFailure &&
+    !hasConflictingState &&
+    !hasStructuredErrors
+  ) {
+    return { kind: "success" };
+  }
+  return {
+    kind: "failure",
+    reason:
+      result === null
+        ? "native runtime reported an unsuccessful terminal result"
+        : terminalFailureReason(result),
+  };
+};
