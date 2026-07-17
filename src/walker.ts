@@ -1459,13 +1459,14 @@ export const runResponsesCompact = async (
       `compact upstream unreachable: ${sanitizeErrorLine(err, 300)}`,
     );
   }
-  // Verbatim passthrough — the Codex client owns the compact protocol;
-  // no usage row (the vendor bills compaction as part of the session).
+  // Verbatim passthrough — the Codex client owns the compact protocol; no
+  // usage row (the vendor bills compaction as part of the session). Headers
+  // forward via the same transport-safe filter every other passthrough
+  // uses, so upstream retry metadata (429 `retry-after`, rate-limit
+  // headers) reaches the client intact.
   const text = await resp.text();
   return new Response(text, {
     status: resp.status,
-    headers: {
-      "content-type": resp.headers.get("content-type") ?? "application/json",
-    },
+    headers: passthroughHeaders(resp),
   });
 };
