@@ -113,22 +113,20 @@ The daemon can install/uninstall any catalogued **skill**, **plugin**, or
   `install_integration` / `uninstall_integration` command (via the existing
   `POST /api/daemon/cmd` → poll), dispatched in `control-relay.ts`.
 
-`runIntegration` fetches the gateway's EXISTING
-`/api/<area>/<slug>/install.sh?mode=install|uninstall|state` (so no install
-logic is forked onto the box — the one mode-aware script encapsulates the
-per-target footprint AND its own inverse + self-probe) and pipes it to `bash`
-with `OPENLLM_API_KEY` in its env. **Fail-closed integrity:** before any
-execution it fetches the gateway's separately-served SHA-256
-(`/api/daemon/integrity`), refuses on mismatch / missing digest, and places the
-key into the executed env ONLY after verification — mirroring the binary
-checksum gate in `packages/setup/daemon/install.sh`.
+`runIntegration` requests the gateway's validated non-executable pointer,
+validates its full-commit raw GitHub URL, downloads the script directly into a
+mode-0600 daemon temp file with redirects disabled, and hashes the exact bytes
+against `script_sha256`. Only then does it add `OPENLLM_API_KEY` for install and
+launch `bash <file>` with the requested mode/target. Uninstall/state receive no
+key. The script performs its independent embedded self-check before side
+effects; the daemon never fetches gateway script bytes or `/api/daemon/integrity`.
 
-`device-state.ts` is manifest-driven: it runs each integration's
-`install.sh?mode=state` (which prints a single `{"installed":bool,"version":…}`
-JSON line by reading a durable config-side marker — no hardcoded footprint scan)
-and caches the result on `DaemonStatus.integrations`, so the dashboard renders a
-stateful Install vs ✓ installed / Uninstall button. Re-probed after each
-install/uninstall (not on every refresh). See
+`device-state.ts` is catalog-driven: it runs each verified script with `-s`,
+parses the single JSON line, and compares its `installed_sha256` with the
+current pointer's script SHA to compute `diverged`. The result is cached on
+`DaemonStatus.integrations`, so the dashboard renders Install vs installed /
+Reinstall / Uninstall. Re-probed after each install/uninstall, not every status
+refresh. See
 [`docs/proposals/daemon-owned-state-stateless-relay.md`](../../docs/proposals/daemon-owned-state-stateless-relay.md).
 
 ## Coreless walker (the data path)

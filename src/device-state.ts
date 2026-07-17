@@ -44,6 +44,7 @@ export const getInstalledIntegrations = (): TDaemonInstalledIntegration[] =>
 export type TProbeVerdict = {
   readonly installed: boolean;
   readonly diverged?: boolean;
+  readonly installedSha256?: string;
 };
 
 /** Parse the state verdict out of an `install.sh -s` run's output. The probe
@@ -57,11 +58,20 @@ export const parseState = (output: string): TProbeVerdict | null => {
     const t = line.trim();
     if (!t.startsWith("{") || !t.includes('"installed"')) continue;
     try {
-      const j = JSON.parse(t) as { installed?: unknown; diverged?: unknown };
+      const j = JSON.parse(t) as {
+        installed?: unknown;
+        diverged?: unknown;
+        installed_sha256?: unknown;
+      };
       if (typeof j.installed === "boolean") {
-        return typeof j.diverged === "boolean"
-          ? { installed: j.installed, diverged: j.diverged }
-          : { installed: j.installed };
+        return {
+          installed: j.installed,
+          ...(typeof j.diverged === "boolean" ? { diverged: j.diverged } : {}),
+          ...(typeof j.installed_sha256 === "string" &&
+          j.installed_sha256.length > 0
+            ? { installedSha256: j.installed_sha256 }
+            : {}),
+        };
       }
     } catch {
       // not the JSON line — keep scanning
@@ -116,7 +126,16 @@ export const probeIntegration = async (
     return;
   }
   const next = cache.filter((i) => !(i.kind === kind && i.slug === slug));
-  next.push({ kind, slug, ...verdict });
+  const diverged =
+    verdict.installed && verdict.installedSha256 !== undefined
+      ? verdict.installedSha256 !== r.scriptSha256
+      : verdict.diverged;
+  next.push({
+    kind,
+    slug,
+    installed: verdict.installed,
+    ...(diverged === undefined ? {} : { diverged }),
+  });
   cache = next;
 };
 
@@ -135,13 +154,17 @@ export const refreshDeviceState = async (): Promise<
         slugs.map(async (slug) => {
           const r = await runIntegration(kind, "state", slug);
           const verdict = parseState(r.output);
-          return verdict === null
-            ? null
-            : ({
-                kind,
-                slug,
-                ...verdict,
-              } satisfies TDaemonInstalledIntegration);
+          if (verdict === null) return null;
+          const diverged =
+            verdict.installed && verdict.installedSha256 !== undefined
+              ? verdict.installedSha256 !== r.scriptSha256
+              : verdict.diverged;
+          return {
+            kind,
+            slug,
+            installed: verdict.installed,
+            ...(diverged === undefined ? {} : { diverged }),
+          } satisfies TDaemonInstalledIntegration;
         }),
       );
     }),
