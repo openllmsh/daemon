@@ -102,7 +102,12 @@ import {
   sseResponseForClient,
 } from "./client-encode";
 import { recordRequest } from "./cloud-client";
-import { activeSubMethod, lookupCatalogEntry, planSigningKey } from "./config";
+import {
+  activeSubMethod,
+  activeSubMethodOverrides,
+  lookupCatalogEntry,
+  planSigningKey,
+} from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
@@ -981,7 +986,12 @@ const serveSubscription = async (
       );
     }
     recordTokens(tokensFromResponse(canonical));
-    return deliverJsonResponse(canonical, args.surface, clientWire, resp.status);
+    return deliverJsonResponse(
+      canonical,
+      args.surface,
+      clientWire,
+      resp.status,
+    );
   }
 
   // Upstream returned JSON + client wants JSON (anthropic/kimi non-stream).
@@ -1255,11 +1265,14 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
   const baseEstimate = estimateBodyTokens(args.rawBody);
 
-  // The cloud's execution preference, sampled ONCE per request from the
-  // cached bootstrap snapshot so it can never switch mid-hop (a bootstrap
-  // refresh landing mid-walk applies to the NEXT request). Resolved per
-  // hop against the provider's declared methods in `selectSubMethod`.
+  // The cloud's execution preference — a global value plus per-provider
+  // overrides — sampled ONCE per request from the cached bootstrap
+  // snapshot so it can never switch mid-hop (a bootstrap refresh landing
+  // mid-walk applies to the NEXT request). Resolved per hop against the
+  // provider's declared methods in `selectSubMethod`, with the provider's
+  // override winning over the global preference.
   const requestedSubMethod = activeSubMethod();
+  const subMethodOverrides = activeSubMethodOverrides();
 
   let lastError: string | null = null;
   for (const [hopIndex, hop] of hops.entries()) {
@@ -1313,7 +1326,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     // (the commit rule below is method-agnostic).
     if (
       isNativeRuntimeProvider(hop.provider) &&
-      selectSubMethod(hop.provider, requestedSubMethod) === "bridge"
+      selectSubMethod(
+        hop.provider,
+        subMethodOverrides[hop.provider] ?? requestedSubMethod,
+      ) === "bridge"
     ) {
       const native = await tryServeNativeRuntime({
         provider: hop.provider,

@@ -97,6 +97,17 @@ export const activeSubMethod = (): TSubMethod | null =>
   snapshot.active_sub_method ?? null;
 
 /**
+ * Per-provider overrides layered on top of `activeSubMethod` (from the
+ * same bootstrap snapshot — `provider:method` entries in the cloud's
+ * `ACTIVE_SUB_METHOD` env). Empty when the cloud sent none / predates the
+ * field. Sampled together with the global preference once per request so
+ * a mid-walk bootstrap refresh never switches a hop.
+ */
+export const activeSubMethodOverrides = (): Readonly<
+  Record<string, TSubMethod>
+> => snapshot.active_sub_methods ?? {};
+
+/**
  * Cloud-controlled opt-in for the daemon's signed-plan cache (default off —
  * absent on older clouds keeps the rider inert). See `plan-cache.ts`.
  */

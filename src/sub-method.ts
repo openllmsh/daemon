@@ -6,8 +6,11 @@
  * `bridge` = the native vendor-runtime path (`native-runtime/`);
  * `handrolled` = the walker's manual upstream-HTTP transport. The cloud
  * publishes a preference in the bootstrap snapshot
- * (`config.ts#activeSubMethod`, from the cloud env `ACTIVE_SUB_METHOD`);
- * selection resolves it against the provider's declared methods:
+ * (`config.ts#activeSubMethod` + per-provider
+ * `config.ts#activeSubMethodOverrides`, both from the cloud env
+ * `ACTIVE_SUB_METHOD`); the walker passes `overrides[provider] ?? global`
+ * as `requested`, and selection resolves it against the provider's
+ * declared methods:
  *
  *   selected = requested !== null && methods.includes(requested)
  *     ? requested
