@@ -72,9 +72,10 @@ daemon/
                             of the cloud's bootstrap-published ACTIVE_SUB_METHOD preference — a
                             `handrolled` selection never probes/spawns the native bridge
                             (docs/proposals/active-sub-method.md)
-    plan-cache.ts           flag-gated signed-plan cache (bootstrap `plan_cache`, default off): a
-                            direct plan-less /v1/* request replays the last cloud-signed tuple for
-                            its alias within a short TTL — signature still verified per request
+    plan-cache.ts           flag-gated signed-plan cache (bootstrap `plan_cache`, cloud default ON,
+                            DAEMON_PLAN_CACHE=0 disables): a direct plan-less /v1/* request replays
+                            the last cloud-signed tuple for its alias within a short TTL —
+                            signature still verified per request
     client-encode.ts        client-wire encoders + the SHARED DELIVERY TAIL both execution methods
                             end in (deliverChunkStream: tee → meter → encode + heartbeat;
                             deliverJsonResponse; sseResponseForClient for pre-metered turns)

@@ -1,7 +1,8 @@
 /**
- * Signed-plan cache — the OPTIONAL efficiency rider of
+ * Signed-plan cache — the efficiency rider of
  * `docs/proposals/sub-method-simplified-execution.md` §4, gated by the
- * cloud-published `plan_cache` bootstrap flag (default off).
+ * cloud-published `plan_cache` bootstrap flag (cloud default ON;
+ * `DAEMON_PLAN_CACHE=0` on the cloud disables it fleet-wide).
  *
  * The audit's largest remaining latency item is the per-request WAN round
  * trip (client → cloud plan resolution → 307). Within one interactive burst
