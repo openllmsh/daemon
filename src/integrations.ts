@@ -11,8 +11,10 @@ import { daemonTempDir } from "./sandbox/working-set";
 export type TIntegrationKind = TDaemonIntegrationKind;
 export type TIntegrationMode = "install" | "uninstall" | "state";
 
-const AREA: Record<TIntegrationKind, "plugin" | "setup"> = {
-  plugin: "plugin",
+/** Wire kinds map onto the ONE registry area: former "plugin" slugs live in
+ *  `setup/` with `kind: extension` frontmatter — same delivery contract. */
+const AREA: Record<TIntegrationKind, "setup"> = {
+  plugin: "setup",
   setup: "setup",
 };
 
@@ -50,16 +52,15 @@ const isLoopbackOrigin = (origin: string): boolean => {
 
 const fetchPointer = async (
   cloudOrigin: string,
-  area: "plugin" | "setup",
+  area: "setup",
   slug: string,
 ): Promise<{
   readonly scriptUrl: string;
   readonly scriptSha256: string;
 } | null> => {
-  const routeArea = area === "plugin" ? "plugins" : "setup";
   try {
     const response = await fetch(
-      `${cloudOrigin}/api/${routeArea}/${encodeURIComponent(slug)}/pointer`,
+      `${cloudOrigin}/api/${area}/${encodeURIComponent(slug)}/pointer`,
       {
         redirect: "manual",
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -77,7 +78,7 @@ const fetchPointer = async (
     ) {
       return null;
     }
-    const devScriptUrl = `${cloudOrigin}/api/${routeArea}/${encodeURIComponent(slug)}/local-script`;
+    const devScriptUrl = `${cloudOrigin}/api/${area}/${encodeURIComponent(slug)}/local-script`;
     if (!(isLoopbackOrigin(cloudOrigin) && body.script_url === devScriptUrl)) {
       validateRegistryRawUrl(body.script_url, {
         area,

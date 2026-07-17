@@ -21,12 +21,14 @@ import { daemonEnv } from "./env";
 import { runIntegration } from "./integrations";
 import { logDebug, logWarn } from "./logger";
 
-/** The cloud catalog endpoint per area — the registry manifest, served live, so
- *  the walk discovers exactly the items the gateway publishes. */
-const CATALOG_PATH: Record<TDaemonIntegrationKind, string> = {
-  plugin: "/api/plugins",
-  setup: "/api/setup/options",
-};
+/** ONE catalog endpoint: the unified setup options list. The wire kind maps to
+ *  the option's `extensions` list — an option that extends clients is the
+ *  former plugin surface; one without is a client setup — keeping the
+ *  daemon⇄dashboard protocol unchanged over the folded registry. */
+const kindMatches = (
+  kind: TDaemonIntegrationKind,
+  extensions: ReadonlyArray<string>,
+): boolean => (kind === "plugin") === extensions.length > 0;
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -84,23 +86,32 @@ export const parseState = (output: string): TProbeVerdict | null => {
 export const parseInstalled = (output: string): boolean | null =>
   parseState(output)?.installed ?? null;
 
-/** Fetch the slugs/ids the gateway catalogs for one area. */
+/** Fetch the slugs the gateway catalogs for one wire kind. */
 const fetchCatalogSlugs = async (
   kind: TDaemonIntegrationKind,
 ): Promise<string[]> => {
   const { cloudOrigin } = daemonEnv();
-  const url = `${cloudOrigin}${CATALOG_PATH[kind]}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${cloudOrigin}/api/setup/options`, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return [];
     const body = (await res.json()) as {
-      data?: ReadonlyArray<{ slug?: unknown; id?: unknown }>;
+      data?: ReadonlyArray<{ id?: unknown; extensions?: unknown }>;
     };
     return (body.data ?? [])
-      .map((i) => (typeof i.slug === "string" ? i.slug : i.id))
-      .filter((s): s is string => typeof s === "string" && s.length > 0);
+      .filter((item) =>
+        kindMatches(
+          kind,
+          Array.isArray(item.extensions)
+            ? item.extensions.filter(
+                (entry): entry is string => typeof entry === "string",
+              )
+            : [],
+        ),
+      )
+      .map((item) => item.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
   } catch {
     return [];
   }
