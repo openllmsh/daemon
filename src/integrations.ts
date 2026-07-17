@@ -85,7 +85,7 @@ export const runIntegration = async (
   kind: TIntegrationKind,
   mode: TIntegrationMode,
   slug: string,
-  target = "claude-code",
+  target?: string,
 ): Promise<TIntegrationResult> => {
   const { cloudOrigin, apiKey } = daemonEnv();
   const area = AREA[kind];
@@ -140,16 +140,14 @@ export const runIntegration = async (
         : shared;
     const modeArgs =
       mode === "uninstall" ? ["-u"] : mode === "state" ? ["-s"] : [];
-    const proc = Bun.spawn(
-      ["bash", scriptPath, ...modeArgs, "--target", target],
-      {
-        env,
-        cwd: daemonTempDir(),
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: SCRIPT_TIMEOUT_MS,
-      },
-    );
+    const targetArgs = target === undefined ? [] : ["--target", target];
+    const proc = Bun.spawn(["bash", scriptPath, ...modeArgs, ...targetArgs], {
+      env,
+      cwd: daemonTempDir(),
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: SCRIPT_TIMEOUT_MS,
+    });
     const [stdout, stderr, code] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
