@@ -19,11 +19,12 @@ import {
   ChatCompletionRequest,
   ResponsesRequest,
 } from "@openllmsh/protocol";
+import { daemonPlanSigningPayload } from "@openllmsh/protocol";
 import { Schema } from "effect";
-import { planCacheEnabled } from "./config";
+import { planCacheEnabled, planSigningKey } from "./config";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { lookupPlan, storePlan } from "./plan-cache";
-import { runWalker } from "./walker";
+import { runWalker, verifyPlanSignature } from "./walker";
 
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
@@ -85,12 +86,22 @@ export const handleInference = async (req: Request): Promise<Response> => {
     );
   }
 
-  // Signed-plan cache (flag-gated rider — `plan-cache.ts`, default off). A
-  // 307-borne request remembers its signed tuple per model alias; a DIRECT
-  // request (no `?__plan=`) within the TTL replays it, skipping the cloud
-  // round trip. The walker verifies the signature either way, so the flag
-  // being off (or a cache miss) is exactly the pre-rider flow: no plan → the
+  // Signed-plan cache (flag-gated rider — `plan-cache.ts`). A 307-borne
+  // request remembers its signed tuple per model alias; a DIRECT request
+  // (no `?__plan=`) within the TTL replays it, skipping the cloud round
+  // trip. The walker verifies the signature either way, so the flag being
+  // off (or a cache miss) is exactly the pre-rider flow: no plan → the
   // walker's clean 400.
+  //
+  // A tuple enters the cache ONLY after the same signature check the walker
+  // enforces (unsigned accepted only in no-key dev mode), so a forged or
+  // tampered tuple can never overwrite an entry. Residual scope, accepted:
+  // the alias is NOT inside the signed payload (adding it would change the
+  // canonical payload and fail-close every already-deployed daemon), so a
+  // LOOPBACK caller could pair a genuinely-signed tuple with a different
+  // `model` in the body — but this surface is 127.0.0.1 with the caller
+  // owning the machine (see the module doc: no auth gate), and such a
+  // caller can already address the daemon/cloud arbitrarily as themselves.
   let planParam = url.searchParams.get("__plan");
   let pmidsParam = url.searchParams.get("__pmids");
   let originParam = url.searchParams.get("__origin");
@@ -98,7 +109,21 @@ export const handleInference = async (req: Request): Promise<Response> => {
   const alias = (rawBody as { model?: unknown } | null)?.model;
   if (planCacheEnabled() && typeof alias === "string" && alias.length > 0) {
     if (planParam !== null) {
-      storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
+      const sigKey = planSigningKey();
+      const verified =
+        sigKey === null ||
+        verifyPlanSignature(
+          daemonPlanSigningPayload(
+            planParam,
+            pmidsParam ?? "",
+            originParam ?? "",
+          ),
+          sigParam,
+          sigKey,
+        );
+      if (verified) {
+        storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
+      }
     } else {
       const cached = lookupPlan(alias);
       if (cached !== null) {

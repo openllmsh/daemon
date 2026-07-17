@@ -286,32 +286,29 @@ const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
   });
 
 /**
- * Headers NEVER retained by the identity capture: credentials (`authorization`
- * / `x-api-key` / `cookie`), transport + entity headers the rebuilt request
- * derives itself, and `anthropic-beta` — that one is composed separately by
- * the wire builder (`buildUpstreamHeaders` merges the OAuth beta + the
- * client's inbound beta), so replaying a captured copy would fight it.
+ * Headers the identity capture RETAINS — a strict ALLOWLIST of the known
+ * Claude CLI identity set, so a credential-bearing or unrecognized header
+ * (`authorization`, `proxy-authorization`, `cookie`, a future vendor token)
+ * is never persisted or replayed, even one we didn't foresee. Deliberately
+ * NOT here: `anthropic-beta` (composed separately by the wire builder —
+ * `buildUpstreamHeaders` merges the OAuth beta + the client's inbound beta,
+ * so replaying a captured copy would fight it) and every transport/entity
+ * header (the rebuilt request derives its own).
  */
-const IDENTITY_DENY: ReadonlySet<string> = new Set([
-  "authorization",
-  "x-api-key",
-  "cookie",
-  "host",
-  "content-length",
-  "content-type",
-  "accept",
-  "accept-encoding",
-  "connection",
-  "transfer-encoding",
-  "keep-alive",
-  "expect",
-  "anthropic-beta",
+const IDENTITY_ALLOW: ReadonlySet<string> = new Set([
+  "user-agent",
+  "x-app",
+  "anthropic-version",
+  "anthropic-dangerous-direct-browser-access",
 ]);
+/** The SDK's telemetry family (`x-stainless-lang`, `-os`, `-arch`,
+ *  `-runtime`, `-package-version`, …) — allowlisted by prefix. */
+const IDENTITY_ALLOW_PREFIX = "x-stainless-";
 
 /**
- * Filter a captured request's headers down to the CLI's IDENTITY set:
- * everything except credentials / transport / entity headers (deny-listed
- * above), lower-cased. Exported for the parity tests.
+ * Filter a captured request's headers down to the CLI's IDENTITY set — the
+ * allowlist above, lower-cased; everything else is rejected. Exported for
+ * the parity tests.
  */
 export const filterIdentityHeaders = (
   headers: Headers,
@@ -319,7 +316,8 @@ export const filterIdentityHeaders = (
   const out: Record<string, string> = {};
   headers.forEach((value, key) => {
     const name = key.toLowerCase();
-    if (IDENTITY_DENY.has(name)) return;
+    if (!IDENTITY_ALLOW.has(name) && !name.startsWith(IDENTITY_ALLOW_PREFIX))
+      return;
     out[name] = value;
   });
   return out;
@@ -344,8 +342,8 @@ type TRecorder = {
  * far enough to issue its inference call. The inference request itself is
  * captured-then-killed and never forwarded, so it never reaches the vendor. The
  * request PATH is read, plus — for `captureIdentity` providers — the FILTERED
- * identity headers (never `authorization`; see `IDENTITY_DENY`). URL-only
- * captures discard the header set.
+ * identity headers (allowlist-only; see `IDENTITY_ALLOW`). URL-only captures
+ * discard the header set.
  */
 const startRecorder = (spec: TCaptureSpec): TRecorder => {
   let resolveFirst!: (v: TCapturedRequest) => void;
@@ -485,8 +483,10 @@ const runCaptureOnce = (
       // stable default) — a run for them exists for IDENTITY only, so no
       // URL is persisted that `ensureUpstreamUrl` would then start serving.
       ...(spec.liveCapture !== false ? { upstream_url: captured.url } : {}),
-      ...(spec.captureIdentity === true &&
-      Object.keys(captured.identityHeaders).length > 0
+      // ALWAYS written on a successful capture (even `{}`): an empty set
+      // means the CLI genuinely sent no allowlisted identity headers, and a
+      // stale non-empty fixture must be CLEARED, not kept.
+      ...(spec.captureIdentity === true
         ? { identity_headers: captured.identityHeaders }
         : {}),
       cli_version: ver ?? "",
@@ -504,6 +504,29 @@ const runCaptureOnce = (
   })().finally(() => captureInFlight.delete(provider));
   captureInFlight.set(provider, run);
   return run;
+};
+
+// Memoized `--version` probe: `resolveIdentityHeaders` runs on EVERY
+// claude_code handrolled hop (via `credentialForUpstream`), and before the
+// identity fixture existed that path spawned NOTHING for claude — the
+// freshness check must not reintroduce a per-request `claude --version`
+// spawn. A short TTL keeps a CLI update visible within minutes (the fixture
+// TTL is 24h, so minute-level staleness here is irrelevant).
+const VERSION_MEMO_TTL_MS = 5 * 60_000;
+const versionMemo = new Map<
+  TCliProvider,
+  { readonly version: string | null; readonly atMs: number }
+>();
+const memoizedCliVersion = async (
+  provider: TCliProvider,
+): Promise<string | null> => {
+  const hit = versionMemo.get(provider);
+  if (hit !== undefined && Date.now() - hit.atMs < VERSION_MEMO_TTL_MS) {
+    return hit.version;
+  }
+  const version = await cliVersion(cliBin(provider), cliEnv(provider));
+  versionMemo.set(provider, { version, atMs: Date.now() });
+  return version;
 };
 
 /** Version match + within TTL — the shared freshness of the last capture. */
@@ -569,13 +592,19 @@ export const resolveIdentityHeaders = async (
   const cfg = (await readConfig(provider)) ?? {};
   const stored = cfg.identity_headers ?? null;
   if (opts?.force !== true && stored !== null) {
-    const ver = await cliVersion(cliBin(provider), cliEnv(provider));
+    // Memoized — this runs per hop and must not spawn `--version` each time.
+    const ver = await memoizedCliVersion(provider);
     if (captureFresh(cfg, ver)) return stored;
   }
   const captured = await runCaptureOnce(provider);
-  return captured !== null && Object.keys(captured.identityHeaders).length > 0
+  // Capture FAILED → the stale-but-present fixture beats nothing. Capture
+  // SUCCEEDED with an empty set → the CLI sent no allowlisted identity;
+  // resolve null (originator-only) rather than replaying a stale fixture
+  // the persistence above just cleared.
+  if (captured === null) return stored;
+  return Object.keys(captured.identityHeaders).length > 0
     ? captured.identityHeaders
-    : stored;
+    : null;
 };
 
 /**

@@ -28,6 +28,16 @@ const MAC = platform() === "darwin";
 const loginKeychainPath = (home: string): string =>
   join(home, "Library", "Keychains", "login.keychain-db");
 
+/** The argv with secret-bearing option VALUES redacted for logging: `-w`
+ *  carries the OAuth credential payload (`add-generic-password`), `-p` a
+ *  keychain password — neither may reach `openllmd.err.log`. */
+const redactSecurityArgv = (argv: ReadonlyArray<string>): string[] =>
+  argv.map((arg, i) =>
+    i > 0 && (argv[i - 1] === "-w" || argv[i - 1] === "-p")
+      ? "<redacted>"
+      : arg,
+  );
+
 const runSecurity = async (
   argv: ReadonlyArray<string>,
   home: string,
@@ -43,7 +53,8 @@ const runSecurity = async (
     const code = await proc.exited;
     // A `security` child SIGKILLed by the sandbox leaves no keychain + no
     // trace — surface it so a later "Keychain Not Found" dialog is explained.
-    logIfKilled(["security", ...argv], proc);
+    // Redacted: the argv may carry the OAuth payload (`-w`).
+    logIfKilled(redactSecurityArgv(["security", ...argv]), proc);
     return code === 0;
   } catch {
     return false;
@@ -164,9 +175,11 @@ const ensureKeychainNow = async (home: string, kc: string): Promise<void> => {
   }
   // Unlock at the FINAL path (securityd keys unlock state by path, so re-unlock
   // after the rename). Unlocking the reserved name by explicit path is fine —
-  // only `create-keychain` at it fails.
-  await runSecurity(["unlock-keychain", "-p", "", kc], home);
-  ensuredKeychains.add(kc);
+  // only `create-keychain` at it fails. Cache ONLY a successful unlock: a
+  // failed one must be retried on the next call, not remembered as ensured
+  // (a locked keychain wedges `claude auth login` just like a missing one).
+  const unlocked = await runSecurity(["unlock-keychain", "-p", "", kc], home);
+  if (unlocked) ensuredKeychains.add(kc);
 };
 
 /**
