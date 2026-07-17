@@ -118,7 +118,7 @@ import {
 } from "./native-runtime/serve";
 import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
-import { selectSubMethod } from "./sub-method";
+import { isClaudeCodeOriginator, selectSubMethod } from "./sub-method";
 import { sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
@@ -1228,9 +1228,15 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   // snapshot so it can never switch mid-hop (a bootstrap refresh landing
   // mid-walk applies to the NEXT request). Resolved per hop against the
   // provider's declared methods in `selectSubMethod`, with the provider's
-  // override winning over the global preference.
+  // override winning over the global preference — EXCEPT a `claude_code`
+  // hop whose inbound request comes from the real Claude Code client,
+  // which is always handrolled (the ToS-alignment override inside
+  // `selectSubMethod`: forwarding the genuine client's own request on the
+  // CLI's credential IS the official-client flow; the bridge would nest a
+  // second Claude Code around it).
   const requestedSubMethod = activeSubMethod();
   const subMethodOverrides = activeSubMethodOverrides();
+  const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
 
   let lastError: string | null = null;
   for (const [hopIndex, hop] of hops.entries()) {
@@ -1273,6 +1279,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       selectSubMethod(
         hop.provider,
         subMethodOverrides[hop.provider] ?? requestedSubMethod,
+        { isClaudeCode: claudeCodeOriginator },
       ) === "bridge"
     ) {
       const native = await tryServeNativeRuntime({

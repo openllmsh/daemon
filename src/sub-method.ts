@@ -50,16 +50,44 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
 };
 
 /**
+ * Is the inbound request from a REAL first-party Claude client? Claude
+ * Code stamps `user-agent: claude-cli/<semver> …`, Claude Cowork (and
+ * sibling official Claude apps) stamp their own `claude*` identity, and
+ * the gateway/daemon forward the header verbatim
+ * (`originatorHeadersFrom`) — so the `claude` prefix is the family
+ * signature. A spoof (or an unrelated third-party lib that happens to
+ * name itself `claude-*`) gains nothing: it merely selects the MORE
+ * ToS-aligned transport, which serves every request shape anyway.
+ */
+export const isClaudeCodeOriginator = (headers: Headers): boolean =>
+  headers.get("user-agent")?.toLowerCase().startsWith("claude") === true;
+
+/**
  * Resolve the effective method for one subscription hop. Deterministic:
  * a null/unsupported preference selects the provider default
  * (`methods[0]`). Unknown providers (not in the closed subscription set)
  * resolve to `handrolled` — the walker's `canWalkPlan`/`UPSTREAM_WIRE`
  * already decide whether such a hop is servable at all.
+ *
+ * ToS-alignment override (beats `ACTIVE_SUB_METHOD`): a `claude_code`
+ * hop whose inbound request comes from the REAL Claude Code client
+ * (`originator.isClaudeCode`) is ALWAYS handrolled. The handrolled
+ * transport forwards the genuine client's own request — verbatim
+ * Anthropic wire, its own identity headers — on the CLI's own
+ * credential, which IS the official-client flow the subscription terms
+ * describe. Spawning the bridge there would nest a SECOND Claude Code
+ * runtime around a request the real one already produced: slower
+ * (process spawn + stream-json re-encode), lossier, and no more
+ * compliant.
  */
 export const selectSubMethod = (
   provider: string,
   requested: TSubMethod | null,
+  originator?: { readonly isClaudeCode: boolean },
 ): TSubMethod => {
+  if (provider === "claude_code" && originator?.isClaudeCode === true) {
+    return "handrolled";
+  }
   const capability =
     SUB_METHOD_CAPABILITIES[provider as TSubscriptionProviderSlug];
   if (capability === undefined) return "handrolled";
