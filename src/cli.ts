@@ -95,11 +95,10 @@ const runAutoUpdate = (args: readonly string[]): never => {
   process.exit(2);
 };
 
-// The `list` endpoint per integration group (setup is singular + keyed by id).
-const LIST_PATH: Record<TIntegrationKind, string> = {
-  extension: "/api/setup/options",
-  setup: "/api/setup/options",
-};
+// ONE catalog endpoint; each group filters by the option's `extensions` list
+// (non-empty ⇔ extension, empty ⇔ client setup) — same classification as
+// device-state.ts, so `extension list` and `setup list` partition the catalog.
+const LIST_PATH = "/api/setup/options";
 
 const integrationUsage = (kind: TIntegrationKind): never => {
   process.stderr.write(
@@ -120,7 +119,7 @@ const runIntegrationCli = async (
   const action = args[0];
 
   if (action === "list") {
-    const url = `${daemonEnv().cloudOrigin}${LIST_PATH[kind]}`;
+    const url = `${daemonEnv().cloudOrigin}${LIST_PATH}`;
     try {
       const res = await fetch(url);
       if (!res.ok) {
@@ -128,10 +127,17 @@ const runIntegrationCli = async (
         process.exit(1);
       }
       const body = (await res.json()) as {
-        data?: ReadonlyArray<{ slug?: string; id?: string; name?: string }>;
+        data?: ReadonlyArray<{
+          id?: string;
+          name?: string;
+          extensions?: ReadonlyArray<string>;
+        }>;
       };
       for (const item of body.data ?? []) {
-        const id = item.slug ?? item.id ?? "";
+        const isExtension = (item.extensions?.length ?? 0) > 0;
+        if ((kind === "extension") !== isExtension) continue;
+        const id = item.id ?? "";
+        if (id.length === 0) continue;
         process.stdout.write(`${id.padEnd(24)}${item.name ?? ""}\n`);
       }
       process.exit(0);
