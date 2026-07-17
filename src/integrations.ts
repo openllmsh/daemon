@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { SHA256_RE, validateRegistryRawUrl } from "@openllm/registry/pointer";
 import type { TDaemonIntegrationKind } from "@openllmsh/protocol";
+import {
+  SHA256_RE,
+  validateRegistryRawUrl,
+} from "@openllmsh/protocol/registry-pointer";
 import { daemonEnv } from "./env";
 import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";
@@ -11,10 +14,10 @@ import { daemonTempDir } from "./sandbox/working-set";
 export type TIntegrationKind = TDaemonIntegrationKind;
 export type TIntegrationMode = "install" | "uninstall" | "state";
 
-/** Wire kinds map onto the ONE registry area: former "plugin" slugs live in
- *  `setup/` with `kind: extension` frontmatter — same delivery contract. */
+/** Wire kinds map onto the ONE registry area: an `extension` is a setup entry
+ *  whose frontmatter declares `extensions:` — same delivery contract. */
 const AREA: Record<TIntegrationKind, "setup"> = {
-  plugin: "setup",
+  extension: "setup",
   setup: "setup",
 };
 

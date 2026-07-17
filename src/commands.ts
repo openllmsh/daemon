@@ -26,9 +26,9 @@ export const COMMANDS: readonly TCommand[] = [
     description: "Show or follow the daemon log",
   },
   {
-    name: "plugin",
+    name: "extension",
     args: "<install|uninstall|list> [slug]",
-    description: "Install or remove a Claude Code plugin on this machine",
+    description: "Install or remove a client extension on this machine",
   },
   {
     name: "setup",
@@ -71,8 +71,8 @@ export const PROVIDERS = [
   "grok",
 ] as const;
 
-/** Action choices for the `plugin` / `setup` integration groups. */
-export const INTEGRATION_GROUPS = ["plugin", "setup"] as const;
+/** Action choices for the `extension` / `setup` integration groups. */
+export const INTEGRATION_GROUPS = ["extension", "setup"] as const;
 export const INTEGRATION_ACTIONS = ["install", "uninstall", "list"] as const;
 
 /** Argument choices for the `auto-update` subcommand. */

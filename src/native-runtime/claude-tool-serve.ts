@@ -14,10 +14,7 @@
 import type { TChatCompletionRequest } from "@openllmsh/protocol";
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
-import {
-  deliverJsonResponse,
-  sseResponseForClient,
-} from "../client-encode";
+import { deliverJsonResponse, sseResponseForClient } from "../client-encode";
 import type { TClientTool, TIteratorFactory } from "./claude-tool-session";
 import {
   continueToolTurn,

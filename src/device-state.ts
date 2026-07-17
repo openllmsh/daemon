@@ -28,7 +28,7 @@ import { logDebug, logWarn } from "./logger";
 const kindMatches = (
   kind: TDaemonIntegrationKind,
   extensions: ReadonlyArray<string>,
-): boolean => (kind === "plugin") === extensions.length > 0;
+): boolean => (kind === "extension") === extensions.length > 0;
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -157,7 +157,7 @@ export const probeIntegration = async (
 export const refreshDeviceState = async (): Promise<
   TDaemonInstalledIntegration[]
 > => {
-  const kinds: TDaemonIntegrationKind[] = ["plugin", "setup"];
+  const kinds: TDaemonIntegrationKind[] = ["extension", "setup"];
   const perArea = await Promise.all(
     kinds.map(async (kind) => {
       const slugs = await fetchCatalogSlugs(kind);

@@ -13,7 +13,7 @@
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
  *   openllmd logs [-f] [-n N]     show or follow the daemon log
- *   openllmd plugin <install|uninstall|list> [slug]   manage a Claude Code plugin
+ *   openllmd extension <install|uninstall|list> [slug]  manage a client extension
  *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
@@ -97,7 +97,7 @@ const runAutoUpdate = (args: readonly string[]): never => {
 
 // The `list` endpoint per integration group (setup is singular + keyed by id).
 const LIST_PATH: Record<TIntegrationKind, string> = {
-  plugin: "/api/plugins",
+  extension: "/api/setup/options",
   setup: "/api/setup/options",
 };
 
@@ -109,7 +109,7 @@ const integrationUsage = (kind: TIntegrationKind): never => {
 };
 
 /**
- * Run a `plugin|setup` subcommand. Foreground one-shot (no server boot):
+ * Run an `extension|setup` subcommand. Foreground one-shot (no server boot):
  * `list` prints the catalog; `install|uninstall <slug>` runs the shared
  * executor and exits with its status. Exits the process in every branch.
  */
@@ -199,7 +199,7 @@ export const runCli = (): boolean => {
     case "logs":
       runLogs(rest);
       break;
-    case "plugin":
+    case "extension":
     case "setup":
       // Foreground one-shot: the async executor process.exit()s when done; the
       // pending fetch keeps the event loop alive. Returning true prevents the

@@ -141,7 +141,10 @@ export const deliverJsonResponse = (
   clientWire: TClientWire,
   status?: number,
 ): Response =>
-  new Response(JSON.stringify(jsonBodyForClient(canonical, surface, clientWire)), {
-    status: status ?? 200,
-    headers: { "content-type": "application/json" },
-  });
+  new Response(
+    JSON.stringify(jsonBodyForClient(canonical, surface, clientWire)),
+    {
+      status: status ?? 200,
+      headers: { "content-type": "application/json" },
+    },
+  );
