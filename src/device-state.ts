@@ -47,6 +47,7 @@ export type TProbeVerdict = {
   readonly installed: boolean;
   readonly diverged?: boolean;
   readonly installedSha256?: string;
+  readonly version?: string;
 };
 
 /** Parse the state verdict out of an `install.sh -s` run's output. The probe
@@ -64,6 +65,7 @@ export const parseState = (output: string): TProbeVerdict | null => {
         installed?: unknown;
         diverged?: unknown;
         installed_sha256?: unknown;
+        version?: unknown;
       };
       if (typeof j.installed === "boolean") {
         return {
@@ -72,6 +74,9 @@ export const parseState = (output: string): TProbeVerdict | null => {
           ...(typeof j.installed_sha256 === "string" &&
           j.installed_sha256.length > 0
             ? { installedSha256: j.installed_sha256 }
+            : {}),
+          ...(typeof j.version === "string" && j.version.length > 0
+            ? { version: j.version }
             : {}),
         };
       }
@@ -165,6 +170,7 @@ export const probeIntegration = async (
     ...(kind === "extension" && target !== undefined ? { target } : {}),
     installed: verdict.installed,
     ...(diverged === undefined ? {} : { diverged }),
+    ...(verdict.version === undefined ? {} : { version: verdict.version }),
   });
   cache = next;
 };
@@ -219,6 +225,9 @@ export const refreshDeviceState = async (): Promise<
             ...(kind === "extension" && target !== undefined ? { target } : {}),
             installed: verdict.installed,
             ...(diverged === undefined ? {} : { diverged }),
+            ...(verdict.version === undefined
+              ? {}
+              : { version: verdict.version }),
           } satisfies TDaemonInstalledIntegration;
         }),
       );
