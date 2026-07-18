@@ -258,21 +258,8 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // so granting global /tmp would leak access to every other process's temp
   // files. Instead we create and use our own isolated temp under stateDir.
   const daemonTmp = daemonTempDir();
-  // The integration scripts' staging dir ($HOME/.cache/openllm — see the grant
-  // below). PRE-CREATE it (best-effort) so the grant lands on the real leaf:
-  // `existing()` deliberately refuses to climb to bare $HOME, so on a fresh box
-  // where ~/.cache itself is absent the leaf would otherwise stay ungranted and
-  // the confined script's first mktemp would still EACCES. Mirrors how
-  // `daemonTempDir()` pre-creates the daemon tmp above.
-  const integrationTmp = join(home, ".cache", "openllm");
-  try {
-    mkdirSync(integrationTmp, { recursive: true, mode: 0o700 });
-  } catch {
-    // Best-effort — if creation fails, `existing()` still climbs to whatever
-    // ancestor DOES exist (or returns the leaf, which fails to grant safely).
-  }
   // The write-once original-config backups the integration scripts take
-  // (`backup_once` in packages/api/lib/scripts.ts) — hardcoded to
+  // (`backup_once` in the assembled registry runtime) — hardcoded to
   // $HOME/.openllm/backups in the scripts, so it must be granted explicitly:
   // it coincides with the state dir's subtree only when
   // OPENLLM_DAEMON_STATE_DIR is unset. Pre-created (0700 — backups may carry
@@ -283,17 +270,17 @@ export const daemonWorkingSet = (): TWorkingSet => {
   try {
     mkdirSync(backupsDir, { recursive: true, mode: 0o700 });
   } catch {
-    // Best-effort — same posture as integrationTmp above.
+    // Best-effort — if creation fails, the sandbox grant remains narrow.
   }
-  // The install stamps the wrapper scripts record/compare/clear
-  // (`record_install_stamp` / `state_with_divergence` in
-  // packages/api/lib/scripts.ts) — hardcoded to $HOME/.openllm/installed like
+  // The install stamps the assembled scripts record/compare/clear
+  // (`record_install_stamp` / `read_install_stamp` in the registry runtime) —
+  // hardcoded to $HOME/.openllm/installed like
   // the backups dir above; same rationale + posture.
   const stampsDir = join(home, ".openllm", "installed");
   try {
     mkdirSync(stampsDir, { recursive: true, mode: 0o700 });
   } catch {
-    // Best-effort — same posture as integrationTmp above.
+    // Best-effort — if creation fails, the sandbox grant remains narrow.
   }
   // Pre-create the vendor CLI install/config dirs the host-install + setup flows
   // write into (claude / codex / kimi). REQUIRED on Linux: Landlock can only
@@ -302,7 +289,7 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // be UNgranted and the vendor installer's `mkdir -p ~/.kimi-code/bin` EACCESes
   // (the Linux EC2 failure). macOS Seatbelt grants by path pattern so it doesn't
   // need this — pre-creating is a harmless no-op there. Same pattern as the
-  // daemonTempDir / integrationTmp pre-creation above.
+  // daemonTempDir pre-creation above.
   for (const d of [
     // claude-code: SCOPED subtrees only, never the whole ~/.claude — the
     // user's real OAuth token (`~/.claude/.credentials.json` on Linux) lives
@@ -409,10 +396,10 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // real directory must be writable.
     dirname(process.execPath),
     // ── Integration / setup workflow targets ──────────────────────────
-    // The SHA-gated plugin/setup scripts the daemon runs (via `bash -s`)
-    // configure the user's CLIs IN PLACE — including the NON-isolated codex /
-    // kimi / claude setups (`packages/registry/setup/{codex,kimi-code,claude-code}`)
-    // and the plugin installers (`packages/registry/plugin`). Every path
+    // The SHA-gated setup/extension scripts the daemon runs from verified temp
+    // files configure the user's CLIs IN PLACE — including the NON-isolated codex /
+    // kimi / claude setups and the extension under `packages/registry/setup`.
+    // Every path
     // they write MUST be granted or the install fails under the sandbox.
     //   claude-code: SCOPED to the subtrees the scripts + installer write —
     //   NEVER the whole ~/.claude, whose root holds the user's real OAuth
@@ -469,15 +456,6 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   edits to worry about: installs run in the UNSANDBOXED user context (the
     //   daemon install script), where the native installers do their normal
     //   rc/PATH edits.)
-    //   the integration scripts' OWN staging dir: the shared script preamble
-    //   (`packages/api/lib/scripts.ts` `pick_tmpdir`) points TMPDIR at
-    //   `$HOME/.cache/openllm` (the root fs, to dodge the small /tmp tmpfs on
-    //   cloud images), and EVERY install/uninstall does its `mktemp` +
-    //   download/extract there. Without this grant a confined integration's
-    //   first `mktemp` EACCESes → the `set -e` script exits 1 (the EC2
-    //   install/uninstall failure). Pre-created above so the grant lands on the
-    //   real leaf even when ~/.cache didn't previously exist.
-    integrationTmp,
     // Daemon-owned temp directory (NOT global /tmp). Vendor install scripts
     // stage downloads here. Created above with 0o700 so it's isolated.
     daemonTmp,

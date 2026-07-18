@@ -86,34 +86,37 @@ export const parseState = (output: string): TProbeVerdict | null => {
 export const parseInstalled = (output: string): boolean | null =>
   parseState(output)?.installed ?? null;
 
-/** Fetch the slugs the gateway catalogs for one wire kind. */
-const fetchCatalogSlugs = async (
-  kind: TDaemonIntegrationKind,
-): Promise<string[]> => {
+type TCatalogItem = {
+  readonly id: string;
+  readonly extensions: ReadonlyArray<string>;
+};
+
+/** Fetch the unified setup catalog once. Null means retrieval/shape failure. */
+const fetchCatalog = async (): Promise<ReadonlyArray<TCatalogItem> | null> => {
   const { cloudOrigin } = daemonEnv();
   try {
     const res = await fetch(`${cloudOrigin}/api/setup/options`, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) return [];
-    const body = (await res.json()) as {
-      data?: ReadonlyArray<{ id?: unknown; extensions?: unknown }>;
-    };
-    return (body.data ?? [])
-      .filter((item) =>
-        kindMatches(
-          kind,
-          Array.isArray(item.extensions)
-            ? item.extensions.filter(
-                (entry): entry is string => typeof entry === "string",
-              )
-            : [],
-        ),
-      )
-      .map((item) => item.id)
-      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (!res.ok) return null;
+    const body = (await res.json()) as { data?: unknown };
+    if (!Array.isArray(body.data)) return null;
+    const catalog: TCatalogItem[] = [];
+    for (const item of body.data) {
+      if (typeof item !== "object" || item === null) return null;
+      const record = item as { id?: unknown; extensions?: unknown };
+      if (typeof record.id !== "string" || !Array.isArray(record.extensions)) {
+        return null;
+      }
+      const extensions = record.extensions.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+      if (extensions.length !== record.extensions.length) return null;
+      catalog.push({ id: record.id, extensions });
+    }
+    return catalog;
   } catch {
-    return [];
+    return null;
   }
 };
 
@@ -139,8 +142,10 @@ export const probeIntegration = async (
   }
   const next = cache.filter((i) => !(i.kind === kind && i.slug === slug));
   const diverged =
-    verdict.installed && verdict.installedSha256 !== undefined
-      ? verdict.installedSha256 !== r.scriptSha256
+    verdict.installed &&
+    verdict.installedSha256 !== undefined &&
+    r.installStampSha256 !== undefined
+      ? verdict.installedSha256 !== r.installStampSha256
       : verdict.diverged;
   next.push({
     kind,
@@ -158,18 +163,27 @@ export const probeIntegration = async (
 export const refreshDeviceState = async (): Promise<
   TDaemonInstalledIntegration[]
 > => {
+  const catalog = await fetchCatalog();
+  if (catalog === null) {
+    logWarn("device-state", "catalog unavailable — preserving cached state");
+    return cache;
+  }
   const kinds: TDaemonIntegrationKind[] = ["extension", "setup"];
   const perArea = await Promise.all(
     kinds.map(async (kind) => {
-      const slugs = await fetchCatalogSlugs(kind);
+      const slugs = catalog
+        .filter((item) => kindMatches(kind, item.extensions))
+        .map((item) => item.id);
       return Promise.all(
         slugs.map(async (slug) => {
           const r = await runIntegration(kind, "state", slug);
           const verdict = parseState(r.output);
           if (verdict === null) return null;
           const diverged =
-            verdict.installed && verdict.installedSha256 !== undefined
-              ? verdict.installedSha256 !== r.scriptSha256
+            verdict.installed &&
+            verdict.installedSha256 !== undefined &&
+            r.installStampSha256 !== undefined
+              ? verdict.installedSha256 !== r.installStampSha256
               : verdict.diverged;
           return {
             kind,

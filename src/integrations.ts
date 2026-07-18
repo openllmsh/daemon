@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { TDaemonIntegrationKind } from "@openllmsh/protocol";
 import {
+  readRegistryInstallStampSha256,
   SHA256_RE,
   validateRegistryRawUrl,
 } from "@openllmsh/protocol/registry-pointer";
@@ -25,7 +26,10 @@ export type TIntegrationResult = {
   readonly ok: boolean;
   readonly code: number;
   readonly output: string;
+  /** SHA-256 of the exact downloaded bytes, matching the registry pointer. */
   readonly scriptSha256?: string;
+  /** Canonical self-check identity persisted by successful file-mode installs. */
+  readonly installStampSha256?: string;
 };
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -117,6 +121,12 @@ export const runIntegration = async (
       `integrity mismatch for ${area}/${slug}: expected ${pointer.scriptSha256} got ${actual} — refusing to run`,
     );
   }
+  const installStampSha256 = readRegistryInstallStampSha256(bytes);
+  if (installStampSha256 === null) {
+    return fail(
+      `integrity: invalid installer checksum field for ${area}/${slug} — refusing to run`,
+    );
+  }
 
   const scriptPath = path.join(
     daemonTempDir(),
@@ -181,6 +191,7 @@ export const runIntegration = async (
       code,
       output: safeOutput.slice(-4000),
       scriptSha256: pointer.scriptSha256,
+      installStampSha256,
     };
   } finally {
     fs.rmSync(scriptPath, { force: true });
