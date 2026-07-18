@@ -16,6 +16,7 @@
 import type {
   TDaemonInstalledIntegration,
   TDaemonIntegrationKind,
+  TGatewayMode,
 } from "@openllmsh/protocol";
 import { daemonEnv } from "./env";
 import { runIntegration } from "./integrations";
@@ -49,6 +50,7 @@ export type TProbeVerdict = {
   readonly installedSha256?: string;
   readonly version?: string;
   readonly installedCommit?: string;
+  readonly gateway?: TGatewayMode;
 };
 
 /** Parse the state verdict out of an `install.sh -s` run's output. The probe
@@ -68,6 +70,7 @@ export const parseState = (output: string): TProbeVerdict | null => {
         installed_sha256?: unknown;
         version?: unknown;
         installed_commit?: unknown;
+        gateway?: unknown;
       };
       if (typeof j.installed === "boolean") {
         return {
@@ -84,6 +87,9 @@ export const parseState = (output: string): TProbeVerdict | null => {
           /^[0-9a-f]{40}$/.test(j.installed_commit)
             ? { installedCommit: j.installed_commit }
             : {}),
+          ...(j.gateway === "local" || j.gateway === "cloud"
+            ? { gateway: j.gateway }
+            : {}),
         };
       }
     } catch {
@@ -96,6 +102,21 @@ export const parseState = (output: string): TProbeVerdict | null => {
 /** Back-compat boolean view of `parseState` (kept for existing tests). */
 export const parseInstalled = (output: string): boolean | null =>
   parseState(output)?.installed ?? null;
+
+/** The verdict's optional fields in wire shape — shared by the single-item
+ *  probe and the full walk so a new probe field is a one-site addition. */
+const verdictWireFields = (
+  verdict: TProbeVerdict,
+): Pick<
+  TDaemonInstalledIntegration,
+  "version" | "installed_commit" | "gateway"
+> => ({
+  ...(verdict.version === undefined ? {} : { version: verdict.version }),
+  ...(verdict.installedCommit === undefined
+    ? {}
+    : { installed_commit: verdict.installedCommit }),
+  ...(verdict.gateway === undefined ? {} : { gateway: verdict.gateway }),
+});
 
 type TCatalogItem = {
   readonly id: string;
@@ -176,10 +197,7 @@ export const probeIntegration = async (
     ...(kind === "extension" && target !== undefined ? { target } : {}),
     installed: verdict.installed,
     ...(diverged === undefined ? {} : { diverged }),
-    ...(verdict.version === undefined ? {} : { version: verdict.version }),
-    ...(verdict.installedCommit === undefined
-      ? {}
-      : { installed_commit: verdict.installedCommit }),
+    ...verdictWireFields(verdict),
   });
   cache = next;
 };
@@ -234,12 +252,7 @@ export const refreshDeviceState = async (): Promise<
             ...(kind === "extension" && target !== undefined ? { target } : {}),
             installed: verdict.installed,
             ...(diverged === undefined ? {} : { diverged }),
-            ...(verdict.version === undefined
-              ? {}
-              : { version: verdict.version }),
-            ...(verdict.installedCommit === undefined
-              ? {}
-              : { installed_commit: verdict.installedCommit }),
+            ...verdictWireFields(verdict),
           } satisfies TDaemonInstalledIntegration;
         }),
       );

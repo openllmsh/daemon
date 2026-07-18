@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { TDaemonIntegrationKind } from "@openllmsh/protocol";
+import type { TDaemonIntegrationKind, TGatewayMode } from "@openllmsh/protocol";
 import {
   readRegistryInstallStampSha256,
   SHA256_RE,
@@ -92,6 +92,7 @@ export const runIntegration = async (
   mode: TIntegrationMode,
   slug: string,
   target?: string,
+  gateway?: TGatewayMode,
 ): Promise<TIntegrationResult> => {
   const { cloudOrigin, apiKey } = daemonEnv();
   const area = AREA[kind];
@@ -170,13 +171,20 @@ export const runIntegration = async (
     const modeArgs =
       mode === "uninstall" ? ["-u"] : mode === "state" ? ["-s"] : [];
     const targetArgs = target === undefined ? [] : ["--target", target];
-    const proc = Bun.spawn(["bash", scriptPath, ...modeArgs, ...targetArgs], {
-      env,
-      cwd: daemonTempDir(),
-      stdout: "pipe",
-      stderr: "pipe",
-      timeout: SCRIPT_TIMEOUT_MS,
-    });
+    // `--gateway` only steers an INSTALL (which base URL gets baked);
+    // uninstall/state runs don't take it.
+    const gatewayArgs =
+      mode === "install" && gateway !== undefined ? ["--gateway", gateway] : [];
+    const proc = Bun.spawn(
+      ["bash", scriptPath, ...modeArgs, ...targetArgs, ...gatewayArgs],
+      {
+        env,
+        cwd: daemonTempDir(),
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: SCRIPT_TIMEOUT_MS,
+      },
+    );
     const [stdout, stderr, code] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),

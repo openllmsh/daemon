@@ -19,11 +19,21 @@ import {
   ChatCompletionRequest,
   ResponsesRequest,
 } from "@openllmsh/protocol";
+import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { Schema } from "effect";
+import { fetchPlan } from "./cloud-client";
 import { planCacheEnabled } from "./config";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
+import { isSubscriptionSlug } from "./delegation";
+import { passthroughToOrigin } from "./forward";
+import { logWarn } from "./logger";
 import { lookupPlan, storePlan } from "./plan-cache";
-import { planSignatureOk, runResponsesCompact, runWalker } from "./walker";
+import {
+  parsePlan,
+  planSignatureOk,
+  runResponsesCompact,
+  runWalker,
+} from "./walker";
 
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
@@ -125,6 +135,59 @@ export const handleInference = async (req: Request): Promise<Response> => {
       if (cached !== null) {
         ({ planParam, pmidsParam, originParam, sigParam } = cached);
       }
+    }
+  }
+
+  // Local-first gateway (docs/proposals/local-first-gateway.md): a DIRECT
+  // request (no `?__plan=` — the client's base URL is the daemon, baked at
+  // install time by a `--gateway local` setup) that the plan cache didn't
+  // cover. Fetch a signed plan from the origin (body never transits the
+  // cloud), verify it with the SAME per-user key a 307 is verified with,
+  // and walk it locally when it contains at least one subscription hop; a
+  // pure-BYOK plan (and a failed fetch) passes through to the origin
+  // verbatim — the cloud keeps its own fallback/cooldown machinery,
+  // byte-identical to a directly-pointed client. 307-borne requests are
+  // untouched by this branch.
+  if (
+    planParam === null &&
+    !isResponsesCompact &&
+    typeof alias === "string" &&
+    alias.length > 0
+  ) {
+    let fetched: Awaited<ReturnType<typeof fetchPlan>> | null = null;
+    try {
+      fetched = await fetchPlan(alias, estimateBodyTokens(rawBody));
+    } catch (err) {
+      logWarn(
+        "listener",
+        `plan fetch failed for ${alias} — passing through to origin (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+    if (fetched === null) {
+      return withCors(req, await passthroughToOrigin(req, rawBytes));
+    }
+    const verified = planSignatureOk(
+      fetched.plan,
+      fetched.pmids,
+      fetched.origin,
+      fetched.sig,
+    );
+    const hasSubscriptionHop =
+      verified &&
+      parsePlan(fetched.plan).some((entry) =>
+        isSubscriptionSlug(entry.split("/")[0] ?? ""),
+      );
+    if (!verified || !hasSubscriptionHop) {
+      // Unverifiable, or nothing for the box to serve — the origin is
+      // strictly better placed to run this request.
+      return withCors(req, await passthroughToOrigin(req, rawBytes));
+    }
+    planParam = fetched.plan;
+    pmidsParam = fetched.pmids;
+    originParam = fetched.origin;
+    sigParam = fetched.sig;
+    if (planCacheEnabled()) {
+      storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
     }
   }
 

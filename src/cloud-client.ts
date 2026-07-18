@@ -13,18 +13,21 @@ import { hostname } from "node:os";
 import type {
   TDaemonBootstrap,
   TDaemonModelReport,
+  TDaemonPlanResponse,
   TDaemonRecordRequest,
   TRelayChannelResponse,
 } from "@openllmsh/protocol";
 import {
   DAEMON_DEVICE_ID_HEADER,
   DAEMON_DEVICE_LABEL_HEADER,
+  DaemonPlanResponse,
   RelayChannelResponse,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
 
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
+const decodePlan = Schema.decodeUnknownSync(DaemonPlanResponse);
 
 /** Thrown when no API key is configured yet — the daemon is keyless. */
 export class NoApiKeyError extends Error {
@@ -118,6 +121,31 @@ export const fetchBootstrap = async (): Promise<TDaemonBootstrap> => {
   }
   if (!resp.ok) throw new Error(`bootstrap fetch failed: ${resp.status}`);
   return (await resp.json()) as TDaemonBootstrap;
+};
+
+/**
+ * Fetch a signed plan for a DIRECT client request (local-first gateway,
+ * `docs/proposals/local-first-gateway.md` §4.1): the same tuple a
+ * same-machine 307 carries, as JSON — the request body never transits the
+ * cloud. The caller MUST verify `sig` (`planSignatureOk`) before caching
+ * or executing. Throws on keyless/rejected/unreachable so the listener
+ * can fall back to passthrough.
+ */
+export const fetchPlan = async (
+  model: string,
+  estTokens: number,
+): Promise<TDaemonPlanResponse> => {
+  const params = new URLSearchParams({ model });
+  if (estTokens > 0) params.set("est_tokens", String(Math.ceil(estTokens)));
+  const resp = await cloudFetch(
+    cloudUrl(`/api/daemon/plan?${params.toString()}`),
+    { method: "GET", headers: authHeaders() },
+  );
+  if (resp.status === 401 || resp.status === 403) {
+    throw new InvalidApiKeyError(resp.status);
+  }
+  if (!resp.ok) throw new Error(`plan fetch failed: ${resp.status}`);
+  return decodePlan(await resp.json());
 };
 
 /**

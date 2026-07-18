@@ -75,6 +75,7 @@ export const runCommandInner = async (
           action,
           cmd.payload.slug,
           cmd.payload.target,
+          cmd.payload.gateway,
         );
         // Re-probe just this item's `-s` state (against the SAME target that was
         // just modified) so the post-command status push reflects the change (no

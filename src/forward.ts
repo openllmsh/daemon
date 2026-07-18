@@ -11,6 +11,7 @@
  * Authenticated with the user's `sk-llm-...` key — the same key the cloud
  * already validates for `/v1/*`.
  */
+import { NO_DAEMON_HEADER } from "@openllmsh/protocol";
 import { daemonEnv } from "./env";
 
 /**
@@ -40,6 +41,54 @@ export const forwardToCloud = async (
   // Lock the cloud to the exact concrete model the local chain picked, so
   // the cloud doesn't re-run its own alias/fallback resolution.
   headers.set("x-openllm-pin-model", pinnedModel);
+  headers.delete("host");
+  headers.delete("content-length");
+
+  return fetch(target, {
+    method: inbound.method,
+    headers,
+    body: bodyBytes,
+    signal: inbound.signal,
+  });
+};
+
+/**
+ * Transparent passthrough to the origin for a DIRECT client request the
+ * daemon does not walk itself (local-first gateway,
+ * `docs/proposals/local-first-gateway.md` §4.2): the plan resolved
+ * pure-BYOK (the cloud keeps its own fallback + cooldown machinery, which
+ * must stay byte-identical to today), or the plan fetch failed. No
+ * `x-openllm-pin-model` — an inbound one is STRIPPED so the cloud runs
+ * its full resolve (pinning is the daemon's own forward primitive, never
+ * a caller's).
+ *
+ * Auth: the caller's own `Authorization` bearer is forwarded when present
+ * (clients configured at the daemon carry their `sk-llm` key, and it may
+ * differ from the daemon's paired key — usage must account to the caller's
+ * key); absent one, the daemon's paired key fills in. `x-openllm-no-daemon`
+ * is set so the cloud never 307s the request back to this same daemon (a
+ * wasted loopback bounce — we ARE the machine, and we already chose not to
+ * walk this request).
+ */
+export const passthroughToOrigin = async (
+  inbound: Request,
+  bodyBytes: ArrayBuffer,
+): Promise<Response> => {
+  const url = new URL(inbound.url);
+  const search = new URLSearchParams(url.search);
+  // Strip the daemon's own plan params (present on a replayed/307-borne
+  // shape) — the cloud `/v1` surface never reads them.
+  for (const p of ["__plan", "__pmids", "__origin", "__sig"]) search.delete(p);
+  const qs = search.toString();
+  const target = `${daemonEnv().cloudOrigin}${url.pathname}${qs.length > 0 ? `?${qs}` : ""}`;
+  const headers = new Headers(inbound.headers);
+  headers.delete("x-openllm-pin-model");
+  const callerAuth = inbound.headers.get("authorization");
+  if (callerAuth === null || callerAuth.length === 0) {
+    const { apiKey } = daemonEnv();
+    if (apiKey !== null) headers.set("authorization", `Bearer ${apiKey}`);
+  }
+  headers.set(NO_DAEMON_HEADER, "1");
   headers.delete("host");
   headers.delete("content-length");
 
