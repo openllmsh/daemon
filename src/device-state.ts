@@ -49,6 +49,7 @@ export type TProbeVerdict = {
   readonly installedSha256?: string;
   readonly version?: string;
   readonly installedCommit?: string;
+  readonly gateway?: "local" | "cloud";
 };
 
 /** Parse the state verdict out of an `install.sh -s` run's output. The probe
@@ -68,6 +69,7 @@ export const parseState = (output: string): TProbeVerdict | null => {
         installed_sha256?: unknown;
         version?: unknown;
         installed_commit?: unknown;
+        gateway?: unknown;
       };
       if (typeof j.installed === "boolean") {
         return {
@@ -83,6 +85,9 @@ export const parseState = (output: string): TProbeVerdict | null => {
           ...(typeof j.installed_commit === "string" &&
           /^[0-9a-f]{40}$/.test(j.installed_commit)
             ? { installedCommit: j.installed_commit }
+            : {}),
+          ...(j.gateway === "local" || j.gateway === "cloud"
+            ? { gateway: j.gateway }
             : {}),
         };
       }
@@ -180,6 +185,7 @@ export const probeIntegration = async (
     ...(verdict.installedCommit === undefined
       ? {}
       : { installed_commit: verdict.installedCommit }),
+    ...(verdict.gateway === undefined ? {} : { gateway: verdict.gateway }),
   });
   cache = next;
 };
@@ -240,6 +246,9 @@ export const refreshDeviceState = async (): Promise<
             ...(verdict.installedCommit === undefined
               ? {}
               : { installed_commit: verdict.installedCommit }),
+            ...(verdict.gateway === undefined
+              ? {}
+              : { gateway: verdict.gateway }),
           } satisfies TDaemonInstalledIntegration;
         }),
       );

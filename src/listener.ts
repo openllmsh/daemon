@@ -26,7 +26,6 @@ import { planCacheEnabled } from "./config";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
-import { localGatewayEnabled } from "./local-gateway-pref";
 import { logWarn } from "./logger";
 import { lookupPlan, storePlan } from "./plan-cache";
 import {
@@ -131,10 +130,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
       if (planSignatureOk(planParam, pmidsParam, originParam, sigParam)) {
         storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
       }
-    } else if (localGatewayEnabled()) {
-      // Replay is a local-serve decision, so the local-gateway flag gates it
-      // too: OFF means every direct request passes through to the origin
-      // (below), warm cache or not.
+    } else {
       const cached = lookupPlan(alias);
       if (cached !== null) {
         ({ planParam, pmidsParam, originParam, sigParam } = cached);
@@ -143,23 +139,21 @@ export const handleInference = async (req: Request): Promise<Response> => {
   }
 
   // Local-first gateway (docs/proposals/local-first-gateway.md): a DIRECT
-  // request (no `?__plan=` — the client's base URL is the daemon) that the
-  // plan cache didn't cover. Flag ON → fetch a signed plan from the origin
-  // (body never transits the cloud), verify it with the SAME per-user key a
-  // 307 is verified with, and walk it locally when it contains at least one
-  // subscription hop; a pure-BYOK plan (and a failed fetch, and flag OFF)
-  // passes through to the origin verbatim — the cloud keeps its own
-  // fallback/cooldown machinery, byte-identical to a directly-pointed
-  // client. 307-borne requests are untouched by this branch.
+  // request (no `?__plan=` — the client's base URL is the daemon, baked at
+  // install time by a `--gateway local` setup) that the plan cache didn't
+  // cover. Fetch a signed plan from the origin (body never transits the
+  // cloud), verify it with the SAME per-user key a 307 is verified with,
+  // and walk it locally when it contains at least one subscription hop; a
+  // pure-BYOK plan (and a failed fetch) passes through to the origin
+  // verbatim — the cloud keeps its own fallback/cooldown machinery,
+  // byte-identical to a directly-pointed client. 307-borne requests are
+  // untouched by this branch.
   if (
     planParam === null &&
     !isResponsesCompact &&
     typeof alias === "string" &&
     alias.length > 0
   ) {
-    if (!localGatewayEnabled()) {
-      return withCors(req, await passthroughToOrigin(req, rawBytes));
-    }
     let fetched: Awaited<ReturnType<typeof fetchPlan>> | null = null;
     try {
       fetched = await fetchPlan(alias, estimateBodyTokens(rawBody));
