@@ -50,6 +50,7 @@ const fetchPointer = async (
 ): Promise<{
   readonly scriptUrl: string;
   readonly scriptSha256: string;
+  readonly scriptCommit: string;
 } | null> => {
   try {
     const response = await fetch(
@@ -71,7 +72,7 @@ const fetchPointer = async (
     ) {
       return null;
     }
-    validateRegistryRawUrl(body.script_url, {
+    const location = validateRegistryRawUrl(body.script_url, {
       area,
       slug,
       filename: "install.sh",
@@ -79,6 +80,7 @@ const fetchPointer = async (
     return {
       scriptUrl: body.script_url,
       scriptSha256: body.script_sha256,
+      scriptCommit: location.commit,
     };
   } catch {
     return null;
@@ -151,6 +153,10 @@ export const runIntegration = async (
       ...baseEnv,
       OPENLLM_SKIP_CLI_INSTALL: "1",
       OPENLLM_CLOUD_ORIGIN: cloudOrigin,
+      // The artifact commit the verified script came from — the install stamp
+      // records it so the dashboard can link the device's installed version to
+      // its exact public commit.
+      OPENLLM_REGISTRY_COMMIT: pointer.scriptCommit,
       PATH: pathValue,
       // Registry scripts self-check through mktemp before mode dispatch. The OS
       // sandbox deliberately denies global /tmp; this working-set directory is
