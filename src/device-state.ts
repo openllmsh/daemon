@@ -91,6 +91,16 @@ type TCatalogItem = {
   readonly extensions: ReadonlyArray<string>;
 };
 
+const integrationMatches = (
+  item: TDaemonInstalledIntegration,
+  kind: TDaemonIntegrationKind,
+  slug: string,
+  target?: string,
+): boolean =>
+  item.kind === kind &&
+  item.slug === slug &&
+  (kind === "setup" || item.target === target);
+
 /** Fetch the unified setup catalog once. Null means retrieval/shape failure. */
 const fetchCatalog = async (): Promise<ReadonlyArray<TCatalogItem> | null> => {
   const { cloudOrigin } = daemonEnv();
@@ -140,7 +150,9 @@ export const probeIntegration = async (
     );
     return;
   }
-  const next = cache.filter((i) => !(i.kind === kind && i.slug === slug));
+  const next = cache.filter(
+    (item) => !integrationMatches(item, kind, slug, target),
+  );
   const diverged =
     verdict.installed &&
     verdict.installedSha256 !== undefined &&
@@ -150,6 +162,7 @@ export const probeIntegration = async (
   next.push({
     kind,
     slug,
+    ...(kind === "extension" && target !== undefined ? { target } : {}),
     installed: verdict.installed,
     ...(diverged === undefined ? {} : { diverged }),
   });
@@ -171,14 +184,29 @@ export const refreshDeviceState = async (): Promise<
   const kinds: TDaemonIntegrationKind[] = ["extension", "setup"];
   const perArea = await Promise.all(
     kinds.map(async (kind) => {
-      const slugs = catalog
-        .filter((item) => kindMatches(kind, item.extensions))
-        .map((item) => item.id);
+      const probes: Array<{ readonly slug: string; readonly target?: string }> =
+        [];
+      for (const item of catalog) {
+        if (!kindMatches(kind, item.extensions)) continue;
+        if (kind === "extension") {
+          probes.push(
+            ...item.extensions.map((target) => ({ slug: item.id, target })),
+          );
+        } else {
+          probes.push({ slug: item.id });
+        }
+      }
       return Promise.all(
-        slugs.map(async (slug) => {
-          const r = await runIntegration(kind, "state", slug);
+        probes.map(async ({ slug, target }) => {
+          const r = await runIntegration(kind, "state", slug, target);
           const verdict = parseState(r.output);
-          if (verdict === null) return null;
+          if (verdict === null) {
+            return (
+              cache.find((item) =>
+                integrationMatches(item, kind, slug, target),
+              ) ?? null
+            );
+          }
           const diverged =
             verdict.installed &&
             verdict.installedSha256 !== undefined &&
@@ -188,6 +216,7 @@ export const refreshDeviceState = async (): Promise<
           return {
             kind,
             slug,
+            ...(kind === "extension" && target !== undefined ? { target } : {}),
             installed: verdict.installed,
             ...(diverged === undefined ? {} : { diverged }),
           } satisfies TDaemonInstalledIntegration;
@@ -197,7 +226,7 @@ export const refreshDeviceState = async (): Promise<
   );
   cache = perArea
     .flat()
-    .filter((i): i is TDaemonInstalledIntegration => i !== null);
+    .filter((item): item is TDaemonInstalledIntegration => item !== null);
   logDebug("device-state", `walk complete — ${cache.length} items probed`);
   return cache;
 };

@@ -114,7 +114,14 @@ export const runIntegration = async (
   if (!response.ok || response.status >= 300) {
     return fail(`fetch ${pointer.scriptUrl} → ${response.status}`);
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await response.arrayBuffer());
+  } catch (error) {
+    return fail(
+      `read ${pointer.scriptUrl} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const actual = sha256Hex(bytes);
   if (actual !== pointer.scriptSha256) {
     return fail(
@@ -132,8 +139,10 @@ export const runIntegration = async (
     daemonTempDir(),
     `registry-${area}-${slug}-${process.pid}-${Date.now()}.sh`,
   );
-  fs.writeFileSync(scriptPath, bytes, { mode: 0o600, flag: "wx" });
+  let scriptCreated = false;
   try {
+    fs.writeFileSync(scriptPath, bytes, { mode: 0o600, flag: "wx" });
+    scriptCreated = true;
     const { OPENLLM_API_KEY: _omit, ...baseEnv } = process.env;
     const pathValue = [...DEFAULT_BIN_DIRS, baseEnv.PATH ?? ""]
       .filter((entry) => entry.length > 0)
@@ -193,7 +202,17 @@ export const runIntegration = async (
       scriptSha256: pointer.scriptSha256,
       installStampSha256,
     };
+  } catch (error) {
+    return fail(
+      `${mode} ${kind} ${slug} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   } finally {
-    fs.rmSync(scriptPath, { force: true });
+    if (scriptCreated) {
+      try {
+        fs.rmSync(scriptPath, { force: true });
+      } catch {
+        // Best-effort cleanup must not replace the execution result.
+      }
+    }
   }
 };
