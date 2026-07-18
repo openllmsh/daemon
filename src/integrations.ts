@@ -133,6 +133,10 @@ export const runIntegration = async (
       OPENLLM_SKIP_CLI_INSTALL: "1",
       OPENLLM_CLOUD_ORIGIN: cloudOrigin,
       PATH: pathValue,
+      // Registry scripts self-check through mktemp before mode dispatch. The OS
+      // sandbox deliberately denies global /tmp; this working-set directory is
+      // the one granted temp location for state/install/uninstall alike.
+      TMPDIR: daemonTempDir(),
     };
     const env =
       mode === "install"
