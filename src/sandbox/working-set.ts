@@ -272,10 +272,21 @@ export const daemonWorkingSet = (): TWorkingSet => {
   } catch {
     // Best-effort — if creation fails, the sandbox grant remains narrow.
   }
-  // The install stamps the assembled scripts record/compare/clear
+  // The install state the assembled scripts record/compare/clear
   // (`record_install_stamp` / `read_install_stamp` in the registry runtime) —
-  // hardcoded to $HOME/.openllm/installed like
-  // the backups dir above; same rationale + posture.
+  // ONE canonical $HOME/.openllm/state.json, written IN PLACE (the runtime
+  // stages content in $TMPDIR and `cat >`s the granted file, exactly the
+  // settings.json posture), so a FILE-scoped grant suffices — never the whole
+  // ~/.openllm dir. Pre-created 0600 so the grant lands on the real leaf.
+  const stateJson = join(home, ".openllm", "state.json");
+  try {
+    mkdirSync(join(home, ".openllm"), { recursive: true, mode: 0o700 });
+    writeFileSync(stateJson, "{\n}\n", { flag: "wx", mode: 0o600 });
+  } catch {
+    // Exists already, or creation failed — either way best-effort.
+  }
+  // Legacy per-file stamps (pre-state.json installs) — still read as the
+  // migration fallback and cleared by installs/uninstalls.
   const stampsDir = join(home, ".openllm", "installed");
   try {
     mkdirSync(stampsDir, { recursive: true, mode: 0o700 });
@@ -384,12 +395,17 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
     // + the installed binary and its self-update temp (`<state>/bin`).
     state,
+    // The canonical install-state file ($HOME/.openllm/state.json) — a FILE
+    // grant, never the whole ~/.openllm dir: the runtime writes it in place
+    // (settings.json posture). Hardcoded in the scripts, NOT derived from the
+    // state dir; redundant with `state` in the default layout, load-bearing
+    // when OPENLLM_DAEMON_STATE_DIR points elsewhere.
+    stateJson,
     // The scripts' write-once original-config backups ($HOME/.openllm/backups
-    // — hardcoded in backup_once, NOT derived from the state dir; pre-created
-    // above). Redundant with `state` in the default layout, load-bearing when
-    // OPENLLM_DAEMON_STATE_DIR points elsewhere.
+    // — hardcoded in backup_once; pre-created above so the grant lands on the
+    // real leaf even when the parent grant failed to create).
     backupsDir,
-    // The install stamps the wrappers record/compare/clear — same rationale.
+    // Legacy per-file install stamps — the migration fallback reads.
     stampsDir,
     // Belt-and-braces for a binary installed OUTSIDE the state dir (manual
     // placement): self-update renames a temp over `process.execPath`, so its
