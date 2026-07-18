@@ -16,6 +16,7 @@ import { getDelegate } from "./delegation";
 import { probeIntegration } from "./device-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
+import { localGatewayEnabled, setLocalGateway } from "./local-gateway-pref";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
@@ -260,6 +261,32 @@ export const runCommandInner = async (
           id: cmd.id,
           status: "done",
           result: { auto_update: persisted },
+        };
+      }
+      // Toggle local-first gateway mode from the dashboard (Integrations
+      // daemon card). Same shape as set_auto_update: persist to the shared
+      // env file, read back to confirm the write took before acking, and let
+      // the post-command status push carry the effective value back so the
+      // switch reflects reality. Takes effect on the next direct request —
+      // no restart, no client re-setup.
+      case "set_local_gateway": {
+        const enabled = cmd.payload.enabled;
+        setLocalGateway(enabled);
+        const persisted = localGatewayEnabled();
+        if (persisted !== enabled) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: {
+              error: "failed to persist local-gateway preference",
+              local_gateway: persisted,
+            },
+          };
+        }
+        return {
+          id: cmd.id,
+          status: "done",
+          result: { local_gateway: persisted },
         };
       }
       default: {

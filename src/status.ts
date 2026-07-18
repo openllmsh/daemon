@@ -13,6 +13,7 @@ import { DELEGATES } from "./delegation";
 import { getInstalledIntegrations } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
+import { localGatewayEnabled } from "./local-gateway-pref";
 import { logWarn } from "./logger";
 import { sandboxState } from "./sandbox/landlock";
 import { cachedUsage, peekUsage } from "./usage-cache";
@@ -56,6 +57,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     daemon_version: DAEMON_VERSION,
     key_configured: hasApiKey(),
     auto_update: autoUpdateEnabled(),
+    local_gateway: localGatewayEnabled(),
     cloud_state: getCloudState(),
     pubkey: daemonPublicKey(),
     port: daemonPort(),
