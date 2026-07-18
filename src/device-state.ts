@@ -21,12 +21,14 @@ import { daemonEnv } from "./env";
 import { runIntegration } from "./integrations";
 import { logDebug, logWarn } from "./logger";
 
-/** The cloud catalog endpoint per area — the registry manifest, served live, so
- *  the walk discovers exactly the items the gateway publishes. */
-const CATALOG_PATH: Record<TDaemonIntegrationKind, string> = {
-  plugin: "/api/plugins",
-  setup: "/api/setup/options",
-};
+/** ONE catalog endpoint: the unified setup options list. The wire kind maps to
+ *  the option's `extensions` list — an option that extends clients is the
+ *  former plugin surface; one without is a client setup — keeping the
+ *  daemon⇄dashboard protocol unchanged over the folded registry. */
+const kindMatches = (
+  kind: TDaemonIntegrationKind,
+  extensions: ReadonlyArray<string>,
+): boolean => (kind === "extension") === extensions.length > 0;
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -44,6 +46,9 @@ export const getInstalledIntegrations = (): TDaemonInstalledIntegration[] =>
 export type TProbeVerdict = {
   readonly installed: boolean;
   readonly diverged?: boolean;
+  readonly installedSha256?: string;
+  readonly version?: string;
+  readonly installedCommit?: string;
 };
 
 /** Parse the state verdict out of an `install.sh -s` run's output. The probe
@@ -57,11 +62,29 @@ export const parseState = (output: string): TProbeVerdict | null => {
     const t = line.trim();
     if (!t.startsWith("{") || !t.includes('"installed"')) continue;
     try {
-      const j = JSON.parse(t) as { installed?: unknown; diverged?: unknown };
+      const j = JSON.parse(t) as {
+        installed?: unknown;
+        diverged?: unknown;
+        installed_sha256?: unknown;
+        version?: unknown;
+        installed_commit?: unknown;
+      };
       if (typeof j.installed === "boolean") {
-        return typeof j.diverged === "boolean"
-          ? { installed: j.installed, diverged: j.diverged }
-          : { installed: j.installed };
+        return {
+          installed: j.installed,
+          ...(typeof j.diverged === "boolean" ? { diverged: j.diverged } : {}),
+          ...(typeof j.installed_sha256 === "string" &&
+          j.installed_sha256.length > 0
+            ? { installedSha256: j.installed_sha256 }
+            : {}),
+          ...(typeof j.version === "string" && j.version.length > 0
+            ? { version: j.version }
+            : {}),
+          ...(typeof j.installed_commit === "string" &&
+          /^[0-9a-f]{40}$/.test(j.installed_commit)
+            ? { installedCommit: j.installed_commit }
+            : {}),
+        };
       }
     } catch {
       // not the JSON line — keep scanning
@@ -74,37 +97,60 @@ export const parseState = (output: string): TProbeVerdict | null => {
 export const parseInstalled = (output: string): boolean | null =>
   parseState(output)?.installed ?? null;
 
-/** Fetch the slugs/ids the gateway catalogs for one area. */
-const fetchCatalogSlugs = async (
+type TCatalogItem = {
+  readonly id: string;
+  readonly extensions: ReadonlyArray<string>;
+};
+
+const integrationMatches = (
+  item: TDaemonInstalledIntegration,
   kind: TDaemonIntegrationKind,
-): Promise<string[]> => {
+  slug: string,
+  target?: string,
+): boolean =>
+  item.kind === kind &&
+  item.slug === slug &&
+  (kind === "setup" || item.target === target);
+
+/** Fetch the unified setup catalog once. Null means retrieval/shape failure. */
+const fetchCatalog = async (): Promise<ReadonlyArray<TCatalogItem> | null> => {
   const { cloudOrigin } = daemonEnv();
-  const url = `${cloudOrigin}${CATALOG_PATH[kind]}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${cloudOrigin}/api/setup/options`, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) return [];
-    const body = (await res.json()) as {
-      data?: ReadonlyArray<{ slug?: unknown; id?: unknown }>;
-    };
-    return (body.data ?? [])
-      .map((i) => (typeof i.slug === "string" ? i.slug : i.id))
-      .filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (!res.ok) return null;
+    const body = (await res.json()) as { data?: unknown };
+    if (!Array.isArray(body.data)) return null;
+    const catalog: TCatalogItem[] = [];
+    for (const item of body.data) {
+      if (typeof item !== "object" || item === null) return null;
+      const record = item as { id?: unknown; extensions?: unknown };
+      if (typeof record.id !== "string" || !Array.isArray(record.extensions)) {
+        return null;
+      }
+      const extensions = record.extensions.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+      if (extensions.length !== record.extensions.length) return null;
+      catalog.push({ id: record.id, extensions });
+    }
+    return catalog;
   } catch {
-    return [];
+    return null;
   }
 };
 
 /** Probe ONE item's state (`install.sh -s`) and patch its cache entry. Used
  *  after an install/uninstall so the next status push reflects the change
- *  without a full walk. `target` MUST match the one the install/uninstall ran
- *  against (defaults to `claude-code`) so the probe inspects the directory that
- *  actually changed. A null verdict (probe failed) leaves the cache as-is. */
+ *  without a full walk. When present, `target` MUST match the client the
+ *  install/uninstall ran against so the probe inspects what actually changed.
+ *  Plain setups omit it; extension callers pass the selected
+ *  client id. A null verdict (probe failed) leaves the cache as-is. */
 export const probeIntegration = async (
   kind: TDaemonIntegrationKind,
   slug: string,
-  target = "claude-code",
+  target?: string,
 ): Promise<void> => {
   const r = await runIntegration(kind, "state", slug, target);
   const verdict = parseState(r.output);
@@ -115,8 +161,26 @@ export const probeIntegration = async (
     );
     return;
   }
-  const next = cache.filter((i) => !(i.kind === kind && i.slug === slug));
-  next.push({ kind, slug, ...verdict });
+  const next = cache.filter(
+    (item) => !integrationMatches(item, kind, slug, target),
+  );
+  const diverged =
+    verdict.installed &&
+    verdict.installedSha256 !== undefined &&
+    r.installStampSha256 !== undefined
+      ? verdict.installedSha256 !== r.installStampSha256
+      : verdict.diverged;
+  next.push({
+    kind,
+    slug,
+    ...(kind === "extension" && target !== undefined ? { target } : {}),
+    installed: verdict.installed,
+    ...(diverged === undefined ? {} : { diverged }),
+    ...(verdict.version === undefined ? {} : { version: verdict.version }),
+    ...(verdict.installedCommit === undefined
+      ? {}
+      : { installed_commit: verdict.installedCommit }),
+  });
   cache = next;
 };
 
@@ -127,28 +191,63 @@ export const probeIntegration = async (
 export const refreshDeviceState = async (): Promise<
   TDaemonInstalledIntegration[]
 > => {
-  const kinds: TDaemonIntegrationKind[] = ["plugin", "setup"];
+  const catalog = await fetchCatalog();
+  if (catalog === null) {
+    logWarn("device-state", "catalog unavailable — preserving cached state");
+    return cache;
+  }
+  const kinds: TDaemonIntegrationKind[] = ["extension", "setup"];
   const perArea = await Promise.all(
     kinds.map(async (kind) => {
-      const slugs = await fetchCatalogSlugs(kind);
+      const probes: Array<{ readonly slug: string; readonly target?: string }> =
+        [];
+      for (const item of catalog) {
+        if (!kindMatches(kind, item.extensions)) continue;
+        if (kind === "extension") {
+          probes.push(
+            ...item.extensions.map((target) => ({ slug: item.id, target })),
+          );
+        } else {
+          probes.push({ slug: item.id });
+        }
+      }
       return Promise.all(
-        slugs.map(async (slug) => {
-          const r = await runIntegration(kind, "state", slug);
+        probes.map(async ({ slug, target }) => {
+          const r = await runIntegration(kind, "state", slug, target);
           const verdict = parseState(r.output);
-          return verdict === null
-            ? null
-            : ({
-                kind,
-                slug,
-                ...verdict,
-              } satisfies TDaemonInstalledIntegration);
+          if (verdict === null) {
+            return (
+              cache.find((item) =>
+                integrationMatches(item, kind, slug, target),
+              ) ?? null
+            );
+          }
+          const diverged =
+            verdict.installed &&
+            verdict.installedSha256 !== undefined &&
+            r.installStampSha256 !== undefined
+              ? verdict.installedSha256 !== r.installStampSha256
+              : verdict.diverged;
+          return {
+            kind,
+            slug,
+            ...(kind === "extension" && target !== undefined ? { target } : {}),
+            installed: verdict.installed,
+            ...(diverged === undefined ? {} : { diverged }),
+            ...(verdict.version === undefined
+              ? {}
+              : { version: verdict.version }),
+            ...(verdict.installedCommit === undefined
+              ? {}
+              : { installed_commit: verdict.installedCommit }),
+          } satisfies TDaemonInstalledIntegration;
         }),
       );
     }),
   );
   cache = perArea
     .flat()
-    .filter((i): i is TDaemonInstalledIntegration => i !== null);
+    .filter((item): item is TDaemonInstalledIntegration => item !== null);
   logDebug("device-state", `walk complete — ${cache.length} items probed`);
   return cache;
 };

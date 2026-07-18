@@ -13,7 +13,7 @@
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
  *   openllmd logs [-f] [-n N]     show or follow the daemon log
- *   openllmd plugin <install|uninstall|list> [slug]   manage a Claude Code plugin
+ *   openllmd extension <install|uninstall|list> [slug]  manage a client extension
  *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
@@ -95,11 +95,10 @@ const runAutoUpdate = (args: readonly string[]): never => {
   process.exit(2);
 };
 
-// The `list` endpoint per integration group (setup is singular + keyed by id).
-const LIST_PATH: Record<TIntegrationKind, string> = {
-  plugin: "/api/plugins",
-  setup: "/api/setup/options",
-};
+// ONE catalog endpoint; each group filters by the option's `extensions` list
+// (non-empty ⇔ extension, empty ⇔ client setup) — same classification as
+// device-state.ts, so `extension list` and `setup list` partition the catalog.
+const LIST_PATH = "/api/setup/options";
 
 const integrationUsage = (kind: TIntegrationKind): never => {
   process.stderr.write(
@@ -109,7 +108,7 @@ const integrationUsage = (kind: TIntegrationKind): never => {
 };
 
 /**
- * Run a `plugin|setup` subcommand. Foreground one-shot (no server boot):
+ * Run an `extension|setup` subcommand. Foreground one-shot (no server boot):
  * `list` prints the catalog; `install|uninstall <slug>` runs the shared
  * executor and exits with its status. Exits the process in every branch.
  */
@@ -120,7 +119,7 @@ const runIntegrationCli = async (
   const action = args[0];
 
   if (action === "list") {
-    const url = `${daemonEnv().cloudOrigin}${LIST_PATH[kind]}`;
+    const url = `${daemonEnv().cloudOrigin}${LIST_PATH}`;
     try {
       const res = await fetch(url);
       if (!res.ok) {
@@ -128,10 +127,17 @@ const runIntegrationCli = async (
         process.exit(1);
       }
       const body = (await res.json()) as {
-        data?: ReadonlyArray<{ slug?: string; id?: string; name?: string }>;
+        data?: ReadonlyArray<{
+          id?: string;
+          name?: string;
+          extensions?: ReadonlyArray<string>;
+        }>;
       };
       for (const item of body.data ?? []) {
-        const id = item.slug ?? item.id ?? "";
+        const isExtension = (item.extensions?.length ?? 0) > 0;
+        if ((kind === "extension") !== isExtension) continue;
+        const id = item.id ?? "";
+        if (id.length === 0) continue;
         process.stdout.write(`${id.padEnd(24)}${item.name ?? ""}\n`);
       }
       process.exit(0);
@@ -199,7 +205,7 @@ export const runCli = (): boolean => {
     case "logs":
       runLogs(rest);
       break;
-    case "plugin":
+    case "extension":
     case "setup":
       // Foreground one-shot: the async executor process.exit()s when done; the
       // pending fetch keeps the event loop alive. Returning true prevents the
