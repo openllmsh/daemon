@@ -64,7 +64,14 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../cli-paths";
+import {
+  CLI_PROVIDERS,
+  cliBin,
+  hostCliCandidates,
+  sessionConfigDir,
+  sessionConfigLinks,
+  sessionSandboxHome,
+} from "../cli-paths";
 import { stateDir } from "../env";
 import { DAEMON_VERSION } from "../version";
 
@@ -292,6 +299,21 @@ export const daemonWorkingSet = (): TWorkingSet => {
     mkdirSync(stampsDir, { recursive: true, mode: 0o700 });
   } catch {
     // Best-effort — if creation fails, the sandbox grant remains narrow.
+  }
+  // Device-session shared sandbox home (feature §2.2): the fully-granted
+  // HOME device sessions run their CLI in. It nests under the state dir
+  // (already granted RW), so no NEW rw grant is needed — but pre-create the
+  // home + each provider's config dir so a Landlock leaf grant lands, and
+  // so the config symlinks the session host attaches have a parent dir.
+  const sandboxHome = sessionSandboxHome();
+  try {
+    mkdirSync(sandboxHome, { recursive: true, mode: 0o700 });
+    for (const provider of CLI_PROVIDERS) {
+      mkdirSync(sessionConfigDir(provider), { recursive: true, mode: 0o700 });
+    }
+  } catch {
+    // best-effort — a missing leaf just means that provider's session
+    // falls back / fails visibly, not a daemon-boot failure.
   }
   // Pre-create the vendor CLI install/config dirs the host-install + setup flows
   // write into (claude / codex / kimi). REQUIRED on Linux: Landlock can only
@@ -563,6 +585,21 @@ export const daemonWorkingSet = (): TWorkingSet => {
   for (const provider of CLI_PROVIDERS) {
     for (const seed of [...hostCliCandidates(provider), cliBin(provider)]) {
       for (const dir of resolveCliExecDirs(seed, home)) readOnly.add(dir);
+    }
+  }
+  // Device-session config attach (feature §2.2): the session host symlinks
+  // the user's REAL config files (login/settings) into the sandbox home so
+  // the session CLI reads the user's actual OpenLLM-configured setup. The
+  // sandbox home is RW (nests under `state`), but the symlink TARGETS are
+  // the real files under `$HOME` — grant each a FILE-scoped READ so the
+  // confined CLI can follow the link. Only add a grant when the file
+  // ACTUALLY EXISTS: a missing leaf would let `existing()` climb to its
+  // parent (e.g. `~/.codex`), widening the grant to the whole config dir
+  // and colliding with an existing RW grant. A not-yet-configured provider
+  // shares nothing (its session then falls back to a fresh login).
+  for (const provider of CLI_PROVIDERS) {
+    for (const { real } of sessionConfigLinks(provider)) {
+      if (existsSync(real)) readOnly.add(real);
     }
   }
   // A read-write grant subsumes a read-only one — keep the lists disjoint.

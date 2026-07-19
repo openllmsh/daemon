@@ -16,19 +16,22 @@
  *  - `detach`  — the consumer went away: the PTY LIVES ON (dormant) until
  *                the detached-TTL reaper fires (SESSION_DETACHED_TTL_MS).
  *
- * Isolation: the CLI runs as the USER's real tool — real `HOME`, real
- * binary (`hostCliBin`), real config — because a device session is the
- * user driving their own CLI, already OpenLLM-configured by the
- * integration install (`.claude/settings.json` etc., which the daemon
- * sandbox already grants). NOT the isolated `~/.openllm/cli/<provider>/`
- * home (that's the headless subscription-delegation plane). cwd is
- * pinned to the session workspace. Each session is its own async task —
- * never the control channel's commandTail.
+ * Isolation: the CLI runs the user's REAL binary (`hostCliBin`) but with
+ * HOME pointed at ONE shared sandbox home (`~/.openllm/sandbox`) — NOT the
+ * real `$HOME` (only scoped subtrees of which the daemon sandbox grants,
+ * so an interactive CLI writing session-env/history there gets EPERM) and
+ * NOT the isolated `cliEnv` (the headless delegation plane). The sandbox
+ * home is fully granted, so the CLI installs deps + writes state freely
+ * inside it and nowhere else; the user's real login/settings are
+ * SYMLINKED in (`attachSessionConfig`) so there's no re-register, and host
+ * bins are shared via the real PATH. cwd is a per-session workspace under
+ * the sandbox home. Each session is its own async task — never the control
+ * channel's commandTail. See
+ * `docs/proposals/device-session-shared-sandbox-home.md`.
  */
 
-import { existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { dirname } from "node:path";
 import type {
   TRelayFrame,
   TRelaySessionCloseFrame,
@@ -43,9 +46,14 @@ import {
   TUNNEL_CHUNK_MAX,
 } from "@openllmsh/protocol";
 import type { TCliProvider } from "./cli-paths";
-import { hostCliCandidates } from "./cli-paths";
+import {
+  hostCliCandidates,
+  sessionConfigDir,
+  sessionConfigLinks,
+  sessionEnv,
+  sessionWorkspace,
+} from "./cli-paths";
 import { spawnEnv } from "./delegation/spawn";
-import { stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
 
 /** Max concurrently-LIVE PTYs on one daemon. */
@@ -148,7 +156,31 @@ export const sessionStatusReport = (): Array<{
 const liveCount = (): number =>
   [...sessions.values()].filter((s) => s.pty !== null).length;
 
-const sessionsRoot = (): string => join(stateDir(), "sessions");
+/**
+ * Prepare the shared sandbox home for a provider: ensure the config dir
+ * exists and symlink the user's REAL config files (login, settings) into
+ * it, so the session CLI reads the user's actual OpenLLM-configured setup
+ * without exposing the whole real home — writes (session-env, history,
+ * deps) land in the granted sandbox. Idempotent + best-effort: a missing
+ * real file (not logged in yet) is skipped; an existing link is left.
+ */
+const attachSessionConfig = (cli: TCliProvider): void => {
+  try {
+    mkdirSync(sessionConfigDir(cli), { recursive: true });
+  } catch {
+    // best-effort — the grant lands on whatever exists
+  }
+  for (const { real, link } of sessionConfigLinks(cli)) {
+    if (!existsSync(real)) continue; // not configured yet — nothing to share
+    if (existsSync(link)) continue; // already attached
+    try {
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(real, link);
+    } catch {
+      // best-effort — a broken/racing link just means the CLI falls back
+    }
+  }
+};
 
 /**
  * The user's REAL CLI binary — NOT the isolated `cliBin()` under
@@ -356,7 +388,7 @@ const handleOpen = (
     nack("overloaded");
     return;
   }
-  const workspace = join(sessionsRoot(), frame.session_id);
+  const workspace = sessionWorkspace(frame.session_id);
   try {
     mkdirSync(workspace, { recursive: true });
   } catch (err) {
@@ -367,6 +399,10 @@ const handleOpen = (
     nack("spawn_failed");
     return;
   }
+  // Attach the user's real config into the shared sandbox home so the CLI
+  // reads their actual login/settings (no re-register) while writing into
+  // the granted sandbox.
+  attachSessionConfig(cli);
 
   const s: TSession = existing ?? {
     id: frame.session_id,
@@ -386,14 +422,16 @@ const handleOpen = (
     const pty = spawner({
       argv: argvFor(cli, frame.mode === "continue" ? "continue" : "spawn"),
       cwd: workspace,
-      // The user's REAL environment — NOT the isolated `cliEnv()`. A
-      // device session drives the user's own CLI with its own config +
-      // login (already OpenLLM-configured by the integration install);
-      // `spawnEnv` layers this over `process.env`, so the real HOME/PATH
-      // carry through. HOME is pinned explicitly (defensive — the CLI
-      // must read the user's real ~/.claude etc.) and TERM is forced for
-      // the PTY.
-      env: { HOME: homedir(), TERM: "xterm-256color" },
+      // The SHARED SANDBOX home (`~/.openllm/sandbox`), NOT the real
+      // `$HOME` (unwritable under the daemon sandbox — the crash source)
+      // nor the isolated `cliEnv()` (the delegation plane). The CLI writes
+      // session-env/history/deps freely inside the granted sandbox; its
+      // config-dir env points at the sandbox config dir, where the user's
+      // real login/settings were symlinked in (`attachSessionConfig`), so
+      // reads use the user's actual OpenLLM-configured setup. `spawnEnv`
+      // layers over `process.env`, so the real PATH (shared host bins)
+      // carries through.
+      env: sessionEnv(cli),
       cols: frame.cols,
       rows: frame.rows,
       onData: (chunk) => {
