@@ -23,7 +23,8 @@
  * never the control channel's commandTail.
  */
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
   TRelayFrame,
@@ -39,7 +40,7 @@ import {
   TUNNEL_CHUNK_MAX,
 } from "@openllmsh/protocol";
 import type { TCliProvider } from "./cli-paths";
-import { cliBin, cliEnv } from "./cli-paths";
+import { hostCliCandidates } from "./cli-paths";
 import { spawnEnv } from "./delegation/spawn";
 import { stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
@@ -146,13 +147,31 @@ const liveCount = (): number =>
 
 const sessionsRoot = (): string => join(stateDir(), "sessions");
 
+/**
+ * The user's REAL CLI binary — NOT the isolated `cliBin()` under
+ * `~/.openllm/cli/<provider>/`. A device session is the user driving
+ * their OWN interactive CLI, which is already configured for OpenLLM by
+ * the integration install (its real `~/.claude` / `~/.codex` config +
+ * login). The isolated home exists only for the SUBSCRIPTION-delegation
+ * data plane (a headless credential runner); a live terminal must use
+ * the user's actual tool + settings. Falls back to the bare command name
+ * (PATH resolves it) when no known install path exists. */
+const hostCliBin = (cli: TCliProvider): string => {
+  for (const candidate of hostCliCandidates(cli)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  // Last resort: the command name — Bun.spawn resolves it against PATH.
+  const first = hostCliCandidates(cli)[0];
+  return first ?? cli;
+};
+
 /** The CLI's argv for a session start. `continue` uses the vendor's own
  *  same-directory resume where the daemon knows one. */
 const argvFor = (
   cli: TCliProvider,
   mode: "spawn" | "continue",
 ): ReadonlyArray<string> => {
-  const bin = cliBin(cli);
+  const bin = hostCliBin(cli);
   if (mode === "continue" && cli === "claude_code") {
     // Claude persists sessions per-cwd; --continue reopens the most
     // recent conversation in this workspace.
@@ -359,7 +378,14 @@ const handleOpen = (
     const pty = spawner({
       argv: argvFor(cli, frame.mode === "continue" ? "continue" : "spawn"),
       cwd: workspace,
-      env: cliEnv(cli),
+      // The user's REAL environment — NOT the isolated `cliEnv()`. A
+      // device session drives the user's own CLI with its own config +
+      // login (already OpenLLM-configured by the integration install);
+      // `spawnEnv` layers this over `process.env`, so the real HOME/PATH
+      // carry through. HOME is pinned explicitly (defensive — the CLI
+      // must read the user's real ~/.claude etc.) and TERM is forced for
+      // the PTY.
+      env: { HOME: homedir(), TERM: "xterm-256color" },
       cols: frame.cols,
       rows: frame.rows,
       onData: (chunk) => {
