@@ -16,10 +16,13 @@
  *  - `detach`  — the consumer went away: the PTY LIVES ON (dormant) until
  *                the detached-TTL reaper fires (SESSION_DETACHED_TTL_MS).
  *
- * Isolation: the CLI runs with the provider's isolated home (`cliEnv` —
- * vendor login + gateway config intact) but cwd pinned to the session
- * workspace, inside the daemon's OS sandbox (the state dir is already
- * read-write in the working set). Each session is its own async task —
+ * Isolation: the CLI runs as the USER's real tool — real `HOME`, real
+ * binary (`hostCliBin`), real config — because a device session is the
+ * user driving their own CLI, already OpenLLM-configured by the
+ * integration install (`.claude/settings.json` etc., which the daemon
+ * sandbox already grants). NOT the isolated `~/.openllm/cli/<provider>/`
+ * home (that's the headless subscription-delegation plane). cwd is
+ * pinned to the session workspace. Each session is its own async task —
  * never the control channel's commandTail.
  */
 
