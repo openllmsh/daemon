@@ -51,11 +51,33 @@ const child = spawn(BINARY, [], {
     OPENLLM_DAEMON_SANDBOX: "1",
   },
 });
-// Forward termination so the orchestrator's SIGTERM (restart / quit) reaches
-// the binary, not just this wrapper.
-const forward = (sig: NodeJS.Signals): void => {
-  if (!child.killed) child.kill(sig);
+
+// Clean teardown on dev close (orchestrator restart / quit, Ctrl-C). The
+// binary handles SIGTERM/SIGINT itself — it flips presence offline
+// (`stopControlChannel` sends `status active:false`) BEFORE exiting, so
+// the daemon UNREGISTERS gracefully instead of ageing out. The wrapper's
+// jobs: (1) forward the signal, (2) give the binary a grace window to
+// flush that beacon, then SIGKILL if it's still up, and (3) NEVER orphan
+// the binary — a `process.on("exit")` backstop kills it even on an
+// unexpected wrapper death.
+let killTimer: ReturnType<typeof setTimeout> | null = null;
+const stop = (sig: NodeJS.Signals): void => {
+  if (child.exitCode !== null || child.killed) return;
+  child.kill(sig);
+  // Grace window for the graceful-exit beacon; hard-kill if it overruns.
+  killTimer ??= setTimeout(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }, 4000);
+  killTimer.unref?.();
 };
-process.on("SIGTERM", () => forward("SIGTERM"));
-process.on("SIGINT", () => forward("SIGINT"));
-child.on("exit", (code) => process.exit(code ?? 0));
+process.on("SIGTERM", () => stop("SIGTERM"));
+process.on("SIGINT", () => stop("SIGINT"));
+// Backstop: if THIS process exits for any reason, the binary must not
+// survive it (a stray sandboxed daemon on 8788 would block the next run).
+process.on("exit", () => {
+  if (child.exitCode === null && !child.killed) child.kill("SIGKILL");
+});
+child.on("exit", (code) => {
+  if (killTimer !== null) clearTimeout(killTimer);
+  process.exit(code ?? 0);
+});
