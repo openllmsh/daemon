@@ -24,6 +24,10 @@ import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
 import { logInfo } from "./logger";
 
 const OPEN_TIMEOUT_MS = 15_000;
+/** After a successful open ack, allow the serving daemon's dispatch its own
+ *  first-token latency (upstream cold starts / long prompts routinely exceed
+ *  the open window). Matches the relay's tunnel idle timeout. */
+const RESPONSE_HEAD_TIMEOUT_MS = 120_000;
 
 /**
  * The relay frame sender, REGISTERED by the control channel at startup
@@ -88,7 +92,26 @@ export const handleConsumedTunnelFrame = (
 ): void => {
   switch (frame.type) {
     case "tunnel_open_ack": {
-      if (frame.ok) return; // wait for the head data frame
+      if (frame.ok) {
+        // Accepted — re-arm the deadline for the RESPONSE head: the open
+        // window (15s) covered relay routing + accept, but the dispatch's
+        // first byte legitimately takes longer (upstream first-token
+        // latency). Cleared by the first `dir:"res"` data frame.
+        const t = pending.get(frame.tunnel_id);
+        if (t !== undefined && !t.headDone) {
+          clearTimeout(t.headTimer);
+          t.headTimer = setTimeout(() => {
+            // Tell the serving end to abort its dispatch, then error out.
+            relaySender?.({
+              type: "tunnel_close",
+              tunnel_id: frame.tunnel_id,
+              reason: "timeout",
+            });
+            finish(frame.tunnel_id, new Error("tunnel response timed out"));
+          }, RESPONSE_HEAD_TIMEOUT_MS);
+        }
+        return;
+      }
       finish(frame.tunnel_id, new Error(frame.error ?? "tunnel refused"));
       return;
     }
