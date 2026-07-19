@@ -2,12 +2,23 @@
  * Daemon runtime configuration.
  *
  * Everything lives in ONE file — `~/.openllm/.env` (resolved via
- * `envFilePath()`). It's the single source both dev (`bun dev:daemon`,
- * which auto-loads it) and the
+ * `envFilePath()`). It's the single source the
  * installed service (systemd `EnvironmentFile=` / the macOS launch agent's
- * `OPENLLM_DAEMON_ENV_FILE`) boot from — and it is SHARED with the other
+ * `OPENLLM_DAEMON_ENV_FILE`) boots from — and it is SHARED with the other
  * OpenLLM tools on the box: the CLI (`openllmc`) reads the same file for
- * the cloud origin + API key. The keys it holds:
+ * the cloud origin + API key.
+ *
+ * DEV mode (`OPENLLM_DAEMON_DEV=1`) is ISOLATED: `envFilePath()` resolves
+ * `<stateDir>/.dev.env` instead, so a source-run dev daemon never clobbers
+ * the installed daemon's config — all dev writes (`setApiKey`,
+ * `setCloudOrigin`, the minted device id, the auto-update pref) land in
+ * `.dev.env`, the default port is `8788` (vs prod `8787`), the cloud origin
+ * defaults to the local Next server, and the ONLY thing read from the
+ * shared `.env` is a live, read-only `OPENLLM_API_KEY` fallback when
+ * `.dev.env` is keyless — so dev reuses the already-paired key without
+ * copying it. The shared file is never written in dev.
+ *
+ * The keys the env file holds:
  *
  * - `OPENLLM_API_KEY`     — the user's `sk-llm-...` key. Authenticates
  *                            every cloud control-plane call. OPTIONAL at
@@ -103,9 +114,16 @@ export const stateDir = (): string =>
  * `bun dev:daemon` auto-loads. Shared product-wide: the CLI (`openllmc`)
  * reads the same file for `OPENLLM_CLOUD_ORIGIN` / `OPENLLM_API_KEY`, so a
  * re-pair or a custom origin applies to every OpenLLM tool on the box.
+ * In DEV mode this resolves `.dev.env` instead — the isolated dev config —
+ * so dev never reads/writes the installed daemon's file (see header).
  */
 export const envFilePath = (): string =>
-  process.env.OPENLLM_DAEMON_ENV_FILE ?? join(stateDir(), ".env");
+  process.env.OPENLLM_DAEMON_ENV_FILE ??
+  join(stateDir(), isDevMode() ? ".dev.env" : ".env");
+
+/** The SHARED (prod/installed) env file — read-only in dev, used solely for
+ *  the live `OPENLLM_API_KEY` fallback in `loadApiKey`. */
+const sharedEnvFilePath = (): string => join(stateDir(), ".env");
 
 /**
  * Load the daemon's `KEY=value` env file into `process.env` (without
@@ -122,15 +140,23 @@ export const loadEnvFile = (): void => {
   } catch {
     return;
   }
+  for (const [key, value] of parseEnvLines(text)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+};
+
+/** Parse `KEY=value` lines (comments + blanks ignored) into a map. Shared by
+ *  `loadEnvFile` and the dev-mode shared-file API-key fallback. */
+const parseEnvLines = (text: string): Map<string, string> => {
+  const out = new Map<string, string>();
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
     const eq = trimmed.indexOf("=");
     if (eq <= 0) continue;
-    const key = trimmed.slice(0, eq).trim();
-    const value = trimmed.slice(eq + 1).trim();
-    if (process.env[key] === undefined) process.env[key] = value;
+    out.set(trimmed.slice(0, eq).trim(), trimmed.slice(eq + 1).trim());
   }
+  return out;
 };
 
 /**
@@ -179,10 +205,15 @@ export const writeEnvFileVars = (
 /** The default loopback port for the daemon's `/v1/*` + `/whoami` surface. */
 export const DEFAULT_DAEMON_PORT = 8787;
 
+/** Dev-mode default port — distinct from prod so a source-run dev daemon can
+ *  coexist with the installed daemon on `8787`. */
+export const DEV_DEFAULT_DAEMON_PORT = 8788;
+
 /**
  * The loopback port the daemon listens on (`OPENLLM_DAEMON_PORT`, default
- * `8787`). Single source — `main.ts` binds it and `status.ts` publishes it on
- * `TDaemonStatus.port` so the dashboard can probe `/whoami` for locality. See
+ * `8787`; `8788` in dev mode). Single source — `main.ts` binds it and
+ * `status.ts` publishes it on `TDaemonStatus.port` so the dashboard can probe
+ * `/whoami` for locality. See
  * `docs/proposals/this-machine-detection-audit.md`.
  */
 export const daemonPort = (): number => {
@@ -190,11 +221,12 @@ export const daemonPort = (): number => {
   // the env file here too — otherwise a port supplied via `OPENLLM_DAEMON_ENV_FILE`
   // is ignored for the actual bind. Idempotent (only sets unset vars).
   loadEnvFile();
+  const fallback = isDevMode() ? DEV_DEFAULT_DAEMON_PORT : DEFAULT_DAEMON_PORT;
   const raw = process.env.OPENLLM_DAEMON_PORT;
-  if (raw === undefined) return DEFAULT_DAEMON_PORT;
+  if (raw === undefined) return fallback;
   // Whole-string integer in the valid TCP range — reject `8787abc`, `0`, > 65535.
   const n = Number(raw.trim());
-  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : DEFAULT_DAEMON_PORT;
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
 };
 
 const apiKeyFile = (): string => join(stateDir(), "api-key");
@@ -249,6 +281,11 @@ export const deviceId = (): string => {
  * the env file, removed, and used. Returns null when neither is present — the
  * daemon runs keyless until the dashboard sets one. Callers run `loadEnvFile`
  * before this (via `daemonEnv`).
+ *
+ * DEV mode adds a LIVE, read-only fallback: when `.dev.env` is keyless, the
+ * shared `.env`'s `OPENLLM_API_KEY` is used (parsed key-only — never a blanket
+ * merge, which would leak the prod origin/port/device-id into dev) and never
+ * written anywhere, so dev reuses the paired key without forking it.
  */
 const loadApiKey = (): string | null => {
   const fromEnv = process.env.OPENLLM_API_KEY?.trim();
@@ -269,6 +306,16 @@ const loadApiKey = (): string | null => {
     }
   } catch {
     // no legacy key file — keyless
+  }
+  if (isDevMode()) {
+    try {
+      const shared = parseEnvLines(readFileSync(sharedEnvFilePath(), "utf-8"))
+        .get("OPENLLM_API_KEY")
+        ?.trim();
+      if (shared !== undefined && shared.length > 0) return shared;
+    } catch {
+      // no shared file — keyless
+    }
   }
   return null;
 };
