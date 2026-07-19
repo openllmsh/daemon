@@ -114,6 +114,16 @@ export const activeSubMethodOverrides = (): Readonly<
 export const planCacheEnabled = (): boolean => snapshot.plan_cache === true;
 
 /**
+ * The fleet-peer key id serving `provider` (subscription tunnel — feature
+ * §1), from the last bootstrap. Null when no online fleet daemon serves it
+ * (or the cloud predates the field) — the walker then falls through exactly
+ * as before the tunnel existed.
+ */
+export const fleetSubscriptionServerFor = (provider: string): string | null =>
+  snapshot.fleet_subscriptions?.find((f) => f.provider === provider)?.key_id ??
+  null;
+
+/**
  * The daemon version the cloud currently publishes (bare semver), from the last
  * bootstrap. Null when unpublished or the cloud is too old to advertise it. The
  * self-updater compares it to `DAEMON_VERSION`. See `self-update.ts`.

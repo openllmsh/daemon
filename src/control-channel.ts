@@ -16,6 +16,17 @@ import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import { computeStatus } from "./status";
+import {
+  failAllConsumedTunnels,
+  handleConsumedTunnelFrame,
+  ownsTunnel,
+  registerTunnelSender,
+} from "./tunnel-client";
+import {
+  abortAllTunnels,
+  handleTunnelFrame,
+  isTunnelFrame,
+} from "./tunnel-server";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
@@ -380,7 +391,24 @@ const onFrame = (frame: TRelayFrame): void => {
       heartbeat.notePong();
       return;
     default:
-      // welcome / others: nothing to do (partysocket owns reconnection)
+      // Subscription tunnels. This daemon can be BOTH ends: the CONSUMER of
+      // tunnels it opened (routed by tunnel-id ownership — acks/res frames)
+      // and the SERVER of tunnels a fleet peer/browser opened (everything
+      // else). Both run on their own async tasks — never the commandTail (a
+      // streaming response would block every command).
+      if (frame.type === "tunnel_open_ack") {
+        handleConsumedTunnelFrame(frame);
+        return;
+      }
+      if (isTunnelFrame(frame)) {
+        if (frame.type !== "tunnel_open" && ownsTunnel(frame.tunnel_id)) {
+          handleConsumedTunnelFrame(frame);
+          return;
+        }
+        handleTunnelFrame(frame, send);
+        return;
+      }
+      // others: nothing to do (partysocket owns reconnection)
       return;
   }
 };
@@ -479,6 +507,10 @@ export const migrateIfRelayMoved = async (
 export const startControlChannel = (): void => {
   if (ws !== null) return;
   logInfo("control-channel", "connecting over websocket");
+  // Give the tunnel CLIENT (walker → fleet peer) a frame sender without a
+  // walker→control-channel import (which would close an import cycle via
+  // tunnel-server → listener → walker).
+  registerTunnelSender(send);
   const socket = new ReconnectingWebSocket(channelUrl, undefined, {
     WebSocket: globalThis.WebSocket,
     minReconnectionDelay: 1_000,
@@ -495,6 +527,11 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
+    // The relay swept the old socket's tunnels; their frames can never route
+    // again — abort the served dispatches so they stop streaming into a void,
+    // and error the consumed ones so waiting walkers fail over.
+    abortAllTunnels();
+    failAllConsumedTunnels();
     daemonSessionId = null;
     supportsOrderedStatus = null;
     statusSeq = 0;

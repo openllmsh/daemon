@@ -105,6 +105,7 @@ import { recordRequest } from "./cloud-client";
 import {
   activeSubMethod,
   activeSubMethodOverrides,
+  fleetSubscriptionServerFor,
   lookupCatalogEntry,
   planSigningKey,
 } from "./config";
@@ -119,6 +120,7 @@ import {
 import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { isClaudeCodeOriginator, selectSubMethod } from "./sub-method";
+import { tunnelToPeer } from "./tunnel-client";
 import { sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
@@ -1183,6 +1185,57 @@ const serveKimiBuiltinSearch = async (
  * is a misuse of the daemon surface (clients reach it only via the
  * gateway's 307, which always carries a plan) → 400.
  */
+/**
+ * Fleet subscription tunnel — the consuming-daemon fallback for a
+ * subscription hop this box could not serve locally (`serveSubscription` →
+ * "retry", usually "no usable credential"). When the bootstrap snapshot
+ * names an online fleet peer serving the provider, the ORIGINAL inbound
+ * request tunnels to the peer over the relay; the peer walks it with its
+ * own credential (its local plan fetch pins the same alias, so the same
+ * chain policy applies). Returns null — meaning "fall through like any
+ * failed hop" — when: the request is itself tunnel-borne (loop guard), no
+ * peer serves the provider, or the tunnel fails before the response head.
+ */
+const tryFleetTunnel = async (
+  hop: THop,
+  args: TWalkArgs,
+): Promise<Response | null> => {
+  if (args.req.headers.get("x-openllm-tunneled") === "1") return null;
+  const peerKeyId = fleetSubscriptionServerFor(hop.provider);
+  if (peerKeyId === null) return null;
+  const clientWantsStream =
+    (args.rawBody as { stream?: unknown } | null)?.stream === true;
+  try {
+    const res = await tunnelToPeer({
+      keyId: peerKeyId,
+      surface:
+        args.surface === "messages"
+          ? "messages"
+          : args.surface === "responses"
+            ? "responses"
+            : "chat_completions",
+      body: new Uint8Array(args.rawBytes),
+      accept: clientWantsStream ? "text/event-stream" : "application/json",
+      anthropicVersion:
+        args.surface === "messages"
+          ? args.req.headers.get("anthropic-version")
+          : null,
+      anthropicBeta:
+        args.surface === "messages"
+          ? args.req.headers.get("anthropic-beta")
+          : null,
+      signal: args.req.signal,
+    });
+    // Commit only a success — a peer-side failure (its own walk exhausted)
+    // must not consume this box's remaining hops silently, but the peer
+    // already ran the full plan, so forward its terminal answer on the
+    // FINAL failure too; pre-head failures threw and fell through.
+    return res;
+  } catch {
+    return null;
+  }
+};
+
 export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const planModelIds = parsePlan(args.planParam);
   if (planModelIds.length === 0) {
@@ -1314,6 +1367,13 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
       const served = await serveSubscription(hop, wire, args, finalHop);
       if (served !== "retry") return served; // committed
+      // Fleet tunnel (feature §1): no local credential — a fleet peer may
+      // serve this provider over the relay. Never for a tunnel-borne
+      // request (loop guard) — a two-daemon credential gap must fail the
+      // hop, not ping-pong. Any tunnel failure degrades to the ordinary
+      // failed-hop fall-through.
+      const tunneled = await tryFleetTunnel(hop, args);
+      if (tunneled !== null) return tunneled;
       lastError = `subscription hop ${hop.modelId} failed pre-stream`;
       continue;
     }
