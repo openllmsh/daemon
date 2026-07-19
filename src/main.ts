@@ -49,6 +49,7 @@ import {
   maybeSelfUpdate,
   trackBodyDone,
 } from "./self-update";
+import { reapDetachedSessions } from "./session-host";
 import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -199,6 +200,11 @@ const main = async (): Promise<void> => {
   // dashboard never reaches loopback (no Private Network Access prompt). See
   // `docs/proposals/daemon-relay-websocket-push.md`.
   startControlChannel();
+
+  // Reap DETACHED device-session PTYs past their TTL (feature §2.2) —
+  // attached sessions never idle out.
+  const sessionReaper = setInterval(() => reapDetachedSessions(), 60_000);
+  sessionReaper.unref?.();
 
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.

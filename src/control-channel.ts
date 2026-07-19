@@ -15,6 +15,11 @@ import { runCommandInner } from "./control-relay";
 import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
+import {
+  detachAllSessions,
+  handleSessionFrame,
+  isSessionFrame,
+} from "./session-host";
 import { computeStatus } from "./status";
 import {
   failAllConsumedTunnels,
@@ -408,6 +413,12 @@ const onFrame = (frame: TRelayFrame): void => {
         handleTunnelFrame(frame, send);
         return;
       }
+      // Device sessions (PTY host) — each session runs on its own async
+      // task, mirroring the tunnel server.
+      if (isSessionFrame(frame)) {
+        handleSessionFrame(frame, send);
+        return;
+      }
       // others: nothing to do (partysocket owns reconnection)
       return;
   }
@@ -532,6 +543,9 @@ export const startControlChannel = (): void => {
     // and error the consumed ones so waiting walkers fail over.
     abortAllTunnels();
     failAllConsumedTunnels();
+    // Session CHANNELS died with the old socket, but the PTYs live on —
+    // detach so re-attach works after the browser reconnects.
+    detachAllSessions();
     daemonSessionId = null;
     supportsOrderedStatus = null;
     statusSeq = 0;
