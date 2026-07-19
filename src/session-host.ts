@@ -175,10 +175,15 @@ const argvFor = (
   mode: "spawn" | "continue",
 ): ReadonlyArray<string> => {
   const bin = hostCliBin(cli);
-  if (mode === "continue" && cli === "claude_code") {
+  if (cli === "claude_code") {
+    // The session workspace is a throwaway sandboxed dir the user is
+    // driving interactively — skip the per-tool permission prompts that
+    // would otherwise block every action in a fresh cwd.
+    const flags = ["--dangerously-skip-permissions"];
     // Claude persists sessions per-cwd; --continue reopens the most
     // recent conversation in this workspace.
-    return [bin, "--continue"];
+    if (mode === "continue") flags.push("--continue");
+    return [bin, ...flags];
   }
   return [bin];
 };
