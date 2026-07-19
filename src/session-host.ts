@@ -90,11 +90,19 @@ const bunPtySpawner: TPtySpawner = (args) => {
     rows: args.rows,
     data: (_t, chunk) => args.onData(chunk),
   });
-  const proc = Bun.spawn([...args.argv], {
-    cwd: args.cwd,
-    env: spawnEnv(args.env),
-    terminal,
-  });
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn([...args.argv], {
+      cwd: args.cwd,
+      env: spawnEnv(args.env),
+      terminal,
+    });
+  } catch (err) {
+    // Spawn threw (ENOENT etc.) — the terminal was already created above;
+    // close it so the failed attempt doesn't leak a PTY fd.
+    terminal.close();
+    throw err;
+  }
   void proc.exited.then(() => {
     args.onExit();
     terminal.close();
@@ -140,7 +148,7 @@ const sessions = new Map<string, TSession>();
 /** Status report for `DaemonStatus.sessions`. */
 export const sessionStatusReport = (): Array<{
   id: string;
-  cli: string;
+  cli: TCliProvider;
   started_at_ms: number;
   attached: boolean;
   live: boolean;
@@ -380,10 +388,6 @@ const handleOpen = (
     nack("session_busy");
     return;
   }
-  if (frame.mode === "continue" && existing === undefined) {
-    // Daemon restarted since — the workspace may still exist on disk;
-    // recreate the record and continue in place.
-  }
   if (liveCount() >= MAX_LIVE_SESSIONS) {
     nack("overloaded");
     return;
@@ -404,6 +408,23 @@ const handleOpen = (
   // the granted sandbox.
   attachSessionConfig(cli);
 
+  // The CLI must actually be installed on this box — `hostCliCandidates`
+  // already folds in a PATH scan (`resolveOnPath`), so no candidate on
+  // disk means the spawn could only ENOENT. Nack the precise error so the
+  // browser can say "install it" instead of a generic spawn failure.
+  // Only enforced for the REAL spawner — an injected test spawner never
+  // execs, and CI boxes don't carry the vendor CLIs.
+  if (
+    spawner === bunPtySpawner &&
+    !hostCliCandidates(cli).some((candidate) => existsSync(candidate))
+  ) {
+    nack("cli_not_installed");
+    return;
+  }
+
+  // `continue` after a daemon restart: no in-memory record, but the
+  // workspace may still exist on disk — recreate the record (the `??`
+  // fallback) and continue in place.
   const s: TSession = existing ?? {
     id: frame.session_id,
     cli,

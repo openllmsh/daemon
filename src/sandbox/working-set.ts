@@ -597,8 +597,25 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // parent (e.g. `~/.codex`), widening the grant to the whole config dir
   // and colliding with an existing RW grant. A not-yet-configured provider
   // shares nothing (its session then falls back to a fresh login).
+  // THREAT-MODEL EXCEPTION — credential files among the config links are
+  // NOT granted by the generic loop: each is an explicit, documented,
+  // FILE-scoped decision here. Today that is the Claude OAuth token
+  // (`~/.claude/.credentials.json`, the §5-A jewel): the device-session
+  // feature needs the session CLI to authenticate as the user's real
+  // Claude login (feature §2.2 — no re-login inside the sandbox), and
+  // Claude has no separate auth-handoff mechanism, so a READ-only grant
+  // is accepted. A compromised daemon could read this token (it still
+  // cannot write `~/.claude`) — traded against forcing users through a
+  // fresh in-sandbox login that would mint yet another long-lived token.
+  const credentialExceptions = new Set([
+    join(home, ".claude", ".credentials.json"),
+  ]);
+  for (const cred of credentialExceptions) {
+    if (existsSync(cred)) readOnly.add(cred);
+  }
   for (const provider of CLI_PROVIDERS) {
     for (const { real } of sessionConfigLinks(provider)) {
+      if (credentialExceptions.has(real)) continue; // granted above, explicitly
       if (existsSync(real)) readOnly.add(real);
     }
   }
