@@ -41,10 +41,13 @@ import type {
   TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
 import {
-  SESSION_DETACHED_TTL_MS,
+  parseStreamCtrlPayload,
   SESSION_ID_PATTERN,
+  SESSION_QUIET_REAP_MS,
   TUNNEL_CHUNK_MAX,
 } from "@openllmsh/protocol";
+import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
+import type { TMuxStream } from "@openllmsh/tunnel/mux";
 import type { TCliProvider } from "./cli-paths";
 import {
   hostCliCandidates,
@@ -61,7 +64,7 @@ const MAX_LIVE_SESSIONS = 4;
 
 /** Scrollback ring cap — enough to repaint a screenful+history on attach
  *  without unbounded memory. */
-const SCROLLBACK_MAX_BYTES = 256 * 1024;
+const SCROLLBACK_MAX_BYTES = 1024 * 1024;
 
 // ─── PTY abstraction (injectable for CI — no PTY there) ──────────────
 
@@ -69,6 +72,7 @@ export type TPtyLike = {
   write(data: Uint8Array | string): void;
   resize(cols: number, rows: number): void;
   kill(): void;
+  readonly pid?: number;
 };
 
 export type TPtySpawnArgs = {
@@ -117,6 +121,7 @@ const bunPtySpawner: TPtySpawner = (args) => {
         /* already gone */
       }
     },
+    pid: proc.pid,
   };
 };
 
@@ -141,9 +146,115 @@ type TSession = {
   outSeq: number;
   startedAtMs: number;
   detachedAtMs: number | null;
+  lastOutputAtMs: number;
+  lastBusyAtMs: number;
+  busy: boolean;
+  title: string | null;
+  pid: number | null;
+  muxStream: TMuxStream | null;
 };
 
 const sessions = new Map<string, TSession>();
+
+type TActivityProbe = (rootPids: ReadonlySet<number>) => Promise<Set<number>>;
+let activityProbe: TActivityProbe | null = null;
+let quietHook: (() => void) | null = null;
+
+export const setActivityProbe = (probe: TActivityProbe | null): void => {
+  activityProbe = probe;
+};
+
+export const setSessionQuietHook = (hook: (() => void) | null): void => {
+  quietHook = hook;
+};
+
+const probeActivity = async (
+  rootPids: ReadonlySet<number>,
+): Promise<Set<number>> => {
+  if (activityProbe !== null) return activityProbe(rootPids);
+  const proc = Bun.spawn(["ps", "-Ao", "pid=,ppid=,pcpu="], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const text = await new Response(proc.stdout).text();
+  if ((await proc.exited) !== 0) throw new Error("ps exited nonzero");
+  const rows = text
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.trim().split(/\s+/));
+  const parent = new Map<number, number>();
+  const cpu = new Map<number, number>();
+  for (const row of rows) {
+    const [pidText, parentText, cpuText] = row;
+    const pid = Number(pidText);
+    const ppid = Number(parentText);
+    const percent = Number(cpuText);
+    if (
+      !Number.isInteger(pid) ||
+      !Number.isInteger(ppid) ||
+      !Number.isFinite(percent)
+    )
+      throw new Error("unparseable ps output");
+    parent.set(pid, ppid);
+    cpu.set(pid, percent);
+  }
+  const busy = new Set<number>();
+  for (const root of rootPids) {
+    let total = 0;
+    for (const [pid, percent] of cpu) {
+      let current: number | undefined = pid;
+      while (current !== undefined && current !== 0) {
+        if (current === root) {
+          total += percent;
+          break;
+        }
+        current = parent.get(current);
+      }
+    }
+    if (total > 1) busy.add(root);
+  }
+  return busy;
+};
+
+/** Poll detached process trees. Probe failures deliberately mark every session busy. */
+export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
+  const dormant = [...sessions.values()].filter(
+    (session) => session.pty !== null && !session.attached,
+  );
+  if (dormant.length === 0) return;
+  const pids = new Set<number>();
+  for (const session of dormant) {
+    if (session.pid === null) {
+      for (const candidate of dormant) {
+        candidate.busy = true;
+        candidate.lastBusyAtMs = now;
+      }
+      return;
+    }
+    pids.add(session.pid);
+  }
+  let busyPids: Set<number>;
+  try {
+    busyPids = await probeActivity(pids);
+  } catch (error) {
+    logWarn(
+      "session",
+      `activity probe failed; retaining sessions: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    for (const session of dormant) {
+      session.busy = true;
+      session.lastBusyAtMs = now;
+    }
+    return;
+  }
+  for (const session of dormant) {
+    const isBusy = session.pid !== null && busyPids.has(session.pid);
+    if (isBusy) session.lastBusyAtMs = now;
+    if (session.busy && !isBusy) quietHook?.();
+    session.busy = isBusy;
+  }
+};
 
 /** Status report for `DaemonStatus.sessions`. */
 export const sessionStatusReport = (): Array<{
@@ -152,14 +263,21 @@ export const sessionStatusReport = (): Array<{
   started_at_ms: number;
   attached: boolean;
   live: boolean;
+  busy: boolean;
+  title?: string;
 }> =>
-  [...sessions.values()].map((s) => ({
-    id: s.id,
-    cli: s.cli,
-    started_at_ms: s.startedAtMs,
-    attached: s.attached,
-    live: s.pty !== null,
-  }));
+  [...sessions.values()]
+    .sort((a, b) => b.startedAtMs - a.startedAtMs)
+    .slice(0, 12)
+    .map((s) => ({
+      id: s.id,
+      cli: s.cli,
+      started_at_ms: s.startedAtMs,
+      attached: s.attached,
+      live: s.pty !== null,
+      busy: s.busy,
+      ...(s.title === null ? {} : { title: s.title.slice(0, 80) }),
+    }));
 
 const liveCount = (): number =>
   [...sessions.values()].filter((s) => s.pty !== null).length;
@@ -246,6 +364,10 @@ const sendOut = (
   chunk: Uint8Array,
   send: (frame: TRelayFrame) => void,
 ): void => {
+  if (s.muxStream !== null) {
+    void s.muxStream.write(chunk);
+    return;
+  }
   for (let i = 0; i < chunk.length; i += TUNNEL_CHUNK_MAX) {
     send({
       type: "session_io",
@@ -301,10 +423,7 @@ export const handleSessionFrame = (
       const s = sessions.get(frame.session_id);
       if (s === undefined) return;
       if (frame.reason === "detach" || frame.reason === "consumer_gone") {
-        // The consumer went away — keep the PTY (dormant) for re-attach.
-        s.attached = false;
-        s.detachedAtMs = Date.now();
-        logInfo("session", "session detached", { id: s.id });
+        detachSession(s.id);
         return;
       }
       // Explicit kill / terminal teardown.
@@ -318,6 +437,15 @@ export const handleSessionFrame = (
       return;
     }
   }
+};
+
+export const detachSession = (id: string): void => {
+  const session = sessions.get(id);
+  if (session === undefined || !session.attached) return;
+  session.attached = false;
+  session.muxStream = null;
+  session.detachedAtMs = Date.now();
+  logInfo("session", "session detached", { id: session.id });
 };
 
 const handleOpen = (
@@ -436,6 +564,12 @@ const handleOpen = (
     outSeq: 0,
     startedAtMs: Date.now(),
     detachedAtMs: null,
+    lastOutputAtMs: Date.now(),
+    lastBusyAtMs: Date.now(),
+    busy: true,
+    title: frame.title ?? null,
+    pid: null,
+    muxStream: null,
   };
   sessions.set(s.id, s);
 
@@ -456,6 +590,7 @@ const handleOpen = (
       cols: frame.cols,
       rows: frame.rows,
       onData: (chunk) => {
+        s.lastOutputAtMs = Date.now();
         pushScrollback(s, chunk);
         if (s.attached) sendOut(s, chunk, send);
       },
@@ -473,6 +608,9 @@ const handleOpen = (
       },
     });
     s.pty = pty;
+    s.pid = pty.pid ?? null;
+    s.busy = true;
+    s.lastBusyAtMs = Date.now();
     s.attached = true;
     s.detachedAtMs = null;
     send({
@@ -496,31 +634,105 @@ const handleOpen = (
   }
 };
 
+/** Bind a mux session stream without changing the legacy JSON state machine. */
+export const bindMuxSessionStream = (
+  stream: TMuxStream,
+  open: {
+    readonly session_id: string;
+    readonly cli: TSubscriptionProviderSlug;
+    readonly cols: number;
+    readonly rows: number;
+    readonly mode: "spawn" | "attach" | "continue";
+    readonly title?: string;
+  },
+): void => {
+  const existing = sessions.get(open.session_id);
+  if (existing?.attached) {
+    stream.reset(encodeJsonPayload({ code: "session_busy" }));
+    return;
+  }
+  const send = (frame: TRelayFrame): void => {
+    if (frame.type === "session_open_ack") {
+      if (!frame.ok) {
+        stream.reset(
+          encodeJsonPayload({ code: frame.error ?? "spawn_failed" }),
+        );
+        return;
+      }
+      const session = sessions.get(open.session_id);
+      if (session === undefined) return;
+      session.muxStream = stream;
+      stream.sendCtrl(
+        encodeJsonPayload({ t: "open_ack", ok: true, live: frame.live }),
+      );
+      if (open.mode === "attach") {
+        void stream.write(new TextEncoder().encode("\x1b[2J\x1b[H"));
+        for (const chunk of session.scrollback) void stream.write(chunk);
+        stream.sendCtrl(encodeJsonPayload({ t: "replay_done" }));
+      }
+      return;
+    }
+    if (frame.type === "session_close") stream.end();
+  };
+  handleSessionFrame(
+    {
+      type: "session_open",
+      session_id: open.session_id,
+      key_id: "mux",
+      cli: open.cli,
+      cols: open.cols,
+      rows: open.rows,
+      mode: open.mode,
+      ...(open.title === undefined ? {} : { title: open.title }),
+    },
+    send,
+  );
+  stream.onData((bytes) => {
+    const session = sessions.get(open.session_id);
+    session?.pty?.write(bytes);
+  });
+  stream.onCtrl((payload) => {
+    const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
+    const session = sessions.get(open.session_id);
+    if (session === undefined) return;
+    if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
+    if (ctrl?.t === "close" && ctrl.intent === "kill") {
+      session.pty?.kill();
+      session.pty = null;
+      session.pid = null;
+      session.attached = false;
+    }
+  });
+  stream.onReset(() => detachSession(open.session_id));
+  stream.onEnd(() => detachSession(open.session_id));
+};
+
 /** Control-channel reconnect: the relay swept every channel — DETACH all
  *  attached sessions (PTYs survive relay cycling; the browser re-attaches
  *  on its own reconnect). */
 export const detachAllSessions = (): void => {
-  const now = Date.now();
   for (const s of sessions.values()) {
-    if (s.attached) {
-      s.attached = false;
-      s.detachedAtMs = now;
-    }
+    if (s.attached) detachSession(s.id);
   }
 };
 
-/** Reap DETACHED live PTYs past the TTL. Called on a timer from main. */
+/** Reap only detached PTYs quiet for the full grace period. */
 export const reapDetachedSessions = (now = Date.now()): void => {
   for (const s of sessions.values()) {
+    const latestActivity = Math.max(
+      s.lastOutputAtMs,
+      s.lastBusyAtMs,
+      s.detachedAtMs ?? 0,
+    );
     if (
       s.pty !== null &&
       !s.attached &&
-      s.detachedAtMs !== null &&
-      now - s.detachedAtMs > SESSION_DETACHED_TTL_MS
+      now - latestActivity > SESSION_QUIET_REAP_MS
     ) {
-      logInfo("session", "reaping detached session", { id: s.id });
+      logInfo("session", "reaping quiet detached session", { id: s.id });
       s.pty.kill();
       s.pty = null;
+      s.pid = null;
     }
   }
 };

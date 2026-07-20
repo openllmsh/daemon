@@ -61,6 +61,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     pubkey: daemonPublicKey(),
     port: daemonPort(),
     sandbox: sandboxState(),
+    caps: ["mux1"],
     connections,
     // Cached manifest-driven device state (refreshed by the `-s` walk on boot
     // + after install/uninstall + on refresh), NOT a live scan — the walk is

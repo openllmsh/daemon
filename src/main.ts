@@ -49,7 +49,7 @@ import {
   maybeSelfUpdate,
   trackBodyDone,
 } from "./self-update";
-import { reapDetachedSessions } from "./session-host";
+import { pollSessionActivity, reapDetachedSessions } from "./session-host";
 import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -205,6 +205,10 @@ const main = async (): Promise<void> => {
   // attached sessions never idle out.
   const sessionReaper = setInterval(() => reapDetachedSessions(), 60_000);
   sessionReaper.unref?.();
+  const sessionActivityPoller = setInterval(() => {
+    void pollSessionActivity();
+  }, 15_000);
+  sessionActivityPoller.unref?.();
 
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.

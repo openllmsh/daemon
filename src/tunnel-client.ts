@@ -21,7 +21,9 @@ import type {
   TTunnelSurface,
 } from "@openllmsh/protocol";
 import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
+import { tunnelStream } from "@openllmsh/tunnel/streams";
 import { logInfo } from "./logger";
+import { muxChannelTo } from "./mux-host";
 
 const OPEN_TIMEOUT_MS = 15_000;
 /** After a successful open ack, allow the serving daemon's dispatch its own
@@ -171,7 +173,7 @@ export const handleConsumedTunnelFrame = (
  * response head arrives (body streams thereafter); rejects on any failure
  * (including no registered relay sender — control channel not started).
  */
-export const tunnelToPeer = (args: {
+export const tunnelToPeer = async (args: {
   keyId: string;
   surface: TTunnelSurface;
   body: Uint8Array;
@@ -180,6 +182,33 @@ export const tunnelToPeer = (args: {
   anthropicBeta?: string | null;
   signal: AbortSignal;
 }): Promise<Response> => {
+  const headers = {
+    content_type: "application/json" as const,
+    accept: args.accept,
+    ...(args.anthropicVersion != null
+      ? { anthropic_version: args.anthropicVersion.slice(0, 32) }
+      : {}),
+    ...(args.anthropicBeta != null
+      ? { anthropic_beta: args.anthropicBeta.slice(0, 256) }
+      : {}),
+  };
+  const mux = await muxChannelTo(args.keyId);
+  if (mux !== null) {
+    try {
+      const result = await tunnelStream(mux, {
+        surface: args.surface,
+        headers,
+        body: args.body,
+        signal: args.signal,
+      });
+      return new Response(result.body, {
+        status: result.status,
+        headers: result.headers,
+      });
+    } catch {
+      // Any pre-head mux failure falls through to the established JSON splice.
+    }
+  }
   const sender = relaySender;
   if (sender === null) {
     return Promise.reject(new Error("relay channel not started"));
@@ -223,16 +252,7 @@ export const tunnelToPeer = (args: {
       key_id: args.keyId,
       method: "POST",
       surface: args.surface,
-      headers: {
-        content_type: "application/json",
-        accept: args.accept,
-        ...(args.anthropicVersion != null
-          ? { anthropic_version: args.anthropicVersion.slice(0, 32) }
-          : {}),
-        ...(args.anthropicBeta != null
-          ? { anthropic_beta: args.anthropicBeta.slice(0, 256) }
-          : {}),
-      },
+      headers,
       consumer: "daemon",
     });
     let seq = 0;

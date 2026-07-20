@@ -16,9 +16,19 @@ import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import {
+  acceptChannel,
+  configureMuxHost,
+  handleChannelOpenAck,
+  muxHostOnBytes,
+  replaceMuxPeerCaps,
+  resetAllChannels,
+  updateMuxPeerCaps,
+} from "./mux-host";
+import {
   detachAllSessions,
   handleSessionFrame,
   isSessionFrame,
+  setSessionQuietHook,
 } from "./session-host";
 import { computeStatus } from "./status";
 import {
@@ -123,6 +133,15 @@ let hasConnected = false;
  *  fresh (paired with the `reconnected` line). */
 let lastErrorReason = "";
 let lastCloseLine = "";
+
+const sendBytes = (bytes: Uint8Array): void => {
+  if (ws === null || ws.readyState !== ws.OPEN || !helloSent) return;
+  try {
+    ws.send(bytes.buffer as ArrayBuffer);
+  } catch {
+    // best-effort while the socket races a close
+  }
+};
 
 const send = (frame: TRelayFrame): void => {
   if (ws === null || ws.readyState !== ws.OPEN) return;
@@ -377,6 +396,7 @@ const onFrame = (frame: TRelayFrame): void => {
       });
       return;
     case "welcome":
+      replaceMuxPeerCaps(frame.snapshot_caps);
       daemonSessionId = frame.daemon_session_id ?? null;
       supportsOrderedStatus = frame.daemon_session_id !== undefined;
       // Sequence 1 of the session is reserved for the hello snapshot the relay
@@ -394,6 +414,15 @@ const onFrame = (frame: TRelayFrame): void => {
       // is alive, so re-arm the liveness window (R4: arm off pong, not off any
       // inbound frame — that's how we notice a dead outbound direction).
       heartbeat.notePong();
+      return;
+    case "channel_open":
+      acceptChannel(frame);
+      return;
+    case "channel_open_ack":
+      handleChannelOpenAck(frame);
+      return;
+    case "presence":
+      updateMuxPeerCaps(frame.key_id, frame.active ? frame.caps : undefined);
       return;
     default:
       // Subscription tunnels. This daemon can be BOTH ends: the CONSUMER of
@@ -425,6 +454,18 @@ const onFrame = (frame: TRelayFrame): void => {
 };
 
 const onMessage = (data: unknown): void => {
+  if (data instanceof ArrayBuffer) {
+    muxHostOnBytes(new Uint8Array(data));
+    return;
+  }
+  if (data instanceof Uint8Array) {
+    muxHostOnBytes(data);
+    return;
+  }
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
+    muxHostOnBytes(new Uint8Array(data));
+    return;
+  }
   if (typeof data !== "string") return;
   let json: unknown;
   try {
@@ -522,6 +563,10 @@ export const startControlChannel = (): void => {
   // walker→control-channel import (which would close an import cycle via
   // tunnel-server → listener → walker).
   registerTunnelSender(send);
+  setSessionQuietHook(() => {
+    void pushStatusIfChanged();
+  });
+  configureMuxHost({ send, sendBytes });
   const socket = new ReconnectingWebSocket(channelUrl, undefined, {
     WebSocket: globalThis.WebSocket,
     minReconnectionDelay: 1_000,
@@ -543,6 +588,7 @@ export const startControlChannel = (): void => {
     // and error the consumed ones so waiting walkers fail over.
     abortAllTunnels();
     failAllConsumedTunnels();
+    resetAllChannels();
     // Session CHANNELS died with the old socket, but the PTYs live on —
     // detach so re-attach works after the browser reconnects.
     detachAllSessions();
@@ -563,6 +609,7 @@ export const startControlChannel = (): void => {
         type: "hello",
         ticket,
         protocol_version: RELAY_PROTOCOL_VERSION,
+        caps: ["mux1"],
       });
       startWatcher();
     }
