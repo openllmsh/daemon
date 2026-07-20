@@ -275,6 +275,26 @@ ${renderUnitRestart(systemdMajor())}${renderUnitLogging(systemdMajor())}${render
 WantedBy=default.target
 `;
 
+/**
+ * `launchctl bootout` is ASYNCHRONOUS — it requests teardown and returns while
+ * launchd is still killing the old process and unregistering the label. A
+ * `bootstrap` issued in that window fails ("service already bootstrapped" —
+ * swallowed by tryRun), the legacy `load` fallback silently no-ops, and the
+ * follow-up `kickstart -k` lands on a half-torn-down label: the net effect was
+ * a reinstall that left the OLD binary running (or nothing running) until the
+ * user manually ran `openllmd restart` after the race had settled. Poll the
+ * label until launchd reports it gone (bounded) so the re-bootstrap below is
+ * deterministic.
+ */
+const waitForBootout = (target: string, timeoutMs = 10_000): void => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // `launchctl print` exits non-zero once the label is fully unregistered.
+    if (capture("launchctl", ["print", target]).length === 0) return;
+    execFileSync("sleep", ["0.2"], { stdio: "ignore" });
+  }
+};
+
 const startMac = (binPath: string): void => {
   const plist = plistPath();
   mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
@@ -286,7 +306,7 @@ const startMac = (binPath: string): void => {
   // label in a DISABLED override — so KeepAlive/RunAtLoad never take effect and
   // the daemon "won't stay running". `enable` clears that override; `bootstrap`
   // loads it (fall back to `load` on older macOS); `kickstart -k` (re)starts it.
-  tryRun("launchctl", ["bootout", target]);
+  if (tryRun("launchctl", ["bootout", target])) waitForBootout(target);
   tryRun("launchctl", ["enable", target]);
   if (
     !tryRun("launchctl", ["bootstrap", domain, plist]) &&
