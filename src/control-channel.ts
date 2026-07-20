@@ -154,6 +154,16 @@ const send = (frame: TRelayFrame): void => {
   }
 };
 
+/** Reset relay-owned work at a connection boundary. PTY processes survive a
+ * handoff, while their mux channels, served tunnels, and consumed tunnels are
+ * tied to the old relay socket and must not continue into the successor. */
+export const resetRelayScopedState = (): void => {
+  abortAllTunnels();
+  failAllConsumedTunnels();
+  resetAllChannels();
+  detachAllSessions();
+};
+
 const enqueueStatusPublish = (
   compute: () => Promise<{ status: unknown; fingerprint: string } | null>,
   active?: boolean,
@@ -583,15 +593,7 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
-    // The relay swept the old socket's tunnels; their frames can never route
-    // again — abort the served dispatches so they stop streaming into a void,
-    // and error the consumed ones so waiting walkers fail over.
-    abortAllTunnels();
-    failAllConsumedTunnels();
-    resetAllChannels();
-    // Session CHANNELS died with the old socket, but the PTYs live on —
-    // detach so re-attach works after the browser reconnects.
-    detachAllSessions();
+    resetRelayScopedState();
     daemonSessionId = null;
     supportsOrderedStatus = null;
     statusSeq = 0;
