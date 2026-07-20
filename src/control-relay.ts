@@ -18,6 +18,7 @@ import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
+import { clearPlanCache } from "./plan-cache";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
 
@@ -205,6 +206,12 @@ export const runCommandInner = async (
         // dedicated on-demand re-walk is future work (proposal §9 cadence).
         return { id: cmd.id, status: "done" };
       case "status":
+        return { id: cmd.id, status: "done" };
+      // Drop every cached signed plan tuple. Enqueued by the dashboard after
+      // a chain/config save so the next request re-resolves through the cloud
+      // instead of replaying the pre-save chain for up to the cache TTL.
+      case "bust_plan_cache":
+        clearPlanCache();
         return { id: cmd.id, status: "done" };
       // Force a self-update check now (the daemon also checks on every bootstrap
       // tick WHEN auto-update is opted in). This is an EXPLICIT user request, so
