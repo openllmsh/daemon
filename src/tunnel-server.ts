@@ -140,7 +140,7 @@ export const handleTunnelFrame = (
 ): void => {
   switch (frame.type) {
     case "tunnel_open": {
-      if (served.size >= MAX_SERVED_TUNNELS) {
+      if (served.size + muxServedCount >= MAX_SERVED_TUNNELS) {
         send({
           type: "tunnel_open_ack",
           tunnel_id: frame.tunnel_id,

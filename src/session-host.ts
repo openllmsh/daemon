@@ -503,10 +503,13 @@ const handleOpen = (
       ok: true,
       live: true,
     });
-    // Repaint: clear, then replay the ring (already sized to the new
-    // dims by the resize above).
-    sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
-    for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
+    // The legacy JSON caller needs its repaint frames here. Mux callers set
+    // `muxStream` in bindMuxSessionStream's ack handler and replay directly
+    // to that binary stream instead.
+    if (existing.muxStream === null) {
+      sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
+      for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
+    }
     logInfo("session", "session re-attached", { id: existing.id });
     return;
   }

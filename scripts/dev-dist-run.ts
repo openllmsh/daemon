@@ -75,7 +75,7 @@ process.on("SIGINT", () => stop("SIGINT"));
 // Backstop: if THIS process exits for any reason, the binary must not
 // survive it (a stray sandboxed daemon on 8788 would block the next run).
 process.on("exit", () => {
-  if (child.exitCode === null && !child.killed) child.kill("SIGKILL");
+  if (child.exitCode === null) child.kill("SIGKILL");
 });
 child.on("exit", (code) => {
   if (killTimer !== null) clearTimeout(killTimer);
