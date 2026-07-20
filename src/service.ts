@@ -284,15 +284,19 @@ WantedBy=default.target
  * a reinstall that left the OLD binary running (or nothing running) until the
  * user manually ran `openllmd restart` after the race had settled. Poll the
  * label until launchd reports it gone (bounded) so the re-bootstrap below is
- * deterministic.
+ * deterministic. Returns whether teardown completed — a caller must NOT
+ * bootstrap on `false` (it would re-enter the same race).
  */
-const waitForBootout = (target: string, timeoutMs = 10_000): void => {
+const waitForBootout = (target: string, timeoutMs = 10_000): boolean => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     // `launchctl print` exits non-zero once the label is fully unregistered.
-    if (capture("launchctl", ["print", target]).length === 0) return;
+    // (A broken launchctl also captures empty — acceptable: the bootstrap
+    // that follows would then fail loudly and throw.)
+    if (capture("launchctl", ["print", target]).length === 0) return true;
     execFileSync("sleep", ["0.2"], { stdio: "ignore" });
   }
+  return false;
 };
 
 const startMac = (binPath: string): void => {
@@ -306,7 +310,13 @@ const startMac = (binPath: string): void => {
   // label in a DISABLED override — so KeepAlive/RunAtLoad never take effect and
   // the daemon "won't stay running". `enable` clears that override; `bootstrap`
   // loads it (fall back to `load` on older macOS); `kickstart -k` (re)starts it.
-  if (tryRun("launchctl", ["bootout", target])) waitForBootout(target);
+  if (tryRun("launchctl", ["bootout", target]) && !waitForBootout(target)) {
+    // Teardown never completed — bootstrapping now would land on the
+    // half-registered label (the exact race this guard exists to close).
+    throw new Error(
+      `launchd did not finish tearing down ${LABEL} within 10s — run 'openllmd restart' to retry`,
+    );
+  }
   tryRun("launchctl", ["enable", target]);
   if (
     !tryRun("launchctl", ["bootstrap", domain, plist]) &&
