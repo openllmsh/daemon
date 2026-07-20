@@ -318,7 +318,8 @@ walker's own `report`. Offline coverage:
 
 ## Two localhost surfaces
 
-`Bun.serve` on `127.0.0.1:<port>` (default 8787) routes by path:
+`Bun.serve` on `127.0.0.1:<port>` (default 8787; 8788 in dev mode) routes
+by path:
 
 - **`/v1/*` — inference.** Mirrors the cloud's OpenAI/Anthropic surface.
   `listener.ts` parses → `dispatch.runLocalDispatch` resolves the user's
@@ -372,6 +373,16 @@ then relaxes to the 5-minute TTL — so a just-set key (or a `next dev`
 that just finished compiling) is picked up within seconds. This also
 makes dev fast: `bun run dev` boots the daemon keyless and you set a key
 once from the UI.
+
+**Dev-mode config isolation.** With `OPENLLM_DAEMON_DEV=1` the daemon's
+config file is `~/.openllm/.dev.env` (not the shared `.env`), the default
+port is `8788`, and the cloud origin defaults to the local Next server —
+so a source-run dev daemon coexists with the installed daemon without
+clobbering its config. The ONLY dev read of the shared `.env` is a live,
+read-only `OPENLLM_API_KEY` fallback when `.dev.env` is keyless (dev
+reuses the paired key without forking it); every dev write — key, origin,
+minted device id, auto-update pref — lands in `.dev.env`. The dashboard
+probes both 8787 and 8788 for `/whoami` (`lib/hooks/use-this-device.ts`).
 
 ## Isolated CLIs (install + run)
 
