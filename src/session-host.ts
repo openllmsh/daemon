@@ -30,8 +30,16 @@
  * `docs/proposals/device-session-shared-sandbox-home.md`.
  */
 
-import { existsSync, mkdirSync, symlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type {
   TRelayFrame,
   TRelaySessionCloseFrame,
@@ -54,6 +62,7 @@ import {
   sessionConfigDir,
   sessionConfigLinks,
   sessionEnv,
+  sessionSandboxHome,
   sessionWorkspace,
 } from "./cli-paths";
 import { spawnEnv } from "./delegation/spawn";
@@ -61,6 +70,125 @@ import { logInfo, logWarn } from "./logger";
 
 /** Max concurrently-LIVE PTYs on one daemon. */
 const MAX_LIVE_SESSIONS = 4;
+
+// ── Atomic PTY lifecycle: no session process ever outlives its daemon ──
+//
+// A PTY is a child process; if the daemon dies without killing it, it leaks
+// (memory + a held session slot) until the machine reboots. Two escape hatches
+// are closed:
+//   1. CATCHABLE exit (SIGTERM from auto-update/launchd, SIGINT, uncaught
+//      error) → `killAllSessions()` runs from main.ts's exit paths.
+//   2. UNCATCHABLE exit (SIGKILL, crash, power loss) → cleanup can't run, so
+//      each live PTY records a pidfile; the NEXT daemon start sweeps stale
+//      pidfiles and kills any survivor whose command still looks like ours.
+// Together these guarantee the machine never accumulates orphaned session PTYs.
+
+/** Directory holding one `<sessionId>.pid` file per live PTY. */
+const pidDir = (): string => join(sessionSandboxHome(), "pids");
+
+const pidFile = (sessionId: string): string =>
+  join(pidDir(), `${sessionId}.pid`);
+
+const writePidFile = (sessionId: string, pid: number): void => {
+  try {
+    mkdirSync(pidDir(), { recursive: true });
+    writeFileSync(pidFile(sessionId), String(pid), "utf8");
+  } catch (err) {
+    logWarn(
+      "session",
+      `pidfile write failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+};
+
+const removePidFile = (sessionId: string): void => {
+  try {
+    rmSync(pidFile(sessionId), { force: true });
+  } catch {
+    /* best-effort */
+  }
+};
+
+const vendorCliNames = ["claude", "codex", "kimi", "grok"];
+
+/** Extract and validate the executable token from `ps -o command=` output. */
+export const isVendorSessionCommand = (command: string): boolean => {
+  const executable = command.trim().split(/\s+/, 1)[0];
+  if (executable === undefined || executable === "") return false;
+  const name = basename(executable).toLowerCase();
+  return vendorCliNames.some(
+    (vendor) => name === vendor || name.startsWith(`${vendor}-`),
+  );
+};
+
+/** Whether a live process with `pid` is (still) one of our session CLIs.
+ *  Conservative: only kill when the executable is a known vendor CLI, so a
+ *  reused PID with a vendor name in an argument can never be SIGKILLed. */
+const looksLikeSessionProc = (pid: number): boolean => {
+  try {
+    const out = Bun.spawnSync(["ps", "-p", String(pid), "-o", "command="], {
+      stdout: "pipe",
+    }).stdout.toString();
+    return isVendorSessionCommand(out);
+  } catch {
+    return false;
+  }
+};
+
+/** Startup sweep: kill any orphan PTY a PRIOR daemon instance left behind
+ *  (uncatchable exit), then clear its pidfile. Idempotent; call once at boot
+ *  BEFORE accepting sessions. */
+export const reapOrphanSessionProcs = (): void => {
+  let entries: string[];
+  try {
+    entries = readdirSync(pidDir());
+  } catch {
+    return; // no pid dir yet — nothing to sweep
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".pid")) continue;
+    const path = join(pidDir(), entry);
+    let pid = 0;
+    try {
+      pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    } catch {
+      pid = 0;
+    }
+    if (Number.isInteger(pid) && pid > 0 && looksLikeSessionProc(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+        logInfo("session", "reaped orphan session process from prior daemon", {
+          pid,
+          file: entry,
+        });
+      } catch {
+        /* already gone */
+      }
+    }
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+};
+
+/** Kill EVERY live session PTY now (catchable-exit cleanup). Synchronous so it
+ *  completes inside a signal handler before `process.exit`. Clears pidfiles. */
+export const killAllSessions = (): void => {
+  for (const s of sessions.values()) {
+    if (s.pty !== null) {
+      try {
+        s.pty.kill();
+      } catch {
+        /* already gone */
+      }
+      s.pty = null;
+      s.pid = null;
+    }
+    removePidFile(s.id);
+  }
+};
 
 /** Scrollback ring cap — enough to repaint a screenful+history on attach
  *  without unbounded memory. */
@@ -152,9 +280,16 @@ type TSession = {
   title: string | null;
   pid: number | null;
   muxStream: TMuxStream | null;
+  /** Serializes replay, replay_done, and live mux output in wire order. */
+  muxWriteTail: Promise<void>;
+  /** Daemon-minted monotonically increasing value for successful opens. */
+  generation: number;
+  /** Terminal state retained so a later attach can explain why it cannot resume. */
+  lastExitReason: "evicted" | "reaped" | "done" | "killed" | null;
 };
 
 const sessions = new Map<string, TSession>();
+let nextSessionGeneration = 0;
 
 type TActivityProbe = (rootPids: ReadonlySet<number>) => Promise<Set<number>>;
 let activityProbe: TActivityProbe | null = null;
@@ -265,6 +400,7 @@ export const sessionStatusReport = (): Array<{
   live: boolean;
   busy: boolean;
   title?: string;
+  last_exit_reason?: "evicted" | "reaped" | "done" | "killed";
 }> =>
   [...sessions.values()]
     .sort((a, b) => b.startedAtMs - a.startedAtMs)
@@ -277,6 +413,9 @@ export const sessionStatusReport = (): Array<{
       live: s.pty !== null,
       busy: s.busy,
       ...(s.title === null ? {} : { title: s.title.slice(0, 80) }),
+      ...(s.lastExitReason === null
+        ? {}
+        : { last_exit_reason: s.lastExitReason }),
     }));
 
 const liveCount = (): number =>
@@ -359,13 +498,32 @@ const b64 = (bytes: Uint8Array): string =>
   Buffer.from(bytes).toString("base64");
 
 /** Send one out-direction chunk, split at the wire cap. */
+const detachMuxStream = (s: TSession, stream?: TMuxStream): void => {
+  if (stream !== undefined && s.muxStream !== stream) return;
+  s.muxStream = null;
+  s.muxWriteTail = Promise.resolve();
+  if (s.attached) detachSession(s.id);
+};
+
+/** Queue a mux write after all prior replay/live output. */
+const writeMux = (s: TSession, stream: TMuxStream, chunk: Uint8Array): void => {
+  s.muxWriteTail = s.muxWriteTail
+    .then(() => stream.write(chunk))
+    .catch(() => detachMuxStream(s, stream));
+};
+
+const writeCurrentMux = (s: TSession, chunk: Uint8Array): void => {
+  if (s.muxStream !== null) writeMux(s, s.muxStream, chunk);
+};
+
+/** Send one out-direction chunk, preserving mux writes and failures in order. */
 const sendOut = (
   s: TSession,
   chunk: Uint8Array,
   send: (frame: TRelayFrame) => void,
 ): void => {
   if (s.muxStream !== null) {
-    void s.muxStream.write(chunk);
+    writeCurrentMux(s, chunk);
     return;
   }
   for (let i = 0; i < chunk.length; i += TUNNEL_CHUNK_MAX) {
@@ -378,6 +536,43 @@ const sendOut = (
     });
     s.outSeq += 1;
   }
+};
+
+const terminalClose = (
+  s: TSession,
+  send: (frame: TRelayFrame) => void,
+  reason: "done" | "killed",
+): void => {
+  const muxStream = s.muxStream;
+  if (s.attached) {
+    s.attached = false;
+    if (muxStream === null) {
+      send({
+        type: "session_close",
+        session_id: s.id,
+        reason,
+        generation: s.generation,
+      });
+    }
+  }
+  muxStream?.end();
+  // Do not wait for the peer's END callback to clear replay state: a restart
+  // may bind the same row before that callback runs. Otherwise its first PTY
+  // chunks remain queued behind a replay_done that only attach emits.
+  s.muxStream = null;
+  s.muxWriteTail = Promise.resolve();
+};
+
+const endPty = (
+  s: TSession,
+  reason: "evicted" | "reaped" | "done" | "killed",
+  kill = true,
+): void => {
+  s.lastExitReason = reason;
+  if (kill) s.pty?.kill();
+  s.pty = null;
+  s.pid = null;
+  removePidFile(s.id);
 };
 
 // ─── frame handling ──────────────────────────────────────────────────
@@ -427,9 +622,8 @@ export const handleSessionFrame = (
         return;
       }
       // Explicit kill / terminal teardown.
-      s.pty?.kill();
-      s.pty = null;
-      s.attached = false;
+      endPty(s, "killed");
+      terminalClose(s, send, "killed");
       logInfo("session", "session closed", {
         id: s.id,
         reason: frame.reason ?? "unknown",
@@ -460,12 +654,16 @@ const handleOpen = (
       | "session_busy"
       | "overloaded"
       | "spawn_failed",
+    lastExitReason?: "evicted" | "reaped" | "done" | "killed" | null,
   ): void => {
     send({
       type: "session_open_ack",
       session_id: frame.session_id,
       ok: false,
       error,
+      ...(lastExitReason === undefined || lastExitReason === null
+        ? {}
+        : { last_exit_reason: lastExitReason }),
     });
   };
   if (!ptySupported()) {
@@ -491,17 +689,19 @@ const handleOpen = (
     }
     if (existing.pty === null) {
       // Dead — the consumer should re-open with mode:"continue".
-      nack("session_not_found");
+      nack("session_not_found", existing.lastExitReason);
       return;
     }
     existing.attached = true;
     existing.detachedAtMs = null;
+    existing.generation = ++nextSessionGeneration;
     existing.pty.resize(frame.cols, frame.rows);
     send({
       type: "session_open_ack",
       session_id: frame.session_id,
       ok: true,
       live: true,
+      generation: existing.generation,
     });
     // The legacy JSON caller needs its repaint frames here. Mux callers set
     // `muxStream` in bindMuxSessionStream's ack handler and replay directly
@@ -519,9 +719,17 @@ const handleOpen = (
     nack("session_busy");
     return;
   }
-  if (liveCount() >= MAX_LIVE_SESSIONS) {
-    nack("overloaded");
-    return;
+  // At capacity — reclaim detached slots under pressure BEFORE giving up.
+  // Evict least-recently-active DETACHED sessions (never the one being
+  // (re)opened, never an attached/viewed one) until a slot frees. This clears
+  // a backlog of stale detached PTYs (e.g. from a prior client churn) in a
+  // single open instead of one-per-attempt, so a fresh spawn/restart succeeds
+  // rather than looping on `overloaded`.
+  while (liveCount() >= MAX_LIVE_SESSIONS) {
+    if (!evictOneDetached(frame.session_id)) {
+      nack("overloaded");
+      return;
+    }
   }
   const workspace = sessionWorkspace(frame.session_id);
   try {
@@ -573,6 +781,9 @@ const handleOpen = (
     title: frame.title ?? null,
     pid: null,
     muxStream: null,
+    muxWriteTail: Promise.resolve(),
+    generation: 0,
+    lastExitReason: null,
   };
   sessions.set(s.id, s);
 
@@ -598,29 +809,28 @@ const handleOpen = (
         if (s.attached) sendOut(s, chunk, send);
       },
       onExit: () => {
-        s.pty = null;
-        if (s.attached) {
-          s.attached = false;
-          send({
-            type: "session_close",
-            session_id: s.id,
-            reason: "done",
-          });
-        }
+        const reason = s.lastExitReason ?? "done";
+        endPty(s, reason, false);
+        terminalClose(s, send, reason === "done" ? "done" : "killed");
         logInfo("session", "session CLI exited", { id: s.id });
       },
     });
     s.pty = pty;
     s.pid = pty.pid ?? null;
+    // Record the live PID so a crash-killed daemon's successor can reap it.
+    if (s.pid !== null) writePidFile(s.id, s.pid);
     s.busy = true;
     s.lastBusyAtMs = Date.now();
     s.attached = true;
     s.detachedAtMs = null;
+    s.generation = ++nextSessionGeneration;
+    s.lastExitReason = null;
     send({
       type: "session_open_ack",
       session_id: s.id,
       ok: true,
       live: false,
+      generation: s.generation,
     });
     logInfo("session", "session started", {
       id: s.id,
@@ -649,16 +859,16 @@ export const bindMuxSessionStream = (
     readonly title?: string;
   },
 ): void => {
-  const existing = sessions.get(open.session_id);
-  if (existing?.attached) {
-    stream.reset(encodeJsonPayload({ code: "session_busy" }));
-    return;
-  }
   const send = (frame: TRelayFrame): void => {
     if (frame.type === "session_open_ack") {
       if (!frame.ok) {
         stream.reset(
-          encodeJsonPayload({ code: frame.error ?? "spawn_failed" }),
+          encodeJsonPayload({
+            code: frame.error ?? "spawn_failed",
+            ...(frame.last_exit_reason === undefined
+              ? {}
+              : { last_exit_reason: frame.last_exit_reason }),
+          }),
         );
         return;
       }
@@ -666,13 +876,24 @@ export const bindMuxSessionStream = (
       if (session === undefined) return;
       session.muxStream = stream;
       stream.sendCtrl(
-        encodeJsonPayload({ t: "open_ack", ok: true, live: frame.live }),
+        encodeJsonPayload({
+          t: "open_ack",
+          ok: true,
+          live: frame.live,
+          generation: frame.generation,
+        }),
       );
-      if (open.mode === "attach") {
-        void stream.write(new TextEncoder().encode("\x1b[2J\x1b[H"));
-        for (const chunk of session.scrollback) void stream.write(chunk);
-        stream.sendCtrl(encodeJsonPayload({ t: "replay_done" }));
-      }
+      if (open.mode !== "attach") return;
+      // Snapshot before yielding. The shared tail makes later PTY output wait
+      // behind the repaint and replay_done without a separate live-output buffer.
+      const scrollback = [...session.scrollback];
+      session.muxWriteTail = session.muxWriteTail
+        .then(async () => {
+          await stream.write(new TextEncoder().encode("\x1b[2J\x1b[H"));
+          for (const chunk of scrollback) await stream.write(chunk);
+          stream.sendCtrl(encodeJsonPayload({ t: "replay_done" }));
+        })
+        .catch(() => detachMuxStream(session, stream));
       return;
     }
     if (frame.type === "session_close") stream.end();
@@ -700,14 +921,19 @@ export const bindMuxSessionStream = (
     if (session === undefined) return;
     if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
     if (ctrl?.t === "close" && ctrl.intent === "kill") {
-      session.pty?.kill();
-      session.pty = null;
-      session.pid = null;
-      session.attached = false;
+      endPty(session, "killed");
+      // END is a clean terminal close to sessionStream.closed ("done").
+      terminalClose(session, send, "killed");
     }
   });
-  stream.onReset(() => detachSession(open.session_id));
-  stream.onEnd(() => detachSession(open.session_id));
+  stream.onReset(() => {
+    const session = sessions.get(open.session_id);
+    if (session !== undefined) detachMuxStream(session, stream);
+  });
+  stream.onEnd(() => {
+    const session = sessions.get(open.session_id);
+    if (session !== undefined) detachMuxStream(session, stream);
+  });
 };
 
 /** Control-channel reconnect: the relay swept every channel — DETACH all
@@ -720,6 +946,33 @@ export const detachAllSessions = (): void => {
 };
 
 /** Reap only detached PTYs quiet for the full grace period. */
+/**
+ * Slot-pressure eviction: kill the least-recently-active DETACHED session so a
+ * new spawn can take its slot. Never evicts an attached (viewer present) or the
+ * `keep` session; a still-working detached task is eligible only because the
+ * user is explicitly opening another — the cap is hard at MAX_LIVE_SESSIONS.
+ * Returns true if a session was reclaimed. Prefers quiet sessions (oldest
+ * activity first) so a busy background task is the last to go.
+ */
+const evictOneDetached = (keep: string): boolean => {
+  let victim: TSession | null = null;
+  let victimActivity = Number.POSITIVE_INFINITY;
+  for (const s of sessions.values()) {
+    if (s.pty === null || s.attached || s.id === keep) continue;
+    const activity = Math.max(s.lastOutputAtMs, s.lastBusyAtMs);
+    if (activity < victimActivity) {
+      victim = s;
+      victimActivity = activity;
+    }
+  }
+  if (victim === null) return false;
+  logInfo("session", "evicting detached session under slot pressure", {
+    id: victim.id,
+  });
+  endPty(victim, "evicted");
+  return true;
+};
+
 export const reapDetachedSessions = (now = Date.now()): void => {
   for (const s of sessions.values()) {
     const latestActivity = Math.max(
@@ -733,15 +986,16 @@ export const reapDetachedSessions = (now = Date.now()): void => {
       now - latestActivity > SESSION_QUIET_REAP_MS
     ) {
       logInfo("session", "reaping quiet detached session", { id: s.id });
-      s.pty.kill();
-      s.pty = null;
-      s.pid = null;
+      endPty(s, "reaped");
     }
   }
 };
 
 /** Test-only: reset all session state. */
 export const resetSessionsForTest = (): void => {
-  for (const s of sessions.values()) s.pty?.kill();
+  for (const s of sessions.values()) {
+    s.pty?.kill();
+    removePidFile(s.id);
+  }
   sessions.clear();
 };
