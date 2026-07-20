@@ -1,10 +1,9 @@
 import type { TRelayFrame } from "@openllmsh/protocol";
-import { parseStreamOpenPayload } from "@openllmsh/protocol";
-import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
-import type { TDuplex, TMuxChannel, TMuxStream } from "@openllmsh/tunnel/mux";
+import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
+import { serveStream } from "@openllmsh/tunnel/streams";
 import { bindMuxSessionStream } from "./session-host";
-import { serveMuxTunnelStream } from "./tunnel-server";
+import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 let active: TMuxChannel | null = null;
 let sink: ((bytes: Uint8Array | null) => void) | null = null;
@@ -145,25 +144,14 @@ export const configureMuxHost = (options: {
   sendBinary = options.sendBytes;
 };
 
-const reset = (
-  stream: TMuxStream,
-  code: "invalid_tunnel" | "protocol_error",
-): void => {
-  stream.reset(encodeJsonPayload({ code }));
-};
-
-const onStream = (stream: TMuxStream, payload: Uint8Array): void => {
-  const open = parseStreamOpenPayload(decodeJsonPayload(payload));
-  if (open === null) {
-    reset(stream, "invalid_tunnel");
-    return;
-  }
-  if (open.kind === "tunnel") {
-    serveMuxTunnelStream(stream, payload);
-    return;
-  }
-  bindMuxSessionStream(stream, open);
-};
+const onStream = serveStream({
+  // Keep the tunnel-server import lazy: its production dispatcher reaches the
+  // control channel, which imports this host during daemon initialization.
+  tunnel: (open, body, signal) => serveMuxTunnel(open, body, signal),
+  session: bindMuxSessionStream,
+  admitTunnel: () => admitMuxTunnel(),
+  invalidOpenCode: "invalid_tunnel",
+});
 
 /** Accept the relay-authorized channel. D2 allows only one active channel/socket. */
 export const acceptChannel = (frame: { readonly channel_id: string }): void => {

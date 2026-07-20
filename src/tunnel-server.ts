@@ -21,16 +21,10 @@ import type {
   TRelayTunnelDataFrame,
   TRelayTunnelEndFrame,
   TRelayTunnelOpenFrame,
-  TStreamResetCode,
   TTunnelSurface,
 } from "@openllmsh/protocol";
-import { parseStreamOpenPayload, TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
-import {
-  decodeJsonPayload,
-  encodeJsonPayload,
-  MAX_PAYLOAD_BYTES,
-} from "@openllmsh/tunnel/codec";
-import type { TMuxStream } from "@openllmsh/tunnel/mux";
+import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
+import type { TServeTunnel } from "@openllmsh/tunnel/streams";
 import { handleInference } from "./listener";
 import { logInfo, logWarn } from "./logger";
 import { beginRequest, endRequest } from "./self-update";
@@ -88,9 +82,50 @@ const forwardedHeaders = (open: {
   return headers;
 };
 
-const muxReset = (stream: TMuxStream, code: TStreamResetCode): void => {
-  stream.reset(encodeJsonPayload({ code }));
+type TTunneledOpen = {
+  readonly surface: TTunnelSurface;
+  readonly headers?: {
+    readonly content_type?: "application/json";
+    readonly accept?: "application/json" | "text/event-stream";
+    readonly anthropic_version?: string;
+    readonly anthropic_beta?: string;
+  };
 };
+
+function tunneledRequest(
+  open: TTunneledOpen,
+  body: Uint8Array,
+  signal: AbortSignal,
+): Request;
+function tunneledRequest(
+  open: TTunneledOpen,
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): Request;
+/** Construct the in-process request while preserving Bun's stream duplex requirement. */
+function tunneledRequest(
+  open: TTunneledOpen,
+  body: ReadableStream<Uint8Array> | Uint8Array,
+  signal: AbortSignal,
+): Request {
+  const url = `http://127.0.0.1${surfacePath(open.surface)}`;
+  const headers = forwardedHeaders(open);
+  if (body instanceof Uint8Array) {
+    return new Request(url, {
+      method: "POST",
+      headers,
+      body: body as unknown as BodyInit,
+      signal,
+    });
+  }
+  return new Request(url, {
+    method: "POST",
+    headers,
+    body,
+    duplex: "half",
+    signal,
+  } as RequestInit);
+}
 
 /** The request dispatcher — `handleInference` in production; injectable so
  *  tests exercise the tunnel state machine without a walker/cloud. */
@@ -209,13 +244,7 @@ const serveTunnel = async (
 ): Promise<void> => {
   const body = concatChunks(t.reqChunks);
   t.reqChunks.length = 0;
-  const headers = forwardedHeaders(t.open);
-  const req = new Request(`http://127.0.0.1${surfacePath(t.open.surface)}`, {
-    method: "POST",
-    headers,
-    body,
-    signal: t.abort.signal,
-  });
+  const req = tunneledRequest(t.open, body, t.abort.signal);
 
   // Mirror the listener's in-flight tracking so self-update waits for
   // streaming tunnels exactly as it waits for loopback streams.
@@ -296,102 +325,49 @@ const serveTunnel = async (
   }
 };
 
-/**
- * Serve a binary mux tunnel. Unlike the legacy splice, dispatch begins at OPEN
- * and the in-process handler consumes request bytes as DATA arrives.
- */
-export const serveMuxTunnelStream = (
-  stream: TMuxStream,
-  openPayload: Uint8Array,
-): void => {
-  const open = parseStreamOpenPayload(decodeJsonPayload(openPayload));
-  if (open === null || open.kind !== "tunnel") {
-    muxReset(stream, "invalid_tunnel");
-    return;
-  }
-  if (served.size + muxServedCount >= MAX_SERVED_TUNNELS) {
-    muxReset(stream, "tunnel_busy");
-    return;
-  }
+/** Admission remains daemon-owned so JSON and mux tunnels share one capacity cap. */
+export const admitMuxTunnel = (): "tunnel_busy" | null =>
+  served.size + muxServedCount >= MAX_SERVED_TUNNELS ? "tunnel_busy" : null;
+
+/** Daemon adapter for the generic mux serving seam. */
+export const serveMuxTunnel: TServeTunnel = async (open, body, signal) => {
   muxServedCount += 1;
-  const abort = new AbortController();
-  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  const body = new ReadableStream<Uint8Array>({
-    start(nextController) {
-      controller = nextController;
-    },
-    cancel() {
-      abort.abort();
-    },
-  });
-  const offData = stream.onData((bytes) => controller?.enqueue(bytes));
-  const offEnd = stream.onEnd(() => controller?.close());
-  const offReset = stream.onReset(() => {
-    abort.abort();
-    try {
-      controller?.error(new Error("consumer reset"));
-    } catch {
-      // The request body may already have reached its terminal state.
-    }
-    void reader?.cancel().catch(() => {});
-  });
-  const run = async (): Promise<void> => {
-    beginRequest();
-    try {
-      const req = new Request(`http://127.0.0.1${surfacePath(open.surface)}`, {
-        method: "POST",
-        headers: forwardedHeaders(open),
-        body,
-        duplex: "half",
-        signal: abort.signal,
-      } as RequestInit);
-      const res = await dispatch(req);
-      const contentType = res.headers.get("content-type") ?? "application/json";
-      stream.sendCtrl(
-        encodeJsonPayload({
-          t: "res_head",
-          status: res.status,
-          res_headers: {
-            content_type: contentType,
-            is_sse: contentType.includes("text/event-stream"),
-          },
-        }),
-      );
-      if (res.body !== null) {
-        reader = res.body.getReader();
-        for (;;) {
-          const result = await reader.read();
-          if (result.done || abort.signal.aborted) break;
-          for (
-            let offset = 0;
-            offset < result.value.byteLength;
-            offset += MAX_PAYLOAD_BYTES
-          ) {
-            await stream.write(
-              result.value.subarray(offset, offset + MAX_PAYLOAD_BYTES),
-            );
-          }
-        }
-      }
-      if (!abort.signal.aborted) stream.end();
-    } catch (error) {
-      if (!abort.signal.aborted) {
-        logWarn(
-          "tunnel",
-          `mux dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        muxReset(stream, "dispatch_failed");
-      }
-    } finally {
-      offData();
-      offEnd();
-      offReset();
-      muxServedCount -= 1;
-      endRequest();
-    }
+  beginRequest();
+  let completed = false;
+  const complete = (): void => {
+    if (completed) return;
+    completed = true;
+    signal.removeEventListener("abort", complete);
+    muxServedCount -= 1;
+    endRequest();
   };
-  void run();
+  // Dispatch can still be awaiting a provider when the relay dies. Release
+  // daemon-owned admission and self-update fencing immediately; completion is
+  // idempotent if a late response subsequently reaches the generic streamer.
+  signal.addEventListener("abort", complete, { once: true });
+  try {
+    const response = await dispatch(tunneledRequest(open, body, signal));
+    const contentType =
+      response.headers.get("content-type") ?? "application/json";
+    return {
+      status: response.status,
+      headers: {
+        content_type: contentType,
+        is_sse: contentType.includes("text/event-stream"),
+      },
+      body: response.body,
+      onComplete: complete,
+    };
+  } catch (error) {
+    complete();
+    if (!signal.aborted) {
+      logWarn(
+        "tunnel",
+        `mux dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    throw error;
+  }
 };
 
 const concatChunks = (chunks: Uint8Array[]): Uint8Array<ArrayBuffer> => {

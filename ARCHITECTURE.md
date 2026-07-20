@@ -1,7 +1,8 @@
 # `packages/daemon` Architecture
 
 > The headless **local daemon** — a source-free compiled binary (coreless:
-> built from `@openllmsh/wire` + `@openllmsh/protocol`, NOT `@openllm/core`) that
+> built from `@openllmsh/wire` + `@openllmsh/protocol` + `@openllmsh/tunnel`, NOT
+> `@openllm/core`) that
 > runs the **subscription** data plane on the user's
 > machine. It delegates to the official vendor CLIs' own credentials +
 > identity (never minting, storing, or forging a subscription token),
@@ -25,8 +26,8 @@ providers keep running on the cloud unchanged.
 
 ## Dependency boundary (load-bearing)
 
-The daemon links **only** `@openllmsh/wire`, `@openllmsh/protocol`, and
-`effect` — it is **`@openllm/core`-free** (the §7.5 cut-over is done: the
+The daemon links `@openllmsh/wire`, `@openllmsh/protocol`, `@openllmsh/tunnel`,
+and `effect` — it is **`@openllm/core`-free** (the §7.5 cut-over is done: the
 core-backed `dispatch.ts`/`encode.ts` are deleted and the walker is the
 sole data path). `@openllmsh/wire` is the dependency-light package of pure
 wire-format transforms extracted from `core` (request/response/streaming
@@ -90,6 +91,10 @@ daemon/
     cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record)
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
+    mux-host.ts             mux1 channel negotiation, relay duplex ownership, and OPEN dispatch
+    tunnel-client.ts        consuming subscription tunnel: mux first, JSON splice fallback
+    tunnel-server.ts        serving in-process tunneled request dispatch for JSON and mux streams
+    session-host.ts         PTY/session host; binds mux streams and detaches them on end/reset
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
       types.ts              TProviderDelegate contract
@@ -315,6 +320,24 @@ and metadata-only token reporting are unchanged; the recorder rides the
 walker's own `report`. Offline coverage:
 `tests/transport/native-runtime.test.ts` (fixture runtimes). See
 `docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
+
+## Tunnel and session transport
+
+The daemon uses the capability-gated `mux1` channel when both endpoints support
+it. `mux-host.ts` owns one relay duplex/channel, negotiates `channel_open` /
+`channel_open_ack`, receives mux OPEN frames, and dispatches tunnel streams to
+`tunnel-server.ts` or session streams to `session-host.ts`. `tunnel-client.ts`
+uses this mux path first; a channel nack, timeout, or other pre-response-head
+failure falls back to the retained JSON `tunnel_*` splice. The serving path
+maps a closed tunnel-surface vocabulary to the daemon's in-process `/v1/*`
+handler and streams the result.
+
+For device sessions, `session-host.ts` binds the mux stream to the live PTY:
+input and resize controls reach the PTY, output flows back on the stream, and a
+stream end/reset detaches rather than kills the PTY. The legacy `session_*`
+splice remains available for capability skew and fallback. These transport
+modules do not change the core-free boundary or place vendor credentials on the
+relay.
 
 ## Two localhost surfaces
 
@@ -694,7 +717,8 @@ present (a re-run re-pairs in place; the minted `OPENLLM_DEVICE_ID` is kept).
 
 ## Layering rules
 
-- Depends only on `core` + `schema` + `effect`. No db/vault/vercel/next.
+- Depends on `wire` + `protocol` + `tunnel` + `effect` (with schema used through
+  protocol), never `core`; no db/vault/vercel/next.
 - Holds no DEK; never decrypts a vault credential.
 - Never transmits a subscription token or CLI-store contents off-box;
   cloud-bound payloads are metadata only.
