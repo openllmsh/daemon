@@ -750,9 +750,14 @@ export const formatHopFailuresHeader = (
 ): string =>
   trail
     .map((e) => {
-      if (e.status !== undefined) return `${e.modelId}:${e.status}`;
+      // Keep the sanitized reason detail even when a status is present — a
+      // bare `model:403` loses the "usage limit" / "context window" context
+      // that makes the trail diagnosable.
       const tag = e.reason.replace(/[\r\n;,]+/g, " ").trim().slice(0, 48);
-      return `${e.modelId}:${tag.length > 0 ? tag : "failed"}`;
+      const label = tag.length > 0 ? tag : "failed";
+      return e.status !== undefined
+        ? `${e.modelId}:${e.status}:${label}`
+        : `${e.modelId}:${label}`;
     })
     .join(";");
 
