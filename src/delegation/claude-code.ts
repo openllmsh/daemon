@@ -29,10 +29,7 @@
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
-import type {
-  TProviderUsageSnapshot,
-  TProviderUsageWindow,
-} from "@openllmsh/protocol";
+import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logWarn } from "../logger";
@@ -54,6 +51,7 @@ import { makeBlockingConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
+import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
 import {
   cliVersion,
   ensureIsolatedKeychain,
@@ -431,59 +429,17 @@ export const claudeCodeDelegate: TProviderDelegate = {
                 : `Claude couldn't report usage (HTTP ${resp.status}).`;
         return { kind: "unavailable", reason };
       }
-      const data = (await resp.json()) as Record<
-        string,
-        { utilization?: number; resets_at?: string | null } | null
-      >;
-      // Durations are implied by Anthropic's payload keys (`five_hour`,
-      // `seven_day*`) — stated on the canonical window so downstream
-      // consumers never have to parse them back out of the label.
-      const win = (
-        label: string,
-        raw: { utilization?: number; resets_at?: string | null } | null,
-        windowMs: number,
-      ): TProviderUsageWindow => ({
-        label,
-        percent_used:
-          typeof raw?.utilization === "number" ? raw.utilization : 0,
-        reset_at_ms:
-          typeof raw?.resets_at === "string" ? toEpochMs(raw.resets_at) : null,
-        window_ms: windowMs,
-      });
-      const FIVE_HOURS_MS = 5 * 3_600_000;
-      const SEVEN_DAYS_MS = 7 * 86_400_000;
-      // The two core windows are always shown. The model-scoped 7-day
-      // windows (`seven_day_opus` / `seven_day_sonnet`) are shown ONLY
-      // when the account actually has them — Anthropic returns `null` for
-      // a scope with no usage in the period, and the payload also carries
-      // several internal/experimental codename keys we deliberately skip.
-      const windows = [
-        win("5-hour", data.five_hour ?? null, FIVE_HOURS_MS),
-        win("7-day", data.seven_day ?? null, SEVEN_DAYS_MS),
-      ];
-      const scoped: ReadonlyArray<readonly [string, string]> = [
-        ["seven_day_opus", "7-day · Opus"],
-        ["seven_day_sonnet", "7-day · Sonnet"],
-      ];
-      for (const [key, label] of scoped) {
-        const raw = data[key];
-        if (raw != null && typeof raw.utilization === "number") {
-          windows.push(win(label, raw, SEVEN_DAYS_MS));
-        }
-      }
-      const maxPct = windows.reduce(
-        (a, w) => (w.percent_used > a ? w.percent_used : a),
-        0,
-      );
+      const data: unknown = await resp.json();
+      // Shared plan meters → `windows` (status + tightest-window +
+      // calibration). Model-scoped caps (Fable / Opus / Sonnet) →
+      // `extra_pools`, same contract as Codex Spark: display-only, never
+      // flip overall status when only a single model family is exhausted.
+      const { windows, extra_pools } = reduceClaudeUsage(data);
       return {
         kind: "quota",
-        status:
-          maxPct >= 100
-            ? "rejected"
-            : maxPct >= 80
-              ? "allowed_warning"
-              : "allowed",
+        status: reduceQuotaStatus(undefined, windows),
         windows,
+        ...(extra_pools.length > 0 ? { extra_pools } : {}),
         note: "Pro/Max subscription — read locally via Claude Code",
       };
     } catch (err) {
