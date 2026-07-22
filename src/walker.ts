@@ -704,14 +704,66 @@ const upstreamErrorLine = (err: UpstreamStreamError): string => {
   return message.startsWith(type) ? message : `${type}: ${message}`;
 };
 
+export type THopRetry = {
+  readonly kind: "retry";
+  readonly reason: string;
+  readonly status?: number;
+  readonly bodySnippet?: string;
+};
+
+export type THopServeOutcome = Response | THopRetry;
+
+export type THopTrailEntry = {
+  readonly modelId: string;
+  readonly provider: string;
+  readonly reason: string;
+  readonly status?: number;
+};
+
+export const hopRetry = (
+  reason: string,
+  detail?: { readonly status?: number; readonly bodySnippet?: string },
+): THopRetry => ({
+  kind: "retry",
+  reason,
+  ...(detail?.status !== undefined ? { status: detail.status } : {}),
+  ...(detail?.bodySnippet !== undefined && detail.bodySnippet.length > 0
+    ? { bodySnippet: detail.bodySnippet }
+    : {}),
+});
+
+export const isHopRetry = (v: THopServeOutcome): v is THopRetry =>
+  typeof v === "object" &&
+  v !== null &&
+  "kind" in v &&
+  (v as { kind: unknown }).kind === "retry";
+
+/** Short single-line snippet from upstream body for trail/UI (max chars). */
+export const hopBodySnippet = (raw: string, max = 200): string => {
+  const line = raw.replace(/\s+/g, " ").trim();
+  if (line.length === 0) return "";
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+};
+
+export const formatHopFailuresHeader = (
+  trail: ReadonlyArray<THopTrailEntry>,
+): string =>
+  trail
+    .map((e) => {
+      if (e.status !== undefined) return `${e.modelId}:${e.status}`;
+      const tag = e.reason.replace(/[\r\n;,]+/g, " ").trim().slice(0, 48);
+      return `${e.modelId}:${tag.length > 0 ? tag : "failed"}`;
+    })
+    .join(";");
+
 const serveSubscription = async (
   hop: THop,
   wire: TUpstreamWire,
   args: TWalkArgs,
   finalHop: boolean,
-): Promise<Response | "retry"> => {
+): Promise<THopServeOutcome> => {
   const acquired = await acquireUpstream(hop.provider, args);
-  if (acquired === "retry") return "retry";
+  if (acquired === "retry") return hopRetry("no usable credential");
   const { headers: baseHeaders, url, accountHash } = acquired;
 
   const clientWantsStream =
@@ -773,9 +825,10 @@ const serveSubscription = async (
     finalHop,
     args.req.signal,
   );
-  if (resp === null) return "retry"; // network error — pre-stream, fall through
+  if (resp === null) return hopRetry("network error"); // pre-stream, fall through
   if (!resp.ok) {
     const raw = await resp.text().catch(() => "");
+    const bodySnippet = hopBodySnippet(raw);
     // No output has been committed yet. A different configured candidate may
     // accept the same canonical request regardless of this provider's status
     // code or envelope shape, so use the shared cloud/daemon policy.
@@ -784,17 +837,34 @@ const serveSubscription = async (
       classifyPrecommitResponse(resp.status, raw, wire, args.req.signal.aborted)
         .kind === "transient"
     ) {
-      return "retry";
+      return hopRetry(`HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`, {
+        status: resp.status,
+        bodySnippet,
+      });
     }
     // The final hop has nowhere to walk (or the caller aborted): surface the
-    // upstream response verbatim, including status and Retry-After.
+    // upstream response verbatim, including status and Retry-After. Still
+    // record a zero-token error row so Overview's debug table shows it.
+    report(
+      {
+        model: hop.modelId,
+        provider: hop.provider,
+        status: statusFor(resp.status),
+        ...ZERO_TOKENS,
+        latency_ms: Date.now() - args.startedAt,
+        endpoint: args.endpoint,
+        error: `HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`,
+        ...(accountHash !== null ? { account_hash: accountHash } : {}),
+      },
+      args.originParam,
+    );
     return new Response(raw.length > 0 ? raw : null, {
       status: resp.status,
       headers: passthroughHeaders(resp),
     });
   }
 
-  if (!resp.body) return "retry";
+  if (!resp.body) return hopRetry("empty response body");
 
   // Committed. Re-encode the response to the client's wire + record a
   // metadata row. Cost is NOT computed here — the cloud recomputes it from
@@ -825,12 +895,12 @@ const serveSubscription = async (
   // and the JSON drain): a non-final hop WALKS — nothing was generated,
   // so the walk cannot double-spend; the final hop surfaces a 502
   // recorded as an ERROR row.
-  const peekedError = (error: unknown): Response | "retry" => {
-    if (!finalHop && !args.req.signal.aborted) return "retry";
+  const peekedError = (error: unknown): THopServeOutcome => {
     const detail =
       error instanceof UpstreamStreamError
         ? sanitizeErrorLine(upstreamErrorLine(error), 300)
         : sanitizeErrorLine(error, 300);
+    if (!finalHop && !args.req.signal.aborted) return hopRetry(detail);
     report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
     return errorJson(
       502,
@@ -896,7 +966,7 @@ const serveSubscription = async (
       if (peeked.kind === "refusal" && refusalWalks()) {
         void toClient.cancel().catch(() => undefined);
         void peeked.chunks.cancel().catch(() => undefined);
-        return "retry";
+        return hopRetry("content filter refusal");
       }
       meter(peeked.chunks);
       return new Response(heartbeat(toClient), {
@@ -919,7 +989,7 @@ const serveSubscription = async (
     if (peeked.kind === "error") return peekedError(peeked.error);
     if (peeked.kind === "refusal" && refusalWalks()) {
       void peeked.chunks.cancel().catch(() => undefined);
-      return "retry";
+      return hopRetry("content filter refusal");
     }
     return deliverChunkStream(peeked.chunks, {
       surface: args.surface,
@@ -952,7 +1022,7 @@ const serveSubscription = async (
     if (peeked.kind === "error") return peekedError(peeked.error);
     if (peeked.kind === "refusal" && refusalWalks()) {
       void peeked.chunks.cancel().catch(() => undefined);
-      return "retry";
+      return hopRetry("content filter refusal");
     }
     let canonical: TChatCompletionResponse;
     try {
@@ -1013,7 +1083,9 @@ const serveSubscription = async (
   // A 200 whose decoded body IS a structured refusal walks a non-final hop
   // (nothing to double-spend), mirroring the streaming pre-commit peek and
   // the cloud non-stream promotion. The final hop surfaces it verbatim.
-  if (isCanonicalRefusal(canonical) && refusalWalks()) return "retry";
+  if (isCanonicalRefusal(canonical) && refusalWalks()) {
+    return hopRetry("content filter refusal");
+  }
   recordTokens(tokensFromResponse(canonical));
   // Passthrough returns the upstream bytes verbatim; cross-wire re-encodes
   // through the shared delivery tail.
@@ -1045,7 +1117,7 @@ const serveKimiBuiltinSearch = async (
     readonly accountHash: string | null;
   },
   initialBody: unknown,
-): Promise<Response | "retry"> => {
+): Promise<THopServeOutcome> => {
   const wire: TUpstreamWire = "openai";
   const clientWantsStream =
     (args.rawBody as { stream?: unknown } | null)?.stream === true;
@@ -1095,7 +1167,7 @@ const serveKimiBuiltinSearch = async (
     // re-run the whole conversation, so surface the continuation failure
     // instead and record what was consumed.
     if (resp === null) {
-      if (round === 0) return "retry";
+      if (round === 0) return hopRetry("network error");
       recordOnce("error");
       return errorJson(
         502,
@@ -1104,6 +1176,7 @@ const serveKimiBuiltinSearch = async (
     }
     if (!resp.ok) {
       const raw = await resp.text().catch(() => "");
+      const bodySnippet = hopBodySnippet(raw);
       if (
         round === 0 &&
         !finalHop &&
@@ -1114,7 +1187,10 @@ const serveKimiBuiltinSearch = async (
           args.req.signal.aborted,
         ).kind === "transient"
       ) {
-        return "retry";
+        return hopRetry(`HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`, {
+          status: resp.status,
+          bodySnippet,
+        });
       }
       recordOnce(statusFor(resp.status));
       return new Response(raw.length > 0 ? raw : null, {
@@ -1272,7 +1348,52 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
 
   let lastError: string | null = null;
+  const hopTrail: THopTrailEntry[] = [];
+  const attempted: string[] = [];
+  const reportHopFailure = (
+    hop: THop,
+    reason: string,
+    status?: number,
+  ): void => {
+    report(
+      {
+        model: hop.modelId,
+        provider: hop.provider,
+        status: status === undefined ? "error" : statusFor(status),
+        ...ZERO_TOKENS,
+        latency_ms: Date.now() - args.startedAt,
+        endpoint: args.endpoint,
+        error: reason,
+      },
+      args.originParam,
+    );
+  };
+  const addHopFailure = (
+    hop: THop,
+    reason: string,
+    status?: number,
+  ): void => {
+    hopTrail.push({
+      modelId: hop.modelId,
+      provider: hop.provider,
+      reason,
+      ...(status !== undefined ? { status } : {}),
+    });
+    reportHopFailure(hop, reason, status);
+  };
+  const withHopTrailHeaders = (resp: Response): Response => {
+    if (attempted.length === 0 && hopTrail.length === 0) return resp;
+    const headers = passthroughHeaders(resp);
+    if (attempted.length > 0) {
+      headers.set("x-openllm-chain", attempted.join(","));
+    }
+    if (hopTrail.length > 0) {
+      headers.set("x-openllm-hop-failures", formatHopFailuresHeader(hopTrail));
+    }
+    return new Response(resp.body, { status: resp.status, headers });
+  };
   for (const [hopIndex, hop] of hops.entries()) {
+    attempted.push(hop.modelId);
     const finalHop = hopIndex === hops.length - 1;
     // ── Context gate, per hop (shared with the cloud chain —
     // `shouldSkipHopForContext`) ──────────────────────────────────────
@@ -1291,6 +1412,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       })
     ) {
       lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request clearly exceeds its input window`;
+      addHopFailure(hop, lastError);
       continue;
     }
     // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
@@ -1337,7 +1459,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
             args.originParam,
           ),
       });
-      if (native instanceof Response) return native; // committed natively
+      if (native instanceof Response) return withHopTrailHeaders(native);
       lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
       // ↓ fall through to the manual transport for this hop (no `continue`)
       //   — EXCEPT for a non-CC claude_code request (see the gate below).
@@ -1356,6 +1478,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       lastError =
         lastError ??
         `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
+      addHopFailure(hop, lastError);
       continue;
     }
     const wire = UPSTREAM_WIRE[hop.provider];
@@ -1363,8 +1486,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
       const served = await serveSubscription(hop, wire, args, finalHop);
-      if (served !== "retry") return served; // committed
-      lastError = `subscription hop ${hop.modelId} failed pre-stream`;
+      if (!isHopRetry(served)) return withHopTrailHeaders(served);
+      // Pre-stream candidate failure: record + trail, then walk. Never throw.
+      lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
+      addHopFailure(hop, served.reason, served.status);
       continue;
     }
     // API-key hop: forward to the cloud pinned to this concrete model.
@@ -1378,6 +1503,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       );
     } catch {
       lastError = `forward of ${hop.modelId} to cloud failed`;
+      addHopFailure(hop, lastError);
       if (args.req.signal.aborted) break;
       continue;
     }
@@ -1396,18 +1522,33 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       );
       if (cls.kind === "transient") {
         lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
+        addHopFailure(
+          hop,
+          hopBodySnippet(raw).length > 0
+            ? `HTTP ${resp.status}: ${hopBodySnippet(raw)}`
+            : lastError,
+          resp.status,
+        );
         continue;
       }
     }
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: passthroughHeaders(resp),
-    });
+    return withHopTrailHeaders(
+      new Response(resp.body, {
+        status: resp.status,
+        headers: passthroughHeaders(resp),
+      }),
+    );
   }
-  // Every hop in the plan failed pre-stream.
-  return errorJson(
-    502,
-    `all hops in the plan failed${lastError !== null ? ` (last: ${lastError})` : ""}`,
+  // Every hop in the plan failed pre-stream. Surface the trail so the client
+  // (and Overview once rows land in Neon) can see WHY earlier hops walked.
+  const trailSummary =
+    hopTrail.length > 0
+      ? ` (trail: ${formatHopFailuresHeader(hopTrail)}; last: ${lastError ?? "unknown"})`
+      : lastError !== null
+        ? ` (last: ${lastError})`
+        : "";
+  return withHopTrailHeaders(
+    errorJson(502, `all hops in the plan failed${trailSummary}`),
   );
 };
 
