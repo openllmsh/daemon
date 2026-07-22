@@ -370,8 +370,12 @@ export const normalizeNativeTerminalResult = (
     (result !== null &&
       Object.hasOwn(result, "status") &&
       terminalStatus === null) ||
+    // `api_error_status` is null on EVERY successful result (it means "no
+    // upstream HTTP error") — a present-but-null value is normal, not invalid.
+    // Only a present, non-null, non-finite-number value is malformed.
     (result !== null &&
       Object.hasOwn(result, "api_error_status") &&
+      apiErrorStatus !== null &&
       (typeof apiErrorStatus !== "number" || !Number.isFinite(apiErrorStatus)));
   const hasConflictingState =
     subtype !== null && terminalStatus !== null && subtype !== terminalStatus;

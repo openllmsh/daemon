@@ -1339,7 +1339,24 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       });
       if (native instanceof Response) return native; // committed natively
       lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
-      // ↓ fall through to the manual transport for this hop (no `continue`).
+      // ↓ fall through to the manual transport for this hop (no `continue`)
+      //   — EXCEPT for a non-CC claude_code request (see the gate below).
+    }
+    // Compliance gate: the manual (handrolled) transport is a legitimate path
+    // for claude_code ONLY when the originator is the genuine Claude Code CLI
+    // — it forwards that client's OWN request verbatim on its OWN credential,
+    // the official-client flow. For ANY other originator the manual
+    // claude_code path would have to SPOOF the Claude Code identity to pass
+    // Anthropic's OAuth spoof-guard (inject a "You are Claude Code" preamble
+    // the client never sent), which we refuse. So a non-CC claude_code hop is
+    // BRIDGE-ONLY: the real vendor CLI is the sole compliant path. If the
+    // bridge declined (or wasn't selected), advance the plan rather than fall
+    // to the spoof-prone manual transport.
+    if (hop.provider === "claude_code" && !claudeCodeOriginator) {
+      lastError =
+        lastError ??
+        `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
+      continue;
     }
     const wire = UPSTREAM_WIRE[hop.provider];
     if (wire !== undefined) {
