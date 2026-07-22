@@ -122,6 +122,7 @@ import {
 } from "./native-runtime/serve";
 import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
+import { clearPlanCache } from "./plan-cache";
 import { isClaudeCodeOriginator, selectSubMethod } from "./sub-method";
 import { sampleUsageAfterRequest } from "./usage-cache";
 
@@ -863,6 +864,9 @@ const serveSubscription = async (
       },
       args.originParam,
     );
+    // Final-hop failure still cools the model — bust the plan cache so the
+    // next request re-resolves instead of replaying this leader.
+    clearPlanCache();
     return new Response(raw.length > 0 ? raw : null, {
       status: resp.status,
       headers: passthroughHeaders(resp),
@@ -1372,6 +1376,11 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       },
       args.originParam,
     );
+    // A hop that failed is about to cool on the cloud (daemon-record →
+    // publishCooldownMark). Drop the signed-plan cache so the next request
+    // re-resolves a plan that skips the cooled model instead of replaying
+    // the same rate-limited leader for the rest of the 45s TTL.
+    clearPlanCache();
   };
   const addHopFailure = (
     hop: THop,
