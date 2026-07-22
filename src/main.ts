@@ -37,7 +37,14 @@ import {
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
 import { refreshDeviceState } from "./device-state";
-import { daemonPort, deviceId, hasApiKey, isDevMode, stateDir } from "./env";
+import {
+  daemonEnv,
+  daemonPort,
+  deviceId,
+  hasApiKey,
+  isDevMode,
+  stateDir,
+} from "./env";
 import { buildHealth } from "./health";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
@@ -308,6 +315,7 @@ const main = async (): Promise<void> => {
             sandbox: sandboxState(),
             cloudState: getCloudState(),
             keyConfigured: hasApiKey(),
+            cloudOrigin: daemonEnv().cloudOrigin,
             bootAt: BOOT_AT,
             now: Date.now(),
           });
