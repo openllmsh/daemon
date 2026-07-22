@@ -33,6 +33,8 @@
 import { existsSync } from "node:fs";
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { AnthropicStreamEvent } from "@openllmsh/protocol";
+import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
+import { isMeaningfulChunk } from "@openllmsh/wire/lib/streaming/peek";
 import {
   fromAnthropicStreamEvent,
   newAnthropicStreamState,
@@ -203,10 +205,46 @@ export const runClaudeNative = async (
     }
   };
 
-  // ── Pre-commit: wait for the FIRST model output ─────────────────────
+  // ── Pre-commit: buffer housekeeping until the FIRST MEANINGFUL output ─
+  // A role-only `message_start` decodes to an empty canonical chunk; it is
+  // NOT model output and must not commit the response — a structured
+  // failure or refusal can still follow it (the AUP/cyber-safeguard shape:
+  // `message_start`, then a `result`/`stream_event:error`). Committing on
+  // housekeeping would forfeit the native-decline → same-hop manual
+  // fallback for exactly that case (shared `isMeaningfulChunk` semantics,
+  // parity with the walker + cloud peek). Buffered housekeeping is replayed
+  // ahead of the first meaningful chunk so no event is lost.
+  const buffered: TChatCompletionChunk[] = [];
+  const pump = async (): Promise<
+    | { kind: "meaningful"; chunk: TChatCompletionChunk }
+    | { kind: "exit" }
+    | { kind: "error"; reason: string }
+  > => {
+    for (;;) {
+      const next = await nextChunk();
+      if (next === "end") return { kind: "exit" };
+      if (typeof next === "object" && "error" in next) {
+        return { kind: "error", reason: next.error };
+      }
+      const chunk = next as TChatCompletionChunk;
+      if (isMeaningfulChunk(chunk)) {
+        // A structured refusal (content filter) before any output is not
+        // model output: decline so the manual transport can serve the same
+        // hop, and — failing that — the walker advances to the next hop.
+        if (isRefusalChunk(chunk)) {
+          return {
+            kind: "error",
+            reason: "claude runtime refused the request (content filter)",
+          };
+        }
+        return { kind: "meaningful", chunk };
+      }
+      buffered.push(chunk); // housekeeping — replay ahead of the live tail
+    }
+  };
   let precommitTimer: ReturnType<typeof setTimeout> | undefined;
   const first = await Promise.race([
-    nextChunk(),
+    pump(),
     new Promise<"timeout">((resolve) => {
       precommitTimer = setTimeout(
         () => resolve("timeout"),
@@ -215,7 +253,7 @@ export const runClaudeNative = async (
     }),
   ]);
   clearTimeout(precommitTimer);
-  if (first === "timeout" || first === "end" || typeof first !== "object") {
+  if (first === "timeout" || first.kind === "exit") {
     kill();
     const stderr = await new Response(proc.stderr as ReadableStream<Uint8Array>)
       .text()
@@ -227,18 +265,20 @@ export const runClaudeNative = async (
     logError("native-runtime", "claude hop declined pre-commit", { reason });
     return { kind: "declined", reason };
   }
-  if ("error" in first) {
+  if (first.kind === "error") {
     kill();
     logError("native-runtime", "claude hop declined pre-commit", {
-      reason: first.error,
+      reason: first.reason,
     });
-    return { kind: "declined", reason: first.error };
+    return { kind: "declined", reason: first.reason };
   }
+  const firstMeaningful = first.chunk;
 
   // ── Committed: stream canonical chunks until the result line ────────
   const chunks = new ReadableStream<TChatCompletionChunk>({
     start(controller) {
-      controller.enqueue(first);
+      for (const c of buffered) controller.enqueue(c);
+      controller.enqueue(firstMeaningful);
     },
     async pull(controller) {
       const next = await nextChunk();
