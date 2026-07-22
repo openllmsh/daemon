@@ -569,6 +569,8 @@ export const daemonWorkingSet = (): TWorkingSet => {
       for (const dir of resolveCliExecDirs(seed, home)) readOnly.add(dir);
     }
   }
+  // A read-write grant subsumes a read-only one — keep the lists disjoint.
+  for (const rw of readWrite) readOnly.delete(rw);
   return {
     readWrite: existing([...readWrite]),
     readOnly: existing([...readOnly]),
