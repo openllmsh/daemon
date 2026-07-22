@@ -15,9 +15,34 @@ import { NO_DAEMON_HEADER } from "@openllmsh/protocol";
 import { daemonEnv } from "./env";
 
 /**
+ * Bun's `fetch` auto-decompresses upstream bodies but may leave the
+ * original `content-encoding` / length / hop-by-hop headers in place.
+ * Forwarding those as-is makes the next client try to decompress plain
+ * bytes (`ZlibError` / `BrotliDecompressionError`). Same denylist the
+ * walker applies in `passthroughHeaders`.
+ */
+const stripHopByHopResponseHeaders = (resp: Response): Response => {
+  const headers = new Headers(resp.headers);
+  for (const h of [
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+  ]) {
+    headers.delete(h);
+  }
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+  });
+};
+
+/**
  * Proxy one inbound request to the cloud `/v1/*` surface verbatim,
  * pinning the model to the API-key hop the local chain selected. Streams
- * the upstream response through unchanged (status + headers + body).
+ * the upstream response through (status + body; hop-by-hop encoding
+ * headers stripped so Bun's auto-decompression cannot poison clients).
  */
 export const forwardToCloud = async (
   inbound: Request,
@@ -44,12 +69,13 @@ export const forwardToCloud = async (
   headers.delete("host");
   headers.delete("content-length");
 
-  return fetch(target, {
+  const resp = await fetch(target, {
     method: inbound.method,
     headers,
     body: bodyBytes,
     signal: inbound.signal,
   });
+  return stripHopByHopResponseHeaders(resp);
 };
 
 /**
@@ -92,10 +118,11 @@ export const passthroughToOrigin = async (
   headers.delete("host");
   headers.delete("content-length");
 
-  return fetch(target, {
+  const resp = await fetch(target, {
     method: inbound.method,
     headers,
     body: bodyBytes,
     signal: inbound.signal,
   });
+  return stripHopByHopResponseHeaders(resp);
 };

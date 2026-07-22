@@ -34,6 +34,114 @@ const positionalLabel = (key: string): string => {
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
 
+const toEpochMs = (raw: unknown): number | null => {
+  if (typeof raw !== "string") return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+};
+
+const FIVE_HOURS_MS = 5 * 3_600_000;
+const SEVEN_DAYS_MS = 7 * 86_400_000;
+
+/**
+ * Reduce Anthropic's OAuth usage payload into the same windows /
+ * extra_pools split ChatGPT uses for main meters vs. per-feature pools.
+ *
+ *   - `windows` — the shared plan meters (`five_hour` + `seven_day`).
+ *     These alone drive overall status, the card's tightest-window
+ *     face, and calibration. Hitting them means the whole subscription
+ *     is constrained.
+ *   - `extra_pools` — model-scoped 7-day caps (Opus / Sonnet / Fable /
+ *     whatever ships next). Same contract as Codex's Spark pool: they
+ *     meter DIFFERENT usage, so a 100% Fable pool must NOT flip status
+ *     to `rejected` or become the tightest window while the shared
+ *     7-day is still open.
+ *
+ * Model-scoped meters come from TWO shapes Anthropic has shipped:
+ *   1. Legacy top-level keys (`seven_day_opus` / `seven_day_sonnet` /
+ *      `seven_day_fable`) — kept as a fallback for older payloads.
+ *   2. The 2026 `limits[]` array — `kind: "weekly_scoped"` entries with
+ *      `scope.model.display_name` (captured live: Fable is only here;
+ *      the top-level `seven_day_*` keys for new families are null /
+ *      absent). Walking `limits` means a new model family surfaces
+ *      without another hardcode.
+ *
+ * Experimental top-level codenames (`seven_day_cowork`, `tangelo`, …)
+ * are still deliberately ignored so they can't pollute calibration.
+ */
+export type TClaudeUsageReduced = {
+  readonly windows: TProviderUsageWindow[];
+  readonly extra_pools: TProviderUsageWindow[];
+};
+
+export const reduceClaudeUsage = (payload: unknown): TClaudeUsageReduced => {
+  const data = isRecord(payload) ? payload : {};
+  const reduceWindow = (
+    label: string,
+    raw: unknown,
+    windowMs: number,
+  ): TProviderUsageWindow => {
+    const value = isRecord(raw) ? raw : {};
+    return {
+      label,
+      percent_used:
+        typeof value.utilization === "number" ? value.utilization : 0,
+      reset_at_ms: toEpochMs(value.resets_at),
+      window_ms: windowMs,
+    };
+  };
+
+  // Shared plan meters only — status + calibration read these.
+  const windows: TProviderUsageWindow[] = [
+    reduceWindow("5-hour", data.five_hour, FIVE_HOURS_MS),
+    reduceWindow("7-day", data.seven_day, SEVEN_DAYS_MS),
+  ];
+
+  // Per-model caps — display-only, like Codex Spark.
+  const extraPools: TProviderUsageWindow[] = [];
+  const seen = new Set<string>();
+  const pushPool = (pool: TProviderUsageWindow): void => {
+    if (seen.has(pool.label)) return;
+    seen.add(pool.label);
+    extraPools.push(pool);
+  };
+
+  const scoped: ReadonlyArray<readonly [string, string]> = [
+    ["seven_day_opus", "7-day · Opus"],
+    ["seven_day_sonnet", "7-day · Sonnet"],
+    ["seven_day_fable", "7-day · Fable"],
+  ];
+  for (const [key, label] of scoped) {
+    const raw = data[key];
+    if (isRecord(raw) && typeof raw.utilization === "number") {
+      pushPool(reduceWindow(label, raw, SEVEN_DAYS_MS));
+    }
+  }
+
+  if (Array.isArray(data.limits)) {
+    for (const entry of data.limits) {
+      if (!isRecord(entry) || entry.kind !== "weekly_scoped") continue;
+      if (typeof entry.percent !== "number") continue;
+      const scope = isRecord(entry.scope) ? entry.scope : null;
+      const model = scope !== null && isRecord(scope.model) ? scope.model : null;
+      const name =
+        model !== null &&
+        typeof model.display_name === "string" &&
+        model.display_name.length > 0
+          ? model.display_name
+          : null;
+      if (name === null) continue;
+      pushPool({
+        label: `7-day · ${name}`,
+        percent_used: entry.percent,
+        reset_at_ms: toEpochMs(entry.resets_at),
+        window_ms: SEVEN_DAYS_MS,
+      });
+    }
+  }
+  return { windows, extra_pools: extraPools };
+};
+
 /**
  * Reduce Codex's `rate_limit` object to canonical windows GENERICALLY:
  * any object value carrying a numeric `used_percent` is a window

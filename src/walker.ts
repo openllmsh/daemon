@@ -59,6 +59,10 @@ import {
 } from "@openllmsh/wire/lib/encrypted-content";
 import { classifyHopError } from "@openllmsh/wire/lib/error-class";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
+import {
+  isCanonicalRefusal,
+  isRefusalChunk,
+} from "@openllmsh/wire/lib/refusal";
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
 import {
   isMeaningfulChunk,
@@ -836,6 +840,16 @@ const serveSubscription = async (
     );
   };
 
+  // A STRUCTURED refusal (Anthropic policy/safety block, content filter)
+  // that preceded ANY output is not proof another candidate will refuse
+  // the same canonical request — so a non-final, non-aborted hop WALKS
+  // (nothing was generated; no double-spend), exactly like the pre-output
+  // stream-error path. It is request-semantic, NOT a provider-health
+  // fault, so it never marks a cooldown. The FINAL hop has nowhere to
+  // walk: it surfaces the authentic provider refusal (returns false, so
+  // the caller commits the buffered stream / decoded response as-is).
+  const refusalWalks = (): boolean => !finalHop && !args.req.signal.aborted;
+
   // ── Client wants a live stream ──────────────────────────────────────
   // First-class path: stream chunk-by-chunk, re-encoding to the client's
   // wire as bytes arrive. (upstreamStreams is always true here — chatgpt
@@ -875,11 +889,16 @@ const serveSubscription = async (
         // The meter's decoded view is LOSSY (schema-unknown frames are
         // dropped): an empty decode of a byte-verbatim passthrough must
         // commit, not walk — the client's bytes ride `toClient` untouched.
-        { emptyStreamIsError: false },
+        { emptyStreamIsError: false, isRefusal: isRefusalChunk },
       );
       if (peeked.kind === "error") {
         void toClient.cancel().catch(() => undefined);
         return peekedError(peeked.error);
+      }
+      if (peeked.kind === "refusal" && refusalWalks()) {
+        void toClient.cancel().catch(() => undefined);
+        void peeked.chunks.cancel().catch(() => undefined);
+        return "retry";
       }
       meter(peeked.chunks);
       return new Response(heartbeat(toClient), {
@@ -897,8 +916,13 @@ const serveSubscription = async (
     const peeked = await peekFirstChunk(
       decodeUpstreamStream(wire, resp.body, hop.providerModelId),
       isMeaningfulChunk,
+      { isRefusal: isRefusalChunk },
     );
     if (peeked.kind === "error") return peekedError(peeked.error);
+    if (peeked.kind === "refusal" && refusalWalks()) {
+      void peeked.chunks.cancel().catch(() => undefined);
+      return "retry";
+    }
     return deliverChunkStream(peeked.chunks, {
       surface: args.surface,
       clientWire,
@@ -925,8 +949,13 @@ const serveSubscription = async (
     const peeked = await peekFirstChunk(
       decodeUpstreamStream(wire, resp.body, hop.providerModelId),
       isMeaningfulChunk,
+      { isRefusal: isRefusalChunk },
     );
     if (peeked.kind === "error") return peekedError(peeked.error);
+    if (peeked.kind === "refusal" && refusalWalks()) {
+      void peeked.chunks.cancel().catch(() => undefined);
+      return "retry";
+    }
     let canonical: TChatCompletionResponse;
     try {
       canonical = await accumulateChunksToResponse(
@@ -983,6 +1012,10 @@ const serveSubscription = async (
       headers: passthroughHeaders(resp),
     });
   }
+  // A 200 whose decoded body IS a structured refusal walks a non-final hop
+  // (nothing to double-spend), mirroring the streaming pre-commit peek and
+  // the cloud non-stream promotion. The final hop surfaces it verbatim.
+  if (isCanonicalRefusal(canonical) && refusalWalks()) return "retry";
   recordTokens(tokensFromResponse(canonical));
   // Passthrough returns the upstream bytes verbatim; cross-wire re-encodes
   // through the shared delivery tail.
@@ -1359,7 +1392,24 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       });
       if (native instanceof Response) return native; // committed natively
       lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
-      // ↓ fall through to the manual transport for this hop (no `continue`).
+      // ↓ fall through to the manual transport for this hop (no `continue`)
+      //   — EXCEPT for a non-CC claude_code request (see the gate below).
+    }
+    // Compliance gate: the manual (handrolled) transport is a legitimate path
+    // for claude_code ONLY when the originator is the genuine Claude Code CLI
+    // — it forwards that client's OWN request verbatim on its OWN credential,
+    // the official-client flow. For ANY other originator the manual
+    // claude_code path would have to SPOOF the Claude Code identity to pass
+    // Anthropic's OAuth spoof-guard (inject a "You are Claude Code" preamble
+    // the client never sent), which we refuse. So a non-CC claude_code hop is
+    // BRIDGE-ONLY: the real vendor CLI is the sole compliant path. If the
+    // bridge declined (or wasn't selected), advance the plan rather than fall
+    // to the spoof-prone manual transport.
+    if (hop.provider === "claude_code" && !claudeCodeOriginator) {
+      lastError =
+        lastError ??
+        `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
+      continue;
     }
     const wire = UPSTREAM_WIRE[hop.provider];
     if (wire !== undefined) {
