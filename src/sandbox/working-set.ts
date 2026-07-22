@@ -68,9 +68,6 @@ import {
   CLI_PROVIDERS,
   cliBin,
   hostCliCandidates,
-  sessionConfigDir,
-  sessionConfigLinks,
-  sessionSandboxHome,
 } from "../cli-paths";
 import { stateDir } from "../env";
 import { DAEMON_VERSION } from "../version";
@@ -299,21 +296,6 @@ export const daemonWorkingSet = (): TWorkingSet => {
     mkdirSync(stampsDir, { recursive: true, mode: 0o700 });
   } catch {
     // Best-effort — if creation fails, the sandbox grant remains narrow.
-  }
-  // Device-session shared sandbox home (feature §2.2): the fully-granted
-  // HOME device sessions run their CLI in. It nests under the state dir
-  // (already granted RW), so no NEW rw grant is needed — but pre-create the
-  // home + each provider's config dir so a Landlock leaf grant lands, and
-  // so the config symlinks the session host attaches have a parent dir.
-  const sandboxHome = sessionSandboxHome();
-  try {
-    mkdirSync(sandboxHome, { recursive: true, mode: 0o700 });
-    for (const provider of CLI_PROVIDERS) {
-      mkdirSync(sessionConfigDir(provider), { recursive: true, mode: 0o700 });
-    }
-  } catch {
-    // best-effort — a missing leaf just means that provider's session
-    // falls back / fails visibly, not a daemon-boot failure.
   }
   // Pre-create the vendor CLI install/config dirs the host-install + setup flows
   // write into (claude / codex / kimi). REQUIRED on Linux: Landlock can only
@@ -587,40 +569,6 @@ export const daemonWorkingSet = (): TWorkingSet => {
       for (const dir of resolveCliExecDirs(seed, home)) readOnly.add(dir);
     }
   }
-  // Device-session config attach (feature §2.2): the session host symlinks
-  // the user's REAL config files (login/settings) into the sandbox home so
-  // the session CLI reads the user's actual OpenLLM-configured setup. The
-  // sandbox home is RW (nests under `state`), but the symlink TARGETS are
-  // the real files under `$HOME` — grant each a FILE-scoped READ so the
-  // confined CLI can follow the link. Only add a grant when the file
-  // ACTUALLY EXISTS: a missing leaf would let `existing()` climb to its
-  // parent (e.g. `~/.codex`), widening the grant to the whole config dir
-  // and colliding with an existing RW grant. A not-yet-configured provider
-  // shares nothing (its session then falls back to a fresh login).
-  // THREAT-MODEL EXCEPTION — credential files among the config links are
-  // NOT granted by the generic loop: each is an explicit, documented,
-  // FILE-scoped decision here. Today that is the Claude OAuth token
-  // (`~/.claude/.credentials.json`, the §5-A jewel): the device-session
-  // feature needs the session CLI to authenticate as the user's real
-  // Claude login (feature §2.2 — no re-login inside the sandbox), and
-  // Claude has no separate auth-handoff mechanism, so a READ-only grant
-  // is accepted. A compromised daemon could read this token (it still
-  // cannot write `~/.claude`) — traded against forcing users through a
-  // fresh in-sandbox login that would mint yet another long-lived token.
-  const credentialExceptions = new Set([
-    join(home, ".claude", ".credentials.json"),
-  ]);
-  for (const cred of credentialExceptions) {
-    if (existsSync(cred)) readOnly.add(cred);
-  }
-  for (const provider of CLI_PROVIDERS) {
-    for (const { real } of sessionConfigLinks(provider)) {
-      if (credentialExceptions.has(real)) continue; // granted above, explicitly
-      if (existsSync(real)) readOnly.add(real);
-    }
-  }
-  // A read-write grant subsumes a read-only one — keep the lists disjoint.
-  for (const rw of readWrite) readOnly.delete(rw);
   return {
     readWrite: existing([...readWrite]),
     readOnly: existing([...readOnly]),

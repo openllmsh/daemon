@@ -94,7 +94,6 @@ daemon/
     mux-host.ts             mux1 channel negotiation, relay duplex ownership, and OPEN dispatch
     tunnel-client.ts        consuming subscription tunnel: mux first, JSON splice fallback
     tunnel-server.ts        serving in-process tunneled request dispatch for JSON and mux streams
-    session-host.ts         PTY/session host; binds mux streams and detaches them on end/reset
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
       types.ts              TProviderDelegate contract
@@ -321,23 +320,17 @@ walker's own `report`. Offline coverage:
 `tests/transport/native-runtime.test.ts` (fixture runtimes). See
 `docs/audit/2026-07-13-t3code-provider-routing-comparison.md` §5.
 
-## Tunnel and session transport
+## Tunnel transport
 
 The daemon uses the capability-gated `mux1` channel when both endpoints support
 it. `mux-host.ts` owns one relay duplex/channel, negotiates `channel_open` /
 `channel_open_ack`, receives mux OPEN frames, and dispatches tunnel streams to
-`tunnel-server.ts` or session streams to `session-host.ts`. `tunnel-client.ts`
-uses this mux path first; a channel nack, timeout, or other pre-response-head
-failure falls back to the retained JSON `tunnel_*` splice. The serving path
-maps a closed tunnel-surface vocabulary to the daemon's in-process `/v1/*`
-handler and streams the result.
+`tunnel-server.ts`. `tunnel-client.ts` uses this mux path first; a channel nack,
+timeout, or other pre-response-head failure falls back to the retained JSON
+`tunnel_*` splice. The serving path maps a closed tunnel-surface vocabulary to
+the daemon's in-process `/v1/*` handler and streams the result.
 
-For device sessions, `session-host.ts` binds the mux stream to the live PTY:
-input and resize controls reach the PTY, output flows back on the stream, and a
-stream end/reset detaches rather than kills the PTY. The legacy `session_*`
-splice remains available for capability skew and fallback. These transport
-modules do not change the core-free boundary or place vendor credentials on the
-relay.
+Device-session/PTy work belongs to `feat/session-chat`, not this branch.
 
 ## Two localhost surfaces
 

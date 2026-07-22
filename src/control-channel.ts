@@ -24,12 +24,6 @@ import {
   resetAllChannels,
   updateMuxPeerCaps,
 } from "./mux-host";
-import {
-  detachAllSessions,
-  handleSessionFrame,
-  isSessionFrame,
-  setSessionQuietHook,
-} from "./session-host";
 import { computeStatus } from "./status";
 import {
   failAllConsumedTunnels,
@@ -161,7 +155,6 @@ export const resetRelayScopedState = (): void => {
   abortAllTunnels();
   failAllConsumedTunnels();
   resetAllChannels();
-  detachAllSessions();
 };
 
 const enqueueStatusPublish = (
@@ -452,12 +445,6 @@ const onFrame = (frame: TRelayFrame): void => {
         handleTunnelFrame(frame, send);
         return;
       }
-      // Device sessions (PTY host) — each session runs on its own async
-      // task, mirroring the tunnel server.
-      if (isSessionFrame(frame)) {
-        handleSessionFrame(frame, send);
-        return;
-      }
       // others: nothing to do (partysocket owns reconnection)
       return;
   }
@@ -573,9 +560,6 @@ export const startControlChannel = (): void => {
   // walker→control-channel import (which would close an import cycle via
   // tunnel-server → listener → walker).
   registerTunnelSender(send);
-  setSessionQuietHook(() => {
-    void pushStatusIfChanged();
-  });
   configureMuxHost({ send, sendBytes });
   const socket = new ReconnectingWebSocket(channelUrl, undefined, {
     WebSocket: globalThis.WebSocket,

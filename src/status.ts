@@ -15,7 +15,6 @@ import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { sandboxState } from "./sandbox/landlock";
-import { ptySupported, sessionStatusReport } from "./session-host";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -67,10 +66,6 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     // + after install/uninstall + on refresh), NOT a live scan — the walk is
     // too heavy to run on every status push.
     integrations: getInstalledIntegrations(),
-    // Device chat sessions (feature §2.2): whether this box can host a
-    // PTY, and the sessions it currently holds (live/dormant).
-    pty_supported: ptySupported(),
-    sessions: sessionStatusReport(),
   };
 };
 

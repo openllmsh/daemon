@@ -2,7 +2,6 @@ import type { TRelayFrame } from "@openllmsh/protocol";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
-import { bindMuxSessionStream } from "./session-host";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 let active: TMuxChannel | null = null;
@@ -148,7 +147,6 @@ const onStream = serveStream({
   // Keep the tunnel-server import lazy: its production dispatcher reaches the
   // control channel, which imports this host during daemon initialization.
   tunnel: (open, body, signal) => serveMuxTunnel(open, body, signal),
-  session: bindMuxSessionStream,
   admitTunnel: () => admitMuxTunnel(),
   invalidOpenCode: "invalid_tunnel",
 });
@@ -196,7 +194,7 @@ export const muxHostOnBytes = (bytes: Uint8Array): void => {
   sink?.(bytes);
 };
 
-/** A dead relay socket tears down all stream state without killing PTYs. */
+/** A dead relay socket tears down all stream state. */
 export const resetAllChannels = (): void => {
   for (const keyId of [...opening.keys()]) failOpen(keyId);
   const channel = active;

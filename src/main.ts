@@ -56,12 +56,6 @@ import {
   maybeSelfUpdate,
   trackBodyDone,
 } from "./self-update";
-import {
-  killAllSessions,
-  pollSessionActivity,
-  reapDetachedSessions,
-  reapOrphanSessionProcs,
-} from "./session-host";
 import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -121,12 +115,10 @@ const main = async (): Promise<void> => {
   // synchronously (appendFileSync), so the line is flushed before exit.
   process.on("uncaughtException", (err) => {
     logError("uncaughtException", err);
-    killAllSessions(); // never leak a PTY on a fatal exit
     process.exit(1);
   });
   process.on("unhandledRejection", (reason) => {
     logError("unhandledRejection", reason);
-    killAllSessions();
     process.exit(1);
   });
 
@@ -213,21 +205,7 @@ const main = async (): Promise<void> => {
   // commands and marks this key's daemon "online" server-side — so the
   // dashboard never reaches loopback (no Private Network Access prompt). See
   // `docs/proposals/daemon-relay-websocket-push.md`.
-  // Reap orphan session PTYs a PRIOR daemon left behind after an uncatchable
-  // exit (SIGKILL, crash, power loss) — BEFORE accepting new sessions, so the
-  // slot budget starts clean and no stale CLI process leaks on the machine.
-  reapOrphanSessionProcs();
-
   startControlChannel();
-
-  // Reap DETACHED device-session PTYs past their TTL (feature §2.2) —
-  // attached sessions never idle out.
-  const sessionReaper = setInterval(() => reapDetachedSessions(), 60_000);
-  sessionReaper.unref?.();
-  const sessionActivityPoller = setInterval(() => {
-    void pollSessionActivity();
-  }, 15_000);
-  sessionActivityPoller.unref?.();
 
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.
@@ -235,9 +213,6 @@ const main = async (): Promise<void> => {
   const shutdown = (signal: NodeJS.Signals): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Kill session PTYs BEFORE exit — an auto-update/launchd SIGTERM must not
-    // orphan them (they would leak memory + hold slots until reboot).
-    killAllSessions();
     void stopControlChannel().finally(() => {
       process.exit(signal === "SIGINT" ? 130 : 143);
     });
