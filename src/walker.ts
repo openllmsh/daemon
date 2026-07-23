@@ -54,11 +54,16 @@ import {
   daemonPlanSigningPayload,
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
+import type { TCompactionSurface } from "@openllmsh/wire/features/compaction/compact-request";
+import { compactRequestToFit } from "@openllmsh/wire/features/compaction/compact-request";
 import {
   contextOverflowRequiredTokens,
   nextLargerContextModel,
 } from "@openllmsh/wire/features/context-demote";
-import { shouldSkipHopForContext } from "@openllmsh/wire/features/context-skip";
+import {
+  CONTEXT_SKIP_CONFIDENCE_FACTOR,
+  shouldSkipHopForContext,
+} from "@openllmsh/wire/features/context-skip";
 import {
   GATE_STALE_CAP_MS,
   quotaGateDecision,
@@ -1495,8 +1500,25 @@ export const usageForActiveAccount = async (
     : peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
 };
 
+/**
+ * The plan hop with the LARGEST known input window, and that window — the
+ * last-resort compaction target. Unknown-limit hops are ignored (no window to
+ * size a budget from). Returns `null` when no hop declares a limit.
+ */
+const largestContextHop = (
+  hops: ReadonlyArray<THop>,
+): { hop: THop; window: number } | null => {
+  let best: { hop: THop; window: number } | null = null;
+  for (const hop of hops) {
+    const window = lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null;
+    if (window !== null && (best === null || window > best.window)) {
+      best = { hop, window };
+    }
+  }
+  return best;
+};
+
 export const runWalker = async (args: TWalkArgs): Promise<Response> => {
-  const accountHashByProvider = new Map<string, string | null>();
   const planModelIds = parsePlan(args.planParam);
   if (planModelIds.length === 0) {
     return errorJson(
@@ -1532,6 +1554,92 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     );
   }
 
+  // First: walk the plan as-is. LAST-RESORT compaction (below) only runs if that
+  // whole walk fails on SIZE — every hop oversized — so a healthy request never
+  // pays for a rewrite (same last-resort-only rule as the cloud chain; see
+  // wire/features/context-skip.ts).
+  const firstPass = await walkPlan(args, hops);
+  if (!(await isContextOverflowResponse(firstPass))) return firstPass;
+
+  const largest = largestContextHop(hops);
+  const compactionTarget =
+    largest === null
+      ? null
+      : Math.floor(largest.window * CONTEXT_SKIP_CONFIDENCE_FACTOR);
+  if (
+    largest === null ||
+    compactionTarget === null ||
+    estimateBodyTokens(args.rawBody) <= compactionTarget ||
+    args.req.signal.aborted
+  ) {
+    return firstPass;
+  }
+  const surface: TCompactionSurface =
+    args.surface === "chat_completions" ? "chat_completions" : "messages";
+  const compacted = compactRequestToFit(
+    args.rawBody,
+    surface,
+    compactionTarget,
+  );
+  if (!compacted.compacted) return firstPass;
+  // Re-walk ONCE with the shrunk body. The compacted retry is itself never
+  // re-compacted (only this outer pass compacts), so this can't loop.
+  const compactedArgs: TWalkArgs = {
+    ...args,
+    rawBody: compacted.body,
+    rawBytes: new TextEncoder().encode(JSON.stringify(compacted.body))
+      .buffer as ArrayBuffer,
+  };
+  return walkPlan(compactedArgs, hops);
+};
+
+/**
+ * True when a walk's terminal Response is a context-overflow failure — either
+ * the synthesized 502 fall-through or an upstream 4xx whose body carries the
+ * "maximum context length" diagnostic. This is the signal that last-resort
+ * compaction should retry; any other outcome (success, a non-size error) returns
+ * to the caller untouched.
+ */
+const isContextOverflowResponse = async (
+  response: Response,
+): Promise<boolean> => {
+  if (response.ok) return false;
+  const text = await response
+    .clone()
+    .text()
+    .catch(() => "");
+  // The synthesized fall-through: every hop failed pre-stream.
+  if (response.status === 502 && text.includes("all hops in the plan failed")) {
+    return true;
+  }
+  // An upstream overflow envelope — either the exact "contains N tokens" form
+  // (which also yields the required-token count) or the broader vendor phrasing
+  // the shared error classifier recognises (`maximum context length`, `exceeds
+  // the context window`, …).
+  if (contextOverflowRequiredTokens(text) !== null) return true;
+  return CONTEXT_OVERFLOW_TEXT.test(text);
+};
+
+/**
+ * The vendor phrasings that mean "request too large for this model's context",
+ * mirroring `wire/lib/error-class`'s internal `CONTEXT_OVERFLOW_BODY` so the
+ * last-resort retry triggers on the same envelopes the walk classifies as
+ * `context_overflow` — not only the strict `contains N tokens` shape.
+ */
+const CONTEXT_OVERFLOW_TEXT =
+  /maximum (?:prompt|context) length|exceeds the context window|too many tokens|reduce the length of the messages/i;
+
+/**
+ * Walk a resolved plan once and return its terminal Response. Extracted from
+ * `runWalker` so the last-resort compaction path can re-invoke the identical
+ * walk with a shrunk body. All plan/signature validation stays in `runWalker`
+ * (it must not re-run on the compacted retry).
+ */
+const walkPlan = async (
+  args: TWalkArgs,
+  hops: ReadonlyArray<THop>,
+): Promise<Response> => {
+  const accountHashByProvider = new Map<string, string | null>();
   // Canonical view of the inbound for native-runtime eligibility and encoding.
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
   const baseEstimate = estimateBodyTokens(args.rawBody);
