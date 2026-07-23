@@ -1574,8 +1574,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   ) {
     return firstPass;
   }
-  const surface: TCompactionSurface =
-    args.surface === "chat_completions" ? "chat_completions" : "messages";
+  // The daemon forwards the RAW inbound body per surface, so the compactor must
+  // match: `responses` (Codex) is `{ input: item[] }`, `messages` (Claude) is
+  // Anthropic-shaped, `chat_completions` is canonical OpenAI.
+  const surface: TCompactionSurface = args.surface;
   const compacted = compactRequestToFit(
     args.rawBody,
     surface,
