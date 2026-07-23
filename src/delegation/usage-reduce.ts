@@ -98,8 +98,32 @@ export const reduceClaudeUsage = (payload: unknown): TClaudeUsageReduced => {
   ];
 
   // Per-model caps — display-only, like Codex Spark.
+  const scopedClaudePool = ({
+    meterId,
+    displayName,
+    percent,
+    resetsAt,
+  }: {
+    readonly meterId: string;
+    readonly displayName: string;
+    readonly percent: number;
+    readonly resetsAt: unknown;
+  }): TProviderUsageWindow => ({
+    meter_id: meterId,
+    label: `7-day · ${displayName}`,
+    percent_used: percent,
+    reset_at_ms: toEpochMs(resetsAt),
+    window_ms: SEVEN_DAYS_MS,
+  });
   const extraPools: TProviderUsageWindow[] = [];
   const seen = new Set<string>();
+  // Dedupe by DISPLAY label: the legacy `seven_day_*` keys and the
+  // `limits[]` weekly_scoped entries are two vendor encodings of the SAME
+  // logical pool, and `scopedClaudePool` gives both the identical
+  // `7-day · <family>` label. Keying on label collapses a payload that
+  // (rarely) carries both, exactly as before meter_id existed. `meter_id`
+  // rides along on the surviving pool for the catalog-meter gate; it is
+  // deliberately NOT the dedupe key (the two encodings differ there).
   const pushPool = (pool: TProviderUsageWindow): void => {
     if (seen.has(pool.label)) return;
     seen.add(pool.label);
@@ -107,14 +131,21 @@ export const reduceClaudeUsage = (payload: unknown): TClaudeUsageReduced => {
   };
 
   const scoped: ReadonlyArray<readonly [string, string]> = [
-    ["seven_day_opus", "7-day · Opus"],
-    ["seven_day_sonnet", "7-day · Sonnet"],
-    ["seven_day_fable", "7-day · Fable"],
+    ["seven_day_opus", "Opus"],
+    ["seven_day_sonnet", "Sonnet"],
+    ["seven_day_fable", "Fable"],
   ];
-  for (const [key, label] of scoped) {
-    const raw = data[key];
+  for (const [meterId, displayName] of scoped) {
+    const raw = data[meterId];
     if (isRecord(raw) && typeof raw.utilization === "number") {
-      pushPool(reduceWindow(label, raw, SEVEN_DAYS_MS));
+      pushPool(
+        scopedClaudePool({
+          meterId,
+          displayName,
+          percent: raw.utilization,
+          resetsAt: raw.resets_at,
+        }),
+      );
     }
   }
 
@@ -131,12 +162,14 @@ export const reduceClaudeUsage = (payload: unknown): TClaudeUsageReduced => {
           ? model.display_name
           : null;
       if (name === null) continue;
-      pushPool({
-        label: `7-day · ${name}`,
-        percent_used: entry.percent,
-        reset_at_ms: toEpochMs(entry.resets_at),
-        window_ms: SEVEN_DAYS_MS,
-      });
+      pushPool(
+        scopedClaudePool({
+          meterId: name,
+          displayName: name,
+          percent: entry.percent,
+          resetsAt: entry.resets_at,
+        }),
+      );
     }
   }
   return { windows, extra_pools: extraPools };
@@ -213,6 +246,7 @@ export const reduceChatgptPools = (
     for (const w of windows) {
       pools.push({
         ...w,
+        meter_id: name,
         label: windows.length === 1 ? name : `${name} · ${w.label}`,
       });
     }
