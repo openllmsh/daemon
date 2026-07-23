@@ -46,6 +46,15 @@
  *     immediately;
  *   - concurrent callers during a refresh share ONE in-flight fetch
  *     (single-flight per provider).
+ *
+ * The dashboard's display TTL is deliberately NOT the routing TTL. The walker
+ * uses {@link peekUsageForQuotaGate}: after the UI has stopped showing an old
+ * card, it may retain only an exhausted quota pool with a known future reset.
+ * That pool is self-validating — it cannot refill before its own reset — and is
+ * therefore safe evidence to skip a dead hop. When a cached reset has passed,
+ * the routing reader asks only that provider/account to revalidate through this
+ * cache's existing single-flight and back-off machinery; it never creates a
+ * polling sweep or blocks an inference request on the vendor.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -332,6 +341,53 @@ export const peekUsage = (
   const now = Date.now();
   if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
     return stampStale(entry.good.snapshot, entry.good.atMs, now);
+  }
+  return entry.failure;
+};
+
+/**
+ * PASSIVE routing read — retains a long-aged quota snapshot only when an
+ * exhausted window or extra pool has a known reset still ahead. Unlike the UI
+ * display reader, that fact remains valid regardless of snapshot age: the
+ * exhausted pool cannot refill until its own reset instant. All other cases
+ * preserve {@link peekUsage}'s exact display-TTL behavior.
+ *
+ * A passed reset proves the cached quota is expired. When a fetcher is supplied,
+ * schedule one detached, provider/account-scoped cache read without `force`;
+ * `cachedUsage` supplies the existing freshness, back-off, and single-flight
+ * limits. The reader returns immediately and never lets a vendor failure throw.
+ */
+export const peekUsageForQuotaGate = (
+  slug: string,
+  accountHash?: string,
+  revalidate?: () => Promise<TProviderUsageSnapshot>,
+): TProviderUsageSnapshot | null => {
+  const entry = cache.get(usageCacheKey(slug, accountHash));
+  if (entry === undefined) return null;
+  const now = Date.now();
+  if (entry.good === null) return entry.failure;
+
+  const snapshot = entry.good.snapshot;
+  if (snapshot.kind !== "quota") return peekUsage(slug, accountHash);
+  const pools = [...snapshot.windows, ...(snapshot.extra_pools ?? [])];
+  if (
+    revalidate !== undefined &&
+    pools.some((pool) => pool.reset_at_ms !== null && now >= pool.reset_at_ms)
+  ) {
+    void cachedUsage(slug, revalidate, { accountHash });
+  }
+  if (now - entry.good.atMs < STALE_TTL_MS) {
+    return stampStale(snapshot, entry.good.atMs, now);
+  }
+  if (
+    pools.some(
+      (pool) =>
+        pool.percent_used >= 100 &&
+        pool.reset_at_ms !== null &&
+        now < pool.reset_at_ms,
+    )
+  ) {
+    return stampStale(snapshot, entry.good.atMs, now);
   }
   return entry.failure;
 };
