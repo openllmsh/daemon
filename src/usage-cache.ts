@@ -148,6 +148,15 @@ export const enableUsagePersistence = (dir: string): void => {
   hydrate();
 };
 
+/**
+ * Test-only: opt this process back OUT of disk persistence so a case that
+ * enabled it (via a temp dir) can't leak a `persistDir` into later in-memory
+ * cases. Never called by the daemon itself.
+ */
+export const disableUsagePersistenceForTest = (): void => {
+  persistDir = null;
+};
+
 // Load persisted good snapshots into the in-memory cache. Never clobbers a
 // slug that already has live state. Best-effort: a missing/corrupt file just
 // starts the cache cold.
