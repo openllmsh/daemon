@@ -144,7 +144,7 @@ import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
 import { isClaudeCodeOriginator, selectSubMethod } from "./sub-method";
-import { peekUsage, sampleUsageAfterRequest } from "./usage-cache";
+import { peekUsageForQuotaGate, sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
 // the one constant that stays in the walker. The upstream URL is no longer
@@ -379,17 +379,42 @@ const abortableDelay = (ms: number, signal: AbortSignal): Promise<void> =>
  * error or a 429/408/5xx). Returns `null` when every attempt failed at the
  * network layer (no `Response` to surface).
  */
+type TTransportFailure = { readonly reason: string };
+
+// Fetch's message frequently embeds the upstream URL (and potentially an API
+// token). Keep only a conventional errno-like code, else its short error name.
+const transportFailureFrom = (err: unknown): TTransportFailure => {
+  const record =
+    err !== null && typeof err === "object"
+      ? (err as { readonly cause?: unknown; readonly name?: unknown })
+      : null;
+  const cause = record?.cause;
+  const causeRecord =
+    cause !== null && typeof cause === "object"
+      ? (cause as { readonly code?: unknown })
+      : null;
+  const code = causeRecord?.code;
+  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)) {
+    return { reason: `network error: ${code}` };
+  }
+  const name = record?.name;
+  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{1,63}$/.test(name)
+    ? { reason: `network error: ${name}` }
+    : { reason: "network error" };
+};
+
 export const postUpstream = async (
   url: string,
   init: RequestInit,
   finalHop: boolean,
   signal: AbortSignal,
+  onTransportFailure?: (failure: TTransportFailure) => void,
 ): Promise<Response | null> => {
   let first: Response | null = null;
   try {
     first = await fetch(url, init);
-  } catch {
-    first = null;
+  } catch (err) {
+    onTransportFailure?.(transportFailureFrom(err));
   }
   const failedRetryable =
     first === null || (!first.ok && shouldRetryFinalHopInPlace(first.status));
@@ -401,7 +426,8 @@ export const postUpstream = async (
   if (signal.aborted) return first;
   try {
     return await fetch(url, init);
-  } catch {
+  } catch (err) {
+    onTransportFailure?.(transportFailureFrom(err));
     return first;
   }
 };
@@ -422,6 +448,7 @@ const postWithDecryptRetry = async (
   wire: TUpstreamWire,
   finalHop: boolean,
   signal: AbortSignal,
+  onTransportFailure?: (failure: TTransportFailure) => void,
 ): Promise<Response | null> => {
   const send = (b: unknown): Promise<Response | null> =>
     postUpstream(
@@ -429,6 +456,7 @@ const postWithDecryptRetry = async (
       { method: "POST", headers, body: JSON.stringify(b), signal },
       finalHop,
       signal,
+      onTransportFailure,
     );
   const first = await send(body);
   // `chatgpt` is the only encrypted-content-bearing upstream wire (grok maps to
@@ -478,7 +506,10 @@ const errorEnvelopeFrom = (raw: string): TErrorEnvelope | undefined => {
       ? { error: json.error as TErrorEnvelope["error"] }
       : undefined;
   } catch {
-    return undefined;
+    const message = hopBodySnippet(raw);
+    return message.length > 0
+      ? { error: { message, type: "upstream_error" } }
+      : undefined;
   }
 };
 
@@ -856,6 +887,7 @@ const serveSubscription = async (
   wire: TUpstreamWire,
   args: TWalkArgs,
   finalHop: boolean,
+  onQuotaExhausted?: (provider: string, accountHash: string | null) => void,
 ): Promise<THopServeOutcome> => {
   const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return hopRetry("no usable credential");
@@ -912,6 +944,7 @@ const serveSubscription = async (
       withKimiBuiltinSearch(body),
     );
   }
+  const transport = { failure: null as TTransportFailure | null };
   const resp = await postWithDecryptRetry(
     url,
     headers,
@@ -919,9 +952,18 @@ const serveSubscription = async (
     wire,
     finalHop,
     args.req.signal,
+    (failure) => {
+      transport.failure = failure;
+    },
   );
   if (resp === null) {
-    return hopRetry("network error", { cooldownReason: "network" });
+    // An inbound cancellation aborts the fetch by design. It is terminal but
+    // not an upstream failure, so it must neither walk nor write a cooldown row.
+    if (args.req.signal.aborted)
+      return errorJson(499, "client aborted request");
+    return hopRetry(transport.failure?.reason ?? "network error", {
+      cooldownReason: "network",
+    });
   }
   if (!resp.ok) {
     const raw = await resp.text().catch(() => "");
@@ -952,6 +994,9 @@ const serveSubscription = async (
     // The final hop has nowhere to walk (or the caller aborted): surface the
     // upstream response verbatim, including status and Retry-After. Still
     // record a zero-token error row so Overview's debug table shows it.
+    if (cls.kind === "transient" && cls.reason === "quota_exhausted") {
+      onQuotaExhausted?.(hop.provider, accountHash);
+    }
     report(
       {
         model: hop.modelId,
@@ -1012,7 +1057,19 @@ const serveSubscription = async (
       error instanceof UpstreamStreamError
         ? sanitizeErrorLine(upstreamErrorLine(error), 300)
         : sanitizeErrorLine(error, 300);
-    if (!finalHop && !args.req.signal.aborted) return hopRetry(detail);
+    if (!finalHop && !args.req.signal.aborted) {
+      // Preserve the terminal response this pre-output error would have
+      // produced on the final hop, so a forced-context epilogue that also
+      // fails surfaces IT (the authentic upstream failure) instead of the
+      // generic all-hops-failed 502 — mirroring the non-final HTTP
+      // pre-commit branch above.
+      return hopRetry(detail, {
+        upstreamResponse: errorJson(
+          502,
+          `upstream stream ended before producing output: ${detail}`,
+        ),
+      });
+    }
     report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
     return errorJson(
       502,
@@ -1420,10 +1477,11 @@ export const usageForActiveAccount = async (
   provider: string,
   accountHashByProvider: Map<string, string | null>,
 ): Promise<TProviderUsageSnapshot | null> => {
+  const delegate = getDelegate(provider);
+  if (delegate === null) return null;
+
   let accountHash = accountHashByProvider.get(provider);
   if (accountHash === undefined) {
-    const delegate = getDelegate(provider);
-    if (delegate === null) return null;
     try {
       const status = await delegate.status();
       accountHash = status.connected ? (status.account_hash ?? null) : null;
@@ -1432,7 +1490,9 @@ export const usageForActiveAccount = async (
     }
     accountHashByProvider.set(provider, accountHash);
   }
-  return accountHash === null ? null : peekUsage(provider, accountHash);
+  return accountHash === null
+    ? null
+    : peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
 };
 
 export const runWalker = async (args: TWalkArgs): Promise<Response> => {
@@ -1496,6 +1556,18 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const hopTrail: THopTrailEntry[] = [];
   const attempted: string[] = [];
   let contextDemotionTarget: string | null = null;
+  const sampleQuotaUsage = (
+    provider: string,
+    accountHash: string | null | undefined,
+  ): void => {
+    const delegate = getDelegate(provider);
+    if (delegate === null) return;
+    sampleUsageAfterRequest(
+      provider,
+      () => delegate.usage(),
+      accountHash ?? undefined,
+    );
+  };
   const reportHopFailure = (
     hop: THop,
     reason: string,
@@ -1547,14 +1619,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     // window — an exhausted account produces no successful request, so nothing
     // else would ever re-sample it.
     if (cooldownReason === "quota_exhausted") {
-      const delegate = getDelegate(hop.provider);
-      if (delegate !== null) {
-        sampleUsageAfterRequest(
-          hop.provider,
-          () => delegate.usage(),
-          accountHashByProvider.get(hop.provider) ?? undefined,
-        );
-      }
+      sampleQuotaUsage(hop.provider, accountHashByProvider.get(hop.provider));
     }
     reportHopFailure(hop, reason, status, cooldownReason);
   };
@@ -1780,7 +1845,13 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     if (wire !== undefined) {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
-      const served = await serveSubscription(hop, wire, args, finalHop);
+      const served = await serveSubscription(
+        hop,
+        wire,
+        args,
+        finalHop,
+        sampleQuotaUsage,
+      );
       if (!isHopRetry(served)) {
         if (
           forceContextAttempt &&
@@ -1793,10 +1864,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       }
       // Pre-stream candidate failure: record + trail, then walk. Never throw.
       lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
-      preserveTerminalResponse(
-        served.upstreamResponse,
-        forceContextAttempt,
-      );
+      preserveTerminalResponse(served.upstreamResponse, forceContextAttempt);
       if (served.cooldownReason === "context_overflow") {
         const requiredTokens =
           contextOverflowRequiredTokens(served.bodySnippet ?? served.reason) ??
