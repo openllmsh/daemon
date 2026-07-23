@@ -131,6 +131,7 @@ import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
 import { forwardToCloud } from "./forward";
+import { isHopCoolingDown, markHopCooldown } from "./hop-cooldown";
 import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
@@ -456,10 +457,19 @@ const hopFormat = (wire: TUpstreamWire): "openai" | "anthropic" =>
 
 /** Best-effort error-envelope extraction for reason tagging. Parsing is never
  * a routing gate: an unknown provider body still represents an uncommitted
- * candidate failure and therefore walks. */
+ * candidate failure and therefore walks.
+ *
+ * A STRING-valued `error` is lifted into the canonical envelope: xAI's CLI
+ * proxy answers an exhausted balance with `{"error":"Grok Build usage balance
+ * exhausted"}`, and dropping that prose left the classifier with an empty
+ * message — tagging the hop `payment` (60s) instead of `quota_exhausted`, so
+ * the dead account was re-dialled all session. */
 const errorEnvelopeFrom = (raw: string): TErrorEnvelope | undefined => {
   try {
     const json = JSON.parse(raw) as { error?: unknown };
+    if (typeof json.error === "string") {
+      return { error: { message: json.error, type: "upstream_error" } };
+    }
     return json.error !== null && typeof json.error === "object"
       ? { error: json.error as TErrorEnvelope["error"] }
       : undefined;
@@ -660,10 +670,38 @@ const inboundBetaOf = (args: TWalkArgs): string | null =>
 
 /**
  * Apply a transform to every tool's `parameters` schema in a built upstream
- * body, leaving tools without an object `parameters` (and non-array `tools`)
- * untouched. Shared by the keyword-strip + ref-normalization compat branches so
- * the two can't drift.
+ * body, leaving tools without a `parameters` (and non-array `tools`) untouched.
+ * Shared by the keyword-strip + ref-normalization compat branches so the two
+ * can't drift.
+ *
+ * BOTH tool shapes are handled, because the daemon's upstream wires disagree:
+ *   - Responses wire (grok, chatgpt) — FLAT `{type,name,parameters}`;
+ *   - chat-completions wire (kimi_code) — NESTED
+ *     `{type:"function", function:{name,parameters}}`.
+ * Only matching the flat shape forwarded Kimi's tools verbatim, which Moonshot
+ * 400s ("tools.function.parameters is not a valid moonshot flavored json
+ * schema … references must start with #/$defs/").
  */
+const mapOneToolParameters = (
+  tool: unknown,
+  transform: (params: unknown) => unknown,
+): unknown => {
+  if (tool === null || typeof tool !== "object") return tool;
+  const rec = tool as Record<string, unknown>;
+  if ("parameters" in rec) {
+    return { ...rec, parameters: transform(rec.parameters) };
+  }
+  const fn = rec.function;
+  if (fn !== null && typeof fn === "object" && "parameters" in fn) {
+    const fnRec = fn as Record<string, unknown>;
+    return {
+      ...rec,
+      function: { ...fnRec, parameters: transform(fnRec.parameters) },
+    };
+  }
+  return tool;
+};
+
 const mapToolParameters = (
   out: Record<string, unknown>,
   transform: (params: unknown) => unknown,
@@ -671,14 +709,7 @@ const mapToolParameters = (
   if (!Array.isArray(out.tools)) return out;
   return {
     ...out,
-    tools: out.tools.map((tool) =>
-      tool !== null && typeof tool === "object" && "parameters" in tool
-        ? {
-            ...(tool as Record<string, unknown>),
-            parameters: transform((tool as Record<string, unknown>).parameters),
-          }
-        : tool,
-    ),
+    tools: out.tools.map((tool) => mapOneToolParameters(tool, transform)),
   };
 };
 
@@ -1503,6 +1534,27 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       reason,
       ...(status !== undefined ? { status } : {}),
     });
+    // Cool the hop on THIS box too — the cloud mark is best-effort and
+    // cross-process, so without a local table an exhausted account is
+    // re-dialled on every subsequent request (see hop-cooldown.ts).
+    if (cooldownReason !== undefined) {
+      markHopCooldown(hop.provider, hop.modelId, cooldownReason);
+    }
+    // The vendor just TOLD us this account is out of quota. Schedule the same
+    // debounced, rate-limited usage sample a successful request schedules, so
+    // the quota gate gets a rejected snapshot to route on for the rest of the
+    // window — an exhausted account produces no successful request, so nothing
+    // else would ever re-sample it.
+    if (cooldownReason === "quota_exhausted") {
+      const delegate = getDelegate(hop.provider);
+      if (delegate !== null) {
+        sampleUsageAfterRequest(
+          hop.provider,
+          () => delegate.usage(),
+          accountHashByProvider.get(hop.provider) ?? undefined,
+        );
+      }
+    }
     reportHopFailure(hop, reason, status, cooldownReason);
   };
   const withHopTrailHeaders = (resp: Response): Response => {
@@ -1533,6 +1585,20 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       continue;
     }
     contextDemotionTarget = null;
+    // ── Local cooldown gate, per hop ──────────────────────────────────
+    // A hop that just failed with a cooling reason (quota exhausted, rate
+    // limited, auth) is not dialled again from this box until its policy TTL
+    // expires. Never applied to the FINAL hop (never-drop-all: the caller gets
+    // the real upstream error, not a synthetic one).
+    if (!finalHop && isHopCoolingDown(hop.provider, hop.modelId)) {
+      lastError = `hop ${hop.modelId} skipped: cooling down after a recent failure`;
+      hopTrail.push({
+        modelId: hop.modelId,
+        provider: hop.provider,
+        reason: lastError,
+      });
+      continue;
+    }
     // ── Context gate, per hop (shared with the cloud chain —
     // `shouldSkipHopForContext`) ──────────────────────────────────────
     // Plan A already happened (the catalog served correct budgets +
