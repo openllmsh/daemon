@@ -68,6 +68,7 @@ import {
   GATE_STALE_CAP_MS,
   quotaGateDecision,
 } from "@openllmsh/wire/features/quota-gate";
+import { encodingForSurface } from "@openllmsh/wire/lib/canonical/encoding-select";
 import {
   estimateAnthropicInputTokens,
   estimateBodyTokens,
@@ -1566,10 +1567,13 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     largest === null
       ? null
       : Math.floor(largest.window * CONTEXT_SKIP_CONFIDENCE_FACTOR);
+  // Measure with the ruler family that matches the wire (Claude for `messages`,
+  // o200k otherwise) — the same choice the compactor's fit check uses.
+  const encoding = encodingForSurface(args.surface);
   if (
     largest === null ||
     compactionTarget === null ||
-    estimateBodyTokens(args.rawBody) <= compactionTarget ||
+    estimateBodyTokens(args.rawBody, encoding) <= compactionTarget ||
     args.req.signal.aborted
   ) {
     return firstPass;
@@ -1582,6 +1586,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     args.rawBody,
     surface,
     compactionTarget,
+    encoding,
   );
   if (!compacted.compacted) return firstPass;
   // Re-walk ONCE with the shrunk body. The compacted retry is itself never
