@@ -51,6 +51,10 @@ import {
   type TServerSearchCall,
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
+import {
+  contextOverflowRequiredTokens,
+  nextLargerContextModel,
+} from "@openllmsh/wire/features/context-demote";
 import { shouldSkipHopForContext } from "@openllmsh/wire/features/context-skip";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import {
@@ -712,6 +716,8 @@ export type THopRetry = {
   readonly status?: number;
   readonly bodySnippet?: string;
   readonly cooldownReason?: TCooldownReason;
+  /** Original overflow response retained when no larger hop remains. */
+  readonly upstreamResponse?: Response;
 };
 
 export type THopServeOutcome = Response | THopRetry;
@@ -729,6 +735,7 @@ export const hopRetry = (
     readonly status?: number;
     readonly bodySnippet?: string;
     readonly cooldownReason?: TCooldownReason;
+    readonly upstreamResponse?: Response;
   },
 ): THopRetry => ({
   kind: "retry",
@@ -739,6 +746,9 @@ export const hopRetry = (
     : {}),
   ...(detail?.cooldownReason !== undefined
     ? { cooldownReason: detail.cooldownReason }
+    : {}),
+  ...(detail?.upstreamResponse !== undefined
+    ? { upstreamResponse: detail.upstreamResponse }
     : {}),
 });
 
@@ -865,6 +875,14 @@ const serveSubscription = async (
           status: resp.status,
           bodySnippet,
           cooldownReason: cls.reason,
+          ...(cls.reason === "context_overflow"
+            ? {
+                upstreamResponse: new Response(raw.length > 0 ? raw : null, {
+                  status: resp.status,
+                  headers: passthroughHeaders(resp),
+                }),
+              }
+            : {}),
         },
       );
     }
@@ -1393,6 +1411,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   let lastError: string | null = null;
   const hopTrail: THopTrailEntry[] = [];
   const attempted: string[] = [];
+  let contextDemotionTarget: string | null = null;
   const reportHopFailure = (
     hop: THop,
     reason: string,
@@ -1448,6 +1467,17 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   for (const [hopIndex, hop] of hops.entries()) {
     attempted.push(hop.modelId);
     const finalHop = hopIndex === hops.length - 1;
+    if (contextDemotionTarget !== null && hop.modelId !== contextDemotionTarget) {
+      const reason = `hop ${hop.modelId} skipped: context overflow requires a larger input window`;
+      lastError = reason;
+      hopTrail.push({
+        modelId: hop.modelId,
+        provider: hop.provider,
+        reason,
+      });
+      continue;
+    }
+    contextDemotionTarget = null;
     // ── Context gate, per hop (shared with the cloud chain —
     // `shouldSkipHopForContext`) ──────────────────────────────────────
     // Plan A already happened (the catalog served correct budgets +
@@ -1542,6 +1572,30 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       if (!isHopRetry(served)) return withHopTrailHeaders(served);
       // Pre-stream candidate failure: record + trail, then walk. Never throw.
       lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
+      if (served.cooldownReason === "context_overflow") {
+        const requiredTokens =
+          contextOverflowRequiredTokens(served.bodySnippet ?? served.reason) ??
+          baseEstimate;
+        const nextModel = nextLargerContextModel(
+          hops.map((candidate) => candidate.modelId),
+          hop.modelId,
+          requiredTokens,
+          (modelId) => lookupCatalogEntry(modelId)?.input_token_limit ?? null,
+        );
+        if (nextModel !== null && !args.req.signal.aborted) {
+          hopTrail.push({
+            modelId: hop.modelId,
+            provider: hop.provider,
+            reason: served.reason,
+            ...(served.status !== undefined ? { status: served.status } : {}),
+          });
+          contextDemotionTarget = nextModel;
+          continue;
+        }
+        if (served.upstreamResponse !== undefined) {
+          return withHopTrailHeaders(served.upstreamResponse);
+        }
+      }
       addHopFailure(hop, served.reason, served.status, served.cooldownReason);
       continue;
     }
@@ -1575,14 +1629,37 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       );
       if (cls.kind === "transient") {
         lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
-        addHopFailure(
-          hop,
+        const reason =
           hopBodySnippet(raw).length > 0
             ? `HTTP ${resp.status}: ${hopBodySnippet(raw)}`
-            : lastError,
-          resp.status,
-          cls.reason,
-        );
+            : lastError;
+        if (cls.reason === "context_overflow") {
+          const requiredTokens =
+            contextOverflowRequiredTokens(raw) ?? baseEstimate;
+          const nextModel = nextLargerContextModel(
+            hops.map((candidate) => candidate.modelId),
+            hop.modelId,
+            requiredTokens,
+            (modelId) => lookupCatalogEntry(modelId)?.input_token_limit ?? null,
+          );
+          if (nextModel !== null && !args.req.signal.aborted) {
+            hopTrail.push({
+              modelId: hop.modelId,
+              provider: hop.provider,
+              reason,
+              status: resp.status,
+            });
+            contextDemotionTarget = nextModel;
+            continue;
+          }
+          return withHopTrailHeaders(
+            new Response(resp.body, {
+              status: resp.status,
+              headers: passthroughHeaders(resp),
+            }),
+          );
+        }
+        addHopFailure(hop, reason, resp.status, cls.reason);
         continue;
       }
     }
