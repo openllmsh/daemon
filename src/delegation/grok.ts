@@ -30,8 +30,10 @@
  *     OAuth token (401 on a bad/absent token; the extra `x-grok-client-*`
  *     headers aren't required but are sent for parity). Returns
  *     `{ config: { monthlyLimit:{val}, used:{val}, billingPeriodStart/End, … } }`
- *     — we surface the included-quota window as one bar (see
- *     {@link parseGrokBilling}). Verified live against a SuperGrok / X Premium+
+ *     for the MONTHLY view, and `?format=credits` for the WEEKLY Grok Build pool
+ *     (`creditUsagePercent` / `productUsage[GrokBuild]` / `currentPeriod`) — the
+ *     primary limit `grok /usage` shows. We surface BOTH windows (weekly first;
+ *     see {@link parseGrokUsage}). Verified live against a SuperGrok / X Premium+
  *     session. (An earlier probe wrongly concluded usage was forbidden — it hit
  *     `grok.com/rest/rate-limits`, a DIFFERENT grpc gateway that 404/501s these
  *     routes regardless of token; that was a wrong host, not a tier limit.)
@@ -44,7 +46,10 @@
  */
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
+import type {
+  TProviderUsageSnapshot,
+  TProviderUsageWindow,
+} from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
@@ -309,9 +314,11 @@ const deviceLogin = makeStreamDeviceConnect({
 // the CLI binary's own `billing.rs` struct):
 //   { config: { monthlyLimit:{val}, used:{val}, onDemandCap:{val},
 //               billingPeriodStart, billingPeriodEnd, history:[…] } }
-// We surface the INCLUDED-quota window (`used` / `monthlyLimit`) as one bar; the
-// period end is the reset. `?format=credits` returns a different (weekly
-// on-demand/prepaid) view we don't use.
+// The plain path gives the MONTHLY included-credit window (`used` /
+// `monthlyLimit`; period end = reset). `?format=credits` gives the WEEKLY Grok
+// Build pool (`creditUsagePercent` / `productUsage[GrokBuild]`; `currentPeriod`)
+// — the primary limit `grok /usage` + grok.com show and the one that gates
+// inference. We surface BOTH (weekly first); see {@link parseGrokUsage}.
 
 type TGrokBillingVal = { readonly val?: number };
 type TGrokBillingConfig = {
@@ -321,47 +328,125 @@ type TGrokBillingConfig = {
 };
 type TGrokBilling = { readonly config?: TGrokBillingConfig };
 
-/** Map a `/v1/billing` body into a usage snapshot. Pure (no network) so it can
- *  be unit-tested. Returns `unavailable` when there is no included-quota window
- *  (a plan that only reports on-demand credit), so the UI points to grok.com. */
-export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot => {
+// The `?format=credits` view — the WEEKLY unified-billing pool the Grok CLI's
+// own `/usage` and the grok.com dashboard show, and the one that actually gates
+// Grok Build inference (verified live 2026-07: an account at 47% monthly can be
+// 100% weekly and 402 "Grok Build usage balance exhausted"). `creditUsagePercent`
+// is the overall figure; `productUsage[GrokBuild].usagePercent` is the same pool
+// per-product. `currentPeriod.end` is the weekly reset.
+type TGrokCreditsPeriod = {
+  readonly type?: string;
+  readonly end?: string;
+};
+type TGrokCreditsProductUsage = {
+  readonly product?: string;
+  readonly usagePercent?: number;
+};
+type TGrokCreditsConfig = {
+  readonly creditUsagePercent?: number;
+  readonly currentPeriod?: TGrokCreditsPeriod;
+  readonly productUsage?: ReadonlyArray<TGrokCreditsProductUsage>;
+};
+type TGrokCredits = { readonly config?: TGrokCreditsConfig };
+
+const GROK_NOTE = "Grok — read locally via Grok CLI";
+const clampPercent = (n: number): number => Math.max(0, Math.min(100, n));
+const parseIsoMs = (iso: string | undefined): number | null => {
+  if (typeof iso !== "string") return null;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? null : t;
+};
+
+// One usage window plus the escalated status a set of windows implies (the
+// MOST-used window drives the overall status — an exhausted weekly pool must
+// `reject` even when monthly has headroom).
+const statusForWindows = (
+  windows: ReadonlyArray<TProviderUsageWindow>,
+): "allowed" | "allowed_warning" | "rejected" => {
+  const peak = windows.reduce((m, w) => Math.max(m, w.percent_used), 0);
+  return peak >= 100 ? "rejected" : peak >= 80 ? "allowed_warning" : "allowed";
+};
+
+/** The MONTHLY included-credit window from a plain `/v1/billing` body, or null
+ *  when the plan reports no included-quota window (on-demand-only). */
+export const parseGrokMonthlyWindow = (
+  body: unknown,
+): TProviderUsageWindow | null => {
   const config =
     body !== null && typeof body === "object" && "config" in body
       ? ((body as TGrokBilling).config ?? {})
       : {};
   const limit =
     typeof config.monthlyLimit?.val === "number" ? config.monthlyLimit.val : 0;
-  if (limit <= 0) {
+  if (limit <= 0) return null;
+  const used = typeof config.used?.val === "number" ? config.used.val : 0;
+  return {
+    label: "Monthly",
+    percent_used: clampPercent((used / limit) * 100),
+    reset_at_ms: parseIsoMs(config.billingPeriodEnd),
+  };
+};
+
+/** The WEEKLY Grok Build window from a `?format=credits` body, or null when the
+ *  view lacks a weekly figure. Prefers the GrokBuild per-product percent, then
+ *  the overall `creditUsagePercent`. */
+export const parseGrokWeeklyWindow = (
+  body: unknown,
+): TProviderUsageWindow | null => {
+  const config =
+    body !== null && typeof body === "object" && "config" in body
+      ? ((body as TGrokCredits).config ?? {})
+      : {};
+  const product = config.productUsage?.find((p) => p.product === "GrokBuild");
+  const pct =
+    typeof product?.usagePercent === "number"
+      ? product.usagePercent
+      : typeof config.creditUsagePercent === "number"
+        ? config.creditUsagePercent
+        : null;
+  if (pct === null) return null;
+  return {
+    label: "Weekly",
+    percent_used: clampPercent(pct),
+    reset_at_ms: parseIsoMs(config.currentPeriod?.end),
+  };
+};
+
+/** Combine the weekly (`?format=credits`) + monthly (plain) views into ONE
+ *  snapshot. Weekly is listed first (it's the pool that gates Grok Build
+ *  inference; the CLI's `/usage` shows it). `creditsBody` may be null when that
+ *  fetch failed — the snapshot then degrades to monthly-only rather than going
+ *  unavailable. Pure (no network) so it can be unit-tested. Returns
+ *  `unavailable` only when NEITHER view yields a window. */
+export const parseGrokUsage = (
+  billingBody: unknown,
+  creditsBody: unknown,
+): TProviderUsageSnapshot => {
+  const weekly = parseGrokWeeklyWindow(creditsBody);
+  const monthly = parseGrokMonthlyWindow(billingBody);
+  const windows = [weekly, monthly].filter(
+    (w): w is TProviderUsageWindow => w !== null,
+  );
+  if (windows.length === 0) {
     return {
       kind: "unavailable",
       reason: "Grok reported no included-quota window for this plan.",
       link: "https://grok.com",
     };
   }
-  const used = typeof config.used?.val === "number" ? config.used.val : 0;
-  const percentUsed = Math.max(0, Math.min(100, (used / limit) * 100));
-  const resetMs =
-    typeof config.billingPeriodEnd === "string"
-      ? Date.parse(config.billingPeriodEnd)
-      : Number.NaN;
   return {
     kind: "quota",
-    status:
-      percentUsed >= 100
-        ? "rejected"
-        : percentUsed >= 80
-          ? "allowed_warning"
-          : "allowed",
-    windows: [
-      {
-        label: "Monthly",
-        percent_used: percentUsed,
-        reset_at_ms: Number.isNaN(resetMs) ? null : resetMs,
-      },
-    ],
-    note: "Grok — read locally via Grok CLI",
+    status: statusForWindows(windows),
+    windows,
+    note: GROK_NOTE,
   };
 };
+
+/** Back-compat monthly-only snapshot from a plain `/v1/billing` body. Retained
+ *  for callers/tests that only exercise the monthly view; new code uses
+ *  {@link parseGrokUsage} to include the weekly Grok Build pool. */
+export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot =>
+  parseGrokUsage(body, null);
 
 // ─── Live model rows (shared by listModels + per-hop capability reads) ─────
 //
@@ -504,36 +589,61 @@ export const grokDelegate: TProviderDelegate = {
     if (token === null) {
       return { kind: "unavailable", reason: "not signed in to Grok" };
     }
-    try {
-      // Same host as inference (`resolveProviderUrl` derives it from the captured
-      // upstream, never spawning the CLI). The plain OAuth bearer is accepted;
-      // we send the CLI's genuine identity headers too, mirroring
-      // `credentialForUpstream`.
-      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
-        method: "GET",
-        headers: {
-          authorization: `Bearer ${token.accessToken}`,
-          "x-grok-client-version": await clientVersion(),
-          "x-grok-client-identifier": "xai-grok-cli",
-          accept: "application/json",
-        },
-      });
-      if (!resp.ok) {
-        const reason =
-          resp.status === 401
-            ? "Grok authorization was rejected — re-sign in via `grok login`."
-            : resp.status === 403
-              ? "No active SuperGrok / X Premium+ subscription on this account."
-              : `Grok couldn't report usage (HTTP ${resp.status}).`;
-        return { kind: "unavailable", reason, link: "https://grok.com" };
+    // Same host as inference (`resolveProviderUrl` derives it from the captured
+    // upstream, never spawning the CLI). The plain OAuth bearer is accepted; we
+    // send the CLI's genuine identity headers too, mirroring
+    // `credentialForUpstream`.
+    const headers = {
+      authorization: `Bearer ${token.accessToken}`,
+      "x-grok-client-version": await clientVersion(),
+      "x-grok-client-identifier": "xai-grok-cli",
+      accept: "application/json",
+    };
+    // One authed billing GET → the parsed body, or a `{ error }` marker carrying
+    // the HTTP status so the WEEKLY (primary) view can turn a hard error into an
+    // `unavailable` snapshot while a MONTHLY failure just degrades gracefully.
+    const getBilling = async (
+      path: string,
+    ): Promise<{ body: unknown } | { error: number }> => {
+      try {
+        const resp = await fetch(await resolveProviderUrl(PROVIDER, path), {
+          method: "GET",
+          headers,
+          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+        });
+        if (!resp.ok) return { error: resp.status };
+        return { body: await resp.json() };
+      } catch {
+        return { error: 0 };
       }
-      return parseGrokBilling(await resp.json());
-    } catch (err) {
-      return {
-        kind: "unavailable",
-        reason: err instanceof Error ? err.message : "usage fetch failed",
-      };
+    };
+
+    // The WEEKLY Grok Build pool (`?format=credits`) is the primary limit —
+    // it's what `grok /usage` and grok.com show and what gates inference; the
+    // MONTHLY included-credit view (plain path) is secondary. Fetch both; weekly
+    // decides the error envelope, monthly is best-effort (null → weekly-only).
+    const [credits, monthly] = await Promise.all([
+      getBilling(`${USAGE_PATH}?format=credits`),
+      getBilling(USAGE_PATH),
+    ]);
+
+    if ("error" in credits && "error" in monthly) {
+      const status = credits.error;
+      const reason =
+        status === 401
+          ? "Grok authorization was rejected — re-sign in via `grok login`."
+          : status === 403
+            ? "No active SuperGrok / X Premium+ subscription on this account."
+            : status === 0
+              ? "Grok usage fetch failed."
+              : `Grok couldn't report usage (HTTP ${status}).`;
+      return { kind: "unavailable", reason, link: "https://grok.com" };
     }
+
+    return parseGrokUsage(
+      "body" in monthly ? monthly.body : null,
+      "body" in credits ? credits.body : null,
+    );
   },
 
   listModels: async () => {
