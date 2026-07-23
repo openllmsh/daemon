@@ -87,7 +87,10 @@ import {
   UpstreamStreamError,
   upstreamErrorFrom,
 } from "@openllmsh/wire/lib/streaming/upstream-error";
-import { stripSchemaKeywords } from "@openllmsh/wire/lib/tool-schema";
+import {
+  normalizeSchemaRefs,
+  stripSchemaKeywords,
+} from "@openllmsh/wire/lib/tool-schema";
 import { fromAnthropicResponse } from "@openllmsh/wire/providers/anthropic/response";
 import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
 import {
@@ -656,6 +659,30 @@ const inboundBetaOf = (args: TWalkArgs): string | null =>
   args.surface === "messages" ? args.req.headers.get("anthropic-beta") : null;
 
 /**
+ * Apply a transform to every tool's `parameters` schema in a built upstream
+ * body, leaving tools without an object `parameters` (and non-array `tools`)
+ * untouched. Shared by the keyword-strip + ref-normalization compat branches so
+ * the two can't drift.
+ */
+const mapToolParameters = (
+  out: Record<string, unknown>,
+  transform: (params: unknown) => unknown,
+): Record<string, unknown> => {
+  if (!Array.isArray(out.tools)) return out;
+  return {
+    ...out,
+    tools: out.tools.map((tool) =>
+      tool !== null && typeof tool === "object" && "parameters" in tool
+        ? {
+            ...(tool as Record<string, unknown>),
+            parameters: transform((tool as Record<string, unknown>).parameters),
+          }
+        : tool,
+    ),
+  };
+};
+
+/**
  * Delegate-owned per-model request compat, applied to the BUILT upstream body
  * (grok today; a no-op for delegates that declare neither knob — audit
  * 2026-07-14 §F2/§F7):
@@ -690,25 +717,15 @@ export const applyDelegateModelCompat = async (
     }
   }
   const keywords = delegate.unsupportedToolSchemaKeywords;
-  if (
-    keywords !== undefined &&
-    keywords.length > 0 &&
-    Array.isArray(out.tools)
-  ) {
-    out = {
-      ...out,
-      tools: out.tools.map((tool) =>
-        tool !== null && typeof tool === "object" && "parameters" in tool
-          ? {
-              ...(tool as Record<string, unknown>),
-              parameters: stripSchemaKeywords(
-                (tool as Record<string, unknown>).parameters,
-                keywords,
-              ),
-            }
-          : tool,
-      ),
-    };
+  if (keywords !== undefined && keywords.length > 0) {
+    out = mapToolParameters(out, (params) =>
+      stripSchemaKeywords(params, keywords),
+    );
+  }
+  // Ref normalization runs AFTER keyword stripping so both transforms compose on
+  // one hop that opts into both (Kimi: refs only, today). See §3.2.
+  if (delegate.normalizesToolSchemaRefs === true) {
+    out = mapToolParameters(out, (params) => normalizeSchemaRefs(params));
   }
   return out;
 };

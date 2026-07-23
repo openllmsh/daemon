@@ -116,6 +116,16 @@ export type TProviderDelegate = {
   readonly unsupportedToolSchemaKeywords?: ReadonlyArray<string>;
 
   /**
+   * When true, the walker rewrites every tool `parameters` schema so local
+   * definitions `$ref`s point at `#/$defs/…` (`#/definitions/…` → `#/$defs/…`;
+   * `definitions` map → `$defs`) before the upstream call. Kimi/Moonshot's
+   * endpoint 400s any other ref base ("references must start with #/$defs/").
+   * Applied after keyword stripping. Absent/false = forward refs verbatim. See
+   * docs/proposals/kimi-tool-schema-ref-normalization.md.
+   */
+  readonly normalizesToolSchemaRefs?: boolean;
+
+  /**
    * Produce, for ONE inference call: the bearer (from the official CLI's store),
    * the request TARGET `url` (captured from a real CLI request, or the default),
    * and only the CREDENTIAL-INTRINSIC `headers` — the small set the request can't

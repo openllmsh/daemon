@@ -581,6 +581,12 @@ const cancelConnect = makeCancelConnect(PROVIDER, slot, {
 export const kimiCodeDelegate: TProviderDelegate = {
   slug: PROVIDER,
 
+  // Moonshot's endpoint rejects tool-schema `$ref`s not based at `#/$defs/`
+  // ("not a valid moonshot flavored json schema … references must start with
+  // #/$defs/"); the walker normalizes them before the upstream call. See
+  // docs/proposals/kimi-tool-schema-ref-normalization.md.
+  normalizesToolSchemaRefs: true,
+
   connect: connectDevice,
   cancelConnect,
 
