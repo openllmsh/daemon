@@ -44,6 +44,7 @@ import {
   type TAnthropicResponse,
   type TChatCompletionChunk,
   type TChatCompletionResponse,
+  type TCooldownReason,
   type TDaemonRecordRequest,
   type TErrorEnvelope,
   type TRequestStatus,
@@ -710,6 +711,7 @@ export type THopRetry = {
   readonly reason: string;
   readonly status?: number;
   readonly bodySnippet?: string;
+  readonly cooldownReason?: TCooldownReason;
 };
 
 export type THopServeOutcome = Response | THopRetry;
@@ -723,13 +725,20 @@ export type THopTrailEntry = {
 
 export const hopRetry = (
   reason: string,
-  detail?: { readonly status?: number; readonly bodySnippet?: string },
+  detail?: {
+    readonly status?: number;
+    readonly bodySnippet?: string;
+    readonly cooldownReason?: TCooldownReason;
+  },
 ): THopRetry => ({
   kind: "retry",
   reason,
   ...(detail?.status !== undefined ? { status: detail.status } : {}),
   ...(detail?.bodySnippet !== undefined && detail.bodySnippet.length > 0
     ? { bodySnippet: detail.bodySnippet }
+    : {}),
+  ...(detail?.cooldownReason !== undefined
+    ? { cooldownReason: detail.cooldownReason }
     : {}),
 });
 
@@ -754,7 +763,10 @@ export const formatHopFailuresHeader = (
       // Keep the sanitized reason detail even when a status is present — a
       // bare `model:403` loses the "usage limit" / "context window" context
       // that makes the trail diagnosable.
-      const tag = e.reason.replace(/[\r\n;,]+/g, " ").trim().slice(0, 48);
+      const tag = e.reason
+        .replace(/[\r\n;,]+/g, " ")
+        .trim()
+        .slice(0, 48);
       const label = tag.length > 0 ? tag : "failed";
       return e.status !== undefined
         ? `${e.modelId}:${e.status}:${label}`
@@ -831,22 +843,30 @@ const serveSubscription = async (
     finalHop,
     args.req.signal,
   );
-  if (resp === null) return hopRetry("network error"); // pre-stream, fall through
+  if (resp === null) {
+    return hopRetry("network error", { cooldownReason: "network" });
+  }
   if (!resp.ok) {
     const raw = await resp.text().catch(() => "");
     const bodySnippet = hopBodySnippet(raw);
     // No output has been committed yet. A different configured candidate may
     // accept the same canonical request regardless of this provider's status
     // code or envelope shape, so use the shared cloud/daemon policy.
-    if (
-      !finalHop &&
-      classifyPrecommitResponse(resp.status, raw, wire, args.req.signal.aborted)
-        .kind === "transient"
-    ) {
-      return hopRetry(`HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`, {
-        status: resp.status,
-        bodySnippet,
-      });
+    const cls = classifyPrecommitResponse(
+      resp.status,
+      raw,
+      wire,
+      args.req.signal.aborted,
+    );
+    if (!finalHop && cls.kind === "transient") {
+      return hopRetry(
+        `HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`,
+        {
+          status: resp.status,
+          bodySnippet,
+          cooldownReason: cls.reason,
+        },
+      );
     }
     // The final hop has nowhere to walk (or the caller aborted): surface the
     // upstream response verbatim, including status and Retry-After. Still
@@ -860,6 +880,8 @@ const serveSubscription = async (
         latency_ms: Date.now() - args.startedAt,
         endpoint: args.endpoint,
         error: `HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`,
+        cooldown_reason:
+          cls.kind === "transient" ? cls.reason : "upstream_rejection",
         ...(accountHash !== null ? { account_hash: accountHash } : {}),
       },
       args.originParam,
@@ -1145,7 +1167,10 @@ const serveKimiBuiltinSearch = async (
     totals.tokens_in += Number(usage.prompt_tokens ?? 0) || 0;
     totals.tokens_out += Number(usage.completion_tokens ?? 0) || 0;
   };
-  const recordOnce = (status: TRequestStatus): void =>
+  const recordOnce = (
+    status: TRequestStatus,
+    cooldownReason?: TCooldownReason,
+  ): void =>
     report(
       {
         model: hop.modelId,
@@ -1153,6 +1178,9 @@ const serveKimiBuiltinSearch = async (
         status,
         latency_ms: Date.now() - args.startedAt,
         endpoint: args.endpoint,
+        ...(cooldownReason !== undefined
+          ? { cooldown_reason: cooldownReason }
+          : {}),
         ...(acquired.accountHash !== null
           ? { account_hash: acquired.accountHash }
           : {}),
@@ -1176,7 +1204,9 @@ const serveKimiBuiltinSearch = async (
     // re-run the whole conversation, so surface the continuation failure
     // instead and record what was consumed.
     if (resp === null) {
-      if (round === 0) return hopRetry("network error");
+      if (round === 0) {
+        return hopRetry("network error", { cooldownReason: "network" });
+      }
       recordOnce("error");
       return errorJson(
         502,
@@ -1186,22 +1216,26 @@ const serveKimiBuiltinSearch = async (
     if (!resp.ok) {
       const raw = await resp.text().catch(() => "");
       const bodySnippet = hopBodySnippet(raw);
-      if (
-        round === 0 &&
-        !finalHop &&
-        classifyPrecommitResponse(
-          resp.status,
-          raw,
-          wire,
-          args.req.signal.aborted,
-        ).kind === "transient"
-      ) {
-        return hopRetry(`HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`, {
-          status: resp.status,
-          bodySnippet,
-        });
+      const cls = classifyPrecommitResponse(
+        resp.status,
+        raw,
+        wire,
+        args.req.signal.aborted,
+      );
+      if (round === 0 && !finalHop && cls.kind === "transient") {
+        return hopRetry(
+          `HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`,
+          {
+            status: resp.status,
+            bodySnippet,
+            cooldownReason: cls.reason,
+          },
+        );
       }
-      recordOnce(statusFor(resp.status));
+      recordOnce(
+        statusFor(resp.status),
+        cls.kind === "transient" ? cls.reason : undefined,
+      );
       return new Response(raw.length > 0 ? raw : null, {
         status: resp.status,
         headers: passthroughHeaders(resp),
@@ -1363,6 +1397,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     hop: THop,
     reason: string,
     status?: number,
+    cooldownReason?: TCooldownReason,
   ): void => {
     report(
       {
@@ -1373,6 +1408,9 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         latency_ms: Date.now() - args.startedAt,
         endpoint: args.endpoint,
         error: reason,
+        ...(cooldownReason !== undefined
+          ? { cooldown_reason: cooldownReason }
+          : {}),
       },
       args.originParam,
     );
@@ -1386,6 +1424,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     hop: THop,
     reason: string,
     status?: number,
+    cooldownReason?: TCooldownReason,
   ): void => {
     hopTrail.push({
       modelId: hop.modelId,
@@ -1393,7 +1432,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       reason,
       ...(status !== undefined ? { status } : {}),
     });
-    reportHopFailure(hop, reason, status);
+    reportHopFailure(hop, reason, status, cooldownReason);
   };
   const withHopTrailHeaders = (resp: Response): Response => {
     if (attempted.length === 0 && hopTrail.length === 0) return resp;
@@ -1503,7 +1542,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       if (!isHopRetry(served)) return withHopTrailHeaders(served);
       // Pre-stream candidate failure: record + trail, then walk. Never throw.
       lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
-      addHopFailure(hop, served.reason, served.status);
+      addHopFailure(hop, served.reason, served.status, served.cooldownReason);
       continue;
     }
     // API-key hop: forward to the cloud pinned to this concrete model.
@@ -1542,6 +1581,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
             ? `HTTP ${resp.status}: ${hopBodySnippet(raw)}`
             : lastError,
           resp.status,
+          cls.reason,
         );
         continue;
       }
