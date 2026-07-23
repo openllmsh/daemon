@@ -63,7 +63,10 @@ import {
   GATE_STALE_CAP_MS,
   quotaGateDecision,
 } from "@openllmsh/wire/features/quota-gate";
-import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
+import {
+  estimateAnthropicInputTokens,
+  estimateBodyTokens,
+} from "@openllmsh/wire/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
   responsesBodyHasEncryptedContent,
@@ -132,6 +135,7 @@ import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
 import { forwardToCloud } from "./forward";
 import { isHopCoolingDown, markHopCooldown } from "./hop-cooldown";
+import { logWarn } from "./logger";
 import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
@@ -1862,6 +1866,135 @@ export const resolveCompactModelId = (
   }
   const model = (rawBody as { model?: unknown } | null)?.model;
   return typeof model === "string" ? model : "";
+};
+
+/**
+ * Upstream count-tokens endpoint for an Anthropic `/v1/messages` URL — the
+ * delegate's captured inference URL just gains the `/count_tokens` leaf, with
+ * the query string preserved. Returns `null` when the captured URL is NOT a
+ * `/messages` endpoint: we never GUESS a vendor path, and the caller falls back
+ * to the local estimate instead.
+ */
+export const countTokensUpstreamUrl = (messagesUrl: string): string | null => {
+  let u: URL;
+  try {
+    u = new URL(messagesUrl);
+  } catch {
+    return null;
+  }
+  const path = u.pathname.replace(/\/+$/, "");
+  if (!path.endsWith("/messages")) return null;
+  u.pathname = `${path}/count_tokens`;
+  return u.toString();
+};
+
+/**
+ * Serve `POST /v1/messages/count_tokens` — Claude Code's PREFLIGHT (model
+ * availability + the context-window indicator). It is NOT inference and must
+ * never be walked as such.
+ *
+ * It used to be: the listener's surface test (`endsWith("/messages")`) missed
+ * this path, so it fell through to the `chat_completions` default, the body was
+ * pushed through the OpenAI→Anthropic adapter (which deliberately DROPS
+ * `cache_control` — no non-Anthropic upstream honours it) and POSTed to the
+ * captured INFERENCE url. Every context-indicator tick therefore ran a real,
+ * fully-uncached, max-context Opus generation, walked the whole fallback chain
+ * when it failed, and drew opaque `rate_limit_error` 429s from Anthropic — a
+ * request shape no genuine Claude Code ever sends.
+ *
+ * Now: ONE hop, no walk. When the plan's head speaks the Anthropic wire we
+ * forward the client's body verbatim to the vendor's own `/count_tokens` leaf
+ * (free, consumes no quota) through the shared `buildUpstreamRequest` recipe —
+ * so it carries the same identity + `anthropic-version`/`anthropic-beta` as
+ * inference, with only `model` pinned and adaptive-thinking normalised.
+ * ANYTHING else — untrusted plan, non-Anthropic head, no credential, an
+ * unrecognised captured url, or a non-2xx upstream — answers
+ * `estimateAnthropicInputTokens`, the SAME estimator the cloud handler serves,
+ * so the number a client sees doesn't shift with which surface answered. A
+ * preflight always returns a `{ input_tokens }` body, never a bare 4xx. No usage
+ * row is recorded; the vendor bills nothing for a token count.
+ */
+export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
+  const estimate = (reason: string): Response => {
+    logWarn(
+      "count-tokens",
+      `serving local estimate for ${args.endpoint}: ${reason}`,
+    );
+    return new Response(
+      JSON.stringify({
+        input_tokens: estimateAnthropicInputTokens(args.rawBody),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+  // A forged plan must not steer which vendor sees the body (same rule as
+  // `runWalker`); an untrusted plan degrades to the estimate rather than 403ing
+  // — the preflight contract is a number, not an error.
+  if (
+    !planSignatureOk(
+      args.planParam,
+      args.pmidsParam,
+      args.originParam,
+      args.sigParam,
+    )
+  ) {
+    return estimate("plan signature missing or invalid");
+  }
+  const planModelIds = parsePlan(args.planParam);
+  const head = planModelIds[0];
+  if (head === undefined) return estimate("no plan");
+  const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
+  // The HEAD of the chain only: it's the hop that would serve the matching
+  // `/v1/messages` call, so it's the one whose tokenizer the client is asking
+  // about. A preflight never walks — a fallback hop's count would describe a
+  // model the request isn't going to.
+  const hop = resolveHop(head, pmids[0]);
+  if (UPSTREAM_WIRE[hop.provider] !== "anthropic") {
+    return estimate(`${hop.provider} has no count_tokens endpoint`);
+  }
+  const acquired = await acquireUpstream(hop.provider, args);
+  if (acquired === "retry") {
+    return estimate(`no usable ${hop.provider} credential`);
+  }
+  const url = countTokensUpstreamUrl(acquired.url);
+  if (url === null) {
+    return estimate("captured upstream url is not a /messages endpoint");
+  }
+  const built = buildUpstreamRequest({
+    surface: "messages",
+    upstreamWire: "anthropic",
+    rawBody: args.rawBody,
+    providerModelId: hop.providerModelId,
+    // `undefined` preserves the body's own stream flag — a count_tokens body
+    // carries none, and injecting one would diverge from the real CLI.
+    stream: undefined,
+    baseHeaders: acquired.headers,
+    inboundBeta: inboundBetaOf(args),
+    isOAuth: true,
+  });
+  let resp: Response;
+  let text: string;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: built.headers,
+      body: JSON.stringify(built.body),
+      signal: args.req.signal,
+    });
+    // The body read is INSIDE the try: a mid-body stream error (or the client
+    // aborting) rejects here, and a preflight that throws would surface as a
+    // 500 — the one thing this handler promises never to do.
+    text = await resp.text();
+  } catch (err) {
+    return estimate(`upstream unreachable: ${sanitizeErrorLine(err, 200)}`);
+  }
+  if (!resp.ok) {
+    return estimate(`upstream ${resp.status}: ${text.slice(0, 200)}`);
+  }
+  return new Response(text, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 };
 
 /**

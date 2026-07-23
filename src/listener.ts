@@ -15,6 +15,7 @@
  */
 
 import {
+  AnthropicCountTokensRequest,
   AnthropicRequest,
   ChatCompletionRequest,
   ResponsesRequest,
@@ -31,6 +32,7 @@ import { lookupPlan, storePlan } from "./plan-cache";
 import {
   parsePlan,
   planSignatureOk,
+  runCountTokens,
   runResponsesCompact,
   runWalker,
 } from "./walker";
@@ -38,6 +40,9 @@ import {
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
 const parseResponsesRequest = Schema.decodeUnknownSync(ResponsesRequest);
+const parseCountTokensRequest = Schema.decodeUnknownSync(
+  AnthropicCountTokensRequest,
+);
 
 /**
  * Add CORS headers to a response WITHOUT consuming its body, so streaming
@@ -65,8 +70,13 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // verbatim vendor passthrough (`runResponsesCompact`) — no surface
   // schema, no walk.
   const isResponsesCompact = url.pathname.endsWith("/responses/compact");
+  // Anthropic's PREFLIGHT, not inference. It must be matched BEFORE the
+  // `/messages` test below (which it does not satisfy) or it falls through to
+  // the `chat_completions` default and gets served as a real Opus generation —
+  // see `runCountTokens` for what that cost us.
+  const isCountTokens = url.pathname.endsWith("/messages/count_tokens");
   const surface: "chat_completions" | "messages" | "responses" =
-    url.pathname.endsWith("/messages")
+    url.pathname.endsWith("/messages") || isCountTokens
       ? "messages"
       : url.pathname.endsWith("/responses") || isResponsesCompact
         ? "responses"
@@ -91,7 +101,8 @@ export const handleInference = async (req: Request): Promise<Response> => {
   try {
     if (isResponsesCompact) {
       // no-op — verbatim vendor passthrough
-    } else if (surface === "messages") parseAnthropicRequest(rawBody);
+    } else if (isCountTokens) parseCountTokensRequest(rawBody);
+    else if (surface === "messages") parseAnthropicRequest(rawBody);
     else if (surface === "responses") parseResponsesRequest(rawBody);
     else parseOpenAIRequest(rawBody);
   } catch (err) {
@@ -207,6 +218,8 @@ export const handleInference = async (req: Request): Promise<Response> => {
     req,
     await (isResponsesCompact
       ? runResponsesCompact(walkArgs)
-      : runWalker(walkArgs)),
+      : isCountTokens
+        ? runCountTokens(walkArgs)
+        : runWalker(walkArgs)),
   );
 };
