@@ -86,11 +86,34 @@ type TUsageEntry = {
 };
 
 const cache = new Map<string, TUsageEntry>();
+const generations = new Map<string, number>();
+
+/** Stable cache partition for a provider identity, preserving legacy slug keys. */
+export const usageCacheKey = (slug: string, accountHash?: string): string =>
+  accountHash === undefined ? slug : `${slug}#${accountHash}`;
+
+const generationFor = (key: string): number => generations.get(key) ?? 0;
+
+const bumpGeneration = (key: string): void => {
+  generations.set(key, generationFor(key) + 1);
+};
+
+const matchesSlug = (key: string, slug: string): boolean =>
+  key === slug || key.startsWith(`${slug}#`);
+
+const clearRequestSamples = (matches: (key: string) => boolean): void => {
+  for (const [key, sample] of requestSamples.entries()) {
+    if (!matches(key)) continue;
+    if (sample.timer !== null) clearTimeout(sample.timer);
+    requestSamples.delete(key);
+  }
+};
 
 type TRequestSample = {
   fetcher: () => Promise<TProviderUsageSnapshot>;
   timer: ReturnType<typeof setTimeout> | null;
   lastSampleAtMs: number;
+  generation: number;
 };
 
 const requestSamples = new Map<string, TRequestSample>();
@@ -202,10 +225,12 @@ const servable = (entry: TUsageEntry, now: number): TProviderUsageSnapshot => {
 export const cachedUsage = async (
   slug: string,
   fetcher: () => Promise<TProviderUsageSnapshot>,
-  options: { readonly force?: boolean } = {},
+  options: { readonly force?: boolean; readonly accountHash?: string } = {},
 ): Promise<TProviderUsageSnapshot> => {
+  const key = usageCacheKey(slug, options.accountHash);
+  const generation = generationFor(key);
   const now = Date.now();
-  const entry = cache.get(slug);
+  const entry = cache.get(key);
   if (entry !== undefined) {
     // Fresh, usable snapshot — serve it with no upstream call.
     if (
@@ -249,7 +274,10 @@ export const cachedUsage = async (
       };
     }
     const at = Date.now();
-    const prev = cache.get(slug);
+    if (generationFor(key) !== generation) {
+      return { kind: "unavailable", reason: "usage cache invalidated" };
+    }
+    const prev = cache.get(key);
     const updated: TUsageEntry = {
       good: isUsable(next)
         ? { snapshot: next, atMs: at }
@@ -258,7 +286,7 @@ export const cachedUsage = async (
       lastAttemptAtMs: at,
       inFlight: null,
     };
-    cache.set(slug, updated);
+    cache.set(key, updated);
     // Persist the good snapshot (+ attempt time) so a daemon restart can serve
     // it instead of going dark when the post-restart read is rate-limited.
     persist();
@@ -267,7 +295,7 @@ export const cachedUsage = async (
 
   // Publish the in-flight promise so a concurrent caller shares this fetch,
   // preserving the prior good/failure/attempt state for the fallback path.
-  cache.set(slug, {
+  cache.set(key, {
     good: entry?.good ?? null,
     failure: entry?.failure ?? null,
     lastAttemptAtMs: entry?.lastAttemptAtMs ?? 0,
@@ -286,8 +314,11 @@ export const cachedUsage = async (
  * (the daemon booted but no one has demanded usage yet) — the card then simply
  * shows no quota until a `refresh` populates it.
  */
-export const peekUsage = (slug: string): TProviderUsageSnapshot | null => {
-  const entry = cache.get(slug);
+export const peekUsage = (
+  slug: string,
+  accountHash?: string,
+): TProviderUsageSnapshot | null => {
+  const entry = cache.get(usageCacheKey(slug, accountHash));
   if (entry === undefined) return null;
   const now = Date.now();
   if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
@@ -304,25 +335,29 @@ export const peekUsage = (slug: string): TProviderUsageSnapshot | null => {
 export const sampleUsageAfterRequest = (
   slug: string,
   fetcher: () => Promise<TProviderUsageSnapshot>,
+  accountHash?: string,
 ): void => {
-  const current = requestSamples.get(slug);
+  const key = usageCacheKey(slug, accountHash);
+  const current = requestSamples.get(key);
   const sample: TRequestSample = current ?? {
     fetcher,
     timer: null,
     lastSampleAtMs: 0,
+    generation: generationFor(key),
   };
   sample.fetcher = fetcher;
   if (sample.timer !== null) clearTimeout(sample.timer);
   sample.timer = setTimeout(() => {
     sample.timer = null;
+    if (generationFor(key) !== sample.generation) return;
     const now = Date.now();
     if (now - sample.lastSampleAtMs < REQUEST_SAMPLE_MIN_INTERVAL_MS) return;
     sample.lastSampleAtMs = now;
     // Request-driven sampling intentionally asks for a fresh boundary while
     // preserving the prior good snapshot as a fallback if the read is limited.
-    void cachedUsage(slug, sample.fetcher, { force: true });
+    void cachedUsage(slug, sample.fetcher, { force: true, accountHash });
   }, REQUEST_SAMPLE_DEBOUNCE_MS);
-  requestSamples.set(slug, sample);
+  requestSamples.set(key, sample);
 };
 
 /** Test-only cleanup for the module-global request sampler. */
@@ -331,6 +366,13 @@ export const clearRequestUsageSamples = (): void => {
     if (sample.timer !== null) clearTimeout(sample.timer);
   }
   requestSamples.clear();
+};
+
+/** Test-only volatile cache reset; intentionally preserves persisted snapshots. */
+export const resetUsageCacheForTest = (): void => {
+  cache.clear();
+  generations.clear();
+  clearRequestUsageSamples();
 };
 
 /**
@@ -342,7 +384,23 @@ export const clearRequestUsageSamples = (): void => {
  * so a concurrent caller still gets a result; this only guarantees the NEXT
  * read bypasses the back-off / freshness window.
  */
-export const invalidateUsage = (slug?: string): void => {
-  if (slug === undefined) cache.clear();
-  else cache.delete(slug);
+export const invalidateUsage = (slug?: string, accountHash?: string): void => {
+  const matches =
+    slug === undefined
+      ? (): boolean => true
+      : accountHash === undefined
+        ? (key: string): boolean => matchesSlug(key, slug)
+        : (key: string): boolean => key === usageCacheKey(slug, accountHash);
+  const keys = new Set([
+    ...cache.keys(),
+    ...generations.keys(),
+    ...requestSamples.keys(),
+  ]);
+  for (const key of keys) {
+    if (!matches(key)) continue;
+    bumpGeneration(key);
+    cache.delete(key);
+  }
+  clearRequestSamples(matches);
+  persist();
 };

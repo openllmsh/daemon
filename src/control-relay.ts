@@ -21,6 +21,7 @@ import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
+import { invalidateUsage } from "./usage-cache";
 
 // Cap how long the post-install/uninstall `-s` re-probe may delay the command
 // ack. The probe only warms the device-state cache for the next status push, so
@@ -56,6 +57,7 @@ export const runCommandInner = async (
         // with a failure backoff, and a fresh credential must report
         // immediately. Fire-and-forget — never delays the ack.
         if (r.connected) {
+          invalidateUsage(cmd.payload.slug);
           resetModelReportThrottle(cmd.payload.slug);
           void maybeReportModels().catch(() => {});
         }
@@ -115,6 +117,7 @@ export const runCommandInner = async (
           delegate.connectDeviceCode !== undefined
             ? await delegate.connectDeviceCode()
             : await delegate.connect();
+        if (r.connected) invalidateUsage(cmd.payload.slug);
         return {
           id: cmd.id,
           status: r.connected || r.pending === true ? "done" : "error",
@@ -156,6 +159,7 @@ export const runCommandInner = async (
           };
         }
         const r = await delegate.logout();
+        if (r.ok) invalidateUsage(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "submit_login_code": {
@@ -180,6 +184,7 @@ export const runCommandInner = async (
           };
         }
         const r = await delegate.submitLoginCode(code);
+        if (r.ok) invalidateUsage(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       // The on-demand usage read. The demand is the manual "Refresh usage"

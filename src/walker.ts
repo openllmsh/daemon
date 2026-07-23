@@ -37,18 +37,21 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type {
+  TAnthropicResponse,
+  TChatCompletionChunk,
+  TChatCompletionResponse,
+  TCooldownReason,
+  TDaemonRecordRequest,
+  TErrorEnvelope,
+  TProviderUsageSnapshot,
+  TRequestStatus,
+  TServerSearchCall,
+} from "@openllmsh/protocol";
 import {
   AnthropicResponse,
   ChatCompletionChunk,
   daemonPlanSigningPayload,
-  type TAnthropicResponse,
-  type TChatCompletionChunk,
-  type TChatCompletionResponse,
-  type TCooldownReason,
-  type TDaemonRecordRequest,
-  type TErrorEnvelope,
-  type TRequestStatus,
-  type TServerSearchCall,
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
 import {
@@ -56,6 +59,10 @@ import {
   nextLargerContextModel,
 } from "@openllmsh/wire/features/context-demote";
 import { shouldSkipHopForContext } from "@openllmsh/wire/features/context-skip";
+import {
+  GATE_STALE_CAP_MS,
+  quotaGateDecision,
+} from "@openllmsh/wire/features/quota-gate";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
@@ -129,7 +136,7 @@ import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
 import { isClaudeCodeOriginator, selectSubMethod } from "./sub-method";
-import { sampleUsageAfterRequest } from "./usage-cache";
+import { peekUsage, sampleUsageAfterRequest } from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
 // the one constant that stays in the walker. The upstream URL is no longer
@@ -507,7 +514,11 @@ const passthroughHeaders = (resp: Response): Headers => {
   return headers;
 };
 
-const report = (row: TDaemonRecordRequest, origin: string | null): void => {
+const report = (
+  row: TDaemonRecordRequest,
+  origin: string | null,
+  accountHash?: string,
+): void => {
   void recordRequest(row, origin);
   if (
     row.status !== "success" ||
@@ -518,7 +529,11 @@ const report = (row: TDaemonRecordRequest, origin: string | null): void => {
   }
   const delegate = getDelegate(row.provider);
   if (delegate !== null) {
-    sampleUsageAfterRequest(row.provider, () => delegate.usage());
+    sampleUsageAfterRequest(
+      row.provider,
+      () => delegate.usage(),
+      row.account_hash ?? accountHash,
+    );
   }
 };
 
@@ -1353,7 +1368,27 @@ const serveKimiBuiltinSearch = async (
  * is a misuse of the daemon surface (clients reach it only via the
  * gateway's 307, which always carries a plan) → 400.
  */
+export const usageForActiveAccount = async (
+  provider: string,
+  accountHashByProvider: Map<string, string | null>,
+): Promise<TProviderUsageSnapshot | null> => {
+  let accountHash = accountHashByProvider.get(provider);
+  if (accountHash === undefined) {
+    const delegate = getDelegate(provider);
+    if (delegate === null) return null;
+    try {
+      const status = await delegate.status();
+      accountHash = status.connected ? (status.account_hash ?? null) : null;
+    } catch {
+      accountHash = null;
+    }
+    accountHashByProvider.set(provider, accountHash);
+  }
+  return accountHash === null ? null : peekUsage(provider, accountHash);
+};
+
 export const runWalker = async (args: TWalkArgs): Promise<Response> => {
+  const accountHashByProvider = new Map<string, string | null>();
   const planModelIds = parsePlan(args.planParam);
   if (planModelIds.length === 0) {
     return errorJson(
@@ -1467,7 +1502,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   for (const [hopIndex, hop] of hops.entries()) {
     attempted.push(hop.modelId);
     const finalHop = hopIndex === hops.length - 1;
-    if (contextDemotionTarget !== null && hop.modelId !== contextDemotionTarget) {
+    if (
+      contextDemotionTarget !== null &&
+      hop.modelId !== contextDemotionTarget
+    ) {
       const reason = `hop ${hop.modelId} skipped: context overflow requires a larger input window`;
       lastError = reason;
       hopTrail.push({
@@ -1497,6 +1535,28 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request clearly exceeds its input window`;
       addHopFailure(hop, lastError);
       continue;
+    }
+    if (isSubscriptionSlug(hop.provider)) {
+      const decision = quotaGateDecision({
+        snapshot: await usageForActiveAccount(
+          hop.provider,
+          accountHashByProvider,
+        ),
+        meter: lookupCatalogEntry(hop.modelId)?.subscription_meter,
+        finalHop,
+        staleCapMs: GATE_STALE_CAP_MS,
+        now: Date.now(),
+      });
+      if (decision.kind === "skip") {
+        lastError = decision.reason;
+        hopTrail.push({
+          modelId: hop.modelId,
+          provider: hop.provider,
+          reason: decision.reason,
+        });
+        clearPlanCache();
+        continue;
+      }
     }
     // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
     // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
@@ -1540,9 +1600,19 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
               ...tokens,
             },
             args.originParam,
+            accountHashByProvider.get(hop.provider) ?? undefined,
           ),
       });
-      if (native instanceof Response) return withHopTrailHeaders(native);
+      if (native instanceof Response) {
+        if (
+          native.status === 408 ||
+          native.status === 429 ||
+          native.status >= 500
+        ) {
+          clearPlanCache();
+        }
+        return withHopTrailHeaders(native);
+      }
       lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
       // ↓ fall through to the manual transport for this hop (no `continue`)
       //   — EXCEPT for a non-CC claude_code request (see the gate below).

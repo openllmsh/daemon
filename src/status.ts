@@ -34,7 +34,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
         // on demand — the `refresh` command → `refreshUsage` (the manual button
         // or the providers page mounting). Here we just attach whatever that last
         // on-demand read cached. See `usage-cache.ts`.
-        const usage = peekUsage(d.slug);
+        const usage = peekUsage(d.slug, conn.account_hash);
         return usage === null ? conn : { ...conn, usage };
       } catch (err) {
         // One provider's status read must NOT sink the whole snapshot (every
@@ -103,8 +103,11 @@ export const refreshUsage = async (slug?: string): Promise<void> => {
       .filter((d) => slug === undefined || d.slug === slug)
       .map(async (d) => {
         // Only connected providers have a usage endpoint to read.
-        if (!(await d.status()).connected) return;
-        await cachedUsage(d.slug, () => d.usage());
+        const status = await d.status();
+        if (!status.connected) return;
+        await cachedUsage(d.slug, () => d.usage(), {
+          accountHash: status.account_hash,
+        });
       }),
   );
 };
