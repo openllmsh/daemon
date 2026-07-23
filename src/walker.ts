@@ -783,7 +783,7 @@ export type THopRetry = {
   readonly status?: number;
   readonly bodySnippet?: string;
   readonly cooldownReason?: TCooldownReason;
-  /** Original overflow response retained when no larger hop remains. */
+  /** Original upstream error retained when a later forced retry must fail back. */
   readonly upstreamResponse?: Response;
 };
 
@@ -942,14 +942,10 @@ const serveSubscription = async (
           status: resp.status,
           bodySnippet,
           cooldownReason: cls.reason,
-          ...(cls.reason === "context_overflow"
-            ? {
-                upstreamResponse: new Response(raw.length > 0 ? raw : null, {
-                  status: resp.status,
-                  headers: passthroughHeaders(resp),
-                }),
-              }
-            : {}),
+          upstreamResponse: new Response(raw.length > 0 ? raw : null, {
+            status: resp.status,
+            headers: passthroughHeaders(resp),
+          }),
         },
       );
     }
@@ -1496,6 +1492,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
 
   let lastError: string | null = null;
+  let firstTerminalResponse: Response | null = null;
   const hopTrail: THopTrailEntry[] = [];
   const attempted: string[] = [];
   let contextDemotionTarget: string | null = null;
@@ -1572,9 +1569,60 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     }
     return new Response(resp.body, { status: resp.status, headers });
   };
-  for (const [hopIndex, hop] of hops.entries()) {
+  // Context skips preserve priority without permanently excluding a model:
+  // once ordinary candidates are exhausted, retry the skipped candidates once
+  // in original order with the heuristic bypassed. The final forced candidate
+  // returns its authentic provider result, so failed retries cannot loop.
+  const queue: Array<{
+    readonly hop: THop;
+    readonly forceContextAttempt: boolean;
+  }> = hops.map((hop) => ({ hop, forceContextAttempt: false }));
+  const contextSkipped: THop[] = [];
+  let requeuedSkipped = false;
+  const preserveTerminalResponse = (
+    response: Response | undefined,
+    forceContextAttempt: boolean,
+  ): void => {
+    if (
+      firstTerminalResponse === null &&
+      response !== undefined &&
+      !forceContextAttempt &&
+      !requeuedSkipped &&
+      contextSkipped.length > 0
+    ) {
+      firstTerminalResponse = response;
+    }
+  };
+  let queueIndex = 0;
+  while (true) {
+    if (queueIndex >= queue.length) {
+      if (
+        !requeuedSkipped &&
+        contextSkipped.length > 0 &&
+        !args.req.signal.aborted
+      ) {
+        requeuedSkipped = true;
+        queue.push(
+          ...contextSkipped.map((hop) => ({
+            hop,
+            forceContextAttempt: true,
+          })),
+        );
+        continue;
+      }
+      break;
+    }
+    const candidate = queue[queueIndex];
+    if (candidate === undefined) break;
+    queueIndex += 1;
+    const { hop, forceContextAttempt } = candidate;
     attempted.push(hop.modelId);
-    const finalHop = hopIndex === hops.length - 1;
+    // A skipped ordinary candidate means the physical queue still has a
+    // forced-context epilogue. Its successor must remain walkable until that
+    // retry receives the tokenizer's final verdict.
+    const finalHop =
+      queueIndex === queue.length &&
+      (requeuedSkipped || contextSkipped.length === 0);
     if (
       contextDemotionTarget !== null &&
       hop.modelId !== contextDemotionTarget
@@ -1607,11 +1655,13 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     // `shouldSkipHopForContext`) ──────────────────────────────────────
     // Plan A already happened (the catalog served correct budgets +
     // `/responses/compact` passes through, so the client compacts
-    // itself). Skip this hop only when the estimate CLEARLY exceeds its
-    // window; borderline cases dispatch — the real upstream tokenizer
-    // gets the final word, and the pre-output peek walk below is the
-    // backstop for estimate misses.
+    // itself). Skip a non-final hop when the conservative routing estimate
+    // exceeds its known input budget; the final hop still lets the real
+    // upstream tokenizer decide, the forced-context epilogue above retries
+    // skipped hops once everything else exhausts, and the pre-output peek
+    // walk below is the backstop for estimate misses.
     if (
+      !forceContextAttempt &&
       shouldSkipHopForContext({
         estimatedTokens: baseEstimate,
         inputTokenLimit:
@@ -1620,7 +1670,12 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       })
     ) {
       lastError = `hop ${hop.modelId} skipped: ~${baseEstimate}-token request clearly exceeds its input window`;
-      addHopFailure(hop, lastError);
+      contextSkipped.push(hop);
+      hopTrail.push({
+        modelId: hop.modelId,
+        provider: hop.provider,
+        reason: lastError,
+      });
       continue;
     }
     if (isSubscriptionSlug(hop.provider)) {
@@ -1726,9 +1781,22 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       // Manual subscription transport — the fallback for native declines
       // (claude_code + chatgpt) and the sole path for kimi_code + grok.
       const served = await serveSubscription(hop, wire, args, finalHop);
-      if (!isHopRetry(served)) return withHopTrailHeaders(served);
+      if (!isHopRetry(served)) {
+        if (
+          forceContextAttempt &&
+          !served.ok &&
+          firstTerminalResponse !== null
+        ) {
+          return withHopTrailHeaders(firstTerminalResponse);
+        }
+        return withHopTrailHeaders(served);
+      }
       // Pre-stream candidate failure: record + trail, then walk. Never throw.
       lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
+      preserveTerminalResponse(
+        served.upstreamResponse,
+        forceContextAttempt,
+      );
       if (served.cooldownReason === "context_overflow") {
         const requiredTokens =
           contextOverflowRequiredTokens(served.bodySnippet ?? served.reason) ??
@@ -1771,7 +1839,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       if (args.req.signal.aborted) break;
       continue;
     }
-    if (!resp.ok && !finalHop) {
+    if (!resp.ok) {
       const raw = await resp
         .clone()
         .text()
@@ -1784,7 +1852,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
         "openai",
         args.req.signal.aborted,
       );
-      if (cls.kind === "transient") {
+      if (cls.kind === "transient" && !finalHop) {
         lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
         const reason =
           hopBodySnippet(raw).length > 0
@@ -1817,7 +1885,11 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
           );
         }
         addHopFailure(hop, reason, resp.status, cls.reason);
+        preserveTerminalResponse(resp.clone(), forceContextAttempt);
         continue;
+      }
+      if (forceContextAttempt && firstTerminalResponse !== null) {
+        return withHopTrailHeaders(firstTerminalResponse);
       }
     }
     return withHopTrailHeaders(
