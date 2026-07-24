@@ -41,13 +41,13 @@ type TAttempt = {
 
 /** The result of collecting and attempting one due model-list report. */
 export type TMaybeModelReportResult = {
-  /** Whether at least one connected provider had models to POST. */
+  /** Whether at least one live provider listing was POSTed to the cloud. */
   readonly attempted: boolean;
-  /** Number of provider model lists included in the report. */
+  /** Number of successful provider model listings included in the report. */
   readonly reported: number;
-  /** Whether the cloud POST failed after entries were collected. */
+  /** Whether a provider listing or the cloud POST failed. */
   readonly failed: boolean;
-  /** Safe diagnostic for an attempted cloud POST failure. */
+  /** Safe diagnostic for failed provider listings or a cloud POST failure. */
   readonly error?: string;
 };
 
@@ -103,6 +103,7 @@ export const maybeReportModels = async (
     })),
   );
   const entries: TDaemonModelReportEntry[] = [];
+  const failedProviders: string[] = [];
   for (const { slug, cliVersion, models } of results) {
     // EVERY attempt stamps — a failed/empty fetch backs off on
     // FAILURE_RETRY_MS rather than re-firing each bootstrap tick.
@@ -115,10 +116,14 @@ export const maybeReportModels = async (
       ok,
       ...(cliVersion ? { cliVersion } : {}),
     });
+    if (models === null) {
+      failedProviders.push(slug);
+      continue;
+    }
     // `cli_version` rides along so the cloud can refuse a write from a
     // device whose CLI is OLDER than the one that produced the current
     // row (version-gated model lists must not shrink cross-device).
-    if (ok) {
+    if (models.length > 0) {
       entries.push({
         provider: slug,
         models,
@@ -126,11 +131,16 @@ export const maybeReportModels = async (
       });
     }
   }
+  const listingError =
+    failedProviders.length > 0
+      ? `model listing failed for ${failedProviders.join(", ")}`
+      : undefined;
   if (entries.length === 0) {
     return {
       attempted: false,
       reported: 0,
-      failed: false,
+      failed: failedProviders.length > 0,
+      ...(listingError === undefined ? {} : { error: listingError }),
     };
   }
 
@@ -139,7 +149,8 @@ export const maybeReportModels = async (
     return {
       attempted: true,
       reported: entries.length,
-      failed: false,
+      failed: failedProviders.length > 0,
+      ...(listingError === undefined ? {} : { error: listingError }),
     };
   }
 
@@ -147,6 +158,9 @@ export const maybeReportModels = async (
     attempted: true,
     reported: entries.length,
     failed: true,
-    error: result.error,
+    error:
+      listingError === undefined
+        ? result.error
+        : `${listingError}; ${result.error}`,
   };
 };
