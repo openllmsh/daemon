@@ -1596,8 +1596,8 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   if (
     largest === null ||
     compactionTarget === null ||
-    estimateBodyTokensExact(args.rawBody, encoding) <= compactionTarget ||
-    args.req.signal.aborted
+    args.req.signal.aborted ||
+    estimateBodyTokensExact(args.rawBody, encoding) <= compactionTarget
   ) {
     return firstPass;
   }
