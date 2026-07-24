@@ -67,12 +67,13 @@ const macHomeRead = (home: string): string[] => [
  * config dirs and so must be re-denied even though a parent is granted — the
  * daemon writes config there but never needs the user's vendor tokens:
  *   - `~/.codex/auth.json` — codex OAuth store (its dir is a setup target);
- *   - `~/.kimi-code/credentials/` — the kimi OAuth store SUBTREE (dir deny,
- *     not a single literal, so a renamed/added store file stays covered);
  *   - `~/.claude/.credentials.json` — belt-and-braces: the working set now
  *     grants only scoped `~/.claude` subtrees (never the root), but macOS is
  *     where Claude Code keeps tokens in the keychain anyway — keep the file
  *     deny in case a future grant re-widens.
+ * (`~/.grok/auth.json` needs no entry: the working set grants only the
+ * config.toml FILE + the bin/downloads EXEC dirs at that root, so the
+ * credential is never under a granted path.)
  * Denied for BOTH read (exfiltration) and write (tampering / token swap) —
  * `buildProfile` emits each rule under `file-read*` AND `file-write*`. Every
  * OTHER user secret (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/{gcloud,gh}`,
@@ -82,7 +83,6 @@ const macHomeRead = (home: string): string[] => [
  */
 const credentialDeny = (home: string): string[] => [
   `(literal "${esc(home)}/.codex/auth.json")`,
-  `(subpath "${esc(home)}/.kimi-code/credentials")`,
   `(literal "${esc(home)}/.claude/.credentials.json")`,
 ];
 
@@ -118,7 +118,8 @@ export const homeAncestorPaths = (
  * whitelists — parity with Linux Landlock (`landlock.ts`):
  *
  *   WRITES — only the daemon working set + the workflow targets
- *   (`working-set.ts`, incl. ~/.claude, ~/.codex, ~/.kimi-code, ~/.local/bin)
+ *   (`working-set.ts`, incl. the scoped ~/.claude subtrees, ~/.codex,
+ *   ~/.grok/config.toml)
  *   + the macOS runtime ({@link macRuntimeWrite}) are writable. Everything else
  *   (the rest of `$HOME`, the system) is write-denied — tamper protection.
  *

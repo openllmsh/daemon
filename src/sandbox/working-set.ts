@@ -23,7 +23,15 @@
  *       `~/.claude`: the user's real Claude OAuth token
  *       (`~/.claude/.credentials.json` on Linux) sits at that root and must
  *       stay outside the working set on BOTH backends (the
- *       2026-07-03 working-set-exposure audit §5-A parity fix).
+ *       2026-07-03 working-set-exposure audit §5-A parity fix);
+ *     - the grok-build setup's `~/.grok/config.toml` — a FILE grant, NEVER
+ *       the `~/.grok` dir: the user's xAI session (`~/.grok/auth.json`) sits
+ *       at that root and must stay outside the working set on BOTH backends
+ *       (same posture as the scoped `~/.claude` grants);
+ *     - the opencode setup's `~/.config/opencode` — SCOPED to that leaf only
+ *       (never bare `~/.config`, which holds gcloud/gh tokens). The credential
+ *       store at `~/.local/share/opencode/auth.json` is never granted; the
+ *       setup writes the key inline under `provider.openllm.options.apiKey`.
  *
  *   read-only
  *     - the system trees the runtime + spawned tools (`bash`, `curl`, the
@@ -40,11 +48,10 @@
  *       binary dirs (`~/.local/bin`, `~/.local/share/claude`, `~/.grok/bin` are
  *       read+exec only — the daemon runs the CLIs but never installs or updates
  *       them; that is user-run + unsandboxed) and `~/.bun/bin`
- *       (launcher-trojan guard). Known residuals (documented in the audit,
- *       closed by the §3 broker): `~/.codex/auth.json` +
- *       `~/.kimi-code/credentials/` remain inside still-granted setup-target
- *       dirs on Linux (Landlock has no deny rules); macOS re-denies them
- *       (`seatbelt.ts` `credentialDeny`).
+ *       (launcher-trojan guard). Known residual (documented in the audit,
+ *       closed by the §3 broker): `~/.codex/auth.json` remains inside a
+ *       still-granted setup-target dir on Linux (Landlock has no deny rules);
+ *       macOS re-denies it (`seatbelt.ts` `credentialDeny`).
  *
  * Note the system `/tmp` is deliberately NOT granted (granting it would leak
  * every other process's temp files — and the user unit no longer sets
@@ -294,10 +301,10 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // Best-effort — if creation fails, the sandbox grant remains narrow.
   }
   // Pre-create the vendor CLI install/config dirs the host-install + setup flows
-  // write into (claude / codex / kimi). REQUIRED on Linux: Landlock can only
+  // write into (claude / codex). REQUIRED on Linux: Landlock can only
   // grant an EXISTING path (`existing()` drops a non-existent leaf rather than
-  // widen the grant to bare $HOME), so on a fresh box `~/.kimi-code` etc. would
-  // be UNgranted and the vendor installer's `mkdir -p ~/.kimi-code/bin` EACCESes
+  // widen the grant to bare $HOME), so on a fresh box `~/.codex` etc. would
+  // be UNgranted and the vendor installer's `mkdir -p ~/.codex/bin` EACCESes
   // (the Linux EC2 failure). macOS Seatbelt grants by path pattern so it doesn't
   // need this — pre-creating is a harmless no-op there. Same pattern as the
   // daemonTempDir pre-creation above.
@@ -314,7 +321,6 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude", "hooks"),
     join(home, ".claude", "plugin-state"),
     join(home, ".codex"),
-    join(home, ".kimi-code"),
     // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
     // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch> (the
     // installer drops the binary in downloads/ and links bin/grok → it). So
@@ -331,6 +337,11 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // `existing()` won't widen to it, and ~/.config holds gcloud/gh secrets the
     // deny-default must keep out).
     join(home, ".config", "raycast", "ai"),
+    // opencode (non-isolated setup): the setup writes
+    // ~/.config/opencode/opencode.json(+c). Pre-create the `opencode` leaf so
+    // the SCOPED grant below lands on a real path (NOT bare ~/.config — same
+    // posture as raycast). Never grant ~/.local/share/opencode (auth.json).
+    join(home, ".config", "opencode"),
     join(home, ".local", "bin"),
     join(home, ".local", "share", "claude"),
     // claude's XDG dirs — its native installer/runtime use the full XDG layout
@@ -378,6 +389,24 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // the whole file. An existing user-authored CLAUDE.md is untouched.
   const claudeMd = join(home, ".claude", "CLAUDE.md");
   seedFileIfMissing(claudeMd, "");
+  // ~/.grok/config.toml (the grok-build setup's merge target): a FILE grant at
+  // the `~/.grok` root — the sibling `~/.grok/auth.json` (the user's xAI
+  // session) must stay outside the working set, so the dir itself is never
+  // granted (Landlock has no deny rules; the only way to keep auth.json out
+  // is to not grant its parent — the audit §5-A posture). Seed EMPTY: empty
+  // TOML parses as an empty document, and the install script merges into it
+  // in place (`cat >` — a file-scoped grant can't take a cross-dir rename).
+  // 0o600 because the installed config carries the gateway API key.
+  const grokConfig = join(home, ".grok", "config.toml");
+  seedFileIfMissing(grokConfig, "");
+  // ~/.config/opencode/opencode.json (the opencode setup's merge target):
+  // seeded so a FILE-scoped write always has a real leaf. Empty object merges
+  // cleanly; 0o600 because the installed config carries the gateway API key.
+  // The parent dir is pre-created + RW-granted below (scoped under sensitive
+  // ~/.config — never the bare root). auth.json lives under
+  // ~/.local/share/opencode and is never granted.
+  const opencodeConfig = join(home, ".config", "opencode", "opencode.json");
+  seedFileIfMissing(opencodeConfig, "{}\n");
   // bun's global install cache — the RW half of the split ~/.bun grant (bin is
   // read+exec only, below). Only pre-create it when bun IS installed: absent
   // bun means the plugin install fails its own `command -v bun` check, and
@@ -414,7 +443,7 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // ── Integration / setup workflow targets ──────────────────────────
     // The SHA-gated setup/extension scripts the daemon runs from verified temp
     // files configure the user's CLIs IN PLACE — including the NON-isolated codex /
-    // kimi / claude setups and the extension under `packages/registry/setup`.
+    // grok-build / claude setups and the extension under `packages/registry/setup`.
     // Every path
     // they write MUST be granted or the install fails under the sandbox.
     //   claude-code: SCOPED to the subtrees the scripts + installer write —
@@ -437,8 +466,12 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude.json"),
     //   codex (non-isolated setup): ~/.codex/config.toml + catalog json.
     join(home, ".codex"),
-    //   kimi-code (non-isolated setup): ~/.kimi-code.
-    join(home, ".kimi-code"),
+    //   grok-build (non-isolated setup): ONLY the config.toml FILE (pre-created
+    //   above) — never the ~/.grok dir, whose root holds the user's xAI session
+    //   (auth.json; same §5-A posture as ~/.claude). The setup writes it in
+    //   place (no sibling temp + rename — a file grant carries no create right
+    //   on the ungranted parent dir).
+    grokConfig,
     //   raycast (non-isolated setup): ONLY ~/.config/raycast/ai — the sole dir
     //   the setup writes (providers.yaml + its .openllm-bak). NOT the whole
     //   ~/.config (which holds gcloud/gh tokens the deny-default keeps out), nor
@@ -446,6 +479,12 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   the `ai` leaf so the config write is granted and every other secret
     //   stays denied.
     join(home, ".config", "raycast", "ai"),
+    //   opencode (non-isolated setup): ONLY ~/.config/opencode — the sole dir
+    //   the setup writes (opencode.json / opencode.jsonc). NOT bare ~/.config
+    //   (gcloud/gh tokens) and NOT ~/.local/share/opencode (auth.json holds
+    //   provider credentials from `/connect` — we write the key inline under
+    //   provider.openllm.options.apiKey instead).
+    join(home, ".config", "opencode"),
     //   (~/.grok/bin, ~/.local/bin, ~/.local/share/claude are READ+EXEC in the
     //   readOnly set below — the daemon EXECS the vendor CLIs there but never
     //   WRITES: installs + vendor self-update are user-run + unsandboxed now.

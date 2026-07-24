@@ -82,14 +82,15 @@ export const cliBin = (provider: TCliProvider): string =>
  * is generic across every provider, closing the class of bug rather than one
  * path (see issue #203).
  *
- * The symlink target must be EXEC-able under the OS sandbox: the codex
- * (`~/.codex`) + kimi (`~/.kimi-code`) homes (read-write working set) and
- * claude's binary dir (`~/.local/share/claude`, read+exec in `working-set.ts`)
- * + anything outside `$HOME` all qualify. A non-standard in-`$HOME` location a
- * PATH scan surfaces is covered too: `working-set.ts` seeds
- * `resolveCliExecDirs` from THIS list and follows the real symlink chain,
- * granting read+exec on whatever dirs the binary actually lives in (bounded —
- * never `$HOME`/root/a sensitive root).
+ * The symlink target must be EXEC-able under the OS sandbox: the codex home
+ * (`~/.codex`, a read-write working-set setup target), claude's binary dir
+ * (`~/.local/share/claude`, read+exec in `working-set.ts`), grok's bin dirs
+ * (`~/.grok/{bin,downloads}`, read+exec) + anything outside `$HOME` all
+ * qualify. Any OTHER in-`$HOME` location (kimi's `~/.kimi-code/bin`, a
+ * non-standard dir a PATH scan surfaces) is covered too: `working-set.ts`
+ * seeds `resolveCliExecDirs` from THIS list and follows the real symlink
+ * chain, granting read+exec on whatever dirs the binary actually lives in
+ * (bounded — never `$HOME`/root/a sensitive root).
  */
 export const hostCliCandidates = (provider: TCliProvider): string[] => {
   const home = homedir();
