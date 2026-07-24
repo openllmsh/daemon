@@ -21,6 +21,7 @@ import type {
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
+import { partialUsageFrom } from "@openllmsh/wire/lib/streaming/upstream-error";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
 import { deliverChunkStream, deliverJsonResponse } from "../client-encode";
@@ -72,8 +73,8 @@ export type TNativeServeParams = {
   readonly wantsStream: boolean;
   readonly signal: AbortSignal;
   /** Report the hop's token counts + outcome to the cloud (walker's `report`):
-   *  "success" with the accumulated tokens, or "error" with ZERO_TOKENS when
-   *  the committed stream failed before accumulating. */
+   *  "success" with accumulated tokens, or "error" with the last usage observed
+   *  before a committed stream failed (zero only when no usage was emitted). */
   readonly record: (tokens: TNativeTokens, status: "success" | "error") => void;
 };
 
@@ -240,8 +241,12 @@ export const tryServeNativeRuntime = async (
       committed.sessionId(),
     );
   };
-  const fail = (): void => {
-    params.record(ZERO_TOKENS, "error");
+  const fail = (err: unknown): void => {
+    const usage = partialUsageFrom(err);
+    params.record(
+      usage === null ? ZERO_TOKENS : tokensFromResponse({ usage }),
+      "error",
+    );
     lease.abandon();
   };
 
@@ -265,8 +270,8 @@ export const tryServeNativeRuntime = async (
       committed.chunks,
       params.providerModelId,
     );
-  } catch {
-    fail();
+  } catch (err) {
+    fail(err);
     return errorJson(502, "native runtime stream ended before output");
   }
   settle(canonical);

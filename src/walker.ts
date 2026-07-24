@@ -100,6 +100,8 @@ import { decodeProviderEventStream } from "@openllmsh/wire/lib/streaming/provide
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
 import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
 import {
+  partialUsageFrom,
+  streamFailureCause,
   UpstreamStreamError,
   upstreamErrorFrom,
 } from "@openllmsh/wire/lib/streaming/upstream-error";
@@ -828,10 +830,17 @@ const upstreamErrorLine = (err: UpstreamStreamError): string => {
  * `public.requests` row must carry: an upstream failure is unguessable, so a
  * row without it is not debuggable.
  */
-const streamFailureDetail = (err: unknown): string =>
-  err instanceof UpstreamStreamError
-    ? sanitizeErrorLine(upstreamErrorLine(err), 300)
-    : sanitizeErrorLine(err, 300);
+const streamFailureDetail = (err: unknown): string => {
+  const cause = streamFailureCause(err);
+  return cause instanceof UpstreamStreamError
+    ? sanitizeErrorLine(upstreamErrorLine(cause), 300)
+    : sanitizeErrorLine(cause, 300);
+};
+
+const streamFailureTokens = (err: unknown): TNativeTokens => {
+  const usage = partialUsageFrom(err);
+  return usage === null ? ZERO_TOKENS : tokensFromResponse({ usage });
+};
 
 export type THopRetry = {
   readonly kind: "retry";
@@ -1097,7 +1106,7 @@ const serveSubscription = async (
       {
         ...baseRow,
         status: "error",
-        ...ZERO_TOKENS,
+        ...streamFailureTokens(err),
         latency_ms: elapsed(),
         error: `upstream stream failed after output began: ${streamFailureDetail(err)}`,
       },
