@@ -218,6 +218,20 @@ export const runCommandInner = async (
       case "bust_plan_cache":
         clearPlanCache();
         return { id: cmd.id, status: "done" };
+      // Force a live model-list re-report. The dashboard's "Available
+      // models" refresh button enqueues this mid-TTL so the user doesn't
+      // have to `openllmd restart`. Clear EVERY slug's throttle first
+      // (a successful report stamps the 30m window; a failed one stamps
+      // the 15m failure backoff — both would otherwise block a manual
+      // refresh), then AWAIT the report so the lifecycle frame the
+      // dashboard keys off of only lands AFTER `/api/daemon/models` has
+      // the fresh rows. Errors are swallowed by maybeReportModels; the
+      // ack is always done (a failed report just leaves the row stale →
+      // catalog fallback, same as the background tick).
+      case "refresh_models":
+        resetModelReportThrottle();
+        await maybeReportModels();
+        return { id: cmd.id, status: "done" };
       // Force a self-update check now (the daemon also checks on every bootstrap
       // tick WHEN auto-update is opted in). This is an EXPLICIT user request, so
       // it passes `force` to converge regardless of the opt-in preference.
