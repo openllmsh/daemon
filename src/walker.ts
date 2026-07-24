@@ -62,6 +62,7 @@ import {
 } from "@openllmsh/wire/features/context-demote";
 import {
   CONTEXT_SKIP_CONFIDENCE_FACTOR,
+  compactionTargetFor,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
 import {
@@ -1566,10 +1567,16 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   if (!(await isContextOverflowResponse(firstPass))) return firstPass;
 
   const largest = largestContextHop(hops);
+  // Shrink the target by the target hop's provider calibration factor, so the
+  // compacted body fits the VENDOR's tokenizer (which counts ~1.4× more than our
+  // ruler for Claude), not just our local ruler.
   const compactionTarget =
     largest === null
       ? null
-      : Math.floor(largest.window * CONTEXT_SKIP_CONFIDENCE_FACTOR);
+      : Math.floor(
+          compactionTargetFor(largest.hop.provider, largest.window) *
+            CONTEXT_SKIP_CONFIDENCE_FACTOR,
+        );
   // Measure with the ruler family that matches the wire (Claude for `messages`,
   // o200k otherwise) — the same choice the compactor's fit check uses.
   const encoding = encodingForSurface(args.surface);
