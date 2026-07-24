@@ -154,6 +154,14 @@ export const runIntegration = async (
       ...baseEnv,
       OPENLLM_SKIP_CLI_INSTALL: "1",
       OPENLLM_CLOUD_ORIGIN: cloudOrigin,
+      // A sha256 of the pairing key — lets a `manages_env` state probe detect
+      // shared-~/.openllm/.env drift (its OPENLLM_API_KEY vs this pairing)
+      // WITHOUT a usable secret in the probe's env (state runs deliberately
+      // don't receive OPENLLM_API_KEY).
+      OPENLLM_API_KEY_SHA256:
+        apiKey != null && apiKey !== ""
+          ? sha256Hex(new TextEncoder().encode(apiKey))
+          : "",
       // The artifact commit the verified script came from — the install stamp
       // records it so the dashboard can link the device's installed version to
       // its exact public commit.

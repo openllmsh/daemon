@@ -103,6 +103,31 @@ export const parseState = (output: string): TProbeVerdict | null => {
 export const parseInstalled = (output: string): boolean | null =>
   parseState(output)?.installed ?? null;
 
+/** Merge the script's own drift verdict with the client-side stamp comparison.
+ *  The sha comparison catches BUNDLE drift (installed artifact ≠ the current
+ *  published artifact); the script's `diverged` covers MANAGED-CONFIG drift
+ *  the stamp can't see — e.g. the shared `~/.openllm/.env` gateway keys,
+ *  reported only by `manages_env` setups. EITHER signal marks the install
+ *  diverged. When the stamp comparison can't run (a missing stamp on either
+ *  side) the script's verdict is the only signal and passes through —
+ *  including `undefined` for old bundles that report nothing. */
+export const resolveDiverged = (
+  verdict: TProbeVerdict,
+  installStampSha256: string | undefined,
+): boolean | undefined => {
+  if (
+    verdict.installed &&
+    verdict.installedSha256 !== undefined &&
+    installStampSha256 !== undefined
+  ) {
+    return (
+      verdict.installedSha256 !== installStampSha256 ||
+      verdict.diverged === true
+    );
+  }
+  return verdict.diverged;
+};
+
 /** The verdict's optional fields in wire shape — shared by the single-item
  *  probe and the full walk so a new probe field is a one-site addition. */
 const verdictWireFields = (
@@ -185,12 +210,7 @@ export const probeIntegration = async (
   const next = cache.filter(
     (item) => !integrationMatches(item, kind, slug, target),
   );
-  const diverged =
-    verdict.installed &&
-    verdict.installedSha256 !== undefined &&
-    r.installStampSha256 !== undefined
-      ? verdict.installedSha256 !== r.installStampSha256
-      : verdict.diverged;
+  const diverged = resolveDiverged(verdict, r.installStampSha256);
   next.push({
     kind,
     slug,
@@ -240,12 +260,7 @@ export const refreshDeviceState = async (): Promise<
               ) ?? null
             );
           }
-          const diverged =
-            verdict.installed &&
-            verdict.installedSha256 !== undefined &&
-            r.installStampSha256 !== undefined
-              ? verdict.installedSha256 !== r.installStampSha256
-              : verdict.diverged;
+          const diverged = resolveDiverged(verdict, r.installStampSha256);
           return {
             kind,
             slug,
