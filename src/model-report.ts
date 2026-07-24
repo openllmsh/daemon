@@ -38,6 +38,19 @@ type TAttempt = {
   readonly ok: boolean;
   readonly cliVersion?: string;
 };
+
+/** The result of collecting and attempting one due model-list report. */
+export type TMaybeModelReportResult = {
+  /** Whether at least one connected provider had models to POST. */
+  readonly attempted: boolean;
+  /** Number of provider model lists included in the report. */
+  readonly reported: number;
+  /** Whether the cloud POST failed after entries were collected. */
+  readonly failed: boolean;
+  /** Safe diagnostic for an attempted cloud POST failure. */
+  readonly error?: string;
+};
+
 const lastAttempt = new Map<string, TAttempt>();
 
 /** Reset the throttle — all slugs, or one (post-connect / tests). */
@@ -58,12 +71,13 @@ const isDue = (
 };
 
 /**
- * Collect + report due model lists. Never throws; resolves when the
- * report round-trip settles (callers fire-and-forget from the loop).
+ * Collect + report due model lists without throwing. The returned outcome lets
+ * explicit callers surface a cloud-report failure, while background callers
+ * simply ignore it and remain best-effort.
  */
 export const maybeReportModels = async (
   now: number = Date.now(),
-): Promise<void> => {
+): Promise<TMaybeModelReportResult> => {
   const candidates = await Promise.all(
     Object.entries(DELEGATES)
       .filter(([, delegate]) => delegate.listModels !== undefined)
@@ -94,8 +108,8 @@ export const maybeReportModels = async (
     // FAILURE_RETRY_MS rather than re-firing each bootstrap tick.
     const ok = models !== null && models.length > 0;
     // Stamp on FETCH, not successful report — if the report POST fails
-    // the next TTL tick retries (reportModels swallows errors; the
-    // cloud row just goes stale → catalog fallback, not corruption).
+    // the next TTL tick retries (the cloud row just goes stale → catalog
+    // fallback, not corruption).
     lastAttempt.set(slug, {
       at: now,
       ok,
@@ -112,6 +126,27 @@ export const maybeReportModels = async (
       });
     }
   }
-  if (entries.length === 0) return;
-  await reportModels({ entries });
+  if (entries.length === 0) {
+    return {
+      attempted: false,
+      reported: 0,
+      failed: false,
+    };
+  }
+
+  const result = await reportModels({ entries });
+  if (result.ok) {
+    return {
+      attempted: true,
+      reported: entries.length,
+      failed: false,
+    };
+  }
+
+  return {
+    attempted: true,
+    reported: entries.length,
+    failed: true,
+    error: result.error,
+  };
 };

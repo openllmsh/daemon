@@ -225,13 +225,22 @@ export const runCommandInner = async (
       // the 15m failure backoff — both would otherwise block a manual
       // refresh), then AWAIT the report so the lifecycle frame the
       // dashboard keys off of only lands AFTER `/api/daemon/models` has
-      // the fresh rows. Errors are swallowed by maybeReportModels; the
-      // ack is always done (a failed report just leaves the row stale →
-      // catalog fallback, same as the background tick).
-      case "refresh_models":
+      // the fresh rows. For explicit refresh, surface a report failure as
+      // `error`; no entries to report still returns done.
+      case "refresh_models": {
         resetModelReportThrottle();
-        await maybeReportModels();
+        const report = await maybeReportModels();
+        if (report.failed) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: {
+              error: report.error,
+            },
+          };
+        }
         return { id: cmd.id, status: "done" };
+      }
       // Force a self-update check now (the daemon also checks on every bootstrap
       // tick WHEN auto-update is opted in). This is an EXPLICIT user request, so
       // it passes `force` to converge regardless of the opt-in preference.

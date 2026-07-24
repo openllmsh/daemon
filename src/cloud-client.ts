@@ -196,23 +196,35 @@ export const recordRequest = async (
   }
 };
 
+/** The terminal outcome of one cloud model-cache report attempt. */
+export type TModelReportResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: string };
+
 /**
  * Report the live model lists this daemon's connected delegates observed
  * (`POST /api/daemon/models` — live-provider-model-catalog proposal §4).
  * Metadata only (model ids + optional display/context data, never a
- * credential). Best-effort: a failed report just leaves the cloud's
- * model-cache row stale → static-catalog fallback.
+ * credential). The caller chooses whether a failure is background-best-effort
+ * or should be surfaced to an explicit user action.
  */
 export const reportModels = async (
   report: TDaemonModelReport,
-): Promise<void> => {
+): Promise<TModelReportResult> => {
   try {
-    await cloudFetch(cloudUrl("/api/daemon/models"), {
+    const resp = await cloudFetch(cloudUrl("/api/daemon/models"), {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify(report),
     });
-  } catch {
-    // swallow — model-list reporting is non-critical metadata
+    if (!resp.ok) {
+      return { ok: false, error: `model report failed: HTTP ${resp.status}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "model report failed",
+    };
   }
 };
