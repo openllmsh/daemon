@@ -75,6 +75,7 @@ import {
 import {
   estimateAnthropicInputTokens,
   estimateBodyTokens,
+  estimateBodyTokensExact,
 } from "@openllmsh/wire/lib/canonical/token-estimate";
 import {
   isEncryptedContentError,
@@ -1595,7 +1596,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   if (
     largest === null ||
     compactionTarget === null ||
-    estimateBodyTokens(args.rawBody, encoding) <= compactionTarget ||
+    estimateBodyTokensExact(args.rawBody, encoding) <= compactionTarget ||
     args.req.signal.aborted
   ) {
     return firstPass;
