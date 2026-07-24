@@ -78,7 +78,10 @@ import {
   responsesBodyHasEncryptedContent,
   stripResponsesEncryptedContent,
 } from "@openllmsh/wire/lib/encrypted-content";
-import { classifyHopError } from "@openllmsh/wire/lib/error-class";
+import {
+  CONTEXT_OVERFLOW_BODY,
+  classifyHopError,
+} from "@openllmsh/wire/lib/error-class";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import {
   isCanonicalRefusal,
@@ -1622,19 +1625,11 @@ const isContextOverflowResponse = async (
   // An upstream overflow envelope — either the exact "contains N tokens" form
   // (which also yields the required-token count) or the broader vendor phrasing
   // the shared error classifier recognises (`maximum context length`, `exceeds
-  // the context window`, …).
+  // the context window`, …). Reuse wire's CONTEXT_OVERFLOW_BODY so the retry
+  // triggers on exactly the envelopes the walk classifies as `context_overflow`.
   if (contextOverflowRequiredTokens(text) !== null) return true;
-  return CONTEXT_OVERFLOW_TEXT.test(text);
+  return CONTEXT_OVERFLOW_BODY.test(text);
 };
-
-/**
- * The vendor phrasings that mean "request too large for this model's context",
- * mirroring `wire/lib/error-class`'s internal `CONTEXT_OVERFLOW_BODY` so the
- * last-resort retry triggers on the same envelopes the walk classifies as
- * `context_overflow` — not only the strict `contains N tokens` shape.
- */
-const CONTEXT_OVERFLOW_TEXT =
-  /maximum (?:prompt|context) length|exceeds the context window|too many tokens|reduce the length of the messages/i;
 
 /**
  * Walk a resolved plan once and return its terminal Response. Extracted from
