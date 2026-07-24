@@ -68,7 +68,10 @@ import {
   GATE_STALE_CAP_MS,
   quotaGateDecision,
 } from "@openllmsh/wire/features/quota-gate";
-import { encodingForSurface } from "@openllmsh/wire/lib/canonical/encoding-select";
+import {
+  encodingForSurface,
+  getTokenCounter,
+} from "@openllmsh/wire/lib/canonical/encoding-select";
 import {
   estimateAnthropicInputTokens,
   estimateBodyTokens,
@@ -1576,6 +1579,19 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   // Measure with the ruler family that matches the wire (Claude for `messages`,
   // o200k otherwise) — the same choice the compactor's fit check uses.
   const encoding = encodingForSurface(args.surface);
+  // Warm the BPE ruler before the size gate AND the compactor's internal fit
+  // checks — this is the one place an exact count decides whether to compact and
+  // by how much. The ~160 ms one-time load per isolate is trivial next to the
+  // re-walk it gates (the alternative here is a hard 502), and every later
+  // oversized request on this warm daemon process reuses the counter for free;
+  // the healthy path never warms it and stays on the cheap `chars/4` fallback.
+  if (
+    largest !== null &&
+    compactionTarget !== null &&
+    !args.req.signal.aborted
+  ) {
+    await getTokenCounter(encoding);
+  }
   if (
     largest === null ||
     compactionTarget === null ||
