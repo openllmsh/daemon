@@ -88,8 +88,10 @@ export type TDeliverStreamParams = {
    *  (and, on the native path, advance the session) here. */
   readonly onResponse: (resp: TChatCompletionResponse) => void;
   /** The meter branch failed before accumulating (the client branch already
-   *  streams independently) — record the zero/error row here. */
-  readonly onError: () => void;
+   *  streams independently) — record the error row here. Receives the failure
+   *  so the row can carry WHY: the caller is the only place that reason is
+   *  still available, and a row without it is not debuggable. */
+  readonly onError: (error: unknown) => void;
 };
 
 /**

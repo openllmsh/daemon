@@ -821,6 +821,18 @@ const upstreamErrorLine = (err: UpstreamStreamError): string => {
   return message.startsWith(type) ? message : `${type}: ${message}`;
 };
 
+/**
+ * The one-line, credential-safe reason a stream failed — the vendor's terminal
+ * error (with its own `upstreamType` code) when there is one, else the thrown
+ * transport failure. This is what BOTH the client envelope and the recorded
+ * `public.requests` row must carry: an upstream failure is unguessable, so a
+ * row without it is not debuggable.
+ */
+const streamFailureDetail = (err: unknown): string =>
+  err instanceof UpstreamStreamError
+    ? sanitizeErrorLine(upstreamErrorLine(err), 300)
+    : sanitizeErrorLine(err, 300);
+
 export type THopRetry = {
   readonly kind: "retry";
   readonly reason: string;
@@ -1049,16 +1061,49 @@ const serveSubscription = async (
   // flag, which buildUpstreamBody set from the client's. So upstream is SSE
   // iff chatgpt, or the client asked to stream.
   const upstreamStreams = wire === "chatgpt" || clientWantsStream;
+  // NOTE: `latency_ms` is deliberately NOT part of `baseRow`. A streaming hop
+  // commits within milliseconds and then runs for minutes, so a latency
+  // stamped here would describe time-to-first-byte and mislabel every stream
+  // (a real 342s stream recorded 2066ms). Each report stamps it when the row
+  // is actually written — i.e. when the stream ends.
   const baseRow = {
     model: hop.modelId,
     provider: hop.provider,
     status: statusFor(resp.status),
-    latency_ms: Date.now() - args.startedAt,
     endpoint: args.endpoint,
     ...(accountHash !== null ? { account_hash: accountHash } : {}),
   } satisfies Partial<TDaemonRecordRequest>;
+  const elapsed = (): number => Date.now() - args.startedAt;
   const recordTokens = (u: TNativeTokens): void =>
-    report({ ...baseRow, ...u }, args.originParam);
+    report({ ...baseRow, latency_ms: elapsed(), ...u }, args.originParam);
+  /**
+   * A committed stream that died mid-flight. The hop returned 200, so
+   * `baseRow.status` is "success" — it MUST be overridden here, else a severed
+   * stream is recorded as a healthy turn (indistinguishable from success, with
+   * only the zero token count as a hint). The client has already received a
+   * 200 and partial bytes; this row is the only record that it broke.
+   *
+   * A CLIENT abort is excluded. The upstream fetch is wired to
+   * `args.req.signal`, so a client hanging up mid-stream (Ctrl-C on a long
+   * turn — routine) rejects this same meter branch with an AbortError. That is
+   * terminal but NOT an upstream fault, and recording it as one would poison
+   * the very provider-health data this row exists to make trustworthy. Same
+   * rule the neighbouring decisions already apply (the pre-commit 499,
+   * `peekedError`, `refusalWalks`): an aborted request writes no failure row.
+   */
+  const recordStreamFailure = (err: unknown): void => {
+    if (args.req.signal.aborted) return;
+    report(
+      {
+        ...baseRow,
+        status: "error",
+        ...ZERO_TOKENS,
+        latency_ms: elapsed(),
+        error: `upstream stream failed after output began: ${streamFailureDetail(err)}`,
+      },
+      args.originParam,
+    );
+  };
 
   // Shared terminal handling for a FIRST-event in-stream rejection caught
   // by the pre-commit peek (streaming passthrough, streaming cross-wire,
@@ -1066,10 +1111,7 @@ const serveSubscription = async (
   // so the walk cannot double-spend; the final hop surfaces a 502
   // recorded as an ERROR row.
   const peekedError = (error: unknown): THopServeOutcome => {
-    const detail =
-      error instanceof UpstreamStreamError
-        ? sanitizeErrorLine(upstreamErrorLine(error), 300)
-        : sanitizeErrorLine(error, 300);
+    const detail = streamFailureDetail(error);
     if (!finalHop && !args.req.signal.aborted) {
       // Preserve the terminal response this pre-output error would have
       // produced on the final hop, so a forced-context epilogue that also
@@ -1083,7 +1125,16 @@ const serveSubscription = async (
         ),
       });
     }
-    report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
+    report(
+      {
+        ...baseRow,
+        status: "error",
+        ...ZERO_TOKENS,
+        latency_ms: elapsed(),
+        error: `upstream stream ended before producing output: ${detail}`,
+      },
+      args.originParam,
+    );
     return errorJson(
       502,
       `upstream stream ended before producing output: ${detail}`,
@@ -1121,7 +1172,7 @@ const serveSubscription = async (
     const meter = (chunks: ReadableStream<TChatCompletionChunk>): void => {
       void accumulateChunksToResponse(chunks, hop.providerModelId)
         .then((r) => recordTokens(tokensFromResponse(r)))
-        .catch(() => recordTokens(ZERO_TOKENS));
+        .catch(recordStreamFailure);
     };
     if (passthrough) {
       // Same wire in and out — the client gets the upstream bytes verbatim
@@ -1179,7 +1230,7 @@ const serveSubscription = async (
       providerModelId: hop.providerModelId,
       status: resp.status,
       onResponse: (r) => recordTokens(tokensFromResponse(r)),
-      onError: () => recordTokens(ZERO_TOKENS),
+      onError: recordStreamFailure,
     });
   }
 
@@ -1219,14 +1270,10 @@ const serveSubscription = async (
       // line instead of a bare generic message. Recorded as an ERROR row —
       // the client receives a 502, so `statusFor(resp.status)`'s "success"
       // (from the upstream 200) would misreport the outcome.
-      const detail =
-        err instanceof UpstreamStreamError
-          ? sanitizeErrorLine(upstreamErrorLine(err), 300)
-          : sanitizeErrorLine(err, 300);
-      report({ ...baseRow, status: "error", ...ZERO_TOKENS }, args.originParam);
+      recordStreamFailure(err);
       return errorJson(
         502,
-        `upstream stream failed after output began: ${detail}`,
+        `upstream stream failed after output began: ${streamFailureDetail(err)}`,
       );
     }
     recordTokens(tokensFromResponse(canonical));
@@ -1241,12 +1288,43 @@ const serveSubscription = async (
   // Upstream returned JSON + client wants JSON (anthropic/kimi non-stream).
   // Decode for tokens + client re-encode; on parse/decode failure surface
   // the upstream payload verbatim rather than mangling it.
-  const text = await resp.text();
+  //
+  // The read itself can fail: the upstream committed a 200 and then dropped
+  // the connection mid-body. Unguarded, that rejection escapes `runWalker`
+  // entirely — no row is written and the daemon's outer handler synthesizes a
+  // bare 500, the most invisible failure this walker can produce. Treat it as
+  // the post-commit stream failure it is.
+  let text: string;
+  try {
+    text = await resp.text();
+  } catch (err) {
+    recordStreamFailure(err);
+    return errorJson(
+      502,
+      `upstream stream failed after output began: ${streamFailureDetail(err)}`,
+    );
+  }
+  // An undecodable body is NOT a failed request: the client receives the
+  // upstream's 200 bytes verbatim, so the row's status stays "success". What
+  // is lost is METERING — we can't read the token counts — and a zero-token
+  // success row is exactly the undebuggable shape this file is trying to
+  // eliminate. So the row keeps its honest status and carries a note saying
+  // why the counts are zero, rather than silently looking like a free request.
+  const recordUnmetered = (reason: string): void =>
+    report(
+      {
+        ...baseRow,
+        ...ZERO_TOKENS,
+        latency_ms: elapsed(),
+        error: `delivered verbatim but not metered: ${reason}`,
+      },
+      args.originParam,
+    );
   let upstreamJson: unknown;
   try {
     upstreamJson = JSON.parse(text);
-  } catch {
-    recordTokens(ZERO_TOKENS);
+  } catch (err) {
+    recordUnmetered(`response body is not JSON (${streamFailureDetail(err)})`);
     return new Response(text, {
       status: resp.status,
       headers: passthroughHeaders(resp),
@@ -1255,8 +1333,10 @@ const serveSubscription = async (
   let canonical: TChatCompletionResponse;
   try {
     canonical = decodeUpstreamJson(wire, upstreamJson, hop.providerModelId);
-  } catch {
-    recordTokens(ZERO_TOKENS);
+  } catch (err) {
+    recordUnmetered(
+      `response did not decode on the ${wire} wire (${streamFailureDetail(err)})`,
+    );
     return new Response(text, {
       status: resp.status,
       headers: passthroughHeaders(resp),
