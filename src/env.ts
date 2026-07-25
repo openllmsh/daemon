@@ -5,7 +5,7 @@
  * `envFilePath()`). It's the single source the
  * installed service (systemd `EnvironmentFile=` / the macOS launch agent's
  * `OPENLLM_DAEMON_ENV_FILE`) boots from — and it is SHARED with the other
- * OpenLLM tools on the box: the CLI (`openllmc`) reads the same file for
+ * OpenLLM tools on the box: the CLI (`openllm`) reads the same file for
  * the cloud origin + API key.
  *
  * DEV mode (`OPENLLM_DAEMON_DEV=1`) is ISOLATED: `envFilePath()` resolves
@@ -111,7 +111,7 @@ export const stateDir = (): string =>
  * macOS launch agent points us here because launchd can't read a native
  * `EnvironmentFile`); otherwise it's `.env` under the state dir — the same
  * path systemd's `EnvironmentFile=` and the installer write to, and the one
- * `bun dev:daemon` auto-loads. Shared product-wide: the CLI (`openllmc`)
+ * `bun dev:daemon` auto-loads. Shared product-wide: the CLI (`openllm`)
  * reads the same file for `OPENLLM_CLOUD_ORIGIN` / `OPENLLM_API_KEY`, so a
  * re-pair or a custom origin applies to every OpenLLM tool on the box.
  * In DEV mode this resolves `.dev.env` instead — the isolated dev config —

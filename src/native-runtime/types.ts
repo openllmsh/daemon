@@ -97,7 +97,7 @@ export const cleanNativeSpawnEnv = (
     // (or a child's child) runs resolves `~/.openllm` to the real location —
     // NOT `<isolated HOME>/.openllm`. Without this, a child computing
     // `stateDir()` under the isolated HOME recursively creates
-    // `<iso home>/.openllm/cli/<provider>/home`. (openllmc uses `homedir()`
+    // `<iso home>/.openllm/cli/<provider>/home`. (openllm uses `homedir()`
     // directly and ignores this — the `--strict-mcp-config`/`--setting-sources
     // ""` flags keep the openllm MCP from loading on the inference path.)
     OPENLLM_DAEMON_STATE_DIR: stateDir(),

@@ -142,7 +142,7 @@ const main = async (): Promise<void> => {
   // already current). Fire-and-forget: it self-guards and, when it updates,
   // swaps the binary + exits once `/v1` is idle so the supervisor relaunches.
   void maybeSelfUpdate(latestVersion());
-  // Converge the installed openllmc CLI too — same toggle, same tick. Daemon
+  // Converge the installed openllm CLI too — same toggle, same tick. Daemon
   // first: if the daemon swaps + exits mid-flight, the relaunch's boot call
   // finishes the CLI converge within seconds.
   void maybeUpdateCli(latestCliVersion());

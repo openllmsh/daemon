@@ -1,5 +1,5 @@
 /**
- * CLI (`openllmc`) converger — the daemon keeps the INSTALLED CLI binary on
+ * CLI (`openllm`) converger — the daemon keeps the INSTALLED CLI binary on
  * the cloud's pinned release, on the same auto-update tick and under the same
  * opt-out toggle as its own self-update (`self-update.ts`). One flow, one
  * toggle: disabling daemon auto-update pins the CLI too.
@@ -11,10 +11,10 @@
  * daemon's own updater:
  *
  *   - No drain / no restart — the CLI is not this process; the swap is just a
- *     file replace. A running `openllmc` keeps its old inode (POSIX rename).
+ *     file replace. A running `openllm` keeps its old inode (POSIX rename).
  *   - The daemon NEVER installs the CLI — an absent binary at
- *     `~/.openllm/bin/openllmc` is a skip, mirroring the vendor-CLI policy in
- *     `cli-install.ts`. Manual `openllmc self-update` also still works; both
+ *     `~/.openllm/bin/openllm` (or the legacy `openllmc` path) is a skip, mirroring the vendor-CLI policy in
+ *     `cli-install.ts`. Manual `openllm self-update` also still works; both
  *     paths write verified bytes via distinct pid-suffixed temps, so a race is
  *     last-writer-wins with a complete binary either way.
  *   - Its own attempt SLOT (`cli`) in the shared `state.json` so a daemon
@@ -27,6 +27,7 @@ import {
   existsSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -38,17 +39,24 @@ import { logError, logInfo, logWarn } from "./logger";
 import { currentTarget, fetchBinary, fetchDigest } from "./self-update";
 import { recentlyAttempted, recordAttempt } from "./state-file";
 
-/** Where the install script places the CLI (`~/.openllm/bin/openllmc`). */
-export const cliBinaryPath = (): string => join(stateDir(), "bin", "openllmc");
+/** Where the install script places the CLI (`~/.openllm/bin/openllm`). */
+export const cliBinaryPath = (): string => join(stateDir(), "bin", "openllm");
+
+/** Pre-rename install location (`~/.openllm/bin/openllmc`) — still converged
+ *  (and migrated to the new name) so existing machines pick up the renamed
+ *  binary through auto-update alone. */
+export const legacyCliBinaryPath = (): string =>
+  join(stateDir(), "bin", "openllmc");
 
 /**
- * The installed CLI's version, probed by spawning `openllmc --version`
- * (output `openllmc vX.Y.Z`). Null when the binary is absent, won't run, or
- * prints something unparseable — the converger then leaves it alone.
+ * The installed CLI's version, probed by spawning `openllm --version`
+ * (output `openllm vX.Y.Z`; legacy binaries print `openllmc vX.Y.Z`). Null
+ * when the binary is absent, won't run, or prints something unparseable —
+ * the converger then leaves it alone.
  */
 const installedCliVersion = async (bin: string): Promise<string | null> => {
   const out = await cliVersion(bin);
-  return out?.match(/openllmc v(\S+)/)?.[1] ?? null;
+  return out?.match(/openllmc? v(\S+)/)?.[1] ?? null;
 };
 
 // Re-entrancy guard: a bootstrap tick and a forced dashboard update could both
@@ -57,7 +65,7 @@ const installedCliVersion = async (bin: string): Promise<string | null> => {
 let updating = false;
 
 /**
- * Converge the installed `openllmc` to `latest` (the cloud's published CLI
+ * Converge the installed `openllm` CLI to `latest` (the cloud's published CLI
  * version) when it differs. No-op (returns) when not applicable — auto-update
  * opted out, CLI not installed, dev-linked binary, already converged, unknown
  * target, no release, or a recent attempt. Never throws into the caller.
@@ -73,14 +81,20 @@ export const maybeUpdateCli = async (
   if (updating) return;
   if (opts?.force !== true && !autoUpdateEnabled()) return;
   if (latest === null || latest.length === 0) return;
-  const bin = cliBinaryPath();
+  let bin = cliBinaryPath();
+  // Rename migration: a machine installed before the openllmc → openllm
+  // rename has only the legacy path. Converge THAT file — the swap below
+  // writes the renamed binary to the NEW path and leaves a compat symlink.
+  const legacy = legacyCliBinaryPath();
+  const legacyOnly = !existsSync(bin) && existsSync(legacy);
+  if (legacyOnly) bin = legacy;
   // The daemon never installs the CLI — absent means skip, not install.
   if (!existsSync(bin)) return;
   const current = await installedCliVersion(bin);
   if (current === null) {
     logWarn(
       "cli-update",
-      "installed openllmc did not report a version — skipping",
+      "installed openllm CLI did not report a version — skipping",
     );
     return;
   }
@@ -89,18 +103,19 @@ export const maybeUpdateCli = async (
   if (current === latest) return; // already converged
   const target = currentTarget();
   if (target === null) {
-    // No prebuilt binary for this arch — the openllmc repo README documents
+    // No prebuilt binary for this arch — the openllm CLI repo README documents
     // building the host binary (`bun run compile:host`).
     logWarn(
       "cli-update",
-      `unsupported host ${process.platform}-${process.arch} — no prebuilt openllmc for this arch; build from source: https://github.com/openllmsh/cli#build-from-source`,
+      `unsupported host ${process.platform}-${process.arch} — no prebuilt openllm CLI for this arch; build from source: https://github.com/openllmsh/cli#build-from-source`,
     );
     return;
   }
   if (recentlyAttempted("cli", latest)) return;
 
   updating = true;
-  const tmp = join(dirname(bin), `.openllmc.update.${process.pid}.tmp`);
+  const dest = cliBinaryPath(); // always land on the NEW name
+  const tmp = join(dirname(dest), `.openllm.update.${process.pid}.tmp`);
   try {
     const origin = daemonEnv().cloudOrigin;
     const base = `${origin}/api/cli/binary/${target}`;
@@ -120,13 +135,23 @@ export const maybeUpdateCli = async (
     }
     writeFileSync(tmp, bytes, { mode: 0o755 });
     chmodSync(tmp, 0o755); // force mode regardless of umask
-    renameSync(tmp, bin); // atomic on POSIX; a running openllmc keeps its inode
-    hardenMacBinary(bin); // dequarantine + ad-hoc sign so arm64 can exec it
+    renameSync(tmp, dest); // atomic on POSIX; a running CLI keeps its inode
+    hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
+    if (legacyOnly) {
+      // Replace the old binary file with a transitional symlink so
+      // absolute-path callers (old MCP entries, hooks) keep working.
+      try {
+        rmSync(legacy, { force: true });
+        symlinkSync(dest, legacy);
+      } catch {
+        // best-effort — the new path is authoritative either way
+      }
+    }
     // Record only AFTER a successful swap — a transient download failure should
     // retry on the next tick, but a swap that doesn't converge (mis-publish)
     // must back off.
     recordAttempt("cli", latest);
-    logInfo("cli-update", `updated openllmc ${current} → ${latest}`);
+    logInfo("cli-update", `updated openllm CLI ${current} → ${latest}`);
   } catch (err) {
     logError("cli-update", err, { target, latest });
     try {

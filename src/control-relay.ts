@@ -251,7 +251,7 @@ export const runCommandInner = async (
       case "update":
         void (async () => {
           await refreshBootstrap();
-          // CLI first: converging openllmc is a plain file swap, while a daemon
+          // CLI first: converging openllm is a plain file swap, while a daemon
           // update EXITS the process — anything after it would never run (and
           // with auto-update toggled off, the relaunched boot wouldn't force it).
           await maybeUpdateCli(latestCliVersion(), { force: true });
