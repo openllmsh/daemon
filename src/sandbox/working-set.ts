@@ -163,13 +163,29 @@ const MAX_SYMLINK_HOPS = 16;
  *   2. `dirname(realpath(seed))` — catches INTERMEDIATE DIR symlinks a file walk
  *      steps over (codex's `current → releases/<v>`).
  *
+ * Each collected dir is emitted in BOTH forms — the canonical (realpath'd) path
+ * AND the RAW path as the chain spells it. The two backends enforce on different
+ * things: Landlock resolves a rule to an INODE, so the canonical form is the only
+ * one that matters, but macOS Seatbelt matches the PATH the kernel walks, and
+ * that walk must be able to `stat()` every intermediate component AS WRITTEN.
+ * Canonicalizing codex's `~/.codex/packages/standalone/current/bin` to its
+ * `releases/<v>-<arch>/bin` target silently dropped the `current` symlink node
+ * from the profile, so `seatbelt.ts`'s `homeAncestorPaths` never emitted a
+ * metadata literal for it and every `codex` spawn — plus the `existsSync` probe
+ * behind `cli_installed` — EPERM'd at that node, surfacing in the dashboard as
+ * "ChatGPT (Codex) CLI not found on this machine" on a box where codex WAS
+ * installed (audit `2026-07-25-codex-exec-dir-symlink-seatbelt.md`). Emitting the
+ * raw path too keeps the ancestor walk honest; on Linux it is a duplicate rule
+ * for the same inode, which Landlock ignores.
+ *
  * SECURITY: emits READ+EXEC dir grants only (binaries, never credentials — auth
  * stores like `~/.grok/auth.json` are SIBLINGS, not under any bin/downloads
  * dir). Every candidate must EXIST and must not be `/`, `$HOME`, an ancestor of
- * `$HOME`, or a bare `SENSITIVE_ROOTS` entry — so a bare/broken/hostile chain can
- * never widen the grant onto the home tree, the filesystem root, or a
- * secret-bearing root. All fs reads are best-effort: a missing/broken/looping
- * link just stops the walk with whatever was safely collected (never throws).
+ * `$HOME`, or a bare `SENSITIVE_ROOTS` entry — checked in BOTH forms, so neither
+ * a raw nor a canonical bare/broken/hostile chain can widen the grant onto the
+ * home tree, the filesystem root, or a secret-bearing root. All fs reads are
+ * best-effort: a missing/broken/looping link just stops the walk with whatever
+ * was safely collected (never throws).
  */
 export const resolveCliExecDirs = (seed: string, home: string): string[] => {
   const out = new Set<string>();
@@ -186,20 +202,31 @@ export const resolveCliExecDirs = (seed: string, home: string): string[] => {
     }
   };
   const canonHome = canon(home);
-  const forbidden = new Set<string>([canonHome, "/"]);
-  for (let a = dirname(canonHome); a !== dirname(a); a = dirname(a)) {
-    forbidden.add(a); // ancestors of home: /Users, / (mac); /home, / (linux)
+  // Both forms of every bound: a RAW path is granted alongside its canonical
+  // one (see the doc comment), so a raw `$HOME`/ancestor/sensitive-root spelling
+  // must be rejected just as hard as the canonical one.
+  const forbidden = new Set<string>([canonHome, home, "/"]);
+  for (const start of [canonHome, home]) {
+    for (let a = dirname(start); a !== dirname(a); a = dirname(a)) {
+      forbidden.add(a); // ancestors of home: /Users, / (mac); /home, / (linux)
+    }
   }
-  for (const root of SENSITIVE_ROOTS(home)) forbidden.add(canon(root));
+  for (const root of SENSITIVE_ROOTS(home)) {
+    forbidden.add(root);
+    forbidden.add(canon(root));
+  }
   const addExecDir = (dir: string): void => {
     if (!existsSync(dir)) return; // Landlock can't grant a missing path
     const real = canon(dir);
     // Reject $HOME, filesystem root, any ancestor of $HOME, or a bare
     // secret-bearing root — a bare/broken/hostile chain must never widen the
-    // grant onto the home tree, `/`, or a credential root. Grant the CANONICAL
-    // path (what the kernel actually enforces on).
-    if (forbidden.has(real)) return;
+    // grant onto the home tree, `/`, or a credential root.
+    if (forbidden.has(dir) || forbidden.has(real)) return;
+    // The CANONICAL path (what Landlock enforces on, as an inode) AND the RAW
+    // path (what Seatbelt's path walk stats, component by component). A Set
+    // collapses the two when the dir carries no symlink.
     out.add(real);
+    out.add(dir);
   };
 
   // Pass 1: per-hop symlink walk (does NOT follow — inspects each link itself).
