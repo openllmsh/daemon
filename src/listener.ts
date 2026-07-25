@@ -24,6 +24,7 @@ import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate
 import { Schema } from "effect";
 import { fetchPlan } from "./cloud-client";
 import { planCacheEnabled } from "./config";
+import { notePresenceActivity } from "./control-channel";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
@@ -63,6 +64,12 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // CORS/PNA preflight — the dashboard fetches this surface cross-origin
   // (HTTPS page → http://127.0.0.1) for subscription models.
   if (isPreflight(req)) return preflightResponse(req);
+
+  // A client pointed DIRECTLY at the daemon port is the strongest possible
+  // liveness proof — republish presence (throttled, off the response path) so
+  // the cloud can never hold this daemon offline while it is serving, which
+  // would refuse the next subscription chain with `subscription_requires_daemon`.
+  notePresenceActivity();
 
   const startedAt = Date.now();
   const url = new URL(req.url);

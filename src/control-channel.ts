@@ -159,6 +159,32 @@ const pushStatus = async (active?: boolean): Promise<void> =>
     return { status, fingerprint: JSON.stringify(status) };
   }, active);
 
+/** Throttle for `notePresenceActivity` — traffic-driven presence refreshes are
+ *  a liveness signal, not telemetry, so one per minute is ample (the routing
+ *  freshness window is far wider) and an agentic client's burst costs one push. */
+const PRESENCE_REFRESH_MS = 60_000;
+let lastPresenceRefreshAt = 0;
+
+/**
+ * "A request just hit my LOCAL `/v1` surface" — proof this daemon is alive and
+ * serving, so republish presence to the cloud (an unconditional `status` frame
+ * makes the relay write `daemon_active = true` + slide `last_seen`).
+ *
+ * Without this, presence is only ever asserted on hello or on a CHANGED status
+ * snapshot, so a daemon that is demonstrably serving traffic could still read
+ * offline to the proxy — and the next chain that leads with a subscription hop
+ * gets `subscription_requires_daemon` instead of a 307 to the very daemon that
+ * just answered. Throttled, fire-and-forget, never on the response path.
+ */
+export const notePresenceActivity = (): void => {
+  const now = Date.now();
+  if (now - lastPresenceRefreshAt < PRESENCE_REFRESH_MS) return;
+  lastPresenceRefreshAt = now;
+  void pushStatus().catch(() => {
+    // best-effort: presence also self-heals on the relay keepalive
+  });
+};
+
 /** Send a fresh snapshot only when it changed — surfaces out-of-band flips
  *  (a device-code login completing) while a command isn't in flight. Exported
  *  so the bootstrap scheduler can push a `cloud_state` change immediately. */
@@ -498,6 +524,10 @@ export const startControlChannel = (): void => {
     daemonSessionId = null;
     supportsOrderedStatus = null;
     statusSeq = 0;
+    // A fresh connection re-arms the traffic-driven presence refresh: the first
+    // local request after a reconnect should be able to republish presence
+    // rather than sit out the remainder of the previous socket's throttle.
+    lastPresenceRefreshAt = 0;
     // Drop the previous generation's publish queue: a slow probe it queued can
     // no longer send (its captured generation mismatches), so keeping it as
     // the tail would only delay this session's first status behind dead work.
