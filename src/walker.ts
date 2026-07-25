@@ -1727,10 +1727,10 @@ const isContextOverflowResponse = async (
     .clone()
     .text()
     .catch(() => "");
-  // The synthesized fall-through: every hop failed pre-stream.
-  if (response.status === 502 && text.includes("all hops in the plan failed")) {
-    return true;
-  }
+  // Do NOT treat the generic "all hops in the plan failed" 502 as overflow —
+  // that fall-through covers auth / rate-limit / 5xx exhaustion too, and
+  // compacting then re-walking a doomed plan only wastes another hop round.
+  // Require a real size-rejection signal from the hop trail / upstream body.
   // An upstream overflow envelope — either the exact "contains N tokens" form
   // (which also yields the required-token count) or the broader vendor phrasing
   // the shared error classifier recognises (`maximum context length`, `exceeds

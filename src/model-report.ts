@@ -156,7 +156,8 @@ export const maybeReportModels = async (
 
   return {
     attempted: true,
-    reported: entries.length,
+    // Cloud rejected / could not accept the POST — nothing was reported.
+    reported: 0,
     failed: true,
     error:
       listingError === undefined

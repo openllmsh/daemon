@@ -272,7 +272,12 @@ export const tryServeNativeRuntime = async (
     );
   } catch (err) {
     fail(err);
-    return errorJson(502, "native runtime stream ended before output");
+    return errorJson(
+      502,
+      partialUsageFrom(err) === null
+        ? "native runtime stream ended before output"
+        : "native runtime stream failed after output began",
+    );
   }
   settle(canonical);
   return deliverJsonResponse(canonical, params.surface, clientWire);
