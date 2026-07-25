@@ -13,8 +13,6 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
-import { probeIntegration } from "./device-state";
-import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
@@ -62,45 +60,6 @@ export const runCommandInner = async (
           void maybeReportModels().catch(() => {});
         }
         return { id: cmd.id, status: "done", result: r };
-      }
-      case "install_integration":
-      case "uninstall_integration": {
-        // Run a plugin/setup install or uninstall on THIS machine via the
-        // same shared executor the CLI uses. The dashboard enqueues this against
-        // the selected daemon key; the executor fetches the gateway script,
-        // verifies it (fail-closed), and shells out. See
-        // `docs/proposals/daemon-integration-triggers.md` §5. The kind enum +
-        // charset-pinned slug/target are guaranteed by the command schema.
-        const action =
-          cmd.kind === "install_integration" ? "install" : "uninstall";
-        const r = await runIntegration(
-          cmd.payload.kind,
-          action,
-          cmd.payload.slug,
-          cmd.payload.target,
-          cmd.payload.gateway,
-        );
-        // Re-probe just this item's `-s` state (against the SAME target that was
-        // just modified) so the post-command status push reflects the change (no
-        // full walk). Best-effort AND bounded: we don't let a slow probe block
-        // the command ack — if it doesn't settle within PROBE_ACK_TIMEOUT_MS the
-        // ack returns anyway and the cache is corrected on the next boot/refresh
-        // walk. A failed probe likewise leaves the cached entry.
-        if (r.ok) {
-          const probe = probeIntegration(
-            cmd.payload.kind,
-            cmd.payload.slug,
-            cmd.payload.target,
-          ).catch(() => {});
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          await Promise.race([
-            probe.finally(() => clearTimeout(timer)),
-            new Promise<void>((resolve) => {
-              timer = setTimeout(resolve, PROBE_ACK_TIMEOUT_MS);
-            }),
-          ]);
-        }
-        return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "connect_device_code": {
         // Start a device-code login (codex remote; kimi falls back to its

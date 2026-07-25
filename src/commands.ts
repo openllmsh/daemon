@@ -26,16 +26,6 @@ export const COMMANDS: readonly TCommand[] = [
     description: "Show or follow the daemon log",
   },
   {
-    name: "extension",
-    args: "<install|uninstall|list> [slug]",
-    description: "Install or remove a client extension on this machine",
-  },
-  {
-    name: "setup",
-    args: "<install|uninstall|list> [id]",
-    description: "Install or remove a client setup on this machine",
-  },
-  {
     name: "auto-update",
     args: "<on|off|status>",
     description:
@@ -70,10 +60,6 @@ export const PROVIDERS = [
   "kimi_code",
   "grok",
 ] as const;
-
-/** Action choices for the `extension` / `setup` integration groups. */
-export const INTEGRATION_GROUPS = ["extension", "setup"] as const;
-export const INTEGRATION_ACTIONS = ["install", "uninstall", "list"] as const;
 
 /** Argument choices for the `auto-update` subcommand. */
 export const AUTO_UPDATE_ACTIONS = ["on", "off", "status"] as const;

@@ -13,8 +13,6 @@
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
  *   openllmd logs [-f] [-n N]     show or follow the daemon log
- *   openllmd extension <install|uninstall|list> [slug]  manage a client extension
- *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
  *   openllmd completion <shell>   emit / install shell completion
@@ -25,8 +23,6 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { COMMANDS, FLAGS } from "./commands";
 import { runCompletion } from "./completion";
 import { daemonEnv } from "./env";
-import type { TIntegrationKind, TIntegrationMode } from "./integrations";
-import { runIntegration } from "./integrations";
 import { logError } from "./logger";
 import { runLogs } from "./logs";
 import {
@@ -95,71 +91,6 @@ const runAutoUpdate = (args: readonly string[]): never => {
   process.exit(2);
 };
 
-// ONE catalog endpoint; each group filters by the option's `extensions` list
-// (non-empty ⇔ extension, empty ⇔ client setup) — same classification as
-// device-state.ts, so `extension list` and `setup list` partition the catalog.
-const LIST_PATH = "/api/setup/options";
-
-const integrationUsage = (kind: TIntegrationKind): never => {
-  process.stderr.write(
-    `usage: openllmd ${kind} <install|uninstall|state|list> [${kind === "setup" ? "id" : "slug"}]\n`,
-  );
-  process.exit(2);
-};
-
-/**
- * Run an `extension|setup` subcommand. Foreground one-shot (no server boot):
- * `list` prints the catalog; `install|uninstall <slug>` runs the shared
- * executor and exits with its status. Exits the process in every branch.
- */
-const runIntegrationCli = async (
-  kind: TIntegrationKind,
-  args: readonly string[],
-): Promise<never> => {
-  const action = args[0];
-
-  if (action === "list") {
-    const url = `${daemonEnv().cloudOrigin}${LIST_PATH}`;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        process.stderr.write(`list failed: ${url} → ${res.status}\n`);
-        process.exit(1);
-      }
-      const body = (await res.json()) as {
-        data?: ReadonlyArray<{
-          id?: string;
-          name?: string;
-          extensions?: ReadonlyArray<string>;
-        }>;
-      };
-      for (const item of body.data ?? []) {
-        const isExtension = (item.extensions?.length ?? 0) > 0;
-        if ((kind === "extension") !== isExtension) continue;
-        const id = item.id ?? "";
-        if (id.length === 0) continue;
-        process.stdout.write(`${id.padEnd(24)}${item.name ?? ""}\n`);
-      }
-      process.exit(0);
-    } catch (err) {
-      process.stderr.write(
-        `list failed: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-      process.exit(1);
-    }
-  }
-
-  if (action === "install" || action === "uninstall" || action === "state") {
-    const slug = args[1];
-    if (slug === undefined || slug.length === 0) return integrationUsage(kind);
-    const result = await runIntegration(kind, action as TIntegrationMode, slug);
-    if (result.output.length > 0) process.stdout.write(`${result.output}\n`);
-    process.exit(result.ok ? 0 : 1);
-  }
-
-  return integrationUsage(kind);
-};
-
 export const runCli = (): boolean => {
   const args = userArgs();
   if (args.length === 0) return false; // bare invocation → boot the server
@@ -205,17 +136,6 @@ export const runCli = (): boolean => {
     case "logs":
       runLogs(rest);
       break;
-    case "extension":
-    case "setup":
-      // Foreground one-shot: the async executor process.exit()s when done; the
-      // pending fetch keeps the event loop alive. Returning true prevents the
-      // server boot path in main.ts. Any unexpected rejection is caught here so
-      // it exits deterministically (non-zero) instead of an unhandled rejection.
-      runIntegrationCli(args[0] as TIntegrationKind, rest).catch((err) => {
-        logError("cli", err);
-        process.exit(1);
-      });
-      return true;
     case "auto-update":
       runAutoUpdate(rest);
       break;

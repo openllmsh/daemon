@@ -67,7 +67,6 @@ import {
   mkdirSync,
   readlinkSync,
   realpathSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -265,90 +264,30 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // so granting global /tmp would leak access to every other process's temp
   // files. Instead we create and use our own isolated temp under stateDir.
   const daemonTmp = daemonTempDir();
-  // The write-once original-config backups the integration scripts take
-  // (`backup_once` in the assembled registry runtime) — hardcoded to
-  // $HOME/.openllm/backups in the scripts, so it must be granted explicitly:
-  // it coincides with the state dir's subtree only when
-  // OPENLLM_DAEMON_STATE_DIR is unset. Pre-created (0700 — backups may carry
-  // credentials from previously-installed configs) so the grant lands on the
-  // real leaf. Without this, a daemon-driven install's backup_once silently
-  // no-ops under confinement (its best-effort posture swallows the EACCES).
-  const backupsDir = join(home, ".openllm", "backups");
-  try {
-    mkdirSync(backupsDir, { recursive: true, mode: 0o700 });
-  } catch {
-    // Best-effort — if creation fails, the sandbox grant remains narrow.
-  }
-  // The install state the assembled scripts record/compare/clear
-  // (`record_install_stamp` / `read_install_stamp` in the registry runtime) —
-  // ONE canonical $HOME/.openllm/state.json, written IN PLACE (the runtime
-  // stages content in $TMPDIR and `cat >`s the granted file, exactly the
-  // settings.json posture), so a FILE-scoped grant suffices — never the whole
-  // ~/.openllm dir. Pre-created 0600 so the grant lands on the real leaf.
-  const stateJson = join(home, ".openllm", "state.json");
-  try {
-    mkdirSync(join(home, ".openllm"), { recursive: true, mode: 0o700 });
-    writeFileSync(stateJson, "{\n}\n", { flag: "wx", mode: 0o600 });
-  } catch {
-    // Exists already, or creation failed — either way best-effort.
-  }
-  // Legacy per-file stamps (pre-state.json installs) — still read as the
-  // migration fallback and cleared by installs/uninstalls.
-  const stampsDir = join(home, ".openllm", "installed");
-  try {
-    mkdirSync(stampsDir, { recursive: true, mode: 0o700 });
-  } catch {
-    // Best-effort — if creation fails, the sandbox grant remains narrow.
-  }
-  // Pre-create the vendor CLI install/config dirs the host-install + setup flows
-  // write into (claude / codex). REQUIRED on Linux: Landlock can only
-  // grant an EXISTING path (`existing()` drops a non-existent leaf rather than
-  // widen the grant to bare $HOME), so on a fresh box `~/.codex` etc. would
-  // be UNgranted and the vendor installer's `mkdir -p ~/.codex/bin` EACCESes
-  // (the Linux EC2 failure). macOS Seatbelt grants by path pattern so it doesn't
-  // need this — pre-creating is a harmless no-op there. Same pattern as the
-  // daemonTempDir pre-creation above.
+  // Pre-create the vendor-CLI dirs the daemon EXECS through. REQUIRED on
+  // Linux: Landlock can only grant an EXISTING path (`existing()` drops a
+  // missing leaf rather than widening the grant to bare $HOME), so a fresh box
+  // would leave these ungranted and every vendor spawn would EACCES. macOS
+  // Seatbelt grants by pattern, so pre-creating is a harmless no-op there.
+  //
+  // This list used to also pre-create every CLIENT CONFIG dir (~/.claude
+  // subtrees, ~/.codex, ~/.config/{raycast/ai,opencode}) because the daemon ran
+  // the registry install scripts, which edited those files IN PLACE under
+  // confinement. It doesn't any more — `openllm <client>` applies the config at
+  // RUN time, in the USER's own process, outside this sandbox — so none of them
+  // are granted (or created) here. See
+  // `docs/proposals/remove-registry-runtime-config-merge.md` §8.1.
   for (const d of [
-    // claude-code: SCOPED subtrees only, never the whole ~/.claude — the
-    // user's real OAuth token (`~/.claude/.credentials.json` on Linux) lives
-    // at the root and must stay outside the working set (audit §5-A). These
-    // are exactly what the SHA-gated scripts + the official installer write:
-    //   skills/commands/hooks/plugins/plugin-state — plugin installs;
-    //   downloads — claude.ai/install.sh's staging dir.
-    join(home, ".claude", "skills"),
-    join(home, ".claude", "plugins"),
-    join(home, ".claude", "commands"),
-    join(home, ".claude", "hooks"),
-    join(home, ".claude", "plugin-state"),
-    join(home, ".codex"),
     // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
-    // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch> (the
-    // installer drops the binary in downloads/ and links bin/grok → it). So
-    // EXEC reads through to downloads/, and BOTH need READ+EXEC below. Pre-create
-    // both so the grants land on real leaves (NOT bare ~/.grok — `existing()`
-    // won't widen to $HOME; the user's real ~/.grok/auth.json stays out of the
-    // working set). They are read+exec only — the daemon runs grok but never
-    // installs/updates it (that's user-run + unsandboxed).
+    // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch>. So
+    // EXEC reads through to downloads/, and BOTH need READ+EXEC below.
+    // Pre-create both so the grants land on real leaves (NOT bare ~/.grok —
+    // the user's ~/.grok/auth.json must stay out of the working set).
     join(home, ".grok", "bin"),
     join(home, ".grok", "downloads"),
-    // raycast (non-isolated setup): the setup writes ~/.config/raycast/ai/
-    // providers.yaml (+ its .openllm-bak backup). Pre-create the `ai` leaf so
-    // the SCOPED grant below lands on a real path (NOT bare ~/.config —
-    // `existing()` won't widen to it, and ~/.config holds gcloud/gh secrets the
-    // deny-default must keep out).
-    join(home, ".config", "raycast", "ai"),
-    // opencode (non-isolated setup): the setup writes
-    // ~/.config/opencode/opencode.json(+c). Pre-create the `opencode` leaf so
-    // the SCOPED grant below lands on a real path (NOT bare ~/.config — same
-    // posture as raycast). Never grant ~/.local/share/opencode (auth.json).
-    join(home, ".config", "opencode"),
     join(home, ".local", "bin"),
     join(home, ".local", "share", "claude"),
-    // claude's XDG dirs — its native installer/runtime use the full XDG layout
-    // ON LINUX (`~/.local/state/claude`, `~/.cache/claude`); absent on macOS.
-    // Pre-creating makes the parents exist so the installer's mkdir succeeds,
-    // and the grants below let claude write its state/cache. (`~/.claude` is the
-    // config dir, granted above; `~/.local/share/claude` is the binary.)
+    // claude's XDG dirs — its runtime writes these ON LINUX; absent on macOS.
     join(home, ".local", "state", "claude"),
     join(home, ".cache", "claude"),
   ]) {
@@ -359,54 +298,17 @@ export const daemonWorkingSet = (): TWorkingSet => {
       // back / fails visibly, not a daemon-boot failure.
     }
   }
-  // FILE-scoped grants need the file to EXIST (a Landlock file rule can't
-  // grant a missing path, and open(O_CREAT) needs MAKE_REG on the PARENT dir,
-  // which stays ungranted) — so pre-create each when absent. `wx` never
-  // touches an existing file; explicit 0o600 (not the process umask) because
-  // these seed user-config files that may carry the gateway API key — keep
-  // them private from group/other regardless of the daemon's inherited umask.
-  // A pre-create failure (~/.claude itself couldn't be made) is fine: the
-  // grant below just lands on whatever is really there.
-  const seedFileIfMissing = (path: string, content: string): void => {
-    try {
-      writeFileSync(path, content, { flag: "wx", mode: 0o600 });
-    } catch {
-      // exists already (the common case) or the parent couldn't be made.
-    }
-  };
-  // ~/.claude/settings.json (never the whole ~/.claude — see the scoped
-  // subtrees above). Every settings-merge script branches on `[ -f ]` /
-  // parses the file, and `{}` merges cleanly on all of them.
-  const claudeSettings = join(home, ".claude", "settings.json");
-  seedFileIfMissing(claudeSettings, "{}\n");
-  // ~/.claude.json (the MCP-server registry the plugin installs merge into):
-  // a FILE grant at the $HOME root, so a confined child can never CREATE it.
-  const claudeJson = join(home, ".claude.json");
-  seedFileIfMissing(claudeJson, "{}\n");
-  // ~/.claude/CLAUDE.md (the user-level memory file the plugin's install
-  // merges its managed guidance region into). Seed EMPTY (not "{}"): the
-  // install script treats an empty file as "fresh" and writes the region as
-  // the whole file. An existing user-authored CLAUDE.md is untouched.
-  const claudeMd = join(home, ".claude", "CLAUDE.md");
-  seedFileIfMissing(claudeMd, "");
-  // ~/.grok/config.toml (the grok-build setup's merge target): a FILE grant at
-  // the `~/.grok` root — the sibling `~/.grok/auth.json` (the user's xAI
-  // session) must stay outside the working set, so the dir itself is never
-  // granted (Landlock has no deny rules; the only way to keep auth.json out
-  // is to not grant its parent — the audit §5-A posture). Seed EMPTY: empty
-  // TOML parses as an empty document, and the install script merges into it
-  // in place (`cat >` — a file-scoped grant can't take a cross-dir rename).
-  // 0o600 because the installed config carries the gateway API key.
-  const grokConfig = join(home, ".grok", "config.toml");
-  seedFileIfMissing(grokConfig, "");
-  // ~/.config/opencode/opencode.json (the opencode setup's merge target):
-  // seeded so a FILE-scoped write always has a real leaf. Empty object merges
-  // cleanly; 0o600 because the installed config carries the gateway API key.
-  // The parent dir is pre-created + RW-granted below (scoped under sensitive
-  // ~/.config — never the bare root). auth.json lives under
-  // ~/.local/share/opencode and is never granted.
-  const opencodeConfig = join(home, ".config", "opencode", "opencode.json");
-  seedFileIfMissing(opencodeConfig, "{}\n");
+  // NOTE: no client-config seeding here any more. The daemon used to
+  // pre-create + FILE-grant ~/.claude/settings.json, ~/.claude.json,
+  // ~/.claude/CLAUDE.md, ~/.grok/config.toml and
+  // ~/.config/opencode/opencode.json so the registry install scripts could
+  // merge into them under confinement. Those scripts are gone: a client's
+  // config is composed at RUN time by `openllm <client>` in the user's own
+  // process, and for session clients it is never written at all. The daemon
+  // therefore needs ZERO third-party config grants — including for Raycast,
+  // whose in-place writer is likewise a user-invoked CLI command, never a
+  // daemon command (there is no control-channel command that could ask the
+  // daemon to touch it).
   // bun's global install cache — the RW half of the split ~/.bun grant (bin is
   // read+exec only, below). Only pre-create it when bun IS installed: absent
   // bun means the plugin install fails its own `command -v bun` check, and
@@ -429,67 +331,23 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // (settings.json posture). Hardcoded in the scripts, NOT derived from the
     // state dir; redundant with `state` in the default layout, load-bearing
     // when OPENLLM_DAEMON_STATE_DIR points elsewhere.
-    stateJson,
     // The scripts' write-once original-config backups ($HOME/.openllm/backups
     // — hardcoded in backup_once; pre-created above so the grant lands on the
     // real leaf even when the parent grant failed to create).
-    backupsDir,
     // Legacy per-file install stamps — the migration fallback reads.
-    stampsDir,
     // Belt-and-braces for a binary installed OUTSIDE the state dir (manual
     // placement): self-update renames a temp over `process.execPath`, so its
     // real directory must be writable.
     dirname(process.execPath),
-    // ── Integration / setup workflow targets ──────────────────────────
-    // The SHA-gated setup/extension scripts the daemon runs from verified temp
-    // files configure the user's CLIs IN PLACE — including the NON-isolated codex /
-    // grok-build / claude setups and the extension under `packages/registry/setup`.
-    // Every path
-    // they write MUST be granted or the install fails under the sandbox.
-    //   claude-code: SCOPED to the subtrees the scripts + installer write —
-    //   NEVER the whole ~/.claude, whose root holds the user's real OAuth
-    //   token on Linux (`.credentials.json`; audit §5-A credential-parity
-    //   fix — Landlock has no deny rules, so the only way to keep the token
-    //   out is to not grant its parent). settings.json is a FILE grant
-    //   (pre-created above; `ruleAccessFor` masks it to file-applicable
-    //   rights) — note a file-scoped grant can't take a cross-dir rename, so
-    //   the merge scripts write it IN PLACE (`cat > settings.json`).
-    join(home, ".claude", "skills"),
-    join(home, ".claude", "plugins"),
-    join(home, ".claude", "commands"),
-    join(home, ".claude", "hooks"),
-    join(home, ".claude", "plugin-state"),
-    claudeSettings,
-    //   ~/.claude/CLAUDE.md is a FILE grant too (pre-created above) — the
-    //   plugin install merges its managed guidance region in place.
-    claudeMd,
-    join(home, ".claude.json"),
-    //   codex (non-isolated setup): ~/.codex/config.toml + catalog json.
-    join(home, ".codex"),
-    //   grok-build (non-isolated setup): ONLY the config.toml FILE (pre-created
-    //   above) — never the ~/.grok dir, whose root holds the user's xAI session
-    //   (auth.json; same §5-A posture as ~/.claude). The setup writes it in
-    //   place (no sibling temp + rename — a file grant carries no create right
-    //   on the ungranted parent dir).
-    grokConfig,
-    //   raycast (non-isolated setup): ONLY ~/.config/raycast/ai — the sole dir
-    //   the setup writes (providers.yaml + its .openllm-bak). NOT the whole
-    //   ~/.config (which holds gcloud/gh tokens the deny-default keeps out), nor
-    //   even all of ~/.config/raycast (the user's extensions/state) — scoped to
-    //   the `ai` leaf so the config write is granted and every other secret
-    //   stays denied.
-    join(home, ".config", "raycast", "ai"),
-    //   opencode (non-isolated setup): ONLY ~/.config/opencode — the sole dir
-    //   the setup writes (opencode.json / opencode.jsonc). NOT bare ~/.config
-    //   (gcloud/gh tokens) and NOT ~/.local/share/opencode (auth.json holds
-    //   provider credentials from `/connect` — we write the key inline under
-    //   provider.openllm.options.apiKey instead).
-    join(home, ".config", "opencode"),
-    //   (~/.grok/bin, ~/.local/bin, ~/.local/share/claude are READ+EXEC in the
-    //   readOnly set below — the daemon EXECS the vendor CLIs there but never
-    //   WRITES: installs + vendor self-update are user-run + unsandboxed now.
-    //   ~/.grok/downloads + ~/.claude/downloads were installer STAGING dirs and
-    //   are no longer granted at all.)
+    // ── NO client-config grants ───────────────────────────────────────
+    // Every path that used to be granted here (~/.claude subtrees +
+    // settings.json + ~/.claude.json + CLAUDE.md, ~/.codex,
+    // ~/.grok/config.toml, ~/.config/raycast/ai, ~/.config/opencode) existed so
+    // the daemon could run a registry install script that edited the user's
+    // client config in place. There are no such scripts, and no
+    // control-channel command that installs anything — so the daemon has no
+    // business writing any of them. `openllm <client>` does that work in the
+    // user's own unconfined process.
     //   bun's global install cache ONLY (the SPLIT ~/.bun grant — audit §5-B):
     //   the claude-context plugin install runs `bun install`, which populates
     //   ~/.bun/install/cache. The `bun` BINARY dir (~/.bun/bin) is read+exec in

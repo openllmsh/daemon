@@ -25,8 +25,6 @@ import {
   COMMANDS,
   COMPLETION_SHELLS,
   FLAGS,
-  INTEGRATION_ACTIONS,
-  INTEGRATION_GROUPS,
 } from "./commands";
 
 export type { TCompletionShell } from "./commands";
@@ -36,7 +34,6 @@ const TOP_LEVEL = [...COMMANDS.map((c) => c.name), ...FLAGS.map((f) => f.name)];
 /** `completion`'s own argument choices. */
 const COMPLETION_ARGS = [...COMPLETION_SHELLS, "install"];
 /** The integration groups' shared `<install|uninstall|list>` action choices. */
-const INTEGRATION_ARGS = [...INTEGRATION_ACTIONS];
 /** `auto-update`'s `<on|off|status>` argument choices. */
 const AUTO_UPDATE_ARGS = [...AUTO_UPDATE_ACTIONS];
 
@@ -54,7 +51,6 @@ _openllmd() {
   case "$cmd" in
     completion) COMPREPLY=( $(compgen -W "${COMPLETION_ARGS.join(" ")}" -- "$cur") ) ;;
     auto-update) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${AUTO_UPDATE_ARGS.join(" ")}" -- "$cur") ) ;;
-    ${INTEGRATION_GROUPS.join("|")}) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${INTEGRATION_ARGS.join(" ")}" -- "$cur") ) ;;
   esac
 }
 complete -F _openllmd openllmd
@@ -85,7 +81,6 @@ _openllmd() {
       case "$line[1]" in
         completion) _values 'shell' ${COMPLETION_ARGS.join(" ")} ;;
         auto-update) _values 'action' ${AUTO_UPDATE_ARGS.join(" ")} ;;
-        ${INTEGRATION_GROUPS.join("|")}) _values 'action' ${INTEGRATION_ARGS.join(" ")} ;;
       esac ;;
   esac
 }
@@ -101,7 +96,6 @@ const fishScript = (): string => {
   lines.push(
     `complete -c openllmd -n '__fish_seen_subcommand_from completion' -a '${COMPLETION_ARGS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from auto-update' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
-    `complete -c openllmd -n '__fish_seen_subcommand_from ${INTEGRATION_GROUPS.join(" ")}' -a '${INTEGRATION_ARGS.join(" ")}'`,
     `complete -c openllmd -s h -l help -d 'Show help'`,
     `complete -c openllmd -s v -l version -d 'Print the version'`,
   );

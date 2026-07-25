@@ -36,7 +36,7 @@ import {
   stopControlChannel,
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
-import { refreshDeviceState } from "./device-state";
+import { refreshCliState } from "./device-state";
 import {
   daemonEnv,
   daemonPort,
@@ -152,7 +152,7 @@ const main = async (): Promise<void> => {
   // watcher re-pushes when the cache lands. Re-walked after install/uninstall
   // and on a whole-daemon refresh (control-relay.ts).
   if (getCloudState() === "ok") {
-    void refreshDeviceState()
+    void refreshCliState()
       .then(() => pushStatusIfChanged())
       .catch((err) => logError("main", err));
     // First model-list report — connected delegates' live lists reach
@@ -174,7 +174,7 @@ const main = async (): Promise<void> => {
         // A bootstrap that just recovered to `ok` (boot-time unreachable, or a
         // newly-set key) is the first chance to run the device-state walk.
         if (changed && getCloudState() === "ok") {
-          void refreshDeviceState()
+          void refreshCliState()
             .then(() => pushStatusIfChanged())
             .catch((err) => logError("main", err));
         }

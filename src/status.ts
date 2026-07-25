@@ -10,7 +10,7 @@ import type { TDaemonStatus } from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
-import { getInstalledIntegrations } from "./device-state";
+import { getCliState } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
@@ -64,7 +64,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     // Cached manifest-driven device state (refreshed by the `-s` walk on boot
     // + after install/uninstall + on refresh), NOT a live scan — the walk is
     // too heavy to run on every status push.
-    integrations: getInstalledIntegrations(),
+    cli: getCliState(),
   };
 };
 

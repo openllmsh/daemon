@@ -154,7 +154,8 @@ export const reduceClaudeUsage = (payload: unknown): TClaudeUsageReduced => {
       if (!isRecord(entry) || entry.kind !== "weekly_scoped") continue;
       if (typeof entry.percent !== "number") continue;
       const scope = isRecord(entry.scope) ? entry.scope : null;
-      const model = scope !== null && isRecord(scope.model) ? scope.model : null;
+      const model =
+        scope !== null && isRecord(scope.model) ? scope.model : null;
       const name =
         model !== null &&
         typeof model.display_name === "string" &&
