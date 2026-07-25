@@ -61,9 +61,9 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     port: daemonPort(),
     sandbox: sandboxState(),
     connections,
-    // Cached manifest-driven device state (refreshed by the `-s` walk on boot
-    // + after install/uninstall + on refresh), NOT a live scan — the walk is
-    // too heavy to run on every status push.
+    // TTL-cached CLI probe from `getCliState()`. It returns cached state when fresh
+    // and schedules a background refresh when stale, so status can stay responsive
+    // without blocking and without manifest scans.
     cli: getCliState(),
   };
 };

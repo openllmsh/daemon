@@ -92,7 +92,9 @@ install_component() {
 
   published="$(curl -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
   case "$published" in
-    [0-9a-f]*) [ ${#published} -eq 64 ] || die "malformed checksum for $name" ;;
+    [0-9a-f]*)
+      [[ "$published" =~ ^[0-9a-f]{64}$ ]] || die "malformed checksum for $name"
+      ;;
     *) die "no published checksum for $name ($TARGET) — nothing to install" ;;
   esac
 
