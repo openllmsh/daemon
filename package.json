@@ -1,6 +1,6 @@
 {
   "name": "@openllmsh/daemon",
-  "version": "0.0.0-dev",
+  "version": "1.8.1",
   "private": false,
   "type": "module",
   "exports": {
@@ -17,8 +17,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.207",
-    "@openllmsh/protocol": "workspace:*",
-    "@openllmsh/wire": "workspace:*",
+    "@openllmsh/wire": "github:openllmsh/wire#v1.8.1",
     "effect": ">=3.20.0",
     "partysocket": "^1.1.19",
     "zod": "^4.4.3"
