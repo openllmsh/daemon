@@ -116,6 +116,7 @@ import {
   newChatGptStreamState,
   type TChatGptStreamEvent,
 } from "@openllmsh/wire/providers/chatgpt/streaming";
+import { withChatGptNativeSearch } from "@openllmsh/wire/providers/chatgpt/web-search";
 import { withGrokNativeSearch } from "@openllmsh/wire/providers/grok/web-search";
 import {
   KIMI_SEARCH_MAX_ROUNDS,
@@ -951,8 +952,12 @@ const serveSubscription = async (
   // Provider-native search: the client DECLARED the Anthropic
   // `web_search_*` server tool — an explicit platform-executes-search
   // contract (Claude Code's WebSearch). A bare `web_search`-NAMED function
-  // tool never triggers either branch.
+  // tool never triggers a provider-native branch.
   //
+  //   - chatgpt: Codex's OpenAI Responses `web_search` tool executes hosted
+  //     search within ONE request. The bridge enables this capability through
+  //     `thread/start.config`; handrolled hops must inject the native tool
+  //     themselves or leak an unexecutable client `web_search` function.
   //   - grok: xAI's Responses proxy runs web + X search fully server-side
   //     within ONE request. Swap the canonicalised `web_search` function
   //     tool for the native `web_search`/`x_search` tools (one search owner
@@ -966,6 +971,9 @@ const serveSubscription = async (
   const declaredSearch =
     args.surface === "messages" &&
     declaresAnthropicServerSearchTool(args.rawBody);
+  if (declaredSearch && hop.provider === "chatgpt") {
+    body = withChatGptNativeSearch(body);
+  }
   if (declaredSearch && hop.provider === "grok") {
     body = withGrokNativeSearch(body);
   }
