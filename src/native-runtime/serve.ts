@@ -26,6 +26,7 @@ import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
 import { deliverChunkStream, deliverJsonResponse } from "../client-encode";
 import { errorJson } from "../cors";
+import { logDebug, logWarn } from "../logger";
 import { runClaudeNative } from "./claude-native";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
 import { runCodexNative } from "./codex-app-server";
@@ -53,6 +54,84 @@ import {
 const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   claude_code: new NativeSessionStore(),
   chatgpt: new NativeSessionStore(),
+};
+
+/**
+ * Resume-correlation counters, per provider. INSTRUMENTATION ONLY — nothing
+ * branches on these.
+ *
+ * The session key is derived from a hash of the conversation prefix
+ * (`deriveConversation`), not from a vendor session id, so any client-side
+ * history edit, compaction, or model switch MISSES and falls back to
+ * `renderSeed` — which flattens the whole transcript into a fresh cold
+ * session. That fallback is the expensive path (full history re-sent, no
+ * vendor-side session memory), and we currently have no visibility into how
+ * often it fires. These counters answer that before we invest in a
+ * persistent-session redesign.
+ *
+ *   - `firstTurn`  — no prior assistant turn; a fresh session is CORRECT.
+ *   - `resumeHit`  — prior history AND the prefix matched → delta-only feed.
+ *   - `resumeMiss` — prior history but NO match → `renderSeed` cold start.
+ *
+ * The ratio that matters is `resumeMiss / (resumeHit + resumeMiss)`;
+ * `firstTurn` is excluded because it isn't a correlation failure.
+ */
+type TResumeStats = {
+  firstTurn: number;
+  resumeHit: number;
+  resumeMiss: number;
+};
+
+const resumeStats: Record<TNativeRuntimeProvider, TResumeStats> = {
+  claude_code: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
+  chatgpt: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
+};
+
+/** Snapshot the resume-correlation counters (introspection / tests). */
+export const nativeResumeStats = (): Record<
+  TNativeRuntimeProvider,
+  TResumeStats
+> => ({
+  claude_code: { ...resumeStats.claude_code },
+  chatgpt: { ...resumeStats.chatgpt },
+});
+
+/** Reset the counters (tests). */
+export const resetNativeResumeStats = (): void => {
+  resumeStats.claude_code = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
+  resumeStats.chatgpt = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
+};
+
+/**
+ * Record one correlation outcome and log it. A MISS logs at `warn` with the
+ * transcript size being re-sent (the cost of the fallback); the other two log
+ * at `debug` so steady-state traffic stays quiet.
+ */
+const recordResumeOutcome = (
+  provider: TNativeRuntimeProvider,
+  outcome: "firstTurn" | "resumeHit" | "resumeMiss",
+  turnCount: number,
+  seedChars: number,
+): void => {
+  const s = resumeStats[provider];
+  s[outcome]++;
+  const meta = {
+    provider,
+    outcome,
+    turnCount,
+    firstTurn: s.firstTurn,
+    resumeHit: s.resumeHit,
+    resumeMiss: s.resumeMiss,
+  };
+  if (outcome === "resumeMiss") {
+    logWarn(
+      "native-runtime",
+      "resume MISS — prior history did not correlate; re-seeding a fresh session with the rendered transcript",
+      { ...meta, seedChars },
+    );
+    return;
+  }
+  logDebug("native-runtime", `resume ${outcome}`, meta);
 };
 
 /**
@@ -183,6 +262,14 @@ export const tryServeNativeRuntime = async (
       : hasPrior
         ? renderSeed(req.turns, deltaText)
         : deltaText;
+  // Instrumentation: which of the three correlation outcomes this turn took.
+  // `hasPrior && resumeId === null` is the expensive `renderSeed` fallback.
+  recordResumeOutcome(
+    params.provider,
+    resumeId !== null ? "resumeHit" : hasPrior ? "resumeMiss" : "firstTurn",
+    req.turns.length,
+    resumeId === null && hasPrior ? userText.length : 0,
+  );
   // A resumed session already carries the system prompt; only a fresh start
   // applies it.
   const systemText = resumeId !== null ? null : req.systemText;

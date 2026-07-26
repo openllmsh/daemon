@@ -186,26 +186,72 @@ const userAgent = async (): Promise<string> => {
 };
 
 /**
+ * Cache TTL for `claude auth status`. The spawn costs ~200 ms (measured), and
+ * the quota gate on the INFERENCE path hits it once per walk with a cold
+ * `accountHashByProvider` — so an uncached probe taxes every request. Auth
+ * state only changes on login / logout / token expiry, and both mutations
+ * invalidate explicitly below, so a short TTL is safe for status accuracy.
+ * Mirrors `CLI_INSTALL_STATE_TTL_MS` in `../cli-install`.
+ */
+const AUTH_STATUS_TTL_MS = 30_000;
+
+let authStatusCache: { result: boolean | null; expiresAt: number } | null =
+  null;
+
+/**
+ * Generation token guarding against stale writes: a probe that started before
+ * an invalidation must not install its now-outdated result.
+ */
+let authStatusGeneration = 0;
+
+/**
+ * Drop the cached `claude auth status`. Called on every auth MUTATION (login
+ * success, logout) so a state change is visible immediately rather than after
+ * the TTL. Exported for tests that drive login/logout out of band.
+ */
+export const clearAuthStatusCache = (): void => {
+  authStatusCache = null;
+  authStatusGeneration++;
+};
+
+/**
  * Authoritative connection check via `claude auth status` (JSON):
  *   { loggedIn: bool, authMethod: "claudeai" | "api_key" | …, … }
  * We require loggedIn AND a subscription auth method (not `api_key` —
  * the daemon serves the subscription path, not a console key). Returns
  * null when the CLI is absent or the JSON is unparseable, so the caller
  * falls back to the credential-store read.
+ *
+ * Result cached for `AUTH_STATUS_TTL_MS` (see above).
  */
 const authStatusLoggedIn = async (): Promise<boolean | null> => {
-  const out = await runCapture([bin(), "auth", "status"], env());
-  if (out === null) return null;
-  try {
-    const parsed = JSON.parse(out) as {
-      loggedIn?: boolean;
-      authMethod?: string;
-    };
-    if (parsed.loggedIn !== true) return false;
-    return parsed.authMethod !== "api_key";
-  } catch {
-    return null;
+  const cached = authStatusCache;
+  if (cached !== null && cached.expiresAt > Date.now()) return cached.result;
+
+  const generation = authStatusGeneration;
+  const probe = async (): Promise<boolean | null> => {
+    const out = await runCapture([bin(), "auth", "status"], env());
+    if (out === null) return null;
+    try {
+      const parsed = JSON.parse(out) as {
+        loggedIn?: boolean;
+        authMethod?: string;
+      };
+      if (parsed.loggedIn !== true) return false;
+      return parsed.authMethod !== "api_key";
+    } catch {
+      return null;
+    }
+  };
+
+  const result = await probe();
+  // A `null` is an INCONCLUSIVE probe (CLI absent / unparseable JSON), not a
+  // known state — caching it would pin the caller to the fragile store-read
+  // fallback for the whole TTL. Only cache a definite answer.
+  if (result !== null && generation === authStatusGeneration) {
+    authStatusCache = { result, expiresAt: Date.now() + AUTH_STATUS_TTL_MS };
   }
+  return result;
 };
 
 /**
@@ -283,7 +329,13 @@ const connectDirect = makeBlockingConnect({
   beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
   argv: LOGIN_ARGV,
   env,
-  afterLogin: () => grantKeychainToolAccess(cliHome(PROVIDER)),
+  // Drop the cached status BEFORE `verifyConnected` runs: the pre-login
+  // `installed`/status reads may have cached a signed-OUT answer that would
+  // otherwise make the post-login verification falsely fail.
+  afterLogin: () => {
+    clearAuthStatusCache();
+    return grantKeychainToolAccess(cliHome(PROVIDER));
+  },
   verifyConnected: isConnected,
   onConnected: refreshConfig,
   successDetail: () =>
@@ -323,8 +375,15 @@ const device = makePasteBackDevice({
     refreshConfig();
   },
   onCodeAccepted: () => grantKeychainToolAccess(cliHome(PROVIDER)),
-  verifyAfterSubmit: async () =>
-    (await authStatusLoggedIn()) === true || (await readToken()) !== null,
+  // Same ordering rule as the browser flow: invalidate first, so the verify
+  // below observes the post-paste credential rather than a stale signed-out
+  // answer cached by the pre-login `connected` probe.
+  verifyAfterSubmit: async () => {
+    clearAuthStatusCache();
+    return (
+      (await authStatusLoggedIn()) === true || (await readToken()) !== null
+    );
+  },
   submitSuccessDetail: () =>
     signedInDetail(
       "signed in but the stored credential has NO refresh token — it cannot auto-refresh; the access token will expire (~8h) and require re-login",
@@ -517,6 +576,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
   },
 
   logout: async () => {
+    // The credential is about to disappear — drop the cached status so no
+    // caller can read a stale "connected" for up to the TTL.
+    clearAuthStatusCache();
     // `claude auth logout` clears the isolated login credential (keychain item
     // on macOS, .credentials.json on Linux).
     if ((await cliInstallState(PROVIDER)).installed) {
@@ -529,6 +591,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
         force: true,
       }).catch(() => {});
     }
+    // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
+    // clear could have completed mid-logout and installed a "connected"
+    // result under the new generation. The post-clear leaves the cache empty
+    // so the next read re-probes against the now-cleared credential.
+    clearAuthStatusCache();
     const cleared =
       (await loadStore())?.claudeAiOauth?.accessToken === undefined;
     return cleared
