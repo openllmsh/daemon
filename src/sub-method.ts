@@ -48,10 +48,11 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
   chatgpt: { methods: ["bridge", "handrolled"] },
   kimi_code: { methods: ["handrolled"] },
   grok: { methods: ["handrolled"] },
-  // Cursor's only supported inference transport is ACP bridge, which is not
-  // implemented yet. Declare handrolled to preserve native-runtime lockstep;
-  // the walker declines it explicitly rather than attempting HTTP inference.
-  cursor: { methods: ["handrolled"] },
+  // Cursor's ONLY inference transport is the ACP bridge (`cursor-agent acp`,
+  // native-runtime/cursor-acp.ts) — there is no manual HTTP path (no
+  // UPSTREAM_WIRE entry), so it is the one BRIDGE-ONLY provider: a bridge
+  // decline advances the plan instead of falling to a manual transport.
+  cursor: { methods: ["bridge"] },
 };
 
 /**

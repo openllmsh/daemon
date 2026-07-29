@@ -9,6 +9,7 @@
 import { platform } from "node:os";
 import { join } from "node:path";
 import type {
+  TProviderModelEntry,
   TProviderUsageSnapshot,
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
@@ -16,6 +17,7 @@ import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logError, logInfo } from "../logger";
+import { listCursorModelsViaAcp } from "../native-runtime/cursor-acp";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -45,6 +47,15 @@ const REFRESH_LEEWAY_MS = 5 * 60_000;
 
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
+
+// ─── Live model rows via the ACP bridge (cursor/list_available_models) ─────
+const CURSOR_MODELS_TTL_MS = 5 * 60_000;
+let cursorModelsCache: {
+  at: number;
+  entries: ReadonlyArray<TProviderModelEntry>;
+} | null = null;
+let cursorModelsInflight: Promise<ReadonlyArray<TProviderModelEntry> | null> | null =
+  null;
 
 const redactUrls = (value: string): string =>
   value.replace(/(https?:\/\/[^\s?]+)\?\S*/g, "$1?<redacted>");
@@ -378,19 +389,49 @@ export const cursorDelegate: TProviderDelegate = {
     }
   },
 
-  // Cursor model discovery is ACP-only (`cursor/list_available_models`).
-  // ⚠️ RESEARCH-UNVERIFIED until the ACP bridge implementation lands.
+  // Cursor model discovery is ACP-only: a short-lived `cursor-agent acp`
+  // session's `cursor/list_available_models` extension request (VERIFIED
+  // LIVE) returns `{ models: [{ value, name }] }`. Cached 5 min (like grok's
+  // modelRows); null on any failure — never an empty list.
+  listModels: async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
+    if (
+      cursorModelsCache !== null &&
+      Date.now() - cursorModelsCache.at < CURSOR_MODELS_TTL_MS
+    ) {
+      return cursorModelsCache.entries;
+    }
+    if (cursorModelsInflight === null) {
+      cursorModelsInflight =
+        (async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
+          const rows = await listCursorModelsViaAcp({ bin: bin(), env: env() });
+          if (rows === null) return null;
+          const entries: TProviderModelEntry[] = rows.map((row) => ({
+            provider_model_id: row.value,
+            ...(row.name !== null ? { display_name: row.name } : {}),
+          }));
+          return entries.length > 0 ? entries : null;
+        })().finally(() => {
+          cursorModelsInflight = null;
+        });
+    }
+    const entries = await cursorModelsInflight;
+    if (entries !== null) {
+      cursorModelsCache = { at: Date.now(), entries };
+    }
+    return entries;
+  },
 
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null)
       throw new Error("cursor: not signed in (no stored credential)");
-    // Cursor has no manual HTTP inference path. Resolve the auth-config default
-    // target for diagnostics/contract parity, then reject before any request can
-    // be issued to the dashboard endpoint.
+    // Cursor has no manual HTTP inference path — the ACP bridge
+    // (native-runtime/cursor-acp.ts) serves inference and never calls this.
+    // Resolve the auth-config default target for diagnostics/contract parity,
+    // then reject before any request can be issued to the dashboard endpoint.
     const url = await resolveUpstreamUrl(PROVIDER);
     throw new Error(
-      `cursor inference requires the ACP bridge (cursor-agent acp); manual upstream inference is not implemented (configured target: ${new URL(url).origin})`,
+      `cursor is served by the ACP bridge (cursor-agent acp); there is no manual upstream transport (configured target: ${new URL(url).origin})`,
     );
   },
 

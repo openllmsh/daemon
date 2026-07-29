@@ -197,12 +197,6 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   grok: "chatgpt",
 };
 
-/** Cursor inference is ACP bridge-only. The bridge is deliberately not in this
- * task, so cursor must fail clearly rather than treating api2's dashboard host
- * as an HTTP model endpoint. */
-const cursorInferenceUnavailable = (provider: string): boolean =>
-  provider === "cursor";
-
 // The Codex system preamble ("You are Codex…") is a Codex IDENTITY the ChatGPT
 // backend requires — but WRONG for other providers that merely share the
 // Responses wire (xAI Grok). Injected only for the real `chatgpt` provider on
@@ -338,8 +332,7 @@ export const planSignatureOk = (
 export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
   for (const hop of hops) {
     if (!isSubscriptionSlug(hop.provider)) continue; // API-key → forwardable
-    if (cursorInferenceUnavailable(hop.provider)) continue; // explicit per-hop error
-    if (isNativeRuntimeProvider(hop.provider)) continue; // native runtime path
+    if (isNativeRuntimeProvider(hop.provider)) continue; // native runtime path (incl. bridge-only cursor)
     if (UPSTREAM_WIRE[hop.provider] === undefined) return false;
   }
   return true;
@@ -2075,8 +2068,14 @@ const walkPlan = async (
       addHopFailure(hop, lastError);
       continue;
     }
-    if (cursorInferenceUnavailable(hop.provider)) {
-      lastError = `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp); manual upstream inference is not implemented`;
+    // cursor is BRIDGE-ONLY: no UPSTREAM_WIRE entry (api2.cursor.sh is a
+    // dashboard host, not a model endpoint) and no cloud path (subscription
+    // hops never forward). If the ACP bridge declined above, advance the plan
+    // with the decline reason — never fall to the cloud-forward branch below.
+    if (hop.provider === "cursor") {
+      lastError =
+        lastError ??
+        `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp)`;
       addHopFailure(hop, lastError);
       continue;
     }
