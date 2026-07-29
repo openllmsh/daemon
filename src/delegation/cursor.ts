@@ -14,7 +14,7 @@ import type {
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
-import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logError, logInfo } from "../logger";
 import {
   clearPendingAuth,
@@ -28,7 +28,14 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
-import { readJsonFile, runCapture, stripAnsi } from "./util";
+import {
+  ensureIsolatedKeychain,
+  grantKeychainToolAccess,
+  readIsolatedKeychain,
+  readJsonFile,
+  runCapture,
+  stripAnsi,
+} from "./util";
 
 const PROVIDER = "cursor" as const;
 const CURSOR_ORIGIN = "https://api2.cursor.sh";
@@ -143,9 +150,19 @@ export const parseCursorUsage = (
   };
 };
 
-/** ⚠️ RESEARCH-UNVERIFIED: macOS Cursor tokens use generic-password services. */
+/**
+ * ⚠️ RESEARCH-UNVERIFIED: macOS cursor-agent stores tokens as generic-password
+ * items (services `cursor-access-token` / `cursor-refresh-token`).
+ *
+ * Read them ONLY from the ISOLATED login keychain (the one under the CLI's
+ * isolated HOME), exactly like claude_code: `readIsolatedKeychain` targets the
+ * keychain by explicit path, never the user's real login keychain — so a
+ * missing item is a quiet `null` ("not signed in"), never a "keychain not
+ * found" error or a macOS GUI prompt, and nothing is created or mutated on a
+ * read path beyond ensuring our own isolated keychain file exists.
+ */
 const readMacKeychainSecret = (service: string): Promise<string | null> =>
-  runCapture(["security", "find-generic-password", "-s", service, "-w"]);
+  readIsolatedKeychain(cliHome(PROVIDER), service);
 
 type TCursorFileStore = {
   readonly access_token?: string;
@@ -244,7 +261,19 @@ const connectDirect = makeStreamConnect({
     const url = parseAuthUrl(buffer);
     return url === null ? null : { url, code: "" };
   },
-  onStart: () => logInfo("cursor-connect", "spawning `cursor-agent login`"),
+  // After a successful login lands the tokens, grant command-line tools
+  // prompt-free access to the isolated keychain items (claude_code parity) so
+  // the daemon's later `security` reads never pop a GUI prompt.
+  onConnected: () => grantKeychainToolAccess(cliHome(PROVIDER)),
+  onStart: () => {
+    // Ensure the ISOLATED login keychain exists before the CLI spawns — a CLI
+    // run under the isolated HOME with no keychain there wedges on macOS's
+    // "Keychain Not Found" dialog (same failure claude_code guards against).
+    // Best-effort + non-blocking; the pre-spawn `connected()` probe usually
+    // has already ensured it (readIsolatedKeychain ensures on every read).
+    void ensureIsolatedKeychain(cliHome(PROVIDER)).catch(() => {});
+    logInfo("cursor-connect", "spawning `cursor-agent login`");
+  },
   onParsed: (url) =>
     logInfo("cursor-connect", "parsed authorize URL; surfacing to dashboard", {
       urlLen: url.length,
