@@ -222,6 +222,15 @@ echo "Starting the daemon..."
 # on the host CLI dirs. Fully best-effort: guarded so a slow/failed vendor
 # install never fails the daemon install, and logged to ~/.openllm/cli-install.log.
 provision_clis() {
+  # display | command | dest launcher | official installer URL.
+  # These mirror sources of truth in TS that bash can't import: the dest
+  # launchers match the VENDOR-DEFAULT entries of `hostCliCandidates` in
+  # packages/daemon/src/cli-paths.ts (daemon-side detection additionally
+  # scans PATH generically, mirroring the `has_command` check below — the two
+  # layers agree on "installed" wherever the binary lives), and the URLs match
+  # `VENDOR_CLI_INSTALL_CMD` in lib/hooks/use-daemon.ts + `installHint` in
+  # packages/cli/src/clients/registry.ts. If a vendor path or installer URL
+  # changes, update it in all those places too.
   local specs=(
     "Claude Code|claude|$HOME/.local/bin/claude|https://claude.ai/install.sh"
     "Codex|codex|$HOME/.local/bin/codex|https://chatgpt.com/codex/install.sh"
@@ -259,6 +268,11 @@ provision_clis() {
     IFS='|' read -r name cmd dest url <<<"$spec"
     if has_command "$cmd" || [ -x "$dest" ]; then
       echo "  $name CLI: already installed."
+      # Mirror the skip into the log too — previously only the backgrounded
+      # installer output landed there, so a skipped provider left the log
+      # silent about why nothing was installed.
+      echo "$name CLI: already installed ($(command -v "$cmd" 2>/dev/null || echo "$dest")) — skipping install." \
+        >>"$OPENLLM_DIR/cli-install.log" 2>/dev/null || true
       continue
     fi
     echo "  $name CLI: installing in the background…"
@@ -270,8 +284,9 @@ provision_clis() {
     ) >>"$OPENLLM_DIR/cli-install.log" 2>&1 &
   done
 }
-# `|| true` keeps this off the `set -euo pipefail` path — a vendor install can
-# never abort the daemon install. Background jobs outlive this script.
+# `|| true` + the subshell/background jobs keep this off the `set -euo
+# pipefail` path — a vendor install can never abort the daemon install.
+# Background jobs outlive this script.
 provision_clis || true
 
 cat <<EOF
