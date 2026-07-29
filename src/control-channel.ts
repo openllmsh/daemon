@@ -15,7 +15,28 @@ import { runCommandInner } from "./control-relay";
 import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
+import {
+  acceptChannel,
+  configureMuxHost,
+  DAEMON_MUX_CAPS,
+  handleChannelOpenAck,
+  muxHostOnBytes,
+  replaceMuxPeerCaps,
+  resetAllChannels,
+  updateMuxPeerCaps,
+} from "./mux-host";
 import { computeStatus } from "./status";
+import {
+  failAllConsumedTunnels,
+  handleConsumedTunnelFrame,
+  ownsTunnel,
+  registerTunnelSender,
+} from "./tunnel-client";
+import {
+  abortAllTunnels,
+  handleTunnelFrame,
+  isTunnelFrame,
+} from "./tunnel-server";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
@@ -108,6 +129,15 @@ let hasConnected = false;
 let lastErrorReason = "";
 let lastCloseLine = "";
 
+const sendBytes = (bytes: Uint8Array): void => {
+  if (ws === null || ws.readyState !== ws.OPEN || !helloSent) return;
+  try {
+    ws.send(bytes.buffer as ArrayBuffer);
+  } catch {
+    // best-effort while the socket races a close
+  }
+};
+
 const send = (frame: TRelayFrame): void => {
   if (ws === null || ws.readyState !== ws.OPEN) return;
   // Nothing may precede the hello on a fresh connection (see `helloSent`).
@@ -117,6 +147,15 @@ const send = (frame: TRelayFrame): void => {
   } catch {
     // best-effort: a failed send means the socket is closing; partysocket reconnects
   }
+};
+
+/** Reset relay-owned work at a connection boundary. PTY processes survive a
+ * handoff, while their mux channels, served tunnels, and consumed tunnels are
+ * tied to the old relay socket and must not continue into the successor. */
+export const resetRelayScopedState = (): void => {
+  abortAllTunnels();
+  failAllConsumedTunnels();
+  resetAllChannels();
 };
 
 const enqueueStatusPublish = (
@@ -387,6 +426,7 @@ const onFrame = (frame: TRelayFrame): void => {
       });
       return;
     case "welcome":
+      replaceMuxPeerCaps(frame.snapshot_caps);
       daemonSessionId = frame.daemon_session_id ?? null;
       supportsOrderedStatus = frame.daemon_session_id !== undefined;
       // Sequence 1 of the session is reserved for the hello snapshot the relay
@@ -405,13 +445,51 @@ const onFrame = (frame: TRelayFrame): void => {
       // inbound frame — that's how we notice a dead outbound direction).
       heartbeat.notePong();
       return;
+    case "channel_open":
+      acceptChannel(frame);
+      return;
+    case "channel_open_ack":
+      handleChannelOpenAck(frame);
+      return;
+    case "presence":
+      updateMuxPeerCaps(frame.key_id, frame.active ? frame.caps : undefined);
+      return;
     default:
-      // welcome / others: nothing to do (partysocket owns reconnection)
+      // Subscription tunnels. This daemon can be BOTH ends: the CONSUMER of
+      // tunnels it opened (routed by tunnel-id ownership — acks/res frames)
+      // and the SERVER of tunnels a fleet peer/browser opened (everything
+      // else). Both run on their own async tasks — never the commandTail (a
+      // streaming response would block every command).
+      if (frame.type === "tunnel_open_ack") {
+        handleConsumedTunnelFrame(frame);
+        return;
+      }
+      if (isTunnelFrame(frame)) {
+        if (frame.type !== "tunnel_open" && ownsTunnel(frame.tunnel_id)) {
+          handleConsumedTunnelFrame(frame);
+          return;
+        }
+        handleTunnelFrame(frame, send);
+        return;
+      }
+      // others: nothing to do (partysocket owns reconnection)
       return;
   }
 };
 
 const onMessage = (data: unknown): void => {
+  if (data instanceof ArrayBuffer) {
+    muxHostOnBytes(new Uint8Array(data));
+    return;
+  }
+  if (data instanceof Uint8Array) {
+    muxHostOnBytes(data);
+    return;
+  }
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
+    muxHostOnBytes(new Uint8Array(data));
+    return;
+  }
   if (typeof data !== "string") return;
   let json: unknown;
   try {
@@ -505,6 +583,11 @@ export const migrateIfRelayMoved = async (
 export const startControlChannel = (): void => {
   if (ws !== null) return;
   logInfo("control-channel", "connecting over websocket");
+  // Give the tunnel CLIENT (walker → fleet peer) a frame sender without a
+  // walker→control-channel import (which would close an import cycle via
+  // tunnel-server → listener → walker).
+  registerTunnelSender(send);
+  configureMuxHost({ send, sendBytes });
   const socket = new ReconnectingWebSocket(channelUrl, undefined, {
     WebSocket: globalThis.WebSocket,
     minReconnectionDelay: 1_000,
@@ -521,6 +604,7 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
+    resetRelayScopedState();
     daemonSessionId = null;
     supportsOrderedStatus = null;
     statusSeq = 0;
@@ -542,6 +626,7 @@ export const startControlChannel = (): void => {
         type: "hello",
         ticket,
         protocol_version: RELAY_PROTOCOL_VERSION,
+        caps: [...DAEMON_MUX_CAPS],
       });
       startWatcher();
     }
