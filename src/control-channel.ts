@@ -149,9 +149,9 @@ const send = (frame: TRelayFrame): void => {
   }
 };
 
-/** Reset relay-owned work at a connection boundary. PTY processes survive a
- * handoff, while their mux channels, served tunnels, and consumed tunnels are
- * tied to the old relay socket and must not continue into the successor. */
+/** Reset relay-owned work at a connection boundary. Consumed tunnels, served
+ * tunnels, and mux channels are tied to the old relay socket and must not
+ * continue into the successor. */
 export const resetRelayScopedState = (): void => {
   abortAllTunnels();
   failAllConsumedTunnels();

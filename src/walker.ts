@@ -1666,10 +1666,9 @@ const tryFleetTunnel = async (
           : null,
       signal: args.req.signal,
     });
-    // Commit only a success — a peer-side failure (its own walk exhausted)
-    // must not consume this box's remaining hops silently, but the peer
-    // already ran the full plan, so forward its terminal answer on the
-    // FINAL failure too; pre-head failures threw and fell through.
+    // Any peer response head (success or terminal failure) ends this
+    // consumer walk: the peer already ran its full plan. Pre-head
+    // failures throw below and fall through to the next local hop.
     return res;
   } catch {
     return null;
