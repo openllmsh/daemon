@@ -12,11 +12,13 @@
 #   OPENLLM_API_KEY        pair the daemon now; otherwise pair from the dashboard
 #   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
 #
-# This is the ONLY shell installer for the daemon. It does not know about
-# clients (claude / codex / grok / …) and never edits a third-party config:
-# `openllm <client>` applies OpenLLM at run time instead. The only files it
-# writes outside ~/.openllm are the PATH symlinks and the ONE marked block in
-# your shell rc that `openllm setup` / `openllmd completion` manage.
+# This is the ONLY shell installer for the daemon. It also background-provisions
+# any missing vendor subscription CLIs (claude / codex / kimi / grok) via each
+# vendor's official installer — skip if already present. It never edits a
+# third-party client config: `openllm <client>` applies OpenLLM at run time
+# instead. The only files it writes outside ~/.openllm (besides what a vendor
+# installer itself does) are the PATH symlinks and the ONE marked block in your
+# shell rc that `openllm setup` / `openllmd completion` manage.
 set -euo pipefail
 
 ORIGIN="${OPENLLM_CLOUD_ORIGIN:-https://openllm.sh}"
@@ -209,6 +211,69 @@ fi
 echo "Starting the daemon..."
 "$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"
 
+# --- provision the vendor subscription CLIs (background) -------------------
+# The daemon RUNS the official vendor CLIs but never INSTALLS them (it runs
+# under an OS sandbox that intentionally can't touch shell rc files). So THIS
+# script — run by the user, unsandboxed, with a real HOME/PATH/rc — is where a
+# missing CLI gets installed: fire-and-forget the official installer for each
+# provider not already present. Each native installer does its own normal
+# rc/PATH edit. The daemon only LINKS its isolated run-view to whatever lands
+# (see cli-install.ts) — symlink self-heal is separate and needs no write grant
+# on the host CLI dirs. Fully best-effort: guarded so a slow/failed vendor
+# install never fails the daemon install, and logged to ~/.openllm/cli-install.log.
+provision_clis() {
+  local specs=(
+    "Claude Code|claude|$HOME/.local/bin/claude|https://claude.ai/install.sh"
+    "Codex|codex|$HOME/.local/bin/codex|https://chatgpt.com/codex/install.sh"
+    "Kimi|kimi|$HOME/.kimi-code/bin/kimi|https://code.kimi.com/kimi-code/install.sh"
+    "Grok|grok|$HOME/.grok/bin/grok|https://x.ai/cli/install.sh"
+  )
+  # Build a PATH that (a) puts the STANDARD system dirs FIRST — covering
+  # curl/bash/tar/gzip/uname/sed/grep on macOS AND Linux (all live in
+  # /usr/bin + /bin on both) plus Homebrew — so a real `curl` always wins over
+  # any shim the OUTER process prepended, and (b) APPENDS the caller's own
+  # PATH so Homebrew/nix/snap tools a vendor installer needs stay reachable.
+  # The backgrounded jobs outlive this script, so they must not depend on the
+  # outer PATH: the dev dist-installer prepends an ephemeral `curl` shim it
+  # deletes on exit, and a bare `curl` in a detached job would then resolve to
+  # nothing (or a coreutils multicall). Resolving curl absolutely + running the
+  # job under this PATH makes the primitive robust on every major platform.
+  local sys_path="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/opt/homebrew/bin"
+  local run_path="${sys_path}:${PATH:-}"
+  local curl_bin
+  curl_bin="$(PATH="$run_path" command -v curl 2>/dev/null || true)"
+  # Fallback: probe the canonical absolute locations directly (a pathological
+  # PATH or a shell without a working `command -v` still resolves here).
+  if [ -z "$curl_bin" ]; then
+    local c
+    for c in /usr/bin/curl /bin/curl /usr/local/bin/curl /opt/homebrew/bin/curl; do
+      [ -x "$c" ] && { curl_bin="$c"; break; }
+    done
+  fi
+  if [ -z "$curl_bin" ]; then
+    echo "  Vendor CLIs: curl not found — install them by hand from their official installers." >&2
+    return 0
+  fi
+  local spec name cmd dest url
+  for spec in "${specs[@]}"; do
+    IFS='|' read -r name cmd dest url <<<"$spec"
+    if has_command "$cmd" || [ -x "$dest" ]; then
+      echo "  $name CLI: already installed."
+      continue
+    fi
+    echo "  $name CLI: installing in the background…"
+    # Absolute curl entry + `run_path` for the piped installer and every inner
+    # tool it spawns → a detached job is immune to the outer process's PATH
+    # while the installer still writes under the real $HOME.
+    (
+      PATH="$run_path" "$curl_bin" -fsSL "$url" | PATH="$run_path" bash
+    ) >>"$OPENLLM_DIR/cli-install.log" 2>&1 &
+  done
+}
+# `|| true` keeps this off the `set -euo pipefail` path — a vendor install can
+# never abort the daemon install. Background jobs outlive this script.
+provision_clis || true
+
 cat <<EOF
 
 OpenLLM is installed.
@@ -219,6 +284,9 @@ OpenLLM is installed.
   openllm --help           everything else
 
 Open a new shell (or source your rc) so \`openllm\` and \`ollm\` are on PATH.
+Any missing vendor CLIs are installing in the background
+(see ~/.openllm/cli-install.log). Open the dashboard's Providers tab to
+connect each vendor once its CLI is ready.
 EOF
 if [ -z "$API_KEY" ]; then
   cat <<EOF
