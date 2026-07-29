@@ -197,6 +197,12 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   grok: "chatgpt",
 };
 
+/** Cursor inference is ACP bridge-only. The bridge is deliberately not in this
+ * task, so cursor must fail clearly rather than treating api2's dashboard host
+ * as an HTTP model endpoint. */
+const cursorInferenceUnavailable = (provider: string): boolean =>
+  provider === "cursor";
+
 // The Codex system preamble ("You are Codex…") is a Codex IDENTITY the ChatGPT
 // backend requires — but WRONG for other providers that merely share the
 // Responses wire (xAI Grok). Injected only for the real `chatgpt` provider on
@@ -332,6 +338,7 @@ export const planSignatureOk = (
 export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
   for (const hop of hops) {
     if (!isSubscriptionSlug(hop.provider)) continue; // API-key → forwardable
+    if (cursorInferenceUnavailable(hop.provider)) continue; // explicit per-hop error
     if (isNativeRuntimeProvider(hop.provider)) continue; // native runtime path
     if (UPSTREAM_WIRE[hop.provider] === undefined) return false;
   }
@@ -2065,6 +2072,11 @@ const walkPlan = async (
       lastError =
         lastError ??
         `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
+      addHopFailure(hop, lastError);
+      continue;
+    }
+    if (cursorInferenceUnavailable(hop.provider)) {
+      lastError = `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp); manual upstream inference is not implemented`;
       addHopFailure(hop, lastError);
       continue;
     }

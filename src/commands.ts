@@ -59,6 +59,7 @@ export const PROVIDERS = [
   "chatgpt",
   "kimi_code",
   "grok",
+  "cursor",
 ] as const;
 
 /** Argument choices for the `auto-update` subcommand. */

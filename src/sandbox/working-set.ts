@@ -312,7 +312,10 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // the user's ~/.grok/auth.json must stay out of the working set).
     join(home, ".grok", "bin"),
     join(home, ".grok", "downloads"),
+    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher and versioned binaries live
+    // under ~/.local, so grant only executable-bearing leaves, never ~/.cursor.
     join(home, ".local", "bin"),
+    join(home, ".local", "share", "cursor-agent", "versions"),
     join(home, ".local", "share", "claude"),
     // claude's XDG dirs — its runtime writes these ON LINUX; absent on macOS.
     join(home, ".local", "state", "claude"),
@@ -448,6 +451,9 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // under bin/ or downloads/). `cliInstallState`'s auto-link writes only the
     // isolated symlink under the state dir (read-write), never these dirs.
     join(home, ".local", "bin"),
+    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher resolves into this versioned
+    // executable directory; hostCliCandidates + symlink resolution add any live path.
+    join(home, ".local", "share", "cursor-agent", "versions"),
     join(home, ".local", "share", "claude"),
     join(home, ".grok", "bin"),
     join(home, ".grok", "downloads"),

@@ -36,8 +36,9 @@ export type TSubMethodCapability = {
 /**
  * The initial capability matrix (active-sub-method.md §initial capability
  * matrix). `bridge` is declared exactly for the native-runtime providers
- * (`isNativeRuntimeProvider`); kimi_code + grok are handrolled-only. The
- * table ⇔ native-runtime lockstep is machine-checked in
+ * (`isNativeRuntimeProvider`); kimi_code, grok, and cursor are handrolled-only
+ * until Cursor ACP bridge support is implemented. The table ⇔ native-runtime
+ * lockstep is machine-checked in
  * `tests/transport/sub-method.test.ts`.
  */
 export const SUB_METHOD_CAPABILITIES: Readonly<
@@ -47,6 +48,10 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
   chatgpt: { methods: ["bridge", "handrolled"] },
   kimi_code: { methods: ["handrolled"] },
   grok: { methods: ["handrolled"] },
+  // Cursor's only supported inference transport is ACP bridge, which is not
+  // implemented yet. Declare handrolled to preserve native-runtime lockstep;
+  // the walker declines it explicitly rather than attempting HTTP inference.
+  cursor: { methods: ["handrolled"] },
 };
 
 /**

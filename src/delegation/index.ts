@@ -1,5 +1,6 @@
 import { chatgptDelegate } from "./chatgpt";
 import { claudeCodeDelegate } from "./claude-code";
+import { cursorDelegate } from "./cursor";
 import { grokDelegate } from "./grok";
 import { kimiCodeDelegate } from "./kimi-code";
 import type { TProviderDelegate } from "./types";
@@ -16,6 +17,7 @@ export const DELEGATES: Readonly<Record<string, TProviderDelegate>> = {
   chatgpt: chatgptDelegate,
   kimi_code: kimiCodeDelegate,
   grok: grokDelegate,
+  cursor: cursorDelegate,
 };
 
 export const isSubscriptionSlug = (slug: string): boolean =>
