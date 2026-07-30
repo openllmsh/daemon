@@ -24,6 +24,7 @@ import {
   InvalidApiKeyError,
   NoApiKeyError,
 } from "./cloud-client";
+import { setDeviceAccessPubkey } from "./device-access-verify";
 import { clearPlanCache } from "./plan-cache";
 
 const EMPTY: TDaemonBootstrap = {
@@ -68,6 +69,13 @@ export const refreshBootstrap = async (): Promise<boolean> => {
     // A fresh snapshot may carry new routing config — drop any cached signed
     // plans so a stale chain never outlives the config that produced it.
     clearPlanCache();
+    // Pin the seed-gated device-access verifier when the cloud includes it.
+    // Explicit null clears a previous pin (key un-provisioned / wiped).
+    // Absent (older cloud) leaves the last-known pin alone so a rolling
+    // deploy cannot silently drop enforcement.
+    if (snapshot.device_access_pubkey !== undefined) {
+      setDeviceAccessPubkey(snapshot.device_access_pubkey);
+    }
   } catch (err) {
     if (err instanceof NoApiKeyError) cloudState = "no_key";
     else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";

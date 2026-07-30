@@ -42,6 +42,12 @@ export type TDaemonState = {
     readonly cli?: TUpdateAttempt;
   };
   readonly bootHistory: readonly number[];
+  /**
+   * Seed-derived device-access public key (SPKI DER, base64) pinned from
+   * bootstrap. `null` means explicitly un-provisioned; absent means never
+   * set. Survives restarts so enforcement does not wait on the next poll.
+   */
+  readonly deviceAccessPubkey?: string | null;
 };
 
 /**
@@ -68,17 +74,29 @@ const numberList = (v: unknown): number[] =>
 /** Coerce parsed-unknown JSON into a valid state, field by field. */
 const coerceState = (v: unknown): TDaemonState => {
   if (typeof v !== "object" || v === null) return DEFAULT_STATE;
-  const raw = v as { updateAttempts?: unknown; bootHistory?: unknown };
+  const raw = v as {
+    updateAttempts?: unknown;
+    bootHistory?: unknown;
+    deviceAccessPubkey?: unknown;
+  };
   const attempts =
     typeof raw.updateAttempts === "object" && raw.updateAttempts !== null
       ? (raw.updateAttempts as { daemon?: unknown; cli?: unknown })
       : {};
+  const pubkey =
+    raw.deviceAccessPubkey === null
+      ? null
+      : typeof raw.deviceAccessPubkey === "string" &&
+          raw.deviceAccessPubkey.length > 0
+        ? raw.deviceAccessPubkey
+        : undefined;
   return {
     updateAttempts: {
       ...(isAttempt(attempts.daemon) ? { daemon: attempts.daemon } : {}),
       ...(isAttempt(attempts.cli) ? { cli: attempts.cli } : {}),
     },
     bootHistory: numberList(raw.bootHistory),
+    ...(pubkey !== undefined ? { deviceAccessPubkey: pubkey } : {}),
   };
 };
 

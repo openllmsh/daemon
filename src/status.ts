@@ -14,7 +14,7 @@ import { getCliState } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
-import { DAEMON_MUX_CAPS } from "./mux-host";
+import { currentDaemonCaps } from "./mux-host";
 import { sandboxState } from "./sandbox/landlock";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
@@ -61,7 +61,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     pubkey: daemonPublicKey(),
     port: daemonPort(),
     sandbox: sandboxState(),
-    caps: [...DAEMON_MUX_CAPS],
+    caps: currentDaemonCaps(),
     connections,
     // TTL-cached CLI probe from `getCliState()`. It returns cached state when fresh
     // and schedules a background refresh when stale, so status can stay responsive

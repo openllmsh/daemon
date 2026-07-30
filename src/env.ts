@@ -65,6 +65,30 @@ export type TDaemonEnv = {
 };
 
 /**
+ * Extract the public id half of a `sk-llm-{id}.{secret}` key. The daemon
+ * never imports `@openllm/vault`; this is a shape-only parse (id only —
+ * secret is ignored). Returns null on any mismatch.
+ */
+export const parseApiKeyId = (raw: string): string | null => {
+  if (!raw.startsWith("sk-llm-")) return null;
+  const rest = raw.slice("sk-llm-".length);
+  const dot = rest.indexOf(".");
+  if (dot <= 0 || dot === rest.length - 1) return null;
+  const id = rest.slice(0, dot);
+  return id.length > 0 ? id : null;
+};
+
+/**
+ * This daemon's api key id (the `key_id` grants must target). Null when
+ * keyless or the stored key is malformed.
+ */
+export const daemonApiKeyId = (): string | null => {
+  const key = daemonEnv().apiKey;
+  if (key === null) return null;
+  return parseApiKeyId(key);
+};
+
+/**
  * Compile-time default for the cloud origin, injected by
  * scripts/compile.ts via `--define __OPENLLM_CLOUD_ORIGIN_DEFAULT__`.
  * Declared as a global (NOT `process.env`) so the bundler replaces the

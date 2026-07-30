@@ -20,12 +20,18 @@ import {
   fingerprintFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
+  RTC_AUTH_VERSION_2,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
-import { openSealed, sealTo } from "./keypair";
+import {
+  checkDeviceGrant,
+  getDeviceAccessPubkey,
+} from "./device-access-verify";
+import { daemonApiKeyId } from "./env";
+import { daemonPublicKey, openSealed, sealTo } from "./keypair";
 import { logDebug, logWarn } from "./logger";
 import { serveMuxOnStream } from "./mux-host";
 
@@ -222,6 +228,37 @@ export const handleRtcOffer = async (frame: {
       channelId: frame.channel_id,
     });
     return;
+  }
+
+  // Seed-gate: when provisioned, require a v2 offer carrying a valid grant.
+  // Un-provisioned daemons still accept legacy v1 (no grant).
+  if (getDeviceAccessPubkey() !== null) {
+    if (inner.v !== RTC_AUTH_VERSION_2) {
+      logWarn("rtc-host", "seedgate requires v2 offer with grant", {
+        channelId: frame.channel_id,
+        v: inner.v,
+      });
+      return;
+    }
+    const keyId = daemonApiKeyId();
+    if (keyId === null) {
+      logWarn("rtc-host", "seedgate active but no api key id", {
+        channelId: frame.channel_id,
+      });
+      return;
+    }
+    const checked = checkDeviceGrant(inner.grant, {
+      keyId,
+      cid: frame.channel_id,
+      aud: daemonPublicKey(),
+    });
+    if (!checked.ok) {
+      logWarn("rtc-host", "device grant failed", {
+        channelId: frame.channel_id,
+        reason: checked.reason,
+      });
+      return;
+    }
   }
 
   const offerSdpMax = maxMessageSizeFromSdp(frame.sdp);

@@ -18,7 +18,7 @@ import { logDebug, logInfo, logWarn } from "./logger";
 import {
   acceptChannel,
   configureMuxHost,
-  DAEMON_MUX_CAPS,
+  currentDaemonCaps,
   handleChannelOpenAck,
   muxHostOnBytes,
   replaceMuxPeerCaps,
@@ -644,7 +644,7 @@ export const startControlChannel = (): void => {
         type: "hello",
         ticket,
         protocol_version: RELAY_PROTOCOL_VERSION,
-        caps: [...DAEMON_MUX_CAPS],
+        caps: currentDaemonCaps(),
       });
       startWatcher();
     }
