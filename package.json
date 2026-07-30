@@ -22,6 +22,7 @@
     "@openllmsh/wire": "workspace:*",
     "effect": ">=3.20.0",
     "partysocket": "^1.1.19",
+    "werift": "^0.24.2",
     "zod": "^4.4.3"
   },
   "license": "BUSL-1.1"

@@ -91,7 +91,8 @@ daemon/
     cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record)
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
-    mux-host.ts             mux1 channel negotiation, relay duplex ownership, and OPEN dispatch
+    mux-host.ts             mux1/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
+    rtc-host.ts             werift RTCPeerConnection responder: rtc_offer/answer/ice + mux over data channel
     tunnel-client.ts        consuming subscription tunnel: mux first, JSON splice fallback
     tunnel-server.ts        serving in-process tunneled request dispatch for JSON and mux streams
     record.ts/version/env   request recording, version, env (+ env-file loader)

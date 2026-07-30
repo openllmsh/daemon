@@ -25,6 +25,12 @@ import {
   resetAllChannels,
   updateMuxPeerCaps,
 } from "./mux-host";
+import {
+  configureRtcHost,
+  handleRtcIce,
+  handleRtcOffer,
+  resetAllRtcSessions,
+} from "./rtc-host";
 import { computeStatus } from "./status";
 import {
   failAllConsumedTunnels,
@@ -150,12 +156,13 @@ const send = (frame: TRelayFrame): void => {
 };
 
 /** Reset relay-owned work at a connection boundary. Consumed tunnels, served
- * tunnels, and mux channels are tied to the old relay socket and must not
- * continue into the successor. */
+ * tunnels, mux channels, and RTC signaling sessions are tied to the old
+ * relay socket and must not continue into the successor. */
 export const resetRelayScopedState = (): void => {
   abortAllTunnels();
   failAllConsumedTunnels();
   resetAllChannels();
+  resetAllRtcSessions();
 };
 
 const enqueueStatusPublish = (
@@ -451,6 +458,16 @@ const onFrame = (frame: TRelayFrame): void => {
     case "channel_open_ack":
       handleChannelOpenAck(frame);
       return;
+    case "rtc_offer":
+      // Daemon is the responder: open seal, answer, trickle ICE.
+      void handleRtcOffer(frame);
+      return;
+    case "rtc_ice":
+      void handleRtcIce(frame);
+      return;
+    case "rtc_answer":
+      // Responder path only — a browser-originated answer is unexpected.
+      return;
     case "presence":
       updateMuxPeerCaps(frame.key_id, frame.active ? frame.caps : undefined);
       return;
@@ -588,6 +605,7 @@ export const startControlChannel = (): void => {
   // tunnel-server → listener → walker).
   registerTunnelSender(send);
   configureMuxHost({ send, sendBytes });
+  configureRtcHost({ send });
   const socket = new ReconnectingWebSocket(channelUrl, undefined, {
     WebSocket: globalThis.WebSocket,
     minReconnectionDelay: 1_000,

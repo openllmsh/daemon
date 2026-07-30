@@ -4,8 +4,11 @@ import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
-/** Capability advertised on hello/status — single source for mux negotiation. */
-export const DAEMON_MUX_CAPS = ["mux1"] as const;
+/**
+ * Capabilities advertised on hello/status — single source for mux negotiation.
+ * `mux1` = binary mux over the relay WS; `rtc1` = WebRTC data-channel mux host.
+ */
+export const DAEMON_MUX_CAPS = ["mux1", "rtc1"] as const;
 
 let active: TMuxChannel | null = null;
 let sink: ((bytes: Uint8Array | null) => void) | null = null;
@@ -146,7 +149,12 @@ export const configureMuxHost = (options: {
   sendBinary = options.sendBytes;
 };
 
-const onStream = serveStream({
+/**
+ * Shared OPEN dispatcher for every daemon-side mux channel (relay WS + RTC).
+ * Keep tunnel-server reachable through this single closure so rtc-host does
+ * not re-implement admit/serve.
+ */
+export const serveMuxOnStream = serveStream({
   // Keep the tunnel-server import lazy: its production dispatcher reaches the
   // control channel, which imports this host during daemon initialization.
   tunnel: (open, body, signal) => serveMuxTunnel(open, body, signal),
@@ -183,7 +191,7 @@ export const acceptChannel = (frame: { readonly channel_id: string }): void => {
   active = createChannel({
     duplex,
     side: "daemon",
-    onStream,
+    onStream: serveMuxOnStream,
     onClose: () => {
       active = null;
       sink = null;
