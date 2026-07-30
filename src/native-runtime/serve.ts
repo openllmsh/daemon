@@ -30,6 +30,8 @@ import { logDebug, logWarn } from "../logger";
 import { runClaudeNative } from "./claude-native";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
 import { runCodexNative } from "./codex-app-server";
+import { runCursorNative } from "./cursor-acp";
+import { cursorRequestOf, jsonInstruction } from "./cursor-request";
 import {
   deriveConversation,
   NativeSessionStore,
@@ -54,6 +56,10 @@ import {
 const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   claude_code: new NativeSessionStore(),
   chatgpt: new NativeSessionStore(),
+  // cursor runs COLD sessions in v1 (`runCursorNative` never yields a
+  // resumable id, so this store stays empty); every prior-history turn takes
+  // the renderSeed path. TODO(cursor-resume): ACP `session/load` follow-up.
+  cursor: new NativeSessionStore(),
 };
 
 /**
@@ -85,6 +91,7 @@ type TResumeStats = {
 const resumeStats: Record<TNativeRuntimeProvider, TResumeStats> = {
   claude_code: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
   chatgpt: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
+  cursor: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
 };
 
 /** Snapshot the resume-correlation counters (introspection / tests). */
@@ -94,12 +101,14 @@ export const nativeResumeStats = (): Record<
 > => ({
   claude_code: { ...resumeStats.claude_code },
   chatgpt: { ...resumeStats.chatgpt },
+  cursor: { ...resumeStats.cursor },
 });
 
 /** Reset the counters (tests). */
 export const resetNativeResumeStats = (): void => {
   resumeStats.claude_code = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
   resumeStats.chatgpt = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
+  resumeStats.cursor = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
 };
 
 /**
@@ -202,6 +211,29 @@ export const tryServeNativeRuntime = async (
   // Requests with client-defined tools use the native runtime's ordinary
   // tool passthrough when supported. Search-shaped function tools are not
   // special-cased or executed by the daemon.
+  // cursor is BRIDGE-ONLY (no manual transport to decline to), so its serve
+  // path accepts the widest request surface the ACP runtime can represent:
+  // tools (loopback MCP), images (ACP image blocks), and structured output
+  // (prompt-embedded instruction + local JSON extraction). It skips the
+  // generic control gate below — declining response_format/tool_choice there
+  // would fail the hop outright instead of routing slower.
+  if (params.provider === "cursor") {
+    // cursor accepts the wide surface (tools/images/response_format/tool_choice/
+    // sampling), but `n>1` (multiple choices) and `logprobs` are STRUCTURALLY
+    // unrepresentable over ACP — the agent yields one message with no
+    // token-logprob channel. Decline explicitly rather than silently serving a
+    // single un-scored choice against a request that asked for more.
+    const cursorUnrepresentable =
+      (typeof params.canonical.n === "number" && params.canonical.n > 1) ||
+      params.canonical.logprobs === true;
+    if (cursorUnrepresentable) {
+      return {
+        declined:
+          "cursor ACP can't honor n>1 or logprobs (single un-scored message per turn)",
+      };
+    }
+    return serveCursorHop(params, overrides);
+  }
   // Generation controls the native runtimes can't honor (non-default
   // temperature/top_p/penalties, stop, seed, n, logprobs, logit_bias,
   // response_format, forced tool_choice) → decline so the manual transport
@@ -355,6 +387,81 @@ export const tryServeNativeRuntime = async (
   try {
     canonical = await accumulateChunksToResponse(
       committed.chunks,
+      params.providerModelId,
+    );
+  } catch (err) {
+    fail(err);
+    return errorJson(
+      502,
+      partialUsageFrom(err) === null
+        ? "native runtime stream ended before output"
+        : "native runtime stream failed after output began",
+    );
+  }
+  settle(canonical);
+  return deliverJsonResponse(canonical, params.surface, clientWire);
+};
+
+/**
+ * The cursor serve path — bridge-only, so it accepts tools/images/structured
+ * output instead of declining them (there is no manual transport behind it).
+ * One COLD ACP session per request: `cursorRequestOf` flattens the full
+ * conversation (including assistant tool_calls + tool results) into one
+ * prompt; token counts are chars/4 ESTIMATES (ACP reports none).
+ */
+const serveCursorHop = async (
+  params: TNativeServeParams,
+  overrides?: {
+    readonly bin?: string;
+    readonly env?: Record<string, string>;
+  },
+): Promise<TNativeServeOutcome> => {
+  const req = cursorRequestOf(params.canonical);
+  if (req.promptText.length === 0 && req.images.length === 0) {
+    return { declined: "no user turn to answer" };
+  }
+  const run = await runCursorNative({
+    bin: overrides?.bin ?? cliBin("cursor"),
+    env: overrides?.env ?? cliEnv("cursor"),
+    providerModelId: params.providerModelId,
+    systemText: req.systemText,
+    userText: req.promptText,
+    images: req.images,
+    tools: req.tools,
+    jsonInstructionText:
+      req.jsonMode !== null
+        ? jsonInstruction(req.jsonMode, req.jsonSchema)
+        : null,
+    signal: params.signal,
+  });
+  if (run.kind === "declined") return { declined: run.reason };
+
+  const settle = (
+    resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
+  ): void => {
+    params.record(tokensFromResponse(resp), "success");
+  };
+  const fail = (err: unknown): void => {
+    const usage = partialUsageFrom(err);
+    params.record(
+      usage === null ? ZERO_TOKENS : tokensFromResponse({ usage }),
+      "error",
+    );
+  };
+  const clientWire = clientWireOf(params.surface);
+  if (params.wantsStream) {
+    return deliverChunkStream(run.chunks, {
+      surface: params.surface,
+      clientWire,
+      providerModelId: params.providerModelId,
+      onResponse: settle,
+      onError: fail,
+    });
+  }
+  let canonical: Awaited<ReturnType<typeof accumulateChunksToResponse>>;
+  try {
+    canonical = await accumulateChunksToResponse(
+      run.chunks,
       params.providerModelId,
     );
   } catch (err) {

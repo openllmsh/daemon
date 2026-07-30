@@ -235,6 +235,17 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     env: (base) => ({ GROK_CLI_CHAT_PROXY_BASE_URL: base }),
     liveCapture: false,
   },
+  // ⚠️ RESEARCH-UNVERIFIED: this is Cursor's dashboard host, not an inference
+  // endpoint. Cursor inference is ACP-only; keep the target here only because
+  // every isolated provider has an auth-config entry.
+  cursor: {
+    origin: "https://api2.cursor.sh",
+    path: "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+    match: () => false,
+    argv: (bin) => [bin, "status"],
+    env: () => ({}),
+    liveCapture: false,
+  },
 };
 
 /** The default (pre-capture) upstream URL: ORIGIN + default PATH. The delegate

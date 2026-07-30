@@ -37,6 +37,7 @@ import {
   resolveUpstreamUrl,
 } from "./auth-config";
 import { fetchModelList, positiveInt } from "./fetch-model-list";
+import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -126,23 +127,6 @@ const loadStore = (): Promise<TCodexStore | null> =>
   // Isolated CODEX_HOME → auth.json lives there.
   readJsonFile<TCodexStore>(authPath());
 
-// The codex access token is a JWT; its expiry lives in the `exp` claim (codex
-// itself refreshes off this — see ref/codex `should_refresh_proactively`).
-// Returns null when the token isn't a parseable JWT (then we skip the proactive
-// refresh and let a real 401 surface).
-const parseJwtExpMs = (jwt: string): number | null => {
-  const parts = jwt.split(".");
-  if (parts.length < 2) return null;
-  try {
-    const payload = JSON.parse(
-      Buffer.from(parts[1], "base64url").toString("utf8"),
-    ) as { exp?: number };
-    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
-  } catch {
-    return null;
-  }
-};
-
 /**
  * Trigger the codex CLI's OWN native token refresh: `codex doctor`. Its websocket
  * reachability check routes through the auth manager, which proactively refreshes
@@ -169,7 +153,7 @@ const readToken = async (): Promise<{
   if (tokens?.access_token === undefined || tokens.access_token.length === 0) {
     return null;
   }
-  const expiresAtMs = parseJwtExpMs(tokens.access_token);
+  const expiresAtMs = jwtExpiryMs(tokens.access_token);
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
   const outcome = tokens.refresh_token ? await refresh(expiresAtMs) : "fresh";

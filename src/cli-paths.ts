@@ -47,6 +47,9 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   // drops the host launcher at ~/.grok/bin/grok (see `hostCliCandidates`), and
   // that is what gets symlinked here.
   grok: { binRel: "home/.local/bin/grok", cmd: "grok" },
+  // ⚠️ RESEARCH-UNVERIFIED: Cursor's official installer is reported to place
+  // this launcher at ~/.local/bin/cursor-agent.
+  cursor: { binRel: "home/.local/bin/cursor-agent", cmd: "cursor-agent" },
 };
 
 /** The closed runtime list of CLI providers — derived from `SPECS` keys so it
@@ -120,6 +123,10 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
           join(home, ".grok", "bin", "grok"),
           join(home, ".local", "bin", "grok"),
         ];
+      // ⚠️ RESEARCH-UNVERIFIED: best-known Cursor installer launcher path;
+      // `resolveOnPath` below covers other installation layouts.
+      case "cursor":
+        return [join(home, ".local", "bin", "cursor-agent")];
     }
   })();
   const out: string[] = [];
@@ -150,6 +157,10 @@ export const cliConfigDir = (provider: TCliProvider): string => {
     // grok caches its OAuth token at <home>/.grok/auth.json.
     case "grok":
       return join(home, ".grok");
+    // ⚠️ RESEARCH-UNVERIFIED: cursor-agent stores CLI channel configuration
+    // under ~/.cursor; credentials are read separately from the host keychain.
+    case "cursor":
+      return join(home, ".cursor");
   }
 };
 
@@ -213,6 +224,13 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
     // (~/.grok/bin, installed out of band by the user-run installer) and the
     // isolated path is a symlink to it — the daemon only runs it, never installs.
     case "grok":
+      return {
+        HOME: home,
+        TMPDIR: tmp,
+      };
+    // ⚠️ RESEARCH-UNVERIFIED: Cursor appears HOME-rooted for its ~/.cursor
+    // configuration. Its macOS Keychain credentials remain host-managed.
+    case "cursor":
       return {
         HOME: home,
         TMPDIR: tmp,

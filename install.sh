@@ -13,7 +13,7 @@
 #   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
 #
 # This is the ONLY shell installer for the daemon. It also background-provisions
-# any missing vendor subscription CLIs (claude / codex / kimi / grok) via each
+# any missing vendor subscription CLIs (claude / codex / kimi / grok / cursor-agent) via each
 # vendor's official installer — skip if already present. It never edits a
 # third-party client config: `openllm <client>` applies OpenLLM at run time
 # instead. The only files it writes outside ~/.openllm (besides what a vendor
@@ -236,6 +236,8 @@ provision_clis() {
     "Codex|codex|$HOME/.local/bin/codex|https://chatgpt.com/codex/install.sh"
     "Kimi|kimi|$HOME/.kimi-code/bin/kimi|https://code.kimi.com/kimi-code/install.sh"
     "Grok|grok|$HOME/.grok/bin/grok|https://x.ai/cli/install.sh"
+    # ⚠️ RESEARCH-UNVERIFIED: Cursor's official installer/launcher path.
+    "Cursor Agent|cursor-agent|$HOME/.local/bin/cursor-agent|https://cursor.com/install"
   )
   # Build a PATH that (a) puts the STANDARD system dirs FIRST — covering
   # curl/bash/tar/gzip/uname/sed/grep on macOS AND Linux (all live in

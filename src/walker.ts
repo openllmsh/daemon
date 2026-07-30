@@ -334,7 +334,7 @@ export const planSignatureOk = (
 export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
   for (const hop of hops) {
     if (!isSubscriptionSlug(hop.provider)) continue; // API-key → forwardable
-    if (isNativeRuntimeProvider(hop.provider)) continue; // native runtime path
+    if (isNativeRuntimeProvider(hop.provider)) continue; // native runtime path (incl. bridge-only cursor)
     if (UPSTREAM_WIRE[hop.provider] === undefined) return false;
   }
   return true;
@@ -1962,6 +1962,10 @@ const walkPlan = async (
     queueIndex += 1;
     const { hop, forceContextAttempt } = candidate;
     attempted.push(hop.modelId);
+    // THIS iteration's native-bridge decline reason (if any). Scoped per hop so
+    // a bridge-only provider's failure row reports its OWN decline, never a
+    // prior hop's stale `lastError`.
+    let nativeDecline: string | null = null;
     // A skipped ordinary candidate means the physical queue still has a
     // forced-context epilogue. Its successor must remain walkable until that
     // retry receives the tokenizer's final verdict.
@@ -2100,7 +2104,8 @@ const walkPlan = async (
         }
         return withHopTrailHeaders(native);
       }
-      lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
+      nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
+      lastError = nativeDecline;
       // ↓ fall through to the manual transport for this hop (no `continue`)
       //   — EXCEPT for a non-CC claude_code request (see the gate below).
     }
@@ -2119,6 +2124,18 @@ const walkPlan = async (
         lastError ??
         `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
       addHopFailure(hop, lastError);
+      continue;
+    }
+    // cursor is BRIDGE-ONLY: no UPSTREAM_WIRE entry (api2.cursor.sh is a
+    // dashboard host, not a model endpoint) and no cloud path (subscription
+    // hops never forward). If the ACP bridge declined above, advance the plan
+    // with the decline reason — never fall to the cloud-forward branch below.
+    if (hop.provider === "cursor") {
+      const reason =
+        nativeDecline ??
+        `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp)`;
+      lastError = reason;
+      addHopFailure(hop, reason);
       continue;
     }
     const wire = UPSTREAM_WIRE[hop.provider];

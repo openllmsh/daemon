@@ -43,7 +43,7 @@ import { stateDir } from "../env";
  * in"), and the FULL session env minus auth-poison (macOS keychain access
  * needs the real env, not an `env -i` minimal one).
  */
-export type TNativeRuntimeProvider = "claude_code" | "chatgpt";
+export type TNativeRuntimeProvider = "claude_code" | "chatgpt" | "cursor";
 
 /** Pre-commit budget shared by BOTH native bridges: how long a runtime may
  *  stay silent (spawn/handshake + thread start + first model output) before
@@ -54,6 +54,10 @@ export const PRE_COMMIT_TIMEOUT_MS = 60_000;
 const NATIVE_PROVIDERS: ReadonlySet<string> = new Set([
   "claude_code",
   "chatgpt",
+  // cursor is BRIDGE-ONLY: `cursor-agent acp` is Cursor's sole inference
+  // transport (see native-runtime/cursor-acp.ts) — there is no manual
+  // UPSTREAM_WIRE fallback; a bridge decline advances the plan.
+  "cursor",
 ]);
 
 /** Whether a plan hop's provider is served exclusively by a native runtime. */
