@@ -229,6 +229,13 @@ export const handleRtcOffer = async (frame: {
     offerSdpMax,
     MAX_PAYLOAD_BYTES,
   );
+  if (maxPayloadBytes === null) {
+    logWarn("rtc-host", "sctp max-message-size unusable", {
+      channelId: frame.channel_id,
+      sdpMax: offerSdpMax,
+    });
+    return;
+  }
 
   let pc: RTCPeerConnection;
   try {
@@ -362,6 +369,7 @@ export const rtcSessionCount = (): number => sessions.size;
 /**
  * Test-only: negotiated maxPayloadBytes that would be applied for an SDP.
  * Mirrors the offer path so unit tests can assert the cap without ICE.
+ * Returns `null` when the SDP's SCTP limit cannot fit a mux DATA frame.
  */
-export const negotiateRtcPayloadCapForTest = (sdp: string): number =>
+export const negotiateRtcPayloadCapForTest = (sdp: string): number | null =>
   negotiateRtcPayloadCap(maxMessageSizeFromSdp(sdp), MAX_PAYLOAD_BYTES);
