@@ -36,9 +36,9 @@ export type TSubMethodCapability = {
 /**
  * The initial capability matrix (active-sub-method.md §initial capability
  * matrix). `bridge` is declared exactly for the native-runtime providers
- * (`isNativeRuntimeProvider`); kimi_code, grok, and cursor are handrolled-only
- * until Cursor ACP bridge support is implemented. The table ⇔ native-runtime
- * lockstep is machine-checked in
+ * (`isNativeRuntimeProvider`); kimi_code + grok are handrolled-only; cursor is
+ * the one BRIDGE-ONLY provider (ACP has no manual HTTP transport to fall back
+ * to). The table ⇔ native-runtime lockstep is machine-checked in
  * `tests/transport/sub-method.test.ts`.
  */
 export const SUB_METHOD_CAPABILITIES: Readonly<

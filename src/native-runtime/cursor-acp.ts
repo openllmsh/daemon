@@ -165,11 +165,18 @@ export const createAcpTurnState = (params: {
       choices: [{ index: 0, delta, finish_reason: finish }],
       ...(usage !== undefined ? { usage } : {}),
     }) as TChatCompletionChunk;
+  // `openerEmitted` tracks the on-WIRE role preamble separately from
+  // `sawOutput` (the pre-commit "output is arriving" gate): JSON mode flips
+  // `sawOutput` while buffering with nothing on the wire yet, so the first
+  // real chunk (from `finish`/`emitToolCall`) must still carry
+  // `role: "assistant"`.
+  let openerEmitted = false;
   const opener = (
     delta: Record<string, unknown>,
   ): TChatCompletionChunk | null => {
-    if (sawOutput) return baseChunk(delta, null);
     sawOutput = true;
+    if (openerEmitted) return baseChunk(delta, null);
+    openerEmitted = true;
     return baseChunk({ role: "assistant", content: "", ...delta }, null);
   };
   const usageRow = (): TUsage => {

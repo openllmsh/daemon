@@ -87,7 +87,8 @@ const textAndImagesOf = (
     }
     // input_audio / file parts — no ACP mapping; dropped.
   }
-  return parts.join("");
+  // Newline-join so adjacent text blocks don't fuse into one word run.
+  return parts.join("\n");
 };
 
 const stringifyToolArgs = (args: unknown): string =>

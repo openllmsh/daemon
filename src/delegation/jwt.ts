@@ -25,7 +25,9 @@ export const decodeJwtPayload = (jwt: string): TJwtPayload | null => {
 /** JWT `exp` (seconds) as epoch milliseconds, or null when absent/malformed. */
 export const jwtExpiryMs = (jwt: string): number | null => {
   const exp = decodeJwtPayload(jwt)?.exp;
-  return typeof exp === "number" && Number.isFinite(exp) ? exp * 1000 : null;
+  if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
+  const expiryMs = exp * 1000;
+  return Number.isFinite(expiryMs) ? expiryMs : null;
 };
 
 /** JWT `sub` claim when it is a non-empty string. */

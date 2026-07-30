@@ -24,7 +24,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { accountHashField } from "./account-id";
-import { resolveUpstreamUrl } from "./auth-config";
+import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -40,7 +40,9 @@ import {
 } from "./util";
 
 const PROVIDER = "cursor" as const;
-const CURSOR_ORIGIN = "https://api2.cursor.sh";
+// Usage endpoint LEAF paths — the host comes from `resolveProviderUrl` (the
+// auth-config CAPTURE default / captured origin), so the dashboard host lives
+// in ONE place (`auth-config.ts`) like every other delegate.
 const USAGE_PATH = "/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const PLAN_PATH = "/aiserver.v1.DashboardService/GetPlanInfo";
 const REFRESH_LEEWAY_MS = 5 * 60_000;
@@ -352,13 +354,13 @@ export const cursorDelegate: TProviderDelegate = {
       return { kind: "unavailable", reason: "not signed in to Cursor" };
     try {
       const [usage, plan] = await Promise.all([
-        fetch(`${CURSOR_ORIGIN}${USAGE_PATH}`, {
+        fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
           method: "POST",
           headers: dashboardHeaders(token.accessToken),
           body: "{}",
           signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
         }),
-        fetch(`${CURSOR_ORIGIN}${PLAN_PATH}`, {
+        fetch(await resolveProviderUrl(PROVIDER, PLAN_PATH), {
           method: "POST",
           headers: dashboardHeaders(token.accessToken),
           body: "{}",
