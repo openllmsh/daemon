@@ -63,6 +63,9 @@ import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
 /** Handshake RPC budget (initialize / authenticate / session/new). */
 const RPC_TIMEOUT_MS = 30_000;
+
+/** Cap on the retained stderr tail (bytes) used for failure diagnostics. */
+const STDERR_TAIL_MAX = 4_096;
 /** Hard per-turn budget — the prompt is abandoned (child killed) past this. */
 export const CURSOR_TURN_TIMEOUT_MS = 180_000;
 /** Idle-chunk budget — no session/update within this window kills the turn. */
@@ -276,6 +279,10 @@ class AcpClient {
   private readonly proc: ReturnType<typeof Bun.spawn>;
   private readonly stdin: { write: (s: string) => void; flush?: () => void };
   private disposed = false;
+  /** Bounded tail of the child's stderr — surfaced on a handshake/startup
+   *  failure so a decline isn't a silent black box. Capped so a chatty child
+   *  can't grow it unbounded. */
+  private stderrTail = "";
 
   constructor(
     bin: string,
@@ -291,7 +298,7 @@ class AcpClient {
     this.proc = Bun.spawn([bin, "acp"], {
       stdin: "pipe",
       stdout: "pipe",
-      stderr: "ignore",
+      stderr: "pipe",
       cwd: spawnCwd(env),
       env: cleanNativeSpawnEnv(env),
     });
@@ -302,6 +309,11 @@ class AcpClient {
     void this.pump(this.proc.stdout as ReadableStream<Uint8Array>).catch(() => {
       // reader ends on child exit; dispose() handles state
     });
+    void this.drainStderr(this.proc.stderr as ReadableStream<Uint8Array>).catch(
+      () => {
+        // reader ends on child exit
+      },
+    );
     void this.proc.exited.then(() =>
       this.failAllPending("cursor-agent acp exited"),
     );
@@ -361,6 +373,23 @@ class AcpClient {
   private failAllPending(reason: string): void {
     for (const [, entry] of this.pending) entry.reject(new Error(reason));
     this.pending.clear();
+  }
+
+  /** The most recent stderr output (bounded), for failure diagnostics. */
+  stderr(): string {
+    return this.stderrTail.trim();
+  }
+
+  private async drainStderr(stderr: ReadableStream<Uint8Array>): Promise<void> {
+    const decoder = new TextDecoder();
+    const reader = stderr.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      this.stderrTail = (
+        this.stderrTail + decoder.decode(value, { stream: true })
+      ).slice(-STDERR_TAIL_MAX);
+    }
   }
 
   private send(message: Record<string, unknown>): void {
@@ -631,18 +660,11 @@ export const runCursorNative = async (
     mcp?.stop();
     mcp = null;
   };
-  if ((params.tools?.length ?? 0) > 0) {
-    mcp = startCursorMcpServer({
-      tools: params.tools ?? [],
-      onToolCall: (name, args) => {
-        if (ended) return;
-        lastActivityAt = Date.now();
-        endWith(turn.emitToolCall(name, args));
-        if (sessionId !== null) client.notify("session/cancel", { sessionId });
-      },
-    });
-  }
 
+  // `client` is created FIRST so the MCP server's onToolCall never closes over
+  // it before initialization (a tools/call can only arrive after session/new,
+  // which needs `client` — but declaring it first makes that ordering explicit
+  // rather than relying on it).
   const client = new AcpClient(
     params.bin,
     params.env,
@@ -658,6 +680,18 @@ export const runCursorNative = async (
     },
     handleCursorServerRequest,
   );
+
+  if ((params.tools?.length ?? 0) > 0) {
+    mcp = startCursorMcpServer({
+      tools: params.tools ?? [],
+      onToolCall: (name, args) => {
+        if (ended) return;
+        lastActivityAt = Date.now();
+        endWith(turn.emitToolCall(name, args));
+        if (sessionId !== null) client.notify("session/cancel", { sessionId });
+      },
+    });
+  }
 
   const cancelAndDispose = (): void => {
     if (sessionId !== null) client.notify("session/cancel", { sessionId });
@@ -709,8 +743,14 @@ export const runCursorNative = async (
     sessionId = sid;
     await trySetModel(client, sid, params.providerModelId, opened);
   } catch (error) {
+    const stderrTail = client.stderr();
     client.dispose();
     stopMcp();
+    if (stderrTail.length > 0) {
+      logError("native-runtime", "cursor ACP handshake failed", {
+        stderrTail: stderrTail.slice(-400),
+      });
+    }
     return {
       kind: "declined",
       reason: `cursor ACP handshake failed: ${error instanceof Error ? error.message : String(error)}`,

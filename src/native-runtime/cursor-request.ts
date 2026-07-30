@@ -107,6 +107,11 @@ export const cursorRequestOf = (
   const systemParts: string[] = [];
   const lines: string[] = [];
   const images: TCursorImage[] = [];
+  // Track the non-system turns from the MESSAGE list (not rendered lines) so a
+  // lone user turn is detected structurally — a user whose text literally
+  // begins with "User: " must not be mistaken for framing and stripped.
+  let nonSystemTurns = 0;
+  let loneUserText: string | null = null;
   for (const message of canonical.messages) {
     if (message.role === "system") {
       const text = textAndImagesOf(message.content, images);
@@ -115,11 +120,15 @@ export const cursorRequestOf = (
     }
     if (message.role === "tool") {
       const text = textAndImagesOf(message.content, images);
+      nonSystemTurns += 1;
       lines.push(`Tool result (${message.tool_call_id}): ${text}`);
       continue;
     }
     if (message.role === "user") {
-      lines.push(`User: ${textAndImagesOf(message.content, images)}`);
+      const text = textAndImagesOf(message.content, images);
+      nonSystemTurns += 1;
+      loneUserText = text;
+      lines.push(`User: ${text}`);
       continue;
     }
     if (message.role === "assistant") {
@@ -131,14 +140,18 @@ export const cursorRequestOf = (
         )
         .join(" ");
       const rendered = [text, calls].filter((s) => s.length > 0).join(" ");
-      if (rendered.length > 0) lines.push(`Assistant: ${rendered}`);
+      if (rendered.length > 0) {
+        nonSystemTurns += 1;
+        lines.push(`Assistant: ${rendered}`);
+      }
     }
   }
-  // Single-turn conversations feed the bare user text (no "User:" framing);
-  // multi-turn renders the transcript (mirrors session-store's renderSeed).
+  // Single user turn feeds the bare text (no "User:" framing); anything else
+  // renders the transcript (mirrors session-store's renderSeed). Keyed off the
+  // message structure so a user's own "User: " prefix survives verbatim.
   const promptText =
-    lines.length === 1 && lines[0]?.startsWith("User: ") === true
-      ? lines[0].slice("User: ".length)
+    nonSystemTurns === 1 && loneUserText !== null && lines.length === 1
+      ? loneUserText
       : lines.join("\n\n");
 
   const tools: TCursorTool[] = (canonical.tools ?? []).map((tool) => ({

@@ -1909,6 +1909,10 @@ const walkPlan = async (
     queueIndex += 1;
     const { hop, forceContextAttempt } = candidate;
     attempted.push(hop.modelId);
+    // THIS iteration's native-bridge decline reason (if any). Scoped per hop so
+    // a bridge-only provider's failure row reports its OWN decline, never a
+    // prior hop's stale `lastError`.
+    let nativeDecline: string | null = null;
     // A skipped ordinary candidate means the physical queue still has a
     // forced-context epilogue. Its successor must remain walkable until that
     // retry receives the tokenizer's final verdict.
@@ -2047,7 +2051,8 @@ const walkPlan = async (
         }
         return withHopTrailHeaders(native);
       }
-      lastError = `native hop ${hop.modelId} declined: ${native.declined}`;
+      nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
+      lastError = nativeDecline;
       // ↓ fall through to the manual transport for this hop (no `continue`)
       //   — EXCEPT for a non-CC claude_code request (see the gate below).
     }
@@ -2073,10 +2078,11 @@ const walkPlan = async (
     // hops never forward). If the ACP bridge declined above, advance the plan
     // with the decline reason — never fall to the cloud-forward branch below.
     if (hop.provider === "cursor") {
-      lastError =
-        lastError ??
+      const reason =
+        nativeDecline ??
         `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp)`;
-      addHopFailure(hop, lastError);
+      lastError = reason;
+      addHopFailure(hop, reason);
       continue;
     }
     const wire = UPSTREAM_WIRE[hop.provider];

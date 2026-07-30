@@ -218,6 +218,20 @@ export const tryServeNativeRuntime = async (
   // generic control gate below — declining response_format/tool_choice there
   // would fail the hop outright instead of routing slower.
   if (params.provider === "cursor") {
+    // cursor accepts the wide surface (tools/images/response_format/tool_choice/
+    // sampling), but `n>1` (multiple choices) and `logprobs` are STRUCTURALLY
+    // unrepresentable over ACP — the agent yields one message with no
+    // token-logprob channel. Decline explicitly rather than silently serving a
+    // single un-scored choice against a request that asked for more.
+    const cursorUnrepresentable =
+      (typeof params.canonical.n === "number" && params.canonical.n > 1) ||
+      params.canonical.logprobs === true;
+    if (cursorUnrepresentable) {
+      return {
+        declined:
+          "cursor ACP can't honor n>1 or logprobs (single un-scored message per turn)",
+      };
+    }
     return serveCursorHop(params, overrides);
   }
   // Generation controls the native runtimes can't honor (non-default
