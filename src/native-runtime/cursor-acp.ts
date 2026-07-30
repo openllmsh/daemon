@@ -468,7 +468,14 @@ const INIT_PARAMS = {
 } as const;
 
 /** `initialize` + `authenticate` (the CLI's own stored login). Throws on
- *  failure — the caller maps it to a bridge decline / null model list. */
+ *  failure — the caller maps it to a bridge decline / null model list.
+ *
+ *  NB: the agent advertises `promptCapabilities.image` at initialize, but it's
+ *  a STATIC protocol capability (always true for current cursor-agent), NOT
+ *  per-model — so it can't gate images by the selected model. Verified live
+ *  (2026-07-29): composer-2.5 reads image blocks correctly (blue→"blue",
+ *  green→"green"); the models accept `{ type:"image", data, mimeType }` blocks
+ *  as-is. So we send images unconditionally and let the model handle them. */
 const handshake = async (client: AcpClient): Promise<void> => {
   await client.request("initialize", INIT_PARAMS);
   await client.request("authenticate", { methodId: "cursor_login" });
