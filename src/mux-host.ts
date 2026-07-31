@@ -11,7 +11,8 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 /**
  * Base capabilities advertised on hello/status.
- * `mux1` = binary mux over the relay WS; `rtc1` = WebRTC data-channel mux host.
+ * `mux1` = binary mux over the relay WS; `rtc1` = WebRTC data-channel mux host
+ * and fleet consumer offerer (RTC → relay mux → JSON splice).
  * `seedgate1` is layered on when a device-access pubkey is pinned — see
  * {@link currentDaemonCaps}.
  */
@@ -52,6 +53,11 @@ export const setMuxAckTimeoutForTest = (timeoutMs: number | null): void => {
 export const resetMuxFailureCacheForTest = (): void => {
   failedUntil.clear();
 };
+
+/** Latest relay-advertised peer caps, used by the fleet RTC path. */
+export const getMuxPeerCaps = (
+  keyId: string,
+): ReadonlySet<string> | undefined => peerCaps.get(keyId);
 
 export const updateMuxPeerCaps = (
   keyId: string,

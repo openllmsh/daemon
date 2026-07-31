@@ -26,6 +26,12 @@ import {
   updateMuxPeerCaps,
 } from "./mux-host";
 import {
+  configureRtcClient,
+  handleRtcAnswer,
+  handleRtcClientIce,
+  resetUnmountedRtcClientSessions,
+} from "./rtc-client";
+import {
   configureRtcHost,
   handleRtcIce,
   handleRtcOffer,
@@ -165,6 +171,7 @@ export const resetRelayScopedState = (): void => {
   // Keep RTC sessions whose mux already mounted — the peer connection and
   // data channel do not ride the relay socket and survive reconnect.
   resetUnmountedRtcSessions();
+  resetUnmountedRtcClientSessions();
 };
 
 const enqueueStatusPublish = (
@@ -472,14 +479,25 @@ const onFrame = (frame: TRelayFrame): void => {
       return;
     case "rtc_ice":
       void handleRtcIce(frame).catch((err: unknown) => {
-        logWarn("control-channel", "rtc_ice handler failed", {
+        logWarn("control-channel", "rtc host ICE handler failed", {
+          channelId: frame.channel_id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+      void handleRtcClientIce(frame).catch((err: unknown) => {
+        logWarn("control-channel", "rtc client ICE handler failed", {
           channelId: frame.channel_id,
           err: err instanceof Error ? err.message : String(err),
         });
       });
       return;
     case "rtc_answer":
-      // Responder path only — a browser-originated answer is unexpected.
+      void handleRtcAnswer(frame).catch((err: unknown) => {
+        logWarn("control-channel", "rtc answer handler failed", {
+          channelId: frame.channel_id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
       return;
     case "presence":
       updateMuxPeerCaps(frame.key_id, frame.active ? frame.caps : undefined);
@@ -619,6 +637,7 @@ export const startControlChannel = (): void => {
   registerTunnelSender(send);
   configureMuxHost({ send, sendBytes });
   configureRtcHost({ send });
+  configureRtcClient({ send });
   const socket = new ReconnectingWebSocket(channelUrl, undefined, {
     WebSocket: globalThis.WebSocket,
     minReconnectionDelay: 1_000,

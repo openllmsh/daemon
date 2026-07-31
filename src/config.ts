@@ -131,6 +131,10 @@ export const fleetSubscriptionServerFor = (provider: string): string | null =>
   snapshot.fleet_subscriptions?.find((f) => f.provider === provider)?.key_id ??
   null;
 
+/** Serving daemon X25519 pubkey for a fleet peer, when its bootstrap status supplied one. */
+export const fleetSubscriptionPubkeyFor = (keyId: string): string | null =>
+  snapshot.fleet_subscriptions?.find((f) => f.key_id === keyId)?.pubkey ?? null;
+
 /**
  * The daemon version the cloud currently publishes (bare semver), from the last
  * bootstrap. Null when unpublished or the cloud is too old to advertise it. The

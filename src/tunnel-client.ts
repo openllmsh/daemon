@@ -4,7 +4,8 @@
  * hits a subscription hop this box has no credential for, and the
  * bootstrap's `fleet_subscriptions` names an online peer serving that
  * provider, the request tunnels to the peer over THIS daemon's existing
- * relay socket and streams the peer's response back.
+ * relay socket and streams the peer's response back. Fleet hops prefer an
+ * already-open direct RTC mux, then relay mux, then the JSON splice.
  *
  * Mirrors the browser's `tunnelFetch` (lib/stores/daemon-store.ts): open +
  * buffered request chunks + EOF out; head-frame → streaming `Response` in.
@@ -20,10 +21,12 @@ import type {
   TRelayTunnelOpenAckFrame,
   TTunnelSurface,
 } from "@openllmsh/protocol";
-import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
+import { RTC_CAP, SEEDGATE_CAP, TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
 import { tunnelStream } from "@openllmsh/tunnel/streams";
+import { fleetSubscriptionPubkeyFor } from "./config";
 import { logInfo } from "./logger";
-import { muxChannelTo } from "./mux-host";
+import { getMuxPeerCaps, muxChannelTo } from "./mux-host";
+import { ensureRtcTo, getRtcMuxChannel, markRtcFailure } from "./rtc-client";
 
 const OPEN_TIMEOUT_MS = 15_000;
 /** After a successful open ack, allow the serving daemon's dispatch its own
@@ -204,6 +207,33 @@ export const tunnelToPeer = async (args: {
       ? { anthropic_beta: args.anthropicBeta.slice(0, 256) }
       : {}),
   };
+  const peerCaps = getMuxPeerCaps(args.keyId);
+  const peerPubkey = fleetSubscriptionPubkeyFor(args.keyId);
+  ensureRtcTo(args.keyId, {
+    pubkey: peerPubkey ?? "",
+    hasRtc1: peerCaps?.has(RTC_CAP) ?? false,
+    // Fleet daemons cannot mint a browser vault grant; a seed-gated peer must
+    // use relay mux (whose authenticated `consumer:"daemon"` is admitted).
+    hasSeedgate1: peerCaps?.has(SEEDGATE_CAP) ?? false,
+  });
+  const rtc = getRtcMuxChannel(args.keyId);
+  if (rtc !== null) {
+    try {
+      const result = await tunnelStream(rtc, {
+        surface: args.surface,
+        headers,
+        body: args.body,
+        signal: args.signal,
+      });
+      return new Response(result.body, {
+        status: result.status,
+        headers: result.headers,
+      });
+    } catch {
+      markRtcFailure(args.keyId);
+      // Pre-head RTC failure falls through to relay mux on this request.
+    }
+  }
   const mux = await muxChannelTo(args.keyId);
   if (mux !== null) {
     try {

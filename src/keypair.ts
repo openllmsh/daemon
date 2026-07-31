@@ -76,36 +76,27 @@ const deriveKey = (shared: Buffer): Buffer =>
  * Seal `plaintext` to a recipient daemon's public key (SPKI DER, base64).
  * Output is base64(JSON{ epk, iv, ct }) — the cloud relays it opaquely.
  */
-export const sealTo = (recipientPubB64: string, plaintext: string): string => {
-  const recipient = createPublicKey({
-    key: Buffer.from(recipientPubB64, "base64"),
-    format: "der",
-    type: "spki",
-  });
-  const eph = generateKeyPairSync("x25519");
-  const shared = diffieHellman({
-    privateKey: eph.privateKey,
-    publicKey: recipient,
-  });
-  const key = deriveKey(shared);
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const body = Buffer.concat([
-    cipher.update(plaintext, "utf8"),
-    cipher.final(),
-  ]);
-  const packed = {
-    epk: Buffer.from(
-      eph.publicKey.export({ format: "der", type: "spki" }),
-    ).toString("base64"),
-    iv: iv.toString("base64"),
-    ct: Buffer.concat([body, cipher.getAuthTag()]).toString("base64"),
-  };
-  return Buffer.from(JSON.stringify(packed)).toString("base64");
+export type TEphKeypair = {
+  readonly privateKey: KeyObject;
+  readonly publicKeyB64: string;
 };
 
-/** Open a sealed blob with this daemon's private key. Null on any failure. */
-export const openSealed = (sealedB64: string): string | null => {
+/** Generate an ephemeral X25519 keypair for a one-shot sealed-box reply. */
+export const generateEphKeypair = (): TEphKeypair => {
+  const { privateKey, publicKey } = generateKeyPairSync("x25519");
+  return {
+    privateKey,
+    publicKeyB64: Buffer.from(
+      publicKey.export({ format: "der", type: "spki" }),
+    ).toString("base64"),
+  };
+};
+
+/** Open a sealed blob with an explicit recipient private key. Null on failure. */
+export const openSealedWith = (
+  privateKey: KeyObject,
+  sealedB64: string,
+): string | null => {
   try {
     const { epk, iv, ct } = JSON.parse(
       Buffer.from(sealedB64, "base64").toString("utf8"),
@@ -115,7 +106,7 @@ export const openSealed = (sealedB64: string): string | null => {
       format: "der",
       type: "spki",
     });
-    const shared = diffieHellman({ privateKey: ownPrivate(), publicKey: eph });
+    const shared = diffieHellman({ privateKey, publicKey: eph });
     const key = deriveKey(shared);
     const ctBuf = Buffer.from(ct, "base64");
     const body = ctBuf.subarray(0, ctBuf.length - 16);
@@ -132,4 +123,35 @@ export const openSealed = (sealedB64: string): string | null => {
   } catch {
     return null;
   }
+};
+
+/** Open a sealed blob with this daemon's long-lived private key. */
+export const openSealed = (sealedB64: string): string | null =>
+  openSealedWith(ownPrivate(), sealedB64);
+
+/** Seal plaintext to a recipient daemon's public key (SPKI DER, base64). */
+export const sealTo = (recipientPubB64: string, plaintext: string): string => {
+  const recipient = createPublicKey({
+    key: Buffer.from(recipientPubB64, "base64"),
+    format: "der",
+    type: "spki",
+  });
+  const eph = generateEphKeypair();
+  const shared = diffieHellman({
+    privateKey: eph.privateKey,
+    publicKey: recipient,
+  });
+  const key = deriveKey(shared);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const body = Buffer.concat([
+    cipher.update(plaintext, "utf8"),
+    cipher.final(),
+  ]);
+  const packed = {
+    epk: eph.publicKeyB64,
+    iv: iv.toString("base64"),
+    ct: Buffer.concat([body, cipher.getAuthTag()]).toString("base64"),
+  };
+  return Buffer.from(JSON.stringify(packed)).toString("base64");
 };

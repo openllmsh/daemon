@@ -92,8 +92,9 @@ daemon/
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
     mux-host.ts             mux1/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
-    rtc-host.ts             werift RTCPeerConnection responder: rtc_offer/answer/ice + mux over data channel
-    tunnel-client.ts        consuming subscription tunnel: mux first, JSON splice fallback
+    rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice + mux over data channel
+    rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice + mux over data channel
+    tunnel-client.ts        consuming subscription tunnel: RTC (when open), relay mux, then JSON splice fallback
     tunnel-server.ts        serving in-process tunneled request dispatch for JSON and mux streams
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
@@ -330,11 +331,15 @@ Path ladder on the consumer side: **RTC (when open) → relay binary mux (`mux1`
   `channel_open_ack`, receives mux OPEN frames, and dispatches via
   `serveStream` into `tunnel-server.ts`. Advertises `mux1` + `rtc1`, and
   layers `seedgate1` when a device-access pubkey is pinned from bootstrap.
-- `rtc-host.ts` is the werift RTC responder: same-user `rtc_offer` /
-  `rtc_answer` / `rtc_ice` over the relay, then mux over the data channel
-  (signaling-only relay; payload-cap negotiation; kill-switch /
-  failure-cache fallthrough to mux/splice).
-- `tunnel-client.ts` prefers mux (then splice) for daemon→daemon fleet hops.
+- `rtc-host.ts` is the werift RTC answerer for browser or fleet-peer offers:
+  same-user `rtc_offer` / `rtc_answer` / `rtc_ice` traverse the relay, then the
+  mux runs over the data channel (signaling-only relay; payload-cap negotiation;
+  kill-switch / failure-cache fallthrough to mux/splice).
+- `rtc-client.ts` is the new fleet WebRTC offerer for daemon→daemon tunnels.
+  It reuses `rtc-auth`, `rtc-duplex`, and mux; it does not introduce a second
+  direct-path or hole-punch transport.
+- `tunnel-client.ts` uses the consumer ladder **RTC (when open) → relay binary
+  mux (`mux1`) → JSON `tunnel_*` splice** for daemon→daemon fleet hops.
 - `tunnel-server.ts` maps a closed tunnel-surface vocabulary to the daemon's
   in-process `/v1/*` handler and streams the result. Stamps
   `x-openllm-tunneled` so a fleet walker cannot re-tunnel a tunnel-borne
