@@ -52,10 +52,10 @@ import type { TCliProvider } from "./cli-paths";
 import {
   hostCliCandidates,
   sessionEnv,
-  sessionRoot,
   sessionWorkspace,
 } from "./cli-paths";
 import { spawnEnv } from "./delegation/spawn";
+import { stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
 
 /** Max concurrently-LIVE PTYs on one daemon. */
@@ -74,7 +74,9 @@ const MAX_LIVE_SESSIONS = 4;
 // Together these guarantee the machine never accumulates orphaned session PTYs.
 
 /** Directory holding one `<sessionId>.pid` file per live PTY. */
-const pidDir = (): string => join(sessionRoot(), "pids");
+// Sibling of sessionRoot (not nested under it) so a client-minted
+// session id of "pids" can never collide with the pidfile directory.
+const pidDir = (): string => join(stateDir(), "session-pids");
 
 const pidFile = (sessionId: string): string =>
   join(pidDir(), `${sessionId}.pid`);
