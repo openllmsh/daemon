@@ -94,7 +94,7 @@ daemon/
     mux-host.ts             mux1/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
     rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice + mux over data channel
     rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice + mux over data channel
-    tunnel-client.ts        consuming subscription tunnel: RTC (when open), relay mux, then JSON splice fallback
+    tunnel-client.ts        consuming subscription tunnel: RTC (when open) → relay mux only (no JSON splice)
     tunnel-server.ts        serving in-process tunneled request dispatch for JSON and mux streams
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
