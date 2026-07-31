@@ -25,10 +25,7 @@ import type {
 } from "@openllmsh/protocol";
 import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
 import type { TServeTunnel } from "@openllmsh/tunnel/streams";
-import {
-  checkDeviceGrant,
-  getDeviceAccessPubkey,
-} from "./device-access-verify";
+import { enforceSeedGate } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { handleInference } from "./listener";
@@ -203,39 +200,23 @@ export const handleTunnelFrame = (
         return;
       }
       // Seed-gate: when provisioned, every tunnel_open must carry a valid grant.
-      if (getDeviceAccessPubkey() !== null) {
-        const keyId = daemonApiKeyId();
-        const grant = frame.grant;
-        if (keyId === null || grant === undefined || grant.length === 0) {
-          logWarn("tunnel", "tunnel_open rejected: missing grant", {
-            id: frame.tunnel_id,
-          });
-          send({
-            type: "tunnel_open_ack",
-            tunnel_id: frame.tunnel_id,
-            ok: false,
-            error: "unauthorized",
-          });
-          return;
-        }
-        const checked = checkDeviceGrant(grant, {
-          keyId,
-          cid: frame.tunnel_id,
-          aud: daemonPublicKey(),
+      const gate = enforceSeedGate(frame.grant, {
+        keyId: daemonApiKeyId(),
+        cid: frame.tunnel_id,
+        aud: daemonPublicKey(),
+      });
+      if (gate.mode === "reject") {
+        logWarn("tunnel", "tunnel_open rejected: seedgate", {
+          id: frame.tunnel_id,
+          reason: gate.reason,
         });
-        if (!checked.ok) {
-          logWarn("tunnel", "tunnel_open rejected: grant failed", {
-            id: frame.tunnel_id,
-            reason: checked.reason,
-          });
-          send({
-            type: "tunnel_open_ack",
-            tunnel_id: frame.tunnel_id,
-            ok: false,
-            error: "unauthorized",
-          });
-          return;
-        }
+        send({
+          type: "tunnel_open_ack",
+          tunnel_id: frame.tunnel_id,
+          ok: false,
+          error: "unauthorized",
+        });
+        return;
       }
       served.set(frame.tunnel_id, {
         tunnelId: frame.tunnel_id,

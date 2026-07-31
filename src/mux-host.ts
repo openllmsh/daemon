@@ -1,9 +1,10 @@
+import { SEEDGATE_CAP } from "@openllmsh/protocol";
 import type { TRelayFrame } from "@openllmsh/protocol";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
 import {
-  checkDeviceGrant,
+  enforceSeedGate,
   getDeviceAccessPubkey,
 } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
@@ -22,7 +23,7 @@ export const DAEMON_MUX_CAPS = ["mux1", "rtc1"] as const;
 /** Live capability list — includes `seedgate1` when device access is provisioned. */
 export const currentDaemonCaps = (): string[] => {
   const caps: string[] = [...DAEMON_MUX_CAPS];
-  if (getDeviceAccessPubkey() !== null) caps.push("seedgate1");
+  if (getDeviceAccessPubkey() !== null) caps.push(SEEDGATE_CAP);
   return caps;
 };
 
@@ -197,53 +198,23 @@ export const acceptChannel = (frame: {
   }
   // Seed-gate: when provisioned, every channel_open must carry a valid grant.
   // Gates ALL mux streams (including sessions) that ride this channel.
-  if (getDeviceAccessPubkey() !== null) {
-    const keyId = daemonApiKeyId();
-    const grant = frame.grant;
-    if (keyId === null) {
-      // Match handleRtcOffer: cause-specific log so ops can tell a missing
-      // OPENLLM_API_KEY from a client that simply omitted the grant.
-      logWarn("mux-host", "channel_open rejected: no api key id", {
-        channelId: frame.channel_id,
-      });
-      send({
-        type: "channel_open_ack",
-        channel_id: frame.channel_id,
-        ok: false,
-        error: "unauthorized",
-      });
-      return;
-    }
-    if (grant === undefined || grant.length === 0) {
-      logWarn("mux-host", "channel_open rejected: missing grant", {
-        channelId: frame.channel_id,
-      });
-      send({
-        type: "channel_open_ack",
-        channel_id: frame.channel_id,
-        ok: false,
-        error: "unauthorized",
-      });
-      return;
-    }
-    const checked = checkDeviceGrant(grant, {
-      keyId,
-      cid: frame.channel_id,
-      aud: daemonPublicKey(),
+  const gate = enforceSeedGate(frame.grant, {
+    keyId: daemonApiKeyId(),
+    cid: frame.channel_id,
+    aud: daemonPublicKey(),
+  });
+  if (gate.mode === "reject") {
+    logWarn("mux-host", "channel_open rejected: seedgate", {
+      channelId: frame.channel_id,
+      reason: gate.reason,
     });
-    if (!checked.ok) {
-      logWarn("mux-host", "channel_open rejected: grant failed", {
-        channelId: frame.channel_id,
-        reason: checked.reason,
-      });
-      send({
-        type: "channel_open_ack",
-        channel_id: frame.channel_id,
-        ok: false,
-        error: "unauthorized",
-      });
-      return;
-    }
+    send({
+      type: "channel_open_ack",
+      channel_id: frame.channel_id,
+      ok: false,
+      error: "unauthorized",
+    });
+    return;
   }
   if (active !== null) {
     send({

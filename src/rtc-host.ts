@@ -27,7 +27,7 @@ import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
 import {
-  checkDeviceGrant,
+  enforceSeedGate,
   getDeviceAccessPubkey,
 } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
@@ -231,31 +231,25 @@ export const handleRtcOffer = async (frame: {
   }
 
   // Seed-gate: when provisioned, require a v2 offer carrying a valid grant.
-  // Un-provisioned daemons still accept legacy v1 (no grant).
+  // Un-provisioned daemons still accept legacy v1 (no grant). No open-ack
+  // frame exists for RTC — rejects stay silent (no answer), same as bad proof.
   if (getDeviceAccessPubkey() !== null) {
     if (inner.v !== RTC_AUTH_VERSION_2) {
-      logWarn("rtc-host", "seedgate requires v2 offer with grant", {
+      logWarn("rtc-host", "seedgate rejected", {
         channelId: frame.channel_id,
-        v: inner.v,
+        reason: "v1_offer",
       });
       return;
     }
-    const keyId = daemonApiKeyId();
-    if (keyId === null) {
-      logWarn("rtc-host", "seedgate active but no api key id", {
-        channelId: frame.channel_id,
-      });
-      return;
-    }
-    const checked = checkDeviceGrant(inner.grant, {
-      keyId,
+    const gate = enforceSeedGate(inner.grant, {
+      keyId: daemonApiKeyId(),
       cid: frame.channel_id,
       aud: daemonPublicKey(),
     });
-    if (!checked.ok) {
-      logWarn("rtc-host", "device grant failed", {
+    if (gate.mode === "reject") {
+      logWarn("rtc-host", "seedgate rejected", {
         channelId: frame.channel_id,
-        reason: checked.reason,
+        reason: gate.reason,
       });
       return;
     }

@@ -107,12 +107,15 @@ const rememberNonce = (n: string, now: number): boolean => {
   if (nonceSeen.has(n)) return false;
   nonceSeen.set(n, now + DEVICE_GRANT_TS_WINDOW_MS);
   nonceOrder.push(n);
-  while (nonceOrder.length > NONCE_LRU_CAP) {
-    const evicted = nonceOrder.shift();
-    if (evicted !== undefined) nonceSeen.delete(evicted);
+  // Log once per crossing of the hard cap (not once per eviction in the loop).
+  if (nonceOrder.length > NONCE_LRU_CAP) {
     logWarn("device-access", "nonce LRU hard cap reached; evicting oldest", {
       cap: NONCE_LRU_CAP,
     });
+    while (nonceOrder.length > NONCE_LRU_CAP) {
+      const evicted = nonceOrder.shift();
+      if (evicted !== undefined) nonceSeen.delete(evicted);
+    }
   }
   return true;
 };
@@ -182,4 +185,50 @@ export const checkDeviceGrant = (
   }
   rememberNonce(envelope.n, now);
   return { ok: true };
+};
+
+export type TEnforceSeedGateResult =
+  | { readonly mode: "off" }
+  | { readonly mode: "reject"; readonly reason: string }
+  | { readonly mode: "ok" };
+
+export type TEnforceSeedGateExpect = {
+  readonly keyId: string | null;
+  readonly cid: string;
+  readonly aud: string;
+};
+
+/**
+ * Single seed-gate decision tree for mux / tunnel / RTC.
+ * - pin null → mode "off" (legacy, skip enforcement)
+ * - missing keyId → reject "no_api_key_id"
+ * - missing/empty grant → reject "missing_grant"
+ * - checkDeviceGrant fail → reject with checked.reason
+ * - else ok
+ *
+ * Callers pass `daemonApiKeyId()` / `daemonPublicKey()` so this module stays
+ * free of env/keypair imports (no circular deps).
+ */
+export const enforceSeedGate = (
+  grant: string | undefined,
+  expect: TEnforceSeedGateExpect,
+): TEnforceSeedGateResult => {
+  if (getDeviceAccessPubkey() === null) {
+    return { mode: "off" };
+  }
+  if (expect.keyId === null) {
+    return { mode: "reject", reason: "no_api_key_id" };
+  }
+  if (grant === undefined || grant.length === 0) {
+    return { mode: "reject", reason: "missing_grant" };
+  }
+  const checked = checkDeviceGrant(grant, {
+    keyId: expect.keyId,
+    cid: expect.cid,
+    aud: expect.aud,
+  });
+  if (!checked.ok) {
+    return { mode: "reject", reason: checked.reason };
+  }
+  return { mode: "ok" };
 };
