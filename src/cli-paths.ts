@@ -139,6 +139,33 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
   return out;
 };
 
+// ─── device-session workspace (interactive CLI, real user env) ──────
+//
+// Device chat sessions (feature §2.2) run the user's REAL interactive CLI
+// with the real `$HOME` / PATH so credentials and settings work without
+// re-login. Only the cwd is isolated under `~/.openllm/sessions/<id>/` so
+// session workspaces don't litter the real home. Sandbox HOME rewrite /
+// seatbelt grants are intentionally NOT applied here — those stay for
+// auto-update and login/auth triggers only.
+
+/** Root directory for all device-session workspaces + pidfiles. */
+export const sessionRoot = (): string => join(stateDir(), "sessions");
+
+/** Per-session workspace (cwd). Optional isolation without rewriting HOME. */
+export const sessionWorkspace = (sessionId: string): string =>
+  join(sessionRoot(), sessionId);
+
+/**
+ * Environment overrides for a DEVICE SESSION spawn. Keeps the real HOME so
+ * vendor CLIs read the user's actual login/settings; only sets TERM and a
+ * daemon temp dir. PATH is inherited via `spawnEnv`.
+ */
+export const sessionEnv = (_provider: TCliProvider): Record<string, string> => ({
+  HOME: homedir(),
+  TMPDIR: daemonTempDir(),
+  TERM: "xterm-256color",
+});
+
 /**
  * The CLI's home/config root as the CLI itself sees it (the value of its
  * home env var). Delegates derive their credential-store paths from this

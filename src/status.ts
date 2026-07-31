@@ -16,6 +16,7 @@ import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
 import { sandboxState } from "./sandbox/landlock";
+import { ptySupported, sessionStatusReport } from "./session-host";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -67,6 +68,10 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     // and schedules a background refresh when stale, so status can stay responsive
     // without blocking and without manifest scans.
     cli: getCliState(),
+    // Device chat sessions (feature §2.2): whether this box can host a
+    // PTY, and the sessions it currently holds (live/dormant).
+    pty_supported: ptySupported(),
+    sessions: sessionStatusReport(),
   };
 };
 

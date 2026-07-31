@@ -7,6 +7,7 @@ import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
+import { bindMuxSessionStream } from "./session-host";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 /**
@@ -185,12 +186,13 @@ export const configureMuxHost = (options: {
 /**
  * Shared OPEN dispatcher for every daemon-side mux channel (relay WS + RTC).
  * Keep tunnel-server reachable through this single closure so rtc-host does
- * not re-implement admit/serve.
+ * not re-implement admit/serve. Session OPEN binds a PTY via session-host.
  */
 export const serveMuxOnStream = serveStream({
   // Keep the tunnel-server import lazy: its production dispatcher reaches the
   // control channel, which imports this host during daemon initialization.
   tunnel: (open, body, signal) => serveMuxTunnel(open, body, signal),
+  session: bindMuxSessionStream,
   admitTunnel: () => admitMuxTunnel(),
   invalidOpenCode: "invalid_tunnel",
 });
@@ -268,7 +270,7 @@ export const muxHostOnBytes = (bytes: Uint8Array): void => {
   sink?.(bytes);
 };
 
-/** A dead relay socket tears down all stream state. */
+/** A dead relay socket tears down all stream state without killing PTYs. */
 export const resetAllChannels = (): void => {
   for (const keyId of [...opening.keys()]) failOpen(keyId);
   const channel = active;

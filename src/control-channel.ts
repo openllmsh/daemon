@@ -37,6 +37,12 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
+import {
+  detachAllSessions,
+  handleSessionFrame,
+  isSessionFrame,
+  setSessionActivityHook,
+} from "./session-host";
 import { computeStatus } from "./status";
 import {
   failAllConsumedTunnels,
@@ -163,7 +169,8 @@ const send = (frame: TRelayFrame): void => {
 
 /** Reset relay-owned work at a connection boundary. Consumed tunnels, served
  * tunnels, mux channels, and RTC signaling sessions are tied to the old
- * relay socket and must not continue into the successor. */
+ * relay socket and must not continue into the successor. Device PTYs DETACH
+ * (survive); the browser re-attaches after reconnect. */
 export const resetRelayScopedState = (): void => {
   abortAllTunnels();
   failAllConsumedTunnels();
@@ -172,6 +179,7 @@ export const resetRelayScopedState = (): void => {
   // data channel do not ride the relay socket and survive reconnect.
   resetUnmountedRtcSessions();
   resetUnmountedRtcClientSessions();
+  detachAllSessions();
 };
 
 const enqueueStatusPublish = (
@@ -520,6 +528,12 @@ const onFrame = (frame: TRelayFrame): void => {
         handleTunnelFrame(frame, send);
         return;
       }
+      // Device sessions (PTY host) — each session runs on its own async
+      // task, mirroring the tunnel server.
+      if (isSessionFrame(frame)) {
+        handleSessionFrame(frame, send);
+        return;
+      }
       // others: nothing to do (partysocket owns reconnection)
       return;
   }
@@ -635,6 +649,9 @@ export const startControlChannel = (): void => {
   // walker→control-channel import (which would close an import cycle via
   // tunnel-server → listener → walker).
   registerTunnelSender(send);
+  setSessionActivityHook(() => {
+    void pushStatusIfChanged();
+  });
   configureMuxHost({ send, sendBytes });
   configureRtcHost({ send });
   configureRtcClient({ send });
