@@ -23,7 +23,11 @@ import type {
   TRelayTunnelOpenFrame,
   TTunnelSurface,
 } from "@openllmsh/protocol";
-import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
+import {
+  TUNNEL_CHUNK_MAX,
+  TUNNELED_REQUEST_HEADER,
+  TUNNELED_REQUEST_VALUE,
+} from "@openllmsh/protocol";
 import type { TServeTunnel } from "@openllmsh/tunnel/streams";
 import { enforceSeedGate } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
@@ -84,7 +88,7 @@ const forwardedHeaders = (open: {
     headers.set("anthropic-version", open.headers.anthropic_version);
   if (open.headers?.anthropic_beta !== undefined)
     headers.set("anthropic-beta", open.headers.anthropic_beta);
-  headers.set("x-openllm-tunneled", "1");
+  headers.set(TUNNELED_REQUEST_HEADER, TUNNELED_REQUEST_VALUE);
   return headers;
 };
 

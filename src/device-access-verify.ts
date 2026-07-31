@@ -18,10 +18,11 @@ import { mutateState, readState } from "./state-file";
 /**
  * Hard upper bound on nonces retained for the ts window. Sized for a busy
  * multi-surface open rate (~30 grants/s × 120s window ≈ 3600) with headroom;
- * expiry pruning is the primary retention control — the cap only logs when
- * reached so a runaway client cannot grow the map without bound.
+ * expiry pruning is the primary retention control. When the map is full of
+ * still-valid nonces, new grants are rejected (`nonce_overload`) rather than
+ * silently dropping replay protection.
  */
-const NONCE_LRU_CAP = 4096;
+let nonceLruCap = 4096;
 
 /** Module-level nonce LRU — expire after the grant ts window; hard-cap above. */
 const nonceOrder: string[] = [];
@@ -67,6 +68,11 @@ export const setDeviceAccessPubkeyForTest = (pubkey: string | null): void => {
 export const clearDeviceGrantNoncesForTest = (): void => {
   nonceOrder.length = 0;
   nonceSeen.clear();
+};
+
+/** Test-only: override the nonce map capacity (null restores default 4096). */
+export const setNonceLruCapForTest = (cap: number | null): void => {
+  nonceLruCap = cap ?? 4096;
 };
 
 /**
@@ -115,22 +121,22 @@ const pruneExpiredNonces = (now: number): void => {
  * Remember a verified nonce until its envelope can no longer be accepted.
  * Retention is `envelopeTs + WINDOW` so a future-dated grant (still inside
  * the acceptance window) cannot be replayed after a premature prune.
+ *
+ * Returns false when the map is already full of still-valid nonces — callers
+ * must reject with a distinct overload reason rather than silently drop
+ * replay protection by evicting unexpired entries.
  */
 const rememberNonce = (n: string, envelopeTs: number, now: number): boolean => {
   pruneExpiredNonces(now);
   if (nonceSeen.has(n)) return false;
+  if (nonceOrder.length >= nonceLruCap) {
+    logWarn("device-access", "nonce map full; rejecting new grant", {
+      cap: nonceLruCap,
+    });
+    return false;
+  }
   nonceSeen.set(n, envelopeTs + DEVICE_GRANT_TS_WINDOW_MS);
   nonceOrder.push(n);
-  // Log once per crossing of the hard cap (not once per eviction in the loop).
-  if (nonceOrder.length > NONCE_LRU_CAP) {
-    logWarn("device-access", "nonce LRU hard cap reached; evicting oldest", {
-      cap: NONCE_LRU_CAP,
-    });
-    while (nonceOrder.length > NONCE_LRU_CAP) {
-      const evicted = nonceOrder.shift();
-      if (evicted !== undefined) nonceSeen.delete(evicted);
-    }
-  }
   return true;
 };
 
@@ -202,7 +208,11 @@ export const checkDeviceGrant = (
   if (!verifyDeviceGrantNode(pinned, msg, envelope.sig)) {
     return { ok: false, reason: "bad_sig" };
   }
-  rememberNonce(envelope.n, envelope.ts, now);
+  // Signature verified — only then admit the nonce. Full map of still-valid
+  // nonces rejects rather than evicting (replay protection must not degrade).
+  if (!rememberNonce(envelope.n, envelope.ts, now)) {
+    return { ok: false, reason: "nonce_overload" };
+  }
   return { ok: true };
 };
 

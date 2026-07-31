@@ -323,13 +323,25 @@ walker's own `report`. Offline coverage:
 
 ## Tunnel transport
 
-The daemon uses the capability-gated `mux1` channel when both endpoints support
-it. `mux-host.ts` owns one relay duplex/channel, negotiates `channel_open` /
-`channel_open_ack`, receives mux OPEN frames, and dispatches tunnel streams to
-`tunnel-server.ts`. `tunnel-client.ts` uses this mux path first; a channel nack,
-timeout, or other pre-response-head failure falls back to the retained JSON
-`tunnel_*` splice. The serving path maps a closed tunnel-surface vocabulary to
-the daemon's in-process `/v1/*` handler and streams the result.
+Path ladder on the consumer side: **RTC (when open) → relay binary mux (`mux1`)
+→ JSON `tunnel_*` splice**.
+
+- `mux-host.ts` owns one relay duplex/channel, negotiates `channel_open` /
+  `channel_open_ack`, receives mux OPEN frames, and dispatches via
+  `serveStream` into `tunnel-server.ts`. Advertises `mux1` + `rtc1`, and
+  layers `seedgate1` when a device-access pubkey is pinned from bootstrap.
+- `rtc-host.ts` is the werift RTC responder: same-user `rtc_offer` /
+  `rtc_answer` / `rtc_ice` over the relay, then mux over the data channel
+  (signaling-only relay; payload-cap negotiation; kill-switch /
+  failure-cache fallthrough to mux/splice).
+- `tunnel-client.ts` prefers mux (then splice) for daemon→daemon fleet hops.
+- `tunnel-server.ts` maps a closed tunnel-surface vocabulary to the daemon's
+  in-process `/v1/*` handler and streams the result. Stamps
+  `x-openllm-tunneled` so a fleet walker cannot re-tunnel a tunnel-borne
+  request.
+- `device-access-verify.ts` verifies vault-signed device grants (node:crypto)
+  with ts window + nonce map; browser-only enforcement (daemon fleet hops
+  skip grant). Locked-vault consumers fail closed before probing transports.
 
 Device-session/PTy work belongs to `feat/session-chat`, not this branch.
 

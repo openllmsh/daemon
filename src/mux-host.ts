@@ -1,5 +1,5 @@
 import type { TRelayFrame } from "@openllmsh/protocol";
-import { SEEDGATE_CAP } from "@openllmsh/protocol";
+import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
@@ -15,7 +15,7 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
  * `seedgate1` is layered on when a device-access pubkey is pinned — see
  * {@link currentDaemonCaps}.
  */
-export const DAEMON_MUX_CAPS = ["mux1", "rtc1"] as const;
+export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP] as const;
 
 /** Live capability list — includes `seedgate1` when device access is provisioned. */
 export const currentDaemonCaps = (): string[] => {
@@ -85,7 +85,8 @@ export const muxChannelTo = async (
   keyId: string,
 ): Promise<TMuxChannel | null> => {
   if (process.env.OPENLLM_MUX_DISABLE === "1") return null;
-  if (!peerCaps.get(keyId)?.has("mux1")) return null;
+  const caps = peerCaps.get(keyId);
+  if (caps === undefined || !caps.has(MUX_CAP)) return null;
   if (
     failedUntil.get(keyId) !== undefined &&
     (failedUntil.get(keyId) ?? 0) > Date.now()

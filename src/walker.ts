@@ -52,6 +52,8 @@ import {
   AnthropicResponse,
   ChatCompletionChunk,
   daemonPlanSigningPayload,
+  TUNNELED_REQUEST_HEADER,
+  TUNNELED_REQUEST_VALUE,
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
 import type { TCompactionSurface } from "@openllmsh/wire/features/compaction/compact-request";
@@ -1640,7 +1642,8 @@ const tryFleetTunnel = async (
   hop: THop,
   args: TWalkArgs,
 ): Promise<Response | null> => {
-  if (args.req.headers.get("x-openllm-tunneled") === "1") return null;
+  if (args.req.headers.get(TUNNELED_REQUEST_HEADER) === TUNNELED_REQUEST_VALUE)
+    return null;
   const peerKeyId = fleetSubscriptionServerFor(hop.provider);
   if (peerKeyId === null) return null;
   const clientWantsStream =
