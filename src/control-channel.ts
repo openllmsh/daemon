@@ -529,9 +529,27 @@ const onFrame = (frame: TRelayFrame): void => {
         return;
       }
       // Device sessions (PTY host) — each session runs on its own async
-      // task, mirroring the tunnel server.
+      // task, mirroring the tunnel server. Contain unexpected throws so a
+      // single bad open cannot escape the WebSocket callback unacked.
       if (isSessionFrame(frame)) {
-        handleSessionFrame(frame, send);
+        try {
+          handleSessionFrame(frame, send);
+        } catch (err) {
+          logWarn("control-channel", "session frame handler failed", {
+            type: frame.type,
+            sessionId:
+              "session_id" in frame ? frame.session_id : undefined,
+            err: err instanceof Error ? err.message : String(err),
+          });
+          if (frame.type === "session_open") {
+            send({
+              type: "session_open_ack",
+              session_id: frame.session_id,
+              ok: false,
+              error: "spawn_failed",
+            });
+          }
+        }
         return;
       }
       // others: nothing to do (partysocket owns reconnection)

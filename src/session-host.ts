@@ -704,171 +704,197 @@ const handleOpen = (
         : { last_exit_reason: lastExitReason }),
     });
   };
-  if (!ptySupported()) {
-    nack("pty_unsupported");
-    return;
-  }
-  if (!SESSION_ID_PATTERN.test(frame.session_id)) {
-    nack("spawn_failed");
-    return;
-  }
-  const cli: TSubscriptionProviderSlug = frame.cli;
-  const existing = sessions.get(frame.session_id);
-
-  // ── attach: re-bind a live PTY ────────────────────────────────────
-  if (frame.mode === "attach") {
-    if (existing === undefined) {
-      nack("session_not_found");
+  // Outer guard: pre-spawn helpers (workspace path, binary lookup, …) used
+  // to sit outside the spawn try/catch. An unexpected throw there left the
+  // browser waiting on open_ack until its 15s timeout. Always nack.
+  try {
+    if (!ptySupported()) {
+      nack("pty_unsupported");
       return;
     }
-    if (existing.attached) {
+    if (!SESSION_ID_PATTERN.test(frame.session_id)) {
+      nack("spawn_failed");
+      return;
+    }
+    const cli: TSubscriptionProviderSlug = frame.cli;
+    const existing = sessions.get(frame.session_id);
+
+    // ── attach: re-bind a live PTY ────────────────────────────────────
+    if (frame.mode === "attach") {
+      if (existing === undefined) {
+        nack("session_not_found");
+        return;
+      }
+      if (existing.attached) {
+        nack("session_busy");
+        return;
+      }
+      if (existing.pty === null) {
+        // Dead — the consumer should re-open with mode:"continue".
+        nack("session_not_found", existing.lastExitReason);
+        return;
+      }
+      existing.attached = true;
+      existing.detachedAtMs = null;
+      existing.generation = ++nextSessionGeneration;
+      existing.pty.resize(frame.cols, frame.rows);
+      send({
+        type: "session_open_ack",
+        session_id: frame.session_id,
+        ok: true,
+        live: true,
+        generation: existing.generation,
+      });
+      // The legacy JSON caller needs its repaint frames here. Mux callers set
+      // `muxStream` in bindMuxSessionStream's ack handler and replay directly
+      // to that binary stream instead.
+      if (existing.muxStream === null) {
+        sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
+        for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
+      }
+      logInfo("session", "session re-attached", { id: existing.id });
+      return;
+    }
+
+    // ── spawn / continue: start a CLI process ─────────────────────────
+    if (existing !== undefined && existing.pty !== null) {
       nack("session_busy");
       return;
     }
-    if (existing.pty === null) {
-      // Dead — the consumer should re-open with mode:"continue".
-      nack("session_not_found", existing.lastExitReason);
+    // At capacity: refuse the new spawn. Detached sessions stay alive until
+    // the user explicitly ends them — never silently evict under pressure.
+    if (liveCount() >= MAX_LIVE_SESSIONS) {
+      nack("overloaded");
       return;
     }
-    existing.attached = true;
-    existing.detachedAtMs = null;
-    existing.generation = ++nextSessionGeneration;
-    existing.pty.resize(frame.cols, frame.rows);
-    send({
-      type: "session_open_ack",
-      session_id: frame.session_id,
-      ok: true,
-      live: true,
-      generation: existing.generation,
-    });
-    // The legacy JSON caller needs its repaint frames here. Mux callers set
-    // `muxStream` in bindMuxSessionStream's ack handler and replay directly
-    // to that binary stream instead.
-    if (existing.muxStream === null) {
-      sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
-      for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
-    }
-    logInfo("session", "session re-attached", { id: existing.id });
-    return;
-  }
-
-  // ── spawn / continue: start a CLI process ─────────────────────────
-  if (existing !== undefined && existing.pty !== null) {
-    nack("session_busy");
-    return;
-  }
-  // At capacity: refuse the new spawn. Detached sessions stay alive until
-  // the user explicitly ends them — never silently evict under pressure.
-  if (liveCount() >= MAX_LIVE_SESSIONS) {
-    nack("overloaded");
-    return;
-  }
-  const workspace = sessionWorkspace(frame.session_id);
-  try {
-    mkdirSync(workspace, { recursive: true });
-  } catch (err) {
-    logWarn(
-      "session",
-      `workspace mkdir failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    nack("spawn_failed");
-    return;
-  }
-
-  // Prefer openllm CLI presence (preferred launch path). Fall back to the
-  // host vendor binary when openllm is missing or the provider is unmapped.
-  // Only enforced for the REAL spawner — an injected test spawner never
-  // execs, and CI boxes don't carry the vendor CLIs.
-  if (spawner === bunPtySpawner) {
-    const prefersOpenllm = openllmClientId(cli) !== null;
-    const hasOpenllm = openllmBin() !== null;
-    const hasHostVendor = hostCliCandidates(cli).some((candidate) =>
-      existsSync(candidate),
-    );
-    if (prefersOpenllm ? !hasOpenllm && !hasHostVendor : !hasHostVendor) {
-      nack("cli_not_installed");
+    const workspace = sessionWorkspace(frame.session_id);
+    try {
+      mkdirSync(workspace, { recursive: true });
+    } catch (err) {
+      logWarn(
+        "session",
+        `workspace mkdir failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      nack("spawn_failed");
       return;
     }
-  }
 
-  // `continue` after a daemon restart: no in-memory record, but the
-  // workspace may still exist on disk — recreate the record (the `??`
-  // fallback) and continue in place.
-  const s: TSession = existing ?? {
-    id: frame.session_id,
-    cli,
-    workspace,
-    pty: null,
-    scrollback: [],
-    scrollbackBytes: 0,
-    attached: false,
-    outSeq: 0,
-    startedAtMs: Date.now(),
-    detachedAtMs: null,
-    lastOutputAtMs: Date.now(),
-    lastBusyAtMs: Date.now(),
-    busy: true,
-    title: frame.title ?? null,
-    pid: null,
-    muxStream: null,
-    muxWriteTail: Promise.resolve(),
-    generation: 0,
-    lastExitReason: null,
-  };
-  sessions.set(s.id, s);
+    // Prefer openllm CLI presence (preferred launch path). Fall back to the
+    // host vendor binary when openllm is missing or the provider is unmapped.
+    // Only enforced for the REAL spawner — an injected test spawner never
+    // execs, and CI boxes don't carry the vendor CLIs.
+    if (spawner === bunPtySpawner) {
+      const prefersOpenllm = openllmClientId(cli) !== null;
+      const hasOpenllm = openllmBin() !== null;
+      const hasHostVendor = hostCliCandidates(cli).some((candidate) =>
+        existsSync(candidate),
+      );
+      if (prefersOpenllm ? !hasOpenllm && !hasHostVendor : !hasHostVendor) {
+        nack("cli_not_installed");
+        return;
+      }
+    }
 
-  try {
-    const pty = spawner({
-      argv: argvFor(
+    // `continue` after a daemon restart: no in-memory record, but the
+    // workspace may still exist on disk — recreate the record (the `??`
+    // fallback) and continue in place.
+    const s: TSession = existing ?? {
+      id: frame.session_id,
+      cli,
+      workspace,
+      pty: null,
+      scrollback: [],
+      scrollbackBytes: 0,
+      attached: false,
+      outSeq: 0,
+      startedAtMs: Date.now(),
+      detachedAtMs: null,
+      lastOutputAtMs: Date.now(),
+      lastBusyAtMs: Date.now(),
+      busy: true,
+      title: frame.title ?? null,
+      pid: null,
+      muxStream: null,
+      muxWriteTail: Promise.resolve(),
+      generation: 0,
+      lastExitReason: null,
+    };
+    sessions.set(s.id, s);
+
+    try {
+      const argv = argvFor(
         cli,
         frame.mode === "continue" ? "continue" : "spawn",
         frame.dangerous === true,
-      ),
-      cwd: workspace,
-      // Real user HOME + PATH (via spawnEnv). Session cwd is isolated under
-      // ~/.openllm/sessions/<id>/ without rewriting HOME or sandboxing.
-      env: sessionEnv(cli),
-      cols: frame.cols,
-      rows: frame.rows,
-      onData: (chunk) => {
-        s.lastOutputAtMs = Date.now();
-        pushScrollback(s, chunk);
-        if (s.attached) sendOut(s, chunk, send);
-      },
-      onExit: () => {
-        const reason = s.lastExitReason ?? "done";
-        endPty(s, reason, false);
-        terminalClose(s, send, reason === "done" ? "done" : "killed");
-        logInfo("session", "session CLI exited", { id: s.id });
-      },
-    });
-    s.pty = pty;
-    s.pid = pty.pid ?? null;
-    // Record the live PID so a crash-killed daemon's successor can reap it.
-    if (s.pid !== null) writePidFile(s.id, s.pid);
-    s.busy = true;
-    s.lastBusyAtMs = Date.now();
-    s.attached = true;
-    s.detachedAtMs = null;
-    s.generation = ++nextSessionGeneration;
-    s.lastExitReason = null;
-    send({
-      type: "session_open_ack",
-      session_id: s.id,
-      ok: true,
-      live: false,
-      generation: s.generation,
-    });
-    logInfo("session", "session started", {
-      id: s.id,
-      cli,
-      mode: frame.mode,
-    });
+      );
+      logInfo("session", "session open started", {
+        id: s.id,
+        cli,
+        mode: frame.mode,
+        argv: argv.join(" "),
+      });
+      const pty = spawner({
+        argv,
+        cwd: workspace,
+        // Real user HOME + PATH (via spawnEnv). Session cwd is isolated under
+        // ~/.openllm/sessions/<id>/ without rewriting HOME or sandboxing.
+        env: sessionEnv(cli),
+        cols: frame.cols,
+        rows: frame.rows,
+        onData: (chunk) => {
+          s.lastOutputAtMs = Date.now();
+          pushScrollback(s, chunk);
+          if (s.attached) sendOut(s, chunk, send);
+        },
+        onExit: () => {
+          const reason = s.lastExitReason ?? "done";
+          endPty(s, reason, false);
+          terminalClose(s, send, reason === "done" ? "done" : "killed");
+          logInfo("session", "session CLI exited", { id: s.id });
+        },
+      });
+      s.pty = pty;
+      s.pid = pty.pid ?? null;
+      // Record the live PID so a crash-killed daemon's successor can reap it.
+      // Best-effort and non-critical — do not block open_ack on a slow state FS.
+      if (s.pid !== null) {
+        try {
+          writePidFile(s.id, s.pid);
+        } catch {
+          /* writePidFile already logs; never block ack */
+        }
+      }
+      s.busy = true;
+      s.lastBusyAtMs = Date.now();
+      s.attached = true;
+      s.detachedAtMs = null;
+      s.generation = ++nextSessionGeneration;
+      s.lastExitReason = null;
+      send({
+        type: "session_open_ack",
+        session_id: s.id,
+        ok: true,
+        live: false,
+        generation: s.generation,
+      });
+      logInfo("session", "session started", {
+        id: s.id,
+        cli,
+        mode: frame.mode,
+      });
+    } catch (err) {
+      sessions.delete(s.id);
+      logWarn(
+        "session",
+        `session spawn failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      nack("spawn_failed");
+    }
   } catch (err) {
-    sessions.delete(s.id);
     logWarn(
       "session",
-      `session spawn failed: ${err instanceof Error ? err.message : String(err)}`,
+      `session open failed: ${err instanceof Error ? err.message : String(err)}`,
+      { id: frame.session_id, mode: frame.mode },
     );
     nack("spawn_failed");
   }
