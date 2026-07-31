@@ -203,6 +203,9 @@ export const handleTunnelFrame = (
       // provisioned. Fleet daemon→daemon hops set consumer:"daemon" and have no
       // vault DEK on the consumer side — skip enforcement for those (product
       // rule: seedgate is browser-only until a peer-grant path lands).
+      // Trust boundary: the relay stamps `consumer` from the authenticated
+      // socket role before forward, so a watcher cannot claim "daemon" to
+      // skip the gate. Direct (non-relay) sockets must not self-assert.
       if (frame.consumer !== "daemon") {
         const gate = enforceSeedGate(frame.grant, {
           keyId: daemonApiKeyId(),

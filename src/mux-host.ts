@@ -204,6 +204,9 @@ export const acceptChannel = (frame: {
   // Seed-gate: browser consumers must present a vault-signed grant when
   // provisioned. Fleet daemon→daemon hops set consumer:"daemon" and have no
   // vault DEK — skip enforcement for those (parity with tunnel-server).
+  // Trust boundary: the relay stamps `consumer` from the authenticated
+  // socket role before forward, so a watcher cannot claim "daemon" to
+  // skip the gate. Direct (non-relay) sockets must not self-assert.
   if (frame.consumer !== "daemon") {
     const gate = enforceSeedGate(frame.grant, {
       keyId: daemonApiKeyId(),
