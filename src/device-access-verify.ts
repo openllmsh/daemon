@@ -251,3 +251,22 @@ export const enforceSeedGate = (
   }
   return { mode: "ok" };
 };
+
+/**
+ * RTC offer seed-gate: when provisioned, require offerVersion 2 and a valid
+ * nested grant. Unprovisioned daemons return mode "off" so the host keeps
+ * accepting legacy v1 offers. Single entry for the outer pin + v1 branch that
+ * previously lived inline in rtc-host.
+ */
+export const enforceRtcSeedGate = (
+  grant: string | undefined,
+  expect: TEnforceSeedGateExpect & { readonly offerVersion: number },
+): TEnforceSeedGateResult => {
+  if (getDeviceAccessPubkey() === null) {
+    return { mode: "off" };
+  }
+  if (expect.offerVersion !== 2) {
+    return { mode: "reject", reason: "v1_offer" };
+  }
+  return enforceSeedGate(grant, expect);
+};

@@ -462,12 +462,21 @@ const onFrame = (frame: TRelayFrame): void => {
       return;
     case "rtc_offer":
       // Daemon is the responder: open seal, answer, trickle ICE.
-      // Catch async failures the same way onCommand is guarded — an
-      // unhandled rejection here would crash the process under --unhandled-rejections=strict.
-      void handleRtcOffer(frame).catch(() => {});
+      // Log async failures (parity with serveTunnel) — never crash the process.
+      void handleRtcOffer(frame).catch((err: unknown) => {
+        logWarn("control-channel", "rtc_offer handler failed", {
+          channelId: frame.channel_id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
       return;
     case "rtc_ice":
-      void handleRtcIce(frame).catch(() => {});
+      void handleRtcIce(frame).catch((err: unknown) => {
+        logWarn("control-channel", "rtc_ice handler failed", {
+          channelId: frame.channel_id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
       return;
     case "rtc_answer":
       // Responder path only — a browser-originated answer is unexpected.
@@ -704,6 +713,11 @@ export const stopControlChannel = async (): Promise<void> => {
   stopMigrationCheck();
   heartbeat.stop();
   if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
+  // Tear relay-scoped transports before nulling the socket so in-flight
+  // tunnels/mux/unmounted RTC do not outlive process stop. Mounted RTC is
+  // intentionally kept by resetUnmountedRtcSessions — full process exit
+  // reaps those with the peer connections.
+  resetRelayScopedState();
   ws.close(); // partysocket: a manual close() disables further reconnection
   ws = null;
 };

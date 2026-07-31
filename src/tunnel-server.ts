@@ -199,24 +199,29 @@ export const handleTunnelFrame = (
         });
         return;
       }
-      // Seed-gate: when provisioned, every tunnel_open must carry a valid grant.
-      const gate = enforceSeedGate(frame.grant, {
-        keyId: daemonApiKeyId(),
-        cid: frame.tunnel_id,
-        aud: daemonPublicKey(),
-      });
-      if (gate.mode === "reject") {
-        logWarn("tunnel", "tunnel_open rejected: seedgate", {
-          id: frame.tunnel_id,
-          reason: gate.reason,
+      // Seed-gate: browser consumers must present a vault-signed grant when
+      // provisioned. Fleet daemon→daemon hops set consumer:"daemon" and have no
+      // vault DEK on the consumer side — skip enforcement for those (product
+      // rule: seedgate is browser-only until a peer-grant path lands).
+      if (frame.consumer !== "daemon") {
+        const gate = enforceSeedGate(frame.grant, {
+          keyId: daemonApiKeyId(),
+          cid: frame.tunnel_id,
+          aud: daemonPublicKey(),
         });
-        send({
-          type: "tunnel_open_ack",
-          tunnel_id: frame.tunnel_id,
-          ok: false,
-          error: "unauthorized",
-        });
-        return;
+        if (gate.mode === "reject") {
+          logWarn("tunnel", "tunnel_open rejected: seedgate", {
+            id: frame.tunnel_id,
+            reason: gate.reason,
+          });
+          send({
+            type: "tunnel_open_ack",
+            tunnel_id: frame.tunnel_id,
+            ok: false,
+            error: "unauthorized",
+          });
+          return;
+        }
       }
       served.set(frame.tunnel_id, {
         tunnelId: frame.tunnel_id,

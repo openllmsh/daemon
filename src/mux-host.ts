@@ -1,12 +1,9 @@
-import { SEEDGATE_CAP } from "@openllmsh/protocol";
 import type { TRelayFrame } from "@openllmsh/protocol";
+import { SEEDGATE_CAP } from "@openllmsh/protocol";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
-import {
-  enforceSeedGate,
-  getDeviceAccessPubkey,
-} from "./device-access-verify";
+import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
@@ -111,7 +108,14 @@ export const muxChannelTo = async (
   return new Promise<TMuxChannel | null>((resolve) => {
     const timer = setTimeout(() => failOpen(keyId), muxAckTimeoutMs);
     opening.set(keyId, { resolve, timer, channelId });
-    send({ type: "channel_open", channel_id: channelId, key_id: keyId });
+    // Fleet peer hop: mark consumer so the serving daemon can skip browser-only
+    // seedgate (this process has no vault DEK to mint a grant).
+    send({
+      type: "channel_open",
+      channel_id: channelId,
+      key_id: keyId,
+      consumer: "daemon",
+    });
   });
 };
 
@@ -183,6 +187,7 @@ export const serveMuxOnStream = serveStream({
 export const acceptChannel = (frame: {
   readonly channel_id: string;
   readonly grant?: string;
+  readonly consumer?: "browser" | "daemon";
 }): void => {
   const send = sendFrame;
   const binary = sendBinary;
@@ -196,25 +201,28 @@ export const acceptChannel = (frame: {
     });
     return;
   }
-  // Seed-gate: when provisioned, every channel_open must carry a valid grant.
-  // Gates ALL mux streams (including sessions) that ride this channel.
-  const gate = enforceSeedGate(frame.grant, {
-    keyId: daemonApiKeyId(),
-    cid: frame.channel_id,
-    aud: daemonPublicKey(),
-  });
-  if (gate.mode === "reject") {
-    logWarn("mux-host", "channel_open rejected: seedgate", {
-      channelId: frame.channel_id,
-      reason: gate.reason,
+  // Seed-gate: browser consumers must present a vault-signed grant when
+  // provisioned. Fleet daemon→daemon hops set consumer:"daemon" and have no
+  // vault DEK — skip enforcement for those (parity with tunnel-server).
+  if (frame.consumer !== "daemon") {
+    const gate = enforceSeedGate(frame.grant, {
+      keyId: daemonApiKeyId(),
+      cid: frame.channel_id,
+      aud: daemonPublicKey(),
     });
-    send({
-      type: "channel_open_ack",
-      channel_id: frame.channel_id,
-      ok: false,
-      error: "unauthorized",
-    });
-    return;
+    if (gate.mode === "reject") {
+      logWarn("mux-host", "channel_open rejected: seedgate", {
+        channelId: frame.channel_id,
+        reason: gate.reason,
+      });
+      send({
+        type: "channel_open_ack",
+        channel_id: frame.channel_id,
+        ok: false,
+        error: "unauthorized",
+      });
+      return;
+    }
   }
   if (active !== null) {
     send({

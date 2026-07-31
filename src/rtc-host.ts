@@ -20,13 +20,13 @@ import {
   fingerprintFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
-  RTC_AUTH_VERSION_2,
+  normalizeFingerprint,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
-import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
+import { enforceRtcSeedGate } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey, openSealed, sealTo } from "./keypair";
 import { logDebug, logWarn } from "./logger";
@@ -255,29 +255,35 @@ export const handleRtcOffer = async (frame: {
     return;
   }
 
+  // Bind sealed browser fingerprint to the offer SDP (symmetric to browser
+  // verifyAnswerInner binding daemon fd to answer SDP). Reject when SDP has
+  // no fingerprint or it disagrees with the sealed fb.
+  const offerFb = fingerprintFromSdp(frame.sdp);
+  if (
+    offerFb === null ||
+    normalizeFingerprint(offerFb) !== normalizeFingerprint(inner.fb)
+  ) {
+    logWarn("rtc-host", "offer fingerprint mismatch", {
+      channelId: frame.channel_id,
+    });
+    return;
+  }
+
   // Seed-gate: when provisioned, require a v2 offer carrying a valid grant.
   // Un-provisioned daemons still accept legacy v1 (no grant). No open-ack
   // frame exists for RTC — rejects stay silent (no answer), same as bad proof.
-  if (getDeviceAccessPubkey() !== null) {
-    if (inner.v !== RTC_AUTH_VERSION_2) {
-      logWarn("rtc-host", "seedgate rejected", {
-        channelId: frame.channel_id,
-        reason: "v1_offer",
-      });
-      return;
-    }
-    const gate = enforceSeedGate(inner.grant, {
-      keyId: daemonApiKeyId(),
-      cid: frame.channel_id,
-      aud: daemonPublicKey(),
+  const gate = enforceRtcSeedGate("grant" in inner ? inner.grant : undefined, {
+    keyId: daemonApiKeyId(),
+    cid: frame.channel_id,
+    aud: daemonPublicKey(),
+    offerVersion: inner.v,
+  });
+  if (gate.mode === "reject") {
+    logWarn("rtc-host", "seedgate rejected", {
+      channelId: frame.channel_id,
+      reason: gate.reason,
     });
-    if (gate.mode === "reject") {
-      logWarn("rtc-host", "seedgate rejected", {
-        channelId: frame.channel_id,
-        reason: gate.reason,
-      });
-      return;
-    }
+    return;
   }
 
   const offerSdpMax = maxMessageSizeFromSdp(frame.sdp);
