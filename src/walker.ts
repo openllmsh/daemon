@@ -1674,9 +1674,10 @@ const tryFleetTunnel = async (
     // failures throw below and fall through to the next local hop.
     return res;
   } catch {
+    if (args.req.signal.aborted)
+      throw new DOMException("Aborted", "AbortError");
     return null;
   }
-
 };
 
 export const runWalker = async (args: TWalkArgs): Promise<Response> => {

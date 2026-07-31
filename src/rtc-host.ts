@@ -99,7 +99,11 @@ const asRtcDataChannelLike = (dc: RTCDataChannel): TRtcDataChannelLike => ({
       return;
     }
     // ArrayBufferView (Uint8Array, …) — copy into a Buffer for werift.
-    dc.send(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+    dc.send(
+      Buffer.from(
+        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+      ),
+    );
   },
   close: () => dc.close(),
   get onmessage() {
@@ -359,6 +363,8 @@ export const handleRtcOffer = async (frame: {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
+    if (session.closed) return;
+
     const fd = localFingerprint(pc);
     if (fd === null) {
       closeSession(frame.channel_id, "no_local_fingerprint");
@@ -383,6 +389,8 @@ export const handleRtcOffer = async (frame: {
       closeSession(frame.channel_id, "seal_failed");
       return;
     }
+
+    if (session.closed) return;
 
     const answerSdp = pc.localDescription?.sdp ?? answer.sdp;
     send({

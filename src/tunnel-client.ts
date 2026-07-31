@@ -150,13 +150,25 @@ export const handleConsumedTunnelFrame = (
       if (frame.dir !== "res") return;
       const t = pending.get(frame.tunnel_id);
       if (t === undefined) return;
-      t.controller?.close();
       t.ended = true;
+      if (!t.headDone) {
+        t.headDone = true;
+        clearTimeout(t.headTimer);
+        t.resolveHead(new Response(null));
+      } else {
+        t.controller?.close();
+      }
+      finish(frame.tunnel_id, null);
       return;
     }
     case "tunnel_close": {
       const t = pending.get(frame.tunnel_id);
       if (t === undefined) return;
+      if ((frame.reason === "done" || t.ended) && !t.headDone) {
+        t.headDone = true;
+        clearTimeout(t.headTimer);
+        t.resolveHead(new Response(null));
+      }
       finish(
         frame.tunnel_id,
         frame.reason === "done" || t.ended
@@ -209,6 +221,9 @@ export const tunnelToPeer = async (args: {
       // Any pre-head mux failure falls through to the established JSON splice.
     }
   }
+  if (args.signal.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
   const sender = relaySender;
   if (sender === null) {
     return Promise.reject(new Error("relay channel not started"));
@@ -238,14 +253,19 @@ export const tunnelToPeer = async (args: {
       early: [],
       ended: false,
     });
-    args.signal.addEventListener("abort", () => {
+    const onAbort = (): void => {
       send({
         type: "tunnel_close",
         tunnel_id: tunnelId,
         reason: "consumer_gone",
       });
       finish(tunnelId, new Error("aborted"));
-    });
+    };
+    if (args.signal.aborted) {
+      onAbort();
+      return;
+    }
+    args.signal.addEventListener("abort", onAbort, { once: true });
     send({
       type: "tunnel_open",
       tunnel_id: tunnelId,

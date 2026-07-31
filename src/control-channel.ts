@@ -138,7 +138,7 @@ let lastCloseLine = "";
 const sendBytes = (bytes: Uint8Array): void => {
   if (ws === null || ws.readyState !== ws.OPEN || !helloSent) return;
   try {
-    ws.send(bytes.buffer as ArrayBuffer);
+    ws.send(bytes.slice());
   } catch {
     // best-effort while the socket races a close
   }

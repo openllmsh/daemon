@@ -1,4 +1,4 @@
-import type { TRelayFrame } from "@openllmsh/protocol";
+import type { TChannelCloseReason, TRelayFrame } from "@openllmsh/protocol";
 import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
@@ -71,12 +71,17 @@ export const replaceMuxPeerCaps = (
     updateMuxPeerCaps(keyId, values);
 };
 
-const failOpen = (keyId: string): void => {
+const failOpen = (keyId: string, reason?: TChannelCloseReason): void => {
   const pending = opening.get(keyId);
   if (pending === undefined) return;
   opening.delete(keyId);
   clearTimeout(pending.timer);
   failedUntil.set(keyId, Date.now() + MUX_FAILURE_CACHE_MS);
+  sendFrame?.({
+    type: "channel_close",
+    channel_id: pending.channelId,
+    ...(reason === undefined ? {} : { reason }),
+  });
   pending.resolve(null);
 };
 
@@ -87,11 +92,8 @@ export const muxChannelTo = async (
   if (process.env.OPENLLM_MUX_DISABLE === "1") return null;
   const caps = peerCaps.get(keyId);
   if (caps === undefined || !caps.has(MUX_CAP)) return null;
-  if (
-    failedUntil.get(keyId) !== undefined &&
-    (failedUntil.get(keyId) ?? 0) > Date.now()
-  )
-    return null;
+  const failedAt = failedUntil.get(keyId);
+  if (failedAt !== undefined && failedAt > Date.now()) return null;
   if (active !== null) return activeKeyId === keyId ? active : null;
   const pending = opening.get(keyId);
   if (pending !== undefined)
@@ -107,7 +109,10 @@ export const muxChannelTo = async (
   if (send === null || binary === null) return null;
   const channelId = crypto.randomUUID();
   return new Promise<TMuxChannel | null>((resolve) => {
-    const timer = setTimeout(() => failOpen(keyId), muxAckTimeoutMs);
+    const timer = setTimeout(
+      () => failOpen(keyId, "consumer_gone"),
+      muxAckTimeoutMs,
+    );
     opening.set(keyId, { resolve, timer, channelId });
     // Fleet peer hop: mark consumer so the serving daemon can skip browser-only
     // seedgate (this process has no vault DEK to mint a grant).

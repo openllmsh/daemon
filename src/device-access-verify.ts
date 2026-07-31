@@ -122,12 +122,16 @@ const pruneExpiredNonces = (now: number): void => {
  * Retention is `envelopeTs + WINDOW` so a future-dated grant (still inside
  * the acceptance window) cannot be replayed after a premature prune.
  *
- * Returns false when the map is already full of still-valid nonces — callers
- * must reject with a distinct overload reason rather than silently drop
- * replay protection by evicting unexpired entries.
+ * Callers MUST `pruneExpiredNonces(now)` before invoking this so capacity
+ * checks see a fresh map. Returns false when the map is already full of
+ * still-valid nonces — callers must reject with a distinct overload reason
+ * rather than silently drop replay protection by evicting unexpired entries.
  */
-const rememberNonce = (n: string, envelopeTs: number, now: number): boolean => {
-  pruneExpiredNonces(now);
+const rememberNonce = (
+  n: string,
+  envelopeTs: number,
+  _now: number,
+): boolean => {
   if (nonceSeen.has(n)) return false;
   if (nonceOrder.length >= nonceLruCap) {
     logWarn("device-access", "nonce map full; rejecting new grant", {
@@ -181,6 +185,9 @@ export const checkDeviceGrant = (
   if (envelope.cid !== expect.cid) {
     return { ok: false, reason: "cid_mismatch" };
   }
+  // When expect.aud is non-empty, envelope.aud must match. Empty expect.aud
+  // is the unit-test / low-level opt-out; production callers go through
+  // enforceSeedGate which rejects empty expect.aud before reaching here.
   const expectAud = expect.aud ?? "";
   if (expectAud.length > 0) {
     if (envelope.aud.length === 0) {
@@ -247,6 +254,11 @@ export const enforceSeedGate = (
   }
   if (expect.keyId === null) {
     return { mode: "reject", reason: "no_api_key_id" };
+  }
+  // Fail closed: an empty expected aud would skip audience binding inside
+  // checkDeviceGrant. Production always binds to the daemon pubkey.
+  if (expect.aud.length === 0) {
+    return { mode: "reject", reason: "aud_unbound" };
   }
   if (grant === undefined || grant.length === 0) {
     return { mode: "reject", reason: "missing_grant" };
