@@ -29,7 +29,7 @@ import {
   configureRtcHost,
   handleRtcIce,
   handleRtcOffer,
-  resetAllRtcSessions,
+  resetUnmountedRtcSessions,
 } from "./rtc-host";
 import { computeStatus } from "./status";
 import {
@@ -162,7 +162,9 @@ export const resetRelayScopedState = (): void => {
   abortAllTunnels();
   failAllConsumedTunnels();
   resetAllChannels();
-  resetAllRtcSessions();
+  // Keep RTC sessions whose mux already mounted — the peer connection and
+  // data channel do not ride the relay socket and survive reconnect.
+  resetUnmountedRtcSessions();
 };
 
 const enqueueStatusPublish = (
@@ -460,10 +462,12 @@ const onFrame = (frame: TRelayFrame): void => {
       return;
     case "rtc_offer":
       // Daemon is the responder: open seal, answer, trickle ICE.
-      void handleRtcOffer(frame);
+      // Catch async failures the same way onCommand is guarded — an
+      // unhandled rejection here would crash the process under --unhandled-rejections=strict.
+      void handleRtcOffer(frame).catch(() => {});
       return;
     case "rtc_ice":
-      void handleRtcIce(frame);
+      void handleRtcIce(frame).catch(() => {});
       return;
     case "rtc_answer":
       // Responder path only — a browser-originated answer is unexpected.

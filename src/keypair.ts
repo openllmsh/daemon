@@ -57,11 +57,17 @@ const ownPrivate = (): KeyObject => {
   return privateKey;
 };
 
+/** Memoized SPKI DER base64 of {@link ownPrivate}'s public half. */
+let cachedPubB64: string | null = null;
+
 /** This daemon's public key (SPKI DER, base64) — published on the status. */
-export const daemonPublicKey = (): string =>
-  Buffer.from(
+export const daemonPublicKey = (): string => {
+  if (cachedPubB64 !== null) return cachedPubB64;
+  cachedPubB64 = Buffer.from(
     createPublicKey(ownPrivate()).export({ format: "der", type: "spki" }),
   ).toString("base64");
+  return cachedPubB64;
+};
 
 const deriveKey = (shared: Buffer): Buffer =>
   Buffer.from(hkdfSync("sha256", shared, Buffer.alloc(0), HKDF_INFO, 32));

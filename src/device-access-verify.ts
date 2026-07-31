@@ -91,21 +91,35 @@ export const verifyDeviceGrantNode = (
   }
 };
 
+/**
+ * Drop expired nonces. Scans the full order because retention is based on
+ * envelope.ts (which may be future-dated within the acceptance window), so
+ * expiry is no longer insertion-order monotonic.
+ */
 const pruneExpiredNonces = (now: number): void => {
-  while (nonceOrder.length > 0) {
-    const head = nonceOrder[0];
-    if (head === undefined) break;
-    const exp = nonceSeen.get(head);
-    if (exp !== undefined && exp > now) break;
-    nonceOrder.shift();
-    if (exp !== undefined) nonceSeen.delete(head);
+  if (nonceOrder.length === 0) return;
+  const kept: string[] = [];
+  for (const n of nonceOrder) {
+    const exp = nonceSeen.get(n);
+    if (exp !== undefined && exp > now) {
+      kept.push(n);
+      continue;
+    }
+    nonceSeen.delete(n);
   }
+  nonceOrder.length = 0;
+  nonceOrder.push(...kept);
 };
 
-const rememberNonce = (n: string, now: number): boolean => {
+/**
+ * Remember a verified nonce until its envelope can no longer be accepted.
+ * Retention is `envelopeTs + WINDOW` so a future-dated grant (still inside
+ * the acceptance window) cannot be replayed after a premature prune.
+ */
+const rememberNonce = (n: string, envelopeTs: number, now: number): boolean => {
   pruneExpiredNonces(now);
   if (nonceSeen.has(n)) return false;
-  nonceSeen.set(n, now + DEVICE_GRANT_TS_WINDOW_MS);
+  nonceSeen.set(n, envelopeTs + DEVICE_GRANT_TS_WINDOW_MS);
   nonceOrder.push(n);
   // Log once per crossing of the hard cap (not once per eviction in the loop).
   if (nonceOrder.length > NONCE_LRU_CAP) {
@@ -123,7 +137,11 @@ const rememberNonce = (n: string, now: number): boolean => {
 export type TCheckDeviceGrantExpect = {
   readonly keyId: string;
   readonly cid: string;
-  /** When non-empty, envelope.aud must match if envelope.aud is also non-empty. */
+  /**
+   * When non-empty, envelope.aud must equal this value. An empty envelope.aud
+   * is rejected as `aud_unbound` (provisioned mux/tunnel/RTC must bind the
+   * grant to the daemon pubkey).
+   */
   readonly aud?: string;
 };
 
@@ -158,12 +176,13 @@ export const checkDeviceGrant = (
     return { ok: false, reason: "cid_mismatch" };
   }
   const expectAud = expect.aud ?? "";
-  if (
-    expectAud.length > 0 &&
-    envelope.aud.length > 0 &&
-    envelope.aud !== expectAud
-  ) {
-    return { ok: false, reason: "aud_mismatch" };
+  if (expectAud.length > 0) {
+    if (envelope.aud.length === 0) {
+      return { ok: false, reason: "aud_unbound" };
+    }
+    if (envelope.aud !== expectAud) {
+      return { ok: false, reason: "aud_mismatch" };
+    }
   }
   // Nonce check AFTER identity checks so a wrong-key/cid grant cannot
   // burn a legitimate nonce the browser may still retry with. Only
@@ -183,7 +202,7 @@ export const checkDeviceGrant = (
   if (!verifyDeviceGrantNode(pinned, msg, envelope.sig)) {
     return { ok: false, reason: "bad_sig" };
   }
-  rememberNonce(envelope.n, now);
+  rememberNonce(envelope.n, envelope.ts, now);
   return { ok: true };
 };
 

@@ -26,10 +26,7 @@ import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
-import {
-  enforceSeedGate,
-  getDeviceAccessPubkey,
-} from "./device-access-verify";
+import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey, openSealed, sealTo } from "./keypair";
 import { logDebug, logWarn } from "./logger";
@@ -37,6 +34,13 @@ import { serveMuxOnStream } from "./mux-host";
 
 /** Bound concurrent RTC sessions per daemon process. */
 const MAX_CONCURRENT_RTC = 8;
+
+/**
+ * Max wait from session insert until the mux mounts on the data channel.
+ * Covers a stalled DTLS/ICE handshake after the answer is sent so a half-open
+ * session cannot pin a MAX_CONCURRENT_RTC slot forever.
+ */
+const RTC_HANDSHAKE_TIMEOUT_MS = 30_000;
 
 /** Default STUN; override with comma-separated `OPENLLM_RTC_STUN`. */
 const DEFAULT_STUN = "stun:stun.l.google.com:19302";
@@ -46,6 +50,7 @@ type TRtcSession = {
   readonly pc: RTCPeerConnection;
   mux: TMuxChannel | null;
   closed: boolean;
+  handshakeTimer: ReturnType<typeof setTimeout> | null;
 };
 
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
@@ -132,10 +137,17 @@ const localFingerprint = (pc: RTCPeerConnection): string | null => {
   return null;
 };
 
+const clearHandshakeTimer = (session: TRtcSession): void => {
+  if (session.handshakeTimer === null) return;
+  clearTimeout(session.handshakeTimer);
+  session.handshakeTimer = null;
+};
+
 const closeSession = (channelId: string, reason: string): void => {
   const session = sessions.get(channelId);
   if (session === undefined || session.closed) return;
   session.closed = true;
+  clearHandshakeTimer(session);
   sessions.delete(channelId);
   try {
     session.mux?.close(reason);
@@ -147,7 +159,19 @@ const closeSession = (channelId: string, reason: string): void => {
   logDebug("rtc-host", "session closed", { channelId, reason });
 };
 
-/** Tear down every RTC session — called on control-channel reconnect. */
+/**
+ * Tear down RTC sessions that have not yet mounted a mux. Mounted sessions
+ * (live data channel) survive a control-channel reconnect — their peer
+ * connection does not ride the relay socket.
+ */
+export const resetUnmountedRtcSessions = (): void => {
+  for (const [channelId, session] of [...sessions.entries()]) {
+    if (session.mux !== null) continue;
+    closeSession(channelId, "relay_restart");
+  }
+};
+
+/** Tear down every RTC session — full process reset / test cleanup. */
 export const resetAllRtcSessions = (): void => {
   for (const channelId of [...sessions.keys()]) {
     closeSession(channelId, "relay_restart");
@@ -161,6 +185,7 @@ const attachDataChannel = (
 ): void => {
   const mount = (): void => {
     if (session.closed || session.mux !== null) return;
+    clearHandshakeTimer(session);
     const duplex = rtcDuplex(asRtcDataChannelLike(dc));
     session.mux = createChannel({
       duplex,
@@ -283,8 +308,13 @@ export const handleRtcOffer = async (frame: {
     pc,
     mux: null,
     closed: false,
+    handshakeTimer: null,
   };
   sessions.set(frame.channel_id, session);
+  session.handshakeTimer = setTimeout(() => {
+    if (session.closed || session.mux !== null) return;
+    closeSession(frame.channel_id, "handshake_timeout");
+  }, RTC_HANDSHAKE_TIMEOUT_MS);
 
   pc.ondatachannel = (ev) => {
     if (session.closed) return;
