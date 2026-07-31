@@ -54,6 +54,10 @@ import {
   sessionEnv,
   sessionWorkspace,
 } from "./cli-paths";
+import {
+  cliBinaryPath,
+  legacyCliBinaryPath,
+} from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
@@ -101,7 +105,16 @@ const removePidFile = (sessionId: string): void => {
   }
 };
 
-const vendorCliNames = ["claude", "codex", "kimi", "grok", "cursor-agent"];
+const vendorCliNames = [
+  "claude",
+  "codex",
+  "kimi",
+  "grok",
+  "cursor-agent",
+  // Preferred launch path: openllm [-d] <client>
+  "openllm",
+  "openllmc",
+];
 
 /** Extract and validate the executable token from `ps -o command=` output. */
 export const isVendorSessionCommand = (command: string): boolean => {
@@ -421,10 +434,43 @@ const liveCount = (): number =>
   [...sessions.values()].filter((s) => s.pty !== null).length;
 
 /**
- * The user's REAL CLI binary — NOT the isolated `cliBin()` under
- * `~/.openllm/cli/<provider>/`. A device session is the user driving
- * their OWN interactive CLI. Falls back to the bare command name
- * (PATH resolves it) when no known install path exists. */
+ * Subscription-provider slug → `openllm <client>` id. Only providers that
+ * the openllm CLI actually hosts as session clients are mappable; others
+ * fall back to the host vendor binary (and cannot honor `-d`).
+ */
+const openllmClientId = (cli: TCliProvider): string | null => {
+  switch (cli) {
+    case "claude_code":
+      return "claude";
+    case "chatgpt":
+      return "codex";
+    case "grok":
+      return "grok";
+    // kimi_code / cursor: no openllm client id today — host binary only.
+    default:
+      return null;
+  }
+};
+
+/**
+ * Whether `openllm -d <client>` is meaningful for this provider. Mirrors the
+ * openllm CLI registry's `dangerousFlag` coverage (claude/codex/grok).
+ */
+export const sessionSupportsDangerous = (cli: TCliProvider): boolean =>
+  openllmClientId(cli) !== null;
+
+/** Resolve the installed openllm CLI binary (current name, then legacy). */
+const openllmBin = (): string | null => {
+  for (const path of [cliBinaryPath(), legacyCliBinaryPath()]) {
+    if (existsSync(path)) return path;
+  }
+  return null;
+};
+
+/**
+ * Resolve the host-installed vendor binary. Used only as a last-resort
+ * fallback when the openllm CLI is not installed on this box.
+ */
 const hostCliBin = (cli: TCliProvider): string => {
   for (const candidate of hostCliCandidates(cli)) {
     if (existsSync(candidate)) return candidate;
@@ -434,24 +480,47 @@ const hostCliBin = (cli: TCliProvider): string => {
   return first ?? cli;
 };
 
-/** The CLI's argv for a session start. `continue` uses the vendor's own
- *  same-directory resume where the daemon knows one. */
+/**
+ * The CLI's argv for a session start.
+ *
+ * Preferred path: `openllm [-d] <client> [--continue]` so device sessions
+ * get the same overlay/gateway wiring as a local `openllm claude` launch.
+ * `-d` maps to each client's skip-approvals flag inside the openllm CLI
+ * (claude → `--dangerously-skip-permissions`, codex →
+ * `--dangerously-bypass-approvals-and-sandbox`, grok → `--always-approve`).
+ *
+ * Fallback (openllm CLI missing, or unmapped provider): host vendor binary
+ * directly. Dangerous mode is only applied for claude in that fallback
+ * (the only vendor whose flag we hard-code without openllm's mapping).
+ */
 const argvFor = (
   cli: TCliProvider,
   mode: "spawn" | "continue",
+  dangerous: boolean,
 ): ReadonlyArray<string> => {
-  const bin = hostCliBin(cli);
-  if (cli === "claude_code") {
-    // The session workspace is a throwaway dir the user is driving
-    // interactively — skip the per-tool permission prompts that would
-    // otherwise block every action in a fresh cwd.
-    const flags = ["--dangerously-skip-permissions"];
+  const clientId = openllmClientId(cli);
+  const bin = clientId !== null ? openllmBin() : null;
+  if (clientId !== null && bin !== null) {
+    const args: string[] = [bin];
+    // Only pass -d when the openllm CLI can honor it for this client.
+    if (dangerous) args.push("-d");
+    args.push(clientId);
     // Claude persists sessions per-cwd; --continue reopens the most
-    // recent conversation in this workspace.
-    if (mode === "continue") flags.push("--continue");
-    return [bin, ...flags];
+    // recent conversation in this workspace. Forwarded as a client arg.
+    if (mode === "continue" && cli === "claude_code") {
+      args.push("--continue");
+    }
+    return args;
   }
-  return [bin];
+  // Fallback: host vendor binary (no openllm wrapper).
+  const host = hostCliBin(cli);
+  if (cli === "claude_code") {
+    const flags: string[] = [];
+    if (dangerous) flags.push("--dangerously-skip-permissions");
+    if (mode === "continue") flags.push("--continue");
+    return [host, ...flags];
+  }
+  return [host];
 };
 
 const pushScrollback = (s: TSession, chunk: Uint8Array): void => {
@@ -706,18 +775,20 @@ const handleOpen = (
     return;
   }
 
-  // The CLI must actually be installed on this box — `hostCliCandidates`
-  // already folds in a PATH scan (`resolveOnPath`), so no candidate on
-  // disk means the spawn could only ENOENT. Nack the precise error so the
-  // browser can say "install it" instead of a generic spawn failure.
+  // Prefer openllm CLI presence (preferred launch path). Fall back to the
+  // host vendor binary when openllm is missing or the provider is unmapped.
   // Only enforced for the REAL spawner — an injected test spawner never
   // execs, and CI boxes don't carry the vendor CLIs.
-  if (
-    spawner === bunPtySpawner &&
-    !hostCliCandidates(cli).some((candidate) => existsSync(candidate))
-  ) {
-    nack("cli_not_installed");
-    return;
+  if (spawner === bunPtySpawner) {
+    const prefersOpenllm = openllmClientId(cli) !== null;
+    const hasOpenllm = openllmBin() !== null;
+    const hasHostVendor = hostCliCandidates(cli).some((candidate) =>
+      existsSync(candidate),
+    );
+    if (prefersOpenllm ? !hasOpenllm && !hasHostVendor : !hasHostVendor) {
+      nack("cli_not_installed");
+      return;
+    }
   }
 
   // `continue` after a daemon restart: no in-memory record, but the
@@ -748,7 +819,11 @@ const handleOpen = (
 
   try {
     const pty = spawner({
-      argv: argvFor(cli, frame.mode === "continue" ? "continue" : "spawn"),
+      argv: argvFor(
+        cli,
+        frame.mode === "continue" ? "continue" : "spawn",
+        frame.dangerous === true,
+      ),
       cwd: workspace,
       // Real user HOME + PATH (via spawnEnv). Session cwd is isolated under
       // ~/.openllm/sessions/<id>/ without rewriting HOME or sandboxing.
@@ -809,6 +884,7 @@ export const bindMuxSessionStream = (
     readonly rows: number;
     readonly mode: "spawn" | "attach" | "continue";
     readonly title?: string;
+    readonly dangerous?: boolean;
   },
 ): void => {
   const send = (frame: TRelayFrame): void => {
@@ -860,6 +936,7 @@ export const bindMuxSessionStream = (
       rows: open.rows,
       mode: open.mode,
       ...(open.title === undefined ? {} : { title: open.title }),
+      ...(open.dangerous === true ? { dangerous: true } : {}),
     },
     send,
   );
