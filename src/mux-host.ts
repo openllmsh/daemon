@@ -200,7 +200,21 @@ export const acceptChannel = (frame: {
   if (getDeviceAccessPubkey() !== null) {
     const keyId = daemonApiKeyId();
     const grant = frame.grant;
-    if (keyId === null || grant === undefined || grant.length === 0) {
+    if (keyId === null) {
+      // Match handleRtcOffer: cause-specific log so ops can tell a missing
+      // OPENLLM_API_KEY from a client that simply omitted the grant.
+      logWarn("mux-host", "channel_open rejected: no api key id", {
+        channelId: frame.channel_id,
+      });
+      send({
+        type: "channel_open_ack",
+        channel_id: frame.channel_id,
+        ok: false,
+        error: "unauthorized",
+      });
+      return;
+    }
+    if (grant === undefined || grant.length === 0) {
       logWarn("mux-host", "channel_open rejected: missing grant", {
         channelId: frame.channel_id,
       });

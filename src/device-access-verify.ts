@@ -15,9 +15,15 @@ import {
 import { logWarn } from "./logger";
 import { mutateState, readState } from "./state-file";
 
-const NONCE_LRU_CAP = 256;
+/**
+ * Hard upper bound on nonces retained for the ts window. Sized for a busy
+ * multi-surface open rate (~30 grants/s × 120s window ≈ 3600) with headroom;
+ * expiry pruning is the primary retention control — the cap only logs when
+ * reached so a runaway client cannot grow the map without bound.
+ */
+const NONCE_LRU_CAP = 4096;
 
-/** Module-level nonce LRU — cap 256, expire after the grant ts window. */
+/** Module-level nonce LRU — expire after the grant ts window; hard-cap above. */
 const nonceOrder: string[] = [];
 const nonceSeen = new Map<string, number>();
 
@@ -104,6 +110,9 @@ const rememberNonce = (n: string, now: number): boolean => {
   while (nonceOrder.length > NONCE_LRU_CAP) {
     const evicted = nonceOrder.shift();
     if (evicted !== undefined) nonceSeen.delete(evicted);
+    logWarn("device-access", "nonce LRU hard cap reached; evicting oldest", {
+      cap: NONCE_LRU_CAP,
+    });
   }
   return true;
 };
