@@ -80,8 +80,14 @@ export const refreshBootstrap = async (): Promise<boolean> => {
     }
     // Best-effort: publish the durable X25519 pin on every successful
     // bootstrap so cold dashboards / fleet peers pin via the cloud path
-    // (not solely relay status_push). Fire-and-forget — never blocks boot.
-    void publishIdentity(daemonPublicKey());
+    // (not solely relay status_push). Isolated from cloudState — a local
+    // keypair/construction failure must not flip a successful bootstrap
+    // to "unreachable".
+    try {
+      void publishIdentity(daemonPublicKey());
+    } catch {
+      // swallow — identity pin is non-critical hardening
+    }
   } catch (err) {
     if (err instanceof NoApiKeyError) cloudState = "no_key";
     else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
