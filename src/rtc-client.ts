@@ -39,6 +39,11 @@ type TRtcClientSession = {
   readonly dc: RTCDataChannel;
   readonly eph: ReturnType<typeof generateEphKeypair>;
   readonly nonce: string;
+  /** Local ICE candidates held until `rtc_offer` is on the wire — the answerer
+   *  drops ICE for unknown channel ids. */
+  readonly pendingIce: string[];
+  /** True once `rtc_offer` has been sent (or abandoned). */
+  offerSent: boolean;
   fingerprint: string;
   mux: TMuxChannel | null;
   closed: boolean;
@@ -208,71 +213,101 @@ export const ensureRtcTo = (
   ) {
     return;
   }
-  void beginConnect(keyId, options.pubkey);
+  void beginConnect(keyId, options.pubkey).catch((error: unknown) => {
+    logWarn("rtc-client", "beginConnect rejected", {
+      keyId,
+      err: error instanceof Error ? error.message : String(error),
+    });
+    cacheFailure(keyId);
+  });
+};
+
+const sendIceCandidate = (
+  session: TRtcClientSession,
+  candidateJson: string,
+): void => {
+  if (session.closed || sendFrame === null) return;
+  try {
+    sendFrame({
+      type: "rtc_ice",
+      channel_id: session.channelId,
+      candidate: candidateJson,
+    });
+  } catch {
+    // control socket racing a close
+  }
+};
+
+const flushPendingIce = (session: TRtcClientSession): void => {
+  if (session.closed || !session.offerSent) return;
+  const pending = session.pendingIce.splice(0, session.pendingIce.length);
+  for (const candidate of pending) sendIceCandidate(session, candidate);
 };
 
 const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
   if (sessionsByKey.has(keyId) || failureCached(keyId) || sendFrame === null)
     return;
-  let pc: RTCPeerConnection;
+  let pc: RTCPeerConnection | null = null;
+  let session: TRtcClientSession | null = null;
   try {
     pc = new RTCPeerConnection({ iceServers: [...iceServers()] });
-  } catch (error) {
-    cacheFailure(keyId);
-    logWarn("rtc-client", "RTCPeerConnection construct failed", {
+    const dc = pc.createDataChannel("mux", { ordered: true });
+    const eph = generateEphKeypair();
+    const channelId = crypto.randomUUID();
+    session = {
       keyId,
-      err: error instanceof Error ? error.message : String(error),
-    });
-    return;
-  }
-  const dc = pc.createDataChannel("mux", { ordered: true });
-  const eph = generateEphKeypair();
-  const channelId = crypto.randomUUID();
-  const session: TRtcClientSession = {
-    keyId,
-    channelId,
-    pc,
-    dc,
-    eph,
-    nonce: Buffer.from(randomBytes(RTC_AUTH_NONCE_BYTES)).toString("base64"),
-    fingerprint: "",
-    mux: null,
-    closed: false,
-    signalingTimer: null,
-    iceTimer: null,
-  };
-  sessionsByKey.set(keyId, session);
-  sessionsByChannel.set(channelId, session);
-  session.signalingTimer = setTimeout(() => {
-    if (!session.closed && session.mux === null) markRtcFailure(keyId);
-  }, RTC_SIGNALING_TIMEOUT_MS);
-  dc.onopen = () => {
-    const sdp = pc.remoteDescription?.sdp ?? pc.localDescription?.sdp ?? "";
-    mountMux(session, sdp);
-  };
-  pc.onicecandidate = (event) => {
-    if (session.closed || sendFrame === null || event.candidate == null) return;
-    const candidate = event.candidate;
-    const init =
-      typeof (candidate as RTCIceCandidate).toJSON === "function"
-        ? (candidate as RTCIceCandidate).toJSON()
-        : candidate;
-    try {
-      sendFrame({
-        type: "rtc_ice",
-        channel_id: channelId,
-        candidate: JSON.stringify(init),
-      });
-    } catch {
-      // control socket racing a close
-    }
-  };
-  pc.onconnectionstatechange = () => {
-    if (session.closed) return;
-    if (["failed", "closed", "disconnected"].includes(pc.connectionState))
-      markRtcFailure(keyId);
-  };
-  try {
+      channelId,
+      pc,
+      dc,
+      eph,
+      nonce: Buffer.from(randomBytes(RTC_AUTH_NONCE_BYTES)).toString("base64"),
+      pendingIce: [],
+      offerSent: false,
+      fingerprint: "",
+      mux: null,
+      closed: false,
+      signalingTimer: null,
+      iceTimer: null,
+    };
+    sessionsByKey.set(keyId, session);
+    sessionsByChannel.set(channelId, session);
+    session.signalingTimer = setTimeout(() => {
+      if (session !== null && !session.closed && session.mux === null)
+        markRtcFailure(keyId);
+    }, RTC_SIGNALING_TIMEOUT_MS);
+    dc.onopen = () => {
+      if (session === null) return;
+      const sdp =
+        session.pc.remoteDescription?.sdp ??
+        session.pc.localDescription?.sdp ??
+        "";
+      mountMux(session, sdp);
+    };
+    pc.onicecandidate = (event) => {
+      if (session === null || session.closed || event.candidate == null) return;
+      const candidate = event.candidate;
+      const init =
+        typeof (candidate as RTCIceCandidate).toJSON === "function"
+          ? (candidate as RTCIceCandidate).toJSON()
+          : candidate;
+      const candidateJson = JSON.stringify(init);
+      // Buffer until rtc_offer is sent — answerer drops ICE for unknown ids.
+      if (!session.offerSent) {
+        session.pendingIce.push(candidateJson);
+        return;
+      }
+      sendIceCandidate(session, candidateJson);
+    };
+    pc.onconnectionstatechange = () => {
+      if (session === null || session.closed) return;
+      if (
+        ["failed", "closed", "disconnected"].includes(
+          session.pc.connectionState,
+        )
+      )
+        markRtcFailure(keyId);
+    };
+
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     if (session.closed) return;
@@ -299,12 +334,21 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
       sdp,
       fingerprint_proof: proof,
     });
+    session.offerSent = true;
+    flushPendingIce(session);
   } catch (error) {
     logWarn("rtc-client", "offer setup failed", {
       keyId,
       err: error instanceof Error ? error.message : String(error),
     });
-    markRtcFailure(keyId);
+    if (session !== null) {
+      markRtcFailure(keyId);
+      return;
+    }
+    cacheFailure(keyId);
+    if (pc !== null) {
+      void pc.close().catch(() => {});
+    }
   }
 };
 
@@ -343,6 +387,9 @@ export const handleRtcAnswer = async (frame: {
     await session.pc.setRemoteDescription({ type: "answer", sdp: frame.sdp });
     if (session.closed) return;
     clearTimers(session);
+    // Data channel may already be open (and mux mounted) by the time the
+    // answer handler resumes — do not arm a redundant ICE deadline.
+    if (session.mux !== null) return;
     session.iceTimer = setTimeout(() => {
       if (!session.closed && session.mux === null)
         markRtcFailure(session.keyId);

@@ -35,6 +35,19 @@ const OPEN_TIMEOUT_MS = 15_000;
 const RESPONSE_HEAD_TIMEOUT_MS = 120_000;
 
 /**
+ * Local mux errors that fire before FRAME_TYPE.open leaves the consumer —
+ * the only safe window to re-dispatch the same request over relay mux/splice.
+ * Parity with browser `isPreDispatchTunnelError` in daemon-store.
+ */
+const isPreDispatchTunnelError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message === "channel is closed" ||
+    error.message === "stream ids exhausted"
+  );
+};
+
+/**
  * The relay frame sender, REGISTERED by the control channel at startup
  * (not imported — walker → control-channel would close an import cycle
  * through tunnel-server → listener → walker). Null until the channel
@@ -229,9 +242,19 @@ export const tunnelToPeer = async (args: {
         status: result.status,
         headers: result.headers,
       });
-    } catch {
+    } catch (error: unknown) {
+      // Caller abort is not an RTC path failure — do not cache or fall through.
+      if (args.signal.aborted) {
+        throw error instanceof Error
+          ? error
+          : new DOMException("Aborted", "AbortError");
+      }
+      // openStream sends FRAME_TYPE.open synchronously — once that returns the
+      // peer may already be dispatching. Only re-dispatch on known pre-dispatch
+      // local failures (parity with browser tunnelFetch).
       markRtcFailure(args.keyId);
-      // Pre-head RTC failure falls through to relay mux on this request.
+      if (!isPreDispatchTunnelError(error)) throw error;
+      // Pre-dispatch RTC failure falls through to relay mux on this request.
     }
   }
   const mux = await muxChannelTo(args.keyId);
