@@ -177,6 +177,23 @@ export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
 };
 
 /**
+ * Publish this daemon's long-lived X25519 SPKI to the cloud so browser/fleet
+ * peers pin against a cloud-attested identity (not solely relay status_push).
+ * Best-effort: identity pin lag is non-fatal (RTC falls back to status_push).
+ */
+export const publishIdentity = async (pubkey: string): Promise<void> => {
+  try {
+    await cloudFetch(cloudUrl("/api/daemon/identity"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ pubkey }),
+    });
+  } catch {
+    // swallow — identity pin is best-effort hardening
+  }
+};
+
+/**
  * Record one `public.requests` row for a subscription hop the daemon ran
  * locally. Best-effort: a recording failure must never fail the user's
  * request (the bytes already streamed back), so callers fire-and-forget.

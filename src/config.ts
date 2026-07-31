@@ -23,8 +23,10 @@ import {
   fetchBootstrap,
   InvalidApiKeyError,
   NoApiKeyError,
+  publishIdentity,
 } from "./cloud-client";
 import { setDeviceAccessPubkey } from "./device-access-verify";
+import { daemonPublicKey } from "./keypair";
 import { clearPlanCache } from "./plan-cache";
 
 const EMPTY: TDaemonBootstrap = {
@@ -76,6 +78,10 @@ export const refreshBootstrap = async (): Promise<boolean> => {
     if (snapshot.device_access_pubkey !== undefined) {
       setDeviceAccessPubkey(snapshot.device_access_pubkey);
     }
+    // Best-effort: publish the durable X25519 pin on every successful
+    // bootstrap so cold dashboards / fleet peers pin via the cloud path
+    // (not solely relay status_push). Fire-and-forget — never blocks boot.
+    void publishIdentity(daemonPublicKey());
   } catch (err) {
     if (err instanceof NoApiKeyError) cloudState = "no_key";
     else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
