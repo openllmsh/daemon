@@ -24,6 +24,7 @@ import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
+import type { TEphKeypair } from "./keypair";
 import { generateEphKeypair, openSealedWith, sealTo } from "./keypair";
 import { logDebug, logWarn } from "./logger";
 
@@ -37,13 +38,15 @@ type TRtcClientSession = {
   readonly channelId: string;
   readonly pc: RTCPeerConnection;
   readonly dc: RTCDataChannel;
-  readonly eph: ReturnType<typeof generateEphKeypair>;
+  readonly eph: TEphKeypair;
   readonly nonce: string;
   /** Local ICE candidates held until `rtc_offer` is on the wire — the answerer
    *  drops ICE for unknown channel ids. */
   readonly pendingIce: string[];
   /** True once `rtc_offer` has been sent (or abandoned). */
   offerSent: boolean;
+  /** True once the first valid `rtc_answer` is accepted — duplicates no-op. */
+  answered: boolean;
   fingerprint: string;
   mux: TMuxChannel | null;
   closed: boolean;
@@ -263,6 +266,7 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
       nonce: Buffer.from(randomBytes(RTC_AUTH_NONCE_BYTES)).toString("base64"),
       pendingIce: [],
       offerSent: false,
+      answered: false,
       fingerprint: "",
       mux: null,
       closed: false,
@@ -277,11 +281,14 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
     }, RTC_SIGNALING_TIMEOUT_MS);
     dc.onopen = () => {
       if (session === null) return;
-      const sdp =
-        session.pc.remoteDescription?.sdp ??
-        session.pc.localDescription?.sdp ??
-        "";
-      mountMux(session, sdp);
+      // Payload-cap negotiation needs the answer SDP max-message-size. Falling
+      // back to the local offer would under/over-size the consumer mux.
+      const remoteSdp = session.pc.remoteDescription?.sdp;
+      if (remoteSdp === undefined || remoteSdp.length === 0) {
+        markRtcFailure(session.keyId);
+        return;
+      }
+      mountMux(session, remoteSdp);
     };
     pc.onicecandidate = (event) => {
       if (session === null || session.closed || event.candidate == null) return;
@@ -362,7 +369,8 @@ export const handleRtcAnswer = async (frame: {
   if (
     session === undefined ||
     session.closed ||
-    session.fingerprint.length === 0
+    session.fingerprint.length === 0 ||
+    session.answered
   )
     return;
   const opened = openSealedWith(
@@ -383,6 +391,9 @@ export const handleRtcAnswer = async (frame: {
     markRtcFailure(session.keyId);
     return;
   }
+  // Accept only the first valid answer — a retransmit must not re-enter
+  // setRemoteDescription or trip markRtcFailure on a healthy session.
+  session.answered = true;
   try {
     await session.pc.setRemoteDescription({ type: "answer", sdp: frame.sdp });
     if (session.closed) return;
