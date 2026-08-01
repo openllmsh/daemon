@@ -8,15 +8,8 @@ import { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { codexSessionsDir, codexStateDbPath } from "./paths";
+import { truncate } from "./title";
 import type { THistorySession } from "./types";
-
-const TITLE_MAX = 80;
-
-const truncate = (s: string): string => {
-  const t = s.replace(/\s+/g, " ").trim();
-  if (t.length === 0) return "Untitled";
-  return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 1)}...`;
-};
 
 const titleOf = (row: {
   title?: unknown;
@@ -24,7 +17,12 @@ const titleOf = (row: {
   first_user_message?: unknown;
   preview?: unknown;
 }): string => {
-  for (const key of ["title", "name", "first_user_message", "preview"] as const) {
+  for (const key of [
+    "title",
+    "name",
+    "first_user_message",
+    "preview",
+  ] as const) {
     const v = row[key];
     if (typeof v === "string" && v.trim().length > 0) return truncate(v);
   }
@@ -52,8 +50,7 @@ const readFromDb = (limit: number): THistorySession[] | null => {
         const id = typeof row.id === "string" ? row.id : null;
         if (id === null) continue;
         const cwd = typeof row.cwd === "string" ? row.cwd : null;
-        const updated =
-          typeof row.updated_ms === "number" ? row.updated_ms : 0;
+        const updated = typeof row.updated_ms === "number" ? row.updated_ms : 0;
         out.push({
           id,
           title: titleOf(row),

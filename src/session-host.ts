@@ -56,10 +56,7 @@ import {
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import type { TMuxStream } from "@openllmsh/tunnel/mux";
 import { hostCliCandidates, sessionEnv } from "./cli-paths";
-import {
-  cliBinaryPath,
-  legacyCliBinaryPath,
-} from "./cli-self-update";
+import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
@@ -629,20 +626,18 @@ export const resolveSessionCwd = (requested: string | undefined): string => {
   }
 };
 
-/** Env for a device PTY: real HOME + device-session markers for live.json. */
+/** Env for a device PTY: real HOME + device-session markers for live.json.
+ *  OpenCode is not a subscription provider so it cannot call sessionEnv(cli);
+ *  still use the same HOME/TMPDIR/TERM shape (daemonTempDir for TMPDIR). */
 const deviceSessionEnv = (
   cli: TDeviceSessionCli,
   openllmSessionId: string,
   title: string | null,
 ): Record<string, string> => {
-  const base =
-    cli === "opencode"
-      ? {
-          HOME: homedir(),
-          TMPDIR: process.env.TMPDIR ?? "/tmp",
-          TERM: "xterm-256color",
-        }
-      : sessionEnv(cli);
+  // sessionEnv is typed on SubscriptionProviderSlug; opencode is device-only.
+  // The provider arg is unused today — any subscription slug yields the same
+  // real-HOME + daemon TMPDIR env. Use claude_code as a stand-in for opencode.
+  const base = cli === "opencode" ? sessionEnv("claude_code") : sessionEnv(cli);
   return {
     ...base,
     OPENLLM_DEVICE_SESSION_ID: openllmSessionId,
@@ -924,8 +919,7 @@ const handleOpen = (
         undefined,
     );
     const vendorSessionId =
-      resumeId ??
-      (existing !== undefined ? existing.vendorSessionId : null);
+      resumeId ?? (existing !== undefined ? existing.vendorSessionId : null);
 
     // `continue` after a daemon restart: no in-memory record — recreate it.
     const s: TSession = existing ?? {
@@ -1101,12 +1095,16 @@ export const bindMuxSessionStream = (
   );
   stream.onData((bytes) => {
     const session = sessions.get(open.session_id);
-    session?.pty?.write(bytes);
+    // Stale stream after re-attach: only the current muxStream may write.
+    if (session === undefined || session.muxStream !== stream) return;
+    session.pty?.write(bytes);
   });
   stream.onCtrl((payload) => {
     const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
     const session = sessions.get(open.session_id);
-    if (session === undefined) return;
+    // Reject delayed controls from a prior attachment generation so a
+    // detached stream cannot kill/resize a PTY re-bound to a new consumer.
+    if (session === undefined || session.muxStream !== stream) return;
     if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
     if (ctrl?.t === "close" && ctrl.intent === "kill") {
       endPty(session, "killed");

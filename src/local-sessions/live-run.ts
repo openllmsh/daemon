@@ -45,7 +45,17 @@ const pidAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (err) {
+    // EPERM: process exists but we cannot signal it — treat as alive so we
+    // never reap another user's run dir.
+    if (
+      err !== null &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code?: unknown }).code === "EPERM"
+    ) {
+      return true;
+    }
     return false;
   }
 };
@@ -122,6 +132,8 @@ export const readLiveRuns = (client: TOpenllmClientId): TLiveRun[] => {
   }
   const out: TLiveRun[] = [];
   for (const name of entries) {
+    // Dir name must be purely decimal digits (the openllm wrapper pid).
+    if (!/^\d+$/.test(name)) continue;
     const dirPid = Number.parseInt(name, 10);
     if (!Number.isInteger(dirPid) || dirPid <= 0) continue;
     const dir = join(root, name);
@@ -141,6 +153,9 @@ export const readLiveRuns = (client: TOpenllmClientId): TLiveRun[] => {
     const live = parseLiveJson(raw, client, dirPid);
     if (live === null) continue;
     if (!pidAlive(live.pid)) {
+      // Only reap when the directory's own pid is dead too — a wrong `pid`
+      // in live.json must never delete a running run's metadata.
+      if (pidAlive(dirPid)) continue;
       // Best-effort: drop clearly dead run dirs so the index stays small.
       // The CLI also reaps on next launch; never throw.
       try {

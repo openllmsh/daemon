@@ -9,15 +9,8 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { claudeHistoryPath } from "./paths";
+import { truncate } from "./title";
 import type { THistorySession } from "./types";
-
-const TITLE_MAX = 80;
-
-const truncate = (s: string): string => {
-  const t = s.replace(/\s+/g, " ").trim();
-  if (t.length === 0) return "Untitled";
-  return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 1)}...`;
-};
 
 export const readClaudeHistory = (limit: number): THistorySession[] => {
   const path = claudeHistoryPath();
@@ -55,7 +48,8 @@ export const readClaudeHistory = (limit: number): THistorySession[] => {
     const prev = byId.get(id);
     if (prev === undefined || ts >= prev.updated_at_ms) {
       byId.set(id, {
-        title: display.length > 0 ? truncate(display) : (prev?.title ?? "Untitled"),
+        title:
+          display.length > 0 ? truncate(display) : (prev?.title ?? "Untitled"),
         cwd: project ?? prev?.cwd ?? null,
         updated_at_ms: ts,
       });

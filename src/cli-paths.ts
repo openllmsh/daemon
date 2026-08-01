@@ -13,6 +13,7 @@
  *     home/            the CLI's home/config + credentials (isolated)
  */
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
@@ -163,12 +164,22 @@ export const sessionWorkspace = (sessionId: string): string =>
  * vendor CLIs read the user's actual login/settings; only sets TERM and a
  * daemon temp dir. PATH is inherited via `spawnEnv`. Session-host layers
  * `OPENLLM_DEVICE_SESSION_ID` on top for live.json indexing.
+ *
+ * `daemonTempDir` must succeed — a missing temp root would leave vendor CLIs
+ * writing under an unusable TMPDIR and surface as opaque spawn failures.
  */
-export const sessionEnv = (_provider: TCliProvider): Record<string, string> => ({
-  HOME: homedir(),
-  TMPDIR: daemonTempDir(),
-  TERM: "xterm-256color",
-});
+export const sessionEnv = (_provider: TCliProvider): Record<string, string> => {
+  const tmp = daemonTempDir();
+  // daemonTempDir swallows mkdir errors; fail closed before spawn if unusable.
+  if (!existsSync(tmp)) {
+    throw new Error(`daemon temp dir missing: ${tmp}`);
+  }
+  return {
+    HOME: homedir(),
+    TMPDIR: tmp,
+    TERM: "xterm-256color",
+  };
+};
 
 /**
  * The CLI's home/config root as the CLI itself sees it (the value of its

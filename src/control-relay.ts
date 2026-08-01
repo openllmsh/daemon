@@ -8,7 +8,11 @@
  * long-poll anymore — the relay socket is the daemon's only control transport.
  */
 
-import type { TDaemonCommand, TDaemonCommandAck } from "@openllmsh/protocol";
+import type {
+  TDaemonCommand,
+  TDaemonCommandAck,
+  TLocalCliSession,
+} from "@openllmsh/protocol";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
@@ -18,8 +22,8 @@ import { readLocalSessions } from "./local-sessions";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
-import { deviceSessionsForList } from "./session-host";
 import { maybeSelfUpdate } from "./self-update";
+import { deviceSessionsForList } from "./session-host";
 import { refreshUsage } from "./status";
 import { invalidateUsage } from "./usage-cache";
 
@@ -28,6 +32,14 @@ import { invalidateUsage } from "./usage-cache";
 // missing this window just defers the refreshed state to the next walk — never a
 // reason to hold the dashboard's optimistic button.
 const PROBE_ACK_TIMEOUT_MS = 15_000;
+
+/** Short TTL so picker double-fetch / remounts do not re-scan vendor stores. */
+const LIST_LOCAL_SESSIONS_TTL_MS = 1_500;
+
+const listLocalSessionsCache = new Map<
+  string,
+  { readonly at: number; readonly sessions: TLocalCliSession[] }
+>();
 
 /**
  * Execute one delivered command via the control handlers. Returns the terminal
@@ -204,11 +216,27 @@ export const runCommandInner = async (
       }
       // Vendor-local session index for the device-session picker (history +
       // ~/.openllm/run live.json + in-memory PTYs). Result rides the lifecycle.
+      // Short-TTL cache so rapid picker refreshes do not re-scan vendor stores
+      // + run dirs on the daemon event loop every time.
       case "list_local_sessions": {
+        const now = Date.now();
+        const cacheKey = `${cmd.payload.cli}:${cmd.payload.limit ?? ""}`;
+        const cached = listLocalSessionsCache.get(cacheKey);
+        if (
+          cached !== undefined &&
+          now - cached.at < LIST_LOCAL_SESSIONS_TTL_MS
+        ) {
+          return {
+            id: cmd.id,
+            status: "done",
+            result: { sessions: cached.sessions },
+          };
+        }
         const sessions = readLocalSessions(cmd.payload.cli, {
           limit: cmd.payload.limit,
           deps: { deviceSessions: deviceSessionsForList },
         });
+        listLocalSessionsCache.set(cacheKey, { at: now, sessions });
         return {
           id: cmd.id,
           status: "done",

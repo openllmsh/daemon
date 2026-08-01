@@ -5,15 +5,8 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { opencodeDbPath } from "./paths";
+import { truncate } from "./title";
 import type { THistorySession } from "./types";
-
-const TITLE_MAX = 80;
-
-const truncate = (s: string): string => {
-  const t = s.replace(/\s+/g, " ").trim();
-  if (t.length === 0) return "Untitled";
-  return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 1)}...`;
-};
 
 export const readOpencodeHistory = (limit: number): THistorySession[] => {
   const path = opencodeDbPath();

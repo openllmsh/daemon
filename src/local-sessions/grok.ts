@@ -5,15 +5,8 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { grokSessionsDir } from "./paths";
+import { truncate } from "./title";
 import type { THistorySession } from "./types";
-
-const TITLE_MAX = 80;
-
-const truncate = (s: string): string => {
-  const t = s.replace(/\s+/g, " ").trim();
-  if (t.length === 0) return "Untitled";
-  return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 1)}...`;
-};
 
 const parseUpdatedMs = (raw: unknown, fallback: number): number => {
   if (typeof raw === "string") {
@@ -71,7 +64,10 @@ export const readGrokHistory = (limit: number): THistorySession[] => {
         id,
         title: summary.length > 0 ? truncate(summary) : "Untitled",
         cwd: typeof raw.info?.cwd === "string" ? raw.info.cwd : null,
-        updated_at_ms: parseUpdatedMs(raw.updated_at ?? raw.created_at, s.mtime),
+        updated_at_ms: parseUpdatedMs(
+          raw.updated_at ?? raw.created_at,
+          s.mtime,
+        ),
         cli: "grok",
       });
     } catch {
