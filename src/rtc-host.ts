@@ -18,6 +18,7 @@ import {
   decodeOfferInner,
   encodeAnswerInner,
   fingerprintFromSdp,
+  fingerprintsFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
   normalizeFingerprint,
@@ -260,14 +261,19 @@ export const handleRtcOffer = async (frame: {
 
   // Bind sealed browser fingerprint to the offer SDP (symmetric to browser
   // verifyAnswerInner binding daemon fd to answer SDP). Reject when SDP has
-  // no fingerprint or it disagrees with the sealed fb.
-  const offerFb = fingerprintFromSdp(frame.sdp);
-  if (
-    offerFb === null ||
-    normalizeFingerprint(offerFb) !== normalizeFingerprint(inner.fb)
-  ) {
+  // no matching fingerprint.
+  const offerFingerprints = fingerprintsFromSdp(frame.sdp);
+  const normalizedInnerFb = normalizeFingerprint(inner.fb);
+  const offerMatches = offerFingerprints.some(
+    (fingerprint) => normalizeFingerprint(fingerprint) === normalizedInnerFb,
+  );
+  if (offerFingerprints.length === 0 || !offerMatches) {
     logWarn("rtc-host", "offer fingerprint mismatch", {
       channelId: frame.channel_id,
+      expectedFingerprint: normalizedInnerFb,
+      receivedFingerprints: offerFingerprints.map((fingerprint) =>
+        normalizeFingerprint(fingerprint),
+      ),
     });
     return;
   }

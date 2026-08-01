@@ -15,6 +15,7 @@ import {
   decodeAnswerInner,
   encodeOfferInner,
   fingerprintFromSdp,
+  fingerprintsFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
   RTC_AUTH_NONCE_BYTES,
@@ -379,16 +380,20 @@ export const handleRtcAnswer = async (frame: {
     frame.fingerprint_proof,
   );
   const inner = opened === null ? null : decodeAnswerInner(opened);
+  if (inner === null) {
+    markRtcFailure(session.keyId);
+    return;
+  }
+  const remoteFingerprints = fingerprintsFromSdp(frame.sdp);
   const remoteFingerprint = fingerprintFromSdp(frame.sdp);
-  if (
-    inner === null ||
-    remoteFingerprint === null ||
-    !verifyAnswerInner(inner, {
+  const okRemoteFingerprint = remoteFingerprints.some((fingerprint) =>
+    verifyAnswerInner(inner, {
       nonce: session.nonce,
       browserFingerprint: session.fingerprint,
-      daemonFingerprint: remoteFingerprint,
-    })
-  ) {
+      daemonFingerprint: fingerprint,
+    }),
+  );
+  if (remoteFingerprint === null || !okRemoteFingerprint) {
     markRtcFailure(session.keyId);
     return;
   }
