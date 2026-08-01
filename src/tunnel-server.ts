@@ -400,6 +400,10 @@ export const serveMuxTunnel: TServeTunnel = async (open, body, signal) => {
   // daemon-owned admission and self-update fencing immediately; completion is
   // idempotent if a late response subsequently reaches the generic streamer.
   signal.addEventListener("abort", complete, { once: true });
+  if (signal.aborted) {
+    complete();
+    throw new Error("mux tunnel aborted before dispatch");
+  }
   try {
     const response = await dispatch(tunneledRequest(open, body, signal));
     const contentType =

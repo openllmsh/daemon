@@ -90,6 +90,9 @@ export const verifyDeviceGrantNode = (
       format: "der",
       type: "spki",
     });
+    if (key.asymmetricKeyType !== "ed25519") {
+      return false;
+    }
     const sig = Buffer.from(sigB64, "base64");
     return nodeVerify(null, Buffer.from(message), key, sig);
   } catch {
