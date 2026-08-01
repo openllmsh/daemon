@@ -14,31 +14,14 @@ import {
   statSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { isVendorSessionCommand } from "../vendor-commands";
 import { runClientRoot } from "./paths";
 import type { TLiveRun, TOpenllmClientId } from "./types";
 
+// The live-index filename. Must match the CLI's `LIVE_JSON_NAME`
+// (packages/cli/src/clients/live.ts) — kept as a local literal because the
+// daemon package never imports the CLI package (layering).
 const LIVE_JSON = "live.json";
-
-/** Local copy of session-host's vendor-command check — avoids an import cycle. */
-const vendorNames = [
-  "claude",
-  "codex",
-  "kimi",
-  "grok",
-  "cursor-agent",
-  "opencode",
-  "openllm",
-  "openllmc",
-];
-
-const looksLikeVendorCommand = (command: string): boolean => {
-  const executable = command.trim().split(/\s+/, 1)[0];
-  if (executable === undefined || executable === "") return false;
-  const name = basename(executable).toLowerCase();
-  return vendorNames.some(
-    (vendor) => name === vendor || name.startsWith(`${vendor}-`),
-  );
-};
 
 const pidAlive = (pid: number): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -60,14 +43,30 @@ const pidAlive = (pid: number): boolean => {
   }
 };
 
-const commandOf = (pid: number): string | null => {
+/**
+ * Batched `ps` for a set of pids — ONE process per scan instead of one per
+ * candidate. Returns pid→command. `null` when `ps` is unavailable so callers
+ * can distinguish "no process inspector" from "pid not found".
+ */
+const commandMap = (pids: ReadonlySet<number>): Map<number, string> | null => {
+  if (pids.size === 0) return new Map();
   try {
-    const out = Bun.spawnSync(["ps", "-p", String(pid), "-o", "command="], {
-      stdout: "pipe",
-      stderr: "ignore",
-    }).stdout.toString();
-    const text = out.trim();
-    return text.length > 0 ? text : null;
+    const out = Bun.spawnSync(
+      ["ps", "-o", "pid=,command=", ...[...pids].map((p) => String(p))],
+      { stdout: "pipe", stderr: "ignore" },
+    );
+    if (!out.success && out.stdout.length === 0) return null;
+    const map = new Map<number, string>();
+    for (const line of out.stdout.toString().split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const match = trimmed.match(/^(\d+)\s+(.*)$/);
+      if (match === null) continue;
+      const pid = Number.parseInt(match[1] as string, 10);
+      const command = (match[2] as string).trim();
+      if (Number.isInteger(pid) && command.length > 0) map.set(pid, command);
+    }
+    return map;
   } catch {
     return null;
   }
@@ -130,7 +129,8 @@ export const readLiveRuns = (client: TOpenllmClientId): TLiveRun[] => {
   } catch {
     return [];
   }
-  const out: TLiveRun[] = [];
+  // Pass 1: parse + liveness-gate every candidate, collecting live pids.
+  const candidates: Array<{ live: TLiveRun; dir: string; dirPid: number }> = [];
   for (const name of entries) {
     // Dir name must be purely decimal digits (the openllm wrapper pid).
     if (!/^\d+$/.test(name)) continue;
@@ -165,15 +165,23 @@ export const readLiveRuns = (client: TOpenllmClientId): TLiveRun[] => {
       }
       continue;
     }
-    const cmd = commandOf(live.pid);
-    if (cmd === null || !looksLikeVendorCommand(cmd)) {
-      // PID reused by something else — do not treat as our session.
+    candidates.push({ live, dir, dirPid });
+  }
+
+  // Pass 2: ONE batched `ps` for command recognition across all candidates.
+  const commands = commandMap(new Set(candidates.map((c) => c.live.pid)));
+  const out: TLiveRun[] = [];
+  for (const { live, dir, dirPid } of candidates) {
+    // `ps` unavailable → keep the candidate (liveness already passed); a
+    // reused-pid false positive is preferable to dropping every live run.
+    const cmd = commands?.get(live.pid);
+    if (
+      commands !== null &&
+      (cmd === undefined || !isVendorSessionCommand(cmd))
+    )
       continue;
-    }
     // Dir name should match pid; tolerate mismatch if live.json pid is live.
-    if (basename(dir) !== String(live.pid) && !pidAlive(dirPid)) {
-      continue;
-    }
+    if (basename(dir) !== String(live.pid) && !pidAlive(dirPid)) continue;
     out.push(live);
   }
   return out;

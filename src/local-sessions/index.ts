@@ -9,6 +9,7 @@ import { readCodexHistory } from "./codex";
 import { readGrokHistory } from "./grok";
 import { readLiveRuns } from "./live-run";
 import { readOpencodeHistory } from "./opencode";
+import { TITLE_MAX } from "./title";
 import type { THistorySession, TLiveRun } from "./types";
 import {
   deviceCliOfClientId,
@@ -64,7 +65,7 @@ const defaultLive = (cli: TDeviceSessionCli): TLiveRun[] => {
   return readLiveRuns(clientId);
 };
 
-const clampLimit = (limit: number | undefined): number => {
+export const clampLimit = (limit: number | undefined): number => {
   if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
   const n = Math.floor(limit);
   if (n < 1) return 1;
@@ -143,10 +144,16 @@ export const readLocalSessions = (
 
   for (const live of liveRuns) {
     if (deviceCliOfClientId(live.client) !== cli) continue;
+    // Key priority: vendor id (merge with vendor history) → openllm id (merge
+    // with the in-memory device loop's `openllm:${id}`) → pid. Without the
+    // openllm fallback, a device live.json with no vendor id would key by pid
+    // and duplicate the same session's in-memory device row.
     const vendorKey =
       live.vendor_session_id !== null
         ? `vendor:${live.vendor_session_id}`
-        : `live:${live.pid}`;
+        : live.openllm_session_id !== null && live.openllm_session_id.length > 0
+          ? `openllm:${live.openllm_session_id}`
+          : `live:${live.pid}`;
     const attachable =
       live.host === "device" &&
       live.openllm_session_id !== null &&
@@ -199,7 +206,7 @@ export const readLocalSessions = (
     .slice(0, limit)
     .map((r) => ({
       id: r.id,
-      title: r.title.slice(0, 80),
+      title: r.title.slice(0, TITLE_MAX),
       cwd: r.cwd,
       updated_at_ms: r.updated_at_ms,
       cli,

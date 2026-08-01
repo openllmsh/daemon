@@ -129,7 +129,9 @@ const readFromRollouts = (limit: number): THistorySession[] => {
 };
 
 export const readCodexHistory = (limit: number): THistorySession[] => {
+  // A successful DB read is authoritative even when it is empty (no threads);
+  // only fall back to scanning rollout jsonl when the DB is missing/unusable.
   const fromDb = readFromDb(limit);
-  if (fromDb !== null && fromDb.length > 0) return fromDb;
+  if (fromDb !== null) return fromDb;
   return readFromRollouts(limit);
 };

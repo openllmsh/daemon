@@ -38,7 +38,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import type {
   TDeviceSessionCli,
   TRelayFrame,
@@ -49,6 +49,7 @@ import type {
   TSessionStreamOpenPayload,
 } from "@openllmsh/protocol";
 import {
+  DANGEROUS_SESSION_CLIS,
   parseStreamCtrlPayload,
   SESSION_ID_PATTERN,
   TUNNEL_CHUNK_MAX,
@@ -60,9 +61,20 @@ import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
+import { isVendorSessionCommand } from "./vendor-commands";
+
+// Re-exported for the daemon-session-host test's command-recognition cases.
+export { isVendorSessionCommand } from "./vendor-commands";
 
 /** Max concurrently-LIVE PTYs on one daemon. */
 const MAX_LIVE_SESSIONS = 4;
+
+/** Retained dead (resumable) session records cap — evict oldest beyond this. */
+const MAX_RETAINED_SESSIONS = 32;
+
+/** Vendor session ids accepted for cold resume: url-safe, no leading dash so
+ *  the value can never be parsed as a CLI flag when appended to argv. */
+const RESUME_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
 
 // ── Atomic PTY lifecycle: no session process ever outlives its daemon ──
 //
@@ -102,27 +114,6 @@ const removePidFile = (sessionId: string): void => {
   } catch {
     /* best-effort */
   }
-};
-
-const vendorCliNames = [
-  "claude",
-  "codex",
-  "kimi",
-  "grok",
-  "cursor-agent",
-  // Preferred launch path: openllm [-d] <client>
-  "openllm",
-  "openllmc",
-];
-
-/** Extract and validate the executable token from `ps -o command=` output. */
-export const isVendorSessionCommand = (command: string): boolean => {
-  const executable = command.trim().split(/\s+/, 1)[0];
-  if (executable === undefined || executable === "") return false;
-  const name = basename(executable).toLowerCase();
-  return vendorCliNames.some(
-    (vendor) => name === vendor || name.startsWith(`${vendor}-`),
-  );
 };
 
 /** Whether a live process with `pid` is (still) one of our session CLIs.
@@ -374,15 +365,16 @@ export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
   if (dormant.length === 0) return;
   const pids = new Set<number>();
   for (const session of dormant) {
+    // A dormant session without a known pid can't be probed — mark it busy
+    // (conservative: never reaped on unknown) but keep probing the rest.
     if (session.pid === null) {
-      for (const candidate of dormant) {
-        candidate.busy = true;
-        candidate.lastBusyAtMs = now;
-      }
-      return;
+      session.busy = true;
+      session.lastBusyAtMs = now;
+      continue;
     }
     pids.add(session.pid);
   }
+  if (pids.size === 0) return;
   let busyPids: Set<number>;
   try {
     busyPids = await probeActivity(pids);
@@ -398,7 +390,8 @@ export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
     return;
   }
   for (const session of dormant) {
-    const isBusy = session.pid !== null && busyPids.has(session.pid);
+    if (session.pid === null) continue; // already marked busy above
+    const isBusy = busyPids.has(session.pid);
     if (isBusy) session.lastBusyAtMs = now;
     if (session.busy && !isBusy) activityHook?.();
     session.busy = isBusy;
@@ -480,19 +473,12 @@ const openllmClientId = (cli: TDeviceSessionCli): string => {
 };
 
 /**
- * Whether `openllm -d <client>` is meaningful. Mirrors the openllm CLI
- * registry's `dangerousFlag` coverage (claude/codex/grok — not opencode).
+ * Whether `openllm -d <client>` is meaningful. Reuses the canonical
+ * `DANGEROUS_SESSION_CLIS` set from protocol so the daemon and picker share
+ * ONE membership list (claude/codex/grok — not opencode).
  */
-export const sessionSupportsDangerous = (cli: TDeviceSessionCli): boolean => {
-  switch (cli) {
-    case "claude_code":
-    case "chatgpt":
-    case "grok":
-      return true;
-    default:
-      return false;
-  }
-};
+export const sessionSupportsDangerous = (cli: TDeviceSessionCli): boolean =>
+  DANGEROUS_SESSION_CLIS.has(cli);
 
 /** Resolve the installed openllm CLI binary (current name, then legacy). */
 const openllmBin = (): string | null => {
@@ -627,17 +613,13 @@ export const resolveSessionCwd = (requested: string | undefined): string => {
 };
 
 /** Env for a device PTY: real HOME + device-session markers for live.json.
- *  OpenCode is not a subscription provider so it cannot call sessionEnv(cli);
- *  still use the same HOME/TMPDIR/TERM shape (daemonTempDir for TMPDIR). */
+ *  Provider-agnostic — every device CLI (incl. opencode) shares one env. */
 const deviceSessionEnv = (
-  cli: TDeviceSessionCli,
+  _cli: TDeviceSessionCli,
   openllmSessionId: string,
   title: string | null,
 ): Record<string, string> => {
-  // sessionEnv is typed on SubscriptionProviderSlug; opencode is device-only.
-  // The provider arg is unused today — any subscription slug yields the same
-  // real-HOME + daemon TMPDIR env. Use claude_code as a stand-in for opencode.
-  const base = cli === "opencode" ? sessionEnv("claude_code") : sessionEnv(cli);
+  const base = sessionEnv();
   return {
     ...base,
     OPENLLM_DEVICE_SESSION_ID: openllmSessionId,
@@ -734,7 +716,25 @@ const endPty = (
   if (kill) s.pty?.kill();
   s.pty = null;
   s.pid = null;
+  // Release the scrollback ring — a dead session can't be attached, so its
+  // buffered output is dead weight until the row itself is evicted.
+  s.scrollback.length = 0;
+  s.scrollbackBytes = 0;
   removePidFile(s.id);
+};
+
+/** Bound retained dead session rows: evict the oldest non-live records beyond
+ *  MAX_RETAINED_SESSIONS so a long-lived daemon can't accumulate them without
+ *  limit. Live and attached sessions are never evicted. */
+const evictStaleDeadSessions = (): void => {
+  const dead = [...sessions.values()]
+    .filter((s) => s.pty === null && !s.attached)
+    .sort((a, b) => a.startedAtMs - b.startedAtMs);
+  const excess = dead.length - MAX_RETAINED_SESSIONS;
+  for (let i = 0; i < excess; i += 1) {
+    const victim = dead[i];
+    if (victim !== undefined) sessions.delete(victim.id);
+  }
 };
 
 // ─── frame handling ──────────────────────────────────────────────────
@@ -842,11 +842,18 @@ const handleOpen = (
     }
     const cli: TDeviceSessionCli = frame.cli;
     const existing = sessions.get(frame.session_id);
-    const resumeId =
+    const rawResumeId =
       typeof frame.resume_session_id === "string" &&
       frame.resume_session_id.length > 0
         ? frame.resume_session_id
         : null;
+    // Only accept a vendor session id that is a plain url-safe token: never a
+    // value that could be read as a flag (leading "-") when appended to argv.
+    if (rawResumeId !== null && !RESUME_ID_PATTERN.test(rawResumeId)) {
+      nack("spawn_failed");
+      return;
+    }
+    const resumeId = rawResumeId;
 
     // ── attach: re-bind a live PTY ────────────────────────────────────
     if (frame.mode === "attach") {
@@ -949,6 +956,7 @@ const handleOpen = (
     s.vendorSessionId = vendorSessionId;
     if (frame.title !== undefined) s.title = frame.title;
     sessions.set(s.id, s);
+    evictStaleDeadSessions();
 
     try {
       const argv = argvFor(
@@ -1050,7 +1058,12 @@ export const bindMuxSessionStream = (
         return;
       }
       const session = sessions.get(open.session_id);
-      if (session === undefined) return;
+      if (session === undefined) {
+        // No record for a successful open ack (raced teardown) — reset the
+        // stream so the consumer settles instead of hanging on the channel.
+        stream.reset(encodeJsonPayload({ code: "session_not_found" }));
+        return;
+      }
       session.muxStream = stream;
       stream.sendCtrl(
         encodeJsonPayload({

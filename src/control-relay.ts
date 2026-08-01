@@ -18,7 +18,7 @@ import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { openSealed } from "./keypair";
-import { readLocalSessions } from "./local-sessions";
+import { clampLimit, readLocalSessions } from "./local-sessions";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
@@ -220,7 +220,9 @@ export const runCommandInner = async (
       // + run dirs on the daemon event loop every time.
       case "list_local_sessions": {
         const now = Date.now();
-        const cacheKey = `${cmd.payload.cli}:${cmd.payload.limit ?? ""}`;
+        // Key by the CLAMPED limit so callers passing equivalent limits (e.g.
+        // undefined vs the default, or any value ≥ HARD_CAP) share one entry.
+        const cacheKey = `${cmd.payload.cli}:${clampLimit(cmd.payload.limit)}`;
         const cached = listLocalSessionsCache.get(cacheKey);
         if (
           cached !== undefined &&
@@ -231,6 +233,12 @@ export const runCommandInner = async (
             status: "done",
             result: { sessions: cached.sessions },
           };
+        }
+        // Prune expired entries on each miss so the map can't grow unbounded.
+        for (const [key, entry] of listLocalSessionsCache) {
+          if (now - entry.at >= LIST_LOCAL_SESSIONS_TTL_MS) {
+            listLocalSessionsCache.delete(key);
+          }
         }
         const sessions = readLocalSessions(cmd.payload.cli, {
           limit: cmd.payload.limit,
