@@ -41,6 +41,7 @@ import { join } from "node:path";
 import type { TCliProvider } from "../cli-paths";
 import { cliBin, cliEnv, cliRoot } from "../cli-paths";
 import { logDebug, logInfo } from "../logger";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
 
 /** The persisted shape (all fields optional). */
@@ -427,7 +428,7 @@ const captureInferenceRequest = async (
       : cmdArgv;
   let proc: ReturnType<typeof Bun.spawn> | null = null;
   try {
-    proc = Bun.spawn(spawnArgv, {
+    proc = Bun.spawn(sandboxSpawnArgs(spawnArgv), {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",

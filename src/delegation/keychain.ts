@@ -21,6 +21,7 @@ import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { logError } from "../logger";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { logIfKilled, spawnCwd } from "./spawn";
 
 const MAC = platform() === "darwin";
@@ -43,7 +44,7 @@ const runSecurity = async (
   home: string,
 ): Promise<boolean> => {
   try {
-    const proc = Bun.spawn(["security", ...argv], {
+    const proc = Bun.spawn(sandboxSpawnArgs(["security", ...argv]), {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
@@ -217,7 +218,7 @@ const findKeychainServices = async (
 ): Promise<ReadonlyArray<string>> => {
   try {
     const proc = Bun.spawn(
-      ["security", "dump-keychain", loginKeychainPath(home)],
+      sandboxSpawnArgs(["security", "dump-keychain", loginKeychainPath(home)]),
       {
         stdout: "pipe",
         stderr: "ignore",
@@ -246,14 +247,14 @@ const readKeychainSecret = async (
 ): Promise<string | null> => {
   try {
     const proc = Bun.spawn(
-      [
+      sandboxSpawnArgs([
         "security",
         "find-generic-password",
         "-s",
         service,
         "-w",
         loginKeychainPath(home),
-      ],
+      ]),
       {
         stdout: "pipe",
         stderr: "ignore",

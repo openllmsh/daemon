@@ -25,6 +25,7 @@ import { runCompletion } from "./completion";
 import { daemonEnv } from "./env";
 import { logError } from "./logger";
 import { runLogs } from "./logs";
+import { runSandboxExec } from "./sandbox/exec";
 import {
   serviceRestart,
   serviceStart,
@@ -94,6 +95,22 @@ const runAutoUpdate = (args: readonly string[]): never => {
 export const runCli = (): boolean => {
   const args = userArgs();
   if (args.length === 0) return false; // bare invocation → boot the server
+
+  // The per-child sandbox shim (`sandbox/exec.ts`): apply the working-set
+  // sandbox to THIS re-exec'd process, then run the tail argv. Matched BEFORE
+  // the `--help`/`--version` scans — the tail may legitimately contain
+  // `-h`/`-v`. Nothing heavy loads on this path (no Effect, no env file, no
+  // network).
+  if (args[0] === "--sandbox-exec") {
+    const sep = args.indexOf("--");
+    const tail = sep >= 0 ? args.slice(sep + 1) : [];
+    if (tail.length === 0) {
+      process.stderr.write("--sandbox-exec: missing command\n");
+      process.exit(2);
+    }
+    void runSandboxExec(tail); // apply + spawn + mirror exit
+    return true;
+  }
 
   if (args.includes("-h") || args.includes("--help") || args[0] === "help") {
     process.stdout.write(HELP);

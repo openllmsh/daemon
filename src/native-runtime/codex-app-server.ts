@@ -31,6 +31,7 @@ import type {
 } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
@@ -111,7 +112,7 @@ class CodexAppServerClient {
   }
 
   private async start(): Promise<void> {
-    const proc = Bun.spawn([this.bin, "app-server"], {
+    const proc = Bun.spawn(sandboxSpawnArgs([this.bin, "app-server"]), {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",

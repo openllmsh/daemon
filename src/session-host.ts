@@ -21,8 +21,11 @@
  * `~/.openllm/sessions/<id>/` workspace — vendor history lives under
  * `~/.claude` / `~/.codex` / … Live processes are indexed via the openllm
  * CLI's `~/.openllm/run/<client>/<pid>/live.json` (device env
- * `OPENLLM_DEVICE_SESSION_ID`). Sandbox HOME rewrite and seatbelt grants
- * are NOT applied — those stay for auto-update and login/auth only.
+ * `OPENLLM_DEVICE_SESSION_ID`). The `cliEnv()` isolated-HOME rewrite is NOT
+ * applied (sessions keep the real `$HOME`), and the PTY spawn is deliberately
+ * NOT routed through the per-child sandbox shim (`sandbox/exec.ts`) — the
+ * session IS the user's real CLI over their real files, so OS confinement
+ * would break it by design (`docs/audits/daemon-sandbox-scoping.md`).
  * Each session is its own async task — never the control channel's
  * commandTail.
  */
