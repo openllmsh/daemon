@@ -443,6 +443,20 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
 };
 
 const onFrame = (frame: TRelayFrame): void => {
+  // Synchronous dispatch below (acceptChannel, handleChannelOpenAck,
+  // updateMuxPeerCaps, …) must never throw through the WebSocket callback —
+  // that would tear down the whole control channel over one bad frame.
+  try {
+    dispatchFrame(frame);
+  } catch (err: unknown) {
+    logWarn("control-channel", "frame dispatch failed", {
+      frameType: frame.type,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+};
+
+const dispatchFrame = (frame: TRelayFrame): void => {
   switch (frame.type) {
     case "command":
       onCommand(frame).catch(() => {
