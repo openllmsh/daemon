@@ -6,6 +6,9 @@
  * auth/store read), so callers should not hammer it — the SSE watcher
  * recomputes on a gentle interval and only while a client is listening.
  */
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { TDaemonStatus } from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
@@ -15,10 +18,23 @@ import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
+import { resolveOnPath } from "./path-utils";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
+
+/** OpenCode is a device-session client (not a subscription delegate). Surface
+ *  install presence so the device picker can offer it when the binary exists. */
+const opencodeInstalled = (): boolean => {
+  const home = homedir();
+  const candidates = [
+    join(home, ".opencode", "bin", "opencode"),
+    join(home, ".local", "bin", "opencode"),
+    ...resolveOnPath("opencode"),
+  ];
+  return candidates.some((p) => existsSync(p));
+};
 
 const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
@@ -54,6 +70,15 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
       }
     }),
   );
+  // Device-session-only CLI (no subscription connect card). Append so the
+  // device picker can list it; /providers filters to subscription slugs.
+  if (opencodeInstalled()) {
+    connections.push({
+      provider: "opencode",
+      connected: false,
+      cli_installed: true,
+    });
+  }
   return {
     daemon_version: DAEMON_VERSION,
     key_configured: hasApiKey(),

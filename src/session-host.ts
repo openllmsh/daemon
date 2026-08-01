@@ -3,25 +3,28 @@
  * (`docs/features/sub-tunnel-and-chat-sessions.md` §2.2). A browser
  * consumer opens a `session_*` channel over the relay; this module spawns
  * the chosen vendor CLI under a PTY (Bun's built-in `Bun.Terminal` — no
- * native deps, POSIX only) in `~/.openllm/sessions/<id>/` and streams
+ * native deps, POSIX only) with the user's **real `$HOME`** and streams
  * the TUI both ways.
  *
  * Lifecycle:
- *  - `spawn`   — fresh workspace + fresh CLI process.
+ *  - `spawn`   — fresh CLI process (cwd `$HOME`, or a validated resume cwd).
  *  - `attach`  — re-bind a LIVE PTY (tab reload / another day): ack
  *                `live:true`, replay the scrollback ring after a resize.
- *  - `continue`— the PTY died (or daemon restarted): respawn in the SAME
- *                workspace with the CLI's native continue flag where the
- *                daemon knows one (`claude --continue`), else plain.
+ *  - `continue`— the PTY died (or daemon restarted): respawn with the
+ *                vendor's resume-by-id flag when known, else claude
+ *                `--continue` / plain.
  *  - `detach`  — the consumer went away: the PTY LIVES ON indefinitely
  *                until an explicit kill/end. No quiet reaper.
  *
- * Isolation: the CLI runs the user's REAL binary (`hostCliBin`) with the
- * real `$HOME` / PATH so credentials work without re-login. Only the cwd
- * is a per-session workspace under `~/.openllm/sessions/<id>/`. Sandbox
- * HOME rewrite and seatbelt grants are NOT applied — those stay for
- * auto-update and login/auth triggers only. Each session is its own
- * async task — never the control channel's commandTail.
+ * Isolation: the CLI runs the user's REAL binary with real `$HOME` / PATH
+ * so credentials and vendor session stores work. There is no
+ * `~/.openllm/sessions/<id>/` workspace — vendor history lives under
+ * `~/.claude` / `~/.codex` / … Live processes are indexed via the openllm
+ * CLI's `~/.openllm/run/<client>/<pid>/live.json` (device env
+ * `OPENLLM_DEVICE_SESSION_ID`). Sandbox HOME rewrite and seatbelt grants
+ * are NOT applied — those stay for auto-update and login/auth only.
+ * Each session is its own async task — never the control channel's
+ * commandTail.
  */
 
 import {
@@ -29,17 +32,21 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import type {
+  TDeviceSessionCli,
   TRelayFrame,
   TRelaySessionCloseFrame,
   TRelaySessionIoFrame,
   TRelaySessionOpenFrame,
   TRelaySessionResizeFrame,
-  TSubscriptionProviderSlug,
+  TSessionStreamOpenPayload,
 } from "@openllmsh/protocol";
 import {
   parseStreamCtrlPayload,
@@ -48,12 +55,7 @@ import {
 } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import type { TMuxStream } from "@openllmsh/tunnel/mux";
-import type { TCliProvider } from "./cli-paths";
-import {
-  hostCliCandidates,
-  sessionEnv,
-  sessionWorkspace,
-} from "./cli-paths";
+import { hostCliCandidates, sessionEnv } from "./cli-paths";
 import {
   cliBinaryPath,
   legacyCliBinaryPath,
@@ -269,8 +271,11 @@ export const ptySupported = (): boolean => process.platform !== "win32";
 
 type TSession = {
   readonly id: string;
-  readonly cli: TCliProvider;
-  readonly workspace: string;
+  readonly cli: TDeviceSessionCli;
+  /** Absolute cwd the CLI was (last) spawned in. */
+  cwd: string;
+  /** Vendor resume id when known (cold resume / continue). */
+  vendorSessionId: string | null;
   pty: TPtyLike | null; // null = dead (continue-able)
   scrollback: Uint8Array[];
   scrollbackBytes: number;
@@ -406,13 +411,14 @@ export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
 /** Status report for `DaemonStatus.sessions`. */
 export const sessionStatusReport = (): Array<{
   id: string;
-  cli: TCliProvider;
+  cli: TDeviceSessionCli;
   started_at_ms: number;
   attached: boolean;
   live: boolean;
   busy: boolean;
   title?: string;
   last_exit_reason?: "evicted" | "reaped" | "done" | "killed";
+  vendor_session_id?: string | null;
 }> =>
   [...sessions.values()]
     .sort((a, b) => b.startedAtMs - a.startedAtMs)
@@ -428,17 +434,42 @@ export const sessionStatusReport = (): Array<{
       ...(s.lastExitReason === null
         ? {}
         : { last_exit_reason: s.lastExitReason }),
+      ...(s.vendorSessionId === null
+        ? {}
+        : { vendor_session_id: s.vendorSessionId }),
     }));
+
+/**
+ * Snapshot of in-memory device PTYs for `list_local_sessions` merge.
+ * Exported so the control command can join vendor history with live PTYs.
+ */
+export const deviceSessionsForList = (): ReadonlyArray<{
+  readonly id: string;
+  readonly cli: TDeviceSessionCli;
+  readonly live: boolean;
+  readonly title: string | null;
+  readonly vendor_session_id: string | null;
+  readonly cwd: string;
+  readonly started_at_ms: number;
+}> =>
+  [...sessions.values()].map((s) => ({
+    id: s.id,
+    cli: s.cli,
+    live: s.pty !== null,
+    title: s.title,
+    vendor_session_id: s.vendorSessionId,
+    cwd: s.cwd,
+    started_at_ms: s.startedAtMs,
+  }));
 
 const liveCount = (): number =>
   [...sessions.values()].filter((s) => s.pty !== null).length;
 
 /**
- * Subscription-provider slug → `openllm <client>` id. Only providers that
- * the openllm CLI actually hosts as session clients are mappable; others
- * fall back to the host vendor binary (and cannot honor `-d`).
+ * Device CLI → `openllm <client>` id. Only clients the openllm CLI hosts
+ * are mappable; others fall back to the host vendor binary.
  */
-const openllmClientId = (cli: TCliProvider): string | null => {
+const openllmClientId = (cli: TDeviceSessionCli): string => {
   switch (cli) {
     case "claude_code":
       return "claude";
@@ -446,18 +477,25 @@ const openllmClientId = (cli: TCliProvider): string | null => {
       return "codex";
     case "grok":
       return "grok";
-    // kimi_code / cursor: no openllm client id today — host binary only.
-    default:
-      return null;
+    case "opencode":
+      return "opencode";
   }
 };
 
 /**
- * Whether `openllm -d <client>` is meaningful for this provider. Mirrors the
- * openllm CLI registry's `dangerousFlag` coverage (claude/codex/grok).
+ * Whether `openllm -d <client>` is meaningful. Mirrors the openllm CLI
+ * registry's `dangerousFlag` coverage (claude/codex/grok — not opencode).
  */
-export const sessionSupportsDangerous = (cli: TCliProvider): boolean =>
-  openllmClientId(cli) !== null;
+export const sessionSupportsDangerous = (cli: TDeviceSessionCli): boolean => {
+  switch (cli) {
+    case "claude_code":
+    case "chatgpt":
+    case "grok":
+      return true;
+    default:
+      return false;
+  }
+};
 
 /** Resolve the installed openllm CLI binary (current name, then legacy). */
 const openllmBin = (): string | null => {
@@ -467,60 +505,151 @@ const openllmBin = (): string | null => {
   return null;
 };
 
+/** Host binary candidates for device CLIs (opencode is not a TCliProvider). */
+const hostBinCandidates = (cli: TDeviceSessionCli): string[] => {
+  if (cli === "opencode") {
+    const home = homedir();
+    return [
+      join(home, ".opencode", "bin", "opencode"),
+      join(home, ".local", "bin", "opencode"),
+    ];
+  }
+  // Subscription-backed device CLIs share the isolated-CLI candidate list.
+  return hostCliCandidates(cli);
+};
+
 /**
  * Resolve the host-installed vendor binary. Used only as a last-resort
  * fallback when the openllm CLI is not installed on this box.
  */
-const hostCliBin = (cli: TCliProvider): string => {
-  for (const candidate of hostCliCandidates(cli)) {
+const hostCliBin = (cli: TDeviceSessionCli): string => {
+  for (const candidate of hostBinCandidates(cli)) {
     if (existsSync(candidate)) return candidate;
   }
+  const first = hostBinCandidates(cli)[0];
+  if (first !== undefined) return first;
   // Last resort: the command name — Bun.spawn resolves it against PATH.
-  const first = hostCliCandidates(cli)[0];
-  return first ?? cli;
+  switch (cli) {
+    case "claude_code":
+      return "claude";
+    case "chatgpt":
+      return "codex";
+    case "grok":
+      return "grok";
+    case "opencode":
+      return "opencode";
+  }
+};
+
+/** Append vendor cold-resume flags for a known session id. */
+const pushResumeArgs = (
+  args: string[],
+  cli: TDeviceSessionCli,
+  vendorSessionId: string,
+): void => {
+  switch (cli) {
+    case "claude_code":
+    case "grok":
+      args.push("--resume", vendorSessionId);
+      break;
+    case "chatgpt":
+      args.push("resume", vendorSessionId);
+      break;
+    case "opencode":
+      args.push("--session", vendorSessionId);
+      break;
+    default:
+      break;
+  }
 };
 
 /**
  * The CLI's argv for a session start.
  *
- * Preferred path: `openllm [-d] <client> [--continue]` so device sessions
+ * Preferred path: `openllm [-d] <client> [resume flags]` so device sessions
  * get the same overlay/gateway wiring as a local `openllm claude` launch.
- * `-d` maps to each client's skip-approvals flag inside the openllm CLI
- * (claude → `--dangerously-skip-permissions`, codex →
- * `--dangerously-bypass-approvals-and-sandbox`, grok → `--always-approve`).
- *
- * Fallback (openllm CLI missing, or unmapped provider): host vendor binary
- * directly. Dangerous mode is only applied for claude in that fallback
- * (the only vendor whose flag we hard-code without openllm's mapping).
+ * Cold resume uses vendor resume-by-id; continue without a known id falls
+ * back to claude `--continue` only.
  */
 const argvFor = (
-  cli: TCliProvider,
+  cli: TDeviceSessionCli,
   mode: "spawn" | "continue",
   dangerous: boolean,
+  vendorSessionId: string | null,
 ): ReadonlyArray<string> => {
   const clientId = openllmClientId(cli);
-  const bin = clientId !== null ? openllmBin() : null;
-  if (clientId !== null && bin !== null) {
+  const bin = openllmBin();
+  const canDangerous = dangerous && sessionSupportsDangerous(cli);
+  // Preferred path: openllm wrapper when installed.
+  if (bin !== null) {
     const args: string[] = [bin];
-    // Only pass -d when the openllm CLI can honor it for this client.
-    if (dangerous) args.push("-d");
+    if (canDangerous) args.push("-d");
     args.push(clientId);
-    // Claude persists sessions per-cwd; --continue reopens the most
-    // recent conversation in this workspace. Forwarded as a client arg.
-    if (mode === "continue" && cli === "claude_code") {
+    if (vendorSessionId !== null) {
+      pushResumeArgs(args, cli, vendorSessionId);
+    } else if (mode === "continue" && cli === "claude_code") {
       args.push("--continue");
     }
     return args;
   }
   // Fallback: host vendor binary (no openllm wrapper).
   const host = hostCliBin(cli);
-  if (cli === "claude_code") {
-    const flags: string[] = [];
-    if (dangerous) flags.push("--dangerously-skip-permissions");
-    if (mode === "continue") flags.push("--continue");
-    return [host, ...flags];
+  const flags: string[] = [];
+  if (cli === "claude_code" && canDangerous) {
+    flags.push("--dangerously-skip-permissions");
   }
-  return [host];
+  if (vendorSessionId !== null) {
+    const withResume = [host, ...flags];
+    pushResumeArgs(withResume, cli, vendorSessionId);
+    return withResume;
+  }
+  if (mode === "continue" && cli === "claude_code") {
+    flags.push("--continue");
+  }
+  return [host, ...flags];
+};
+
+/**
+ * Resolve the spawn cwd. New sessions → `$HOME`. Resume may pass an absolute
+ * existing directory; relative / missing / non-dir paths fall back to `$HOME`.
+ */
+export const resolveSessionCwd = (requested: string | undefined): string => {
+  const home = homedir();
+  if (requested === undefined || requested.length === 0) return home;
+  if (!isAbsolute(requested)) return home;
+  // Reject path traversal / non-directories without following untrusted
+  // symlink escapes outside what realpath reports.
+  try {
+    const abs = resolve(requested);
+    const real = realpathSync(abs);
+    if (!statSync(real).isDirectory()) return home;
+    return real;
+  } catch {
+    return home;
+  }
+};
+
+/** Env for a device PTY: real HOME + device-session markers for live.json. */
+const deviceSessionEnv = (
+  cli: TDeviceSessionCli,
+  openllmSessionId: string,
+  title: string | null,
+): Record<string, string> => {
+  const base =
+    cli === "opencode"
+      ? {
+          HOME: homedir(),
+          TMPDIR: process.env.TMPDIR ?? "/tmp",
+          TERM: "xterm-256color",
+        }
+      : sessionEnv(cli);
+  return {
+    ...base,
+    OPENLLM_DEVICE_SESSION_ID: openllmSessionId,
+    ...(title !== null && title.length > 0
+      ? { OPENLLM_DEVICE_TITLE: title.slice(0, 80) }
+      : {}),
+  };
 };
 
 const pushScrollback = (s: TSession, chunk: Uint8Array): void => {
@@ -704,7 +833,7 @@ const handleOpen = (
         : { last_exit_reason: lastExitReason }),
     });
   };
-  // Outer guard: pre-spawn helpers (workspace path, binary lookup, …) used
+  // Outer guard: pre-spawn helpers (cwd resolution, binary lookup, …) used
   // to sit outside the spawn try/catch. An unexpected throw there left the
   // browser waiting on open_ack until its 15s timeout. Always nack.
   try {
@@ -716,8 +845,13 @@ const handleOpen = (
       nack("spawn_failed");
       return;
     }
-    const cli: TSubscriptionProviderSlug = frame.cli;
+    const cli: TDeviceSessionCli = frame.cli;
     const existing = sessions.get(frame.session_id);
+    const resumeId =
+      typeof frame.resume_session_id === "string" &&
+      frame.resume_session_id.length > 0
+        ? frame.resume_session_id
+        : null;
 
     // ── attach: re-bind a live PTY ────────────────────────────────────
     if (frame.mode === "attach") {
@@ -767,41 +901,38 @@ const handleOpen = (
       nack("overloaded");
       return;
     }
-    const workspace = sessionWorkspace(frame.session_id);
-    try {
-      mkdirSync(workspace, { recursive: true });
-    } catch (err) {
-      logWarn(
-        "session",
-        `workspace mkdir failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      nack("spawn_failed");
-      return;
-    }
 
     // Prefer openllm CLI presence (preferred launch path). Fall back to the
-    // host vendor binary when openllm is missing or the provider is unmapped.
-    // Only enforced for the REAL spawner — an injected test spawner never
-    // execs, and CI boxes don't carry the vendor CLIs.
+    // host vendor binary when openllm is missing. Only enforced for the REAL
+    // spawner — an injected test spawner never execs, and CI boxes don't
+    // carry the vendor CLIs. Every DeviceSessionCli maps to an openllm client.
     if (spawner === bunPtySpawner) {
-      const prefersOpenllm = openllmClientId(cli) !== null;
       const hasOpenllm = openllmBin() !== null;
-      const hasHostVendor = hostCliCandidates(cli).some((candidate) =>
+      const hasHostVendor = hostBinCandidates(cli).some((candidate) =>
         existsSync(candidate),
       );
-      if (prefersOpenllm ? !hasOpenllm && !hasHostVendor : !hasHostVendor) {
+      if (!hasOpenllm && !hasHostVendor) {
         nack("cli_not_installed");
         return;
       }
     }
 
-    // `continue` after a daemon restart: no in-memory record, but the
-    // workspace may still exist on disk — recreate the record (the `??`
-    // fallback) and continue in place.
+    // cwd: resume frame / prior session cwd / $HOME. No ~/.openllm/sessions.
+    const cwd = resolveSessionCwd(
+      frame.cwd ??
+        (existing !== undefined ? existing.cwd : undefined) ??
+        undefined,
+    );
+    const vendorSessionId =
+      resumeId ??
+      (existing !== undefined ? existing.vendorSessionId : null);
+
+    // `continue` after a daemon restart: no in-memory record — recreate it.
     const s: TSession = existing ?? {
       id: frame.session_id,
       cli,
-      workspace,
+      cwd,
+      vendorSessionId,
       pty: null,
       scrollback: [],
       scrollbackBytes: 0,
@@ -819,6 +950,10 @@ const handleOpen = (
       generation: 0,
       lastExitReason: null,
     };
+    // Refresh resume metadata on every spawn/continue.
+    s.cwd = cwd;
+    s.vendorSessionId = vendorSessionId;
+    if (frame.title !== undefined) s.title = frame.title;
     sessions.set(s.id, s);
 
     try {
@@ -826,19 +961,21 @@ const handleOpen = (
         cli,
         frame.mode === "continue" ? "continue" : "spawn",
         frame.dangerous === true,
+        vendorSessionId,
       );
       logInfo("session", "session open started", {
         id: s.id,
         cli,
         mode: frame.mode,
+        cwd,
         argv: argv.join(" "),
       });
       const pty = spawner({
         argv,
-        cwd: workspace,
-        // Real user HOME + PATH (via spawnEnv). Session cwd is isolated under
-        // ~/.openllm/sessions/<id>/ without rewriting HOME or sandboxing.
-        env: sessionEnv(cli),
+        cwd,
+        // Real user HOME + PATH (via spawnEnv). Device markers let the
+        // openllm CLI write host=device into ~/.openllm/run/.../live.json.
+        env: deviceSessionEnv(cli, s.id, s.title),
         cols: frame.cols,
         rows: frame.rows,
         onData: (chunk) => {
@@ -903,15 +1040,7 @@ const handleOpen = (
 /** Bind a mux session stream without changing the legacy JSON state machine. */
 export const bindMuxSessionStream = (
   stream: TMuxStream,
-  open: {
-    readonly session_id: string;
-    readonly cli: TSubscriptionProviderSlug;
-    readonly cols: number;
-    readonly rows: number;
-    readonly mode: "spawn" | "attach" | "continue";
-    readonly title?: string;
-    readonly dangerous?: boolean;
-  },
+  open: TSessionStreamOpenPayload,
 ): void => {
   const send = (frame: TRelayFrame): void => {
     if (frame.type === "session_open_ack") {
@@ -963,6 +1092,10 @@ export const bindMuxSessionStream = (
       mode: open.mode,
       ...(open.title === undefined ? {} : { title: open.title }),
       ...(open.dangerous === true ? { dangerous: true } : {}),
+      ...(open.resume_session_id === undefined
+        ? {}
+        : { resume_session_id: open.resume_session_id }),
+      ...(open.cwd === undefined ? {} : { cwd: open.cwd }),
     },
     send,
   );

@@ -14,9 +14,11 @@ import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { openSealed } from "./keypair";
+import { readLocalSessions } from "./local-sessions";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
+import { deviceSessionsForList } from "./session-host";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
 import { invalidateUsage } from "./usage-cache";
@@ -199,6 +201,19 @@ export const runCommandInner = async (
           };
         }
         return { id: cmd.id, status: "done" };
+      }
+      // Vendor-local session index for the device-session picker (history +
+      // ~/.openllm/run live.json + in-memory PTYs). Result rides the lifecycle.
+      case "list_local_sessions": {
+        const sessions = readLocalSessions(cmd.payload.cli, {
+          limit: cmd.payload.limit,
+          deps: { deviceSessions: deviceSessionsForList },
+        });
+        return {
+          id: cmd.id,
+          status: "done",
+          result: { sessions },
+        };
       }
       // Force a self-update check now (the daemon also checks on every bootstrap
       // tick WHEN auto-update is opted in). This is an EXPLICIT user request, so

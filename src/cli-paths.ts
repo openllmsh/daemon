@@ -139,26 +139,30 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
   return out;
 };
 
-// ─── device-session workspace (interactive CLI, real user env) ──────
+// ─── device-session env (interactive CLI, real user home) ───────────
 //
 // Device chat sessions (feature §2.2) run the user's REAL interactive CLI
-// with the real `$HOME` / PATH so credentials and settings work without
-// re-login. Only the cwd is isolated under `~/.openllm/sessions/<id>/` so
-// session workspaces don't litter the real home. Sandbox HOME rewrite /
-// seatbelt grants are intentionally NOT applied here — those stay for
-// auto-update and login/auth triggers only.
+// with the real `$HOME` / PATH so credentials and vendor session stores
+// work without re-login. There is no per-session workspace under
+// `~/.openllm/sessions/` — cwd is `$HOME` (or a validated resume cwd).
+// Sandbox HOME rewrite / seatbelt grants stay for auto-update and
+// login/auth triggers only.
+//
+// Legacy helpers `sessionRoot` / `sessionWorkspace` remain exported for
+// any residual callers/tests but are unused by session-host.
 
-/** Root directory for all device-session workspaces + pidfiles. */
+/** @deprecated Device PTYs no longer use a sessions workspace root. */
 export const sessionRoot = (): string => join(stateDir(), "sessions");
 
-/** Per-session workspace (cwd). Optional isolation without rewriting HOME. */
+/** @deprecated Prefer `$HOME` / resume cwd via session-host.resolveSessionCwd. */
 export const sessionWorkspace = (sessionId: string): string =>
   join(sessionRoot(), sessionId);
 
 /**
  * Environment overrides for a DEVICE SESSION spawn. Keeps the real HOME so
  * vendor CLIs read the user's actual login/settings; only sets TERM and a
- * daemon temp dir. PATH is inherited via `spawnEnv`.
+ * daemon temp dir. PATH is inherited via `spawnEnv`. Session-host layers
+ * `OPENLLM_DEVICE_SESSION_ID` on top for live.json indexing.
  */
 export const sessionEnv = (_provider: TCliProvider): Record<string, string> => ({
   HOME: homedir(),
