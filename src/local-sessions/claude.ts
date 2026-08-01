@@ -7,7 +7,14 @@
  * projects/<slug>/*.jsonl tree.
  */
 
-import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { parseUpdatedMs } from "./grok";
 import { claudeHistoryPath } from "./paths";
 import { truncate } from "./title";
@@ -18,14 +25,25 @@ const CLAUDE_HISTORY_TAIL_BYTES = 2 * 1024 * 1024;
 const readTailLines = (path: string, byteLimit: number): string => {
   const fd = openSync(path, "r");
   try {
-    const stat = statSync(path);
+    const stat = fstatSync(fd);
     const size = Math.max(0, stat.size);
     const start = Math.max(0, size - byteLimit);
     const tailSize = size - start;
     if (tailSize === 0) return "";
     const buffer = Buffer.alloc(tailSize);
-    const read = readSync(fd, buffer, 0, tailSize, start);
-    let text = buffer.subarray(0, read).toString("utf8");
+    let bytesRead = 0;
+    let position = start;
+    let remaining = tailSize;
+
+    while (remaining > 0) {
+      const read = readSync(fd, buffer, bytesRead, remaining, position);
+      if (read === 0) break;
+      bytesRead += read;
+      position += read;
+      remaining -= read;
+    }
+
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
     if (start > 0) {
       const newline = text.indexOf("\n");
       if (newline === -1) return "";
