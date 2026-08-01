@@ -103,9 +103,16 @@ export const runSandboxExec = async (
 ): Promise<never> => {
   const state = await applyDaemonSandbox({ force: true });
   if (state === "error" || state === "unsupported") {
+    // Loud on BOTH channels: stderr for the immediate caller, and the shared
+    // daemon log so per-spawn degradation is visible next to the boot-time
+    // capability probe's posture (the probe can say "enforced" while an
+    // individual apply later degrades — fail-open, but never silent).
     process.stderr.write(
       `openllmd --sandbox-exec: sandbox not applied (${state}) — running unconfined\n`,
     );
+    logWarn("sandbox", `--sandbox-exec apply degraded (${state})`, {
+      command: tail[0] ?? "?",
+    });
   }
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -120,13 +127,34 @@ export const runSandboxExec = async (
         err instanceof Error ? err.message : String(err)
       }\n`,
     );
-    process.exit(127);
+    return process.exit(127);
+  }
+  // Forward termination signals to the tail: the daemon kills the SHIM
+  // (`proc.kill()` at the call site reaches the wrapper, not the child), so
+  // without forwarding the sandboxed tail would outlive its parent. The shim
+  // then exits via the child's `128 + signal` mirror below.
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    process.on(signal, () => {
+      try {
+        proc.kill(signal);
+      } catch {
+        // child already gone — the exit mirror below finishes up
+      }
+    });
   }
   await proc.exited;
   if (proc.signalCode !== null) {
-    process.exit(128 + (signalNumber(proc.signalCode) ?? 15));
+    // The shim's exit-code mirror means the DAEMON-side caller sees
+    // `128 + N`, not a signalCode — so `logIfKilled` can't fire there. Log
+    // the kill HERE (the shim shares the daemon's log file), preserving the
+    // "child killed by a signal — likely a sandbox denial" breadcrumb.
+    logWarn("sandbox", `--sandbox-exec child killed by ${proc.signalCode}`, {
+      command: tail[0] ?? "?",
+      signal: proc.signalCode,
+    });
+    return process.exit(128 + (signalNumber(proc.signalCode) ?? 15));
   }
-  process.exit(proc.exitCode ?? 1);
+  return process.exit(proc.exitCode ?? 1);
 };
 
 /** Map a signal NAME to its conventional number for the `128 + N` exit. */

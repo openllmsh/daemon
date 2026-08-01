@@ -112,7 +112,10 @@ const main = async (): Promise<void> => {
   // Always record the decision at boot so an unconfined posture is visible in
   // the log, not just on the (cloud-pushed) `DaemonStatus.sandbox` field —
   // the localhost-only boot never pushes status.
-  logInfo("sandbox", `os sandbox (per-child): ${sandbox}`);
+  // "capability" wording: this is what wrapped children WILL get, not proof
+  // any child applied it — a per-spawn apply that degrades logs its own
+  // loud warning from the shim (`runSandboxExec`), fail-open per the audit.
+  logInfo("sandbox", `os sandbox capability (per-child): ${sandbox}`);
 
   // Last-resort crash handling. The daemon is headless under launchd/systemd,
   // so an uncaught throw or rejected promise would otherwise die silently —

@@ -230,24 +230,40 @@ export const recordSandboxState = (state: TSandboxState): void => {
 };
 
 /**
+ * Bind libc and probe the kernel's Landlock ABI in one step — the
+ * `LANDLOCK_CREATE_RULESET_VERSION` flags syscall creates no ruleset and
+ * restricts nothing. Shared by the boot-time capability probe
+ * ({@link probeLandlockSupport}) and the real apply (`applyInner`), so the
+ * ABI detection can never drift between the two. `abi <= 0` = unsupported.
+ */
+const probeLandlockAbi = async (): Promise<{
+  readonly libc: TLibc;
+  readonly abi: number;
+} | null> => {
+  const libc = await bindLibc();
+  if (libc === null) return null;
+  const abi = Number(
+    libc.syscall3(
+      SYS_LANDLOCK_CREATE_RULESET,
+      0n,
+      0n,
+      BigInt(LANDLOCK_CREATE_RULESET_VERSION),
+    ),
+  );
+  return { libc, abi };
+};
+
+/**
  * Cheap Linux capability probe: is Landlock actually available on this
- * kernel? Runs only the `LANDLOCK_CREATE_RULESET_VERSION` flags syscall —
- * no ruleset is created, nothing is restricted. Feeds the boot-time posture
- * so `"unsupported"` stays accurate under the per-child model.
+ * kernel? Runs only the ABI flags syscall — no ruleset is created, nothing
+ * is restricted. Feeds the boot-time posture so `"unsupported"` stays
+ * accurate under the per-child model.
  */
 export const probeLandlockSupport = async (): Promise<TSandboxState> => {
   try {
-    const libc = await bindLibc();
-    if (libc === null) return "error";
-    const abi = Number(
-      libc.syscall3(
-        SYS_LANDLOCK_CREATE_RULESET,
-        0n,
-        0n,
-        BigInt(LANDLOCK_CREATE_RULESET_VERSION),
-      ),
-    );
-    return abi <= 0 ? "unsupported" : "enforced";
+    const probed = await probeLandlockAbi();
+    if (probed === null) return "error";
+    return probed.abi <= 0 ? "unsupported" : "enforced";
   } catch {
     return "error";
   }
@@ -308,21 +324,13 @@ const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
     return "unsupported";
   }
   try {
-    const libc = await bindLibc();
-    if (libc === null) {
+    const probed = await probeLandlockAbi();
+    if (probed === null) {
       logWarn("sandbox", "could not bind libc — running unconfined");
       return "error";
     }
-
-    // Probe the kernel's Landlock ABI (≤ 0 = unsupported / disabled).
-    const abi = Number(
-      libc.syscall3(
-        SYS_LANDLOCK_CREATE_RULESET,
-        0n,
-        0n,
-        BigInt(LANDLOCK_CREATE_RULESET_VERSION),
-      ),
-    );
+    const { libc, abi } = probed;
+    // ≤ 0 = unsupported / disabled kernel.
     if (abi <= 0) {
       logInfo(
         "sandbox",
