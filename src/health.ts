@@ -13,9 +13,11 @@
  * The point of the endpoint: the supervisor (systemd/launchd) only knows
  * whether it has a process; it can't tell a daemon that's actually SERVING from
  * one that's crash-looping on the listener bind. A successful fetch of this body
- * IS the authoritative "the daemon is up and serving" signal, and it carries the
- * real `sandbox` posture this process applied at boot (the CLI can't compute
- * that itself — it never ran `applyDaemonSandbox`).
+ * IS the authoritative "the daemon is up and serving" signal, and it carries
+ * the real `sandbox` posture the boot-time capability probe computed —
+ * "enforced" means risky CHILDREN are wrapped via the `--sandbox-exec` shim
+ * (`sandbox/exec.ts`), not that the daemon process is confined (the CLI can't
+ * compute the posture itself — it never ran the probe).
  */
 import type { TCloudState } from "./config";
 import type { TSandboxState } from "./sandbox/landlock";
@@ -23,7 +25,8 @@ import type { TSandboxState } from "./sandbox/landlock";
 export type TDaemonHealth = {
   readonly version: string;
   readonly port: number;
-  /** The OS-sandbox posture this process applied at boot (`sandboxState()`). */
+  /** The per-child OS-sandbox posture from the boot capability probe
+   *  (`sandboxState()`): "enforced" = risky children are wrapped. */
   readonly sandbox: TSandboxState;
   readonly cloud_state: TCloudState;
   readonly key_configured: boolean;

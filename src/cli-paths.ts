@@ -146,8 +146,11 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
 // with the real `$HOME` / PATH so credentials and vendor session stores
 // work without re-login. There is no per-session workspace under
 // `~/.openllm/sessions/` — cwd is `$HOME` (or a validated resume cwd).
-// Sandbox HOME rewrite / seatbelt grants stay for auto-update and
-// login/auth triggers only.
+// The `cliEnv()` isolated-HOME rewrite is not applied here, and the session
+// PTY is deliberately NOT wrapped in the per-child OS sandbox shim
+// (`sandbox/exec.ts`) — it runs the user's real CLI over their real files,
+// which deny-by-default confinement would break
+// (`docs/audits/daemon-sandbox-scoping.md`).
 //
 // Legacy helpers `sessionRoot` / `sessionWorkspace` remain exported for
 // any residual callers/tests but are unused by session-host.

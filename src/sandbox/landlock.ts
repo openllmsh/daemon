@@ -3,13 +3,17 @@
  * Landlock backend — `docs/proposals/daemon-os-sandbox-and-typed-control.md`
  * §3.3a. `applyDaemonSandbox` dispatches by platform: **Linux → Landlock**
  * (here), **macOS → Seatbelt** (`./seatbelt.ts`), other → unsupported. Both
- * backends are in-process, unprivileged, applied once at boot before the
- * listener binds, derived from the same working set (`./working-set.ts`), and
- * inherited across `execve` — so every spawned child (`bash` running a
- * SHA-gated integration script, `curl`, the vendor CLIs) is confined too, and
+ * backends are in-process, unprivileged, derived from the same working set
+ * (`./working-set.ts`), and inherited across `execve`. The sandbox is
+ * PER-CHILD, not process-wide: the daemon itself boots unconfined (so device
+ * session PTYs can run the user's real CLI over their real files) and each
+ * risky child is wrapped through the `--sandbox-exec` self-re-exec shim
+ * (`./exec.ts`), whose re-exec'd process calls `applyDaemonSandbox({ force:
+ * true })` before running the child — so `bash` running a SHA-gated
+ * integration script, `curl`, and the vendor CLIs are confined, and
  * everything outside the working set (`~/.ssh`, `~/.aws`, the user's real
- * `~/.codex`, browser profiles) is unreachable even if the daemon is fully
- * compromised.
+ * `~/.codex`, browser profiles) is unreachable from them. See
+ * `docs/audits/daemon-sandbox-scoping.md`.
  *
  * Landlock (this file): a ruleset granting only the working-set paths, on
  * kernels ≥ 5.13. It can't restrict the network on the kernels we target —
@@ -213,26 +217,98 @@ const pathBeneathAttr = (allowed: bigint, fd: number): Uint8Array => {
 
 let appliedState: TSandboxState = "off";
 
-/** The posture {@link applyDaemonSandbox} ended up with (for `status.ts`). */
+/** The posture this process reached (for `status.ts` / `health.ts`). In the
+ *  daemon server it is fed by the boot-time capability probe
+ *  (`exec.ts` `probeSandboxCapability`) — "enforced" means risky CHILDREN are
+ *  wrapped via the `--sandbox-exec` shim, not that this process is confined. */
 export const sandboxState = (): TSandboxState => appliedState;
+
+/** Record the posture for {@link sandboxState} — used by the boot-time
+ *  capability probe, which computes the posture without applying anything. */
+export const recordSandboxState = (state: TSandboxState): void => {
+  appliedState = state;
+};
+
+/**
+ * Bind libc and probe the kernel's Landlock ABI in one step — the
+ * `LANDLOCK_CREATE_RULESET_VERSION` flags syscall creates no ruleset and
+ * restricts nothing. Shared by the boot-time capability probe
+ * ({@link probeLandlockSupport}) and the real apply (`applyInner`), so the
+ * ABI detection can never drift between the two. `abi <= 0` = unsupported.
+ */
+const probeLandlockAbi = async (): Promise<{
+  readonly libc: TLibc;
+  readonly abi: number;
+} | null> => {
+  const libc = await bindLibc();
+  if (libc === null) return null;
+  const abi = Number(
+    libc.syscall3(
+      SYS_LANDLOCK_CREATE_RULESET,
+      0n,
+      0n,
+      BigInt(LANDLOCK_CREATE_RULESET_VERSION),
+    ),
+  );
+  return { libc, abi };
+};
+
+/**
+ * Cheap Linux capability probe: is Landlock actually available on this
+ * kernel? Runs only the ABI flags syscall — no ruleset is created, nothing
+ * is restricted. Feeds the boot-time posture so `"unsupported"` stays
+ * accurate under the per-child model.
+ */
+export const probeLandlockSupport = async (): Promise<TSandboxState> => {
+  if (process.platform !== "linux") return "unsupported";
+  try {
+    const probed = await probeLandlockAbi();
+    if (probed === null) return "error";
+    return probed.abi <= 0 ? "unsupported" : "enforced";
+  } catch {
+    return "error";
+  }
+};
+
+export type TApplySandboxOpts = {
+  /** Bypass the dev-version opt-in gate (used by the `--sandbox-exec` shim,
+   *  which is invoked deliberately). The `OPENLLM_DAEMON_NO_SANDBOX=1` kill
+   *  switch still wins. */
+  readonly force?: boolean;
+};
 
 /**
  * Apply the Landlock working-set ruleset to THIS process (and, by
- * inheritance, every child it ever spawns). Call once at boot, before the
- * listener binds. Never throws; returns + records the resulting posture.
+ * inheritance, every child it ever spawns). Called by the `--sandbox-exec`
+ * shim before it runs its tail argv (and by the sandbox test probes).
+ * Never throws; returns + records the resulting posture.
  */
-export const applyDaemonSandbox = async (): Promise<TSandboxState> => {
-  appliedState = await applyInner();
+let inProcessApplied = false;
+
+export const applyDaemonSandbox = async (
+  opts?: TApplySandboxOpts,
+): Promise<TSandboxState> => {
+  appliedState = await applyInner(opts);
+  if (appliedState === "enforced") inProcessApplied = true;
   return appliedState;
 };
 
-const applyInner = async (): Promise<TSandboxState> => {
+/** Whether THIS process is itself confined (a real in-process apply reached
+ *  `enforced` — the shim's re-exec, or a test probe). Children then inherit
+ *  the confinement, so `sandboxSpawnArgs` must NOT re-wrap them: the dev-run
+ *  wrap re-execs `process.argv[1]`, which inside a probe is not the daemon
+ *  entry, and a double apply is pointless anyway. */
+export const sandboxAppliedInProcess = (): boolean => inProcessApplied;
+
+const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {
     logWarn("sandbox", "OPENLLM_DAEMON_NO_SANDBOX=1 — running unconfined");
     return "off";
   }
-  // Source runs opt in (§3.5); the compiled service path always applies it.
+  // Source runs opt in (§3.5); the shim (`force`) and the compiled binary
+  // always apply it.
   if (
+    opts?.force !== true &&
     DAEMON_VERSION === "0.0.0-dev" &&
     process.env.OPENLLM_DAEMON_SANDBOX !== "1"
   ) {
@@ -249,21 +325,13 @@ const applyInner = async (): Promise<TSandboxState> => {
     return "unsupported";
   }
   try {
-    const libc = await bindLibc();
-    if (libc === null) {
+    const probed = await probeLandlockAbi();
+    if (probed === null) {
       logWarn("sandbox", "could not bind libc — running unconfined");
       return "error";
     }
-
-    // Probe the kernel's Landlock ABI (≤ 0 = unsupported / disabled).
-    const abi = Number(
-      libc.syscall3(
-        SYS_LANDLOCK_CREATE_RULESET,
-        0n,
-        0n,
-        BigInt(LANDLOCK_CREATE_RULESET_VERSION),
-      ),
-    );
+    const { libc, abi } = probed;
+    // ≤ 0 = unsupported / disabled kernel.
     if (abi <= 0) {
       logInfo(
         "sandbox",

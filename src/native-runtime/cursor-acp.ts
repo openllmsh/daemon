@@ -53,6 +53,7 @@ import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { spawnCwd } from "../delegation/util";
 import { logError, logInfo, logWarn } from "../logger";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import type { TCursorMcpServer } from "./cursor-mcp-server";
 import { startCursorMcpServer } from "./cursor-mcp-server";
@@ -295,7 +296,7 @@ class AcpClient {
       params: unknown,
     ) => unknown = () => null,
   ) {
-    this.proc = Bun.spawn([bin, "acp"], {
+    this.proc = Bun.spawn(sandboxSpawnArgs([bin, "acp"]), {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",

@@ -42,6 +42,7 @@ import {
 import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import type { TNativeRunResult } from "./types";
 import {
   cleanNativeSpawnEnv,
@@ -194,7 +195,7 @@ export const runClaudeNative = async (
   ];
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(argv, {
+    proc = Bun.spawn(sandboxSpawnArgs(argv), {
       stdin: new TextEncoder().encode(params.userText),
       stdout: "pipe",
       stderr: "pipe",

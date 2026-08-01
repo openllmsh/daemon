@@ -24,6 +24,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { spawnCwd } from "./util";
 
 /** The shared return shape of `connect()` / `connectDeviceCode()`. */
@@ -230,7 +231,7 @@ export const spawnStreamLogin = async <T>(
 > => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn([...opts.argv], {
+    proc = Bun.spawn(sandboxSpawnArgs(opts.argv), {
       stdin: "ignore",
       stdout: opts.stream === "stdout" ? "pipe" : "ignore",
       // The unread fd is discarded (not piped) so an undrained pipe can't stall

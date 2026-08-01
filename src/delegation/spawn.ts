@@ -12,6 +12,7 @@ import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import { logError } from "../logger";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
 
 /** Merge an env map onto the parent env for a spawned isolated CLI. */
@@ -84,7 +85,7 @@ export const runCapture = async (
   env?: Record<string, string>,
 ): Promise<string | null> => {
   try {
-    const proc = Bun.spawn([...argv], {
+    const proc = Bun.spawn(sandboxSpawnArgs(argv), {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
@@ -158,7 +159,7 @@ export const spawnLogin = async (
   env?: Record<string, string>,
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
-  const proc = Bun.spawn([...argv], {
+  const proc = Bun.spawn(sandboxSpawnArgs(argv), {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -326,7 +327,9 @@ export const spawnLoginPty = async (
   // already gated to darwin/linux above. We POLL `tsFile` for `opts.until`.
   const scriptArgv = ptyScriptArgv(argv, tsFile) ?? [...argv];
 
-  const proc = Bun.spawn(scriptArgv, {
+  // Wrap the WHOLE `script(1)` argv — the PTY wrapper and the vendor CLI it
+  // runs are one confined tree.
+  const proc = Bun.spawn(sandboxSpawnArgs(scriptArgv), {
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",
@@ -390,6 +393,10 @@ export const openUrl = (url: string): void => {
         ? ["cmd", "/c", "start", "", `"${url}"`]
         : ["xdg-open", url];
   try {
+    // Deliberately UNWRAPPED (no `sandboxSpawnArgs`): opening the user's
+    // browser is a user-facing action like the session-PTY exemption — the
+    // launcher must reach the real GUI session/LaunchServices state, and it
+    // takes only the URL string (no filesystem payload to confine).
     Bun.spawn(argv, {
       stdin: "ignore",
       stdout: "ignore",

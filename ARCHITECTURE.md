@@ -67,6 +67,7 @@ daemon/
       working-set.ts        the daemon's filesystem allow-list — ONE source consumed by every sandbox backend
       landlock.ts           cross-platform applyDaemonSandbox() dispatcher + the Linux Landlock backend (bun:ffi, inherited by children)
       seatbelt.ts           macOS Seatbelt backend — in-process sandbox_init() deny-by-default profile (bun:ffi, inherited by children)
+      exec.ts               per-child sandboxing — sandboxSpawnArgs() wrap + the --sandbox-exec shim verb + the boot capability probe
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
     sub-method.ts           per-provider execution-method table (bridge|handrolled) + per-hop selection
@@ -470,15 +471,27 @@ Two orthogonal hardenings from
   hand-cast). The union ⇔ executor lockstep is machine-checked by
   `tests/deployment/daemon-command-vocabulary.test.ts`.
 - **Filesystem confinement (the blast-radius bound).** The path isolation
-  below is **kernel-enforced on Linux AND macOS**, not just env-redirected.
-  `sandbox/working-set.ts` derives ONE allow-list from `env.ts`/`cli-paths.ts`
+  below is **kernel-enforced on Linux AND macOS**, not just env-redirected —
+  and it is **PER-CHILD**, not process-wide
+  (`docs/audits/daemon-sandbox-scoping.md`): the daemon process boots
+  UNCONFINED (device-session PTYs must run the user's real CLI over their real
+  files), and each risky child argv is wrapped by
+  `sandboxSpawnArgs()` (`sandbox/exec.ts`) into the
+  `openllmd --sandbox-exec -- <argv…>` self-re-exec shim, which applies
+  `applyDaemonSandbox({ force: true })` to itself before running the child
+  (inheritance across `execve` does the rest). Wrapped: delegation capture /
+  login / keychain spawns, the `open`/`xdg-open` browser launch, and the
+  long-lived native runtimes. NOT wrapped: the session-host PTY spawn (the
+  exemption), read-only diagnostics (`ps`, `journalctl`/`tail`), and CLI-verb
+  paths. `sandbox/working-set.ts` derives ONE allow-list from
+  `env.ts`/`cli-paths.ts`
   (the state dir — which contains the binary, CLI homes, and logs — plus the
   claude-code integration footprint `~/.claude`/`~/.claude.json` read-write;
   system trees read-only; everything else, notably `~/.ssh`/`~/.aws`/the
   user's real CLI homes, implicitly denied). `applyDaemonSandbox()`
   (`sandbox/landlock.ts`) dispatches by platform to one of two in-process,
-  unprivileged, self-applied backends — both applied in `main()` before the
-  listener binds, both inherited across `execve` (so `bash` running a SHA-gated
+  unprivileged, self-applied backends — applied in the SHIM process, both
+  inherited across `execve` (so `bash` running a SHA-gated
   integration script, `curl`, and the vendor CLIs are confined too):
   - **Linux → Landlock** (`sandbox/landlock.ts`) — a deny-by-default Landlock
     ruleset over the working set (kernel ≥ 5.13, `bun:ffi` → `syscall(2)`).
@@ -513,9 +526,14 @@ Two orthogonal hardenings from
 
   Posture rides every status push as `DaemonStatus.sandbox`
   (`enforced`/`off`/`unsupported`/`error` — fail-open with a loud log, never
-  silent). Kill switch `OPENLLM_DAEMON_NO_SANDBOX=1`; dev source runs opt in
-  via `OPENLLM_DAEMON_SANDBOX=1`. CLI verbs run unconfined (service
-  registration/uninstall touch paths outside the working set).
+  silent). Under the per-child model it comes from a boot-time CAPABILITY
+  probe (`probeSandboxCapability` in `sandbox/exec.ts` — gates + platform +
+  Linux Landlock ABI, restricting nothing): `enforced` means "risky children
+  are wrapped", not "this process is confined". Kill switch
+  `OPENLLM_DAEMON_NO_SANDBOX=1` (children spawn unwrapped); dev source runs
+  opt in via `OPENLLM_DAEMON_SANDBOX=1` (wraps via `bun <entry>
+  --sandbox-exec`). CLI verbs run unconfined (service registration/uninstall
+  touch paths outside the working set).
 
 ## Delegation (the compliance core)
 

@@ -49,7 +49,8 @@ import { buildHealth } from "./health";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
 import { maybeReportModels } from "./model-report";
-import { applyDaemonSandbox, sandboxState } from "./sandbox/landlock";
+import { probeSandboxCapability } from "./sandbox/exec";
+import { recordSandboxState, sandboxState } from "./sandbox/landlock";
 import {
   beginRequest,
   endRequest,
@@ -98,18 +99,23 @@ const main = async (): Promise<void> => {
   // and before the (costly) sandbox/FFI work it's meant to stop repeating.
   guardCrashLoop();
 
-  // OS sandbox (Linux Landlock / macOS Seatbelt — see `sandbox/landlock.ts`'s
-  // `applyDaemonSandbox` dispatcher): confine this process + every child it
-  // spawns to the declared working set BEFORE any listener binds or network
-  // dial happens. Fail-open with a loud log; the resulting posture rides every
-  // status push (`DaemonStatus.sandbox`). CLI verbs (`runCli` below)
-  // deliberately run unconfined — service registration and uninstall touch
-  // paths outside the working set.
-  const sandbox = await applyDaemonSandbox();
-  // Always record the decision at boot so an unconfined daemon is visible in
+  // OS sandbox is PER-CHILD, not process-wide (see
+  // `docs/audits/daemon-sandbox-scoping.md`): the daemon itself boots
+  // UNCONFINED so device-session PTYs can run the user's real CLI over their
+  // real files; every risky child is wrapped through the `--sandbox-exec`
+  // shim (`sandbox/exec.ts` `sandboxSpawnArgs`). Here we only run the cheap
+  // boot-time CAPABILITY probe (platform + gates + Linux Landlock ABI) so the
+  // posture rides every status push (`DaemonStatus.sandbox`) — "enforced"
+  // means "risky children are wrapped".
+  const sandbox = await probeSandboxCapability();
+  recordSandboxState(sandbox);
+  // Always record the decision at boot so an unconfined posture is visible in
   // the log, not just on the (cloud-pushed) `DaemonStatus.sandbox` field —
   // the localhost-only boot never pushes status.
-  logInfo("sandbox", `os sandbox: ${sandbox}`);
+  // "capability" wording: this is what wrapped children WILL get, not proof
+  // any child applied it — a per-spawn apply that degrades logs its own
+  // loud warning from the shim (`runSandboxExec`), fail-open per the audit.
+  logInfo("sandbox", `os sandbox capability (per-child): ${sandbox}`);
 
   // Last-resort crash handling. The daemon is headless under launchd/systemd,
   // so an uncaught throw or rejected promise would otherwise die silently —

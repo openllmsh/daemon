@@ -12,6 +12,7 @@
 import { chmodSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
 import { spawnCwd, spawnEnv, stripAnsi } from "./spawn";
 
@@ -89,7 +90,7 @@ export const spawnHeadlessLogin = async (
     childEnv.PATH = `${shimDir}:${baseEnv.PATH ?? process.env.PATH ?? ""}`;
   }
 
-  const proc = Bun.spawn([...argv], {
+  const proc = Bun.spawn(sandboxSpawnArgs(argv), {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
