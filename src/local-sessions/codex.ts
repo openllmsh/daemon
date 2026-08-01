@@ -5,11 +5,38 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { codexSessionsDir, codexStateDbPath } from "./paths";
 import { truncate } from "./title";
 import type { THistorySession } from "./types";
+
+const ROLLOUT_FILE_HEADER_BYTES = 4096;
+
+const readHead = (path: string, byteLimit: number): string => {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(byteLimit);
+    const read = readSync(fd, buffer, 0, byteLimit, 0);
+    return buffer.subarray(0, Math.max(0, read)).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+};
+
+const parseRolloutFirstLine = (raw: string): unknown => {
+  const newline = raw.indexOf("\n");
+  const first = newline === -1 ? raw : raw.slice(0, newline);
+  if (first === "") return undefined;
+  return JSON.parse(first);
+};
 
 const titleOf = (row: {
   title?: unknown;
@@ -100,9 +127,9 @@ const readFromRollouts = (limit: number): THistorySession[] => {
   for (const f of files.slice(0, limit * 2)) {
     if (out.length >= limit) break;
     try {
-      const first = readFileSync(f.path, "utf8").split("\n", 1)[0];
-      if (first === undefined) continue;
-      const row = JSON.parse(first) as {
+      const row = parseRolloutFirstLine(
+        readHead(f.path, ROLLOUT_FILE_HEADER_BYTES),
+      ) as {
         type?: string;
         payload?: {
           session_id?: string;

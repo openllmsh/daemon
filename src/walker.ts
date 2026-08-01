@@ -1675,7 +1675,7 @@ const tryFleetTunnel = async (
     return res;
   } catch {
     if (args.req.signal.aborted)
-      throw new DOMException("Aborted", "AbortError");
+      return errorJson(499, "client aborted request");
     return null;
   }
 };

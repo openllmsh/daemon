@@ -344,12 +344,23 @@ const probeActivity = async (
     let total = 0;
     for (const [pid, percent] of cpu) {
       let current: number | undefined = pid;
-      while (current !== undefined && current !== 0) {
+      let hops = 0;
+      const visited = new Set<number>();
+      while (
+        current !== undefined &&
+        current !== 0 &&
+        hops < 4_096 &&
+        !visited.has(current)
+      ) {
         if (current === root) {
           total += percent;
           break;
         }
-        current = parent.get(current);
+        visited.add(current);
+        const next = parent.get(current);
+        if (next === current) break;
+        current = next;
+        hops += 1;
       }
     }
     if (total > 1) busy.add(root);

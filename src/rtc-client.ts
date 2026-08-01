@@ -18,6 +18,7 @@ import {
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
   RTC_AUTH_NONCE_BYTES,
+  RTC_DEFAULT_STUN,
   verifyAnswerInner,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
@@ -28,7 +29,6 @@ import type { TEphKeypair } from "./keypair";
 import { generateEphKeypair, openSealedWith, sealTo } from "./keypair";
 import { logDebug, logWarn } from "./logger";
 
-const DEFAULT_STUN = "stun:stun.l.google.com:19302";
 const RTC_SIGNALING_TIMEOUT_MS = 10_000;
 const RTC_ICE_TIMEOUT_MS = 20_000;
 export const RTC_FAILURE_CACHE_MS = 60_000;
@@ -68,7 +68,8 @@ export const configureRtcClient = (options: {
 
 const iceServers = (): ReadonlyArray<{ urls: string }> => {
   const raw = process.env.OPENLLM_RTC_STUN?.trim();
-  if (raw === undefined || raw.length === 0) return [{ urls: DEFAULT_STUN }];
+  if (raw === undefined || raw.length === 0)
+    return [{ urls: RTC_DEFAULT_STUN }];
   return raw
     .split(",")
     .map((value) => value.trim())

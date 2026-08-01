@@ -8,7 +8,7 @@ import { grokSessionsDir } from "./paths";
 import { truncate } from "./title";
 import type { THistorySession } from "./types";
 
-const parseUpdatedMs = (raw: unknown, fallback: number): number => {
+export const parseUpdatedMs = (raw: unknown, fallback: number): number => {
   if (typeof raw === "string") {
     const t = Date.parse(raw);
     if (Number.isFinite(t)) return t;

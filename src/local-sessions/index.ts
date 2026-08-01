@@ -103,27 +103,35 @@ export const readLocalSessions = (
   };
 
   const byKey = new Map<string, TRow>();
+  const byOpenllmId = new Map<string, string>();
+
+  const mergeRows = (previous: TRow, row: TRow): TRow => ({
+    id: row.id.length > 0 ? row.id : previous.id,
+    title:
+      row.title !== "Untitled" && row.title.length > 0
+        ? row.title
+        : previous.title,
+    cwd: row.cwd ?? previous.cwd,
+    updated_at_ms: Math.max(row.updated_at_ms, previous.updated_at_ms),
+    live: row.live || previous.live,
+    host: row.host ?? previous.host,
+    openllm_session_id: row.openllm_session_id ?? previous.openllm_session_id,
+    attachable: row.attachable || previous.attachable,
+  });
 
   const put = (row: TRow, key: string): void => {
-    const prev = byKey.get(key);
-    if (prev === undefined) {
-      byKey.set(key, row);
-      return;
+    const openllmId = row.openllm_session_id;
+    const existingKey =
+      openllmId !== null && openllmId.length > 0
+        ? byOpenllmId.get(openllmId)
+        : undefined;
+    const targetKey = existingKey ?? key;
+    const previous = byKey.get(targetKey);
+    const merged = previous === undefined ? row : mergeRows(previous, row);
+    byKey.set(targetKey, merged);
+    if (openllmId !== null && openllmId.length > 0) {
+      byOpenllmId.set(openllmId, targetKey);
     }
-    // Prefer attachable / live overlays; keep the fresher timestamp.
-    byKey.set(key, {
-      id: row.id.length > 0 ? row.id : prev.id,
-      title:
-        row.title !== "Untitled" && row.title.length > 0
-          ? row.title
-          : prev.title,
-      cwd: row.cwd ?? prev.cwd,
-      updated_at_ms: Math.max(row.updated_at_ms, prev.updated_at_ms),
-      live: row.live || prev.live,
-      host: row.host ?? prev.host,
-      openllm_session_id: row.openllm_session_id ?? prev.openllm_session_id,
-      attachable: row.attachable || prev.attachable,
-    });
   };
 
   for (const h of history) {

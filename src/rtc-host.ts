@@ -21,6 +21,7 @@ import {
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
   normalizeFingerprint,
+  RTC_DEFAULT_STUN,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
@@ -42,9 +43,6 @@ const MAX_CONCURRENT_RTC = 8;
  */
 const RTC_HANDSHAKE_TIMEOUT_MS = 30_000;
 
-/** Default STUN; override with comma-separated `OPENLLM_RTC_STUN`. */
-const DEFAULT_STUN = "stun:stun.l.google.com:19302";
-
 type TRtcSession = {
   readonly channelId: string;
   readonly pc: RTCPeerConnection;
@@ -65,7 +63,8 @@ export const configureRtcHost = (options: {
 
 const iceServers = (): ReadonlyArray<{ urls: string }> => {
   const raw = process.env.OPENLLM_RTC_STUN?.trim();
-  if (raw === undefined || raw.length === 0) return [{ urls: DEFAULT_STUN }];
+  if (raw === undefined || raw.length === 0)
+    return [{ urls: RTC_DEFAULT_STUN }];
   return raw
     .split(",")
     .map((s) => s.trim())

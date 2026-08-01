@@ -22,10 +22,22 @@ export const VENDOR_CLI_NAMES: readonly string[] = [
   "openllmc",
 ];
 
+const executableFromCommand = (command: string): string | null => {
+  const trimmed = command.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const quote = trimmed[0];
+    const end = trimmed.indexOf(quote, 1);
+    return end > 0 ? trimmed.slice(1, end) : null;
+  }
+  const space = trimmed.search(/\s/);
+  return space === -1 ? trimmed : trimmed.slice(0, space);
+};
+
 /** Extract and validate the executable token from `ps -o command=` output. */
 export const isVendorSessionCommand = (command: string): boolean => {
-  const executable = command.trim().split(/\s+/, 1)[0];
-  if (executable === undefined || executable === "") return false;
+  const executable = executableFromCommand(command);
+  if (executable === null || executable.length === 0) return false;
   const name = basename(executable).toLowerCase();
   return VENDOR_CLI_NAMES.some(
     (vendor) => name === vendor || name.startsWith(`${vendor}-`),

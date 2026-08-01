@@ -146,7 +146,19 @@ export const handleChannelOpenAck = (frame: {
     return;
   }
   const pending = opening.get(keyId);
-  if (pending === undefined || sendBinary === null) return;
+  if (pending === undefined) return;
+  if (sendBinary === null || active !== null) {
+    opening.delete(keyId);
+    clearTimeout(pending.timer);
+    failedUntil.set(keyId, Date.now() + MUX_FAILURE_CACHE_MS);
+    sendFrame?.({
+      type: "channel_close",
+      channel_id: pending.channelId,
+      reason: "channel_exists",
+    });
+    pending.resolve(null);
+    return;
+  }
   opening.delete(keyId);
   clearTimeout(pending.timer);
   const duplex = relayDuplex(sendBinary, (callback) => {
@@ -212,6 +224,15 @@ export const acceptChannel = (frame: {
       channel_id: frame.channel_id,
       ok: false,
       error: "not_capable",
+    });
+    return;
+  }
+  if (active !== null || opening.size > 0) {
+    send({
+      type: "channel_open_ack",
+      channel_id: frame.channel_id,
+      ok: false,
+      error: "channel_exists",
     });
     return;
   }
