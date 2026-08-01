@@ -96,6 +96,8 @@ const forEachLimit = async <T>(
 export const readGrokHistory = async (
   limit: number,
 ): Promise<THistorySession[]> => {
+  if (limit <= 0) return [];
+
   const root = grokSessionsDir();
   const rootStat = await stat(root).catch(() => null);
   if (rootStat === null || !rootStat.isDirectory()) return [];
