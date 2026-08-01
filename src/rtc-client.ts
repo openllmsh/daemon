@@ -33,6 +33,7 @@ import { logDebug, logWarn } from "./logger";
 const RTC_SIGNALING_TIMEOUT_MS = 10_000;
 const RTC_ICE_TIMEOUT_MS = 20_000;
 export const RTC_FAILURE_CACHE_MS = 60_000;
+const RTC_DISCONNECT_GRACE_MS = 3_000;
 
 type TRtcClientSession = {
   readonly keyId: string;
@@ -53,6 +54,7 @@ type TRtcClientSession = {
   closed: boolean;
   signalingTimer: ReturnType<typeof setTimeout> | null;
   iceTimer: ReturnType<typeof setTimeout> | null;
+  disconnectTimer: ReturnType<typeof setTimeout> | null;
 };
 
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
@@ -129,6 +131,10 @@ const clearTimers = (session: TRtcClientSession): void => {
   if (session.iceTimer !== null) {
     clearTimeout(session.iceTimer);
     session.iceTimer = null;
+  }
+  if (session.disconnectTimer !== null) {
+    clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = null;
   }
 };
 
@@ -274,6 +280,7 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
       closed: false,
       signalingTimer: null,
       iceTimer: null,
+      disconnectTimer: null,
     };
     sessionsByKey.set(keyId, session);
     sessionsByChannel.set(channelId, session);
@@ -309,12 +316,29 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
     };
     pc.onconnectionstatechange = () => {
       if (session === null || session.closed) return;
-      if (
-        ["failed", "closed", "disconnected"].includes(
-          session.pc.connectionState,
-        )
-      )
+      const connectionState = session.pc.connectionState;
+      if (connectionState === "failed" || connectionState === "closed") {
         markRtcFailure(keyId);
+        return;
+      }
+      if (connectionState === "disconnected") {
+        if (session.disconnectTimer !== null) return;
+        const disconnectedSession = session;
+        session.disconnectTimer = setTimeout(() => {
+          disconnectedSession.disconnectTimer = null;
+          if (
+            !disconnectedSession.closed &&
+            disconnectedSession.pc.connectionState === "disconnected"
+          ) {
+            markRtcFailure(keyId);
+          }
+        }, RTC_DISCONNECT_GRACE_MS);
+        return;
+      }
+      if (session.disconnectTimer !== null) {
+        clearTimeout(session.disconnectTimer);
+        session.disconnectTimer = null;
+      }
     };
 
     const offer = await pc.createOffer();

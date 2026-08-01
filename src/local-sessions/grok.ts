@@ -20,9 +20,10 @@ export const parseUpdatedMs = (raw: unknown, fallback: number): number => {
 export const readGrokHistory = (limit: number): THistorySession[] => {
   const root = grokSessionsDir();
   if (!existsSync(root)) return [];
-  const summaries: Array<{ path: string; mtime: number }> = [];
+
+  const summaryFiles: Array<{ path: string; mtime: number }> = [];
   const walk = (dir: string, depth: number): void => {
-    if (depth > 6 || summaries.length >= limit * 4) return;
+    if (depth > 6) return;
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -36,8 +37,8 @@ export const readGrokHistory = (limit: number): THistorySession[] => {
       try {
         const st = statSync(abs);
         if (st.isDirectory()) walk(abs, depth + 1);
-        else if (name === "summary.json") {
-          summaries.push({ path: abs, mtime: st.mtimeMs });
+        else if (name === "summary.json" && st.isFile()) {
+          summaryFiles.push({ path: abs, mtime: st.mtimeMs });
         }
       } catch {
         /* skip */
@@ -45,10 +46,9 @@ export const readGrokHistory = (limit: number): THistorySession[] => {
     }
   };
   walk(root, 0);
-  summaries.sort((a, b) => b.mtime - a.mtime);
-  const out: THistorySession[] = [];
-  for (const s of summaries) {
-    if (out.length >= limit) break;
+
+  const sessions: THistorySession[] = [];
+  for (const s of summaryFiles) {
     try {
       const raw = JSON.parse(readFileSync(s.path, "utf8")) as {
         info?: { id?: string; cwd?: string };
@@ -60,13 +60,13 @@ export const readGrokHistory = (limit: number): THistorySession[] => {
       if (typeof id !== "string" || id.length === 0) continue;
       const summary =
         typeof raw.session_summary === "string" ? raw.session_summary : "";
-      out.push({
+      sessions.push({
         id,
         title: summary.length > 0 ? truncate(summary) : "Untitled",
         cwd: typeof raw.info?.cwd === "string" ? raw.info.cwd : null,
         updated_at_ms: parseUpdatedMs(
-          raw.updated_at ?? raw.created_at,
-          s.mtime,
+          raw.updated_at,
+          parseUpdatedMs(raw.created_at, s.mtime),
         ),
         cli: "grok",
       });
@@ -74,5 +74,8 @@ export const readGrokHistory = (limit: number): THistorySession[] => {
       /* skip */
     }
   }
-  return out;
+
+  return sessions
+    .sort((a, b) => b.updated_at_ms - a.updated_at_ms)
+    .slice(0, limit);
 };
