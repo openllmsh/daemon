@@ -18,11 +18,10 @@ import {
   decodeOfferInner,
   encodeAnswerInner,
   fingerprintFromSdp,
-  fingerprintsFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
-  normalizeFingerprint,
   RTC_DEFAULT_STUN,
+  sdpFingerprintsMatch,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
@@ -259,21 +258,11 @@ export const handleRtcOffer = async (frame: {
     return;
   }
 
-  // Bind sealed browser fingerprint to the offer SDP (symmetric to browser
-  // verifyAnswerInner binding daemon fd to answer SDP). Reject when SDP has
-  // no matching fingerprint.
-  const offerFingerprints = fingerprintsFromSdp(frame.sdp);
-  const normalizedInnerFb = normalizeFingerprint(inner.fb);
-  const offerMatches = offerFingerprints.some(
-    (fingerprint) => normalizeFingerprint(fingerprint) === normalizedInnerFb,
-  );
-  if (offerFingerprints.length === 0 || !offerMatches) {
+  // Bind the sealed browser fingerprint to EVERY effective offer SDP
+  // fingerprint. Reject an absent or conflicting set before setting it remote.
+  if (!sdpFingerprintsMatch(frame.sdp, inner.fb)) {
     logWarn("rtc-host", "offer fingerprint mismatch", {
       channelId: frame.channel_id,
-      expectedFingerprint: normalizedInnerFb,
-      receivedFingerprints: offerFingerprints.map((fingerprint) =>
-        normalizeFingerprint(fingerprint),
-      ),
     });
     return;
   }

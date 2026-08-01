@@ -15,11 +15,11 @@ import {
   decodeAnswerInner,
   encodeOfferInner,
   fingerprintFromSdp,
-  fingerprintsFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
   RTC_AUTH_NONCE_BYTES,
   RTC_DEFAULT_STUN,
+  sdpFingerprintsMatch,
   verifyAnswerInner,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
@@ -384,16 +384,12 @@ export const handleRtcAnswer = async (frame: {
     markRtcFailure(session.keyId);
     return;
   }
-  const remoteFingerprints = fingerprintsFromSdp(frame.sdp);
-  const remoteFingerprint = fingerprintFromSdp(frame.sdp);
-  const okRemoteFingerprint = remoteFingerprints.some((fingerprint) =>
-    verifyAnswerInner(inner, {
-      nonce: session.nonce,
-      browserFingerprint: session.fingerprint,
-      daemonFingerprint: fingerprint,
-    }),
-  );
-  if (remoteFingerprint === null || !okRemoteFingerprint) {
+  const answerMatches = verifyAnswerInner(inner, {
+    nonce: session.nonce,
+    browserFingerprint: session.fingerprint,
+    daemonFingerprint: inner.fd,
+  });
+  if (!answerMatches || !sdpFingerprintsMatch(frame.sdp, inner.fd)) {
     markRtcFailure(session.keyId);
     return;
   }

@@ -39,7 +39,5 @@ export const isVendorSessionCommand = (command: string): boolean => {
   const executable = executableFromCommand(command);
   if (executable === null || executable.length === 0) return false;
   const name = basename(executable).toLowerCase();
-  return VENDOR_CLI_NAMES.some(
-    (vendor) => name === vendor || name.startsWith(`${vendor}-`),
-  );
+  return VENDOR_CLI_NAMES.includes(name);
 };
