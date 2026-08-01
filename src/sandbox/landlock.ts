@@ -270,8 +270,18 @@ export const applyDaemonSandbox = async (
   opts?: TApplySandboxOpts,
 ): Promise<TSandboxState> => {
   appliedState = await applyInner(opts);
+  if (appliedState === "enforced") inProcessApplied = true;
   return appliedState;
 };
+
+let inProcessApplied = false;
+
+/** Whether THIS process is itself confined (a real in-process apply reached
+ *  `enforced` — the shim's re-exec, or a test probe). Children then inherit
+ *  the confinement, so `sandboxSpawnArgs` must NOT re-wrap them: the dev-run
+ *  wrap re-execs `process.argv[1]`, which inside a probe is not the daemon
+ *  entry, and a double apply is pointless anyway. */
+export const sandboxAppliedInProcess = (): boolean => inProcessApplied;
 
 const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {

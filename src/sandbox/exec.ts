@@ -24,7 +24,11 @@
 import { logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import type { TSandboxState } from "./landlock";
-import { applyDaemonSandbox, probeLandlockSupport } from "./landlock";
+import {
+  applyDaemonSandbox,
+  probeLandlockSupport,
+  sandboxAppliedInProcess,
+} from "./landlock";
 
 export type TSandboxSpawnOpts = {
   /** Extra allow-list paths for THIS child (v1: ignored; future: appended to
@@ -41,6 +45,10 @@ export type TSandboxSpawnOpts = {
 const sandboxingEnabled = (): boolean => {
   // Kill switch: children spawn unwrapped.
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") return false;
+  // Already confined in-process (the shim's own re-exec, or a test probe that
+  // applied directly): children INHERIT the confinement — re-wrapping would
+  // double-apply and, in a probe, re-exec the wrong entry script.
+  if (sandboxAppliedInProcess()) return false;
   // No backend on this platform (win32 etc.) — identity passthrough.
   if (process.platform !== "darwin" && process.platform !== "linux")
     return false;
