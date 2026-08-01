@@ -156,19 +156,24 @@ export const readLocalSessions = (
     // with the in-memory device loop's `openllm:${id}`) → pid. Without the
     // openllm fallback, a device live.json with no vendor id would key by pid
     // and duplicate the same session's in-memory device row.
-    const vendorKey =
-      live.vendor_session_id !== null
-        ? `vendor:${live.vendor_session_id}`
-        : live.openllm_session_id !== null && live.openllm_session_id.length > 0
-          ? `openllm:${live.openllm_session_id}`
-          : `live:${live.pid}`;
+    const hasVendorSessionId =
+      live.vendor_session_id !== null && live.vendor_session_id.length > 0;
+    const vendorKey = hasVendorSessionId
+      ? `vendor:${live.vendor_session_id}`
+      : live.openllm_session_id !== null && live.openllm_session_id.length > 0
+        ? `openllm:${live.openllm_session_id}`
+        : `live:${live.pid}`;
     const attachable =
       live.host === "device" &&
       live.openllm_session_id !== null &&
       live.openllm_session_id.length > 0;
     put(
       {
-        id: live.vendor_session_id ?? `live-${live.pid}`,
+        id: hasVendorSessionId
+          ? live.vendor_session_id
+          : live.openllm_session_id !== null && live.openllm_session_id.length > 0
+            ? live.openllm_session_id
+            : `live-${live.pid}`,
         title: live.title ?? "Untitled",
         cwd: live.cwd,
         updated_at_ms: live.started_at_ms,
