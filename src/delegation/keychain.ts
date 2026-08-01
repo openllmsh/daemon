@@ -52,9 +52,11 @@ const runSecurity = async (
       env: { ...process.env, HOME: home },
     });
     const code = await proc.exited;
-    // A `security` child SIGKILLed by the sandbox leaves no keychain + no
-    // trace — surface it so a later "Keychain Not Found" dialog is explained.
-    // Redacted: the argv may carry the OAuth payload (`-w`).
+    // Through the `--sandbox-exec` shim the daemon sees `128 + signal` as an
+    // exit CODE, not a signalCode, so this only fires for a kill of the shim
+    // itself; a sandbox kill of the `security` child is attributed by the
+    // SHIM's own log line (`runSandboxExec` logs command name only — already
+    // redacted, never the `-w` OAuth payload). Kept for the unwrapped paths.
     logIfKilled(redactSecurityArgv(["security", ...argv]), proc);
     return code === 0;
   } catch {

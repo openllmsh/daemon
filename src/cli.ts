@@ -108,7 +108,15 @@ export const runCli = (): boolean => {
       process.stderr.write("--sandbox-exec: missing command\n");
       process.exit(2);
     }
-    void runSandboxExec(tail); // apply + spawn + mirror exit
+    // apply + spawn + mirror exit. `runSandboxExec` never resolves; guard a
+    // REJECTION (an unexpected throw before the exit mirror) so it can't
+    // become an unhandled rejection / silent success.
+    runSandboxExec(tail).catch((err: unknown) => {
+      process.stderr.write(
+        `--sandbox-exec: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      process.exit(1);
+    });
     return true;
   }
 

@@ -70,11 +70,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import {
-  CLI_PROVIDERS,
-  cliBin,
-  hostCliCandidates,
-} from "../cli-paths";
+import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../cli-paths";
 import { stateDir } from "../env";
 import { DAEMON_VERSION } from "../version";
 

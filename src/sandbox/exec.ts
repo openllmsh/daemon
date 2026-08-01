@@ -17,9 +17,9 @@
  * the user's real CLI over their real files); each risky child is confined at
  * spawn time instead. Fail-open lives HERE and in the shim, nowhere else:
  * when sandboxing is off/unsupported the wrap is an identity passthrough and
- * a shim whose apply degrades still runs the child — degradation is visible
- * via the boot-time capability probe (`probeSandboxCapability`), not
- * per-spawn.
+ * a shim whose apply degrades still runs the child — surfaced loudly
+ * per-spawn (stderr + `logWarn` in `runSandboxExec`) on top of the boot-time
+ * capability posture (`probeSandboxCapability`).
  */
 import { logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
@@ -133,6 +133,17 @@ export const runSandboxExec = async (
   // (`proc.kill()` at the call site reaches the wrapper, not the child), so
   // without forwarding the sandboxed tail would outlive its parent. The shim
   // then exits via the child's `128 + signal` mirror below.
+  //
+  // RESIDUAL GAP (documented, accepted): a SIGKILL of the shim cannot be
+  // forwarded (uncatchable), so a kill -9 of the wrapper orphans the tail.
+  // Bun exposes neither `PR_SET_PDEATHSIG` for a spawned child nor
+  // detached/process-group spawn semantics, and an FFI prctl can't run in the
+  // child between fork and exec. Every daemon-side kill path uses catchable
+  // signals (`proc.kill()` = SIGTERM, spawnLogin's reaper uses SIGKILL on the
+  // SHIM only after the `until`/timeout capture — at which point an orphaned
+  // login child is the same wedge class the pre-shim code already tolerated
+  // and the orphan-reaper handles at next boot). Revisit if Bun grows
+  // pdeathsig/process-group support.
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     process.on(signal, () => {
       try {

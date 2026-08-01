@@ -393,7 +393,11 @@ export const openUrl = (url: string): void => {
         ? ["cmd", "/c", "start", "", `"${url}"`]
         : ["xdg-open", url];
   try {
-    Bun.spawn(sandboxSpawnArgs(argv), {
+    // Deliberately UNWRAPPED (no `sandboxSpawnArgs`): opening the user's
+    // browser is a user-facing action like the session-PTY exemption — the
+    // launcher must reach the real GUI session/LaunchServices state, and it
+    // takes only the URL string (no filesystem payload to confine).
+    Bun.spawn(argv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",

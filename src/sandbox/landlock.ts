@@ -260,6 +260,7 @@ const probeLandlockAbi = async (): Promise<{
  * accurate under the per-child model.
  */
 export const probeLandlockSupport = async (): Promise<TSandboxState> => {
+  if (process.platform !== "linux") return "unsupported";
   try {
     const probed = await probeLandlockAbi();
     if (probed === null) return "error";
@@ -282,6 +283,8 @@ export type TApplySandboxOpts = {
  * shim before it runs its tail argv (and by the sandbox test probes).
  * Never throws; returns + records the resulting posture.
  */
+let inProcessApplied = false;
+
 export const applyDaemonSandbox = async (
   opts?: TApplySandboxOpts,
 ): Promise<TSandboxState> => {
@@ -289,8 +292,6 @@ export const applyDaemonSandbox = async (
   if (appliedState === "enforced") inProcessApplied = true;
   return appliedState;
 };
-
-let inProcessApplied = false;
 
 /** Whether THIS process is itself confined (a real in-process apply reached
  *  `enforced` — the shim's re-exec, or a test probe). Children then inherit
