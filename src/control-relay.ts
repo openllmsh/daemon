@@ -240,7 +240,7 @@ export const runCommandInner = async (
             listLocalSessionsCache.delete(key);
           }
         }
-        const sessions = readLocalSessions(cmd.payload.cli, {
+        const sessions = await readLocalSessions(cmd.payload.cli, {
           limit: cmd.payload.limit,
           deps: { deviceSessions: deviceSessionsForList },
         });

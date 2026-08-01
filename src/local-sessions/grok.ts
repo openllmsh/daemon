@@ -2,11 +2,19 @@
  * Grok local sessions from ~/.grok/sessions/<cwd-encoded>/<id>/summary.json.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { grokSessionsDir } from "./paths";
 import { truncate } from "./title";
 import type { THistorySession } from "./types";
+
+type TSummaryFile = {
+  readonly path: string;
+  readonly mtime: number;
+};
+
+const MAX_WALK_DEPTH = 6;
+const MAX_PARSE_BURST = 8;
 
 export const parseUpdatedMs = (raw: unknown, fallback: number): number => {
   if (typeof raw === "string") {
@@ -17,47 +25,101 @@ export const parseUpdatedMs = (raw: unknown, fallback: number): number => {
   return fallback;
 };
 
-export const readGrokHistory = (limit: number): THistorySession[] => {
-  const root = grokSessionsDir();
-  if (!existsSync(root)) return [];
+const walkSummaryCandidates = async (
+  dir: string,
+  depth: number,
+  candidates: TSummaryFile[],
+): Promise<void> => {
+  if (depth > MAX_WALK_DEPTH) return;
 
-  const summaryFiles: Array<{ path: string; mtime: number }> = [];
-  const walk = (dir: string, depth: number): void => {
-    if (depth > 6) return;
-    let names: string[];
-    try {
-      names = readdirSync(dir);
-    } catch {
-      return;
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  if (entries.length === 0) return;
+
+  const childDirs: string[] = [];
+  const summaryCandidates: Array<{ path: string }> = [];
+
+  for (const entry of entries) {
+    if (
+      entry.name === "session_search.sqlite" ||
+      entry.name.endsWith(".lock")
+    ) {
+      continue;
     }
-    for (const name of names) {
-      // Skip search index / non-session layout files.
-      if (name === "session_search.sqlite" || name.endsWith(".lock")) continue;
-      const abs = join(dir, name);
-      try {
-        const st = statSync(abs);
-        if (st.isDirectory()) walk(abs, depth + 1);
-        else if (name === "summary.json" && st.isFile()) {
-          summaryFiles.push({ path: abs, mtime: st.mtimeMs });
-        }
-      } catch {
-        /* skip */
-      }
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      childDirs.push(abs);
+      continue;
+    }
+    if (entry.isFile() && entry.name === "summary.json") {
+      summaryCandidates.push({ path: abs });
+    }
+  }
+
+  for (let i = 0; i < summaryCandidates.length; i += 1) {
+    const { path } = summaryCandidates[i] ?? {};
+    if (path === undefined) continue;
+    const st = await stat(path).catch(() => null);
+    if (st === null || !st.isFile()) continue;
+    candidates.push({ path, mtime: st.mtimeMs });
+  }
+
+  await Promise.all(
+    childDirs.map((child) => walkSummaryCandidates(child, depth + 1, candidates)),
+  );
+};
+
+const forEachLimit = async <T>(
+  values: readonly T[],
+  limit: number,
+  visit: (value: T) => Promise<void>,
+): Promise<void> => {
+  const maxConcurrency = Math.max(1, Math.floor(limit));
+  let cursor = 0;
+  const workers: Array<Promise<void>> = [];
+
+  const run = async (): Promise<void> => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= values.length) return;
+      await visit(values[index] as T);
     }
   };
-  walk(root, 0);
+
+  for (let i = 0; i < maxConcurrency && i < values.length; i += 1) {
+    workers.push(run());
+  }
+
+  await Promise.all(workers);
+};
+
+export const readGrokHistory = async (
+  limit: number,
+): Promise<THistorySession[]> => {
+  const root = grokSessionsDir();
+  const rootStat = await stat(root).catch(() => null);
+  if (rootStat === null || !rootStat.isDirectory()) return [];
+
+  const parseBudget = Math.max(1, Math.min(Math.floor(limit), 400));
+  const candidates: TSummaryFile[] = [];
+  await walkSummaryCandidates(root, 0, candidates);
+
+  const toParse = [...candidates]
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, parseBudget * 2);
 
   const sessions: THistorySession[] = [];
-  for (const s of summaryFiles) {
+  await forEachLimit(toParse, MAX_PARSE_BURST, async ({ path, mtime }) => {
     try {
-      const raw = JSON.parse(readFileSync(s.path, "utf8")) as {
+      const text = await readFile(path, "utf8");
+      const raw = JSON.parse(text) as {
         info?: { id?: string; cwd?: string };
         session_summary?: string;
         updated_at?: string;
         created_at?: string;
       };
       const id = raw.info?.id;
-      if (typeof id !== "string" || id.length === 0) continue;
+      if (typeof id !== "string" || id.length === 0) return;
       const summary =
         typeof raw.session_summary === "string" ? raw.session_summary : "";
       sessions.push({
@@ -66,14 +128,14 @@ export const readGrokHistory = (limit: number): THistorySession[] => {
         cwd: typeof raw.info?.cwd === "string" ? raw.info.cwd : null,
         updated_at_ms: parseUpdatedMs(
           raw.updated_at,
-          parseUpdatedMs(raw.created_at, s.mtime),
+          parseUpdatedMs(raw.created_at, mtime),
         ),
         cli: "grok",
       });
     } catch {
       /* skip */
     }
-  }
+  });
 
   return sessions
     .sort((a, b) => b.updated_at_ms - a.updated_at_ms)

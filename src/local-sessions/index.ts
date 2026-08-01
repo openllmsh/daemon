@@ -27,8 +27,8 @@ export type TLocalSessionsDeps = {
   readonly readHistory?: (
     cli: TDeviceSessionCli,
     limit: number,
-  ) => THistorySession[];
-  readonly readLive?: (cli: TDeviceSessionCli) => TLiveRun[];
+  ) => Promise<THistorySession[]>;
+  readonly readLive?: (cli: TDeviceSessionCli) => Promise<TLiveRun[]>;
   /** In-memory device PTYs from session-host (same process). */
   readonly deviceSessions?: () => ReadonlyArray<{
     readonly id: string;
@@ -41,10 +41,10 @@ export type TLocalSessionsDeps = {
   }>;
 };
 
-const defaultHistory = (
+const defaultHistory = async (
   cli: TDeviceSessionCli,
   limit: number,
-): THistorySession[] => {
+): Promise<THistorySession[]> => {
   switch (cli) {
     case "claude_code":
       return readClaudeHistory(limit);
@@ -59,7 +59,7 @@ const defaultHistory = (
   }
 };
 
-const defaultLive = (cli: TDeviceSessionCli): TLiveRun[] => {
+const defaultLive = async (cli: TDeviceSessionCli): Promise<TLiveRun[]> => {
   const clientId = openllmClientIdOf(cli);
   if (clientId === null) return [];
   return readLiveRuns(clientId);
@@ -76,10 +76,10 @@ export const clampLimit = (limit: number | undefined): number => {
  * List local sessions for one device CLI. Never throws — empty on missing
  * stores or read errors.
  */
-export const readLocalSessions = (
+export const readLocalSessions = async (
   cli: TDeviceSessionCli,
   opts: { readonly limit?: number; readonly deps?: TLocalSessionsDeps } = {},
-): TLocalCliSession[] => {
+): Promise<TLocalCliSession[]> => {
   const limit = clampLimit(opts.limit);
   const deps = opts.deps ?? {};
   // Defense-in-depth: every current DeviceSessionCli is listable; keep the
@@ -87,8 +87,13 @@ export const readLocalSessions = (
   // half-reading an unknown store.
   if (!isListableDeviceCli(cli)) return [];
 
-  const history = (deps.readHistory ?? defaultHistory)(cli, limit);
-  const liveRuns = (deps.readLive ?? defaultLive)(cli);
+  const readHistory = deps.readHistory ?? defaultHistory;
+  const readLive = deps.readLive ?? defaultLive;
+
+  const [history, liveRuns] = await Promise.all([
+    readHistory(cli, limit),
+    readLive(cli),
+  ]);
   const device = deps.deviceSessions?.() ?? [];
 
   type TRow = {
@@ -171,7 +176,8 @@ export const readLocalSessions = (
       {
         id: hasVendorSessionId
           ? live.vendor_session_id
-          : live.openllm_session_id !== null && live.openllm_session_id.length > 0
+          : live.openllm_session_id !== null &&
+              live.openllm_session_id.length > 0
             ? live.openllm_session_id
             : `live-${live.pid}`,
         title: live.title ?? "Untitled",
