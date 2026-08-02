@@ -14,6 +14,7 @@
  *   openllmd restart              stop then start
  *   openllmd logs [-f] [-n N]     show or follow the daemon log
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
+ *   openllmd sessions <on|off|status>  opt in/out of remote terminal sessions (default off)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
  *   openllmd completion <shell>   emit / install shell completion
  *   openllmd -h | --help          show help
@@ -22,9 +23,9 @@
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { COMMANDS, FLAGS } from "./commands";
 import { runCompletion } from "./completion";
-import { daemonEnv } from "./env";
 import { logError } from "./logger";
 import { runLogs } from "./logs";
+import { ptySessionsEnabled, setPtySessions } from "./pty-sessions-pref";
 import { runSandboxExec } from "./sandbox/exec";
 import {
   serviceRestart,
@@ -89,6 +90,31 @@ const runAutoUpdate = (args: readonly string[]): never => {
     }
   }
   process.stderr.write("usage: openllmd auto-update <on|off|status>\n");
+  process.exit(2);
+};
+
+/**
+ * Opt in/out of remote terminal sessions (or print the current state), then
+ * exit. This preference is local-only because a remote PTY is RCE-grade.
+ */
+const runSessions = (args: readonly string[]): never => {
+  const sub = args[0];
+  if (args.length <= 1) {
+    if (sub === "on" || sub === "off") {
+      setPtySessions(sub === "on");
+      process.stdout.write(
+        `sessions ${sub === "on" ? "enabled" : "disabled"}\n`,
+      );
+      process.exit(0);
+    }
+    if (sub === undefined || sub === "status") {
+      process.stdout.write(
+        `sessions are ${ptySessionsEnabled() ? "enabled" : "disabled"} (local-only preference; run: openllmd sessions on)\n`,
+      );
+      process.exit(0);
+    }
+  }
+  process.stderr.write("usage: openllmd sessions <on|off|status>\n");
   process.exit(2);
 };
 
@@ -163,6 +189,9 @@ export const runCli = (): boolean => {
       break;
     case "auto-update":
       runAutoUpdate(rest);
+      break;
+    case "sessions":
+      runSessions(rest);
       break;
     case "uninstall":
       runUninstall(rest);

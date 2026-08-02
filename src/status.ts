@@ -19,6 +19,7 @@ import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
 import { resolveOnPath } from "./path-utils";
+import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
 import { cachedUsage, peekUsage } from "./usage-cache";
@@ -95,6 +96,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     daemon_version: DAEMON_VERSION,
     key_configured: hasApiKey(),
     auto_update: autoUpdateEnabled(),
+    pty_sessions: ptySessionsEnabled(),
     cloud_state: getCloudState(),
     pubkey: daemonPublicKey(),
     port: daemonPort(),

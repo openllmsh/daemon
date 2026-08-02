@@ -26,6 +26,7 @@ import {
   resetAllChannels,
   updateMuxPeerCaps,
 } from "./mux-host";
+import { ptySessionsEnabled } from "./pty-sessions-pref";
 import {
   configureRtcClient,
   handleRtcAnswer,
@@ -460,6 +461,48 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
   await commandTail;
 };
 
+/**
+ * Handle a legacy JSON device-session frame. The preference gates NEW remote
+ * opens only; existing PTYs keep their lifecycle when a device owner toggles
+ * this preference off mid-session.
+ */
+export const handleRemoteSessionFrame = (
+  frame: TRelayFrame,
+  sendFrame: (frame: TRelayFrame) => void,
+): boolean => {
+  if (!isSessionFrame(frame)) return false;
+  if (frame.type === "session_open" && !ptySessionsEnabled()) {
+    logInfo("session", "remote session open refused: sessions disabled", {
+      id: frame.session_id,
+    });
+    sendFrame({
+      type: "session_open_ack",
+      session_id: frame.session_id,
+      ok: false,
+      error: "sessions_disabled",
+    });
+    return true;
+  }
+  try {
+    handleSessionFrame(frame, sendFrame);
+  } catch (err) {
+    logWarn("control-channel", "session frame handler failed", {
+      type: frame.type,
+      sessionId: "session_id" in frame ? frame.session_id : undefined,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    if (frame.type === "session_open") {
+      sendFrame({
+        type: "session_open_ack",
+        session_id: frame.session_id,
+        ok: false,
+        error: "spawn_failed",
+      });
+    }
+  }
+  return true;
+};
+
 const onFrame = (frame: TRelayFrame): void => {
   // Synchronous dispatch below (acceptChannel, handleChannelOpenAck,
   // updateMuxPeerCaps, …) must never throw through the WebSocket callback —
@@ -566,26 +609,7 @@ const dispatchFrame = (frame: TRelayFrame): void => {
       // Device sessions (PTY host) — each session runs on its own async
       // task, mirroring the tunnel server. Contain unexpected throws so a
       // single bad open cannot escape the WebSocket callback unacked.
-      if (isSessionFrame(frame)) {
-        try {
-          handleSessionFrame(frame, send);
-        } catch (err) {
-          logWarn("control-channel", "session frame handler failed", {
-            type: frame.type,
-            sessionId: "session_id" in frame ? frame.session_id : undefined,
-            err: err instanceof Error ? err.message : String(err),
-          });
-          if (frame.type === "session_open") {
-            send({
-              type: "session_open_ack",
-              session_id: frame.session_id,
-              ok: false,
-              error: "spawn_failed",
-            });
-          }
-        }
-        return;
-      }
+      if (handleRemoteSessionFrame(frame, send)) return;
       // others: nothing to do (partysocket owns reconnection)
       return;
   }

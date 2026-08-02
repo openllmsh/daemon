@@ -11,6 +11,7 @@
 #   OPENLLM_CLOUD_ORIGIN   gateway origin (default https://openllm.sh)
 #   OPENLLM_API_KEY        pair the daemon now; otherwise pair from the dashboard
 #   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
+#   OPENLLM_DAEMON_PTY_SESSIONS  enable remote terminal sessions (1/true; default off)
 #
 # This is the ONLY shell installer for the daemon. It also background-provisions
 # any missing vendor subscription CLIs (claude / codex / kimi / grok / cursor-agent) via each
@@ -178,11 +179,19 @@ fi
 # present when the caller didn't pass one.
 EXISTING_DEVICE_ID=""
 EXISTING_KEY=""
+EXISTING_PTY_SESSIONS=""
 if [ -f "$ENV_FILE" ]; then
   EXISTING_DEVICE_ID="$(sed -n 's/^OPENLLM_DEVICE_ID=//p' "$ENV_FILE" | head -1)"
   EXISTING_KEY="$(sed -n 's/^OPENLLM_API_KEY=//p' "$ENV_FILE" | head -1)"
+  EXISTING_PTY_SESSIONS="$(sed -n 's/^OPENLLM_DAEMON_PTY_SESSIONS=//p' "$ENV_FILE" | head -1)"
 fi
 API_KEY="${OPENLLM_API_KEY:-$EXISTING_KEY}"
+PTY_SESSIONS_INPUT="${OPENLLM_DAEMON_PTY_SESSIONS:-}"
+case "$PTY_SESSIONS_INPUT" in
+  1|true) PTY_SESSIONS="1" ;;
+  0|false) PTY_SESSIONS="0" ;;
+  *) PTY_SESSIONS="$EXISTING_PTY_SESSIONS" ;;
+esac
 
 umask 077
 {
@@ -190,6 +199,7 @@ umask 077
   echo "OPENLLM_DAEMON_PORT=$DAEMON_PORT"
   [ -n "$API_KEY" ] && echo "OPENLLM_API_KEY=$API_KEY"
   [ -n "$EXISTING_DEVICE_ID" ] && echo "OPENLLM_DEVICE_ID=$EXISTING_DEVICE_ID"
+  [ -n "$PTY_SESSIONS" ] && echo "OPENLLM_DAEMON_PTY_SESSIONS=$PTY_SESSIONS"
 } > "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 echo "  gateway config written → $ENV_FILE"

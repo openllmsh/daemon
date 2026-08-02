@@ -32,6 +32,11 @@ export const COMMANDS: readonly TCommand[] = [
       "Enable or disable automatic daemon self-updates (on by default)",
   },
   {
+    name: "sessions",
+    args: "<on|off|status>",
+    description: "Enable or disable remote terminal sessions (off by default)",
+  },
+  {
     name: "uninstall",
     args: "[--yes]",
     description: "Remove the daemon and ALL state (credentials, service)",
@@ -62,7 +67,7 @@ export const PROVIDERS = [
   "cursor",
 ] as const;
 
-/** Argument choices for the `auto-update` subcommand. */
+/** Argument choices for the `auto-update` and `sessions` subcommands. */
 export const AUTO_UPDATE_ACTIONS = ["on", "off", "status"] as const;
 
 export const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;

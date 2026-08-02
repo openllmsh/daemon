@@ -1,12 +1,14 @@
 import type { TChannelCloseReason, TRelayFrame } from "@openllmsh/protocol";
 import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
+import { encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
 import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
-import { logWarn } from "./logger";
+import { logInfo, logWarn } from "./logger";
+import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { bindMuxSessionStream } from "./session-host";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
@@ -209,7 +211,22 @@ export const serveMuxOnStream = serveStream({
   // Keep the tunnel-server import lazy: its production dispatcher reaches the
   // control channel, which imports this host during daemon initialization.
   tunnel: (open, body, signal) => serveMuxTunnel(open, body, signal),
-  session: bindMuxSessionStream,
+  session: (stream, open) => {
+    if (!ptySessionsEnabled()) {
+      logInfo("session", "remote session open refused: sessions disabled", {
+        id: open.session_id,
+      });
+      stream.reset(
+        encodeJsonPayload({
+          code: "sessions_disabled",
+          message:
+            "remote terminal sessions are disabled on this device — run: openllmd sessions on",
+        }),
+      );
+      return;
+    }
+    bindMuxSessionStream(stream, open);
+  },
   admitTunnel: () => admitMuxTunnel(),
   invalidOpenCode: "invalid_tunnel",
 });

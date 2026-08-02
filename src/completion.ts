@@ -50,7 +50,7 @@ _openllmd() {
   fi
   case "$cmd" in
     completion) COMPREPLY=( $(compgen -W "${COMPLETION_ARGS.join(" ")}" -- "$cur") ) ;;
-    auto-update) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${AUTO_UPDATE_ARGS.join(" ")}" -- "$cur") ) ;;
+    auto-update|sessions) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${AUTO_UPDATE_ARGS.join(" ")}" -- "$cur") ) ;;
   esac
 }
 complete -F _openllmd openllmd
@@ -80,7 +80,7 @@ _openllmd() {
     args)
       case "$line[1]" in
         completion) _values 'shell' ${COMPLETION_ARGS.join(" ")} ;;
-        auto-update) _values 'action' ${AUTO_UPDATE_ARGS.join(" ")} ;;
+        auto-update|sessions) _values 'action' ${AUTO_UPDATE_ARGS.join(" ")} ;;
       esac ;;
   esac
 }
@@ -95,7 +95,7 @@ const fishScript = (): string => {
   );
   lines.push(
     `complete -c openllmd -n '__fish_seen_subcommand_from completion' -a '${COMPLETION_ARGS.join(" ")}'`,
-    `complete -c openllmd -n '__fish_seen_subcommand_from auto-update' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
+    `complete -c openllmd -n '__fish_seen_subcommand_from auto-update sessions' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
     `complete -c openllmd -s h -l help -d 'Show help'`,
     `complete -c openllmd -s v -l version -d 'Print the version'`,
   );

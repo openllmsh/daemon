@@ -50,6 +50,7 @@ import { buildHealth } from "./health";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
 import { maybeReportModels } from "./model-report";
+import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { probeSandboxCapability } from "./sandbox/exec";
 import { recordSandboxState, sandboxState } from "./sandbox/landlock";
 import {
@@ -346,6 +347,7 @@ const main = async (): Promise<void> => {
             sandbox: sandboxState(),
             cloudState: getCloudState(),
             keyConfigured: hasApiKey(),
+            ptySessions: ptySessionsEnabled(),
             cloudOrigin: daemonEnv().cloudOrigin,
             bootAt: BOOT_AT,
             now: Date.now(),
