@@ -93,7 +93,7 @@ daemon/
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
     mux-host.ts             mux1/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
-    session-host.ts         one PTY registry shared by browser mux and local broker attachers: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping
+    session-host.ts         one PTY registry shared by browser mux and local broker attachers: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping; production relay-JSON session frames remain the mutually exclusive fallback (never fan out beside stream consumers)
     broker-listener.ts      authenticated loopback session broker for local openllm CLI attach/list/kill
     rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice + mux over data channel
     rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice + mux over data channel

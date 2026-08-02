@@ -14,6 +14,7 @@ import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
 import { daemonEnv } from "./env";
 import { readAllLocalSessions } from "./local-sessions";
+import { logWarn } from "./logger";
 import type { TSessionStream } from "./session-host";
 import {
   bindSessionStream,
@@ -24,7 +25,7 @@ import {
 type TBrokerSocketData = {
   stream: BrokerSessionStream | null;
   opened: boolean;
-  drainWaiters: Set<() => void>;
+  drainWaiters: Set<{ resolve: () => void; reject: (err: Error) => void }>;
 };
 
 type TBrokerSocket = Bun.ServerWebSocket<TBrokerSocketData>;
@@ -153,8 +154,8 @@ class BrokerSessionStream implements TSessionStream {
     const status = this.socket.sendBinary(bytes);
     if (status > 0) return Promise.resolve();
     if (status === 0) return Promise.reject(new Error("broker socket closed"));
-    return new Promise<void>((resolve) => {
-      this.socket.data.drainWaiters.add(resolve);
+    return new Promise<void>((resolve, reject) => {
+      this.socket.data.drainWaiters.add({ resolve, reject });
     });
   };
 
@@ -242,23 +243,33 @@ export const handleBrokerRequest = async (
       ? "upgraded"
       : json(400, { error: "websocket upgrade failed" });
   }
-  if (url.pathname === "/broker/sessions" && req.method === "GET") {
-    const sessions = await readAllLocalSessions({
-      limit: 100,
-      deps: { deviceSessions: deviceSessionsForList },
-    });
-    return json(200, { sessions });
-  }
-  const kill = /^\/broker\/sessions\/([^/]+)\/kill$/.exec(url.pathname);
-  if (kill !== null && req.method === "POST") {
-    let id: string;
-    try {
-      id = decodeURIComponent(kill[1] ?? "");
-    } catch {
-      return json(404, { ok: false });
+  // A thrown/rejected broker operation must answer as JSON, not escape into
+  // the server's generic error path (the CLI expects a JSON body).
+  try {
+    if (url.pathname === "/broker/sessions" && req.method === "GET") {
+      const sessions = await readAllLocalSessions({
+        limit: 100,
+        deps: { deviceSessions: deviceSessionsForList },
+      });
+      return json(200, { sessions });
     }
-    const ok = killSession(id);
-    return json(ok ? 200 : 404, { ok });
+    const kill = /^\/broker\/sessions\/([^/]+)\/kill$/.exec(url.pathname);
+    if (kill !== null && req.method === "POST") {
+      let id: string;
+      try {
+        id = decodeURIComponent(kill[1] ?? "");
+      } catch {
+        return json(404, { ok: false });
+      }
+      const ok = killSession(id);
+      return json(ok ? 200 : 404, { ok });
+    }
+  } catch (err) {
+    logWarn(
+      "broker",
+      `broker request failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return json(500, { error: "internal" });
   }
   return json(404, { error: "not found" });
 };
@@ -270,7 +281,7 @@ export const brokerWebsocket: Bun.WebSocketHandler<TBrokerSocketData> = {
   drain: (socket): void => {
     const waiters = [...socket.data.drainWaiters];
     socket.data.drainWaiters.clear();
-    for (const resolve of waiters) resolve();
+    for (const waiter of waiters) waiter.resolve();
   },
   message: (socket, message): void => {
     // One catch-all: an exception escaping into Bun's WS runtime would tear
@@ -324,12 +335,14 @@ export const brokerWebsocket: Bun.WebSocketHandler<TBrokerSocketData> = {
     }
   },
   close: (socket): void => {
-    // Release writes parked on backpressure first — drain never fires on a
-    // closed socket, so a lagging consumer's blocked write would hang the
-    // per-consumer tail forever otherwise.
+    // Settle writes parked on backpressure first — drain never fires on a
+    // closed socket, so a blocked write would hang the per-consumer tail
+    // forever otherwise. REJECT (not resolve): the bytes never flushed, and a
+    // resolve would report a successful write to the lag-cap accounting.
     const waiters = [...socket.data.drainWaiters];
     socket.data.drainWaiters.clear();
-    for (const resolve of waiters) resolve();
+    for (const waiter of waiters)
+      waiter.reject(new Error("broker socket closed"));
     socket.data.stream?.closed();
   },
 };

@@ -327,8 +327,6 @@ type TSession = {
   scrollbackBytes: number;
   /** Every active mux or broker consumer. */
   consumers: Set<TAttachedConsumer>;
-  /** Legacy JSON relay has no stream identity, so track it separately. */
-  legacyAttached: boolean;
   outSeq: number;
   startedAtMs: number;
   detachedAtMs: number | null;
@@ -422,8 +420,7 @@ const probeActivity = async (
   return busy;
 };
 
-const isAttached = (session: TSession): boolean =>
-  session.legacyAttached || session.consumers.size > 0;
+const isAttached = (session: TSession): boolean => session.consumers.size > 0;
 
 const scheduleReapKill = (session: TSession, pty: TPtyLike): void => {
   const timer = setTimeout(() => {
@@ -817,12 +814,16 @@ const writeConsumers = (session: TSession, chunk: Uint8Array): void => {
     writeConsumer(session, consumer, chunk);
 };
 
-/** Send one chunk to the legacy JSON consumer only (session_io frames). */
-const sendLegacy = (
+/** Send one out-direction chunk, preserving legacy JSON fallback behavior. */
+const sendOut = (
   session: TSession,
   chunk: Uint8Array,
   send: (frame: TRelayFrame) => void,
 ): void => {
+  if (isAttached(session)) {
+    writeConsumers(session, chunk);
+    return;
+  }
   for (let i = 0; i < chunk.length; i += TUNNEL_CHUNK_MAX) {
     send({
       type: "session_io",
@@ -835,16 +836,6 @@ const sendLegacy = (
   }
 };
 
-/** Send one out-direction chunk, preserving legacy JSON fallback behavior. */
-const sendOut = (
-  session: TSession,
-  chunk: Uint8Array,
-  send: (frame: TRelayFrame) => void,
-): void => {
-  writeConsumers(session, chunk);
-  if (session.legacyAttached) sendLegacy(session, chunk, send);
-};
-
 const terminalClose = (
   session: TSession,
   send: (frame: TRelayFrame) => void,
@@ -852,14 +843,13 @@ const terminalClose = (
 ): void => {
   const consumers = [...session.consumers];
   // Legacy JSON has no session stream to end, so it retains its close frame.
-  if (session.legacyAttached) {
+  if (consumers.length === 0) {
     send({
       type: "session_close",
       session_id: session.id,
       reason,
       generation: session.generation,
     });
-    session.legacyAttached = false;
   }
   // Exit codes are delivered on natural exits before each local broker stream
   // closes. An explicit kill intentionally has no late exit envelope.
@@ -973,7 +963,6 @@ export const detachSession = (id: string): void => {
   if (session === undefined) return;
   for (const consumer of [...session.consumers])
     detachConsumer(session, consumer);
-  session.legacyAttached = false;
   if (!isAttached(session)) session.detachedAtMs = Date.now();
 };
 
@@ -981,10 +970,8 @@ export const detachSession = (id: string): void => {
 export const killSession = (id: string): boolean => {
   const session = sessions.get(id);
   if (session === undefined || session.pty === null) return false;
-  // Kill only — teardown (consumer stream ends + the legacy session_close
-  // frame) runs in the PTY's onExit, which holds the REAL relay sender. A
-  // no-op-sender terminalClose here would clear legacyAttached before that
-  // close frame could ever be delivered.
+  // Kill only — teardown runs in the PTY's onExit, which holds the real
+  // relay sender for a legacy JSON session_close frame.
   endPty(session, "killed");
   logInfo("session", "session closed", { id, reason: "kill" });
   return true;
@@ -1018,7 +1005,6 @@ const handleOpen = (
   frame: TRelaySessionOpenFrame,
   send: (frame: TRelayFrame) => void,
   vendorArgs?: readonly string[],
-  legacy = true,
 ): void => {
   const nack = (
     error:
@@ -1098,10 +1084,8 @@ const handleOpen = (
         nack("session_not_found", existing.lastExitReason);
         return;
       }
-      const wasLegacyAttached = existing.legacyAttached;
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;
-      if (legacy) existing.legacyAttached = true;
       existing.pty.resize(frame.cols, frame.rows);
       send({
         type: "session_open_ack",
@@ -1111,15 +1095,10 @@ const handleOpen = (
         generation: existing.generation,
       });
       // Legacy JSON has no stream object to add to the consumer set, so it
-      // retains its direct repaint frames while mux/broker attachers replay
-      // after their stream is registered below. Gate on the PRIOR legacy
-      // state (stream consumers being present must not suppress it), and
-      // send the repaint to the legacy channel only — live consumers must
-      // not see another attacher's replay.
-      if (legacy && !wasLegacyAttached) {
-        sendLegacy(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
-        for (const chunk of existing.scrollback)
-          sendLegacy(existing, chunk, send);
+      // replays only while no mux or broker stream is attached.
+      if (!isAttached(existing)) {
+        sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
+        for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
       }
       logInfo("session", "session re-attached", { id: existing.id });
       return;
@@ -1171,7 +1150,6 @@ const handleOpen = (
       scrollback: [],
       scrollbackBytes: 0,
       consumers: new Set(),
-      legacyAttached: legacy,
       outSeq: 0,
       startedAtMs: Date.now(),
       detachedAtMs: null,
@@ -1188,7 +1166,6 @@ const handleOpen = (
     s.cwd = cwd;
     s.vendorSessionId = vendorSessionId;
     if (frame.title !== undefined) s.title = frame.title;
-    if (legacy) s.legacyAttached = true;
     sessions.set(s.id, s);
     evictStaleDeadSessions();
 
@@ -1358,7 +1335,6 @@ export const bindSessionStream = (
     },
     send,
     opts.vendorArgs,
-    false,
   );
   const session = sessions.get(open.session_id);
   const consumer =
