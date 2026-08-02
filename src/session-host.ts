@@ -35,19 +35,21 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import type {
+  TDeviceSessionCli,
   TRelayFrame,
   TRelaySessionCloseFrame,
   TRelaySessionIoFrame,
   TRelaySessionOpenFrame,
   TRelaySessionResizeFrame,
 } from "@openllmsh/protocol";
-import { TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
+import { SESSION_ID_PATTERN, TUNNEL_CHUNK_MAX } from "@openllmsh/protocol";
 import { stateDir } from "./env";
-import { logInfo, logWarn } from "./logger";
+import { logInfo } from "./logger";
 import type { TSessionFallback } from "./session-core";
 import {
   closeSession,
@@ -58,23 +60,23 @@ import {
   setSessionLifecycleHooks,
   writeSessionInput,
 } from "./session-core";
+import type { TSessionHostMeta } from "./session-host-proc";
 import { isVendorSessionCommand } from "./vendor-commands";
 
-// ── Atomic PTY lifecycle: no session process ever outlives its daemon ──
+// ── Durable local session registry + legacy browser PTY ownership ─────
 //
-// A PTY is a child process; if the daemon dies without killing it, it leaks
-// (memory + a held session slot) until the machine reboots. Two escape hatches
-// are closed:
-//   1. CATCHABLE exit (SIGTERM from auto-update/launchd, SIGINT, uncaught
-//      error) → `killAllSessions()` runs from main.ts's exit paths.
-//   2. UNCATCHABLE exit (SIGKILL, crash, power loss) → cleanup can't run, so
-//      each live PTY records a pidfile; the NEXT daemon start sweeps stale
-//      pidfiles and kills any survivor whose command still looks like ours.
-// Together these guarantee the machine never accumulates orphaned session PTYs.
+// Local sessions are independent `openllmd __session-host` processes. Their
+// socket directories are the source of truth: a daemon restart adopts a valid
+// live entry and removes only an incomplete/dead one. It must never signal a
+// process discovered there.
+//
+// The pidfile mechanism below is intentionally retained only for the legacy
+// browser/relay PTYs that still run in this daemon during Phase 1. Phase 2 will
+// replace that adapter with a socket client. Durable hosts never write pidfiles.
 
-/** Directory holding one `<sessionId>.pid` file per live PTY. */
-// Sibling of sessionRoot (not nested under it) so a client-minted
-// session id of "pids" can never collide with the pidfile directory.
+const sessionRoot = (): string => join(stateDir(), "sessions");
+
+/** Directory holding one `<sessionId>.pid` file per legacy browser PTY. */
 const pidDir = (): string => join(stateDir(), "session-pids");
 
 const pidFile = (sessionId: string): string =>
@@ -84,11 +86,9 @@ const writePidFile = (sessionId: string, pid: number): void => {
   try {
     mkdirSync(pidDir(), { recursive: true });
     writeFileSync(pidFile(sessionId), String(pid), "utf8");
-  } catch (err) {
-    logWarn(
-      "session",
-      `pidfile write failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  } catch {
+    // The legacy adapter remains usable if its best-effort crash cleanup cannot
+    // persist a pidfile. Durable session-host processes do not use this path.
   }
 };
 
@@ -100,10 +100,129 @@ const removePidFile = (sessionId: string): void => {
   }
 };
 
-/** Whether a live process with `pid` is (still) one of our session CLIs.
- *  Conservative: only kill when the executable is a known vendor CLI, so a
- *  reused PID with a vendor name in an argument can never be SIGKILLed. */
-const looksLikeSessionProc = (pid: number): boolean => {
+const isDeviceSessionCli = (value: unknown): value is TDeviceSessionCli =>
+  value === "claude_code" ||
+  value === "chatgpt" ||
+  value === "grok" ||
+  value === "opencode";
+
+const parseSessionHostMeta = (
+  raw: string,
+  id: string,
+): TSessionHostMeta | null => {
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      return null;
+    const meta = value as Record<string, unknown>;
+    if (
+      meta.id !== id ||
+      !isDeviceSessionCli(meta.cli) ||
+      typeof meta.cwd !== "string" ||
+      meta.cwd.length === 0 ||
+      typeof meta.pid !== "number" ||
+      !Number.isInteger(meta.pid) ||
+      meta.pid <= 0 ||
+      (meta.vendorSessionId !== null &&
+        typeof meta.vendorSessionId !== "string") ||
+      (meta.title !== null && typeof meta.title !== "string") ||
+      typeof meta.startedAtMs !== "number" ||
+      !Number.isFinite(meta.startedAtMs) ||
+      typeof meta.generation !== "number" ||
+      !Number.isInteger(meta.generation)
+    )
+      return null;
+    return {
+      id,
+      cli: meta.cli,
+      cwd: meta.cwd,
+      pid: meta.pid,
+      vendorSessionId: meta.vendorSessionId,
+      title: meta.title,
+      startedAtMs: meta.startedAtMs,
+      generation: meta.generation,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { readonly code?: unknown }).code === "EPERM"
+    );
+  }
+};
+
+const socketPresent = (path: string): boolean => {
+  try {
+    return statSync(path).isSocket();
+  } catch {
+    return false;
+  }
+};
+
+export type TSessionHostReconcilerDeps = {
+  readonly isPidAlive?: (pid: number) => boolean;
+  readonly isSocketPresent?: (path: string) => boolean;
+};
+
+/**
+ * Adopt live durable session-host directories and reap stale registry entries.
+ * A directory survives only with valid metadata, a live host pid, and ctl.sock;
+ * this daemon never sends it a signal. Kept entries are discovery state for
+ * status now and the Phase 2 browser socket proxy later.
+ */
+export const reapOrphanSessionProcs = (
+  deps: TSessionHostReconcilerDeps = {},
+): void => {
+  let entries: string[];
+  try {
+    entries = readdirSync(sessionRoot());
+  } catch {
+    return;
+  }
+  const isPidAlive = deps.isPidAlive ?? pidAlive;
+  const isSocketPresent = deps.isSocketPresent ?? socketPresent;
+  for (const id of entries) {
+    if (!SESSION_ID_PATTERN.test(id)) continue;
+    const directory = join(sessionRoot(), id);
+    let meta: TSessionHostMeta | null = null;
+    try {
+      if (!statSync(directory).isDirectory()) continue;
+      meta = parseSessionHostMeta(
+        readFileSync(join(directory, "meta.json"), "utf8"),
+        id,
+      );
+    } catch {
+      meta = null;
+    }
+    const live =
+      meta !== null &&
+      isPidAlive(meta.pid) &&
+      isSocketPresent(join(directory, "ctl.sock"));
+    if (live && meta !== null) {
+      logInfo("session", "adopted durable session host", { id, pid: meta.pid });
+      continue;
+    }
+    try {
+      rmSync(directory, { recursive: true, force: true });
+      logInfo("session", "reaped stale durable session registry entry", { id });
+    } catch {
+      /* best-effort */
+    }
+  }
+};
+
+/** Whether a live process with `pid` is (still) one legacy browser session CLI. */
+const looksLikeLegacyBrowserSessionProc = (pid: number): boolean => {
   try {
     const out = Bun.spawnSync(["ps", "-p", String(pid), "-o", "command="], {
       stdout: "pipe",
@@ -114,15 +233,13 @@ const looksLikeSessionProc = (pid: number): boolean => {
   }
 };
 
-/** Startup sweep: kill any orphan PTY a PRIOR daemon instance left behind
- *  (uncatchable exit), then clear its pidfile. Idempotent; call once at boot
- *  BEFORE accepting sessions. */
-export const reapOrphanSessionProcs = (): void => {
+/** Reap only legacy in-daemon browser PTYs after an uncatchable daemon exit. */
+export const reapLegacyBrowserSessionProcs = (): void => {
   let entries: string[];
   try {
     entries = readdirSync(pidDir());
   } catch {
-    return; // no pid dir yet — nothing to sweep
+    return;
   }
   for (const entry of entries) {
     if (!entry.endsWith(".pid")) continue;
@@ -131,15 +248,15 @@ export const reapOrphanSessionProcs = (): void => {
     try {
       pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
     } catch {
-      pid = 0;
+      // A partial pidfile is stale; remove it below without signalling anyone.
     }
-    if (Number.isInteger(pid) && pid > 0 && looksLikeSessionProc(pid)) {
+    if (
+      Number.isInteger(pid) &&
+      pid > 0 &&
+      looksLikeLegacyBrowserSessionProc(pid)
+    ) {
       try {
         process.kill(pid, "SIGKILL");
-        logInfo("session", "reaped orphan session process from prior daemon", {
-          pid,
-          file: entry,
-        });
       } catch {
         /* already gone */
       }
@@ -152,11 +269,17 @@ export const reapOrphanSessionProcs = (): void => {
   }
 };
 
+/** Reconcile durable hosts, then retain pre-Phase-2 browser PTY protection. */
+export const reconcileSessionHostsAtBoot = (): void => {
+  reapOrphanSessionProcs();
+  reapLegacyBrowserSessionProcs();
+};
+
 // ── daemon relay-frame adapter ───────────────────────────────────────
 //
 // The state machine lives in session-core.ts. This module deliberately owns
-// only legacy TRelayFrame shaping plus the daemon pidfile lifecycle until
-// Phase 1d replaces those files with the durable session-host registry.
+// only legacy TRelayFrame shaping plus temporary browser-PTY pidfiles. Durable
+// local sessions are discovered through their socket-directory registry.
 
 const legacyFallback = (
   send: (frame: TRelayFrame) => void,

@@ -157,15 +157,14 @@ export const runSandboxExec = async (
   // then exits via the child's `128 + signal` mirror below.
   //
   // RESIDUAL GAP (documented, accepted): a SIGKILL of the shim cannot be
-  // forwarded (uncatchable), so a kill -9 of the wrapper orphans the tail.
-  // Bun exposes neither `PR_SET_PDEATHSIG` for a spawned child nor
-  // detached/process-group spawn semantics, and an FFI prctl can't run in the
+  // forwarded (uncatchable), so a kill -9 of the wrapper can orphan the tail.
+  // Bun does support detached process groups (`detached: true` performs
+  // POSIX setsid) and the durable session host uses that deliberately; it does
+  // not supply `PR_SET_PDEATHSIG`, however, nor can an FFI prctl run in the
   // child between fork and exec. Every daemon-side kill path uses catchable
   // signals (`proc.kill()` = SIGTERM, spawnLogin's reaper uses SIGKILL on the
-  // SHIM only after the `until`/timeout capture — at which point an orphaned
-  // login child is the same wedge class the pre-shim code already tolerated
-  // and the orphan-reaper handles at next boot). Revisit if Bun grows
-  // pdeathsig/process-group support.
+  // SHIM only after the `until`/timeout capture). Revisit if Bun adds a
+  // parent-death signal spawn option.
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     process.on(signal, () => {
       try {

@@ -93,8 +93,10 @@ daemon/
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
     mux-host.ts             mux1/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
-    session-host.ts         one PTY registry shared by browser mux and local broker attachers: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping; production relay-JSON session frames remain the mutually exclusive fallback (never fan out beside stream consumers)
-    broker-listener.ts      authenticated loopback session broker for local openllm CLI attach/list/kill
+    session-core.ts         transport-neutral PTY state machine: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping
+    session-host.ts         legacy browser/relay adapter plus durable socket-directory boot reconciler; retains only temporary in-daemon browser PTY ownership until Phase 2
+    session-host-proc/      detached per-session host: owns one durable PTY, scrollback, idle reaping, meta.json, and ctl.sock
+    broker-listener.ts      legacy authenticated loopback broker surface retained for browser/relay compatibility during the Phase 2 transition
     rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice + mux over data channel
     rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice + mux over data channel
     tunnel-client.ts        consuming subscription tunnel: RTC (when open) → relay mux only (no JSON splice)
@@ -351,32 +353,36 @@ Path ladder on the consumer side: **RTC (when open) → relay binary mux (`mux1`
   with ts window + nonce map; browser-only enforcement (daemon fleet hops
   skip grant). Locked-vault consumers fail closed before probing transports.
 
-### Shared device-session host
+### Durable device-session host
 
-`session-host.ts` is the canonical owner of every live vendor-cli PTY. Browser
-mux/RTC streams and authenticated local broker streams are equal consumers of
-the same session: output fans out through an independent ordered write tail per
-consumer, while either consumer may write input or resize the one PTY
-(last-arriving size wins). An attach adds a consumer; it never evicts an
-existing viewer. Each newly attached stream receives a clear-screen preamble,
-scrollback snapshot, and `replay_done` on its own tail while other consumers
-continue receiving live output.
+A local session is a detached `openllmd __session-host` sibling process, not a
+child of the daemon. It owns one vendor-cli PTY, scrollback, multi-attach fan-out,
+and the 15-second idle-reap poll. Its private registry is
+`~/.openllm/sessions/<id>/`: `meta.json` records the host pid and session
+metadata; `ctl.sock` carries the existing open/ctrl/reset/exit Unix-WebSocket
+attach envelope. An attach adds a consumer, fans output to independent ordered
+write tails, merges input, and uses last-attacher-wins resize. A lagging consumer
+is removed without affecting the PTY or other consumers.
 
-A consumer with more than 2 MiB of queued, unwritten output, or a failed write,
-is reset as `lagging` and removed without affecting the PTY or other viewers.
-`attached` in status is derived from the consumer set. Relay reconnect teardown
-clears all stream bindings but keeps the PTYs resumable.
+The host, rather than the daemon, reaps an unattached session after both output
+and process-tree CPU have been idle for `OPENLLM_SESSION_IDLE_TIMEOUT_MIN`
+(default 60; `0` disables it): SIGTERM then SIGKILL after 10 seconds. Consequently
+a daemon shutdown, fatal exit, update, or crash cannot kill a durable local
+session. On boot the daemon reconciles the socket-directory registry: valid
+`meta.json` + live host pid + present socket is **adopted** (kept, never
+signalled); a dead or incomplete directory is removed. The former pidfile killer
+is retained only for the temporary legacy browser/relay PTYs the daemon still
+owns in-process.
 
-The existing 15-second activity poll also reaps live sessions with no consumers
-when both PTY output and process-tree CPU activity have been idle for
-`OPENLLM_SESSION_IDLE_TIMEOUT_MIN` (default 60; `0` disables it). Reaping sends
-SIGTERM first, waits 10 seconds, then escalates to SIGKILL only if needed. The
-session record stays retained with `last_exit_reason: "reaped"` and its vendor
-session id for a later continue/resume.
+`session-host.ts` deliberately keeps the legacy relay-frame and mux adapter for
+those browser sessions. Phase 2 will turn it into a client of `ctl.sock`; this
+phase does not change the remote-session gate or browser wire surface. See
+[`durable-session-host.md`](../../docs/proposals/durable-session-host.md) and
+[`shared-session-viewing.md`](../../docs/proposals/shared-session-viewing.md).
 
 The session PTY spawn remains deliberately outside the per-child sandbox: it
-runs the user's real vendor CLI against the user's real `$HOME`, while the daemon
-owns process lifecycle and transport fan-out.
+runs the user's real vendor CLI against the user's real `$HOME`; only its
+standalone host owns lifecycle and transport fan-out.
 
 ## Two localhost surfaces
 

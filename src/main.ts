@@ -60,9 +60,8 @@ import {
   trackBodyDone,
 } from "./self-update";
 import {
-  killAllSessions,
   pollSessionActivity,
-  reapOrphanSessionProcs,
+  reconcileSessionHostsAtBoot,
 } from "./session-host";
 import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
@@ -128,12 +127,14 @@ const main = async (): Promise<void> => {
   // synchronously (appendFileSync), so the line is flushed before exit.
   process.on("uncaughtException", (err) => {
     logError("uncaughtException", err);
-    killAllSessions(); // never leak a PTY on a fatal exit
+    // Durable local session hosts are detached sibling processes. A daemon
+    // fatal exit must never terminate their vendor PTYs; attached browser
+    // clients simply lose their transport until Phase 2 reconnects them.
     process.exit(1);
   });
   process.on("unhandledRejection", (reason) => {
     logError("unhandledRejection", reason);
-    killAllSessions();
+    // See uncaughtException: session-host processes own their own lifecycle.
     process.exit(1);
   });
 
@@ -220,9 +221,10 @@ const main = async (): Promise<void> => {
   // commands and marks this key's daemon "online" server-side — so the
   // dashboard never reaches loopback (no Private Network Access prompt). See
   // `docs/proposals/daemon-relay-websocket-push.md`.
-  // Reap orphan session PTYs a PRIOR daemon left behind after an uncatchable
-  // exit (SIGKILL, crash, power loss) — BEFORE accepting new sessions.
-  reapOrphanSessionProcs();
+  // Reconcile the durable session-host registry before accepting connections.
+  // A live socket directory belongs to an independent session process and is
+  // adopted (kept); only incomplete or dead entries are removed.
+  reconcileSessionHostsAtBoot();
 
   startControlChannel();
 
@@ -239,9 +241,8 @@ const main = async (): Promise<void> => {
   const shutdown = (signal: NodeJS.Signals): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Kill session PTYs BEFORE exit — an auto-update/launchd SIGTERM must not
-    // orphan them (they would leak memory + hold slots until reboot).
-    killAllSessions();
+    // Durable local session hosts are detached from this daemon. Stop only the
+    // control transport; their own process owns PTY teardown and idle reaping.
     void stopControlChannel().finally(() => {
       process.exit(signal === "SIGINT" ? 130 : 143);
     });
