@@ -9,8 +9,9 @@ import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
 } from "@openllmsh/protocol";
-import { SESSION_ID_PATTERN } from "@openllmsh/protocol";
+import { DeviceSessionCli, SESSION_ID_PATTERN } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
+import { Schema as S } from "effect";
 import { daemonEnv } from "./env";
 import { readAllLocalSessions } from "./local-sessions";
 import type { TSessionStream } from "./session-host";
@@ -66,11 +67,9 @@ const keyMatches = (req: Request): boolean => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const isCli = (value: unknown): value is TDeviceSessionCli =>
-  value === "claude_code" ||
-  value === "chatgpt" ||
-  value === "grok" ||
-  value === "opencode";
+/** Protocol-owned membership — tracks future DeviceSessionCli additions. */
+const isCli: (value: unknown) => value is TDeviceSessionCli =
+  S.is(DeviceSessionCli);
 
 const isDimension = (value: unknown): value is number =>
   typeof value === "number" &&
@@ -110,12 +109,15 @@ const parseOpen = (
     !isDimension(open.rows) ||
     (open.mode !== "spawn" && open.mode !== "attach") ||
     (open.title !== undefined &&
-      (typeof open.title !== "string" || open.title.length > 80)) ||
+      (typeof open.title !== "string" ||
+        open.title.length > 80 ||
+        open.title.includes("\0"))) ||
     (open.dangerous !== undefined && typeof open.dangerous !== "boolean") ||
     (open.cwd !== undefined &&
       (typeof open.cwd !== "string" ||
         open.cwd.length < 1 ||
         open.cwd.length > 1024 ||
+        open.cwd.includes("\0") ||
         !open.cwd.startsWith("/")))
   )
     return null;
@@ -258,48 +260,55 @@ export const brokerWebsocket: Bun.WebSocketHandler<TBrokerSocketData> = {
     socket.binaryType = "uint8array";
   },
   message: (socket, message): void => {
-    const stream = socket.data.stream;
-    if (typeof message !== "string") {
-      if (!socket.data.opened || stream === null) {
+    // One catch-all: an exception escaping into Bun's WS runtime would tear
+    // the whole listener's error path, not just this socket. Any throw from
+    // parse, stream handlers, or bindSessionStream is a protocol reset here.
+    try {
+      const stream = socket.data.stream;
+      if (typeof message !== "string") {
+        if (!socket.data.opened || stream === null) {
+          protocolError(socket);
+          return;
+        }
+        stream.receiveData(new Uint8Array(message));
+        return;
+      }
+      let envelope: TBrokerEnvelope;
+      try {
+        const parsed: unknown = JSON.parse(message);
+        if (!isRecord(parsed)) throw new Error("not envelope");
+        envelope = parsed;
+      } catch {
         protocolError(socket);
         return;
       }
-      stream.receiveData(new Uint8Array(message));
-      return;
-    }
-    let envelope: TBrokerEnvelope;
-    try {
-      const parsed: unknown = JSON.parse(message);
-      if (!isRecord(parsed)) throw new Error("not envelope");
-      envelope = parsed;
+      if (!socket.data.opened) {
+        if (envelope.t !== "open") {
+          protocolError(socket);
+          return;
+        }
+        const parsed = parseOpen(envelope.open);
+        if (parsed === null) {
+          protocolError(socket);
+          return;
+        }
+        const next = new BrokerSessionStream(socket);
+        socket.data.stream = next;
+        socket.data.opened = true;
+        bindSessionStream(next, parsed.open, {
+          vendorArgs: parsed.vendorArgs,
+          onExit: (code) => {
+            socket.sendText(JSON.stringify({ t: "exit", code }));
+          },
+        });
+        return;
+      }
+      if (envelope.t === "ctrl" && stream !== null)
+        stream.receiveCtrl(envelope.p);
+      // Unknown envelopes deliberately disappear for rolling CLI/daemon upgrades.
     } catch {
       protocolError(socket);
-      return;
     }
-    if (!socket.data.opened) {
-      if (envelope.t !== "open") {
-        protocolError(socket);
-        return;
-      }
-      const parsed = parseOpen(envelope.open);
-      if (parsed === null) {
-        protocolError(socket);
-        return;
-      }
-      const next = new BrokerSessionStream(socket);
-      socket.data.stream = next;
-      socket.data.opened = true;
-      bindSessionStream(next, parsed.open, {
-        vendorArgs: parsed.vendorArgs,
-        onExit: (code) => {
-          socket.sendText(JSON.stringify({ t: "exit", code }));
-        },
-      });
-      return;
-    }
-    if (envelope.t === "ctrl" && stream !== null)
-      stream.receiveCtrl(envelope.p);
-    // Unknown envelopes deliberately disappear for rolling CLI/daemon upgrades.
   },
   close: (socket): void => {
     socket.data.stream?.closed();

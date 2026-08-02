@@ -237,12 +237,28 @@ export const readLocalSessions = async (
     }));
 };
 
-/** List every supported local CLI, preserving the per-CLI merge behavior. */
+/**
+ * List every supported local CLI, preserving the per-CLI merge behavior.
+ * The limit applies to the COMBINED result: each CLI reads unlimited, then
+ * the flattened rows are re-sorted with the same attachable → live →
+ * recency ordering `readLocalSessions` uses, so one chatty CLI can't
+ * crowd a quieter one out via per-group truncation.
+ */
 export const readAllLocalSessions = async (
   opts: { readonly limit?: number; readonly deps?: TLocalSessionsDeps } = {},
 ): Promise<TLocalCliSession[]> => {
+  const limit = clampLimit(opts.limit);
   const groups = await Promise.all(
-    [...LISTABLE_SESSION_CLIS].map((cli) => readLocalSessions(cli, opts)),
+    [...LISTABLE_SESSION_CLIS].map((cli) =>
+      readLocalSessions(cli, { limit: 100, deps: opts.deps }),
+    ),
   );
-  return groups.flat();
+  return groups
+    .flat()
+    .sort((a, b) => {
+      if (a.attachable !== b.attachable) return a.attachable ? -1 : 1;
+      if (a.live !== b.live) return a.live ? -1 : 1;
+      return b.updated_at_ms - a.updated_at_ms;
+    })
+    .slice(0, limit);
 };

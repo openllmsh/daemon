@@ -740,6 +740,13 @@ const terminalClose = (
       });
     }
   }
+  // Exit codes are delivered on NATURAL exits only: Bun's `proc.exited` fires
+  // `onExit(code)` (which sets `exitCode`) BEFORE it calls this close, so the
+  // envelope precedes the socket close. Kill-intent closes run here first —
+  // synchronously, `exitCode` still null — and deliberately send no envelope:
+  // like detach and supersede, a user-initiated teardown reads as exit 0 on
+  // the attached consumer, not as the child's signal status arriving later on
+  // an already-closed socket.
   if (s.exitCode !== null) {
     try {
       s.exitHandler?.(s.exitCode);
