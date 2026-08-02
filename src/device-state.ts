@@ -18,14 +18,20 @@
 
 import { existsSync } from "node:fs";
 import type { TDaemonCliState } from "@openllmsh/protocol";
+import { binarySignature } from "./bin-signature";
 import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
 import { cliVersion } from "./delegation/util";
 import { logDebug } from "./logger";
 
-/** How long a probed CLI state stays fresh. */
-const CACHE_TTL_MS = 30_000;
-
-let cache: { state: TDaemonCliState; at: number } | null = null;
+/** Cached probe, keyed by the binary's PATH + stat signature: the `--version`
+ *  spawn re-runs only when the signature changes (a self-update), never on a
+ *  timer — so the confined spawn stays off the hot status path. */
+interface CliStateCache {
+  path: string;
+  signature: string | null;
+  version: string | null;
+}
+let cache: CliStateCache = { path: "", signature: null, version: null };
 
 /** The installed CLI binary, preferring the current name over the legacy one. */
 const installedBinary = (): string | null => {
@@ -36,33 +42,50 @@ const installedBinary = (): string | null => {
 };
 
 /**
- * Probe the CLI's presence + version. Cheap, but not free (it spawns
- * `--version`), so the result is cached for {@link CACHE_TTL_MS}.
+ * Probe the CLI's presence + version. The `--version` spawn is CONFINED
+ * (sandbox-wrapped like any vendor spawn) but only fires when the binary's stat
+ * signature changed since the last probe (see {@link binarySignature}) — an
+ * unchanged binary returns the cached version with no spawn at all.
  */
 export const refreshCliState = async (): Promise<TDaemonCliState> => {
   const bin = installedBinary();
   if (bin === null) {
-    cache = { state: { installed: false, version: null }, at: Date.now() };
-    return cache.state;
+    cache = { path: "", signature: null, version: null };
+    return { installed: false, version: null };
+  }
+  const signature = binarySignature(bin);
+  // Unchanged binary since the last successful probe → reuse the version, no spawn.
+  if (cache.path === bin && cache.signature === signature) {
+    return { installed: true, version: cache.version };
   }
   // Legacy binaries print `openllmc vX.Y.Z`, current ones `openllm vX.Y.Z`.
   const out = await cliVersion(bin);
   const version = out?.match(/openllmc? v(\S+)/)?.[1] ?? null;
-  cache = { state: { installed: true, version }, at: Date.now() };
+  cache = { path: bin, signature, version };
   logDebug("device-state", "cli state", { installed: true, version });
-  return cache.state;
+  return { installed: true, version };
 };
 
 /**
- * The CLI state for a status push. Serves the cache when fresh; otherwise
- * kicks off a refresh and reports what we last knew (or "not installed" on the
- * very first call) so a status push is never blocked on a spawn.
+ * The CLI state for a status push. A `statSync` is cheap enough to run on every
+ * call: when the binary is unchanged it returns the cached version with no
+ * spawn; when it changed (or on first sight) it kicks a background refresh and
+ * reports the last-known value so the push is never blocked on a spawn.
  */
 export const getCliState = (): TDaemonCliState => {
-  const now = Date.now();
-  if (cache !== null && now - cache.at < CACHE_TTL_MS) return cache.state;
+  const bin = installedBinary();
+  if (bin === null) {
+    cache = { path: "", signature: null, version: null };
+    return { installed: false, version: null };
+  }
+  if (cache.path === bin && cache.signature === binarySignature(bin)) {
+    return { installed: true, version: cache.version };
+  }
   void refreshCliState().catch(() => {
     // Best-effort: a failed probe keeps the previous value.
   });
-  return cache?.state ?? { installed: false, version: null };
+  return {
+    installed: true,
+    version: cache.path === bin ? cache.version : null,
+  };
 };

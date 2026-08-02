@@ -43,6 +43,7 @@ import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
 import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TNativeRunResult } from "./types";
 import {
   cleanNativeSpawnEnv,
@@ -195,13 +196,19 @@ export const runClaudeNative = async (
   ];
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(sandboxSpawnArgs(argv), {
-      stdin: new TextEncoder().encode(params.userText),
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: spawnCwd(params.env),
-      env: cleanNativeSpawnEnv(params.env),
-    });
+    // The bridge reads claude's isolated login-keychain credential to serve the
+    // request; securityd denies a Seatbelt-confined caller, so it runs
+    // unconfined on macOS (confined on Linux) — `sandbox/policy.ts`.
+    proc = Bun.spawn(
+      sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
+      {
+        stdin: new TextEncoder().encode(params.userText),
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: spawnCwd(params.env),
+        env: cleanNativeSpawnEnv(params.env),
+      },
+    );
   } catch (error) {
     return {
       kind: "declined",

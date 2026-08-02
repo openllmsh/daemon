@@ -14,7 +14,9 @@
  * request/poll calls) are injected — this file never imports a delegate, so
  * there is no cycle.
  */
+
 import { clearPendingAuth, setPendingAuth } from "../pending-auth";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TConnectResult, TLoginSlot } from "./login-flow";
 import { guard, spawnStreamLogin } from "./login-flow";
 import type { TLoginResult } from "./util";
@@ -61,7 +63,11 @@ export const makeBlockingConnect = (
       },
       async () => {
         await cfg.beforeLogin?.();
-        const result = await spawnLogin([...cfg.argv()], cfg.env());
+        // Keychain-dependent login (claude) runs unconfined on macOS — see
+        // `sandbox/policy.ts`; codex/kimi/grok stay confined on both platforms.
+        const result = await spawnLogin([...cfg.argv()], cfg.env(), {
+          probe: unwrapKeychainSpawn(cfg.provider),
+        });
         await cfg.afterLogin?.();
         if (await cfg.verifyConnected()) {
           await cfg.onConnected?.();
@@ -128,6 +134,9 @@ export const makeStreamConnect = (
           parse: cfg.parse,
           isConnected: cfg.connected,
           onConnected: cfg.onConnected,
+          // cursor's store is the macOS keychain → unconfined on mac; codex is
+          // file-backed → stays confined (`sandbox/policy.ts`).
+          probe: unwrapKeychainSpawn(cfg.provider),
         });
         if (res.found === null) {
           cfg.onParseFail?.(res.captured);

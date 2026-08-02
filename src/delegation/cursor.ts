@@ -23,6 +23,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { accountHashField } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
@@ -203,10 +204,12 @@ const readFileTokens = async (): Promise<{
 };
 
 const triggerRefresh = async (): Promise<void> => {
-  // `probe: true` — cursor-agent's token store is the macOS keychain, and
-  // securityd refuses keychain access for a Seatbelt-confined caller; a
-  // wrapped refresh silently never persists the rotated token.
-  await spawnRefresh([bin(), "status"], env(), { probe: true });
+  // cursor-agent's token store is the macOS keychain, and securityd refuses a
+  // Seatbelt-confined caller; unconfined on macOS, confined on Linux
+  // (file-backed store) — `sandbox/policy.ts`.
+  await spawnRefresh([bin(), "status"], env(), {
+    probe: unwrapKeychainSpawn(PROVIDER),
+  });
 };
 
 const refresh = makeRefresher({

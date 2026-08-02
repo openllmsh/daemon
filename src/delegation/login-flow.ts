@@ -210,6 +210,9 @@ export type TStreamLoginOpts<T> = {
   readonly isConnected: () => Promise<boolean>;
   /** Runs in the background-exit cleanup when a credential landed. */
   readonly onConnected?: () => void | Promise<void>;
+  /** Skip the sandbox wrap (macOS keychain-dependent login — see
+   *  `sandbox/policy.ts`). Set from `unwrapKeychainSpawn(provider)`. */
+  readonly probe?: boolean;
 };
 
 /**
@@ -231,7 +234,7 @@ export const spawnStreamLogin = async <T>(
 > => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(sandboxSpawnArgs(opts.argv), {
+    proc = Bun.spawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
       stdin: "ignore",
       stdout: opts.stream === "stdout" ? "pipe" : "ignore",
       // The unread fd is discarded (not piped) so an undrained pipe can't stall

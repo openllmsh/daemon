@@ -24,6 +24,7 @@ import {
 } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { binarySignature } from "./bin-signature";
 import type { TCliProvider } from "./cli-paths";
 import {
   cliBin,
@@ -142,6 +143,10 @@ const CLI_INSTALL_STATE_TTL_MS = 30_000;
 interface CliInstallCacheEntry {
   readonly result: TCliInstallState;
   readonly expiresAt: number;
+  /** Stat signature of the resolved binary at probe time — an unchanged
+   *  signature past `expiresAt` reuses the version instead of re-spawning
+   *  `--version` (see {@link binarySignature}). */
+  readonly signature: string | null;
 }
 
 /** Per-provider cache of `cliInstallState` results. */
@@ -185,6 +190,7 @@ export const cliInstallState = async (
         cliInstallStateCache.set(provider, {
           result,
           expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+          signature: null,
         });
       }
       return result;
@@ -198,6 +204,7 @@ export const cliInstallState = async (
       cliInstallStateCache.set(provider, {
         result: notInstalled,
         expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+        signature: null,
       });
     }
     return notInstalled;
@@ -206,12 +213,27 @@ export const cliInstallState = async (
   // (the main link existing skips `linkIsolatedCli` above forever). Idempotent
   // — an up-to-date link is a readlink+compare, so the 30s probe stays cheap.
   linkSidecars(bin);
-  // Unwrapped probe (`probe: true`): a fixed-argv `--version` on the 30s
-  // status path — the `--sandbox-exec` shim's per-spawn daemon re-exec costs
-  // far more than confining a version print protects.
-  const out = await runCapture([bin, "--version"], cliEnv(provider), {
-    probe: true,
-  });
+  // Unchanged binary since the last successful probe → reuse the version WITHOUT
+  // re-spawning `--version`. This is what lets the probe stay CONFINED
+  // (sandbox-wrapped) without the per-tick shim cost: the spawn fires only when
+  // the binary's stat signature changes (a self-update / a repointed run-view).
+  const signature = binarySignature(bin);
+  if (
+    cached?.result.installed === true &&
+    cached.signature === signature &&
+    generation === cacheGeneration
+  ) {
+    cliInstallStateCache.set(provider, {
+      result: cached.result,
+      expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+      signature,
+    });
+    return cached.result;
+  }
+  // Confined `--version` (no `probe`): the sandbox shim wraps it like any vendor
+  // spawn. It runs rarely (only on a signature change), so the ~300ms shim cost
+  // never lands on the hot path.
+  const out = await runCapture([bin, "--version"], cliEnv(provider));
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };
   // Only write to cache if generation hasn't changed (cache not cleared).
@@ -219,6 +241,7 @@ export const cliInstallState = async (
     cliInstallStateCache.set(provider, {
       result,
       expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+      signature,
     });
   }
   return result;

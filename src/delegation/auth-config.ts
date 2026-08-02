@@ -42,6 +42,7 @@ import type { TCliProvider } from "../cli-paths";
 import { cliBin, cliEnv, cliRoot } from "../cli-paths";
 import { logDebug, logInfo } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
 
 /** The persisted shape (all fields optional). */
@@ -428,13 +429,23 @@ const captureInferenceRequest = async (
       : cmdArgv;
   let proc: ReturnType<typeof Bun.spawn> | null = null;
   try {
-    proc = Bun.spawn(sandboxSpawnArgs(spawnArgv), {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      cwd: tmpdir(),
-      env: { ...process.env, ...cliEnv(provider), ...spec.env(recorder.base) },
-    });
+    // claude's identity capture runs the CLI's `exec`, which reads the isolated
+    // keychain credential; unconfined on macOS for the keychain providers,
+    // confined otherwise — `sandbox/policy.ts`.
+    proc = Bun.spawn(
+      sandboxSpawnArgs(spawnArgv, { probe: unwrapKeychainSpawn(provider) }),
+      {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        cwd: tmpdir(),
+        env: {
+          ...process.env,
+          ...cliEnv(provider),
+          ...spec.env(recorder.base),
+        },
+      },
+    );
   } catch (err) {
     recorder.stop();
     logDebug("auth-config", `capture spawn failed for ${provider}`, {

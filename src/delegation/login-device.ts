@@ -15,7 +15,9 @@
  * uses, so codex's two login methods stay mutually exclusive, and `cancelConnect`
  * cancels whichever flow is live. Provider atoms are injected — no delegate import.
  */
+
 import { pendingAuthDetail, setPendingAuth } from "../pending-auth";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TConnectResult, TLoginSlot } from "./login-flow";
 import {
   finishInBackground,
@@ -100,7 +102,11 @@ export const makePasteBackDevice = (
       },
       async () => {
         await cfg.beforeLogin?.();
-        const login = await spawnHeadlessLogin([...cfg.argv()], cfg.env());
+        // Keychain-dependent paste-back login (claude) is unconfined on macOS
+        // (`sandbox/policy.ts`).
+        const login = await spawnHeadlessLogin([...cfg.argv()], cfg.env(), {
+          probe: unwrapKeychainSpawn(cfg.provider),
+        });
         if ("error" in login) {
           return { connected: false, detail: login.error };
         }
@@ -231,6 +237,9 @@ export const makeStreamDeviceConnect = (
           parse: cfg.parse,
           isConnected: cfg.connected,
           onConnected: cfg.onConnected,
+          // codex/grok device-code login is file-backed → stays confined
+          // (`sandbox/policy.ts`); the predicate returns false for them.
+          probe: unwrapKeychainSpawn(cfg.provider),
         });
         if (res.found === null) {
           return { connected: false, detail: cfg.failDetail };

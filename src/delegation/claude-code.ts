@@ -38,6 +38,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { accountHash, nonEmpty } from "./account-id";
 import {
   ensureAuthConfig,
@@ -134,10 +135,12 @@ const readAccountHash = async (): Promise<string | null> => {
  */
 const triggerRefresh = async (): Promise<void> => {
   await ensureIsolatedKeychain(cliHome(PROVIDER));
-  // `probe: true` — the refresh persists the rotated token into the macOS
-  // keychain via securityd, which refuses a Seatbelt-confined caller; a
-  // wrapped refresh silently never lands and the token hard-expires.
-  await spawnRefresh([bin(), "-p", "ping"], env(), { probe: true });
+  // The refresh persists the rotated token into the macOS keychain via
+  // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
+  // confined on Linux (file-backed store) — `sandbox/policy.ts`.
+  await spawnRefresh([bin(), "-p", "ping"], env(), {
+    probe: unwrapKeychainSpawn(PROVIDER),
+  });
 };
 
 // Within the leeway window → fire the CLI refresh in the background (still
@@ -233,13 +236,12 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
 
   const generation = authStatusGeneration;
   const probe = async (): Promise<boolean | null> => {
-    // `probe: true` — MUST run unwrapped: macOS securityd refuses keychain
-    // reads for a Seatbelt-confined caller, so a sandbox-wrapped `auth status`
-    // reports a definite `loggedIn: false` on a signed-in box (verified
-    // empirically against the shipped shim) and the dashboard shows
-    // "installed but not signed in".
+    // macOS securityd refuses keychain reads for a Seatbelt-confined caller, so
+    // a sandbox-wrapped `auth status` reports a definite `loggedIn: false` on a
+    // signed-in box (verified empirically). Unconfined on macOS, confined on
+    // Linux (`sandbox/policy.ts`).
     const out = await runCapture([bin(), "auth", "status"], env(), {
-      probe: true,
+      probe: unwrapKeychainSpawn(PROVIDER),
     });
     if (out === null) return null;
     try {

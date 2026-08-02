@@ -135,14 +135,13 @@ export const runCapture = async (
 };
 
 /** Run a binary's `--version` (best-effort). Returns null on failure.
- *  A fixed-argv read-only probe on the 30s status hot path — spawned
- *  UNWRAPPED (`probe: true`): the shim's full daemon re-exec per spawn costs
- *  far more than confining a no-untrusted-input version print protects. */
+ *  CONFINED (no `probe`): callers gate this behind a stat-signature cache
+ *  (`bin-signature.ts`) so it spawns only when the binary changed, keeping the
+ *  ~300ms shim cost off the hot status path without leaving it unconfined. */
 export const cliVersion = (
   bin: string,
   env?: Record<string, string>,
-): Promise<string | null> =>
-  runCapture([bin, "--version"], env, { probe: true });
+): Promise<string | null> => runCapture([bin, "--version"], env);
 
 export type TLoginResult = {
   readonly code: number;

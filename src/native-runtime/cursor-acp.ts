@@ -54,6 +54,7 @@ import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate
 import { spawnCwd } from "../delegation/util";
 import { logError, logInfo, logWarn } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
 import type { TCursorMcpServer } from "./cursor-mcp-server";
 import { startCursorMcpServer } from "./cursor-mcp-server";
@@ -296,13 +297,19 @@ class AcpClient {
       params: unknown,
     ) => unknown = () => null,
   ) {
-    this.proc = Bun.spawn(sandboxSpawnArgs([bin, "acp"]), {
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: spawnCwd(env),
-      env: cleanNativeSpawnEnv(env),
-    });
+    // The ACP bridge reads cursor's isolated macOS keychain credential;
+    // securityd denies a Seatbelt-confined caller, so it runs unconfined on
+    // macOS (confined on Linux) — `sandbox/policy.ts`.
+    this.proc = Bun.spawn(
+      sandboxSpawnArgs([bin, "acp"], { probe: unwrapKeychainSpawn("cursor") }),
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: spawnCwd(env),
+        env: cleanNativeSpawnEnv(env),
+      },
+    );
     this.stdin = this.proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;

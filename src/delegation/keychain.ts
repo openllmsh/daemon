@@ -22,6 +22,7 @@ import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
+import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { logIfKilled, spawnCwd } from "./spawn";
 
 const MAC = platform() === "darwin";
@@ -44,16 +45,18 @@ const runSecurity = async (
   home: string,
 ): Promise<boolean> => {
   try {
-    // Unwrapped probe: fixed `/usr/bin/security` argv talking to securityd
-    // over mach IPC — the shim's per-spawn daemon re-exec adds cost, not
-    // protection, and keychain ops run on hot status/ensure paths.
-    const proc = Bun.spawn(sandboxSpawnArgs(["security", ...argv], { probe: true }), {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      cwd: spawnCwd({ HOME: home }),
-      env: { ...process.env, HOME: home },
-    });
+    // Unconfined on macOS (`sandbox/policy.ts`): `security` talks to securityd,
+    // which refuses a Seatbelt-confined caller. These paths are macOS-only.
+    const proc = Bun.spawn(
+      sandboxSpawnArgs(["security", ...argv], { probe: unwrapKeychainSpawn() }),
+      {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        cwd: spawnCwd({ HOME: home }),
+        env: { ...process.env, HOME: home },
+      },
+    );
     const code = await proc.exited;
     // Through the `--sandbox-exec` shim the daemon sees `128 + signal` as an
     // exit CODE, not a signalCode, so this only fires for a kill of the shim
@@ -224,7 +227,7 @@ const findKeychainServices = async (
   try {
     const proc = Bun.spawn(
       sandboxSpawnArgs(["security", "dump-keychain", loginKeychainPath(home)], {
-        probe: true,
+        probe: unwrapKeychainSpawn(),
       }),
       {
         stdout: "pipe",
@@ -263,7 +266,7 @@ const readKeychainSecret = async (
           "-w",
           loginKeychainPath(home),
         ],
-        { probe: true },
+        { probe: unwrapKeychainSpawn() },
       ),
       {
         stdout: "pipe",

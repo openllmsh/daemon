@@ -76,7 +76,7 @@ const ensureNoBrowserShimDir = async (): Promise<string | null> => {
 export const spawnHeadlessLogin = async (
   argv: ReadonlyArray<string>,
   env: Record<string, string>,
-  opts?: { readonly urlTimeoutMs?: number },
+  opts?: { readonly urlTimeoutMs?: number; readonly probe?: boolean },
 ): Promise<THeadlessLogin | { error: string }> => {
   const shimDir = await ensureNoBrowserShimDir();
   const baseEnv = spawnEnv(env) ?? { ...process.env };
@@ -90,7 +90,7 @@ export const spawnHeadlessLogin = async (
     childEnv.PATH = `${shimDir}:${baseEnv.PATH ?? process.env.PATH ?? ""}`;
   }
 
-  const proc = Bun.spawn(sandboxSpawnArgs(argv), {
+  const proc = Bun.spawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
