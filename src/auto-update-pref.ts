@@ -74,9 +74,12 @@ export const migrateLegacyAutoUpdate = (): boolean | null => {
 
 /** Whether automatic daemon self-update is enabled. Default TRUE (opt-out). */
 export const autoUpdateEnabled = (): boolean => {
-  loadEnvFile(); // pull the env file into process.env (idempotent; sets unset only)
+  // In dev, `.dev.env` overrides non-selector process env defaults; in prod, an
+  // explicitly-set env value remains authoritative.
+  loadEnvFile();
   const fromEnv = parseFlag(process.env[AUTO_UPDATE_KEY]);
   if (fromEnv !== null) return fromEnv;
+
   // No value in the env file yet — adopt a legacy standalone file if present.
   const migrated = migrateLegacyAutoUpdate();
   if (migrated !== null) return migrated;

@@ -13,9 +13,11 @@
  * the installed daemon's config — all dev writes (`setApiKey`,
  * `setCloudOrigin`, the minted device id, the auto-update pref) land in
  * `.dev.env`, the default port is `8788` (vs prod `8787`), the cloud origin
- * defaults to the local Next server, and the ONLY thing read from the
- * shared `.env` is a live, read-only `OPENLLM_API_KEY` fallback when
- * `.dev.env` is keyless — so dev reuses the already-paired key without
+ * defaults to the local Next server, and `.dev.env` overrides inherited process
+ * env values (except the dev-mode / env-file / state-dir selectors) so Bun's
+ * repository `.env` cannot shadow local daemon configuration. The ONLY thing
+ * read from the shared `.env` is a live, read-only `OPENLLM_API_KEY` fallback
+ * when `.dev.env` is keyless — so dev reuses the already-paired key without
  * copying it. The shared file is never written in dev.
  *
  * The keys the env file holds:
@@ -120,6 +122,33 @@ const compiledCloudOrigin = (): string => {
  */
 export const isDevMode = (): boolean => process.env.OPENLLM_DAEMON_DEV === "1";
 
+/**
+ * Dev-mode `.dev.env` loading is special: when `OPENLLM_DAEMON_DEV=1`, existing
+ * process env vars must be treated as defaults, and file values are honored as
+ * overrides so ad-hoc `bun dev` env injection can't block local testing.
+ *
+ * Production preserves the original behavior: config file values are ignored when
+ * already-present in process.env, so explicitly set vars stay source-of-truth.
+ *
+ * The three selector keys must never be overwritten by file values:
+ * `OPENLLM_DAEMON_DEV` (mode), `OPENLLM_DAEMON_ENV_FILE` (path override), and
+ * `OPENLLM_DAEMON_STATE_DIR` (state root).
+ */
+const LOAD_ENV_FILE_NO_OVERRIDE_KEYS = new Set([
+  "OPENLLM_DAEMON_DEV",
+  "OPENLLM_DAEMON_ENV_FILE",
+  "OPENLLM_DAEMON_STATE_DIR",
+]);
+
+/**
+ * In DEV mode, `.dev.env` is authoritative for all keys except those that select
+ * the loaded file/path itself. In non-dev, the file is still additive-only.
+ */
+function shouldWriteEnvVar(key: string): boolean {
+  if (!isDevMode()) return process.env[key] === undefined;
+  return !LOAD_ENV_FILE_NO_OVERRIDE_KEYS.has(key);
+}
+
 // Dev-only fallback for the cloud origin — points at the local Next
 // server. (The dashboard origin falls back through `cloudOrigin`, and the
 // API key is intentionally absent — set it from the UI like a real user.)
@@ -153,12 +182,17 @@ export const envFilePath = (): string =>
 const sharedEnvFilePath = (): string => join(stateDir(), ".env");
 
 /**
- * Load the daemon's `KEY=value` env file into `process.env` (without
- * overwriting already-set vars). Resolved via `envFilePath()` — the single
- * config file. systemd injects the same file via `EnvironmentFile=` before
- * exec (so this read is a harmless no-op there); the macOS launch agent and
- * `bun dev:daemon` rely on this read to load it. No-op when the file is
- * missing. Synchronous (boot-time, before anything reads env).
+ * Load the daemon's `KEY=value` env file into `process.env`.
+ *
+ * In production, file values only fill already-missing vars. In dev, the file is an
+ * override source: values from `.dev.env` replace any pre-set vars (with the
+ * exception of selector vars in `LOAD_ENV_FILE_NO_OVERRIDE_KEYS`) so ad-hoc
+ * process env from `bun` startup cannot block local testing.
+ *
+ * Resolved via `envFilePath()` — the single config file. systemd injects the same
+ * file via `EnvironmentFile=` before exec (so this read is a harmless no-op there);
+ * the macOS launch agent and `bun dev:daemon` rely on this read to load it. No-op
+ * when the file is missing. Synchronous (boot-time, before anything reads env).
  */
 export const loadEnvFile = (): void => {
   let text: string;
@@ -168,7 +202,7 @@ export const loadEnvFile = (): void => {
     return;
   }
   for (const [key, value] of parseEnvLines(text)) {
-    if (process.env[key] === undefined) process.env[key] = value;
+    if (shouldWriteEnvVar(key)) process.env[key] = value;
   }
 };
 
@@ -246,7 +280,7 @@ export const DEV_DEFAULT_DAEMON_PORT = 8788;
 export const daemonPort = (): number => {
   // `main()` resolves the port before anything else calls `daemonEnv()`, so load
   // the env file here too — otherwise a port supplied via `OPENLLM_DAEMON_ENV_FILE`
-  // is ignored for the actual bind. Idempotent (only sets unset vars).
+  // is ignored for the actual bind. Idempotent (respects DEV override semantics).
   loadEnvFile();
   const fallback = isDevMode() ? DEV_DEFAULT_DAEMON_PORT : DEFAULT_DAEMON_PORT;
   const raw = process.env.OPENLLM_DAEMON_PORT;
@@ -404,10 +438,10 @@ export const hasApiKey = (): boolean => daemonEnv().apiKey !== null;
 export const setCloudOrigin = (origin: string): void => {
   const trimmed = origin.replace(/\/+$/, "");
   if (trimmed.length === 0) return;
-  // Persist into the shared env file (single source; `loadEnvFile` never
-  // overwrites set vars, so mirror into process.env too). A failed write is
-  // surfaced but non-fatal — the in-memory update below still applies for
-  // this process; only restart durability is lost.
+  // Persist into the shared env file (single source; `loadEnvFile` is source-aware
+  // in dev), so mirror into process.env too. A failed write is surfaced but
+  // non-fatal — the in-memory update below still applies for this process; only
+  // restart durability is lost.
   if (!writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: trimmed })) {
     logWarn("env", "failed to persist OPENLLM_CLOUD_ORIGIN to the env file");
   }

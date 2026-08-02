@@ -29,7 +29,9 @@ const parseFlag = (raw: string | undefined): boolean | null => {
 
 /** Whether remote daemon terminal sessions are enabled. Default FALSE (opt-in). */
 export const ptySessionsEnabled = (): boolean => {
-  loadEnvFile(); // pull the env file into process.env (idempotent; sets unset only)
+  loadEnvFile();
+  // In dev mode, `.dev.env` values can override non-selector process env defaults.
+  // In production, existing process env values still win.
   const fromEnv = parseFlag(process.env[PTY_SESSIONS_KEY]);
   if (fromEnv !== null) return fromEnv;
   return false; // default OFF until explicitly opted in
