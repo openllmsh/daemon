@@ -324,6 +324,12 @@ export const brokerWebsocket: Bun.WebSocketHandler<TBrokerSocketData> = {
     }
   },
   close: (socket): void => {
+    // Release writes parked on backpressure first — drain never fires on a
+    // closed socket, so a lagging consumer's blocked write would hang the
+    // per-consumer tail forever otherwise.
+    const waiters = [...socket.data.drainWaiters];
+    socket.data.drainWaiters.clear();
+    for (const resolve of waiters) resolve();
     socket.data.stream?.closed();
   },
 };

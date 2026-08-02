@@ -276,8 +276,12 @@ const bunPtySpawner: TPtySpawner = (args) => {
     throw err;
   }
   void proc.exited.then((exitCode) => {
-    args.onExit(exitCode);
-    terminal.close();
+    try {
+      args.onExit(exitCode);
+    } finally {
+      // A throwing exit handler must never leak the PTY fd.
+      terminal.close();
+    }
   });
   return {
     write: (data) => terminal.write(data),
@@ -813,14 +817,12 @@ const writeConsumers = (session: TSession, chunk: Uint8Array): void => {
     writeConsumer(session, consumer, chunk);
 };
 
-/** Send one out-direction chunk, preserving legacy JSON fallback behavior. */
-const sendOut = (
+/** Send one chunk to the legacy JSON consumer only (session_io frames). */
+const sendLegacy = (
   session: TSession,
   chunk: Uint8Array,
   send: (frame: TRelayFrame) => void,
 ): void => {
-  writeConsumers(session, chunk);
-  if (!session.legacyAttached) return;
   for (let i = 0; i < chunk.length; i += TUNNEL_CHUNK_MAX) {
     send({
       type: "session_io",
@@ -831,6 +833,16 @@ const sendOut = (
     });
     session.outSeq += 1;
   }
+};
+
+/** Send one out-direction chunk, preserving legacy JSON fallback behavior. */
+const sendOut = (
+  session: TSession,
+  chunk: Uint8Array,
+  send: (frame: TRelayFrame) => void,
+): void => {
+  writeConsumers(session, chunk);
+  if (session.legacyAttached) sendLegacy(session, chunk, send);
 };
 
 const terminalClose = (
@@ -969,13 +981,28 @@ export const detachSession = (id: string): void => {
 export const killSession = (id: string): boolean => {
   const session = sessions.get(id);
   if (session === undefined || session.pty === null) return false;
+  // Kill only — teardown (consumer stream ends + the legacy session_close
+  // frame) runs in the PTY's onExit, which holds the REAL relay sender. A
+  // no-op-sender terminalClose here would clear legacyAttached before that
+  // close frame could ever be delivered.
   endPty(session, "killed");
-  terminalClose(session, () => {}, "killed");
   logInfo("session", "session closed", { id, reason: "kill" });
   return true;
 };
 
-const validVendorArgs = (vendorArgs: readonly string[] | undefined): boolean =>
+/** Per-client dangerous bypass flags (mirrors the CLI registry's
+ *  `dangerousFlag` values). Vendor args may not smuggle these — the dangerous
+ *  grant travels ONLY on `frame.dangerous`, which the picker/CLI gate. */
+const DANGEROUS_VENDOR_FLAGS: ReadonlySet<string> = new Set([
+  "--dangerously-skip-permissions",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--always-approve",
+]);
+
+const validVendorArgs = (
+  vendorArgs: readonly string[] | undefined,
+  dangerousGranted: boolean,
+): boolean =>
   vendorArgs === undefined ||
   (vendorArgs.length <= 64 &&
     vendorArgs.every(
@@ -983,7 +1010,8 @@ const validVendorArgs = (vendorArgs: readonly string[] | undefined): boolean =>
         typeof arg === "string" &&
         arg.length >= 1 &&
         arg.length <= 512 &&
-        !arg.includes("\0"),
+        !arg.includes("\0") &&
+        (dangerousGranted || !DANGEROUS_VENDOR_FLAGS.has(arg)),
     ));
 
 const handleOpen = (
@@ -1027,7 +1055,12 @@ const handleOpen = (
   // to sit outside the spawn try/catch. An unexpected throw there left the
   // browser waiting on open_ack until its 15s timeout. Always nack.
   try {
-    if (!validVendorArgs(vendorArgs)) {
+    if (
+      !validVendorArgs(
+        vendorArgs,
+        frame.dangerous === true && sessionSupportsDangerous(frame.cli),
+      )
+    ) {
       nack("spawn_failed");
       return;
     }
@@ -1065,7 +1098,7 @@ const handleOpen = (
         nack("session_not_found", existing.lastExitReason);
         return;
       }
-      const wasAttached = isAttached(existing);
+      const wasLegacyAttached = existing.legacyAttached;
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;
       if (legacy) existing.legacyAttached = true;
@@ -1078,11 +1111,15 @@ const handleOpen = (
         generation: existing.generation,
       });
       // Legacy JSON has no stream object to add to the consumer set, so it
-      // retains its direct repaint frames while mux/broker attachers replay after
-      // their stream is registered below.
-      if (legacy && !wasAttached) {
-        sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
-        for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
+      // retains its direct repaint frames while mux/broker attachers replay
+      // after their stream is registered below. Gate on the PRIOR legacy
+      // state (stream consumers being present must not suppress it), and
+      // send the repaint to the legacy channel only — live consumers must
+      // not see another attacher's replay.
+      if (legacy && !wasLegacyAttached) {
+        sendLegacy(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
+        for (const chunk of existing.scrollback)
+          sendLegacy(existing, chunk, send);
       }
       logInfo("session", "session re-attached", { id: existing.id });
       return;
