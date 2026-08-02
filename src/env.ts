@@ -144,9 +144,10 @@ const LOAD_ENV_FILE_NO_OVERRIDE_KEYS = new Set([
  * In DEV mode, `.dev.env` is authoritative for all keys except those that select
  * the loaded file/path itself. In non-dev, the file is still additive-only.
  */
-function shouldWriteEnvVar(key: string): boolean {
-  if (!isDevMode()) return process.env[key] === undefined;
-  return !LOAD_ENV_FILE_NO_OVERRIDE_KEYS.has(key);
+function shouldWriteEnvVar(key: string, devMode: boolean): boolean {
+  if (LOAD_ENV_FILE_NO_OVERRIDE_KEYS.has(key)) return false;
+  if (!devMode) return process.env[key] === undefined;
+  return true;
 }
 
 // Dev-only fallback for the cloud origin — points at the local Next
@@ -201,8 +202,11 @@ export const loadEnvFile = (): void => {
   } catch {
     return;
   }
+  // Read mode before processing entries: selector values from the file never
+  // apply, so its ordering cannot change whether later ordinary keys override.
+  const devMode = isDevMode();
   for (const [key, value] of parseEnvLines(text)) {
-    if (shouldWriteEnvVar(key)) process.env[key] = value;
+    if (shouldWriteEnvVar(key, devMode)) process.env[key] = value;
   }
 };
 

@@ -323,6 +323,8 @@ type TSession = {
   scrollbackBytes: number;
   /** Every active mux or broker consumer. */
   consumers: Set<TAttachedConsumer>;
+  /** Legacy JSON relay has no stream identity, so track it separately. */
+  legacyAttached: boolean;
   outSeq: number;
   startedAtMs: number;
   detachedAtMs: number | null;
@@ -416,7 +418,8 @@ const probeActivity = async (
   return busy;
 };
 
-const isAttached = (session: TSession): boolean => session.consumers.size > 0;
+const isAttached = (session: TSession): boolean =>
+  session.legacyAttached || session.consumers.size > 0;
 
 const scheduleReapKill = (session: TSession, pty: TPtyLike): void => {
   const timer = setTimeout(() => {
@@ -816,10 +819,8 @@ const sendOut = (
   chunk: Uint8Array,
   send: (frame: TRelayFrame) => void,
 ): void => {
-  if (isAttached(session)) {
-    writeConsumers(session, chunk);
-    return;
-  }
+  writeConsumers(session, chunk);
+  if (!session.legacyAttached) return;
   for (let i = 0; i < chunk.length; i += TUNNEL_CHUNK_MAX) {
     send({
       type: "session_io",
@@ -839,13 +840,14 @@ const terminalClose = (
 ): void => {
   const consumers = [...session.consumers];
   // Legacy JSON has no session stream to end, so it retains its close frame.
-  if (consumers.length === 0) {
+  if (session.legacyAttached) {
     send({
       type: "session_close",
       session_id: session.id,
       reason,
       generation: session.generation,
     });
+    session.legacyAttached = false;
   }
   // Exit codes are delivered on natural exits before each local broker stream
   // closes. An explicit kill intentionally has no late exit envelope.
@@ -959,6 +961,8 @@ export const detachSession = (id: string): void => {
   if (session === undefined) return;
   for (const consumer of [...session.consumers])
     detachConsumer(session, consumer);
+  session.legacyAttached = false;
+  if (!isAttached(session)) session.detachedAtMs = Date.now();
 };
 
 /** Kill a live device PTY by its OpenLLM session id for the local broker. */
@@ -986,6 +990,7 @@ const handleOpen = (
   frame: TRelaySessionOpenFrame,
   send: (frame: TRelayFrame) => void,
   vendorArgs?: readonly string[],
+  legacy = true,
 ): void => {
   const nack = (
     error:
@@ -1060,8 +1065,10 @@ const handleOpen = (
         nack("session_not_found", existing.lastExitReason);
         return;
       }
+      const wasAttached = isAttached(existing);
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;
+      if (legacy) existing.legacyAttached = true;
       existing.pty.resize(frame.cols, frame.rows);
       send({
         type: "session_open_ack",
@@ -1073,7 +1080,7 @@ const handleOpen = (
       // Legacy JSON has no stream object to add to the consumer set, so it
       // retains its direct repaint frames while mux/broker attachers replay after
       // their stream is registered below.
-      if (!isAttached(existing)) {
+      if (legacy && !wasAttached) {
         sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
         for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
       }
@@ -1127,6 +1134,7 @@ const handleOpen = (
       scrollback: [],
       scrollbackBytes: 0,
       consumers: new Set(),
+      legacyAttached: legacy,
       outSeq: 0,
       startedAtMs: Date.now(),
       detachedAtMs: null,
@@ -1143,6 +1151,7 @@ const handleOpen = (
     s.cwd = cwd;
     s.vendorSessionId = vendorSessionId;
     if (frame.title !== undefined) s.title = frame.title;
+    if (legacy) s.legacyAttached = true;
     sessions.set(s.id, s);
     evictStaleDeadSessions();
 
@@ -1198,6 +1207,9 @@ const handleOpen = (
       s.detachedAtMs = null;
       s.generation = ++nextSessionGeneration;
       s.lastExitReason = null;
+      // A reused row may retain the prior child status. The newly spawned PTY
+      // must not report that old exit code when it later closes.
+      s.exitCode = null;
       send({
         type: "session_open_ack",
         session_id: s.id,
@@ -1309,6 +1321,7 @@ export const bindSessionStream = (
     },
     send,
     opts.vendorArgs,
+    false,
   );
   const session = sessions.get(open.session_id);
   const consumer =

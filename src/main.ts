@@ -361,7 +361,12 @@ const main = async (): Promise<void> => {
           headers: { "content-type": "application/json" },
         });
       },
-      websocket: brokerWebsocket,
+      websocket: {
+        ...brokerWebsocket,
+        // Broker terminals may be idle while a user reads output. Bun's
+        // websocket-specific timeout is otherwise 120 seconds; zero disables it.
+        idleTimeout: 0,
+      },
     });
   } catch (err) {
     const code =

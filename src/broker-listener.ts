@@ -24,6 +24,7 @@ import {
 type TBrokerSocketData = {
   stream: BrokerSessionStream | null;
   opened: boolean;
+  drainWaiters: Set<() => void>;
 };
 
 type TBrokerSocket = Bun.ServerWebSocket<TBrokerSocketData>;
@@ -148,8 +149,13 @@ class BrokerSessionStream implements TSessionStream {
 
   constructor(private readonly socket: TBrokerSocket) {}
 
-  write = async (bytes: Uint8Array): Promise<void> => {
-    this.socket.sendBinary(bytes);
+  write = (bytes: Uint8Array): Promise<void> => {
+    const status = this.socket.sendBinary(bytes);
+    if (status > 0) return Promise.resolve();
+    if (status === 0) return Promise.reject(new Error("broker socket closed"));
+    return new Promise<void>((resolve) => {
+      this.socket.data.drainWaiters.add(resolve);
+    });
   };
 
   sendCtrl = (payload: Uint8Array): void => {
@@ -230,7 +236,9 @@ export const handleBrokerRequest = async (
   if (!keyMatches(req)) return json(401, { error: "unauthorized" });
   if (url.pathname === "/broker/session") {
     if (req.method !== "GET") return json(404, { error: "not found" });
-    return server.upgrade(req, { data: { stream: null, opened: false } })
+    return server.upgrade(req, {
+      data: { stream: null, opened: false, drainWaiters: new Set() },
+    })
       ? "upgraded"
       : json(400, { error: "websocket upgrade failed" });
   }
@@ -258,6 +266,11 @@ export const handleBrokerRequest = async (
 export const brokerWebsocket: Bun.WebSocketHandler<TBrokerSocketData> = {
   open: (socket): void => {
     socket.binaryType = "uint8array";
+  },
+  drain: (socket): void => {
+    const waiters = [...socket.data.drainWaiters];
+    socket.data.drainWaiters.clear();
+    for (const resolve of waiters) resolve();
   },
   message: (socket, message): void => {
     // One catch-all: an exception escaping into Bun's WS runtime would tear
