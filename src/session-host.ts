@@ -1005,6 +1005,7 @@ const handleOpen = (
   frame: TRelaySessionOpenFrame,
   send: (frame: TRelayFrame) => void,
   vendorArgs?: readonly string[],
+  onSessionReady?: (session: TSession) => void,
 ): void => {
   const nack = (
     error:
@@ -1086,6 +1087,7 @@ const handleOpen = (
       }
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;
+      onSessionReady?.(existing);
       existing.pty.resize(frame.cols, frame.rows);
       send({
         type: "session_open_ack",
@@ -1184,6 +1186,17 @@ const handleOpen = (
         cwd,
         argv: argv.join(" "),
       });
+      const pendingOutput: Uint8Array[] = [];
+      let ptyReady = false;
+      const onData = (chunk: Uint8Array): void => {
+        s.lastOutputAtMs = Date.now();
+        pushScrollback(s, chunk);
+        if (!ptyReady) {
+          pendingOutput.push(chunk);
+          return;
+        }
+        sendOut(s, chunk, send);
+      };
       const pty = spawner({
         argv,
         cwd,
@@ -1192,11 +1205,7 @@ const handleOpen = (
         env: deviceSessionEnv(cli, s.id, s.title),
         cols: frame.cols,
         rows: frame.rows,
-        onData: (chunk) => {
-          s.lastOutputAtMs = Date.now();
-          pushScrollback(s, chunk);
-          sendOut(s, chunk, send);
-        },
+        onData,
         onExit: (exitCode) => {
           s.exitCode = typeof exitCode === "number" ? exitCode : null;
           const reason = s.lastExitReason ?? "done";
@@ -1206,6 +1215,10 @@ const handleOpen = (
         },
       });
       s.pty = pty;
+      onSessionReady?.(s);
+      ptyReady = true;
+      for (const chunk of pendingOutput) sendOut(s, chunk, send);
+      pendingOutput.length = 0;
       s.pid = pty.pid ?? null;
       // Record the live PID so a crash-killed daemon's successor can reap it.
       // Best-effort and non-critical — do not block open_ack on a slow state FS.
@@ -1263,6 +1276,18 @@ export const bindSessionStream = (
     readonly onExit?: (code: number) => void;
   } = {},
 ): void => {
+  const consumer: TAttachedConsumer = {
+    stream,
+    unsubscribe: [],
+    writeTail: Promise.resolve(),
+    queuedBytes: 0,
+    exitHandler: opts.onExit ?? null,
+  };
+  const registerConsumer = (session: TSession): void => {
+    if (session.consumers.has(consumer)) return;
+    session.consumers.add(consumer);
+    session.detachedAtMs = null;
+  };
   const send = (frame: TRelayFrame): void => {
     if (frame.type === "session_open_ack") {
       if (!frame.ok) {
@@ -1283,15 +1308,7 @@ export const bindSessionStream = (
         stream.reset(encodeJsonPayload({ code: "session_not_found" }));
         return;
       }
-      const consumer: TAttachedConsumer = {
-        stream,
-        unsubscribe: [],
-        writeTail: Promise.resolve(),
-        queuedBytes: 0,
-        exitHandler: opts.onExit ?? null,
-      };
-      session.consumers.add(consumer);
-      session.detachedAtMs = null;
+      registerConsumer(session);
       stream.sendCtrl(
         encodeJsonPayload({
           t: "open_ack",
@@ -1317,6 +1334,8 @@ export const bindSessionStream = (
     }
     if (frame.type === "session_close") stream.end();
   };
+
+  let boundSession: TSession | undefined;
   handleOpen(
     {
       type: "session_open",
@@ -1335,12 +1354,12 @@ export const bindSessionStream = (
     },
     send,
     opts.vendorArgs,
+    (session) => {
+      boundSession = session;
+      registerConsumer(session);
+    },
   );
-  const session = sessions.get(open.session_id);
-  const consumer =
-    session === undefined
-      ? undefined
-      : [...session.consumers].find((entry) => entry.stream === stream);
+  const session = boundSession;
   // A refused open never became a consumer, so it must not leave four dormant
   // transport handlers behind. For accepted streams, keep every unsubscribe on
   // the consumer and release them together on reset/end/lagging/PTY teardown.
