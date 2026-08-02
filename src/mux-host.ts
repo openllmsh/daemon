@@ -41,6 +41,9 @@ const opening = new Map<
 >();
 const failedUntil = new Map<string, number>();
 let activeKeyId: string | null = null;
+/** Relay-assigned id of {@link active}, so an inbound `channel_close` can be
+ *  matched to the channel it refers to. */
+let activeChannelId: string | null = null;
 const MUX_ACK_TIMEOUT_MS = 5_000;
 const MUX_FAILURE_CACHE_MS = 60_000;
 let muxAckTimeoutMs = MUX_ACK_TIMEOUT_MS;
@@ -170,10 +173,12 @@ export const handleChannelOpenAck = (frame: {
     onClose: () => {
       active = null;
       activeKeyId = null;
+      activeChannelId = null;
       sink = null;
     },
   });
   activeKeyId = keyId;
+  activeChannelId = pending.channelId;
   pending.resolve(active);
 };
 
@@ -280,10 +285,38 @@ export const acceptChannel = (frame: {
     onStream: serveMuxOnStream,
     onClose: () => {
       active = null;
+      activeChannelId = null;
       sink = null;
     },
   });
+  activeChannelId = frame.channel_id;
   send({ type: "channel_open_ack", channel_id: frame.channel_id, ok: true });
+};
+
+/**
+ * The relay says this channel's peer is gone (`consumer_gone` when a browser
+ * socket dies, `daemon_gone` for a serving peer). Tear the local half down so
+ * its streams RESET — which detaches any device PTY bound to them — and so the
+ * next `channel_open` is not refused `channel_exists` by a channel whose other
+ * end no longer exists. Previously this frame had no handler at all: the stale
+ * channel survived until the daemon's OWN relay socket cycled, stranding every
+ * session on it in the meantime.
+ */
+export const closeChannelFromRelay = (frame: {
+  readonly channel_id: string;
+  readonly reason?: TChannelCloseReason;
+}): void => {
+  // A close for a channel still being negotiated settles that open instead.
+  for (const [keyId, pending] of [...opening.entries()]) {
+    if (pending.channelId === frame.channel_id) failOpen(keyId, frame.reason);
+  }
+  if (activeChannelId !== frame.channel_id) return;
+  const channel = active;
+  active = null;
+  activeKeyId = null;
+  activeChannelId = null;
+  sink = null;
+  channel?.close(frame.reason ?? "peer_gone");
 };
 
 /** Feed a complete binary websocket message to the active mux channel. */
@@ -297,6 +330,7 @@ export const resetAllChannels = (): void => {
   const channel = active;
   active = null;
   activeKeyId = null;
+  activeChannelId = null;
   sink = null;
   channel?.close("relay_restart");
 };

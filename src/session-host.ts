@@ -818,6 +818,40 @@ export const detachSession = (id: string): void => {
   logInfo("session", "session detached", { id: session.id });
 };
 
+/**
+ * Hand an already-attached PTY to a new consumer.
+ *
+ * `attached` is not falsifiable from here: a closed browser tab never sends a
+ * detach, the relay's `channel_close` used to be dropped on the floor, and an
+ * RTC peer is only declared dead once ICE gives up (observed minutes later).
+ * Refusing the new consumer with `session_busy` therefore stranded the session
+ * for as long as the stale binding survived — the common case being "close the
+ * tab, re-open the same chat URL". A live rival consumer is the rare case, and
+ * it is told to stand down (`superseded`) rather than reconnect, so the two
+ * cannot trade the PTY back and forth.
+ */
+const supersedeConsumer = (s: TSession): void => {
+  const previous = s.muxStream;
+  // Clear BEFORE resetting: a local reset fires this stream's own reset
+  // handlers synchronously, and `detachMuxStream` must see a stream that is no
+  // longer current so it cannot undo the attach that follows.
+  s.muxStream = null;
+  s.muxWriteTail = Promise.resolve();
+  s.attached = false;
+  s.detachedAtMs = Date.now();
+  try {
+    previous?.reset(
+      encodeJsonPayload({
+        code: "superseded",
+        message: "this session was opened by a newer consumer",
+      }),
+    );
+  } catch {
+    // The prior transport is already gone — which is the usual reason we are here.
+  }
+  logInfo("session", "session consumer superseded", { id: s.id });
+};
+
 const handleOpen = (
   frame: TRelaySessionOpenFrame,
   send: (frame: TRelayFrame) => void,
@@ -832,6 +866,17 @@ const handleOpen = (
       | "spawn_failed",
     lastExitReason?: "evicted" | "reaped" | "done" | "killed" | null,
   ): void => {
+    // Every refusal surfaces as user-facing copy in the browser, so it must be
+    // greppable here too — a nack used to return before the first log line,
+    // which made "couldn't open this session" invisible daemon-side.
+    logInfo("session", "session open refused", {
+      id: frame.session_id,
+      mode: frame.mode,
+      error,
+      ...(lastExitReason === undefined || lastExitReason === null
+        ? {}
+        : { last_exit_reason: lastExitReason }),
+    });
     send({
       type: "session_open_ack",
       session_id: frame.session_id,
@@ -875,15 +920,15 @@ const handleOpen = (
         nack("session_not_found");
         return;
       }
-      if (existing.attached) {
-        nack("session_busy");
-        return;
-      }
       if (existing.pty === null) {
-        // Dead — the consumer should re-open with mode:"continue".
+        // Dead — the consumer should re-open with mode:"continue". Checked
+        // before the takeover so a refusal never disturbs a bound consumer.
         nack("session_not_found", existing.lastExitReason);
         return;
       }
+      // A stale binding is the norm, not the exception — take the PTY over
+      // rather than refusing (see {@link supersedeConsumer}).
+      if (existing.attached) supersedeConsumer(existing);
       existing.attached = true;
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;

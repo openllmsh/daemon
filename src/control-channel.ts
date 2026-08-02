@@ -17,6 +17,7 @@ import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import {
   acceptChannel,
+  closeChannelFromRelay,
   configureMuxHost,
   currentDaemonCaps,
   handleChannelOpenAck,
@@ -506,6 +507,9 @@ const dispatchFrame = (frame: TRelayFrame): void => {
     case "channel_open_ack":
       handleChannelOpenAck(frame);
       return;
+    case "channel_close":
+      closeChannelFromRelay(frame);
+      return;
     case "rtc_offer":
       // Daemon is the responder: open seal, answer, trickle ICE.
       // Log async failures (parity with serveTunnel) — never crash the process.
@@ -568,8 +572,7 @@ const dispatchFrame = (frame: TRelayFrame): void => {
         } catch (err) {
           logWarn("control-channel", "session frame handler failed", {
             type: frame.type,
-            sessionId:
-              "session_id" in frame ? frame.session_id : undefined,
+            sessionId: "session_id" in frame ? frame.session_id : undefined,
             err: err instanceof Error ? err.message : String(err),
           });
           if (frame.type === "session_open") {
