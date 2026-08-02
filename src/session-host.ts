@@ -13,8 +13,8 @@
  *  - `continue`— the PTY died (or daemon restarted): respawn with the
  *                vendor's resume-by-id flag when known, else claude
  *                `--continue` / plain.
- *  - `detach`  — the consumer went away: the PTY LIVES ON indefinitely
- *                until an explicit kill/end. No quiet reaper.
+ *  - `detach`  — one consumer went away: the PTY remains available to other
+ *                consumers and is reaped only after it is unattached and idle.
  *
  * Isolation: the CLI runs the user's REAL binary with real `$HOME` / PATH
  * so credentials and vendor session stores work. There is no
@@ -62,7 +62,7 @@ import type { TMuxStream } from "@openllmsh/tunnel/mux";
 import { hostCliCandidates, sessionEnv } from "./cli-paths";
 import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
-import { stateDir } from "./env";
+import { loadEnvFile, stateDir } from "./env";
 import { logInfo, logWarn } from "./logger";
 import { isVendorSessionCommand } from "./vendor-commands";
 
@@ -174,17 +174,25 @@ export const reapOrphanSessionProcs = (): void => {
 /** Kill EVERY live session PTY now (catchable-exit cleanup). Synchronous so it
  *  completes inside a signal handler before `process.exit`. Clears pidfiles. */
 export const killAllSessions = (): void => {
-  for (const s of sessions.values()) {
-    if (s.pty !== null) {
+  for (const session of sessions.values()) {
+    if (session.pty !== null) {
       try {
-        s.pty.kill();
+        session.pty.kill();
       } catch {
         /* already gone */
       }
-      s.pty = null;
-      s.pid = null;
+      session.pty = null;
+      session.pid = null;
     }
-    removePidFile(s.id);
+    for (const consumer of [...session.consumers]) {
+      session.consumers.delete(consumer);
+      try {
+        consumer.stream.end();
+      } catch {
+        /* already gone */
+      }
+    }
+    removePidFile(session.id);
   }
 };
 
@@ -192,12 +200,31 @@ export const killAllSessions = (): void => {
  *  without unbounded memory. */
 const SCROLLBACK_MAX_BYTES = 1024 * 1024;
 
+/** One stalled viewer must not retain unbounded PTY output. */
+const CONSUMER_MAX_QUEUED_BYTES = 2 * 1024 * 1024;
+
+/** Reaped children get time to flush their transcript before forcible exit. */
+const REAP_KILL_GRACE_MS = 10_000;
+
+/** Detached idle timeout. Zero deliberately restores never-reap behavior. */
+const DEFAULT_SESSION_IDLE_TIMEOUT_MIN = 60;
+
+const sessionIdleTimeoutMs = (): number => {
+  loadEnvFile();
+  const raw = process.env.OPENLLM_SESSION_IDLE_TIMEOUT_MIN;
+  if (raw === undefined) return DEFAULT_SESSION_IDLE_TIMEOUT_MIN * 60_000;
+  const minutes = Number(raw.trim());
+  return Number.isFinite(minutes) && minutes >= 0
+    ? Math.floor(minutes * 60_000)
+    : DEFAULT_SESSION_IDLE_TIMEOUT_MIN * 60_000;
+};
+
 // ─── PTY abstraction (injectable for CI — no PTY there) ──────────────
 
 export type TPtyLike = {
   write(data: Uint8Array | string): void;
   resize(cols: number, rows: number): void;
-  kill(): void;
+  kill(signal?: NodeJS.Signals): void;
   readonly pid?: number;
 };
 
@@ -255,9 +282,9 @@ const bunPtySpawner: TPtySpawner = (args) => {
   return {
     write: (data) => terminal.write(data),
     resize: (cols, rows) => terminal.resize(cols, rows),
-    kill: () => {
+    kill: (signal = "SIGTERM") => {
       try {
-        proc.kill();
+        proc.kill(signal);
       } catch {
         /* already gone */
       }
@@ -275,6 +302,13 @@ export const ptySupported = (): boolean => process.platform !== "win32";
 
 // ─── session state ───────────────────────────────────────────────────
 
+type TAttachedConsumer = {
+  readonly stream: TSessionStream;
+  writeTail: Promise<void>;
+  queuedBytes: number;
+  exitHandler: ((code: number) => void) | null;
+};
+
 type TSession = {
   readonly id: string;
   readonly cli: TDeviceSessionCli;
@@ -285,8 +319,8 @@ type TSession = {
   pty: TPtyLike | null; // null = dead (continue-able)
   scrollback: Uint8Array[];
   scrollbackBytes: number;
-  /** A consumer channel is currently bound (frames flow). */
-  attached: boolean;
+  /** Every active mux or broker consumer. */
+  consumers: Set<TAttachedConsumer>;
   outSeq: number;
   startedAtMs: number;
   detachedAtMs: number | null;
@@ -295,17 +329,12 @@ type TSession = {
   busy: boolean;
   title: string | null;
   pid: number | null;
-  muxStream: TSessionStream | null;
-  /** Serializes replay, replay_done, and live mux output in wire order. */
-  muxWriteTail: Promise<void>;
   /** Daemon-minted monotonically increasing value for successful opens. */
   generation: number;
   /** Terminal state retained so a later attach can explain why it cannot resume. */
   lastExitReason: "evicted" | "reaped" | "done" | "killed" | null;
   /** Child status, when Bun's PTY-backed process supplied one. */
   exitCode: number | null;
-  /** Local broker-only exit notification; mux has no equivalent envelope. */
-  exitHandler: ((code: number) => void) | null;
 };
 
 const sessions = new Map<string, TSession>();
@@ -320,13 +349,8 @@ export const setActivityProbe = (probe: TActivityProbe | null): void => {
 };
 
 /** Optional hook fired when a detached session transitions busy → quiet.
- *  Used for status push refresh; never kills the PTY. */
+ *  Used for status push refresh. */
 export const setSessionActivityHook = (hook: (() => void) | null): void => {
-  activityHook = hook;
-};
-
-/** @deprecated Prefer {@link setSessionActivityHook}; quiet reaping is disabled. */
-export const setSessionQuietHook = (hook: (() => void) | null): void => {
   activityHook = hook;
 };
 
@@ -390,10 +414,44 @@ const probeActivity = async (
   return busy;
 };
 
-/** Poll detached process trees. Probe failures deliberately mark every session busy. */
+const isAttached = (session: TSession): boolean => session.consumers.size > 0;
+
+const scheduleReapKill = (session: TSession, pty: TPtyLike): void => {
+  const timer = setTimeout(() => {
+    if (session.pty !== pty) return;
+    try {
+      pty.kill("SIGKILL");
+    } catch {
+      // The child generally exits after SIGTERM; escalation is best-effort.
+    }
+  }, REAP_KILL_GRACE_MS);
+  timer.unref?.();
+};
+
+const reapIdleSession = (session: TSession): void => {
+  const pty = session.pty;
+  if (
+    pty === null ||
+    isAttached(session) ||
+    session.lastExitReason === "reaped"
+  )
+    return;
+  session.lastExitReason = "reaped";
+  try {
+    pty.kill("SIGTERM");
+  } catch {
+    // A raced exit will be reconciled by its onExit callback.
+  }
+  scheduleReapKill(session, pty);
+  logInfo("session", "session reaped after detached idle timeout", {
+    id: session.id,
+  });
+};
+
+/** Poll detached process trees and reap only detached, output-quiet, non-busy sessions. */
 export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
   const dormant = [...sessions.values()].filter(
-    (session) => session.pty !== null && !session.attached,
+    (session) => session.pty !== null && !isAttached(session),
   );
   if (dormant.length === 0) return;
   const pids = new Set<number>();
@@ -422,12 +480,22 @@ export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
     }
     return;
   }
+  const timeoutMs = sessionIdleTimeoutMs();
   for (const session of dormant) {
     if (session.pid === null) continue; // already marked busy above
     const isBusy = busyPids.has(session.pid);
     if (isBusy) session.lastBusyAtMs = now;
     if (session.busy && !isBusy) activityHook?.();
     session.busy = isBusy;
+    if (
+      timeoutMs > 0 &&
+      !isBusy &&
+      !isAttached(session) &&
+      now - session.lastOutputAtMs > timeoutMs &&
+      now - session.lastBusyAtMs > timeoutMs
+    ) {
+      reapIdleSession(session);
+    }
   }
 };
 
@@ -450,7 +518,7 @@ export const sessionStatusReport = (): Array<{
       id: s.id,
       cli: s.cli,
       started_at_ms: s.startedAtMs,
-      attached: s.attached,
+      attached: isAttached(s),
       live: s.pty !== null,
       busy: s.busy,
       ...(s.title === null ? {} : { title: s.title.slice(0, 80) }),
@@ -677,90 +745,122 @@ const pushScrollback = (s: TSession, chunk: Uint8Array): void => {
 const b64 = (bytes: Uint8Array): string =>
   Buffer.from(bytes).toString("base64");
 
-/** Send one out-direction chunk, split at the wire cap. */
-const detachMuxStream = (s: TSession, stream?: TSessionStream): void => {
-  if (stream !== undefined && s.muxStream !== stream) return;
-  s.muxStream = null;
-  s.exitHandler = null;
-  s.muxWriteTail = Promise.resolve();
-  if (s.attached) detachSession(s.id);
+const detachConsumer = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+): void => {
+  if (!session.consumers.delete(consumer)) return;
+  consumer.exitHandler = null;
+  consumer.queuedBytes = 0;
+  if (!isAttached(session)) {
+    session.detachedAtMs = Date.now();
+    logInfo("session", "session detached", { id: session.id });
+  }
 };
 
-/** Queue a mux write after all prior replay/live output. */
-const writeMux = (
-  s: TSession,
-  stream: TSessionStream,
+const resetLaggingConsumer = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+): void => {
+  if (!session.consumers.has(consumer)) return;
+  detachConsumer(session, consumer);
+  try {
+    consumer.stream.reset(
+      encodeJsonPayload({
+        code: "lagging",
+        message: "session output exceeded the consumer queue limit",
+      }),
+    );
+  } catch {
+    // A failed reset is still safely detached from the PTY fan-out.
+  }
+};
+
+/** Queue output on one consumer without making peers wait for it. */
+const writeConsumer = (
+  session: TSession,
+  consumer: TAttachedConsumer,
   chunk: Uint8Array,
 ): void => {
-  s.muxWriteTail = s.muxWriteTail
-    .then(() => stream.write(chunk))
-    .catch(() => detachMuxStream(s, stream));
+  if (!session.consumers.has(consumer)) return;
+  if (consumer.queuedBytes + chunk.length > CONSUMER_MAX_QUEUED_BYTES) {
+    resetLaggingConsumer(session, consumer);
+    return;
+  }
+  consumer.queuedBytes += chunk.length;
+  consumer.writeTail = consumer.writeTail
+    .then(() => consumer.stream.write(chunk))
+    .then(
+      () => {
+        if (session.consumers.has(consumer))
+          consumer.queuedBytes -= chunk.length;
+      },
+      () => {
+        resetLaggingConsumer(session, consumer);
+      },
+    )
+    .catch(() => {});
 };
 
-const writeCurrentMux = (s: TSession, chunk: Uint8Array): void => {
-  if (s.muxStream !== null) writeMux(s, s.muxStream, chunk);
+const writeConsumers = (session: TSession, chunk: Uint8Array): void => {
+  for (const consumer of session.consumers)
+    writeConsumer(session, consumer, chunk);
 };
 
-/** Send one out-direction chunk, preserving mux writes and failures in order. */
+/** Send one out-direction chunk, preserving legacy JSON fallback behavior. */
 const sendOut = (
-  s: TSession,
+  session: TSession,
   chunk: Uint8Array,
   send: (frame: TRelayFrame) => void,
 ): void => {
-  if (s.muxStream !== null) {
-    writeCurrentMux(s, chunk);
+  if (isAttached(session)) {
+    writeConsumers(session, chunk);
     return;
   }
   for (let i = 0; i < chunk.length; i += TUNNEL_CHUNK_MAX) {
     send({
       type: "session_io",
-      session_id: s.id,
+      session_id: session.id,
       dir: "out",
-      seq: s.outSeq,
+      seq: session.outSeq,
       data_b64: b64(chunk.subarray(i, i + TUNNEL_CHUNK_MAX)),
     });
-    s.outSeq += 1;
+    session.outSeq += 1;
   }
 };
 
 const terminalClose = (
-  s: TSession,
+  session: TSession,
   send: (frame: TRelayFrame) => void,
   reason: "done" | "killed",
 ): void => {
-  const muxStream = s.muxStream;
-  if (s.attached) {
-    s.attached = false;
-    if (muxStream === null) {
-      send({
-        type: "session_close",
-        session_id: s.id,
-        reason,
-        generation: s.generation,
-      });
-    }
+  const consumers = [...session.consumers];
+  // Legacy JSON has no session stream to end, so it retains its close frame.
+  if (consumers.length === 0) {
+    send({
+      type: "session_close",
+      session_id: session.id,
+      reason,
+      generation: session.generation,
+    });
   }
-  // Exit codes are delivered on NATURAL exits only: Bun's `proc.exited` fires
-  // `onExit(code)` (which sets `exitCode`) BEFORE it calls this close, so the
-  // envelope precedes the socket close. Kill-intent closes run here first —
-  // synchronously, `exitCode` still null — and deliberately send no envelope:
-  // like detach and supersede, a user-initiated teardown reads as exit 0 on
-  // the attached consumer, not as the child's signal status arriving later on
-  // an already-closed socket.
-  if (s.exitCode !== null) {
+  // Exit codes are delivered on natural exits before each local broker stream
+  // closes. An explicit kill intentionally has no late exit envelope.
+  for (const consumer of consumers) {
+    if (session.exitCode !== null) {
+      try {
+        consumer.exitHandler?.(session.exitCode);
+      } catch {
+        // The local socket may already be gone; close remains terminal.
+      }
+    }
+    detachConsumer(session, consumer);
     try {
-      s.exitHandler?.(s.exitCode);
+      consumer.stream.end();
     } catch {
-      // The local socket may already be gone; close remains terminal.
+      // Closing one broken stream must not prevent peers from closing.
     }
   }
-  s.exitHandler = null;
-  muxStream?.end();
-  // Do not wait for the peer's END callback to clear replay state: a restart
-  // may bind the same row before that callback runs. Otherwise its first PTY
-  // chunks remain queued behind a replay_done that only attach emits.
-  s.muxStream = null;
-  s.muxWriteTail = Promise.resolve();
 };
 
 const endPty = (
@@ -784,7 +884,7 @@ const endPty = (
  *  limit. Live and attached sessions are never evicted. */
 const evictStaleDeadSessions = (): void => {
   const dead = [...sessions.values()]
-    .filter((s) => s.pty === null && !s.attached)
+    .filter((s) => s.pty === null && !isAttached(s))
     .sort((a, b) => a.startedAtMs - b.startedAtMs);
   const excess = dead.length - MAX_RETAINED_SESSIONS;
   for (let i = 0; i < excess; i += 1) {
@@ -853,11 +953,9 @@ export const handleSessionFrame = (
 
 export const detachSession = (id: string): void => {
   const session = sessions.get(id);
-  if (session === undefined || !session.attached) return;
-  session.attached = false;
-  session.muxStream = null;
-  session.detachedAtMs = Date.now();
-  logInfo("session", "session detached", { id: session.id });
+  if (session === undefined) return;
+  for (const consumer of [...session.consumers])
+    detachConsumer(session, consumer);
 };
 
 /** Kill a live device PTY by its OpenLLM session id for the local broker. */
@@ -868,40 +966,6 @@ export const killSession = (id: string): boolean => {
   terminalClose(session, () => {}, "killed");
   logInfo("session", "session closed", { id, reason: "kill" });
   return true;
-};
-
-/**
- * Hand an already-attached PTY to a new consumer.
- *
- * `attached` is not falsifiable from here: a closed browser tab never sends a
- * detach, the relay's `channel_close` used to be dropped on the floor, and an
- * RTC peer is only declared dead once ICE gives up (observed minutes later).
- * Refusing the new consumer with `session_busy` therefore stranded the session
- * for as long as the stale binding survived — the common case being "close the
- * tab, re-open the same chat URL". A live rival consumer is the rare case, and
- * it is told to stand down (`superseded`) rather than reconnect, so the two
- * cannot trade the PTY back and forth.
- */
-const supersedeConsumer = (s: TSession): void => {
-  const previous = s.muxStream;
-  // Clear BEFORE resetting: a local reset fires this stream's own reset
-  // handlers synchronously, and `detachMuxStream` must see a stream that is no
-  // longer current so it cannot undo the attach that follows.
-  s.muxStream = null;
-  s.muxWriteTail = Promise.resolve();
-  s.attached = false;
-  s.detachedAtMs = Date.now();
-  try {
-    previous?.reset(
-      encodeJsonPayload({
-        code: "superseded",
-        message: "this session was opened by a newer consumer",
-      }),
-    );
-  } catch {
-    // The prior transport is already gone — which is the usual reason we are here.
-  }
-  logInfo("session", "session consumer superseded", { id: s.id });
 };
 
 const validVendorArgs = (vendorArgs: readonly string[] | undefined): boolean =>
@@ -989,15 +1053,10 @@ const handleOpen = (
         return;
       }
       if (existing.pty === null) {
-        // Dead — the consumer should re-open with mode:"continue". Checked
-        // before the takeover so a refusal never disturbs a bound consumer.
+        // Dead — the consumer should re-open with mode:"continue".
         nack("session_not_found", existing.lastExitReason);
         return;
       }
-      // A stale binding is the norm, not the exception — take the PTY over
-      // rather than refusing (see {@link supersedeConsumer}).
-      if (existing.attached) supersedeConsumer(existing);
-      existing.attached = true;
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;
       existing.pty.resize(frame.cols, frame.rows);
@@ -1008,10 +1067,10 @@ const handleOpen = (
         live: true,
         generation: existing.generation,
       });
-      // The legacy JSON caller needs its repaint frames here. Mux callers set
-      // `muxStream` in bindMuxSessionStream's ack handler and replay directly
-      // to that binary stream instead.
-      if (existing.muxStream === null) {
+      // Legacy JSON has no stream object to add to the consumer set, so it
+      // retains its direct repaint frames while mux/broker attachers replay after
+      // their stream is registered below.
+      if (!isAttached(existing)) {
         sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"), send);
         for (const chunk of existing.scrollback) sendOut(existing, chunk, send);
       }
@@ -1064,7 +1123,7 @@ const handleOpen = (
       pty: null,
       scrollback: [],
       scrollbackBytes: 0,
-      attached: false,
+      consumers: new Set(),
       outSeq: 0,
       startedAtMs: Date.now(),
       detachedAtMs: null,
@@ -1073,12 +1132,9 @@ const handleOpen = (
       busy: true,
       title: frame.title ?? null,
       pid: null,
-      muxStream: null,
-      muxWriteTail: Promise.resolve(),
       generation: 0,
       lastExitReason: null,
       exitCode: null,
-      exitHandler: null,
     };
     // Refresh resume metadata on every spawn/continue.
     s.cwd = cwd;
@@ -1113,7 +1169,7 @@ const handleOpen = (
         onData: (chunk) => {
           s.lastOutputAtMs = Date.now();
           pushScrollback(s, chunk);
-          if (s.attached) sendOut(s, chunk, send);
+          sendOut(s, chunk, send);
         },
         onExit: (exitCode) => {
           s.exitCode = typeof exitCode === "number" ? exitCode : null;
@@ -1136,7 +1192,6 @@ const handleOpen = (
       }
       s.busy = true;
       s.lastBusyAtMs = Date.now();
-      s.attached = true;
       s.detachedAtMs = null;
       s.generation = ++nextSessionGeneration;
       s.lastExitReason = null;
@@ -1199,8 +1254,14 @@ export const bindSessionStream = (
         stream.reset(encodeJsonPayload({ code: "session_not_found" }));
         return;
       }
-      session.muxStream = stream;
-      session.exitHandler = opts.onExit ?? null;
+      const consumer: TAttachedConsumer = {
+        stream,
+        writeTail: Promise.resolve(),
+        queuedBytes: 0,
+        exitHandler: opts.onExit ?? null,
+      };
+      session.consumers.add(consumer);
+      session.detachedAtMs = null;
       stream.sendCtrl(
         encodeJsonPayload({
           t: "open_ack",
@@ -1210,16 +1271,18 @@ export const bindSessionStream = (
         }),
       );
       if (open.mode !== "attach") return;
-      // Snapshot before yielding. The shared tail makes later PTY output wait
-      // behind the repaint and replay_done without a separate live-output buffer.
+      // Snapshot before yielding. This consumer's private tail orders its
+      // repaint before subsequent live output without delaying other viewers.
       const scrollback = [...session.scrollback];
-      session.muxWriteTail = session.muxWriteTail
-        .then(async () => {
-          await stream.write(new TextEncoder().encode("\x1b[2J\x1b[H"));
-          for (const chunk of scrollback) await stream.write(chunk);
-          stream.sendCtrl(encodeJsonPayload({ t: "replay_done" }));
-        })
-        .catch(() => detachMuxStream(session, stream));
+      writeConsumer(
+        session,
+        consumer,
+        new TextEncoder().encode("\x1b[2J\x1b[H"),
+      );
+      for (const chunk of scrollback) writeConsumer(session, consumer, chunk);
+      consumer.writeTail = consumer.writeTail
+        .then(() => stream.sendCtrl(encodeJsonPayload({ t: "replay_done" })))
+        .catch(() => detachConsumer(session, consumer));
       return;
     }
     if (frame.type === "session_close") stream.end();
@@ -1243,18 +1306,17 @@ export const bindSessionStream = (
     send,
     opts.vendorArgs,
   );
+  const consumerFor = (session: TSession): TAttachedConsumer | undefined =>
+    [...session.consumers].find((consumer) => consumer.stream === stream);
   stream.onData((bytes) => {
     const session = sessions.get(open.session_id);
-    // Stale stream after re-attach: only the current muxStream may write.
-    if (session === undefined || session.muxStream !== stream) return;
+    if (session === undefined || consumerFor(session) === undefined) return;
     session.pty?.write(bytes);
   });
   stream.onCtrl((payload) => {
     const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
     const session = sessions.get(open.session_id);
-    // Reject delayed controls from a prior attachment generation so a
-    // detached stream cannot kill/resize a PTY re-bound to a new consumer.
-    if (session === undefined || session.muxStream !== stream) return;
+    if (session === undefined || consumerFor(session) === undefined) return;
     if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
     if (ctrl?.t === "close" && ctrl.intent === "kill") {
       endPty(session, "killed");
@@ -1264,11 +1326,15 @@ export const bindSessionStream = (
   });
   stream.onReset(() => {
     const session = sessions.get(open.session_id);
-    if (session !== undefined) detachMuxStream(session, stream);
+    if (session === undefined) return;
+    const consumer = consumerFor(session);
+    if (consumer !== undefined) detachConsumer(session, consumer);
   });
   stream.onEnd(() => {
     const session = sessions.get(open.session_id);
-    if (session !== undefined) detachMuxStream(session, stream);
+    if (session === undefined) return;
+    const consumer = consumerFor(session);
+    if (consumer !== undefined) detachConsumer(session, consumer);
   });
 };
 
@@ -1278,23 +1344,10 @@ export const bindMuxSessionStream = (
   open: TSessionStreamOpenPayload,
 ): void => bindSessionStream(stream, open);
 
-/** Control-channel reconnect: the relay swept every channel — DETACH all
- *  attached sessions (PTYs survive relay cycling; the browser re-attaches
- *  on its own reconnect). */
+/** Control-channel reconnect: the relay swept every channel, so clear each
+ *  attached stream while keeping its PTY resumable. */
 export const detachAllSessions = (): void => {
-  for (const s of sessions.values()) {
-    if (s.attached) detachSession(s.id);
-  }
-};
-
-/**
- * @deprecated Quiet reaping is disabled — detach keeps the PTY alive
- * indefinitely. Kept as a no-op so older call sites/tests can still invoke it.
- * Slot-pressure eviction is also disabled: at MAX_LIVE_SESSIONS new spawns
- * nack `overloaded` rather than killing a detached peer.
- */
-export const reapDetachedSessions = (_now = Date.now()): void => {
-  // Intentionally empty: design rule — detach never auto-kills for quietness.
+  for (const session of sessions.values()) detachSession(session.id);
 };
 
 /** Test-only: reset all session state. */

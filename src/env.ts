@@ -43,6 +43,9 @@
  *                            default ON). Read/written by
  *                            `auto-update-pref.ts`; lives here so ALL daemon
  *                            config is in the one file.
+ * - `OPENLLM_SESSION_IDLE_TIMEOUT_MIN` — detached PTY idle-reap window in
+ *                            minutes (default `60`; `0` disables). Read by
+ *                            `session-host.ts` from this same env file.
  *
  * Legacy standalone `api-key` / `device-id` / `auto-update` files
  * (pre-single-file installs) are migrated INTO the env file and then removed —

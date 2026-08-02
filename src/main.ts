@@ -226,8 +226,8 @@ const main = async (): Promise<void> => {
 
   startControlChannel();
 
-  // Activity polling for detached sessions (status reporting only — never
-  // auto-kills quiet PTYs; detach keeps the process alive indefinitely).
+  // Activity polling tracks detached process trees and reaps only sessions
+  // that remain unattached, output-quiet, and CPU-idle past their timeout.
   const sessionActivityPoller = setInterval(() => {
     void pollSessionActivity();
   }, 15_000);
