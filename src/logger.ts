@@ -39,7 +39,10 @@ const MAX_BYTES = 5 * 1024 * 1024;
 type TLevel = "error" | "warn" | "info" | "debug";
 
 const serializeErr = (err: unknown): string => {
-  if (err instanceof Error) return err.stack ?? `${err.name}: ${err.message}`;
+  // `||`, not `??`: a DOMException (e.g. Bun's `AbortSignal.timeout`
+  // TimeoutError) carries an EMPTY-STRING stack, which is not nullish — `??`
+  // logged those errors as `"message":""`, hiding the failure entirely.
+  if (err instanceof Error) return err.stack || `${err.name}: ${err.message}`;
   if (typeof err === "string") return err;
   try {
     return JSON.stringify(err);

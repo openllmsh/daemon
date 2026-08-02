@@ -203,7 +203,10 @@ const readFileTokens = async (): Promise<{
 };
 
 const triggerRefresh = async (): Promise<void> => {
-  await spawnRefresh([bin(), "status"], env());
+  // `probe: true` — cursor-agent's token store is the macOS keychain, and
+  // securityd refuses keychain access for a Seatbelt-confined caller; a
+  // wrapped refresh silently never persists the rotated token.
+  await spawnRefresh([bin(), "status"], env(), { probe: true });
 };
 
 const refresh = makeRefresher({

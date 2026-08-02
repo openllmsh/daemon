@@ -21,6 +21,7 @@
  * per-spawn (stderr + `logWarn` in `runSandboxExec`) on top of the boot-time
  * capability posture (`probeSandboxCapability`).
  */
+import { isAbsolute, resolve } from "node:path";
 import { logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import type { TSandboxState } from "./landlock";
@@ -38,6 +39,13 @@ export type TSandboxSpawnOpts = {
   /** Future network on/off knob (v1: ignored — network policy stays with
    *  systemd / (allow default)). */
   readonly network?: boolean;
+  /** Fixed-argv read-only probe (`<bin> --version`, keychain `security`
+   *  reads): skip the shim. The shim re-execs the whole daemon binary and
+   *  rebuilds the working set PER SPAWN, and probes run on the 30s status hot
+   *  path — that cost dwarfs any risk from a no-untrusted-input probe. Risky
+   *  children (vendor scripts, login flows, anything fed remote data) must
+   *  never set this. */
+  readonly probe?: boolean;
 };
 
 /** Whether per-child sandboxing is enabled for this process — the two env
@@ -60,6 +68,20 @@ const sandboxingEnabled = (): boolean => {
  *  script (`process.argv[1]` in both run forms — see `cli.ts` `userArgs`). */
 const isDevSourceRun = (): boolean => DAEMON_VERSION === "0.0.0-dev";
 
+/** The dev entry script as an ABSOLUTE path, captured at module load while
+ *  `process.cwd()` is still the repo root (`bun run dev:sb` launches there).
+ *  `sandboxSpawnArgs` call sites spawn the shim with the CHILD's cwd (the
+ *  isolated CLI home — `spawnCwd`), where a relative
+ *  `packages/daemon/src/main.ts` no longer resolves: every wrapped dev spawn
+ *  died with "Module not found" instead of running confined, silently
+ *  diverging `dev:sb` from the shipped binary's sandbox behaviour. */
+const DEV_ENTRY: string | undefined =
+  process.argv[1] !== undefined
+    ? isAbsolute(process.argv[1])
+      ? process.argv[1]
+      : resolve(process.argv[1])
+    : undefined;
+
 /**
  * Wrap a child argv for sandboxed execution via the `--sandbox-exec` shim.
  * INVARIANTS:
@@ -75,16 +97,16 @@ const isDevSourceRun = (): boolean => DAEMON_VERSION === "0.0.0-dev";
  */
 export const sandboxSpawnArgs = (
   argv: readonly string[],
-  _opts?: TSandboxSpawnOpts,
+  opts?: TSandboxSpawnOpts,
 ): string[] => {
+  if (opts?.probe === true) return [...argv];
   if (!sandboxingEnabled()) return [...argv];
   if (isDevSourceRun()) {
     // Dev source runs are OPT-IN (`OPENLLM_DAEMON_SANDBOX=1`), and the wrap
     // must go through `bun <entry>` since execPath is the bun runtime.
     if (process.env.OPENLLM_DAEMON_SANDBOX !== "1") return [...argv];
-    const entry = process.argv[1];
-    if (entry === undefined) return [...argv];
-    return [process.execPath, entry, "--sandbox-exec", "--", ...argv];
+    if (DEV_ENTRY === undefined) return [...argv];
+    return [process.execPath, DEV_ENTRY, "--sandbox-exec", "--", ...argv];
   }
   return [process.execPath, "--sandbox-exec", "--", ...argv];
 };

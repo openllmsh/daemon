@@ -134,7 +134,10 @@ const readAccountHash = async (): Promise<string | null> => {
  */
 const triggerRefresh = async (): Promise<void> => {
   await ensureIsolatedKeychain(cliHome(PROVIDER));
-  await spawnRefresh([bin(), "-p", "ping"], env());
+  // `probe: true` — the refresh persists the rotated token into the macOS
+  // keychain via securityd, which refuses a Seatbelt-confined caller; a
+  // wrapped refresh silently never lands and the token hard-expires.
+  await spawnRefresh([bin(), "-p", "ping"], env(), { probe: true });
 };
 
 // Within the leeway window → fire the CLI refresh in the background (still
@@ -230,7 +233,14 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
 
   const generation = authStatusGeneration;
   const probe = async (): Promise<boolean | null> => {
-    const out = await runCapture([bin(), "auth", "status"], env());
+    // `probe: true` — MUST run unwrapped: macOS securityd refuses keychain
+    // reads for a Seatbelt-confined caller, so a sandbox-wrapped `auth status`
+    // reports a definite `loggedIn: false` on a signed-in box (verified
+    // empirically against the shipped shim) and the dashboard shows
+    // "installed but not signed in".
+    const out = await runCapture([bin(), "auth", "status"], env(), {
+      probe: true,
+    });
     if (out === null) return null;
     try {
       const parsed = JSON.parse(out) as {

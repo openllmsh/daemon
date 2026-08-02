@@ -63,15 +63,45 @@ export const logIfKilled = (
     readonly exitCode: number | null;
   },
 ): boolean => {
-  if (proc.signalCode === null) return false;
-  logError("delegation", `child killed by ${proc.signalCode}`, {
+  // The `--sandbox-exec` shim mirrors a signal death of its tail as exit code
+  // `128 + N` (the daemon-side proc is the SHIM, so its signalCode is null) —
+  // without this mapping a sandbox kill of a wrapped child is invisible here
+  // and the spawn just looks like a quiet non-zero exit. A CLI can exit 130
+  // by its own convention (ctrl-c), so this is a diagnostic breadcrumb, not a
+  // hard verdict.
+  const signal =
+    proc.signalCode ??
+    (proc.exitCode !== null && proc.exitCode > 128 && proc.exitCode <= 128 + 31
+      ? (SIGNAL_NAMES[proc.exitCode - 128] ?? `signal ${proc.exitCode - 128}`)
+      : null);
+  if (signal === null) return false;
+  logError("delegation", `child killed by ${signal}`, {
     command: argv[0],
     argv: [...argv],
-    signal: proc.signalCode,
+    signal,
     // The dominant cause on a sandboxed daemon: the child hit a denied op.
     hint: "likely an OS sandbox denial — see DaemonStatus.sandbox / the sandbox working set",
   });
   return true;
+};
+
+/** Conventional signal number → name, for the shim's `128 + N` exit mirror. */
+const SIGNAL_NAMES: Record<number, string> = {
+  1: "SIGHUP",
+  2: "SIGINT",
+  3: "SIGQUIT",
+  4: "SIGILL",
+  5: "SIGTRAP",
+  6: "SIGABRT",
+  7: "SIGBUS",
+  8: "SIGFPE",
+  9: "SIGKILL",
+  10: "SIGUSR1",
+  11: "SIGSEGV",
+  12: "SIGUSR2",
+  13: "SIGPIPE",
+  14: "SIGALRM",
+  15: "SIGTERM",
 };
 
 /**
@@ -83,9 +113,10 @@ export const logIfKilled = (
 export const runCapture = async (
   argv: ReadonlyArray<string>,
   env?: Record<string, string>,
+  opts?: { readonly probe?: boolean },
 ): Promise<string | null> => {
   try {
-    const proc = Bun.spawn(sandboxSpawnArgs(argv), {
+    const proc = Bun.spawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
@@ -103,11 +134,15 @@ export const runCapture = async (
   }
 };
 
-/** Run a binary's `--version` (best-effort). Returns null on failure. */
+/** Run a binary's `--version` (best-effort). Returns null on failure.
+ *  A fixed-argv read-only probe on the 30s status hot path — spawned
+ *  UNWRAPPED (`probe: true`): the shim's full daemon re-exec per spawn costs
+ *  far more than confining a no-untrusted-input version print protects. */
 export const cliVersion = (
   bin: string,
   env?: Record<string, string>,
-): Promise<string | null> => runCapture([bin, "--version"], env);
+): Promise<string | null> =>
+  runCapture([bin, "--version"], env, { probe: true });
 
 export type TLoginResult = {
   readonly code: number;
@@ -130,6 +165,12 @@ export type TSpawnLoginOpts = {
    *  on `proc.exited` would block forever + pile up 99%-CPU runaways. We don't
    *  need the exit — only the output. */
   readonly until?: RegExp;
+  /** Skip the `--sandbox-exec` wrap (see `TSandboxSpawnOpts.probe`). REQUIRED
+   *  for children that must operate a macOS-keychain-backed credential store
+   *  (claude/cursor status + refresh): securityd refuses keychain reads for a
+   *  Seatbelt-confined caller, so a wrapped spawn reports "not signed in" and
+   *  a wrapped refresh silently never persists the rotated token. */
+  readonly probe?: boolean;
 };
 
 /** Default login ceiling — long enough for a human to complete the browser
@@ -159,7 +200,7 @@ export const spawnLogin = async (
   env?: Record<string, string>,
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
-  const proc = Bun.spawn(sandboxSpawnArgs(argv), {
+  const proc = Bun.spawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -329,7 +370,7 @@ export const spawnLoginPty = async (
 
   // Wrap the WHOLE `script(1)` argv — the PTY wrapper and the vendor CLI it
   // runs are one confined tree.
-  const proc = Bun.spawn(sandboxSpawnArgs(scriptArgv), {
+  const proc = Bun.spawn(sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }), {
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",

@@ -31,10 +31,13 @@ export const REFRESH_SPAWN_TIMEOUT_MS = 60_000;
 export const spawnRefresh = async (
   argv: ReadonlyArray<string>,
   env: Record<string, string>,
-  opts?: { readonly pty?: boolean },
+  opts?: { readonly pty?: boolean; readonly probe?: boolean },
 ): Promise<void> => {
   const run = opts?.pty === true ? spawnLoginPty : spawnLogin;
-  await run([...argv], env, { timeoutMs: REFRESH_SPAWN_TIMEOUT_MS });
+  await run([...argv], env, {
+    timeoutMs: REFRESH_SPAWN_TIMEOUT_MS,
+    probe: opts?.probe,
+  });
 };
 
 /** What `makeRefresher` did for this read — tells the caller whether the store

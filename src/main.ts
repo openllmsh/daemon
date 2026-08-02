@@ -361,13 +361,19 @@ const main = async (): Promise<void> => {
       err && typeof err === "object" && "code" in err
         ? String((err as { code?: unknown }).code)
         : "";
+    // BOTH channels: `logError` lands in the shared log file only — without a
+    // stderr line a foreground/dev run (`bun dev:sb`) dies as a bare exit 1
+    // with no visible reason.
     if (code === "EADDRINUSE") {
-      logError(
-        "boot",
+      const msg =
         `port ${port} already in use — another openllmd (or a stray process) holds 127.0.0.1:${port}. ` +
-          "Stop it (`openllmd stop`) or set OPENLLM_DAEMON_PORT to a free port.",
-      );
+        "Stop it (`openllmd stop`) or set OPENLLM_DAEMON_PORT to a free port.";
+      process.stderr.write(`openllmd: ${msg}\n`);
+      logError("boot", msg);
     } else {
+      process.stderr.write(
+        `openllmd: boot failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
       logError("boot", err);
     }
     process.exit(1);

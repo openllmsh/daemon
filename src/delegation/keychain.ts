@@ -44,7 +44,10 @@ const runSecurity = async (
   home: string,
 ): Promise<boolean> => {
   try {
-    const proc = Bun.spawn(sandboxSpawnArgs(["security", ...argv]), {
+    // Unwrapped probe: fixed `/usr/bin/security` argv talking to securityd
+    // over mach IPC — the shim's per-spawn daemon re-exec adds cost, not
+    // protection, and keychain ops run on hot status/ensure paths.
+    const proc = Bun.spawn(sandboxSpawnArgs(["security", ...argv], { probe: true }), {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
@@ -220,7 +223,9 @@ const findKeychainServices = async (
 ): Promise<ReadonlyArray<string>> => {
   try {
     const proc = Bun.spawn(
-      sandboxSpawnArgs(["security", "dump-keychain", loginKeychainPath(home)]),
+      sandboxSpawnArgs(["security", "dump-keychain", loginKeychainPath(home)], {
+        probe: true,
+      }),
       {
         stdout: "pipe",
         stderr: "ignore",
@@ -249,14 +254,17 @@ const readKeychainSecret = async (
 ): Promise<string | null> => {
   try {
     const proc = Bun.spawn(
-      sandboxSpawnArgs([
-        "security",
-        "find-generic-password",
-        "-s",
-        service,
-        "-w",
-        loginKeychainPath(home),
-      ]),
+      sandboxSpawnArgs(
+        [
+          "security",
+          "find-generic-password",
+          "-s",
+          service,
+          "-w",
+          loginKeychainPath(home),
+        ],
+        { probe: true },
+      ),
       {
         stdout: "pipe",
         stderr: "ignore",

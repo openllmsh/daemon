@@ -206,7 +206,12 @@ export const cliInstallState = async (
   // (the main link existing skips `linkIsolatedCli` above forever). Idempotent
   // — an up-to-date link is a readlink+compare, so the 30s probe stays cheap.
   linkSidecars(bin);
-  const out = await runCapture([bin, "--version"], cliEnv(provider));
+  // Unwrapped probe (`probe: true`): a fixed-argv `--version` on the 30s
+  // status path — the `--sandbox-exec` shim's per-spawn daemon re-exec costs
+  // far more than confining a version print protects.
+  const out = await runCapture([bin, "--version"], cliEnv(provider), {
+    probe: true,
+  });
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };
   // Only write to cache if generation hasn't changed (cache not cleared).

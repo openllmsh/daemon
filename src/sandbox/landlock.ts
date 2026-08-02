@@ -32,7 +32,7 @@
  * drain-and-exit + supervisor relaunch, never by widening a live ruleset.
  */
 import { fstatSync } from "node:fs";
-import { logInfo, logWarn } from "../logger";
+import { logDebug, logInfo, logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { daemonWorkingSet } from "./working-set";
 
@@ -417,7 +417,9 @@ const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
       logWarn("sandbox", `landlock_restrict_self failed (${rc})`);
       return "error";
     }
-    logInfo("sandbox", "landlock enforced", {
+    // Debug, not info: runs inside the per-spawn `--sandbox-exec` shim — at
+    // info it floods the shared log with one line per wrapped child spawn.
+    logDebug("sandbox", "landlock enforced", {
       abi,
       readWrite: ws.readWrite.length,
       readOnly: ws.readOnly.length,

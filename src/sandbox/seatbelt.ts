@@ -27,7 +27,7 @@ import type { Pointer } from "bun:ffi";
 import { CString, dlopen, FFIType, ptr } from "bun:ffi";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { logInfo, logWarn } from "../logger";
+import { logDebug, logWarn } from "../logger";
 import type { TSandboxState } from "./landlock";
 import { daemonWorkingSet } from "./working-set";
 
@@ -250,7 +250,10 @@ export const applySeatbelt = (): TSandboxState => {
       cachedState = "error";
       return cachedState;
     }
-    logInfo("sandbox", "seatbelt enforced", {
+    // Debug, not info: this now runs inside the per-spawn `--sandbox-exec`
+    // shim (the daemon process itself is unconfined), so at info it floods the
+    // shared log with one line per wrapped child spawn.
+    logDebug("sandbox", "seatbelt enforced", {
       allowWrite: daemonWorkingSet().readWrite.length,
     });
     cachedState = "enforced";
