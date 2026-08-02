@@ -33,7 +33,7 @@ const MAX_LIVE_SESSIONS = 4;
 const MAX_RETAINED_SESSIONS = 32;
 
 /** Vendor session ids accepted for cold resume: url-safe, no leading dash. */
-const RESUME_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
+export const RESUME_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
 
 /** Scrollback ring cap — enough to repaint a screenful+history on attach
  *  without unbounded memory. */
@@ -1072,9 +1072,6 @@ export const openSession = (
       for (const chunk of pendingOutput) sendOut(s, chunk);
       pendingOutput.length = 0;
       s.pid = pty.pid ?? null;
-      // Lifecycle ownership stays injectable: the current daemon writes its
-      // pidfile adapter, while the standalone host supplies its own persistence.
-      lifecycleHooks.onSpawn(s);
       s.busy = true;
       s.lastBusyAtMs = Date.now();
       s.detachedAtMs = null;
@@ -1083,6 +1080,10 @@ export const openSession = (
       // A reused row may retain the prior child status. The newly spawned PTY
       // must not report that old exit code when it later closes.
       s.exitCode = null;
+      // Lifecycle ownership stays injectable: the current daemon writes its
+      // pidfile adapter, while the standalone host supplies its own persistence.
+      // Run it only after all persisted metadata has its final spawn values.
+      lifecycleHooks.onSpawn(s);
       onAck({ ok: true, live: false, generation: s.generation });
       logInfo("session", "session started", {
         id: s.id,

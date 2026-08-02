@@ -33,6 +33,7 @@ import {
   serviceStatus,
   serviceStop,
 } from "./service";
+import { runSessionHostProcess } from "./session-host-proc";
 import { runUninstall } from "./uninstall";
 import { DAEMON_VERSION } from "./version";
 
@@ -161,6 +162,11 @@ export const runCli = (): boolean => {
 
   const rest = args.slice(1);
   switch (args[0]) {
+    // Internal durable-session host. Deliberately omitted from COMMANDS/help:
+    // Phase 1c starts it detached, so it must never bootstrap the daemon.
+    case "__session-host":
+      return runSessionHostProcess(rest);
+
     case "start":
       serviceStart();
       process.exit(0);
