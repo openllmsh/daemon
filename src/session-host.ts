@@ -304,6 +304,8 @@ export const ptySupported = (): boolean => process.platform !== "win32";
 
 type TAttachedConsumer = {
   readonly stream: TSessionStream;
+  /** Removes this consumer's transport event bindings on detach. */
+  readonly unsubscribe: Array<() => void>;
   writeTail: Promise<void>;
   queuedBytes: number;
   exitHandler: ((code: number) => void) | null;
@@ -752,6 +754,7 @@ const detachConsumer = (
   if (!session.consumers.delete(consumer)) return;
   consumer.exitHandler = null;
   consumer.queuedBytes = 0;
+  for (const unsubscribe of consumer.unsubscribe) unsubscribe();
   if (!isAttached(session)) {
     session.detachedAtMs = Date.now();
     logInfo("session", "session detached", { id: session.id });
@@ -1256,6 +1259,7 @@ export const bindSessionStream = (
       }
       const consumer: TAttachedConsumer = {
         stream,
+        unsubscribe: [],
         writeTail: Promise.resolve(),
         queuedBytes: 0,
         exitHandler: opts.onExit ?? null,
@@ -1306,36 +1310,38 @@ export const bindSessionStream = (
     send,
     opts.vendorArgs,
   );
-  const consumerFor = (session: TSession): TAttachedConsumer | undefined =>
-    [...session.consumers].find((consumer) => consumer.stream === stream);
-  stream.onData((bytes) => {
-    const session = sessions.get(open.session_id);
-    if (session === undefined || consumerFor(session) === undefined) return;
-    session.pty?.write(bytes);
-  });
-  stream.onCtrl((payload) => {
-    const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
-    const session = sessions.get(open.session_id);
-    if (session === undefined || consumerFor(session) === undefined) return;
-    if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
-    if (ctrl?.t === "close" && ctrl.intent === "kill") {
-      endPty(session, "killed");
-      // END is a clean terminal close to sessionStream.closed ("done").
-      terminalClose(session, send, "killed");
-    }
-  });
-  stream.onReset(() => {
-    const session = sessions.get(open.session_id);
-    if (session === undefined) return;
-    const consumer = consumerFor(session);
-    if (consumer !== undefined) detachConsumer(session, consumer);
-  });
-  stream.onEnd(() => {
-    const session = sessions.get(open.session_id);
-    if (session === undefined) return;
-    const consumer = consumerFor(session);
-    if (consumer !== undefined) detachConsumer(session, consumer);
-  });
+  const session = sessions.get(open.session_id);
+  const consumer =
+    session === undefined
+      ? undefined
+      : [...session.consumers].find((entry) => entry.stream === stream);
+  // A refused open never became a consumer, so it must not leave four dormant
+  // transport handlers behind. For accepted streams, keep every unsubscribe on
+  // the consumer and release them together on reset/end/lagging/PTY teardown.
+  if (session === undefined || consumer === undefined) return;
+  consumer.unsubscribe.push(
+    stream.onData((bytes) => {
+      if (!session.consumers.has(consumer)) return;
+      session.pty?.write(bytes);
+    }),
+    stream.onCtrl((payload) => {
+      if (!session.consumers.has(consumer)) return;
+      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
+      if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
+      if (ctrl?.t === "close" && ctrl.intent === "kill") {
+        endPty(session, "killed");
+        // END is a clean terminal close to sessionStream.closed ("done").
+        terminalClose(session, send, "killed");
+      }
+    }),
+    stream.onReset(() => detachConsumer(session, consumer)),
+    stream.onEnd(() => detachConsumer(session, consumer)),
+  );
+  // A stream can synchronously end while a transport registers a handler.
+  // Avoid retaining subscriptions in that raced, already-detached consumer.
+  if (!session.consumers.has(consumer)) {
+    for (const unsubscribe of consumer.unsubscribe) unsubscribe();
+  }
 };
 
 /** Mux compatibility wrapper; the generic binder is intentionally structural. */
