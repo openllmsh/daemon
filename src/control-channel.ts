@@ -44,6 +44,7 @@ import {
   setSessionActivityHook,
 } from "./session-host";
 import { computeStatus } from "./status";
+import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
 import {
   failAllConsumedTunnels,
   handleConsumedTunnelFrame,
@@ -76,6 +77,15 @@ const LIVENESS_TIMEOUT_MS = 70_000;
 // connect stays immediate). Small vs the 35s presence grace, so it never surfaces
 // as a flap. See `docs/audit/presence-reconnect-prior-art.md` §3.
 const RECONNECT_JITTER_MS = 3_000;
+// Stand-down when ANOTHER daemon on the same API key evicts us (`4000
+// superseded`). partysocket resets its backoff on every OPEN, and in a
+// supersede war every dial opens — so without this the two contenders re-dial
+// in ~1s forever and each `onopen`'s `detachAllSessions()` drops every attached
+// device PTY every few seconds. See `supersede-backoff.ts`.
+const SUPERSEDE_BASE_MS = 15_000;
+const SUPERSEDE_MAX_MS = 300_000;
+// An eviction after this much uptime is a fresh conflict, not an escalation.
+const SUPERSEDE_STABLE_MS = 120_000;
 /** Check a healthy relay connection for a deploy handoff without waiting for
  * the five-minute bootstrap loop. Small jitter prevents fleet lockstep. */
 const MIGRATION_CHECK_MS = 45_000;
@@ -104,6 +114,13 @@ const heartbeat = createHeartbeat({
   },
   heartbeatMs: HEARTBEAT_MS,
   livenessMs: LIVENESS_TIMEOUT_MS,
+});
+/** Escalating stand-down when a same-key daemon evicts this connection. */
+const supersedeBackoff = createSupersedeBackoff({
+  baseMs: SUPERSEDE_BASE_MS,
+  maxMs: SUPERSEDE_MAX_MS,
+  stableAfterMs: SUPERSEDE_STABLE_MS,
+  jitterMs: RECONNECT_JITTER_MS,
 });
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
@@ -600,8 +617,11 @@ const onMessage = (data: unknown): void => {
  *  unreachable; partysocket backs off and retries. */
 const channelUrl = async (): Promise<string> => {
   // De-sync fleet reconnect storms (relay redeploy). First connect is immediate;
-  // only re-dials are jittered. partysocket calls this before every (re)connect.
-  if (hasConnected) await sleep(Math.random() * RECONNECT_JITTER_MS);
+  // only re-dials are delayed. partysocket calls this before every (re)connect.
+  // Normally that is plain jitter; after a `4000 superseded` it is the
+  // escalating stand-down that ends a same-key eviction war (partysocket's own
+  // backoff cannot — it resets on every open, and a superseded dial DOES open).
+  if (hasConnected) await sleep(supersedeBackoff.nextDelayMs());
   const channel = await fetchChannel();
   ticket = channel.ticket;
   connectedWssOrigin = wssOrigin(channel.wss_url);
@@ -699,6 +719,7 @@ export const startControlChannel = (): void => {
       hasConnected ? "reconnected over websocket" : "connected over websocket",
     );
     hasConnected = true;
+    supersedeBackoff.noteOpen(Date.now()); // starts the stability clock
     lastErrorReason = ""; // recovered — let the next outage log fresh
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
@@ -756,6 +777,20 @@ export const startControlChannel = (): void => {
     stopMigrationCheck();
     helloSent = false; // the next connection must lead with its own hello
     heartbeat.stop(); // disarm until the next open re-starts it
+    const closeReason = ev.reason ?? "";
+    supersedeBackoff.noteClose(ev.code, closeReason, Date.now());
+    // `4000 superseded` = ANOTHER daemon connected with this same API key and
+    // took the relay's one slot for it. Never a transient blip and never our
+    // own reconnect (partysocket detaches the old socket's listeners before
+    // dialing), so say what it is and how to fix it rather than logging a bare
+    // close code. `channelUrl` applies the stand-down before the next dial.
+    if (isSupersededClose(ev.code, closeReason)) {
+      logWarn(
+        "control-channel",
+        `another OpenLLM daemon is connected with this API key and took over the relay slot; standing down ~${Math.round(supersedeBackoff.standDownMs() / 1000)}s before re-dialing (run one daemon per key, or mint a separate key per device)`,
+      );
+      return;
+    }
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
     // reconnects automatically in all cases.
