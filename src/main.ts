@@ -22,6 +22,7 @@
  */
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { guardCrashLoop } from "./boot-guard";
+import { brokerWebsocket, handleBrokerRequest } from "./broker-listener";
 import { runCli } from "./cli";
 import { maybeUpdateCli } from "./cli-self-update";
 import {
@@ -259,8 +260,11 @@ const main = async (): Promise<void> => {
       // ~10s idle timeout would sever a stream between writes, so raise it to
       // Bun's max; the stream emits its own keep-alives well under it.
       idleTimeout: 255,
-      fetch: async (req: Request): Promise<Response> => {
+      fetch: async (req: Request, server): Promise<Response | undefined> => {
         const url = new URL(req.url);
+        const broker = await handleBrokerRequest(req, server);
+        if (broker === "upgraded") return undefined;
+        if (broker !== null) return broker;
         if (url.pathname.startsWith("/v1/")) {
           // Stamp every inference response as daemon-served — an
           // observability marker (you can always tell a response came from
@@ -355,6 +359,7 @@ const main = async (): Promise<void> => {
           headers: { "content-type": "application/json" },
         });
       },
+      websocket: brokerWebsocket,
     });
   } catch (err) {
     const code =

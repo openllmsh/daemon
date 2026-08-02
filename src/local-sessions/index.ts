@@ -4,6 +4,7 @@
  */
 
 import type { TDeviceSessionCli, TLocalCliSession } from "@openllmsh/protocol";
+import { LISTABLE_SESSION_CLIS } from "@openllmsh/protocol";
 import { readClaudeHistory } from "./claude";
 import { readCodexHistory } from "./codex";
 import { readGrokHistory } from "./grok";
@@ -234,4 +235,14 @@ export const readLocalSessions = async (
       openllm_session_id: r.openllm_session_id,
       attachable: r.attachable,
     }));
+};
+
+/** List every supported local CLI, preserving the per-CLI merge behavior. */
+export const readAllLocalSessions = async (
+  opts: { readonly limit?: number; readonly deps?: TLocalSessionsDeps } = {},
+): Promise<TLocalCliSession[]> => {
+  const groups = await Promise.all(
+    [...LISTABLE_SESSION_CLIS].map((cli) => readLocalSessions(cli, opts)),
+  );
+  return groups.flat();
 };

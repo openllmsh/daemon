@@ -208,10 +208,25 @@ export type TPtySpawnArgs = {
   readonly cols: number;
   readonly rows: number;
   readonly onData: (chunk: Uint8Array) => void;
-  readonly onExit: () => void;
+  readonly onExit: (exitCode?: number) => void;
 };
 
 export type TPtySpawner = (args: TPtySpawnArgs) => TPtyLike;
+
+/**
+ * Transport-neutral endpoint of a device session. Keeping this structural means
+ * the local broker can reuse the exact mux lifecycle without becoming mux wire.
+ */
+export type TSessionStream = {
+  readonly write: (bytes: Uint8Array) => Promise<void>;
+  readonly sendCtrl: (payload: Uint8Array) => void;
+  readonly reset: (payload?: Uint8Array) => void;
+  readonly end: () => void;
+  readonly onData: (handler: (payload: Uint8Array) => unknown) => () => void;
+  readonly onCtrl: (handler: (payload: Uint8Array) => unknown) => () => void;
+  readonly onReset: (handler: (payload: Uint8Array) => unknown) => () => void;
+  readonly onEnd: (handler: () => void) => () => void;
+};
 
 /** Production spawner over Bun's built-in PTY. */
 const bunPtySpawner: TPtySpawner = (args) => {
@@ -233,8 +248,8 @@ const bunPtySpawner: TPtySpawner = (args) => {
     terminal.close();
     throw err;
   }
-  void proc.exited.then(() => {
-    args.onExit();
+  void proc.exited.then((exitCode) => {
+    args.onExit(exitCode);
     terminal.close();
   });
   return {
@@ -280,13 +295,17 @@ type TSession = {
   busy: boolean;
   title: string | null;
   pid: number | null;
-  muxStream: TMuxStream | null;
+  muxStream: TSessionStream | null;
   /** Serializes replay, replay_done, and live mux output in wire order. */
   muxWriteTail: Promise<void>;
   /** Daemon-minted monotonically increasing value for successful opens. */
   generation: number;
   /** Terminal state retained so a later attach can explain why it cannot resume. */
   lastExitReason: "evicted" | "reaped" | "done" | "killed" | null;
+  /** Child status, when Bun's PTY-backed process supplied one. */
+  exitCode: number | null;
+  /** Local broker-only exit notification; mux has no equivalent envelope. */
+  exitHandler: ((code: number) => void) | null;
 };
 
 const sessions = new Map<string, TSession>();
@@ -573,6 +592,7 @@ const argvFor = (
   mode: "spawn" | "continue",
   dangerous: boolean,
   vendorSessionId: string | null,
+  vendorArgs: readonly string[] = [],
 ): ReadonlyArray<string> => {
   const clientId = openllmClientId(cli);
   const bin = openllmBin();
@@ -587,6 +607,7 @@ const argvFor = (
     } else if (mode === "continue" && cli === "claude_code") {
       args.push("--continue");
     }
+    args.push(...vendorArgs);
     return args;
   }
   // Fallback: host vendor binary (no openllm wrapper).
@@ -598,12 +619,13 @@ const argvFor = (
   if (vendorSessionId !== null) {
     const withResume = [host, ...flags];
     pushResumeArgs(withResume, cli, vendorSessionId);
+    withResume.push(...vendorArgs);
     return withResume;
   }
   if (mode === "continue" && cli === "claude_code") {
     flags.push("--continue");
   }
-  return [host, ...flags];
+  return [host, ...flags, ...vendorArgs];
 };
 
 /**
@@ -656,15 +678,20 @@ const b64 = (bytes: Uint8Array): string =>
   Buffer.from(bytes).toString("base64");
 
 /** Send one out-direction chunk, split at the wire cap. */
-const detachMuxStream = (s: TSession, stream?: TMuxStream): void => {
+const detachMuxStream = (s: TSession, stream?: TSessionStream): void => {
   if (stream !== undefined && s.muxStream !== stream) return;
   s.muxStream = null;
+  s.exitHandler = null;
   s.muxWriteTail = Promise.resolve();
   if (s.attached) detachSession(s.id);
 };
 
 /** Queue a mux write after all prior replay/live output. */
-const writeMux = (s: TSession, stream: TMuxStream, chunk: Uint8Array): void => {
+const writeMux = (
+  s: TSession,
+  stream: TSessionStream,
+  chunk: Uint8Array,
+): void => {
   s.muxWriteTail = s.muxWriteTail
     .then(() => stream.write(chunk))
     .catch(() => detachMuxStream(s, stream));
@@ -713,6 +740,14 @@ const terminalClose = (
       });
     }
   }
+  if (s.exitCode !== null) {
+    try {
+      s.exitHandler?.(s.exitCode);
+    } catch {
+      // The local socket may already be gone; close remains terminal.
+    }
+  }
+  s.exitHandler = null;
   muxStream?.end();
   // Do not wait for the peer's END callback to clear replay state: a restart
   // may bind the same row before that callback runs. Otherwise its first PTY
@@ -818,6 +853,16 @@ export const detachSession = (id: string): void => {
   logInfo("session", "session detached", { id: session.id });
 };
 
+/** Kill a live device PTY by its OpenLLM session id for the local broker. */
+export const killSession = (id: string): boolean => {
+  const session = sessions.get(id);
+  if (session === undefined || session.pty === null) return false;
+  endPty(session, "killed");
+  terminalClose(session, () => {}, "killed");
+  logInfo("session", "session closed", { id, reason: "kill" });
+  return true;
+};
+
 /**
  * Hand an already-attached PTY to a new consumer.
  *
@@ -852,9 +897,21 @@ const supersedeConsumer = (s: TSession): void => {
   logInfo("session", "session consumer superseded", { id: s.id });
 };
 
+const validVendorArgs = (vendorArgs: readonly string[] | undefined): boolean =>
+  vendorArgs === undefined ||
+  (vendorArgs.length <= 64 &&
+    vendorArgs.every(
+      (arg) =>
+        typeof arg === "string" &&
+        arg.length >= 1 &&
+        arg.length <= 512 &&
+        !arg.includes("\0"),
+    ));
+
 const handleOpen = (
   frame: TRelaySessionOpenFrame,
   send: (frame: TRelayFrame) => void,
+  vendorArgs?: readonly string[],
 ): void => {
   const nack = (
     error:
@@ -891,6 +948,10 @@ const handleOpen = (
   // to sit outside the spawn try/catch. An unexpected throw there left the
   // browser waiting on open_ack until its 15s timeout. Always nack.
   try {
+    if (!validVendorArgs(vendorArgs)) {
+      nack("spawn_failed");
+      return;
+    }
     if (!ptySupported()) {
       nack("pty_unsupported");
       return;
@@ -1009,6 +1070,8 @@ const handleOpen = (
       muxWriteTail: Promise.resolve(),
       generation: 0,
       lastExitReason: null,
+      exitCode: null,
+      exitHandler: null,
     };
     // Refresh resume metadata on every spawn/continue.
     s.cwd = cwd;
@@ -1023,6 +1086,7 @@ const handleOpen = (
         frame.mode === "continue" ? "continue" : "spawn",
         frame.dangerous === true,
         vendorSessionId,
+        vendorArgs,
       );
       logInfo("session", "session open started", {
         id: s.id,
@@ -1044,7 +1108,8 @@ const handleOpen = (
           pushScrollback(s, chunk);
           if (s.attached) sendOut(s, chunk, send);
         },
-        onExit: () => {
+        onExit: (exitCode) => {
+          s.exitCode = typeof exitCode === "number" ? exitCode : null;
           const reason = s.lastExitReason ?? "done";
           endPty(s, reason, false);
           terminalClose(s, send, reason === "done" ? "done" : "killed");
@@ -1098,10 +1163,14 @@ const handleOpen = (
   }
 };
 
-/** Bind a mux session stream without changing the legacy JSON state machine. */
-export const bindMuxSessionStream = (
-  stream: TMuxStream,
+/** Bind a transport-neutral session stream without changing the legacy JSON state machine. */
+export const bindSessionStream = (
+  stream: TSessionStream,
   open: TSessionStreamOpenPayload,
+  opts: {
+    readonly vendorArgs?: readonly string[];
+    readonly onExit?: (code: number) => void;
+  } = {},
 ): void => {
   const send = (frame: TRelayFrame): void => {
     if (frame.type === "session_open_ack") {
@@ -1124,6 +1193,7 @@ export const bindMuxSessionStream = (
         return;
       }
       session.muxStream = stream;
+      session.exitHandler = opts.onExit ?? null;
       stream.sendCtrl(
         encodeJsonPayload({
           t: "open_ack",
@@ -1147,7 +1217,7 @@ export const bindMuxSessionStream = (
     }
     if (frame.type === "session_close") stream.end();
   };
-  handleSessionFrame(
+  handleOpen(
     {
       type: "session_open",
       session_id: open.session_id,
@@ -1164,6 +1234,7 @@ export const bindMuxSessionStream = (
       ...(open.cwd === undefined ? {} : { cwd: open.cwd }),
     },
     send,
+    opts.vendorArgs,
   );
   stream.onData((bytes) => {
     const session = sessions.get(open.session_id);
@@ -1193,6 +1264,12 @@ export const bindMuxSessionStream = (
     if (session !== undefined) detachMuxStream(session, stream);
   });
 };
+
+/** Mux compatibility wrapper; the generic binder is intentionally structural. */
+export const bindMuxSessionStream = (
+  stream: TMuxStream,
+  open: TSessionStreamOpenPayload,
+): void => bindSessionStream(stream, open);
 
 /** Control-channel reconnect: the relay swept every channel — DETACH all
  *  attached sessions (PTYs survive relay cycling; the browser re-attaches
