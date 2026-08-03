@@ -14,7 +14,7 @@
  * `minReconnectionDelay`. Both sides re-dial in ~1s, forever.
  *
  * That flap is not cosmetic. Every `onopen` runs `resetRelayScopedState()` →
- * `detachAllSessions()`, so each cycle tears every attached device PTY off its
+ * browser attachment transport, so each cycle drops every attached viewer.
  * mux stream: the browser terminal drops every few seconds and settles on
  * "Couldn't open this session".
  *

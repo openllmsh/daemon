@@ -23,15 +23,9 @@ import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
 import { maybeSelfUpdate } from "./self-update";
-import { deviceSessionsForList } from "./session-host";
+import { discoverSessionHosts } from "./session-host-proc";
 import { refreshUsage } from "./status";
 import { invalidateUsage } from "./usage-cache";
-
-// Cap how long the post-install/uninstall `-s` re-probe may delay the command
-// ack. The probe only warms the device-state cache for the next status push, so
-// missing this window just defers the refreshed state to the next walk — never a
-// reason to hold the dashboard's optimistic button.
-const PROBE_ACK_TIMEOUT_MS = 15_000;
 
 /** Short TTL so picker double-fetch / remounts do not re-scan vendor stores. */
 const LIST_LOCAL_SESSIONS_TTL_MS = 1_500;
@@ -215,7 +209,7 @@ export const runCommandInner = async (
         return { id: cmd.id, status: "done" };
       }
       // Vendor-local session index for the device-session picker (history +
-      // ~/.openllm/run live.json + in-memory PTYs). Result rides the lifecycle.
+      // ~/.openllm/run live.json + durable session-host registry). Result rides the lifecycle.
       // Short-TTL cache so rapid picker refreshes do not re-scan vendor stores
       // + run dirs on the daemon event loop every time.
       case "list_local_sessions": {
@@ -242,7 +236,18 @@ export const runCommandInner = async (
         }
         const sessions = await readLocalSessions(cmd.payload.cli, {
           limit: cmd.payload.limit,
-          deps: { deviceSessions: deviceSessionsForList },
+          deps: {
+            deviceSessions: () =>
+              discoverSessionHosts().map((host) => ({
+                id: host.id,
+                cli: host.cli,
+                live: true,
+                title: host.title,
+                vendor_session_id: host.vendorSessionId,
+                cwd: host.cwd,
+                started_at_ms: host.startedAtMs,
+              })),
+          },
         });
         listLocalSessionsCache.set(cacheKey, { at: now, sessions });
         return {

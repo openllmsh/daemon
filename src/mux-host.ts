@@ -9,7 +9,12 @@ import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logInfo, logWarn } from "./logger";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
-import { bindMuxSessionStream } from "./session-host";
+import type { TSessionStream } from "./session-core";
+import {
+  attachSessionHostViaCli,
+  discoverSessionHosts,
+  spawnSessionHostProc,
+} from "./session-host-proc";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 /**
@@ -207,11 +212,49 @@ export const configureMuxHost = (options: {
  * Keep tunnel-server reachable through this single closure so rtc-host does
  * not re-implement admit/serve. Session OPEN binds a PTY via session-host.
  */
+const pipeSessionStreams = (
+  relay: TSessionStream,
+  host: TSessionStream,
+): void => {
+  let closed = false;
+  const closeHost = (): void => {
+    if (closed) return;
+    closed = true;
+    host.end();
+  };
+  relay.onData((bytes) => {
+    void host.write(bytes).catch(() => {
+      closed = true;
+      relay.reset();
+    });
+  });
+  relay.onCtrl((payload) => host.sendCtrl(payload));
+  relay.onReset((payload) => {
+    host.reset(payload);
+    closed = true;
+  });
+  relay.onEnd(closeHost);
+  host.onData((bytes) => {
+    void relay.write(bytes).catch(closeHost);
+  });
+  host.onCtrl((payload) => relay.sendCtrl(payload));
+  host.onReset((payload) => {
+    closed = true;
+    relay.reset(payload);
+  });
+  host.onEnd(() => {
+    if (closed) return;
+    closed = true;
+    relay.end();
+  });
+};
+
+/** Browser mux streams are attach clients; durable hosts own every PTY. */
 export const serveMuxOnStream = serveStream({
   // Keep the tunnel-server import lazy: its production dispatcher reaches the
   // control channel, which imports this host during daemon initialization.
   tunnel: (open, body, signal) => serveMuxTunnel(open, body, signal),
-  session: (stream, open) => {
+  session: async (stream, open) => {
     if (!ptySessionsEnabled()) {
       logInfo("session", "remote session open refused: sessions disabled", {
         id: open.session_id,
@@ -225,7 +268,39 @@ export const serveMuxOnStream = serveStream({
       );
       return;
     }
-    bindMuxSessionStream(stream, open);
+    // Spawn (if needed) then attach via a CLI pipe child. The CLI owns the
+    // unix-socket dial; the daemon never opens a session socket itself.
+    if (open.mode !== "attach") {
+      const socketPath = await spawnSessionHostProc({
+        id: open.session_id,
+        cli: open.cli,
+        ...(open.cwd === undefined ? {} : { cwd: open.cwd }),
+        ...(open.title === undefined ? {} : { title: open.title }),
+        ...(open.dangerous === undefined ? {} : { dangerous: open.dangerous }),
+        ...(open.resume_session_id === undefined
+          ? {}
+          : { resume: open.resume_session_id }),
+      });
+      if (socketPath === null) {
+        stream.reset(encodeJsonPayload({ code: "spawn_failed" }));
+        return;
+      }
+    } else if (
+      discoverSessionHosts().every((host) => host.id !== open.session_id)
+    ) {
+      stream.reset(encodeJsonPayload({ code: "session_not_found" }));
+      return;
+    }
+    const host = attachSessionHostViaCli({ ...open, mode: "attach" });
+    if (host === null) {
+      stream.reset(
+        encodeJsonPayload({
+          code: open.mode === "attach" ? "session_not_found" : "spawn_failed",
+        }),
+      );
+      return;
+    }
+    pipeSessionStreams(stream, host);
   },
   admitTunnel: () => admitMuxTunnel(),
   invalidOpenCode: "invalid_tunnel",

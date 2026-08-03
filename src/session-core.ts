@@ -19,7 +19,6 @@ import {
   SESSION_ID_PATTERN,
 } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
-import type { TMuxStream } from "@openllmsh/tunnel/mux";
 import { hostCliCandidates, sessionEnv } from "./cli-paths";
 import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
@@ -1205,18 +1204,6 @@ export const bindSessionStream = (
   if (!session.consumers.has(consumer)) {
     for (const unsubscribe of consumer.unsubscribe) unsubscribe();
   }
-};
-
-/** Mux compatibility wrapper; the generic binder is intentionally structural. */
-export const bindMuxSessionStream = (
-  stream: TMuxStream,
-  open: TSessionStreamOpenPayload,
-): void => bindSessionStream(stream, open);
-
-/** Control-channel reconnect: the relay swept every channel, so clear each
- *  attached stream while keeping its PTY resumable. */
-export const detachAllSessions = (): void => {
-  for (const session of sessions.values()) detachSession(session.id);
 };
 
 /** Test-only: reset all session state. */

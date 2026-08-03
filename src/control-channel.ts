@@ -26,7 +26,6 @@ import {
   resetAllChannels,
   updateMuxPeerCaps,
 } from "./mux-host";
-import { ptySessionsEnabled } from "./pty-sessions-pref";
 import {
   configureRtcClient,
   handleRtcAnswer,
@@ -39,12 +38,6 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
-import {
-  detachAllSessions,
-  handleSessionFrame,
-  isSessionFrame,
-  setSessionActivityHook,
-} from "./session-host";
 import { computeStatus } from "./status";
 import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
 import {
@@ -82,8 +75,8 @@ const RECONNECT_JITTER_MS = 3_000;
 // Stand-down when ANOTHER daemon on the same API key evicts us (`4000
 // superseded`). partysocket resets its backoff on every OPEN, and in a
 // supersede war every dial opens — so without this the two contenders re-dial
-// in ~1s forever and each `onopen`'s `detachAllSessions()` drops every attached
-// device PTY every few seconds. See `supersede-backoff.ts`.
+// in ~1s forever and each reconnect drops browser attachment transports every
+// few seconds. See `supersede-backoff.ts`.
 const SUPERSEDE_BASE_MS = 15_000;
 const SUPERSEDE_MAX_MS = 300_000;
 // An eviction after this much uptime is a fresh conflict, not an escalation.
@@ -198,7 +191,6 @@ export const resetRelayScopedState = (): void => {
   // data channel do not ride the relay socket and survive reconnect.
   resetUnmountedRtcSessions();
   resetUnmountedRtcClientSessions();
-  detachAllSessions();
 };
 
 const enqueueStatusPublish = (
@@ -461,48 +453,6 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
   await commandTail;
 };
 
-/**
- * Handle a legacy JSON device-session frame. The preference gates NEW remote
- * opens only; existing PTYs keep their lifecycle when a device owner toggles
- * this preference off mid-session.
- */
-export const handleRemoteSessionFrame = (
-  frame: TRelayFrame,
-  sendFrame: (frame: TRelayFrame) => void,
-): boolean => {
-  if (!isSessionFrame(frame)) return false;
-  if (frame.type === "session_open" && !ptySessionsEnabled()) {
-    logInfo("session", "remote session open refused: sessions disabled", {
-      id: frame.session_id,
-    });
-    sendFrame({
-      type: "session_open_ack",
-      session_id: frame.session_id,
-      ok: false,
-      error: "sessions_disabled",
-    });
-    return true;
-  }
-  try {
-    handleSessionFrame(frame, sendFrame);
-  } catch (err) {
-    logWarn("control-channel", "session frame handler failed", {
-      type: frame.type,
-      sessionId: "session_id" in frame ? frame.session_id : undefined,
-      err: err instanceof Error ? err.message : String(err),
-    });
-    if (frame.type === "session_open") {
-      sendFrame({
-        type: "session_open_ack",
-        session_id: frame.session_id,
-        ok: false,
-        error: "spawn_failed",
-      });
-    }
-  }
-  return true;
-};
-
 const onFrame = (frame: TRelayFrame): void => {
   // Synchronous dispatch below (acceptChannel, handleChannelOpenAck,
   // updateMuxPeerCaps, …) must never throw through the WebSocket callback —
@@ -606,11 +556,9 @@ const dispatchFrame = (frame: TRelayFrame): void => {
         handleTunnelFrame(frame, send);
         return;
       }
-      // Device sessions (PTY host) — each session runs on its own async
-      // task, mirroring the tunnel server. Contain unexpected throws so a
-      // single bad open cannot escape the WebSocket callback unacked.
-      if (handleRemoteSessionFrame(frame, send)) return;
-      // others: nothing to do (partysocket owns reconnection)
+      // Session traffic is mux-only. The unpublished legacy JSON session_*
+      // frames intentionally have no fallback path after durable-host migration.
+      // Others: nothing to do (partysocket owns reconnection).
       return;
   }
 };
@@ -728,9 +676,6 @@ export const startControlChannel = (): void => {
   // walker→control-channel import (which would close an import cycle via
   // tunnel-server → listener → walker).
   registerTunnelSender(send);
-  setSessionActivityHook(() => {
-    void pushStatusIfChanged();
-  });
   configureMuxHost({ send, sendBytes });
   configureRtcHost({ send });
   configureRtcClient({ send });

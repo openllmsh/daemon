@@ -22,7 +22,6 @@
  */
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { guardCrashLoop } from "./boot-guard";
-import { brokerWebsocket, handleBrokerRequest } from "./broker-listener";
 import { runCli } from "./cli";
 import { maybeUpdateCli } from "./cli-self-update";
 import {
@@ -59,10 +58,7 @@ import {
   maybeSelfUpdate,
   trackBodyDone,
 } from "./self-update";
-import {
-  pollSessionActivity,
-  reconcileSessionHostsAtBoot,
-} from "./session-host";
+import { reconcileSessionHostsAtBoot } from "./session-host";
 import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -228,13 +224,6 @@ const main = async (): Promise<void> => {
 
   startControlChannel();
 
-  // Activity polling tracks detached process trees and reaps only sessions
-  // that remain unattached, output-quiet, and CPU-idle past their timeout.
-  const sessionActivityPoller = setInterval(() => {
-    void pollSessionActivity();
-  }, 15_000);
-  sessionActivityPoller.unref?.();
-
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.
   let shuttingDown = false;
@@ -262,11 +251,8 @@ const main = async (): Promise<void> => {
       // ~10s idle timeout would sever a stream between writes, so raise it to
       // Bun's max; the stream emits its own keep-alives well under it.
       idleTimeout: 255,
-      fetch: async (req: Request, server): Promise<Response | undefined> => {
+      fetch: async (req: Request): Promise<Response | undefined> => {
         const url = new URL(req.url);
-        const broker = await handleBrokerRequest(req, server);
-        if (broker === "upgraded") return undefined;
-        if (broker !== null) return broker;
         if (url.pathname.startsWith("/v1/")) {
           // Stamp every inference response as daemon-served — an
           // observability marker (you can always tell a response came from
@@ -363,10 +349,7 @@ const main = async (): Promise<void> => {
         });
       },
       websocket: {
-        ...brokerWebsocket,
-        // Broker terminals may be idle while a user reads output. Bun's
-        // websocket-specific timeout is otherwise 120 seconds; zero disables it.
-        idleTimeout: 0,
+        message: (): void => {},
       },
     });
   } catch (err) {
