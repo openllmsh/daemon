@@ -706,13 +706,18 @@ const syncConsumerView = (
     consumer.view = null;
     return;
   }
-  // Dispose any stale view, then build one at the consumer's size seeded with
-  // the shared emulator's current screen (xterm reflows the normal buffer on
-  // write; the alt buffer is clipped — a letterbox — which matches tmux).
+  // Dispose any stale view, then build one seeded with the shared emulator's
+  // current screen. Per @xterm/addon-serialize's guidance, write the snapshot
+  // into a view of the SAME size it originated from (the canonical size), then
+  // resize to the consumer's size so xterm reflows the normal buffer cleanly
+  // (the alt buffer is absolute-positioned, so it clips — a letterbox, matching
+  // tmux). Seeding at the consumer size directly would still reflow (the
+  // serialization is width-agnostic), but same-size-then-resize avoids any
+  // deserialization artifact at the seam.
   consumer.view?.dispose();
   const view = new Terminal({
-    cols: consumer.cols,
-    rows: consumer.rows,
+    cols: session.canonicalCols,
+    rows: session.canonicalRows,
     scrollback: EMULATOR_SCROLLBACK_ROWS,
     allowProposedApi: true,
   });
@@ -720,6 +725,7 @@ const syncConsumerView = (
   if (session.emulator !== null) {
     view.write(serializeScreenBytes(session.emulator));
   }
+  view.resize(consumer.cols, consumer.rows);
 };
 
 /** Serialize the best current screen for THIS consumer's size as its initial

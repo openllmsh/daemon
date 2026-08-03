@@ -20,6 +20,7 @@
     "@openllmsh/protocol": "workspace:*",
     "@openllmsh/tunnel": "workspace:*",
     "@openllmsh/wire": "workspace:*",
+    "@xterm/addon-serialize": "0.14.0",
     "@xterm/headless": "6.0.0",
     "effect": ">=3.20.0",
     "partysocket": "^1.1.19",
