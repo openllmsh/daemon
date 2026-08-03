@@ -135,6 +135,13 @@ import {
   clientWireOf,
 } from "@openllmsh/wire/providers/upstream-request";
 import { Schema } from "effect";
+import type { TCacheProbe } from "./cache-probe";
+import {
+  cacheProbeEnabled,
+  cacheProbeOutcome,
+  cacheProbePrefixHash,
+  cacheProbeWrap,
+} from "./cache-probe";
 import {
   deliverChunkStream,
   deliverJsonResponse,
@@ -991,17 +998,39 @@ const serveSubscription = async (
     );
   }
   const transport = { failure: null as TTransportFailure | null };
-  const resp = await postWithDecryptRetry(
-    url,
-    headers,
-    body,
-    wire,
-    finalHop,
-    args.req.signal,
-    (failure) => {
-      transport.failure = failure;
-    },
-  );
+  // §4.1 cache-race probe (opt-in): only the Anthropic wire races a prompt
+  // cache prefix; other wires have no cache-write concept to correlate.
+  const cacheProbe: TCacheProbe | null =
+    cacheProbeEnabled() && wire === "anthropic"
+      ? (() => {
+          const prefixHash = cacheProbePrefixHash(body);
+          return prefixHash === null
+            ? null
+            : {
+                prefixHash,
+                model: hop.modelId,
+                providerModelId: hop.providerModelId,
+                accountHash,
+                lastInFlight: 0,
+              };
+        })()
+      : null;
+  const dispatch = (): Promise<Response | null> =>
+    postWithDecryptRetry(
+      url,
+      headers,
+      body,
+      wire,
+      finalHop,
+      args.req.signal,
+      (failure) => {
+        transport.failure = failure;
+      },
+    );
+  const resp =
+    cacheProbe !== null
+      ? await cacheProbeWrap(cacheProbe, dispatch)
+      : await dispatch();
   if (resp === null) {
     // An inbound cancellation aborts the fetch by design. It is terminal but
     // not an upstream failure, so it must neither walk nor write a cooldown row.
@@ -1095,8 +1124,10 @@ const serveSubscription = async (
     ...(accountHash !== null ? { account_hash: accountHash } : {}),
   } satisfies Partial<TDaemonRecordRequest>;
   const elapsed = (): number => Date.now() - args.startedAt;
-  const recordTokens = (u: TNativeTokens): void =>
+  const recordTokens = (u: TNativeTokens): void => {
+    if (cacheProbe !== null) cacheProbeOutcome(cacheProbe, u);
     report({ ...baseRow, latency_ms: elapsed(), ...u }, args.originParam);
+  };
   /**
    * A committed stream that died mid-flight. The hop returned 200, so
    * `baseRow.status` is "success" — it MUST be overridden here, else a severed
