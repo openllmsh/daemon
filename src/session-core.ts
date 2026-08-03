@@ -53,6 +53,10 @@ const EMULATOR_SCROLLBACK_ROWS = 5000;
  *  viewers fight over the PTY size within a few frames of each other. */
 const PRIMARY_REELECT_DEBOUNCE_MS = 250;
 
+/** Coalescing window for the manual SIGWINCH fan-out. A drag-resize emits many
+ *  resize CTRLs per second; the child only needs the final geometry. */
+const WINCH_DEBOUNCE_MS = 40;
+
 /** Detached idle timeout. Zero deliberately restores never-reap behavior. */
 const DEFAULT_SESSION_IDLE_TIMEOUT_MIN = 60;
 
@@ -798,6 +802,97 @@ const electPrimary = (
   return winner;
 };
 
+/**
+ * Collect a pid and every descendant of it from one `ps` snapshot. Returns an
+ * EMPTY set when the root is not present in the snapshot, so a stale pid can
+ * never be mistaken for a live process and signalled.
+ */
+const processTree = (rootPid: number): ReadonlySet<number> => {
+  const proc = Bun.spawnSync(["ps", "-Ao", "pid=,ppid="], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (proc.exitCode !== 0) return new Set();
+  const children = new Map<number, number[]>();
+  let rootSeen = false;
+  for (const line of proc.stdout.toString().split("\n")) {
+    const [pidText, parentText] = line.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const ppid = Number(parentText);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+    if (pid === rootPid) rootSeen = true;
+    const siblings = children.get(ppid);
+    if (siblings === undefined) children.set(ppid, [pid]);
+    else siblings.push(pid);
+  }
+  if (!rootSeen) return new Set();
+  const tree = new Set<number>([rootPid]);
+  const queue = [rootPid];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined) continue;
+    for (const child of children.get(current) ?? []) {
+      // A pid cannot be its own ancestor, so `tree` also bounds the walk.
+      if (tree.has(child)) continue;
+      tree.add(child);
+      queue.push(child);
+    }
+  }
+  return tree;
+};
+
+/**
+ * Deliver SIGWINCH to a session's whole process tree after a PTY resize.
+ *
+ * `Bun.spawn({ terminal })` does NOT make the PTY slave the child's CONTROLLING
+ * terminal (`ps` reports `TTY ??`, `SESS 0`), so the kernel's TIOCSWINSZ-driven
+ * SIGWINCH — which targets the tty's foreground process group — reaches nobody.
+ * `pty.resize()` updates the winsize correctly, but a TUI that only re-measures
+ * on SIGWINCH (Ink/Claude Code, codex, …) keeps rendering at its BIRTH size,
+ * which is the mid-session "crumbled output" symptom. So we signal it ourselves.
+ *
+ * The whole TREE, not just the root: the PTY runs `openllm <cli>`, which spawns
+ * the vendor CLI as a GRANDCHILD with inherited stdio. And a pid-by-pid walk,
+ * not `kill(-pid)`: the child inherits the host's process group, so a negative
+ * pid would signal the daemon itself.
+ */
+const deliverWinch = (session: TSession): void => {
+  const rootPid = session.pid;
+  if (rootPid === null || session.pty === null) return;
+  for (const pid of processTree(rootPid)) {
+    try {
+      process.kill(pid, "SIGWINCH");
+    } catch {
+      // Raced exit — the remaining tree still gets the signal.
+    }
+  }
+};
+
+/** Pending debounced SIGWINCH fan-outs, keyed by session id. */
+const winchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+const cancelWinch = (id: string): void => {
+  const timer = winchTimers.get(id);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  winchTimers.delete(id);
+};
+
+/** Queue a coalesced SIGWINCH fan-out for this session. Only the real Bun PTY
+ *  spawner needs it — an injected test spawner owns no OS process tree, and
+ *  signalling its synthetic pids could hit unrelated processes. */
+const scheduleWinch = (session: TSession): void => {
+  if (spawner !== bunPtySpawner || !ptySupported()) return;
+  if (session.pid === null || winchTimers.has(session.id)) return;
+  const timer = setTimeout(() => {
+    winchTimers.delete(session.id);
+    const current = sessions.get(session.id);
+    if (current !== undefined) deliverWinch(current);
+  }, WINCH_DEBOUNCE_MS);
+  timer.unref?.();
+  winchTimers.set(session.id, timer);
+};
+
 /** Resize the canonical PTY + shared emulator to the given size and re-sync
  *  every consumer's view against the new canonical size. */
 const applyCanonicalResize = (
@@ -808,6 +903,8 @@ const applyCanonicalResize = (
   session.canonicalCols = cols;
   session.canonicalRows = rows;
   session.pty?.resize(cols, rows);
+  // The winsize ioctl alone does not wake the child — see deliverWinch.
+  if (session.pty !== null) scheduleWinch(session);
   session.emulator?.resize(cols, rows);
   for (const consumer of session.consumers) syncConsumerView(session, consumer);
 };
@@ -884,6 +981,7 @@ const endPty = (
   kill = true,
 ): void => {
   s.lastExitReason = reason;
+  cancelWinch(s.id);
   if (kill) s.pty?.kill();
   s.pty = null;
   s.pid = null;
@@ -932,6 +1030,7 @@ export const killSession = (id: string): boolean => {
 /** Kill all local PTYs and close their transport-neutral consumers. */
 export const killAllSessions = (): void => {
   for (const session of sessions.values()) {
+    cancelWinch(session.id);
     if (session.pty !== null) {
       try {
         session.pty.kill();
@@ -1505,6 +1604,7 @@ export const bindSessionStream = (
 /** Test-only: reset all session state. */
 export const resetSessionsForTest = (): void => {
   for (const s of sessions.values()) {
+    cancelWinch(s.id);
     s.pty?.kill();
     lifecycleHooks.onEnd(s);
   }
