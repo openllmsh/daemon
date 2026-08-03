@@ -64,28 +64,42 @@ export const cacheProbePrefixHash = (body: unknown): string | null => {
   return createHash("sha256").update(serialised).digest("hex").slice(0, 16);
 };
 
-/** In-flight registry: prefixHash → count of requests awaiting upstream. */
+/** In-flight registry: scope key → count of requests awaiting upstream.
+ *  Anthropic's prompt cache is per-ACCOUNT and per-MODEL, so a bare
+ *  `prefixHash` key would report phantom races between requests that can
+ *  never share a cache entry (same prefix bytes, different account or
+ *  model). The key is a composite of providerModelId + accountHash +
+ *  prefixHash; it never leaves the process — the LOGGED fields stay the
+ *  human-readable model / prefix_hash / account_hash. */
 const cacheProbeInFlight = new Map<string, number>();
 
-/** Register a dispatch; returns the count of same-prefix requests already in
+/** The in-flight scope key: upstream model + account + prefix. */
+const cacheProbeKey = (probe: TCacheProbe): string =>
+  `${probe.providerModelId} ${probe.accountHash ?? ""} ${probe.prefixHash}`;
+
+/** Register a dispatch; returns the count of same-scope requests already in
  *  flight when this one left (the race signal). */
-const cacheProbeAcquire = (prefixHash: string): number => {
-  const current = cacheProbeInFlight.get(prefixHash) ?? 0;
-  cacheProbeInFlight.set(prefixHash, current + 1);
+const cacheProbeAcquire = (key: string): number => {
+  const current = cacheProbeInFlight.get(key) ?? 0;
+  cacheProbeInFlight.set(key, current + 1);
   return current;
 };
 
 /** Deregister once a request settles (success, error, or abort). */
-const cacheProbeRelease = (prefixHash: string): void => {
-  const current = cacheProbeInFlight.get(prefixHash) ?? 0;
-  if (current <= 1) cacheProbeInFlight.delete(prefixHash);
-  else cacheProbeInFlight.set(prefixHash, current - 1);
+const cacheProbeRelease = (key: string): void => {
+  const current = cacheProbeInFlight.get(key) ?? 0;
+  if (current <= 1) cacheProbeInFlight.delete(key);
+  else cacheProbeInFlight.set(key, current - 1);
 };
 
 /** Mutable probe handle threaded from dispatch to the outcome logger. */
 export type TCacheProbe = {
   readonly prefixHash: string;
   readonly model: string;
+  /** Concrete upstream model id — part of the in-flight scope key only (the
+   *  vendor cache is per-model); NOT logged (the log keeps the plan
+   *  `model`). */
+  readonly providerModelId: string;
   readonly accountHash: string | null;
   /** Set at dispatch: same-prefix twins in flight. */
   lastInFlight: number;
@@ -102,7 +116,8 @@ export const cacheProbeWrap = async <T>(
   probe: TCacheProbe,
   send: () => Promise<T>,
 ): Promise<T> => {
-  const inFlight = cacheProbeAcquire(probe.prefixHash);
+  const key = cacheProbeKey(probe);
+  const inFlight = cacheProbeAcquire(key);
   // Stash the dispatch-time race count for the caller to attach to its outcome.
   probe.lastInFlight = inFlight;
   logInfo("cache-probe", "dispatch", {
@@ -114,7 +129,7 @@ export const cacheProbeWrap = async <T>(
   try {
     return await send();
   } finally {
-    cacheProbeRelease(probe.prefixHash);
+    cacheProbeRelease(key);
   }
 };
 

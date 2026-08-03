@@ -1005,6 +1005,7 @@ const serveSubscription = async (
             : {
                 prefixHash,
                 model: hop.modelId,
+                providerModelId: hop.providerModelId,
                 accountHash,
                 lastInFlight: 0,
               };
