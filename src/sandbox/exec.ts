@@ -21,6 +21,7 @@
  * per-spawn (stderr + `logWarn` in `runSandboxExec`) on top of the boot-time
  * capability posture (`probeSandboxCapability`).
  */
+import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
@@ -106,10 +107,38 @@ export const sandboxSpawnArgs = (
     // must go through `bun <entry>` since execPath is the bun runtime.
     if (process.env.OPENLLM_DAEMON_SANDBOX !== "1") return [...argv];
     if (DEV_ENTRY === undefined) return [...argv];
-    return [process.execPath, DEV_ENTRY, "--sandbox-exec", "--", ...argv];
+    return [
+      process.execPath,
+      DEV_ENTRY,
+      "--sandbox-exec",
+      ...HOME_FLAG(),
+      "--",
+      ...argv,
+    ];
   }
-  return [process.execPath, "--sandbox-exec", "--", ...argv];
+  return [process.execPath, "--sandbox-exec", ...HOME_FLAG(), "--", ...argv];
 };
+
+/**
+ * `--home <realHome>` — the DAEMON's real home, pinned into the shim's argv.
+ *
+ * Load-bearing: most call sites spawn the shim with the CHILD's env, which
+ * points `HOME` at the isolated CLI home (`cli-paths.ts` `cliEnv`). The shim
+ * would then build its working set against THAT home — `stateDir()` resolves to
+ * a nonexistent `<isolated>/.openllm` (so the real state dir is never granted)
+ * and Seatbelt's deny-`$HOME`-by-default read rule lands on the isolated home
+ * itself, EPERM-ing the very credential stores the child was spawned to read
+ * (`~/.openllm/cli/<p>/home/.codex`, `.kimi-code`, `.grok/auth.json`). The
+ * daemon process IS unconfined and has the real `HOME`, so it captures the
+ * value at wrap time and the shim threads it into the working set — the tail
+ * still runs with the isolated `HOME` it was given.
+ *
+ * It must travel in ARGV, not the env: the child owns `HOME` in the shared env,
+ * and re-setting `process.env.HOME` inside the shim would not help anyway —
+ * Bun caches `os.homedir()` on its first call, which module-load code has
+ * already made.
+ */
+const HOME_FLAG = (): string[] => ["--home", homedir()];
 
 /**
  * The `--sandbox-exec` verb: apply the working-set sandbox to this process
@@ -122,8 +151,15 @@ export const sandboxSpawnArgs = (
  */
 export const runSandboxExec = async (
   tail: readonly string[],
+  opts?: { readonly home?: string },
 ): Promise<never> => {
-  const state = await applyDaemonSandbox({ force: true });
+  // Build the working set from the DAEMON's home (see `HOME_FLAG`), NOT this
+  // process's `HOME` — the shim inherits the child's isolated one. The tail's
+  // env is untouched, so the child still gets its isolated `HOME`.
+  const state = await applyDaemonSandbox({
+    force: true,
+    ...(opts?.home !== undefined ? { home: opts.home } : {}),
+  });
   if (state === "error" || state === "unsupported") {
     // Loud on BOTH channels: stderr for the immediate caller, and the shared
     // daemon log so per-spawn degradation is visible next to the boot-time

@@ -267,8 +267,8 @@ export const resolveCliExecDirs = (seed: string, home: string): string[] => {
  * missing (mode 0o700). Returns the path even if creation fails — callers
  * can handle the failure as needed.
  */
-export const daemonTempDir = (): string => {
-  const daemonTmp = join(stateDir(), "tmp");
+export const daemonTempDir = (home?: string): string => {
+  const daemonTmp = join(stateDir(home), "tmp");
   try {
     mkdirSync(daemonTmp, { recursive: true, mode: 0o700 });
   } catch {
@@ -282,15 +282,25 @@ export const daemonTempDir = (): string => {
  * The daemon's base working set (no user grants — the §3.4 consent flow
  * unions persisted grants in here when it lands). Resolved at call time so
  * `OPENLLM_DAEMON_STATE_DIR` overrides are honoured.
+ *
+ * `homeOverride` supplies the DAEMON's home explicitly instead of reading
+ * `homedir()`. Load-bearing for the `--sandbox-exec` shim: it is spawned with
+ * the CHILD's env, whose `HOME` points at an isolated CLI home
+ * (`cli-paths.ts` `cliEnv`). Without the override the shim builds the working
+ * set around THAT home — the real state dir is never granted and Seatbelt's
+ * deny-`$HOME` read default lands on the isolated home itself, EPERM-ing the
+ * very credential store the child was spawned to read. (Passing `HOME` through
+ * the env instead does NOT work: Bun caches `os.homedir()` on first call, and
+ * module-load code has already called it by then.)
  */
-export const daemonWorkingSet = (): TWorkingSet => {
-  const home = homedir();
-  const state = stateDir();
+export const daemonWorkingSet = (homeOverride?: string): TWorkingSet => {
+  const home = homeOverride ?? homedir();
+  const state = stateDir(homeOverride);
   // Daemon-owned temp directory under the state dir. The unit hardening no
   // longer sets PrivateTmp (removed due to --user unit compatibility issues),
   // so granting global /tmp would leak access to every other process's temp
   // files. Instead we create and use our own isolated temp under stateDir.
-  const daemonTmp = daemonTempDir();
+  const daemonTmp = daemonTempDir(homeOverride);
   // Pre-create the vendor-CLI dirs the daemon EXECS through. REQUIRED on
   // Linux: Landlock can only grant an EXISTING path (`existing()` drops a
   // missing leaf rather than widening the grant to bare $HOME), so a fresh box

@@ -159,9 +159,14 @@ const DEV_CLOUD_ORIGIN = "http://127.0.0.1:3000";
  * Root for the daemon's local state (`.env`, the isolated vendor CLIs
  * under `cli/<provider>/`, …). Defaults to `~/.openllm`; override with
  * `OPENLLM_DAEMON_STATE_DIR`. Exported so cli-paths.ts nests under it.
+ *
+ * `home` overrides the base for the `homedir()` default — needed ONLY by the
+ * `--sandbox-exec` shim, which runs with the CHILD's `HOME` (an isolated CLI
+ * home) and must still resolve the DAEMON's state dir. See
+ * `sandbox/exec.ts` `HOME_FLAG`.
  */
-export const stateDir = (): string =>
-  process.env.OPENLLM_DAEMON_STATE_DIR ?? join(homedir(), ".openllm");
+export const stateDir = (home?: string): string =>
+  process.env.OPENLLM_DAEMON_STATE_DIR ?? join(home ?? homedir(), ".openllm");
 
 /**
  * The SHARED OpenLLM env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the

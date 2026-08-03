@@ -140,8 +140,8 @@ export const homeAncestorPaths = (
  * a denial is a graceful `EPERM`. SBPL is last-match-wins, so the trailing
  * credential-file deny overrides the broader working-set allow above it.
  */
-const buildProfile = (home: string): string => {
-  const ws = daemonWorkingSet();
+const buildProfile = (home: string, homeOverride?: string): string => {
+  const ws = daemonWorkingSet(homeOverride);
   const writeAllow = [...ws.readWrite, ...macRuntimeWrite(home)]
     .map((p) => `  (subpath "${esc(p)}")`)
     .join("\n");
@@ -213,10 +213,10 @@ let cachedState: TSandboxState | null = null;
  * Apply the Seatbelt profile to THIS process (and, by inheritance, every child
  * it spawns). Idempotent. Never throws; returns + caches the resulting posture.
  */
-export const applySeatbelt = (): TSandboxState => {
+export const applySeatbelt = (homeOverride?: string): TSandboxState => {
   if (cachedState !== null) return cachedState;
   try {
-    const profile = `${buildProfile(homedir())}\0`;
+    const profile = `${buildProfile(homeOverride ?? homedir(), homeOverride)}\0`;
     const profileBuf = new TextEncoder().encode(profile);
     const lib = dlopen("/usr/lib/libsandbox.1.dylib", {
       sandbox_init: {
@@ -254,7 +254,7 @@ export const applySeatbelt = (): TSandboxState => {
     // shim (the daemon process itself is unconfined), so at info it floods the
     // shared log with one line per wrapped child spawn.
     logDebug("sandbox", "seatbelt enforced", {
-      allowWrite: daemonWorkingSet().readWrite.length,
+      allowWrite: daemonWorkingSet(homeOverride).readWrite.length,
     });
     cachedState = "enforced";
     return cachedState;

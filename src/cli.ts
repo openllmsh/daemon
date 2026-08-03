@@ -141,15 +141,25 @@ export const runCli = (): boolean => {
       process.stderr.write("--sandbox-exec: missing command\n");
       process.exit(2);
     }
+    // `--home <realHome>` (shim flags live BEFORE the `--`): the daemon's real
+    // home, used ONLY to build the working set — most call sites spawn the shim
+    // with the child's isolated `HOME`. See `sandbox/exec.ts` `HOME_FLAG`.
+    const homeFlag = args.indexOf("--home");
+    const home =
+      homeFlag >= 0 && (sep < 0 || homeFlag < sep)
+        ? args[homeFlag + 1]
+        : undefined;
     // apply + spawn + mirror exit. `runSandboxExec` never resolves; guard a
     // REJECTION (an unexpected throw before the exit mirror) so it can't
     // become an unhandled rejection / silent success.
-    runSandboxExec(tail).catch((err: unknown) => {
-      process.stderr.write(
-        `--sandbox-exec: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-      process.exit(1);
-    });
+    runSandboxExec(tail, home !== undefined ? { home } : undefined).catch(
+      (err: unknown) => {
+        process.stderr.write(
+          `--sandbox-exec: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exit(1);
+      },
+    );
     return true;
   }
 

@@ -275,6 +275,10 @@ export type TApplySandboxOpts = {
    *  which is invoked deliberately). The `OPENLLM_DAEMON_NO_SANDBOX=1` kill
    *  switch still wins. */
   readonly force?: boolean;
+  /** The DAEMON's home, when this process's `HOME` is NOT it — the
+   *  `--sandbox-exec` shim runs with the CHILD's isolated `HOME`. Threaded
+   *  into the working set; see `sandbox/exec.ts` `HOME_FLAG`. */
+  readonly home?: string;
 };
 
 /**
@@ -319,7 +323,7 @@ const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
     // counterpart to Landlock, applied via `sandbox_init` (no signing needed).
     // The App Sandbox (proposal §3.2 / Phase C) remains the future upgrade.
     const { applySeatbelt } = await import("./seatbelt");
-    return applySeatbelt();
+    return applySeatbelt(opts?.home);
   }
   if (process.platform !== "linux") {
     return "unsupported";
@@ -361,7 +365,7 @@ const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
 
     const readOnlyAccess =
       ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR;
-    const ws = daemonWorkingSet();
+    const ws = daemonWorkingSet(opts?.home);
     const addRules = (paths: readonly string[], allowed: bigint): void => {
       for (const path of paths) {
         const fd = libc.open(cstr(path), O_PATH | O_CLOEXEC);
