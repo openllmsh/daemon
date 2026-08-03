@@ -229,6 +229,15 @@ export const handleRtcOffer = async (frame: {
 }): Promise<void> => {
   const send = sendFrame;
   if (send === null) return;
+  // `rtc1` withdrawn (see `mux-host.ts`): refuse before building a peer
+  // connection, so a browser holding a stale capability snapshot cannot make
+  // this host gather ICE anyway. Silent, like every other reject here.
+  if (process.env.OPENLLM_RTC_DISABLE === "1") {
+    logWarn("rtc-host", "rtc_offer refused: rtc disabled", {
+      channelId: frame.channel_id,
+    });
+    return;
+  }
   if (sessions.has(frame.channel_id)) {
     logWarn("rtc-host", "duplicate rtc_offer", {
       channelId: frame.channel_id,

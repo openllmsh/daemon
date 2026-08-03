@@ -353,6 +353,22 @@ Path ladder on the consumer side: **RTC (when open) → relay binary mux (`mux1`
   with ts window + nonce map; browser-only enforcement (daemon fleet hops
   skip grant). Locked-vault consumers fail closed before probing transports.
 
+**Kill-switches.** `OPENLLM_MUX_DISABLE=1` withdraws the mux transport
+wholesale — including the terminal sessions that ride it. `OPENLLM_RTC_DISABLE=1`
+withdraws only `rtc1`, so the browser never offers, no ICE agent is built, no
+UDP leaves the host, and everything still works over relay mux one hop slower.
+Reach for the latter on a network where the peer-to-peer path is a liability.
+
+**A remote peer's socket is never fatal.** An ICE agent probes the browser's
+candidates over UDP; an unreachable one is answered with ICMP port-unreachable,
+which Linux reports as `ECONNREFUSED` on the next receive. `werift` attaches no
+`"error"` listener to that socket, so it surfaces as an uncaughtException — and
+the daemon used to exit on any of those, turning one dead candidate into a
+permanent crash loop (and a remote DoS: anything that makes the daemon send a
+datagram to a closed port took it down). `crash-policy.ts` classifies a closed
+set of transport errnos as survivable; every other uncaught throw still exits
+for the supervisor to restart clean.
+
 ### Durable device-session host
 
 A local session is a detached `openllmd __session-host` sibling process, not a

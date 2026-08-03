@@ -36,6 +36,7 @@ import {
   stopControlChannel,
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
+import { isTransientNetworkError } from "./crash-policy";
 import { refreshCliState } from "./device-state";
 import {
   daemonEnv,
@@ -122,6 +123,13 @@ const main = async (): Promise<void> => {
   // launch agent / systemd unit restart it clean. `logError` writes
   // synchronously (appendFileSync), so the line is flushed before exit.
   process.on("uncaughtException", (err) => {
+    // A remote peer's dead socket is not this process's problem — see
+    // `crash-policy.ts`. Exiting over one turned an unreachable WebRTC ICE
+    // candidate into a permanent crash loop.
+    if (isTransientNetworkError(err)) {
+      logError("transientNetworkError", err);
+      return;
+    }
     logError("uncaughtException", err);
     // Durable local session hosts are detached sibling processes. A daemon
     // fatal exit must never terminate their vendor PTYs; attached browser
@@ -129,6 +137,10 @@ const main = async (): Promise<void> => {
     process.exit(1);
   });
   process.on("unhandledRejection", (reason) => {
+    if (isTransientNetworkError(reason)) {
+      logError("transientNetworkError", reason);
+      return;
+    }
     logError("unhandledRejection", reason);
     // See uncaughtException: session-host processes own their own lifecycle.
     process.exit(1);

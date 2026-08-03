@@ -26,9 +26,26 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
  */
 export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP] as const;
 
+/**
+ * `OPENLLM_RTC_DISABLE=1` withdraws `rtc1` only.
+ *
+ * The escape hatch for a host where the peer-to-peer path is a liability: on a
+ * network that answers unreachable ICE candidates with ICMP, WebRTC produced a
+ * stream of socket errors with nothing to show for it. Withdrawing the
+ * capability means the browser never offers, so no ICE agent is built and no
+ * UDP is sent — and everything still works over relay mux, one hop slower.
+ *
+ * Deliberately separate from `OPENLLM_MUX_DISABLE`, which withdraws the mux
+ * transport wholesale and takes terminal sessions down with it. That was the
+ * only lever available the first time this was needed, and it was too blunt.
+ */
+const rtcDisabled = (): boolean => process.env.OPENLLM_RTC_DISABLE === "1";
+
 /** Live capability list — includes `seedgate1` when device access is provisioned. */
 export const currentDaemonCaps = (): string[] => {
-  const caps: string[] = [...DAEMON_MUX_CAPS];
+  const caps: string[] = DAEMON_MUX_CAPS.filter(
+    (cap) => cap !== RTC_CAP || !rtcDisabled(),
+  );
   if (getDeviceAccessPubkey() !== null) caps.push(SEEDGATE_CAP);
   return caps;
 };
