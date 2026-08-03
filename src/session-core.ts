@@ -171,6 +171,11 @@ type TAttachedConsumer = {
   viewDirty: boolean;
   /** Last time this consumer produced input / focus — drives primary election. */
   lastActiveAtMs: number;
+  /** Whether {@link cols}/{@link rows} came from an explicit resize CTRL (a
+   *  genuine announced viewport) rather than the attach-time seed. A keystroke
+   *  from a consumer that never resized must not drive the canonical PTY to its
+   *  possibly-stale attach dims (see the onData re-election). */
+  dimsFromResize: boolean;
 };
 
 export type TSession = {
@@ -759,6 +764,7 @@ const electPrimary = (
   session: TSession,
   now: number,
   force: boolean,
+  preferredConsumer: TAttachedConsumer | null = null,
 ): TAttachedConsumer | null => {
   if (
     !force &&
@@ -769,9 +775,19 @@ const electPrimary = (
     return session.primaryConsumer;
   }
   let winner: TAttachedConsumer | null = null;
-  for (const consumer of session.consumers) {
-    if (winner === null || consumer.lastActiveAtMs > winner.lastActiveAtMs)
-      winner = consumer;
+  if (
+    force &&
+    preferredConsumer !== null &&
+    session.consumers.has(preferredConsumer)
+  ) {
+    winner = preferredConsumer;
+  }
+  if (winner === null) {
+    for (const consumer of session.consumers) {
+      if (winner === null || consumer.lastActiveAtMs > winner.lastActiveAtMs) {
+        winner = consumer;
+      }
+    }
   }
   if (winner !== null && winner !== session.primaryConsumer) {
     session.primaryConsumer = winner;
@@ -807,14 +823,17 @@ const handleConsumerResize = (
   cols: number,
   rows: number,
   now: number,
+  forcePrimary = false,
 ): void => {
   consumer.cols = cols;
   consumer.rows = rows;
   const primary = electPrimary(
     session,
     now,
-    session.primaryConsumer === null ||
+    forcePrimary ||
+      session.primaryConsumer === null ||
       !session.consumers.has(session.primaryConsumer),
+    forcePrimary ? consumer : null,
   );
   if (primary === consumer) {
     // This consumer drives the PTY. Its own size becomes canonical; consumers
@@ -1317,6 +1336,7 @@ export const bindSessionStream = (
     view: null,
     viewDirty: false,
     lastActiveAtMs: Date.now(),
+    dimsFromResize: false,
   };
   const registerConsumer = (session: TSession): void => {
     if (session.consumers.has(consumer)) return;
@@ -1397,6 +1417,38 @@ export const bindSessionStream = (
       // Typing marks this consumer active — the input driver becomes the
       // most-recently-active viewer and thus the PTY-size primary.
       consumer.lastActiveAtMs = Date.now();
+      // Typing reclaims PTY-size primacy so the actively-driven terminal owns
+      // the canonical size — a background viewer's stale resize/focus no longer
+      // pins it. Idempotent when already primary (skip) or when size already
+      // matches canonical (handleConsumerResize's cheap path); debounce still
+      // guards SIGWINCH bursts.
+      if (session.primaryConsumer !== consumer) {
+        // Re-elect primary on typing, but NEVER shrink the canonical PTY with a
+        // keystroke driven by possibly-stale attach dims. A keystroke is not a
+        // viewport announcement, so a background viewer that only ever announced
+        // a small attach seed must not pull the actively-driven terminal down to
+        // its size. Apply the resize only when this consumer's dims are a
+        // genuine viewport change: unchanged → just claim primacy (debounced);
+        // a grow → safe to drive; a shrink → only when an explicit resize CTRL
+        // set these dims (dimsFromResize).
+        const differs =
+          consumer.cols !== session.canonicalCols ||
+          consumer.rows !== session.canonicalRows;
+        const shrinks =
+          consumer.cols < session.canonicalCols ||
+          consumer.rows < session.canonicalRows;
+        if (differs && (!shrinks || consumer.dimsFromResize)) {
+          handleConsumerResize(
+            session,
+            consumer,
+            consumer.cols,
+            consumer.rows,
+            consumer.lastActiveAtMs,
+          );
+        } else {
+          electPrimary(session, consumer.lastActiveAtMs, false);
+        }
+      }
       session.pty?.write(bytes);
     }),
     stream.onCtrl((payload) => {
@@ -1407,12 +1459,16 @@ export const bindSessionStream = (
         // drive. Route through the primary-aware policy (last-attacher-wins is
         // gone): only the primary yanks the PTY size.
         consumer.lastActiveAtMs = Date.now();
+        // An explicit resize is a genuine announced viewport — from now on a
+        // keystroke from this consumer may drive the canonical PTY size.
+        consumer.dimsFromResize = true;
         handleConsumerResize(
           session,
           consumer,
           ctrl.cols,
           ctrl.rows,
           consumer.lastActiveAtMs,
+          true,
         );
       }
       if (ctrl?.t === "focus") {
