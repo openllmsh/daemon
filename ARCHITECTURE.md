@@ -361,8 +361,34 @@ and the 15-second idle-reap poll. Its private registry is
 `~/.openllm/sessions/<id>/`: `meta.json` records the host pid and session
 metadata; `ctl.sock` carries the existing open/ctrl/reset/exit Unix-WebSocket
 attach envelope. An attach adds a consumer, fans output to independent ordered
-write tails, merges input, and uses last-attacher-wins resize. A lagging consumer
-is removed without affecting the PTY or other consumers.
+write tails, and merges input. A lagging consumer is removed without affecting
+the PTY or other consumers.
+
+**Sizing: the PTY fits whoever focused last.** The PTY has one size, so with
+several viewers attached one of them — the PRIMARY — decides it, and its
+viewport IS the canonical size. Primacy moves on exactly two signals: a `focus`
+claim and an explicit `resize`. Both are deliberate acts on a specific viewer.
+
+Input deliberately moves nothing. It used to: the input path re-ran an election
+on every keystroke, hedged with a shrink rule, a "did these dims come from a
+real resize" flag, and a debounce window. With two viewers attached that
+alternated the canonical size as the user typed — re-sizing the PTY and
+re-serializing the other viewer mid-keystroke. Every guard was an attempt to
+tame a signal that should not have been driving size at all.
+
+The primary is on the raw byte-identical fast path (its size already matches the
+PTY). Every other viewer keeps a private `@xterm/headless` emulator at its own
+size and is repainted from the shared screen — reflowed for the normal buffer,
+letterboxed for the alt buffer, which cannot be reflowed by any mux. Those
+repaints are full-screen serializes wrapped in synchronized output (DEC 2026),
+emitted only when there is genuinely new output, and only once the emulator has
+PARSED it (`xterm` writes are asynchronous — serializing earlier paints the
+screen as it was before the chunk).
+
+A terminal has no focus events to forward, so the local attach client claims
+focus on its first keystroke after a ≥1s lull; that is what lets a terminal
+sharing a session with a browser pane take the size back. When the primary
+detaches, the most recently focused survivor inherits it.
 
 The host, rather than the daemon, reaps an unattached session after both output
 and process-tree CPU have been idle for `OPENLLM_SESSION_IDLE_TIMEOUT_MIN`

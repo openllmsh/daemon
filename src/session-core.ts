@@ -49,9 +49,17 @@ const REAP_KILL_GRACE_MS = 10_000;
 /** Shared emulator scrollback (rows). The durable screen for attach replay. */
 const EMULATOR_SCROLLBACK_ROWS = 5000;
 
-/** Debounce window for primary re-election — avoids SIGWINCH storms when two
- *  viewers fight over the PTY size within a few frames of each other. */
-const PRIMARY_REELECT_DEBOUNCE_MS = 250;
+// The PTY has ONE size, so with several viewers attached one of them has to
+// decide it. That is the PRIMARY, and primacy moves on exactly two signals:
+// a `focus` claim, and an explicit `resize`. Both are deliberate acts on a
+// specific viewer.
+//
+// Typing deliberately does NOT move it. It used to — the input path re-ran
+// election on every keystroke, guarded by a shrink rule, a "did these dims come
+// from a real resize" flag, and a debounce window. Between two attached viewers
+// that alternated the canonical size as you typed, so the PTY was re-sized and
+// the passive viewer re-serialized mid-keystroke. The guards were all attempts
+// to tame a signal that should not have been driving size in the first place.
 
 /** Coalescing window for the manual SIGWINCH fan-out. A drag-resize emits many
  *  resize CTRLs per second; the child only needs the final geometry. */
@@ -173,13 +181,9 @@ type TAttachedConsumer = {
   /** Whether a per-consumer serialize is already queued on a microtask —
    *  coalesces bursts of chunks into ONE screen serialize (see fanOut). */
   viewDirty: boolean;
-  /** Last time this consumer produced input / focus — drives primary election. */
+  /** When this consumer last focused or resized. Only used to pick a successor
+   *  when the primary leaves — the most recently focused viewer takes over. */
   lastActiveAtMs: number;
-  /** Whether {@link cols}/{@link rows} came from an explicit resize CTRL (a
-   *  genuine announced viewport) rather than the attach-time seed. A keystroke
-   *  from a consumer that never resized must not drive the canonical PTY to its
-   *  possibly-stale attach dims (see the onData re-election). */
-  dimsFromResize: boolean;
 };
 
 export type TSession = {
@@ -199,10 +203,9 @@ export type TSession = {
    *  shared emulator size. */
   canonicalCols: number;
   canonicalRows: number;
-  /** The consumer currently driving the PTY size (most-recently-active). */
+  /** The consumer driving the PTY size: whichever viewer focused or resized
+   *  most recently. Input never changes this. */
   primaryConsumer: TAttachedConsumer | null;
-  /** Timestamp of the last primary (re-)election for debounce. */
-  lastPrimaryElectionAtMs: number;
   /** Every active mux or broker consumer. */
   consumers: Set<TAttachedConsumer>;
   outSeq: number;
@@ -603,9 +606,12 @@ const detachConsumer = (
   consumer.view?.dispose();
   consumer.view = null;
   consumer.viewDirty = false;
-  // A departing primary hands the crown back; the next resize/input re-elects.
-  if (session.primaryConsumer === consumer) session.primaryConsumer = null;
   for (const unsubscribe of consumer.unsubscribe) unsubscribe();
+  // A departing primary hands the PTY size to the most recently focused
+  // survivor. Leaving it vacant would strand the remaining viewers rendering
+  // at a size nobody is looking at any more — and since input no longer
+  // re-elects, nothing else would ever reclaim it.
+  if (session.primaryConsumer === consumer) promoteSuccessorPrimary(session);
   if (!isAttached(session)) {
     session.detachedAtMs = Date.now();
     logInfo("session", "session detached", { id: session.id });
@@ -773,47 +779,39 @@ const paintInitialScreen = (
 };
 
 /**
- * Elect the primary consumer (the one that drives the PTY size). The primary is
- * the most-recently-active consumer. Election is debounced so a burst of
- * near-simultaneous resizes/focus doesn't storm the child with SIGWINCH.
- * `force` bypasses the debounce (used when there is no primary yet).
+ * Hand primacy to the viewer that just focused or resized. Unconditional: this
+ * is a deliberate act on a specific viewer, and there is nothing to arbitrate.
  */
-const electPrimary = (
+const claimPrimary = (
   session: TSession,
+  consumer: TAttachedConsumer,
   now: number,
-  force: boolean,
-  preferredConsumer: TAttachedConsumer | null = null,
-): TAttachedConsumer | null => {
+): void => {
+  consumer.lastActiveAtMs = now;
+  session.primaryConsumer = consumer;
+};
+
+/**
+ * The primary left. Hand the PTY size to the most recently focused survivor so
+ * the remaining viewers are not stranded rendering at a departed viewer's size.
+ */
+const promoteSuccessorPrimary = (session: TSession): void => {
+  let successor: TAttachedConsumer | null = null;
+  for (const consumer of session.consumers) {
+    if (
+      successor === null ||
+      consumer.lastActiveAtMs > successor.lastActiveAtMs
+    )
+      successor = consumer;
+  }
+  session.primaryConsumer = successor;
+  if (successor === null) return;
   if (
-    !force &&
-    session.primaryConsumer !== null &&
-    session.consumers.has(session.primaryConsumer) &&
-    now - session.lastPrimaryElectionAtMs < PRIMARY_REELECT_DEBOUNCE_MS
+    session.canonicalCols !== successor.cols ||
+    session.canonicalRows !== successor.rows
   ) {
-    return session.primaryConsumer;
+    applyCanonicalResize(session, successor.cols, successor.rows);
   }
-  let winner: TAttachedConsumer | null = null;
-  if (
-    force &&
-    preferredConsumer !== null &&
-    session.consumers.has(preferredConsumer)
-  ) {
-    winner = preferredConsumer;
-  }
-  if (winner === null) {
-    for (const consumer of session.consumers) {
-      if (winner === null || consumer.lastActiveAtMs > winner.lastActiveAtMs) {
-        winner = consumer;
-      }
-    }
-  }
-  if (winner !== null && winner !== session.primaryConsumer) {
-    session.primaryConsumer = winner;
-    session.lastPrimaryElectionAtMs = now;
-  } else if (winner === null) {
-    session.primaryConsumer = null;
-  }
-  return winner;
 };
 
 /**
@@ -924,36 +922,27 @@ const applyCanonicalResize = (
 };
 
 /**
- * Handle a consumer viewport change (resize CTRL or an attaching consumer that
- * announced its size). Applies the tmux primary policy: only the primary drives
- * the PTY; non-primary viewers get a private reflowed view + repaint.
+ * Record a consumer's viewport and reconcile what it should be shown.
+ *
+ * The PRIMARY's viewport IS the canonical PTY size. Every other viewer keeps a
+ * private emulator at its own size and is repainted from the shared screen.
+ * Nothing here decides primacy — see {@link claimPrimary}.
+ *
+ * Both branches are no-ops when nothing actually changed. A focus claim arrives
+ * with the dims the consumer already has, and rebuilding a view + writing a
+ * full-screen repaint for that would strobe the viewer for no reason; live
+ * output (`fanOut` → `scheduleViewRepaint`) is what keeps it current.
  */
-const handleConsumerResize = (
+const setConsumerViewport = (
   session: TSession,
   consumer: TAttachedConsumer,
   cols: number,
   rows: number,
-  now: number,
-  forcePrimary = false,
 ): void => {
-  // Whether this is a REAL viewport change. Most calls are not: a keystroke and
-  // a focus claim both route through here with the consumer's CURRENT dims,
-  // purely to re-run primary election. Rebuilding a view and repainting for
-  // those would strobe a passive viewer on every key — see the guards below.
   const changed = consumer.cols !== cols || consumer.rows !== rows;
   consumer.cols = cols;
   consumer.rows = rows;
-  const primary = electPrimary(
-    session,
-    now,
-    forcePrimary ||
-      session.primaryConsumer === null ||
-      !session.consumers.has(session.primaryConsumer),
-    forcePrimary ? consumer : null,
-  );
-  if (primary === consumer) {
-    // This consumer drives the PTY. Its own size becomes canonical; consumers
-    // that now match canonical drop their view, others (re)build one.
+  if (session.primaryConsumer === consumer) {
     if (
       session.canonicalCols !== cols ||
       session.canonicalRows !== rows ||
@@ -967,15 +956,7 @@ const handleConsumerResize = (
     }
     return;
   }
-  // Passive viewer: never touch the PTY. Build/keep a private view sized to it
-  // and repaint at its size against the shared emulator's current content.
-  //
-  // ONLY when something actually changed. A keystroke from a non-primary viewer
-  // lands here (via the input re-election) with dims it already has, and a
-  // focus claim does the same. Rebuilding the view + writing a full-screen
-  // repaint for those made a passive viewer strobe between a cleared screen and
-  // the UI on EVERY key — with no new output behind it. The live-output path
-  // (`fanOut` → `scheduleViewRepaint`) is what keeps a passive viewer current.
+  // Passive viewer: never touches the PTY.
   if (!changed && consumer.view !== null) return;
   syncConsumerView(session, consumer);
   if (consumer.view !== null)
@@ -1323,7 +1304,6 @@ export const openSession = (
       canonicalCols: frame.cols,
       canonicalRows: frame.rows,
       primaryConsumer: null,
-      lastPrimaryElectionAtMs: 0,
       consumers: new Set(),
       outSeq: 0,
       startedAtMs: Date.now(),
@@ -1464,7 +1444,6 @@ export const bindSessionStream = (
     view: null,
     viewDirty: false,
     lastActiveAtMs: Date.now(),
-    dimsFromResize: false,
   };
   const registerConsumer = (session: TSession): void => {
     if (session.consumers.has(consumer)) return;
@@ -1503,18 +1482,19 @@ export const bindSessionStream = (
       }),
     );
     if (open.mode !== "attach") return;
-    // An attaching consumer applies the primary policy: it only yanks the PTY
-    // size if it becomes primary; otherwise it just gets a private view +
-    // serialized paint at its own size. This also serializes the CURRENT screen
-    // at THIS consumer's width — fixing replay that used to match capture width.
-    handleConsumerResize(
-      session,
-      consumer,
-      open.cols,
-      open.rows,
-      consumer.lastActiveAtMs,
-    );
-    // handleConsumerResize paints passive/differently-sized viewers. When the
+    // Attaching does NOT steal the size from whoever is already driving it —
+    // opening a second viewer must not resize the terminal someone is using.
+    // It becomes primary only when the session has none (it is the first, or
+    // the previous primary left); otherwise it gets a private view + a
+    // serialized paint at its own size, and takes over when it focuses.
+    if (
+      session.primaryConsumer === null ||
+      !session.consumers.has(session.primaryConsumer)
+    ) {
+      claimPrimary(session, consumer, consumer.lastActiveAtMs);
+    }
+    setConsumerViewport(session, consumer, open.cols, open.rows);
+    // setConsumerViewport paints passive/differently-sized viewers. When the
     // consumer became primary (or matches canonical with no view), paint the
     // initial screen explicitly so every attach gets a repaint before live
     // output. This consumer's private tail orders its repaint ahead of
@@ -1542,77 +1522,28 @@ export const bindSessionStream = (
   consumer.unsubscribe.push(
     stream.onData((bytes) => {
       if (!session.consumers.has(consumer)) return;
-      // Typing marks this consumer active — the input driver becomes the
-      // most-recently-active viewer and thus the PTY-size primary.
-      consumer.lastActiveAtMs = Date.now();
-      // Typing reclaims PTY-size primacy so the actively-driven terminal owns
-      // the canonical size — a background viewer's stale resize/focus no longer
-      // pins it. Idempotent when already primary (skip) or when size already
-      // matches canonical (handleConsumerResize's cheap path); debounce still
-      // guards SIGWINCH bursts.
-      if (session.primaryConsumer !== consumer) {
-        // Re-elect primary on typing, but NEVER shrink the canonical PTY with a
-        // keystroke driven by possibly-stale attach dims. A keystroke is not a
-        // viewport announcement, so a background viewer that only ever announced
-        // a small attach seed must not pull the actively-driven terminal down to
-        // its size. Apply the resize only when this consumer's dims are a
-        // genuine viewport change: unchanged → just claim primacy (debounced);
-        // a grow → safe to drive; a shrink → only when an explicit resize CTRL
-        // set these dims (dimsFromResize).
-        const differs =
-          consumer.cols !== session.canonicalCols ||
-          consumer.rows !== session.canonicalRows;
-        const shrinks =
-          consumer.cols < session.canonicalCols ||
-          consumer.rows < session.canonicalRows;
-        if (differs && (!shrinks || consumer.dimsFromResize)) {
-          handleConsumerResize(
-            session,
-            consumer,
-            consumer.cols,
-            consumer.rows,
-            consumer.lastActiveAtMs,
-          );
-        } else {
-          electPrimary(session, consumer.lastActiveAtMs, false);
-        }
-      }
+      // Input is input. It does NOT move primacy and does NOT resize the PTY —
+      // see the note on the primary at the top of this file. A keystroke is not
+      // a viewport announcement, and treating it as one made the canonical size
+      // alternate between two attached viewers as the user typed.
       session.pty?.write(bytes);
     }),
     stream.onCtrl((payload) => {
       if (!session.consumers.has(consumer)) return;
       const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
       if (ctrl?.t === "resize") {
-        // Resize also counts as focus/activity — a viewer that resizes wants to
-        // drive. Route through the primary-aware policy (last-attacher-wins is
-        // gone): only the primary yanks the PTY size.
-        consumer.lastActiveAtMs = Date.now();
-        // An explicit resize is a genuine announced viewport — from now on a
-        // keystroke from this consumer may drive the canonical PTY size.
-        consumer.dimsFromResize = true;
-        handleConsumerResize(
-          session,
-          consumer,
-          ctrl.cols,
-          ctrl.rows,
-          consumer.lastActiveAtMs,
-          true,
-        );
+        // Someone dragged THIS viewer's window. A deliberate act on a specific
+        // viewer, so it takes the PTY size with it.
+        claimPrimary(session, consumer, Date.now());
+        setConsumerViewport(session, consumer, ctrl.cols, ctrl.rows);
       }
       if (ctrl?.t === "focus") {
-        // Explicit focus claim (tab focus, desktop attach foreground) — same
-        // primacy path as a resize, but with the consumer's CURRENT size so a
-        // pure focus never invents dimensions. Idempotent when dims match
-        // canonical: re-elects primary (post-debounce) and only SIGWINCHes if
-        // this consumer's size differs from the PTY.
-        consumer.lastActiveAtMs = Date.now();
-        handleConsumerResize(
-          session,
-          consumer,
-          consumer.cols,
-          consumer.rows,
-          consumer.lastActiveAtMs,
-        );
+        // The signal that decides who drives: tab focus, or a local attach
+        // coming to the foreground. Carries the consumer's CURRENT dims, so a
+        // pure focus never invents a size — and `setConsumerViewport` is a
+        // no-op when those dims are already canonical.
+        claimPrimary(session, consumer, Date.now());
+        setConsumerViewport(session, consumer, consumer.cols, consumer.rows);
       }
       if (ctrl?.t === "close" && ctrl.intent === "kill") {
         endPty(session, "killed");
