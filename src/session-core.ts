@@ -8,7 +8,7 @@
 
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
@@ -19,7 +19,7 @@ import {
   SESSION_ID_PATTERN,
 } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
-import { hostCliCandidates, sessionEnv } from "./cli-paths";
+import { sessionEnv } from "./cli-paths";
 import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { loadEnvFile } from "./env";
@@ -452,42 +452,6 @@ const openllmBin = (): string | null => {
   return null;
 };
 
-/** Host binary candidates for device CLIs (opencode is not a TCliProvider). */
-const hostBinCandidates = (cli: TDeviceSessionCli): string[] => {
-  if (cli === "opencode") {
-    const home = homedir();
-    return [
-      join(home, ".opencode", "bin", "opencode"),
-      join(home, ".local", "bin", "opencode"),
-    ];
-  }
-  // Subscription-backed device CLIs share the isolated-CLI candidate list.
-  return hostCliCandidates(cli);
-};
-
-/**
- * Resolve the host-installed vendor binary. Used only as a last-resort
- * fallback when the openllm CLI is not installed on this box.
- */
-const hostCliBin = (cli: TDeviceSessionCli): string => {
-  for (const candidate of hostBinCandidates(cli)) {
-    if (existsSync(candidate)) return candidate;
-  }
-  const first = hostBinCandidates(cli)[0];
-  if (first !== undefined) return first;
-  // Last resort: the command name — Bun.spawn resolves it against PATH.
-  switch (cli) {
-    case "claude_code":
-      return "claude";
-    case "chatgpt":
-      return "codex";
-    case "grok":
-      return "grok";
-    case "opencode":
-      return "opencode";
-  }
-};
-
 /** Append vendor cold-resume flags for a known session id. */
 const pushResumeArgs = (
   args: string[],
@@ -528,35 +492,24 @@ const argvFor = (
   const clientId = openllmClientId(cli);
   const bin = openllmBin();
   const canDangerous = dangerous && sessionSupportsDangerous(cli);
-  // Preferred path: openllm wrapper when installed.
-  if (bin !== null) {
-    const args: string[] = [bin];
-    if (canDangerous) args.push("-d");
-    args.push(clientId);
-    if (vendorSessionId !== null) {
-      pushResumeArgs(args, cli, vendorSessionId);
-    } else if (mode === "continue" && cli === "claude_code") {
-      args.push("--continue");
-    }
-    args.push(...vendorArgs);
-    return args;
+  // Preferred path: openllm wrapper when installed. An injected (test) spawner
+  // never execs the argv, so it stands in for the missing binary — the real
+  // spawner is gated on an installed CLI at the call site.
+  if (bin === null && spawner === bunPtySpawner) {
+    // A direct vendor launch would bypass OpenLLM's gateway/catalog/config
+    // overlay. Callers reject the missing CLI binary before this can run.
+    throw new Error("OpenLLM CLI is not installed");
   }
-  // Fallback: host vendor binary (no openllm wrapper).
-  const host = hostCliBin(cli);
-  const flags: string[] = [];
-  if (cli === "claude_code" && canDangerous) {
-    flags.push("--dangerously-skip-permissions");
-  }
+  const args: string[] = bin === null ? [] : [bin];
+  if (canDangerous) args.push("-d");
+  args.push(clientId);
   if (vendorSessionId !== null) {
-    const withResume = [host, ...flags];
-    pushResumeArgs(withResume, cli, vendorSessionId);
-    withResume.push(...vendorArgs);
-    return withResume;
+    pushResumeArgs(args, cli, vendorSessionId);
+  } else if (mode === "continue" && cli === "claude_code") {
+    args.push("--continue");
   }
-  if (mode === "continue" && cli === "claude_code") {
-    flags.push("--continue");
-  }
-  return [host, ...flags, ...vendorArgs];
+  args.push(...vendorArgs);
+  return args;
 };
 
 /**
@@ -799,6 +752,9 @@ const DANGEROUS_VENDOR_FLAGS: ReadonlySet<string> = new Set([
   "--always-approve",
 ]);
 
+const isDangerousVendorFlag = (arg: string): boolean =>
+  [...DANGEROUS_VENDOR_FLAGS].some((flag) => arg.startsWith(flag));
+
 const validVendorArgs = (
   vendorArgs: readonly string[] | undefined,
   dangerousGranted: boolean,
@@ -811,7 +767,7 @@ const validVendorArgs = (
         arg.length >= 1 &&
         arg.length <= 512 &&
         !arg.includes("\0") &&
-        (dangerousGranted || !DANGEROUS_VENDOR_FLAGS.has(arg)),
+        (dangerousGranted || !isDangerousVendorFlag(arg)),
     ));
 
 export type TSessionOpen = {
@@ -967,19 +923,12 @@ export const openSession = (
       return;
     }
 
-    // Prefer openllm CLI presence (preferred launch path). Fall back to the
-    // host vendor binary when openllm is missing. Only enforced for the REAL
-    // spawner — an injected test spawner never execs, and CI boxes don't
-    // carry the vendor CLIs. Every DeviceSessionCli maps to an openllm client.
-    if (spawner === bunPtySpawner) {
-      const hasOpenllm = openllmBin() !== null;
-      const hasHostVendor = hostBinCandidates(cli).some((candidate) =>
-        existsSync(candidate),
-      );
-      if (!hasOpenllm && !hasHostVendor) {
-        nack("cli_not_installed");
-        return;
-      }
+    // Device sessions must launch through the OpenLLM CLI so the gateway,
+    // catalog, config, and environment overlay is always applied. Only enforce
+    // this for the real spawner — injected test spawners never exec a binary.
+    if (spawner === bunPtySpawner && openllmBin() === null) {
+      nack("cli_not_installed");
+      return;
     }
 
     // cwd: resume frame / prior session cwd / $HOME. No ~/.openllm/sessions.

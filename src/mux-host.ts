@@ -225,6 +225,7 @@ const pipeSessionStreams = (
   relay.onData((bytes) => {
     void host.write(bytes).catch(() => {
       closed = true;
+      host.reset();
       relay.reset();
     });
   });

@@ -6,7 +6,14 @@
  * WebSocket. The wire envelope is the local broker envelope.
  */
 
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type {
   TDeviceSessionCli,
@@ -189,7 +196,7 @@ class SessionHostStream implements TSessionStream {
     const status = this.socket.sendBinary(bytes);
     if (status > 0) return Promise.resolve();
     if (status === 0)
-      return Promise.reject(new Error("session host socket closed"));
+      return Promise.reject(new Error("session host socket send failed"));
     return new Promise<void>((resolve, reject) => {
       this.socket.data.drainWaiters.add({ resolve, reject });
     });
@@ -288,33 +295,81 @@ export const runSessionHost = (
   options: TSessionHostOptions = {},
 ): void => {
   const directory = sessionHostDir(args.id);
-  const socketPath = sessionHostSocketPath(args.id);
-  rmSync(directory, { recursive: true, force: true });
-  mkdirSync(directory, { recursive: true, mode: SESSION_DIR_MODE });
-  chmodSync(directory, SESSION_DIR_MODE);
+  const root = join(stateDir(), "sessions");
+  const claim = join(root, `.${args.id}.claim`);
+  const stagingDirectory = join(root, `.${args.id}.${process.pid}.staging`);
+  const socketPath = join(stagingDirectory, "ctl.sock");
 
   let server: Bun.Server<TSocketData> | null = null;
   let activityTimer: ReturnType<typeof setInterval> | null = null;
   let cleaned = false;
   let meta: TSessionHostMeta | null = null;
+  let published = false;
 
-  const writeMeta = (): void => {
-    if (meta === null) return;
-    writeFileSync(join(directory, "meta.json"), `${JSON.stringify(meta)}\n`, {
-      mode: 0o600,
-    });
+  const fail = (): void => {
+    cleanup();
+    if (options.exit === undefined) process.exitCode = 1;
+    else options.exit(1);
   };
+
   const cleanup = (): void => {
     if (cleaned) return;
     cleaned = true;
     if (activityTimer !== null) clearInterval(activityTimer);
     server?.stop(true);
-    rmSync(directory, { recursive: true, force: true });
+    if (published) rmSync(directory, { recursive: true, force: true });
+    rmSync(stagingDirectory, { recursive: true, force: true });
+    rmSync(claim, { recursive: true, force: true });
   };
   const exit = (): void => {
     cleanup();
     (options.exit ?? process.exit)(0);
   };
+
+  const publish = (): void => {
+    if (published) return;
+    try {
+      renameSync(stagingDirectory, directory);
+      published = true;
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+    rmSync(claim, { recursive: true, force: true });
+  };
+
+  const writeMeta = (): void => {
+    if (meta === null) return;
+    const temp = join(stagingDirectory, `.meta.json.${process.pid}.tmp`);
+    try {
+      writeFileSync(temp, `${JSON.stringify(meta)}\n`, { mode: 0o600 });
+      renameSync(temp, join(stagingDirectory, "meta.json"));
+    } catch (error) {
+      try {
+        rmSync(temp, { force: true });
+      } catch {
+        // Best-effort temp cleanup.
+      }
+      throw error;
+    }
+  };
+
+  try {
+    mkdirSync(root, { recursive: true, mode: SESSION_DIR_MODE });
+    mkdirSync(claim, { mode: SESSION_DIR_MODE });
+  } catch {
+    fail();
+    return;
+  }
+
+  if (existsSync(directory)) {
+    fail();
+    return;
+  }
+
+  rmSync(stagingDirectory, { recursive: true, force: true });
+  mkdirSync(stagingDirectory, { mode: SESSION_DIR_MODE });
+  chmodSync(stagingDirectory, SESSION_DIR_MODE);
 
   setSessionLifecycleHooks({
     onSpawn: (session) => {
@@ -356,78 +411,82 @@ export const runSessionHost = (
     },
   );
   if (spawnFailed || meta === null) {
-    cleanup();
-    if (options.exit === undefined) process.exitCode = 1;
-    else options.exit(1);
+    fail();
     return;
   }
 
-  server = Bun.serve({
-    unix: socketPath,
-    fetch: (request, current): Response | undefined => {
-      if (request.method !== "GET")
-        return new Response("not found", { status: 404 });
-      return current.upgrade(request, {
-        data: { stream: null, opened: false, drainWaiters: new Set() },
-      })
-        ? undefined
-        : new Response("websocket upgrade failed", { status: 400 });
-    },
-    websocket: {
-      open: (socket): void => {
-        socket.binaryType = "uint8array";
+  try {
+    server = Bun.serve({
+      unix: socketPath,
+      fetch: (request, current): Response | undefined => {
+        if (request.method !== "GET")
+          return new Response("not found", { status: 404 });
+        return current.upgrade(request, {
+          data: { stream: null, opened: false, drainWaiters: new Set() },
+        })
+          ? undefined
+          : new Response("websocket upgrade failed", { status: 400 });
       },
-      drain: (socket): void => {
-        const waiters = [...socket.data.drainWaiters];
-        socket.data.drainWaiters.clear();
-        for (const waiter of waiters) waiter.resolve();
-      },
-      message: (socket, message): void => {
-        try {
-          const stream = socket.data.stream;
-          if (typeof message !== "string") {
-            if (!socket.data.opened || stream === null) {
-              protocolError(socket);
+      websocket: {
+        open: (socket): void => {
+          socket.binaryType = "uint8array";
+        },
+        drain: (socket): void => {
+          const waiters = [...socket.data.drainWaiters];
+          socket.data.drainWaiters.clear();
+          for (const waiter of waiters) waiter.resolve();
+        },
+        message: (socket, message): void => {
+          try {
+            const stream = socket.data.stream;
+            if (typeof message !== "string") {
+              if (!socket.data.opened || stream === null) {
+                protocolError(socket);
+                return;
+              }
+              stream.receiveData(new Uint8Array(message));
               return;
             }
-            stream.receiveData(new Uint8Array(message));
-            return;
+            const envelope: TEnvelope = JSON.parse(message) as TEnvelope;
+            if (!socket.data.opened) {
+              if (envelope.t !== "open") {
+                protocolError(socket);
+                return;
+              }
+              const open = parseAttachOpen(envelope.open, args);
+              if (open === null) {
+                protocolError(socket);
+                return;
+              }
+              const next = new SessionHostStream(socket);
+              socket.data.stream = next;
+              socket.data.opened = true;
+              bindSessionStream(next, open, {
+                onExit: (code) =>
+                  socket.sendText(JSON.stringify({ t: "exit", code })),
+              });
+              return;
+            }
+            if (envelope.t === "ctrl" && stream !== null)
+              stream.receiveCtrl(envelope.p);
+          } catch {
+            protocolError(socket);
           }
-          const envelope: TEnvelope = JSON.parse(message) as TEnvelope;
-          if (!socket.data.opened) {
-            if (envelope.t !== "open") {
-              protocolError(socket);
-              return;
-            }
-            const open = parseAttachOpen(envelope.open, args);
-            if (open === null) {
-              protocolError(socket);
-              return;
-            }
-            const next = new SessionHostStream(socket);
-            socket.data.stream = next;
-            socket.data.opened = true;
-            bindSessionStream(next, open, {
-              onExit: (code) =>
-                socket.sendText(JSON.stringify({ t: "exit", code })),
-            });
-            return;
-          }
-          if (envelope.t === "ctrl" && stream !== null)
-            stream.receiveCtrl(envelope.p);
-        } catch {
-          protocolError(socket);
-        }
+        },
+        close: (socket): void => {
+          const waiters = [...socket.data.drainWaiters];
+          socket.data.drainWaiters.clear();
+          for (const waiter of waiters)
+            waiter.reject(new Error("session host socket closed"));
+          socket.data.stream?.closed();
+        },
       },
-      close: (socket): void => {
-        const waiters = [...socket.data.drainWaiters];
-        socket.data.drainWaiters.clear();
-        for (const waiter of waiters)
-          waiter.reject(new Error("session host socket closed"));
-        socket.data.stream?.closed();
-      },
-    },
-  });
+    });
+    publish();
+  } catch {
+    fail();
+    return;
+  }
 
   activityTimer = setInterval(
     () => void pollSessionActivity(),

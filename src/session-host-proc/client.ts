@@ -29,8 +29,9 @@ import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
 
 const SPAWN_SOCKET_TIMEOUT_MS = 2_000;
-/** RS (0x1e) prefixes a JSON control line on the pipe-mode attach stdin. */
+/** RS (0x1e) prefixes a JSON control line on the pipe-mode attach stdio. */
 const PIPE_CTRL = 0x1e;
+const PIPE_CTRL_MAX_BYTES = 512;
 
 export type TLiveSessionHost = TSessionHostMeta & {
   readonly socketPath: string;
@@ -145,9 +146,13 @@ const waitForSessionHostSocket = async (id: string): Promise<string | null> => {
   return socketPresent(socketPath) ? socketPath : null;
 };
 
-const daemonBinary = (): string => {
+const daemonBinary = (): readonly string[] => {
   const installed = join(stateDir(), "bin", "openllmd");
-  return existsSync(installed) ? installed : process.execPath;
+  if (existsSync(installed)) return [installed];
+  const sourceRunner = process.argv[1];
+  return sourceRunner === undefined
+    ? [process.execPath]
+    : [process.execPath, sourceRunner];
 };
 
 /** Spawn a detached sibling session host and wait for its private control socket. */
@@ -168,7 +173,7 @@ export const spawnSessionHostProc = async (
     ...(args.vendorArgs ?? []).flatMap((arg) => ["--vendor-arg", arg]),
   ];
   try {
-    const proc = Bun.spawn([daemonBinary(), ...argv], {
+    const proc = Bun.spawn([...daemonBinary(), ...argv], {
       detached: true,
       stdio: ["ignore", "ignore", "ignore"],
     });
@@ -210,11 +215,70 @@ class CliPipeSessionStream implements TSessionStream {
     if (stdout !== null && typeof stdout !== "number") {
       void (async () => {
         const reader = (stdout as ReadableStream<Uint8Array>).getReader();
+        let ctrlBuffer = "";
+        let ctrlOverflow = false;
         try {
           for (;;) {
             const { done, value } = await reader.read();
             if (done || value === undefined) break;
-            for (const handler of this.dataHandlers) handler(value);
+            let index = 0;
+            while (index < value.length) {
+              if (
+                ctrlBuffer.length > 0 ||
+                ctrlOverflow ||
+                value[index] === PIPE_CTRL
+              ) {
+                if (ctrlBuffer.length === 0 && !ctrlOverflow) index += 1;
+                while (index < value.length) {
+                  const byte = value[index] ?? 0;
+                  index += 1;
+                  if (byte === 0x0a) {
+                    if (!ctrlOverflow) {
+                      try {
+                        const decoded: unknown = JSON.parse(ctrlBuffer);
+                        if (
+                          typeof decoded === "object" &&
+                          decoded !== null &&
+                          !Array.isArray(decoded)
+                        ) {
+                          const control = decoded as Record<string, unknown>;
+                          if (control.t === "reset") {
+                            const { t: _tag, ...reset } = control;
+                            const payload = encodeJsonPayload(reset);
+                            for (const handler of this.resetHandlers)
+                              handler(payload);
+                          } else {
+                            const payload = encodeJsonPayload(control);
+                            for (const handler of this.ctrlHandlers)
+                              handler(payload);
+                          }
+                        }
+                      } catch {
+                        // Malformed control — drop and keep streaming.
+                      }
+                    }
+                    ctrlBuffer = "";
+                    ctrlOverflow = false;
+                    break;
+                  }
+                  ctrlBuffer += String.fromCharCode(byte);
+                  if (ctrlBuffer.length > PIPE_CTRL_MAX_BYTES) {
+                    // Keep consuming through newline so a malformed frame tail
+                    // cannot be emitted as raw terminal output.
+                    ctrlBuffer = "";
+                    ctrlOverflow = true;
+                  }
+                }
+                continue;
+              }
+              const start = index;
+              while (index < value.length && value[index] !== PIPE_CTRL)
+                index += 1;
+              if (index > start) {
+                const bytes = value.subarray(start, index);
+                for (const handler of this.dataHandlers) handler(bytes);
+              }
+            }
           }
         } catch {
           // Child closed stdout.
@@ -234,7 +298,15 @@ class CliPipeSessionStream implements TSessionStream {
 
   write = async (bytes: Uint8Array): Promise<void> => {
     if (this.closed) throw new Error("session pipe closed");
-    this.stdin.write(bytes);
+    await this.stdin.write(bytes);
+  };
+
+  private writeControl = (control: object): void => {
+    void Promise.resolve(
+      this.stdin.write(
+        `${String.fromCharCode(PIPE_CTRL)}${JSON.stringify(control)}\n`,
+      ),
+    ).catch(() => this.fireEnd());
   };
 
   sendCtrl = (payload: Uint8Array): void => {
@@ -257,19 +329,11 @@ class CliPipeSessionStream implements TSessionStream {
       typeof ctrl.cols === "number" &&
       typeof ctrl.rows === "number"
     ) {
-      this.stdin.write(
-        new TextEncoder().encode(
-          `${String.fromCharCode(PIPE_CTRL)}${JSON.stringify({ t: "resize", cols: ctrl.cols, rows: ctrl.rows })}\n`,
-        ),
-      );
+      this.writeControl({ t: "resize", cols: ctrl.cols, rows: ctrl.rows });
       return;
     }
     if (ctrl.t === "close") {
-      this.stdin.write(
-        new TextEncoder().encode(
-          `${String.fromCharCode(PIPE_CTRL)}${JSON.stringify({ t: "close", intent: ctrl.intent ?? "detach" })}\n`,
-        ),
-      );
+      this.writeControl({ t: "close", intent: ctrl.intent ?? "detach" });
     }
   };
 

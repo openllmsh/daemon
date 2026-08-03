@@ -102,7 +102,13 @@ const runSessions = (args: readonly string[]): never => {
   const sub = args[0];
   if (args.length <= 1) {
     if (sub === "on" || sub === "off") {
-      setPtySessions(sub === "on");
+      const persisted = setPtySessions(sub === "on");
+      if (!persisted) {
+        process.stderr.write(
+          "failed to persist the sessions preference to the env file\n",
+        );
+        process.exit(1);
+      }
       process.stdout.write(
         `sessions ${sub === "on" ? "enabled" : "disabled"}\n`,
       );
@@ -147,6 +153,14 @@ export const runCli = (): boolean => {
     return true;
   }
 
+  // Internal durable-session host. Deliberately omitted from COMMANDS/help:
+  // phase 1c starts it detached, so it must never bootstrap the daemon. This
+  // must precede global flag scans because parser values can legitimately be
+  // `-h` or `-v` (for example a title or vendor argument).
+  if (args[0] === "__session-host") {
+    return runSessionHostProcess(args.slice(1));
+  }
+
   if (args.includes("-h") || args.includes("--help") || args[0] === "help") {
     process.stdout.write(HELP);
     process.exit(0);
@@ -162,11 +176,6 @@ export const runCli = (): boolean => {
 
   const rest = args.slice(1);
   switch (args[0]) {
-    // Internal durable-session host. Deliberately omitted from COMMANDS/help:
-    // Phase 1c starts it detached, so it must never bootstrap the daemon.
-    case "__session-host":
-      return runSessionHostProcess(rest);
-
     case "start":
       serviceStart();
       process.exit(0);
