@@ -28,6 +28,17 @@
  * We serialize with `scrollback: 0` (the visible viewport only) and prepend an
  * explicit `\x1b[2J\x1b[H` so the payload is a complete repaint that overwrites
  * whatever the consumer currently shows, independent of its prior state.
+ *
+ * FLICKER: that clear is also why every repaint MUST be wrapped in synchronized
+ * output (DEC private mode 2026). A passive viewer gets one of these per output
+ * chunk — so, on a TUI that redraws per keystroke, one per keystroke — and
+ * without 2026 the terminal presents the cleared screen and the redraw as two
+ * separate frames. The viewer sees the session strobe between a bare cursor and
+ * the UI on every key. Inside a synchronized frame the terminal buffers the
+ * whole payload and presents it atomically, so the intermediate blank frame is
+ * never shown. `?2026` is ignored by terminals that do not implement it (an
+ * unknown DEC private mode is a no-op), so this is safe for every consumer —
+ * and `@xterm/xterm` v6, which the browser pane uses, implements it.
  */
 
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -49,13 +60,20 @@ const addonFor = (term: Terminal): SerializeAddon => {
   return addon;
 };
 
+/** Begin/end synchronized output (DEC private mode 2026) — see the FLICKER
+ *  note above. Everything between is presented as ONE frame. */
+const BEGIN_SYNC = "\x1b[?2026h";
+const END_SYNC = "\x1b[?2026l";
+
 /**
  * Serialize the emulator's current active screen into a repaint string: a
  * clear + home, then the visible viewport (SGR + cursor) as produced by
  * `SerializeAddon`. `scrollback: 0` restricts the dump to the visible rows.
+ * The whole payload is one synchronized-output frame so the clear is never
+ * presented on its own.
  */
 export const serializeScreen = (term: Terminal): string =>
-  `\x1b[2J\x1b[H${addonFor(term).serialize({ scrollback: 0 })}`;
+  `${BEGIN_SYNC}\x1b[2J\x1b[H${addonFor(term).serialize({ scrollback: 0 })}${END_SYNC}`;
 
 /** Convenience: serialize + UTF-8 encode for direct stream writes. */
 export const serializeScreenBytes = (term: Terminal): Uint8Array =>

@@ -674,6 +674,21 @@ const scheduleViewRepaint = (
   });
 };
 
+/** Feed a chunk to a consumer's private view and repaint once it has been
+ *  PARSED. `xterm`'s write queue is asynchronous, so serializing without
+ *  waiting for the write callback captures the screen as it was BEFORE the
+ *  chunk — leaving a passive viewer permanently one frame behind, and showing
+ *  a stale screen outright when the burst it lagged on was the last one. */
+const writeViewAndRepaint = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+  chunk: Uint8Array,
+): void => {
+  consumer.view?.write(chunk, () => {
+    scheduleViewRepaint(session, consumer);
+  });
+};
+
 /** Fan out one out-direction chunk to every attached consumer. Consumers whose
  *  size matches canonical get the raw bytes (byte-identical fast path); others
  *  feed their private emulator and get a coalesced reflowed repaint. */
@@ -685,9 +700,8 @@ const fanOut = (session: TSession, chunk: Uint8Array): void => {
       continue;
     }
     // Differently-sized viewer: keep the private emulator current, then queue a
-    // coalesced serialize at this consumer's size.
-    consumer.view.write(chunk);
-    scheduleViewRepaint(session, consumer);
+    // coalesced serialize at this consumer's size — once the chunk is parsed.
+    writeViewAndRepaint(session, consumer, chunk);
   }
 };
 
@@ -922,6 +936,11 @@ const handleConsumerResize = (
   now: number,
   forcePrimary = false,
 ): void => {
+  // Whether this is a REAL viewport change. Most calls are not: a keystroke and
+  // a focus claim both route through here with the consumer's CURRENT dims,
+  // purely to re-run primary election. Rebuilding a view and repainting for
+  // those would strobe a passive viewer on every key — see the guards below.
+  const changed = consumer.cols !== cols || consumer.rows !== rows;
   consumer.cols = cols;
   consumer.rows = rows;
   const primary = electPrimary(
@@ -941,13 +960,23 @@ const handleConsumerResize = (
       session.emulator === null
     ) {
       applyCanonicalResize(session, cols, rows);
-    } else {
+    } else if (changed || consumer.view !== null) {
+      // Already canonical-sized with no view: nothing to reconcile. Only a real
+      // change, or a stale view left from when it was passive, needs a sync.
       syncConsumerView(session, consumer);
     }
     return;
   }
   // Passive viewer: never touch the PTY. Build/keep a private view sized to it
   // and repaint at its size against the shared emulator's current content.
+  //
+  // ONLY when something actually changed. A keystroke from a non-primary viewer
+  // lands here (via the input re-election) with dims it already has, and a
+  // focus claim does the same. Rebuilding the view + writing a full-screen
+  // repaint for those made a passive viewer strobe between a cleared screen and
+  // the UI on EVERY key — with no new output behind it. The live-output path
+  // (`fanOut` → `scheduleViewRepaint`) is what keeps a passive viewer current.
+  if (!changed && consumer.view !== null) return;
   syncConsumerView(session, consumer);
   if (consumer.view !== null)
     writeConsumer(session, consumer, serializeScreenBytes(consumer.view));
