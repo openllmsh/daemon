@@ -49,6 +49,31 @@ export const legacyCliBinaryPath = (): string =>
   join(stateDir(), "bin", "openllmc");
 
 /**
+ * DEV-ONLY override: an absolute path to a runnable `openllm` the daemon should
+ * spawn/probe INSTEAD of the installed binary. Set by `scripts/dev.ts` (a shim
+ * that execs the working-tree CLI source) so browser-triggered sessions run
+ * this repo's CLI, not the shipped `~/.openllm/bin/openllm`. Unset in
+ * production — `resolveOpenllmCli` then falls back to the installed paths, so
+ * prod behaviour is unchanged. The self-update convergers deliberately do NOT
+ * consult this (they must always converge the real installed binary).
+ */
+export const cliBinaryOverride = (): string | null => {
+  const p = process.env.OPENLLM_CLI_PATH;
+  return p !== undefined && p.length > 0 && existsSync(p) ? p : null;
+};
+
+/**
+ * Resolve the `openllm` CLI the daemon should run: the dev override first (when
+ * present + existing), then the installed binary (current name, then legacy).
+ * Null when none exist. This is the ONE resolver every spawn/attach/probe site
+ * shares so dev and prod never drift.
+ */
+export const resolveOpenllmCli = (): string | null =>
+  cliBinaryOverride() ??
+  [cliBinaryPath(), legacyCliBinaryPath()].find(existsSync) ??
+  null;
+
+/**
  * The installed CLI's version, probed by spawning `openllm --version`
  * (output `openllm vX.Y.Z`; legacy binaries print `openllmc vX.Y.Z`). Null
  * when the binary is absent, won't run, or prints something unparseable —

@@ -23,8 +23,8 @@ import type {
 import { DeviceSessionCli, SESSION_ID_PATTERN } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
-import { cliBinaryPath, legacyCliBinaryPath } from "../cli-self-update";
-import { stateDir } from "../env";
+import { resolveOpenllmCli } from "../cli-self-update";
+import { isDevMode, stateDir } from "../env";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
 
@@ -147,9 +147,21 @@ const waitForSessionHostSocket = async (id: string): Promise<string | null> => {
 };
 
 const daemonBinary = (): readonly string[] => {
+  // The detached session host is what actually owns the PTY and spawns the
+  // openllm CLI. Re-exec THIS daemon's own entrypoint so it inherits our code
+  // (and, in dev, the CLI override). In dev we run from source under
+  // `bun --watch src/main.ts`, so `process.argv[1]` is that script — re-exec it
+  // rather than the INSTALLED `~/.openllm/bin/openllmd`, which would otherwise
+  // run shipped code with none of the dev overrides (and can protocol-skew the
+  // source daemon, surfacing as `spawn_failed` in the browser).
+  const sourceRunner = process.argv[1];
+  if (isDevMode()) {
+    return sourceRunner === undefined
+      ? [process.execPath]
+      : [process.execPath, sourceRunner];
+  }
   const installed = join(stateDir(), "bin", "openllmd");
   if (existsSync(installed)) return [installed];
-  const sourceRunner = process.argv[1];
   return sourceRunner === undefined
     ? [process.execPath]
     : [process.execPath, sourceRunner];
@@ -184,12 +196,7 @@ export const spawnSessionHostProc = async (
   return waitForSessionHostSocket(args.id);
 };
 
-const openllmCliBinary = (): string | null => {
-  for (const path of [cliBinaryPath(), legacyCliBinaryPath()]) {
-    if (existsSync(path)) return path;
-  }
-  return null;
-};
+const openllmCliBinary = (): string | null => resolveOpenllmCli();
 
 /**
  * A TSessionStream that pipes to `openllm sessions attach --pipe`.

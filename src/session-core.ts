@@ -6,7 +6,7 @@
  * or call openSession; this module never imports relay frame types.
  */
 
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import type {
@@ -20,7 +20,7 @@ import {
 } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { sessionEnv } from "./cli-paths";
-import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
+import { resolveOpenllmCli } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { loadEnvFile } from "./env";
 import { logInfo, logWarn } from "./logger";
@@ -444,13 +444,8 @@ const openllmClientId = (cli: TDeviceSessionCli): string => {
 export const sessionSupportsDangerous = (cli: TDeviceSessionCli): boolean =>
   DANGEROUS_SESSION_CLIS.has(cli);
 
-/** Resolve the installed openllm CLI binary (current name, then legacy). */
-const openllmBin = (): string | null => {
-  for (const path of [cliBinaryPath(), legacyCliBinaryPath()]) {
-    if (existsSync(path)) return path;
-  }
-  return null;
-};
+/** Resolve the openllm CLI binary (dev override, then current, then legacy). */
+const openllmBin = (): string | null => resolveOpenllmCli();
 
 /** Append vendor cold-resume flags for a known session id. */
 const pushResumeArgs = (

@@ -16,10 +16,9 @@
  * hot status path.
  */
 
-import { existsSync } from "node:fs";
 import type { TDaemonCliState } from "@openllmsh/protocol";
 import { binarySignature } from "./bin-signature";
-import { cliBinaryPath, legacyCliBinaryPath } from "./cli-self-update";
+import { resolveOpenllmCli } from "./cli-self-update";
 import { cliVersion } from "./delegation/util";
 import { logDebug } from "./logger";
 
@@ -33,13 +32,8 @@ interface CliStateCache {
 }
 let cache: CliStateCache = { path: "", signature: null, version: null };
 
-/** The installed CLI binary, preferring the current name over the legacy one. */
-const installedBinary = (): string | null => {
-  for (const path of [cliBinaryPath(), legacyCliBinaryPath()]) {
-    if (existsSync(path)) return path;
-  }
-  return null;
-};
+/** The CLI binary to probe: dev override first, then current, then legacy. */
+const installedBinary = (): string | null => resolveOpenllmCli();
 
 /**
  * Probe the CLI's presence + version. The `--version` spawn is CONFINED
