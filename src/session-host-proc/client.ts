@@ -40,6 +40,8 @@ export type TLiveSessionHost = TSessionHostMeta & {
 export type TSpawnSessionHostProc = {
   readonly id: string;
   readonly cli: TDeviceSessionCli;
+  readonly cols: number;
+  readonly rows: number;
   readonly cwd?: string;
   readonly title?: string;
   readonly dangerous?: boolean;
@@ -183,6 +185,10 @@ export const spawnSessionHostProc = async (
     ...(args.dangerous === true ? ["--dangerous"] : []),
     ...(args.resume === undefined ? [] : ["--resume", args.resume]),
     ...(args.vendorArgs ?? []).flatMap((arg) => ["--vendor-arg", arg]),
+    "--cols",
+    String(args.cols),
+    "--rows",
+    String(args.rows),
   ];
   try {
     const proc = Bun.spawn([...daemonBinary(), ...argv], {
@@ -337,6 +343,12 @@ class CliPipeSessionStream implements TSessionStream {
       typeof ctrl.rows === "number"
     ) {
       this.writeControl({ t: "resize", cols: ctrl.cols, rows: ctrl.rows });
+      return;
+    }
+    if (ctrl.t === "focus") {
+      // Forward opaque focus claims so a browser tab can claim primary through
+      // the pipe-bridged attach child without typing.
+      this.writeControl({ t: "focus" });
       return;
     }
     if (ctrl.t === "close") {

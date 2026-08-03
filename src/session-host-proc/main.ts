@@ -19,7 +19,11 @@ import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
 } from "@openllmsh/protocol";
-import { DeviceSessionCli, SESSION_ID_PATTERN } from "@openllmsh/protocol";
+import {
+  DeviceSessionCli,
+  SESSION_ID_PATTERN,
+  TerminalDimension,
+} from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
 import { stateDir } from "../env";
@@ -39,6 +43,8 @@ const ACTIVITY_POLL_MS = 15_000;
 export type TSessionHostArgs = {
   readonly id: string;
   readonly cli: TDeviceSessionCli;
+  readonly cols?: number;
+  readonly rows?: number;
   readonly cwd?: string;
   readonly title?: string;
   readonly dangerous: boolean;
@@ -77,11 +83,15 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isCli: (value: unknown) => value is TDeviceSessionCli =
   S.is(DeviceSessionCli);
 
+const parseDimension = (value: string | undefined): number | null => {
+  if (value === undefined) return null;
+  const parsed = Number.parseInt(value, 10);
+  if (value !== `${parsed}`) return null;
+  return S.is(TerminalDimension)(parsed) ? parsed : null;
+};
+
 const isDimension = (value: unknown): value is number =>
-  typeof value === "number" &&
-  Number.isInteger(value) &&
-  value >= 1 &&
-  value <= 1024;
+  S.is(TerminalDimension)(value);
 
 const validVendorArg = (value: string): boolean =>
   value.length >= 1 && value.length <= 512 && !value.includes("\0");
@@ -92,6 +102,8 @@ export const parseSessionHostArgs = (
 ): TSessionHostArgs | null => {
   let id: string | undefined;
   let cli: TDeviceSessionCli | undefined;
+  let cols: number | undefined;
+  let rows: number | undefined;
   let cwd: string | undefined;
   let title: string | undefined;
   let dangerous = false;
@@ -113,6 +125,22 @@ export const parseSessionHostArgs = (
         cli = value;
         index += 1;
         break;
+      case "--cols": {
+        if (cols !== undefined) return null;
+        const parsedCols = parseDimension(value);
+        if (parsedCols === null) return null;
+        cols = parsedCols;
+        index += 1;
+        break;
+      }
+      case "--rows": {
+        if (rows !== undefined) return null;
+        const parsedRows = parseDimension(value);
+        if (parsedRows === null) return null;
+        rows = parsedRows;
+        index += 1;
+        break;
+      }
       case "--cwd":
         if (
           cwd !== undefined ||
@@ -170,6 +198,8 @@ export const parseSessionHostArgs = (
   return {
     id,
     cli,
+    ...(cols === undefined ? {} : { cols }),
+    ...(rows === undefined ? {} : { rows }),
     ...(cwd === undefined ? {} : { cwd }),
     ...(title === undefined ? {} : { title }),
     dangerous,
@@ -393,8 +423,8 @@ export const runSessionHost = (
     {
       session_id: args.id,
       cli: args.cli,
-      cols: 80,
-      rows: 24,
+      cols: args.cols ?? 80,
+      rows: args.rows ?? 24,
       mode: "spawn",
       ...(args.cwd === undefined ? {} : { cwd: args.cwd }),
       ...(args.title === undefined ? {} : { title: args.title }),
@@ -506,7 +536,7 @@ export const runSessionHostProcess = (argv: readonly string[]): boolean => {
   const args = parseSessionHostArgs(argv);
   if (args === null) {
     process.stderr.write(
-      "usage: openllmd __session-host --id <id> --cli <cli> [--cwd <dir> --title <title> --dangerous --resume <vendorId> --vendor-arg <arg>]\n",
+      "usage: openllmd __session-host --id <id> --cli <cli> [--cols <n> --rows <n> --cwd <dir> --title <title> --dangerous --resume <vendorId> --vendor-arg <arg>]\n",
     );
     process.exitCode = 2;
     // `runCli` false means "boot the daemon". This internal command was

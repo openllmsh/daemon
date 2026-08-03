@@ -275,6 +275,8 @@ export const serveMuxOnStream = serveStream({
       const socketPath = await spawnSessionHostProc({
         id: open.session_id,
         cli: open.cli,
+        cols: open.cols,
+        rows: open.rows,
         ...(open.cwd === undefined ? {} : { cwd: open.cwd }),
         ...(open.title === undefined ? {} : { title: open.title }),
         ...(open.dangerous === undefined ? {} : { dangerous: open.dangerous }),

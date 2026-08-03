@@ -19,11 +19,13 @@ import {
   SESSION_ID_PATTERN,
 } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
+import { Terminal } from "@xterm/headless";
 import { sessionEnv } from "./cli-paths";
 import { resolveOpenllmCli } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { loadEnvFile } from "./env";
 import { logInfo, logWarn } from "./logger";
+import { serializeScreenBytes } from "./session-screen";
 
 /** Max concurrently-LIVE PTYs in one session-host process. */
 const MAX_LIVE_SESSIONS = 4;
@@ -43,6 +45,13 @@ const CONSUMER_MAX_QUEUED_BYTES = 2 * 1024 * 1024;
 
 /** Reaped children get time to flush their transcript before forcible exit. */
 const REAP_KILL_GRACE_MS = 10_000;
+
+/** Shared emulator scrollback (rows). The durable screen for attach replay. */
+const EMULATOR_SCROLLBACK_ROWS = 5000;
+
+/** Debounce window for primary re-election — avoids SIGWINCH storms when two
+ *  viewers fight over the PTY size within a few frames of each other. */
+const PRIMARY_REELECT_DEBOUNCE_MS = 250;
 
 /** Detached idle timeout. Zero deliberately restores never-reap behavior. */
 const DEFAULT_SESSION_IDLE_TIMEOUT_MIN = 60;
@@ -151,6 +160,17 @@ type TAttachedConsumer = {
   writeTail: Promise<void>;
   queuedBytes: number;
   exitHandler: ((code: number) => void) | null;
+  /** This consumer's viewport size (may differ from the canonical PTY size). */
+  cols: number;
+  rows: number;
+  /** Per-consumer emulator, created ONLY when this consumer's size differs
+   *  from the session's canonical size; null when it matches (raw fast path). */
+  view: Terminal | null;
+  /** Whether a per-consumer serialize is already queued on a microtask —
+   *  coalesces bursts of chunks into ONE screen serialize (see fanOut). */
+  viewDirty: boolean;
+  /** Last time this consumer produced input / focus — drives primary election. */
+  lastActiveAtMs: number;
 };
 
 export type TSession = {
@@ -163,6 +183,17 @@ export type TSession = {
   pty: TPtyLike | null; // null = dead (continue-able)
   scrollback: Uint8Array[];
   scrollbackBytes: number;
+  /** Shared source-of-truth screen (the canonical-size emulator). Created
+   *  lazily on first PTY spawn; disposed on PTY exit. Null on no-PTY paths. */
+  emulator: Terminal | null;
+  /** Canonical size — == the primary consumer's size == PTY winsize ==
+   *  shared emulator size. */
+  canonicalCols: number;
+  canonicalRows: number;
+  /** The consumer currently driving the PTY size (most-recently-active). */
+  primaryConsumer: TAttachedConsumer | null;
+  /** Timestamp of the last primary (re-)election for debounce. */
+  lastPrimaryElectionAtMs: number;
   /** Every active mux or broker consumer. */
   consumers: Set<TAttachedConsumer>;
   outSeq: number;
@@ -560,6 +591,11 @@ const detachConsumer = (
   if (!session.consumers.delete(consumer)) return;
   consumer.exitHandler = null;
   consumer.queuedBytes = 0;
+  consumer.view?.dispose();
+  consumer.view = null;
+  consumer.viewDirty = false;
+  // A departing primary hands the crown back; the next resize/input re-elects.
+  if (session.primaryConsumer === consumer) session.primaryConsumer = null;
   for (const unsubscribe of consumer.unsubscribe) unsubscribe();
   if (!isAttached(session)) {
     session.detachedAtMs = Date.now();
@@ -611,18 +647,188 @@ const writeConsumer = (
     .catch(() => {});
 };
 
-const writeConsumers = (session: TSession, chunk: Uint8Array): void => {
-  for (const consumer of session.consumers)
-    writeConsumer(session, consumer, chunk);
+/** Schedule a coalesced per-consumer repaint. Multiple chunks arriving before
+ *  the microtask fires collapse into ONE serialize of the reflowed view —
+ *  avoiding an O(rows*cols) serialize per output byte on the hot path.
+ *  TRADEOFF (v1): this is a full-screen serialize, not a true dirty-row diff. */
+const scheduleViewRepaint = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+): void => {
+  if (consumer.viewDirty) return;
+  consumer.viewDirty = true;
+  queueMicrotask(() => {
+    consumer.viewDirty = false;
+    const view = consumer.view;
+    if (view === null || !session.consumers.has(consumer)) return;
+    writeConsumer(session, consumer, serializeScreenBytes(view));
+  });
+};
+
+/** Fan out one out-direction chunk to every attached consumer. Consumers whose
+ *  size matches canonical get the raw bytes (byte-identical fast path); others
+ *  feed their private emulator and get a coalesced reflowed repaint. */
+const fanOut = (session: TSession, chunk: Uint8Array): void => {
+  for (const consumer of session.consumers) {
+    if (consumer.view === null) {
+      // Fast path: identical size — raw passthrough, zero emulation cost.
+      writeConsumer(session, consumer, chunk);
+      continue;
+    }
+    // Differently-sized viewer: keep the private emulator current, then queue a
+    // coalesced serialize at this consumer's size.
+    consumer.view.write(chunk);
+    scheduleViewRepaint(session, consumer);
+  }
 };
 
 /** Fan out one out-direction chunk to every attached transport-neutral consumer. */
 const sendOut = (session: TSession, chunk: Uint8Array): void => {
   if (isAttached(session)) {
-    writeConsumers(session, chunk);
+    fanOut(session, chunk);
     return;
   }
   session.fallback?.onOutput(session, chunk);
+};
+
+/** (Re)build a consumer's private view at its own size by replaying the shared
+ *  emulator's current screen into a fresh emulator, then paint it. When the
+ *  consumer size matches canonical, drop the view entirely (raw fast path). */
+const syncConsumerView = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+): void => {
+  const matchesCanonical =
+    consumer.cols === session.canonicalCols &&
+    consumer.rows === session.canonicalRows;
+  if (matchesCanonical) {
+    consumer.view?.dispose();
+    consumer.view = null;
+    return;
+  }
+  // Dispose any stale view, then build one at the consumer's size seeded with
+  // the shared emulator's current screen (xterm reflows the normal buffer on
+  // write; the alt buffer is clipped — a letterbox — which matches tmux).
+  consumer.view?.dispose();
+  const view = new Terminal({
+    cols: consumer.cols,
+    rows: consumer.rows,
+    scrollback: EMULATOR_SCROLLBACK_ROWS,
+    allowProposedApi: true,
+  });
+  consumer.view = view;
+  if (session.emulator !== null) {
+    view.write(serializeScreenBytes(session.emulator));
+  }
+};
+
+/** Serialize the best current screen for THIS consumer's size as its initial
+ *  attach paint. Prefers the shared emulator (reflowed/clipped to the
+ *  consumer's view); falls back to raw scrollback replay when no emulator. */
+const paintInitialScreen = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+): void => {
+  if (session.emulator === null) {
+    // Legacy / no-PTY path: raw scrollback replay at capture width.
+    writeConsumer(session, consumer, new TextEncoder().encode("\x1b[2J\x1b[H"));
+    for (const chunk of session.scrollback)
+      writeConsumer(session, consumer, chunk);
+    return;
+  }
+  // Ensure the consumer has a correctly-sized view (or the raw fast path), then
+  // serialize the screen at its size.
+  syncConsumerView(session, consumer);
+  const source = consumer.view ?? session.emulator;
+  writeConsumer(session, consumer, serializeScreenBytes(source));
+};
+
+/**
+ * Elect the primary consumer (the one that drives the PTY size). The primary is
+ * the most-recently-active consumer. Election is debounced so a burst of
+ * near-simultaneous resizes/focus doesn't storm the child with SIGWINCH.
+ * `force` bypasses the debounce (used when there is no primary yet).
+ */
+const electPrimary = (
+  session: TSession,
+  now: number,
+  force: boolean,
+): TAttachedConsumer | null => {
+  if (
+    !force &&
+    session.primaryConsumer !== null &&
+    session.consumers.has(session.primaryConsumer) &&
+    now - session.lastPrimaryElectionAtMs < PRIMARY_REELECT_DEBOUNCE_MS
+  ) {
+    return session.primaryConsumer;
+  }
+  let winner: TAttachedConsumer | null = null;
+  for (const consumer of session.consumers) {
+    if (winner === null || consumer.lastActiveAtMs > winner.lastActiveAtMs)
+      winner = consumer;
+  }
+  if (winner !== null && winner !== session.primaryConsumer) {
+    session.primaryConsumer = winner;
+    session.lastPrimaryElectionAtMs = now;
+  } else if (winner === null) {
+    session.primaryConsumer = null;
+  }
+  return winner;
+};
+
+/** Resize the canonical PTY + shared emulator to the given size and re-sync
+ *  every consumer's view against the new canonical size. */
+const applyCanonicalResize = (
+  session: TSession,
+  cols: number,
+  rows: number,
+): void => {
+  session.canonicalCols = cols;
+  session.canonicalRows = rows;
+  session.pty?.resize(cols, rows);
+  session.emulator?.resize(cols, rows);
+  for (const consumer of session.consumers) syncConsumerView(session, consumer);
+};
+
+/**
+ * Handle a consumer viewport change (resize CTRL or an attaching consumer that
+ * announced its size). Applies the tmux primary policy: only the primary drives
+ * the PTY; non-primary viewers get a private reflowed view + repaint.
+ */
+const handleConsumerResize = (
+  session: TSession,
+  consumer: TAttachedConsumer,
+  cols: number,
+  rows: number,
+  now: number,
+): void => {
+  consumer.cols = cols;
+  consumer.rows = rows;
+  const primary = electPrimary(
+    session,
+    now,
+    session.primaryConsumer === null ||
+      !session.consumers.has(session.primaryConsumer),
+  );
+  if (primary === consumer) {
+    // This consumer drives the PTY. Its own size becomes canonical; consumers
+    // that now match canonical drop their view, others (re)build one.
+    if (
+      session.canonicalCols !== cols ||
+      session.canonicalRows !== rows ||
+      session.emulator === null
+    ) {
+      applyCanonicalResize(session, cols, rows);
+    } else {
+      syncConsumerView(session, consumer);
+    }
+    return;
+  }
+  // Passive viewer: never touch the PTY. Build/keep a private view sized to it
+  // and repaint at its size against the shared emulator's current content.
+  syncConsumerView(session, consumer);
+  if (consumer.view !== null)
+    writeConsumer(session, consumer, serializeScreenBytes(consumer.view));
 };
 
 const terminalClose = (session: TSession, reason: "done" | "killed"): void => {
@@ -660,6 +866,10 @@ const endPty = (
   // buffered output is dead weight until the row itself is evicted.
   s.scrollback.length = 0;
   s.scrollbackBytes = 0;
+  // Dispose the shared screen emulator; a dead session has no durable screen.
+  s.emulator?.dispose();
+  s.emulator = null;
+  s.primaryConsumer = null;
   lifecycleHooks.onEnd(s);
 };
 
@@ -723,9 +933,13 @@ export const writeSessionInput = (id: string, bytes: Uint8Array): void => {
   sessions.get(id)?.pty?.write(bytes);
 };
 
-/** Resize the PTY from a transport-neutral session attachment. */
+/** Resize the PTY from a transport-neutral session attachment. Authoritative
+ *  override: sets the canonical size directly (PTY + shared emulator + every
+ *  consumer view), independent of primary election. */
 export const resizeSession = (id: string, cols: number, rows: number): void => {
-  sessions.get(id)?.pty?.resize(cols, rows);
+  const session = sessions.get(id);
+  if (session === undefined || session.pty === null) return;
+  applyCanonicalResize(session, cols, rows);
 };
 
 /** End a session now and close any attached transport-neutral consumers. */
@@ -893,14 +1107,22 @@ export const openSession = (
       }
       existing.detachedAtMs = null;
       existing.generation = ++nextSessionGeneration;
+      // A stream consumer registers here (onSessionReady) BEFORE the ack, so
+      // its size + primary policy is applied in the caller's onAck where the
+      // consumer object is in scope. The legacy JSON path has no consumer.
       onSessionReady?.(existing);
-      existing.pty.resize(frame.cols, frame.rows);
       onAck({ ok: true, live: true, generation: existing.generation });
-      // Legacy JSON has no stream object to add to the consumer set, so it
-      // replays only while no mux or broker stream is attached.
+      // Legacy JSON has no stream object in the consumer set, so it is the sole
+      // viewer: authoritatively drive the PTY to its size and replay the
+      // emulator's screen (or raw scrollback when no emulator exists).
       if (!isAttached(existing)) {
-        sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"));
-        for (const chunk of existing.scrollback) sendOut(existing, chunk);
+        applyCanonicalResize(existing, frame.cols, frame.rows);
+        if (existing.emulator !== null) {
+          sendOut(existing, serializeScreenBytes(existing.emulator));
+        } else {
+          sendOut(existing, new TextEncoder().encode("\x1b[2J\x1b[H"));
+          for (const chunk of existing.scrollback) sendOut(existing, chunk);
+        }
       }
       logInfo("session", "session re-attached", { id: existing.id });
       return;
@@ -944,6 +1166,11 @@ export const openSession = (
       pty: null,
       scrollback: [],
       scrollbackBytes: 0,
+      emulator: null,
+      canonicalCols: frame.cols,
+      canonicalRows: frame.rows,
+      primaryConsumer: null,
+      lastPrimaryElectionAtMs: 0,
       consumers: new Set(),
       outSeq: 0,
       startedAtMs: Date.now(),
@@ -985,13 +1212,26 @@ export const openSession = (
       let ptyReady = false;
       const onData = (chunk: Uint8Array): void => {
         s.lastOutputAtMs = Date.now();
+        // Keep raw scrollback for the no-stream fallback path, and feed the
+        // shared emulator that backs per-consumer reflow + attach replay.
         pushScrollback(s, chunk);
+        s.emulator?.write(chunk);
         if (!ptyReady) {
           pendingOutput.push(chunk);
           return;
         }
         sendOut(s, chunk);
       };
+      // Shared source-of-truth screen, born at the consumer's real size. Fed
+      // synchronously (fire-and-forget) as bytes arrive; xterm queues writes.
+      s.emulator = new Terminal({
+        cols: frame.cols,
+        rows: frame.rows,
+        scrollback: EMULATOR_SCROLLBACK_ROWS,
+        allowProposedApi: true,
+      });
+      s.canonicalCols = frame.cols;
+      s.canonicalRows = frame.rows;
       const pty = spawner({
         argv,
         cwd,
@@ -1066,11 +1306,19 @@ export const bindSessionStream = (
     writeTail: Promise.resolve(),
     queuedBytes: 0,
     exitHandler: opts.onExit ?? null,
+    cols: open.cols,
+    rows: open.rows,
+    view: null,
+    viewDirty: false,
+    lastActiveAtMs: Date.now(),
   };
   const registerConsumer = (session: TSession): void => {
     if (session.consumers.has(consumer)) return;
     session.consumers.add(consumer);
     session.detachedAtMs = null;
+    // If a canonical screen already exists at a different size, this consumer
+    // needs its own reflowed view now (the fast path leaves view === null).
+    if (session.emulator !== null) syncConsumerView(session, consumer);
   };
   const onAck = (ack: TSessionOpenAck): void => {
     if (!ack.ok) {
@@ -1101,11 +1349,23 @@ export const bindSessionStream = (
       }),
     );
     if (open.mode !== "attach") return;
-    // Snapshot before yielding. This consumer's private tail orders its
-    // repaint before subsequent live output without delaying other viewers.
-    const scrollback = [...session.scrollback];
-    writeConsumer(session, consumer, new TextEncoder().encode("\x1b[2J\x1b[H"));
-    for (const chunk of scrollback) writeConsumer(session, consumer, chunk);
+    // An attaching consumer applies the primary policy: it only yanks the PTY
+    // size if it becomes primary; otherwise it just gets a private view +
+    // serialized paint at its own size. This also serializes the CURRENT screen
+    // at THIS consumer's width — fixing replay that used to match capture width.
+    handleConsumerResize(
+      session,
+      consumer,
+      open.cols,
+      open.rows,
+      consumer.lastActiveAtMs,
+    );
+    // handleConsumerResize paints passive/differently-sized viewers. When the
+    // consumer became primary (or matches canonical with no view), paint the
+    // initial screen explicitly so every attach gets a repaint before live
+    // output. This consumer's private tail orders its repaint ahead of
+    // subsequent live output without delaying other viewers.
+    if (consumer.view === null) paintInitialScreen(session, consumer);
     consumer.writeTail = consumer.writeTail
       .then(() => stream.sendCtrl(encodeJsonPayload({ t: "replay_done" })))
       .catch(() => detachConsumer(session, consumer));
@@ -1128,12 +1388,42 @@ export const bindSessionStream = (
   consumer.unsubscribe.push(
     stream.onData((bytes) => {
       if (!session.consumers.has(consumer)) return;
+      // Typing marks this consumer active — the input driver becomes the
+      // most-recently-active viewer and thus the PTY-size primary.
+      consumer.lastActiveAtMs = Date.now();
       session.pty?.write(bytes);
     }),
     stream.onCtrl((payload) => {
       if (!session.consumers.has(consumer)) return;
       const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
-      if (ctrl?.t === "resize") session.pty?.resize(ctrl.cols, ctrl.rows);
+      if (ctrl?.t === "resize") {
+        // Resize also counts as focus/activity — a viewer that resizes wants to
+        // drive. Route through the primary-aware policy (last-attacher-wins is
+        // gone): only the primary yanks the PTY size.
+        consumer.lastActiveAtMs = Date.now();
+        handleConsumerResize(
+          session,
+          consumer,
+          ctrl.cols,
+          ctrl.rows,
+          consumer.lastActiveAtMs,
+        );
+      }
+      if (ctrl?.t === "focus") {
+        // Explicit focus claim (tab focus, desktop attach foreground) — same
+        // primacy path as a resize, but with the consumer's CURRENT size so a
+        // pure focus never invents dimensions. Idempotent when dims match
+        // canonical: re-elects primary (post-debounce) and only SIGWINCHes if
+        // this consumer's size differs from the PTY.
+        consumer.lastActiveAtMs = Date.now();
+        handleConsumerResize(
+          session,
+          consumer,
+          consumer.cols,
+          consumer.rows,
+          consumer.lastActiveAtMs,
+        );
+      }
       if (ctrl?.t === "close" && ctrl.intent === "kill") {
         endPty(session, "killed");
         // END is a clean terminal close to sessionStream.closed ("done").
