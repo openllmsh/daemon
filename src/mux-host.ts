@@ -120,6 +120,9 @@ const logDemuxWarning = (
 const reapIdleChannels = (): void => {
   const now = Date.now();
   for (const record of [...channels.values()]) {
+    // Consumer records are relay-owned channels opened to fleet peers. Closing
+    // one locally without a matching relay close leaves the peer bound to it.
+    if (record.keyId !== null) continue;
     if (record.channel.openStreamCount() > 0) continue;
     if (now - record.lastActivityAt < muxChannelIdleTtlMs) continue;
     logInfo("mux-host", "mux channel reaped: idle", {
@@ -128,7 +131,7 @@ const reapIdleChannels = (): void => {
     });
     closeChannelFromRelay({
       channel_id: record.channelId,
-      reason: "idle_timeout",
+      reason: "done",
     });
   }
 };
@@ -599,18 +602,12 @@ export const acceptChannel = (frame: {
  */
 export const closeChannelFromRelay = (frame: {
   readonly channel_id: string;
-  /** Wire frames carry TChannelCloseReason; the idle reaper adds "idle_timeout". */
-  readonly reason?: TChannelCloseReason | "idle_timeout";
+  readonly reason?: TChannelCloseReason;
 }): void => {
   // A close for a channel still being negotiated settles that open instead.
-  // ("idle_timeout" is reaper-local: a serving channel is never mid-negotiation,
-  // and the reason is not wire-legal for the failOpen channel_close it sends.)
   for (const [keyId, pending] of [...opening.entries()]) {
     if (pending.channelId === frame.channel_id) {
-      failOpen(
-        keyId,
-        frame.reason === "idle_timeout" ? undefined : frame.reason,
-      );
+      failOpen(keyId, frame.reason);
     }
   }
   const record = channels.get(frame.channel_id);
