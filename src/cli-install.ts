@@ -220,6 +220,7 @@ export const cliInstallState = async (
   const signature = binarySignature(bin);
   if (
     cached?.result.installed === true &&
+    cached.result.version !== null &&
     cached.signature === signature &&
     generation === cacheGeneration
   ) {

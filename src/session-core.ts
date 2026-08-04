@@ -65,6 +65,9 @@ const EMULATOR_SCROLLBACK_ROWS = 5000;
  *  resize CTRLs per second; the child only needs the final geometry. */
 const WINCH_DEBOUNCE_MS = 40;
 
+/** Refresh the process tree less often than resize events. */
+const WINCH_PROCESS_TREE_REFRESH_MS = 1_000;
+
 /** Detached idle timeout. Zero deliberately restores never-reap behavior. */
 const DEFAULT_SESSION_IDLE_TIMEOUT_MIN = 60;
 
@@ -733,15 +736,16 @@ const promoteSuccessorPrimary = (session: TSession): void => {
  * EMPTY set when the root is not present in the snapshot, so a stale pid can
  * never be mistaken for a live process and signalled.
  */
-const processTree = (rootPid: number): ReadonlySet<number> => {
-  const proc = Bun.spawnSync(["ps", "-Ao", "pid=,ppid="], {
+const processTree = async (rootPid: number): Promise<ReadonlySet<number>> => {
+  const proc = Bun.spawn(["ps", "-Ao", "pid=,ppid="], {
     stdout: "pipe",
     stderr: "ignore",
   });
-  if (proc.exitCode !== 0) return new Set();
+  const text = await new Response(proc.stdout).text();
+  if ((await proc.exited) !== 0) return new Set();
   const children = new Map<number, number[]>();
   let rootSeen = false;
-  for (const line of proc.stdout.toString().split("\n")) {
+  for (const line of text.split("\n")) {
     const [pidText, parentText] = line.trim().split(/\s+/);
     const pid = Number(pidText);
     const ppid = Number(parentText);
@@ -767,6 +771,57 @@ const processTree = (rootPid: number): ReadonlySet<number> => {
   return tree;
 };
 
+type TWinchProcessTree = {
+  pids: ReadonlySet<number>;
+  refreshedAtMs: number;
+  refresh: Promise<void> | null;
+};
+
+const winchProcessTrees = new Map<string, TWinchProcessTree>();
+
+const refreshWinchProcessTree = (session: TSession): void => {
+  const rootPid = session.pid;
+  if (rootPid === null) return;
+  const cached = winchProcessTrees.get(session.id);
+  if (cached?.refresh !== null && cached !== undefined) return;
+  const tree: TWinchProcessTree = cached ?? {
+    pids: new Set(),
+    refreshedAtMs: 0,
+    refresh: null,
+  };
+  const refresh = processTree(rootPid)
+    .then((pids) => {
+      tree.pids = pids;
+      tree.refreshedAtMs = Date.now();
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGWINCH");
+        } catch {
+          // Raced exit — the remaining tree still gets the signal.
+        }
+      }
+    })
+    .catch(() => {
+      tree.pids = new Set();
+      tree.refreshedAtMs = Date.now();
+    })
+    .finally(() => {
+      tree.refresh = null;
+    });
+  tree.refresh = refresh;
+  winchProcessTrees.set(session.id, tree);
+};
+
+const cachedWinchProcessTree = (session: TSession): ReadonlySet<number> => {
+  const cached = winchProcessTrees.get(session.id);
+  if (
+    cached === undefined ||
+    Date.now() - cached.refreshedAtMs >= WINCH_PROCESS_TREE_REFRESH_MS
+  )
+    refreshWinchProcessTree(session);
+  return cached?.pids ?? new Set();
+};
+
 /**
  * Deliver SIGWINCH to a session's whole process tree after a PTY resize.
  *
@@ -783,9 +838,8 @@ const processTree = (rootPid: number): ReadonlySet<number> => {
  * pid would signal the daemon itself.
  */
 const deliverWinch = (session: TSession): void => {
-  const rootPid = session.pid;
-  if (rootPid === null || session.pty === null) return;
-  for (const pid of processTree(rootPid)) {
+  if (session.pid === null || session.pty === null) return;
+  for (const pid of cachedWinchProcessTree(session)) {
     try {
       process.kill(pid, "SIGWINCH");
     } catch {
@@ -888,6 +942,7 @@ const endPty = (
 ): void => {
   s.lastExitReason = reason;
   cancelWinch(s.id);
+  winchProcessTrees.delete(s.id);
   if (kill) s.pty?.kill();
   s.pty = null;
   s.pid = null;
@@ -1279,10 +1334,6 @@ export const openSession = (
         },
       });
       s.pty = pty;
-      onSessionReady?.(s);
-      ptyReady = true;
-      for (const chunk of pendingOutput) sendOut(s, chunk);
-      pendingOutput.length = 0;
       s.pid = pty.pid ?? null;
       s.busy = true;
       s.lastBusyAtMs = Date.now();
@@ -1296,13 +1347,19 @@ export const openSession = (
       // pidfile adapter, while the standalone host supplies its own persistence.
       // Run it only after all persisted metadata has its final spawn values.
       lifecycleHooks.onSpawn(s);
+      onSessionReady?.(s);
       onAck({ ok: true, live: false, generation: s.generation });
+      ptyReady = true;
+      for (const chunk of pendingOutput) sendOut(s, chunk);
+      pendingOutput.length = 0;
       logInfo("session", "session started", {
         id: s.id,
         cli,
         mode: frame.mode,
       });
     } catch (err) {
+      s.emulator?.dispose();
+      s.emulator = null;
       sessions.delete(s.id);
       logWarn(
         "session",

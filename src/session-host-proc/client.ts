@@ -228,7 +228,8 @@ class CliPipeSessionStream implements TSessionStream {
     if (stdout !== null && typeof stdout !== "number") {
       void (async () => {
         const reader = (stdout as ReadableStream<Uint8Array>).getReader();
-        let ctrlBuffer = "";
+        const ctrlDecoder = new TextDecoder();
+        let ctrlBytes: number[] = [];
         let ctrlOverflow = false;
         try {
           for (;;) {
@@ -237,18 +238,20 @@ class CliPipeSessionStream implements TSessionStream {
             let index = 0;
             while (index < value.length) {
               if (
-                ctrlBuffer.length > 0 ||
+                ctrlBytes.length > 0 ||
                 ctrlOverflow ||
                 value[index] === PIPE_CTRL
               ) {
-                if (ctrlBuffer.length === 0 && !ctrlOverflow) index += 1;
+                if (ctrlBytes.length === 0 && !ctrlOverflow) index += 1;
                 while (index < value.length) {
                   const byte = value[index] ?? 0;
                   index += 1;
                   if (byte === 0x0a) {
                     if (!ctrlOverflow) {
                       try {
-                        const decoded: unknown = JSON.parse(ctrlBuffer);
+                        const decoded: unknown = JSON.parse(
+                          ctrlDecoder.decode(new Uint8Array(ctrlBytes)),
+                        );
                         if (
                           typeof decoded === "object" &&
                           decoded !== null &&
@@ -270,15 +273,15 @@ class CliPipeSessionStream implements TSessionStream {
                         // Malformed control — drop and keep streaming.
                       }
                     }
-                    ctrlBuffer = "";
+                    ctrlBytes = [];
                     ctrlOverflow = false;
                     break;
                   }
-                  ctrlBuffer += String.fromCharCode(byte);
-                  if (ctrlBuffer.length > PIPE_CTRL_MAX_BYTES) {
+                  ctrlBytes.push(byte);
+                  if (ctrlBytes.length > PIPE_CTRL_MAX_BYTES) {
                     // Keep consuming through newline so a malformed frame tail
                     // cannot be emitted as raw terminal output.
-                    ctrlBuffer = "";
+                    ctrlBytes = [];
                     ctrlOverflow = true;
                   }
                 }

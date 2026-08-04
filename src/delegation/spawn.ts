@@ -216,7 +216,7 @@ export const spawnLogin = async (
     if (abandoned) return;
     abandoned = true;
     try {
-      proc.kill("SIGKILL");
+      proc.kill("SIGTERM");
     } catch {
       // already gone
     }
@@ -391,13 +391,13 @@ export const spawnLoginPty = async (
       await new Promise((r) => setTimeout(r, UNTIL_SETTLE_MS));
       captured = await readFile();
       abandoned = true;
-      proc.kill("SIGKILL");
+      proc.kill("SIGTERM");
       break;
     }
     if (proc.exitCode !== null || proc.signalCode !== null) break; // exited
     if (Date.now() >= deadline) {
       abandoned = true;
-      proc.kill("SIGKILL");
+      proc.kill("SIGTERM");
       break;
     }
     await new Promise((r) => setTimeout(r, 400));

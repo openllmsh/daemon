@@ -29,8 +29,15 @@ interface CliStateCache {
   path: string;
   signature: string | null;
   version: string | null;
+  failedProbes: number;
 }
-let cache: CliStateCache = { path: "", signature: null, version: null };
+const MAX_FAILED_VERSION_PROBES = 3;
+let cache: CliStateCache = {
+  path: "",
+  signature: null,
+  version: null,
+  failedProbes: 0,
+};
 
 /** The CLI binary to probe: dev override first, then current, then legacy. */
 const installedBinary = (): string | null => resolveOpenllmCli();
@@ -44,18 +51,32 @@ const installedBinary = (): string | null => resolveOpenllmCli();
 export const refreshCliState = async (): Promise<TDaemonCliState> => {
   const bin = installedBinary();
   if (bin === null) {
-    cache = { path: "", signature: null, version: null };
+    cache = { path: "", signature: null, version: null, failedProbes: 0 };
     return { installed: false, version: null };
   }
   const signature = binarySignature(bin);
-  // Unchanged binary since the last successful probe → reuse the version, no spawn.
-  if (cache.path === bin && cache.signature === signature) {
+  // Unchanged binary with a known version → reuse it, no spawn. A failed probe
+  // is retried a bounded number of times before accepting its null result.
+  if (
+    cache.path === bin &&
+    cache.signature === signature &&
+    (cache.version !== null || cache.failedProbes >= MAX_FAILED_VERSION_PROBES)
+  ) {
     return { installed: true, version: cache.version };
   }
   // Legacy binaries print `openllmc vX.Y.Z`, current ones `openllm vX.Y.Z`.
   const out = await cliVersion(bin);
-  const version = out?.match(/openllmc? v(\S+)/)?.[1] ?? null;
-  cache = { path: bin, signature, version };
+  const probedVersion = out?.match(/openllmc? v(\S+)/)?.[1] ?? null;
+  const sameBinary = cache.path === bin && cache.signature === signature;
+  const failedProbes =
+    probedVersion === null ? (sameBinary ? cache.failedProbes : 0) + 1 : 0;
+  const keepPreviousVersion =
+    sameBinary &&
+    cache.version !== null &&
+    cache.failedProbes > 0 &&
+    failedProbes < MAX_FAILED_VERSION_PROBES;
+  const version = probedVersion ?? (keepPreviousVersion ? cache.version : null);
+  cache = { path: bin, signature, version, failedProbes };
   logDebug("device-state", "cli state", { installed: true, version });
   return { installed: true, version };
 };
@@ -69,7 +90,7 @@ export const refreshCliState = async (): Promise<TDaemonCliState> => {
 export const getCliState = (): TDaemonCliState => {
   const bin = installedBinary();
   if (bin === null) {
-    cache = { path: "", signature: null, version: null };
+    cache = { path: "", signature: null, version: null, failedProbes: 0 };
     return { installed: false, version: null };
   }
   if (cache.path === bin && cache.signature === binarySignature(bin)) {

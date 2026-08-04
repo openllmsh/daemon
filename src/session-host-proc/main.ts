@@ -333,6 +333,7 @@ export const runSessionHost = (
   let server: Bun.Server<TSocketData> | null = null;
   let activityTimer: ReturnType<typeof setInterval> | null = null;
   let cleaned = false;
+  let ownsClaim = false;
   let meta: TSessionHostMeta | null = null;
   let published = false;
 
@@ -349,7 +350,7 @@ export const runSessionHost = (
     server?.stop(true);
     if (published) rmSync(directory, { recursive: true, force: true });
     rmSync(stagingDirectory, { recursive: true, force: true });
-    rmSync(claim, { recursive: true, force: true });
+    if (ownsClaim) rmSync(claim, { recursive: true, force: true });
   };
   const exit = (): void => {
     cleanup();
@@ -366,6 +367,7 @@ export const runSessionHost = (
       throw error;
     }
     rmSync(claim, { recursive: true, force: true });
+    ownsClaim = false;
   };
 
   const writeMeta = (): void => {
@@ -387,6 +389,7 @@ export const runSessionHost = (
   try {
     mkdirSync(root, { recursive: true, mode: SESSION_DIR_MODE });
     mkdirSync(claim, { mode: SESSION_DIR_MODE });
+    ownsClaim = true;
   } catch {
     fail();
     return;

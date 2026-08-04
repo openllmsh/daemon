@@ -6,7 +6,7 @@
  * reconciliation while never creating or retaining a daemon-owned session.
  */
 
-import { readdirSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { TDeviceSessionCli } from "@openllmsh/protocol";
 import { SESSION_ID_PATTERN } from "@openllmsh/protocol";
@@ -30,7 +30,12 @@ export const reapOrphanSessionProcs = (): void => {
   }
   for (const id of entries) {
     if (!SESSION_ID_PATTERN.test(id) || live.has(id)) continue;
-    logInfo("session", "reaped stale durable session registry entry", { id });
+    try {
+      rmSync(join(sessionRoot(), id), { recursive: true, force: true });
+      logInfo("session", "reaped stale durable session registry entry", { id });
+    } catch {
+      // Leave an unreadable entry for a later reconciliation attempt.
+    }
   }
 };
 

@@ -14,6 +14,7 @@ type TSummaryFile = {
 };
 
 const MAX_WALK_DEPTH = 6;
+const MAX_WALK_BURST = 8;
 const MAX_PARSE_BURST = 8;
 
 export const parseUpdatedMs = (raw: unknown, fallback: number): number => {
@@ -26,46 +27,46 @@ export const parseUpdatedMs = (raw: unknown, fallback: number): number => {
 };
 
 const walkSummaryCandidates = async (
-  dir: string,
-  depth: number,
+  root: string,
   candidates: TSummaryFile[],
 ): Promise<void> => {
-  if (depth > MAX_WALK_DEPTH) return;
+  const work: Array<{ readonly dir: string; readonly depth: number }> = [
+    { dir: root, depth: 0 },
+  ];
 
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  if (entries.length === 0) return;
+  const visit = async ({
+    dir,
+    depth,
+  }: {
+    readonly dir: string;
+    readonly depth: number;
+  }): Promise<void> => {
+    if (depth > MAX_WALK_DEPTH) return;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (
+        entry.name === "session_search.sqlite" ||
+        entry.name.endsWith(".lock")
+      ) {
+        continue;
+      }
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        work.push({ dir: path, depth: depth + 1 });
+        continue;
+      }
+      if (!entry.isFile() || entry.name !== "summary.json") continue;
+      const file = await stat(path).catch(() => null);
+      if (file?.isFile()) {
+        candidates.push({ path, mtime: file.mtimeMs });
+      }
+    }
+  };
 
-  const childDirs: string[] = [];
-  const summaryCandidates: Array<{ path: string }> = [];
-
-  for (const entry of entries) {
-    if (
-      entry.name === "session_search.sqlite" ||
-      entry.name.endsWith(".lock")
-    ) {
-      continue;
-    }
-    const abs = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      childDirs.push(abs);
-      continue;
-    }
-    if (entry.isFile() && entry.name === "summary.json") {
-      summaryCandidates.push({ path: abs });
-    }
+  while (work.length > 0) {
+    const batch = work.splice(0, MAX_WALK_BURST);
+    await Promise.all(batch.map(visit));
   }
-
-  for (let i = 0; i < summaryCandidates.length; i += 1) {
-    const { path } = summaryCandidates[i] ?? {};
-    if (path === undefined) continue;
-    const st = await stat(path).catch(() => null);
-    if (st === null || !st.isFile()) continue;
-    candidates.push({ path, mtime: st.mtimeMs });
-  }
-
-  await Promise.all(
-    childDirs.map((child) => walkSummaryCandidates(child, depth + 1, candidates)),
-  );
 };
 
 const forEachLimit = async <T>(
@@ -104,7 +105,7 @@ export const readGrokHistory = async (
 
   const parseBudget = Math.max(1, Math.min(Math.floor(limit), 400));
   const candidates: TSummaryFile[] = [];
-  await walkSummaryCandidates(root, 0, candidates);
+  await walkSummaryCandidates(root, candidates);
 
   const toParse = [...candidates]
     .sort((a, b) => b.mtime - a.mtime)

@@ -20,6 +20,7 @@
  *   openllmd -h | --help          show help
  *   openllmd -v | --version       show version
  */
+import { isAbsolute } from "node:path";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { COMMANDS, FLAGS } from "./commands";
 import { runCompletion } from "./completion";
@@ -145,9 +146,13 @@ export const runCli = (): boolean => {
     // home, used ONLY to build the working set — most call sites spawn the shim
     // with the child's isolated `HOME`. See `sandbox/exec.ts` `HOME_FLAG`.
     const homeFlag = args.indexOf("--home");
-    const home =
+    const homeValue =
       homeFlag >= 0 && (sep < 0 || homeFlag < sep)
         ? args[homeFlag + 1]
+        : undefined;
+    const home =
+      homeValue !== undefined && homeValue !== "--" && isAbsolute(homeValue)
+        ? homeValue
         : undefined;
     // apply + spawn + mirror exit. `runSandboxExec` never resolves; guard a
     // REJECTION (an unexpected throw before the exit mirror) so it can't

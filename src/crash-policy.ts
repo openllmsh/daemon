@@ -27,9 +27,8 @@
  * Deliberately a closed list of transport errnos rather than anything
  * resembling a network error: an unrecognised throw must keep exiting, because
  * the whole value of the last-resort handler is not limping on after a real
- * fault. `EPERM` is here for the Linux-specific case where a local firewall
- * rejects an outbound datagram, which surfaces on the socket exactly like the
- * ICMP path above.
+ * fault. Permission errors are deliberately excluded because they can also
+ * originate in unrelated local filesystem or process operations.
  */
 export const TRANSIENT_NETWORK_CODES: ReadonlySet<string> = new Set([
   "ECONNREFUSED",
@@ -39,7 +38,6 @@ export const TRANSIENT_NETWORK_CODES: ReadonlySet<string> = new Set([
   "ENETDOWN",
   "EPIPE",
   "ETIMEDOUT",
-  "EPERM",
 ]);
 
 /** `Error: ECONNREFUSED: connection refused, recv` — Bun puts the errno first

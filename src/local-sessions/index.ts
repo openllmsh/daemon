@@ -195,15 +195,19 @@ export const readLocalSessions = async (
 
   for (const s of device) {
     if (s.cli !== cli) continue;
-    const vendorKey =
+    const vendorSessionId =
       s.vendor_session_id !== null &&
       s.vendor_session_id !== undefined &&
       s.vendor_session_id.length > 0
-        ? `vendor:${s.vendor_session_id}`
+        ? s.vendor_session_id
+        : null;
+    const vendorKey =
+      vendorSessionId !== null
+        ? `vendor:${vendorSessionId}`
         : `openllm:${s.id}`;
     put(
       {
-        id: s.vendor_session_id ?? s.id,
+        id: vendorSessionId ?? s.id,
         title: s.title ?? "Untitled",
         cwd: s.cwd ?? null,
         updated_at_ms: s.started_at_ms,
