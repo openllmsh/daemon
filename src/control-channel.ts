@@ -45,17 +45,6 @@ import {
 } from "./rtc-host";
 import { computeStatus } from "./status";
 import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
-import {
-  failAllConsumedTunnels,
-  handleConsumedTunnelFrame,
-  ownsTunnel,
-  registerTunnelSender,
-} from "./tunnel-client";
-import {
-  abortAllTunnels,
-  handleTunnelFrame,
-  isTunnelFrame,
-} from "./tunnel-server";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
@@ -184,13 +173,11 @@ const send = (frame: TRelayFrame): void => {
   }
 };
 
-/** Reset relay-owned work at a connection boundary. Consumed tunnels, served
- * tunnels, mux channels, and RTC signaling sessions are tied to the old
- * relay socket and must not continue into the successor. Device PTYs DETACH
- * (survive); the browser re-attaches after reconnect. */
+/** Reset relay-owned work at a connection boundary. Mux channels and RTC
+ * signaling sessions are tied to the old relay socket and must not continue
+ * into the successor. Device PTYs DETACH (survive); the browser re-attaches
+ * after reconnect. */
 export const resetRelayScopedState = (): void => {
-  abortAllTunnels();
-  failAllConsumedTunnels();
   resetAllChannels();
   // Keep RTC sessions whose mux already mounted — the peer connection and
   // data channel do not ride the relay socket and survive reconnect.
@@ -548,26 +535,9 @@ const dispatchFrame = (frame: TRelayFrame): void => {
       updateMuxPeerCaps(frame.key_id, frame.active ? frame.caps : undefined);
       return;
     default:
-      // Subscription tunnels. This daemon can be BOTH ends: the CONSUMER of
-      // tunnels it opened (routed by tunnel-id ownership — acks/res frames)
-      // and the SERVER of tunnels a fleet peer/browser opened (everything
-      // else). Both run on their own async tasks — never the commandTail (a
-      // streaming response would block every command).
-      if (frame.type === "tunnel_open_ack") {
-        handleConsumedTunnelFrame(frame);
-        return;
-      }
-      if (isTunnelFrame(frame)) {
-        if (frame.type !== "tunnel_open" && ownsTunnel(frame.tunnel_id)) {
-          handleConsumedTunnelFrame(frame);
-          return;
-        }
-        handleTunnelFrame(frame, send);
-        return;
-      }
-      // Session traffic is mux-only. The unpublished legacy JSON session_*
-      // frames intentionally have no fallback path after durable-host migration.
-      // Others: nothing to do (partysocket owns reconnection).
+      // Subscription tunnels + device sessions are mux-only (RTC → relay
+      // binary mux). No JSON `tunnel_*`/`session_*` splice remains — an
+      // unrecognized frame has nothing to do (partysocket owns reconnection).
       return;
   }
 };
@@ -689,10 +659,6 @@ export const migrateIfRelayMoved = async (
 export const startControlChannel = (): void => {
   if (ws !== null) return;
   logInfo("control-channel", "connecting over websocket");
-  // Give the tunnel CLIENT (walker → fleet peer) a frame sender without a
-  // walker→control-channel import (which would close an import cycle via
-  // tunnel-server → listener → walker).
-  registerTunnelSender(send);
   configureMuxHost({ send, sendBytes });
   configureRtcHost({ send });
   configureRtcClient({ send });

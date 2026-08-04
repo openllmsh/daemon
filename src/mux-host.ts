@@ -1,5 +1,5 @@
 import type { TChannelCloseReason, TRelayFrame } from "@openllmsh/protocol";
-import { MUX_CAP, MUX2_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
+import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
 import {
   decodeChannelEnvelope,
   encodeChannelEnvelope,
@@ -23,16 +23,14 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 /**
  * Base capabilities advertised on hello/status.
- * `mux1` = binary mux over the relay WS; `mux2` = the channel-id envelope on
- * each relay-WS binary message, which lets ONE relay socket carry several
- * concurrent channels (the daemon always envelopes its relay-WS channels — the
- * relay bridges to a legacy `mux1`-only peer, so no peer-cap knowledge is
- * needed); `rtc1` = WebRTC data-channel mux host and fleet consumer offerer
- * (RTC → relay mux → JSON splice). RTC data channels are NEVER enveloped —
- * they carry a single mux directly, with no relay hop. `seedgate1` is layered
- * on when a device-access pubkey is pinned — see {@link currentDaemonCaps}.
+ * `mux` (wire `"mux2"`) = binary mux over the relay WS with the channel-id
+ * envelope on each binary message, which lets ONE relay socket carry several
+ * concurrent channels; `rtc1` = WebRTC data-channel mux host and fleet consumer
+ * offerer (RTC → relay mux). RTC data channels are NEVER enveloped — they carry
+ * a single mux directly, with no relay hop. `seedgate1` is layered on when a
+ * device-access pubkey is pinned — see {@link currentDaemonCaps}.
  */
-export const DAEMON_MUX_CAPS = [MUX_CAP, MUX2_CAP, RTC_CAP] as const;
+export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP] as const;
 
 /**
  * `OPENLLM_RTC_DISABLE=1` withdraws `rtc1` only.

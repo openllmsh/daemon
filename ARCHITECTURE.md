@@ -92,7 +92,7 @@ daemon/
     cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record)
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
-    mux-host.ts             mux1/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
+    mux-host.ts             mux2/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
     session-core.ts         transport-neutral PTY state machine: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping
     session-host.ts         legacy browser/relay adapter plus durable socket-directory boot reconciler; retains only temporary in-daemon browser PTY ownership until Phase 2
     session-host-proc/      detached per-session host: owns one durable PTY, scrollback, idle reaping, meta.json, and ctl.sock
@@ -100,7 +100,7 @@ daemon/
     rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice + mux over data channel
     rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice + mux over data channel
     tunnel-client.ts        consuming subscription tunnel: RTC (when open) → relay mux only (no JSON splice)
-    tunnel-server.ts        serving in-process tunneled request dispatch for JSON and mux streams
+    tunnel-server.ts        serving in-process tunneled request dispatch for mux streams
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
       types.ts              TProviderDelegate contract
@@ -330,20 +330,20 @@ walker's own `report`. Offline coverage:
 ## Tunnel transport
 
 Consumer ladder (browser and fleet daemon): **RTC (when open) → relay binary
-mux**. There is no JSON `tunnel_*` / `session_*` splice on the consumer path —
-if neither RTC nor mux is available the hop fails and the walker continues.
-Mux peers that both advertise `mux2` use the channel-id envelope (per-device
-channels on one watcher socket); legacy `mux1` stays single-channel. RTC
-refusals return an explicit `rtc_nack` (seedgate / overloaded / disabled /
-not_capable) instead of silent signaling timeouts. Detail lives in
+mux**. The legacy JSON `tunnel_*` / `session_*` splice has been removed — if
+neither RTC nor mux is available the hop fails and the walker continues. Mux
+peers carry the `mux2` channel-id envelope on every relay binary message
+(per-device channels multiplex on one watcher socket). RTC refusals return an
+explicit `rtc_nack` (seedgate / overloaded / disabled / not_capable) instead of
+silent signaling timeouts. Detail lives in
 `@packages/daemon-relay/ARCHITECTURE.md` (relay) and
 `@packages/tunnel/ARCHITECTURE.md` (codec / envelope / RTC helpers).
 
 - `mux-host.ts` owns relay duplex/channel state, negotiates `channel_open` /
   `channel_open_ack`, receives mux OPEN frames, and dispatches via
-  `serveStream` into `tunnel-server.ts`. Advertises `mux1` (+ `mux2` when
-  capable) + `rtc1`, and layers `seedgate1` when a device-access pubkey is
-  pinned from bootstrap.
+  `serveStream` into `tunnel-server.ts`. Advertises `mux` (wire `mux2`) +
+  `rtc1`, and layers `seedgate1` when a device-access pubkey is pinned from
+  bootstrap.
 - `rtc-host.ts` is the werift RTC answerer for browser or fleet-peer offers:
   same-user `rtc_offer` / `rtc_answer` / `rtc_ice` / `rtc_nack` traverse the
   relay, then the mux runs over the data channel (signaling-only relay;

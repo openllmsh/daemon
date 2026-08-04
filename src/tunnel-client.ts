@@ -35,27 +35,6 @@ const isPreDispatchTunnelError = (error: unknown): boolean => {
 };
 
 /**
- * Kept as a no-op so control-channel registration stays a single call site.
- * The consumer no longer opens JSON tunnels, so no sender is required.
- */
-export const registerTunnelSender = (_send: unknown): void => {
-  /* RTC/mux only — no JSON consumer frames to send. */
-};
-
-/** Always false: the consumer never owns JSON tunnel ids. */
-export const ownsTunnel = (_tunnelId: string): boolean => false;
-
-/** No-op: there are no in-flight JSON consumer tunnels to fail. */
-export const failAllConsumedTunnels = (): void => {
-  /* RTC/mux only. */
-};
-
-/** No-op: JSON consumer frames are not handled. */
-export const handleConsumedTunnelFrame = (_frame: unknown): void => {
-  /* RTC/mux only. */
-};
-
-/**
  * Tunnel one request to the fleet peer serving `keyId`. Resolves once the
  * response head arrives (body streams thereafter); rejects when neither RTC
  * nor mux is available, or when the stream fails.
@@ -130,7 +109,7 @@ export const tunnelToPeer = async (args: {
   const mux = await muxChannelTo(args.keyId);
   if (mux === null) {
     throw new Error(
-      "Device transport unavailable. Peer has neither RTC nor mux1 — update OpenLLM on the peer.",
+      "Device transport unavailable. Peer has neither RTC nor mux — update OpenLLM on the peer.",
     );
   }
   logInfo("tunnel-client", "tunneling hop to fleet peer", {
