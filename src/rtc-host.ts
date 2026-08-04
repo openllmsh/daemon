@@ -26,6 +26,7 @@ import {
   negotiateRtcPayloadCap,
   resolveIceServers,
   sdpFingerprintsMatch,
+  weriftIceServers,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
@@ -81,14 +82,12 @@ const iceServers = (): Array<{
   username?: string;
   credential?: string;
 }> =>
-  resolveIceServers(
-    process.env.OPENLLM_RTC_ICE_SERVERS ?? process.env.OPENLLM_RTC_STUN,
-    handshakeIceServers,
-  ).map((s) => ({
-    urls: typeof s.urls === "string" ? s.urls : [...s.urls],
-    ...(s.username !== undefined ? { username: s.username } : {}),
-    ...(s.credential !== undefined ? { credential: s.credential } : {}),
-  }));
+  weriftIceServers(
+    resolveIceServers(
+      process.env.OPENLLM_RTC_ICE_SERVERS ?? process.env.OPENLLM_RTC_STUN,
+      handshakeIceServers,
+    ),
+  );
 
 /** Send a non-silent RTC reject to the offerer so it fails fast instead of
  *  waiting out the signaling/ICE timeout. Best-effort — a racing socket close
@@ -260,32 +259,12 @@ export const handleRtcOffer = async (frame: {
 }): Promise<void> => {
   const send = sendFrame;
   if (send === null) return;
-  // `rtc1` withdrawn (see `mux-host.ts`): refuse before building a peer
-  // connection, so a browser holding a stale capability snapshot cannot make
-  // this host gather ICE anyway. Silent, like every other reject here.
-  if (process.env.OPENLLM_RTC_DISABLE === "1") {
-    logWarn("rtc-host", "rtc_offer refused: rtc disabled", {
-      channelId: frame.channel_id,
-    });
-    // Posture won't change soon — nack so the offerer caches + skips RTC.
-    sendNack(frame.channel_id, "disabled");
-    return;
-  }
   if (sessions.has(frame.channel_id)) {
     // A retransmit of an in-flight offer, not a reject — stay silent (a nack
     // would tear the caller's healthy pending attempt).
     logWarn("rtc-host", "duplicate rtc_offer", {
       channelId: frame.channel_id,
     });
-    return;
-  }
-  if (sessions.size >= MAX_CONCURRENT_RTC) {
-    logWarn("rtc-host", "rtc session cap reached", {
-      channelId: frame.channel_id,
-      cap: MAX_CONCURRENT_RTC,
-    });
-    // Transient — nack so the offerer fails fast; it applies a short/no cache.
-    sendNack(frame.channel_id, "overloaded");
     return;
   }
 
@@ -310,6 +289,23 @@ export const handleRtcOffer = async (frame: {
     logWarn("rtc-host", "offer fingerprint mismatch", {
       channelId: frame.channel_id,
     });
+    return;
+  }
+  // `rtc1` withdrawn (see `mux-host.ts`): an authenticated stale offer gets a
+  // nack so its peer caches the durable posture without exposing it to probes.
+  if (process.env.OPENLLM_RTC_DISABLE === "1") {
+    logWarn("rtc-host", "rtc_offer refused: rtc disabled", {
+      channelId: frame.channel_id,
+    });
+    sendNack(frame.channel_id, "disabled");
+    return;
+  }
+  if (sessions.size >= MAX_CONCURRENT_RTC) {
+    logWarn("rtc-host", "rtc session cap reached", {
+      channelId: frame.channel_id,
+      cap: MAX_CONCURRENT_RTC,
+    });
+    sendNack(frame.channel_id, "overloaded");
     return;
   }
 

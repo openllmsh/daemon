@@ -25,6 +25,7 @@ import {
   resolveIceServers,
   sdpFingerprintsMatch,
   verifyAnswerInner,
+  weriftIceServers,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
@@ -89,14 +90,12 @@ const iceServers = (): Array<{
   username?: string;
   credential?: string;
 }> =>
-  resolveIceServers(
-    process.env.OPENLLM_RTC_ICE_SERVERS ?? process.env.OPENLLM_RTC_STUN,
-    handshakeIceServers,
-  ).map((s) => ({
-    urls: typeof s.urls === "string" ? s.urls : [...s.urls],
-    ...(s.username !== undefined ? { username: s.username } : {}),
-    ...(s.credential !== undefined ? { credential: s.credential } : {}),
-  }));
+  weriftIceServers(
+    resolveIceServers(
+      process.env.OPENLLM_RTC_ICE_SERVERS ?? process.env.OPENLLM_RTC_STUN,
+      handshakeIceServers,
+    ),
+  );
 
 const asRtcDataChannelLike = (dc: RTCDataChannel): TRtcDataChannelLike => ({
   get readyState() {
@@ -508,6 +507,9 @@ export const getRtcMuxChannel = (keyId: string): TMuxChannel | null => {
   if (failureCached(keyId)) return null;
   return sessionsByKey.get(keyId)?.mux ?? null;
 };
+
+/** Test/diagnostic seam for verifying pending RTC session teardown. */
+export const rtcClientSessionCount = (): number => sessionsByChannel.size;
 
 /** Preserve mounted peer connections across a relay reconnect. */
 export const resetUnmountedRtcClientSessions = (): void => {

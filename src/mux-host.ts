@@ -228,27 +228,27 @@ const registerChannel = (
   keyId: string | null,
   side: "consumer" | "daemon",
 ): TRelayChannel => {
-  const record: TRelayChannel = {
-    channelId,
-    keyId,
-    channel: null as unknown as TMuxChannel,
-    sink: null,
-  };
+  let sink: ((bytes: Uint8Array | null) => void) | null = null;
+  let record: TRelayChannel | null = null;
   const duplex = relayDuplex(
     (bytes) => sendBinary?.(encodeChannelEnvelope(channelId, bytes)),
     (callback) => {
-      record.sink = callback;
+      sink = callback;
+      if (record !== null) record.sink = callback;
     },
   );
-  (record as { channel: TMuxChannel }).channel = createChannel({
+  const channel = createChannel({
     duplex,
     side,
     ...(side === "daemon" ? { onStream: serveMuxOnStream } : {}),
     onClose: () => {
-      if (channels.get(channelId) === record) channels.delete(channelId);
-      record.sink = null;
+      if (record !== null && channels.get(channelId) === record) {
+        channels.delete(channelId);
+      }
+      if (record !== null) record.sink = null;
     },
   });
+  record = { channel, channelId, keyId, sink };
   channels.set(channelId, record);
   return record;
 };
