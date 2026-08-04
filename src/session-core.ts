@@ -175,12 +175,6 @@ type TAttachedConsumer = {
   /** This consumer's viewport size (may differ from the canonical PTY size). */
   cols: number;
   rows: number;
-  /** Per-consumer emulator, created ONLY when this consumer's size differs
-   *  from the session's canonical size; null when it matches (raw fast path). */
-  view: Terminal | null;
-  /** Whether a per-consumer serialize is already queued on a microtask —
-   *  coalesces bursts of chunks into ONE screen serialize (see fanOut). */
-  viewDirty: boolean;
   /** When this consumer last focused or resized. Only used to pick a successor
    *  when the primary leaves — the most recently focused viewer takes over. */
   lastActiveAtMs: number;
@@ -603,9 +597,6 @@ const detachConsumer = (
   if (!session.consumers.delete(consumer)) return;
   consumer.exitHandler = null;
   consumer.queuedBytes = 0;
-  consumer.view?.dispose();
-  consumer.view = null;
-  consumer.viewDirty = false;
   for (const unsubscribe of consumer.unsubscribe) unsubscribe();
   // A departing primary hands the PTY size to the most recently focused
   // survivor. Leaving it vacant would strand the remaining viewers rendering
@@ -662,53 +653,18 @@ const writeConsumer = (
     .catch(() => {});
 };
 
-/** Schedule a coalesced per-consumer repaint. Multiple chunks arriving before
- *  the microtask fires collapse into ONE serialize of the reflowed view —
- *  avoiding an O(rows*cols) serialize per output byte on the hot path.
- *  TRADEOFF (v1): this is a full-screen serialize, not a true dirty-row diff. */
-const scheduleViewRepaint = (
-  session: TSession,
-  consumer: TAttachedConsumer,
-): void => {
-  if (consumer.viewDirty) return;
-  consumer.viewDirty = true;
-  queueMicrotask(() => {
-    consumer.viewDirty = false;
-    const view = consumer.view;
-    if (view === null || !session.consumers.has(consumer)) return;
-    writeConsumer(session, consumer, serializeScreenBytes(view));
-  });
-};
-
-/** Feed a chunk to a consumer's private view and repaint once it has been
- *  PARSED. `xterm`'s write queue is asynchronous, so serializing without
- *  waiting for the write callback captures the screen as it was BEFORE the
- *  chunk — leaving a passive viewer permanently one frame behind, and showing
- *  a stale screen outright when the burst it lagged on was the last one. */
-const writeViewAndRepaint = (
-  session: TSession,
-  consumer: TAttachedConsumer,
-  chunk: Uint8Array,
-): void => {
-  consumer.view?.write(chunk, () => {
-    scheduleViewRepaint(session, consumer);
-  });
-};
-
-/** Fan out one out-direction chunk to every attached consumer. Consumers whose
- *  size matches canonical get the raw bytes (byte-identical fast path); others
- *  feed their private emulator and get a coalesced reflowed repaint. */
+/** Fan out one out-direction chunk to every attached consumer — byte-identical.
+ *
+ *  Consumers all render the PTY's grid, so there is nothing to reflow per
+ *  viewer and nothing to re-serialize. Each viewer used to keep a private
+ *  emulator at its own size and receive a FULL-SCREEN repaint per output chunk,
+ *  which is what made a second viewer flash back to an older frame: the repaint
+ *  is a clear plus a redraw of a screen reconstructed a step behind the raw
+ *  stream. A viewer larger than the PTY now simply leaves margin; a smaller one
+ *  wraps until it takes focus, at which point the PTY fits it. */
 const fanOut = (session: TSession, chunk: Uint8Array): void => {
-  for (const consumer of session.consumers) {
-    if (consumer.view === null) {
-      // Fast path: identical size — raw passthrough, zero emulation cost.
-      writeConsumer(session, consumer, chunk);
-      continue;
-    }
-    // Differently-sized viewer: keep the private emulator current, then queue a
-    // coalesced serialize at this consumer's size — once the chunk is parsed.
-    writeViewAndRepaint(session, consumer, chunk);
-  }
+  for (const consumer of session.consumers)
+    writeConsumer(session, consumer, chunk);
 };
 
 /** Fan out one out-direction chunk to every attached transport-neutral consumer. */
@@ -720,46 +676,8 @@ const sendOut = (session: TSession, chunk: Uint8Array): void => {
   session.fallback?.onOutput(session, chunk);
 };
 
-/** (Re)build a consumer's private view at its own size by replaying the shared
- *  emulator's current screen into a fresh emulator, then paint it. When the
- *  consumer size matches canonical, drop the view entirely (raw fast path). */
-const syncConsumerView = (
-  session: TSession,
-  consumer: TAttachedConsumer,
-): void => {
-  const matchesCanonical =
-    consumer.cols === session.canonicalCols &&
-    consumer.rows === session.canonicalRows;
-  if (matchesCanonical) {
-    consumer.view?.dispose();
-    consumer.view = null;
-    return;
-  }
-  // Dispose any stale view, then build one seeded with the shared emulator's
-  // current screen. Per @xterm/addon-serialize's guidance, write the snapshot
-  // into a view of the SAME size it originated from (the canonical size), then
-  // resize to the consumer's size so xterm reflows the normal buffer cleanly
-  // (the alt buffer is absolute-positioned, so it clips — a letterbox, matching
-  // tmux). Seeding at the consumer size directly would still reflow (the
-  // serialization is width-agnostic), but same-size-then-resize avoids any
-  // deserialization artifact at the seam.
-  consumer.view?.dispose();
-  const view = new Terminal({
-    cols: session.canonicalCols,
-    rows: session.canonicalRows,
-    scrollback: EMULATOR_SCROLLBACK_ROWS,
-    allowProposedApi: true,
-  });
-  consumer.view = view;
-  if (session.emulator !== null) {
-    view.write(serializeScreenBytes(session.emulator));
-  }
-  view.resize(consumer.cols, consumer.rows);
-};
-
-/** Serialize the best current screen for THIS consumer's size as its initial
- *  attach paint. Prefers the shared emulator (reflowed/clipped to the
- *  consumer's view); falls back to raw scrollback replay when no emulator. */
+/** Paint the current screen for a newly attached consumer: one serialize of the
+ *  shared emulator, which is the same grid every consumer renders. */
 const paintInitialScreen = (
   session: TSession,
   consumer: TAttachedConsumer,
@@ -771,11 +689,7 @@ const paintInitialScreen = (
       writeConsumer(session, consumer, chunk);
     return;
   }
-  // Ensure the consumer has a correctly-sized view (or the raw fast path), then
-  // serialize the screen at its size.
-  syncConsumerView(session, consumer);
-  const source = consumer.view ?? session.emulator;
-  writeConsumer(session, consumer, serializeScreenBytes(source));
+  writeConsumer(session, consumer, serializeScreenBytes(session.emulator));
 };
 
 /**
@@ -918,20 +832,14 @@ const applyCanonicalResize = (
   // The winsize ioctl alone does not wake the child — see deliverWinch.
   if (session.pty !== null) scheduleWinch(session);
   session.emulator?.resize(cols, rows);
-  for (const consumer of session.consumers) syncConsumerView(session, consumer);
 };
 
 /**
- * Record a consumer's viewport and reconcile what it should be shown.
+ * Record a consumer's viewport, and resize the PTY when that consumer is the
+ * primary — the one that last actually took focus.
  *
- * The PRIMARY's viewport IS the canonical PTY size. Every other viewer keeps a
- * private emulator at its own size and is repainted from the shared screen.
- * Nothing here decides primacy — see {@link claimPrimary}.
- *
- * Both branches are no-ops when nothing actually changed. A focus claim arrives
- * with the dims the consumer already has, and rebuilding a view + writing a
- * full-screen repaint for that would strobe the viewer for no reason; live
- * output (`fanOut` → `scheduleViewRepaint`) is what keeps it current.
+ * Only the primary's size reaches the PTY. Everyone else just has their number
+ * remembered, for when they take focus.
  */
 const setConsumerViewport = (
   session: TSession,
@@ -939,28 +847,16 @@ const setConsumerViewport = (
   cols: number,
   rows: number,
 ): void => {
-  const changed = consumer.cols !== cols || consumer.rows !== rows;
   consumer.cols = cols;
   consumer.rows = rows;
-  if (session.primaryConsumer === consumer) {
-    if (
-      session.canonicalCols !== cols ||
-      session.canonicalRows !== rows ||
-      session.emulator === null
-    ) {
-      applyCanonicalResize(session, cols, rows);
-    } else if (changed || consumer.view !== null) {
-      // Already canonical-sized with no view: nothing to reconcile. Only a real
-      // change, or a stale view left from when it was passive, needs a sync.
-      syncConsumerView(session, consumer);
-    }
-    return;
+  if (session.primaryConsumer !== consumer) return;
+  if (
+    session.canonicalCols !== cols ||
+    session.canonicalRows !== rows ||
+    session.emulator === null
+  ) {
+    applyCanonicalResize(session, cols, rows);
   }
-  // Passive viewer: never touches the PTY.
-  if (!changed && consumer.view !== null) return;
-  syncConsumerView(session, consumer);
-  if (consumer.view !== null)
-    writeConsumer(session, consumer, serializeScreenBytes(consumer.view));
 };
 
 const terminalClose = (session: TSession, reason: "done" | "killed"): void => {
@@ -1441,17 +1337,12 @@ export const bindSessionStream = (
     exitHandler: opts.onExit ?? null,
     cols: open.cols,
     rows: open.rows,
-    view: null,
-    viewDirty: false,
     lastActiveAtMs: Date.now(),
   };
   const registerConsumer = (session: TSession): void => {
     if (session.consumers.has(consumer)) return;
     session.consumers.add(consumer);
     session.detachedAtMs = null;
-    // If a canonical screen already exists at a different size, this consumer
-    // needs its own reflowed view now (the fast path leaves view === null).
-    if (session.emulator !== null) syncConsumerView(session, consumer);
   };
   const onAck = (ack: TSessionOpenAck): void => {
     if (!ack.ok) {
@@ -1494,12 +1385,10 @@ export const bindSessionStream = (
       claimPrimary(session, consumer, consumer.lastActiveAtMs);
     }
     setConsumerViewport(session, consumer, open.cols, open.rows);
-    // setConsumerViewport paints passive/differently-sized viewers. When the
-    // consumer became primary (or matches canonical with no view), paint the
-    // initial screen explicitly so every attach gets a repaint before live
-    // output. This consumer's private tail orders its repaint ahead of
-    // subsequent live output without delaying other viewers.
-    if (consumer.view === null) paintInitialScreen(session, consumer);
+    // Every attach gets the current screen before live output. This consumer's
+    // private write tail orders it ahead of subsequent output without delaying
+    // the other viewers.
+    paintInitialScreen(session, consumer);
     consumer.writeTail = consumer.writeTail
       .then(() => stream.sendCtrl(encodeJsonPayload({ t: "replay_done" })))
       .catch(() => detachConsumer(session, consumer));
