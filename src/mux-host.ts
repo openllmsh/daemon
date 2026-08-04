@@ -66,8 +66,13 @@ export const currentDaemonCaps = (): string[] => {
 type TRelayChannel = {
   readonly channelId: string;
   readonly keyId: string | null;
+  readonly consumer: "browser" | "daemon" | null;
   readonly channel: TMuxChannel;
+  /** The mux's durable inbound callback, installed exactly once at construction. */
+  muxSink: ((bytes: Uint8Array | null) => void) | null;
+  /** The relay binding currently allowed to deliver to {@link muxSink}. */
   sink: ((bytes: Uint8Array | null) => void) | null;
+  lastActivityAt: number;
 };
 
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
@@ -86,7 +91,63 @@ const opening = new Map<
 const failedUntil = new Map<string, number>();
 const MUX_ACK_TIMEOUT_MS = 5_000;
 const MUX_FAILURE_CACHE_MS = 60_000;
+export const MUX_CHANNEL_IDLE_TTL_MS = 90_000;
+const MUX_CHANNEL_REAPER_INTERVAL_MS = 10_000;
+const DEMUX_WARNING_THROTTLE_MS = 5_000;
 let muxAckTimeoutMs = MUX_ACK_TIMEOUT_MS;
+// Mutable ONLY for the test seam below; production keeps the constant export.
+let muxChannelIdleTtlMs = MUX_CHANNEL_IDLE_TTL_MS;
+let channelReaper: ReturnType<typeof setInterval> | null = null;
+const lastDemuxWarningAt = new Map<string, number>();
+
+const touchChannel = (record: TRelayChannel): void => {
+  record.lastActivityAt = Date.now();
+};
+
+const logDemuxWarning = (
+  reason: string,
+  meta: Record<string, unknown>,
+): void => {
+  const now = Date.now();
+  const last = lastDemuxWarningAt.get(reason) ?? 0;
+  if (now - last < DEMUX_WARNING_THROTTLE_MS) return;
+  lastDemuxWarningAt.set(reason, now);
+  logWarn("mux-host", "relay mux frame dropped", {
+    reason,
+    channelCount: channels.size,
+    ...meta,
+  });
+};
+
+const reapIdleChannels = (): void => {
+  const now = Date.now();
+  for (const record of [...channels.values()]) {
+    if (record.channel.openStreamCount() > 0) continue;
+    if (now - record.lastActivityAt < muxChannelIdleTtlMs) continue;
+    logInfo("mux-host", "mux channel reaped: idle", {
+      channelId: record.channelId,
+      idleMs: now - record.lastActivityAt,
+    });
+    closeChannelFromRelay({
+      channel_id: record.channelId,
+      reason: "idle_timeout",
+    });
+  }
+};
+
+const ensureChannelReaper = (): void => {
+  if (channelReaper !== null) return;
+  channelReaper = setInterval(reapIdleChannels, MUX_CHANNEL_REAPER_INTERVAL_MS);
+  channelReaper.unref();
+};
+
+/** Test seam for deterministic idle-channel coverage. */
+export const reapIdleMuxChannelsForTest = (): void => reapIdleChannels();
+
+/** Test seam for deterministic idle-channel coverage. */
+export const setMuxChannelIdleTtlForTest = (ttlMs: number | null): void => {
+  muxChannelIdleTtlMs = ttlMs ?? MUX_CHANNEL_IDLE_TTL_MS;
+};
 
 /** Test-only timeout override for deterministic channel-negotiation coverage. */
 export const setMuxAckTimeoutForTest = (timeoutMs: number | null): void => {
@@ -218,6 +279,23 @@ export const handleChannelOpenAck = (frame: {
 };
 
 /**
+ * (Re)attach the relay binding onto the channel's durable mux sink. Fresh
+ * registration AND a channel_open rebind share this: the mux callback is
+ * installed exactly once at channel construction, so swapping the relay-facing
+ * {@link TRelayChannel.sink} wrapper never disturbs attached session streams.
+ */
+const bindSink = (record: TRelayChannel): void => {
+  const muxSink = record.muxSink;
+  record.sink =
+    muxSink === null
+      ? null
+      : (bytes) => {
+          touchChannel(record);
+          muxSink(bytes);
+        };
+};
+
+/**
  * Register a relay-WS channel (both consumer + serving sides). The duplex
  * envelopes every outbound message with the channel id and reads its inbound
  * bytes from the shared {@link muxHostOnBytes} demux — so several channels can
@@ -228,27 +306,49 @@ const registerChannel = (
   keyId: string | null,
   side: "consumer" | "daemon",
 ): TRelayChannel => {
-  let sink: ((bytes: Uint8Array | null) => void) | null = null;
+  let muxSink: ((bytes: Uint8Array | null) => void) | null = null;
   let record: TRelayChannel | null = null;
   const duplex = relayDuplex(
     (bytes) => sendBinary?.(encodeChannelEnvelope(channelId, bytes)),
     (callback) => {
-      sink = callback;
-      if (record !== null) record.sink = callback;
+      muxSink = callback;
+      if (record !== null) {
+        record.muxSink = callback;
+        bindSink(record);
+      }
     },
   );
   const channel = createChannel({
     duplex,
     side,
-    ...(side === "daemon" ? { onStream: serveMuxOnStream } : {}),
+    ...(side === "daemon"
+      ? {
+          onStream: (stream, open) => {
+            if (record !== null) touchChannel(record);
+            serveMuxOnStream(stream, open);
+          },
+        }
+      : {}),
     onClose: () => {
       if (record !== null && channels.get(channelId) === record) {
         channels.delete(channelId);
       }
-      if (record !== null) record.sink = null;
+      if (record !== null) {
+        record.muxSink = null;
+        record.sink = null;
+      }
     },
   });
-  record = { channel, channelId, keyId, sink };
+  record = {
+    channel,
+    channelId,
+    keyId,
+    consumer: side === "daemon" ? "browser" : null,
+    muxSink,
+    sink: null,
+    lastActivityAt: Date.now(),
+  };
+  bindSink(record);
   channels.set(channelId, record);
   return record;
 };
@@ -269,7 +369,16 @@ export const configureMuxHost = (options: {
 }): void => {
   sendFrame = options.send;
   sendBinary = options.sendBytes;
+  // The reaper lives with the host lifecycle, not the relay socket: the shared
+  // persistent relay sandbox keeps sockets up for days, so relay-socket death
+  // (resetAllChannels) can no longer be the only channel cleanup.
+  ensureChannelReaper();
 };
+
+/** Test seam: the live channel for `channelId` (identity checks across a rebind). */
+export const getMuxChannelForTest = (
+  channelId: string,
+): TMuxChannel | undefined => channels.get(channelId)?.channel;
 
 /**
  * Shared OPEN dispatcher for every daemon-side mux channel (relay WS + RTC).
@@ -373,6 +482,44 @@ export const serveMuxOnStream = serveStream({
   invalidOpenCode: "invalid_tunnel",
 });
 
+/**
+ * Seed-gate: browser consumers must present a vault-signed grant when
+ * provisioned. Fleet daemon→daemon hops set consumer:"daemon" and have no
+ * vault DEK — skip enforcement for those (parity with tunnel-server).
+ * Trust boundary: the relay stamps `consumer` from the authenticated
+ * socket role before forward, so a watcher cannot claim "daemon" to
+ * skip the gate. Direct (non-relay) sockets must not self-assert.
+ * Shared by fresh opens AND rebinds — a rebind is still a consumer proving
+ * access. Sends the `unauthorized` nack and returns false on rejection.
+ */
+const admitBySeedGate = (
+  frame: {
+    readonly channel_id: string;
+    readonly grant?: string;
+    readonly consumer?: "browser" | "daemon";
+  },
+  send: (frame: TRelayFrame) => void,
+): boolean => {
+  if (frame.consumer === "daemon") return true;
+  const gate = enforceSeedGate(frame.grant, {
+    keyId: daemonApiKeyId(),
+    cid: frame.channel_id,
+    aud: daemonPublicKey(),
+  });
+  if (gate.mode !== "reject") return true;
+  logWarn("mux-host", "channel_open rejected: seedgate", {
+    channelId: frame.channel_id,
+    reason: gate.reason,
+  });
+  send({
+    type: "channel_open_ack",
+    channel_id: frame.channel_id,
+    ok: false,
+    error: "unauthorized",
+  });
+  return false;
+};
+
 /** Accept the relay-authorized channel. `mux2` allows several concurrent. */
 export const acceptChannel = (frame: {
   readonly channel_id: string;
@@ -398,44 +545,43 @@ export const acceptChannel = (frame: {
     });
     return;
   }
-  if (channels.has(frame.channel_id)) {
-    logWarn("mux-host", "channel_open rejected: duplicate id", {
-      channelId: frame.channel_id,
-    });
-    send({
-      type: "channel_open_ack",
-      channel_id: frame.channel_id,
-      ok: false,
-      error: "channel_exists",
-    });
-    return;
-  }
-  // Seed-gate: browser consumers must present a vault-signed grant when
-  // provisioned. Fleet daemon→daemon hops set consumer:"daemon" and have no
-  // vault DEK — skip enforcement for those (parity with tunnel-server).
-  // Trust boundary: the relay stamps `consumer` from the authenticated
-  // socket role before forward, so a watcher cannot claim "daemon" to
-  // skip the gate. Direct (non-relay) sockets must not self-assert.
-  if (frame.consumer !== "daemon") {
-    const gate = enforceSeedGate(frame.grant, {
-      keyId: daemonApiKeyId(),
-      cid: frame.channel_id,
-      aud: daemonPublicKey(),
-    });
-    if (gate.mode === "reject") {
-      logWarn("mux-host", "channel_open rejected: seedgate", {
+  const existing = channels.get(frame.channel_id);
+  if (existing !== undefined && existing.muxSink !== null) {
+    if (existing.keyId !== null) {
+      // A consumer-side channel id is OURS — a peer re-opening it is a
+      // protocol bug, not a reconnect. Keep the refusal for that narrow case.
+      logWarn("mux-host", "channel_open rejected: duplicate id", {
         channelId: frame.channel_id,
-        reason: gate.reason,
       });
       send({
         type: "channel_open_ack",
         channel_id: frame.channel_id,
         ok: false,
-        error: "unauthorized",
+        error: "channel_exists",
       });
       return;
     }
+    // REBIND: the browser derives its channel id deterministically and the
+    // relay re-forwards it after a reconnect, so a same-id re-open of a live
+    // serving channel is the consumer re-attaching — NOT a collision. Swap the
+    // inbound sink onto the EXISTING channel (its attached session streams
+    // survive untouched; PTY hosts are durable and never respawned here) and
+    // re-ack so the peer's open settles. A refused rebind (seed gate) leaves
+    // the incumbent channel alone.
+    if (!admitBySeedGate(frame, send)) return;
+    bindSink(existing);
+    touchChannel(existing);
+    logInfo("mux-host", "channel_open rebind", {
+      channelId: frame.channel_id,
+      consumer: frame.consumer ?? "browser",
+    });
+    send({ type: "channel_open_ack", channel_id: frame.channel_id, ok: true });
+    return;
   }
+  // A map-resident record with a null mux sink is a closed shell that never
+  // got reaped — drop it so the re-open registers fresh below.
+  if (existing !== undefined) channels.delete(frame.channel_id);
+  if (!admitBySeedGate(frame, send)) return;
   registerChannel(frame.channel_id, null, "daemon");
   logInfo("mux-host", "channel_open accepted", {
     channelId: frame.channel_id,
@@ -455,11 +601,19 @@ export const acceptChannel = (frame: {
  */
 export const closeChannelFromRelay = (frame: {
   readonly channel_id: string;
-  readonly reason?: TChannelCloseReason;
+  /** Wire frames carry TChannelCloseReason; the idle reaper adds "idle_timeout". */
+  readonly reason?: TChannelCloseReason | "idle_timeout";
 }): void => {
   // A close for a channel still being negotiated settles that open instead.
+  // ("idle_timeout" is reaper-local: a serving channel is never mid-negotiation,
+  // and the reason is not wire-legal for the failOpen channel_close it sends.)
   for (const [keyId, pending] of [...opening.entries()]) {
-    if (pending.channelId === frame.channel_id) failOpen(keyId, frame.reason);
+    if (pending.channelId === frame.channel_id) {
+      failOpen(
+        keyId,
+        frame.reason === "idle_timeout" ? undefined : frame.reason,
+      );
+    }
   }
   const record = channels.get(frame.channel_id);
   if (record === undefined) return;
@@ -476,8 +630,22 @@ export const muxHostOnBytes = (bytes: Uint8Array | null): void => {
     return;
   }
   const envelope = decodeChannelEnvelope(bytes);
-  if (!envelope.ok) return;
-  channels.get(envelope.channelId)?.sink?.(envelope.payload);
+  if (!envelope.ok) {
+    // Was a silent `return`: an undecodable frame vanished here with no trace.
+    logDemuxWarning(`invalid_envelope:${envelope.error}`, {
+      byteLength: bytes.byteLength,
+    });
+    return;
+  }
+  const record = channels.get(envelope.channelId);
+  if (record === undefined) {
+    // Was a silent no-op: relay bytes for a channel the daemon never accepted
+    // (or already tore down) disappeared here — the invisible half of the
+    // production "device did not answer" black hole.
+    logDemuxWarning("unknown_channel", { channelId: envelope.channelId });
+    return;
+  }
+  record.sink?.(envelope.payload);
 };
 
 /** A dead relay socket tears down all stream state without killing PTYs. */
