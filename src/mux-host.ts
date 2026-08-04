@@ -336,6 +336,13 @@ export const acceptChannel = (frame: {
   const binary = sendBinary;
   if (send === null || binary === null) return;
   if (process.env.OPENLLM_MUX_DISABLE === "1") {
+    // Every reject is logged. A silently-refused channel_open is invisible on
+    // the daemon and indistinguishable, from the browser, from a device that
+    // never answered — which is exactly the shape of the hardest transport
+    // bugs to diagnose.
+    logWarn("mux-host", "channel_open rejected: mux disabled", {
+      channelId: frame.channel_id,
+    });
     send({
       type: "channel_open_ack",
       channel_id: frame.channel_id,
@@ -345,6 +352,11 @@ export const acceptChannel = (frame: {
     return;
   }
   if (active !== null || opening.size > 0) {
+    logWarn("mux-host", "channel_open rejected: channel exists", {
+      channelId: frame.channel_id,
+      activeChannelId,
+      opening: opening.size,
+    });
     send({
       type: "channel_open_ack",
       channel_id: frame.channel_id,
@@ -402,6 +414,10 @@ export const acceptChannel = (frame: {
     },
   });
   activeChannelId = frame.channel_id;
+  logInfo("mux-host", "channel_open accepted", {
+    channelId: frame.channel_id,
+    consumer: frame.consumer ?? "browser",
+  });
   send({ type: "channel_open_ack", channel_id: frame.channel_id, ok: true });
 };
 
