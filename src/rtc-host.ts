@@ -10,7 +10,11 @@
  * channel through the relay; payload bytes never touch the relay after the
  * data channel is up.
  */
-import type { TRelayFrame } from "@openllmsh/protocol";
+import type {
+  TIceServer,
+  TRelayFrame,
+  TRtcNackReason,
+} from "@openllmsh/protocol";
 import { MAX_PAYLOAD_BYTES } from "@openllmsh/tunnel/codec";
 import type { TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
@@ -20,11 +24,12 @@ import {
   fingerprintFromSdp,
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
-  RTC_DEFAULT_STUN,
+  resolveIceServers,
   sdpFingerprintsMatch,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
+import { preflightIceCandidate } from "@openllmsh/tunnel/rtc-ice";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
 import { enforceRtcSeedGate } from "./device-access-verify";
@@ -52,24 +57,50 @@ type TRtcSession = {
 };
 
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
+/** Cloud-served ICE servers from the daemon's own channel handshake, if any. */
+let handshakeIceServers: ReadonlyArray<TIceServer> | null = null;
 const sessions = new Map<string, TRtcSession>();
 
-/** Wire the control-channel sender (idempotent; re-called on reconnect). */
+/** Wire the control-channel sender (idempotent; re-called on reconnect).
+ *  `iceServers` carries the cloud handshake config when present. */
 export const configureRtcHost = (options: {
   readonly send: (frame: TRelayFrame) => void;
+  readonly iceServers?: ReadonlyArray<TIceServer> | null;
 }): void => {
   sendFrame = options.send;
+  if (options.iceServers !== undefined) {
+    handshakeIceServers = options.iceServers;
+  }
 };
 
-const iceServers = (): ReadonlyArray<{ urls: string }> => {
-  const raw = process.env.OPENLLM_RTC_STUN?.trim();
-  if (raw === undefined || raw.length === 0)
-    return [{ urls: RTC_DEFAULT_STUN }];
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-    .map((urls) => ({ urls }));
+/** ICE-server precedence: local env (`OPENLLM_RTC_ICE_SERVERS`, or the
+ *  deprecated `OPENLLM_RTC_STUN` legacy alias) → cloud handshake → default.
+ *  Mapped into werift's mutable `RTCIceServer` shape. */
+const iceServers = (): Array<{
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}> =>
+  resolveIceServers(
+    process.env.OPENLLM_RTC_ICE_SERVERS ?? process.env.OPENLLM_RTC_STUN,
+    handshakeIceServers,
+  ).map((s) => ({
+    urls: typeof s.urls === "string" ? s.urls : [...s.urls],
+    ...(s.username !== undefined ? { username: s.username } : {}),
+    ...(s.credential !== undefined ? { credential: s.credential } : {}),
+  }));
+
+/** Send a non-silent RTC reject to the offerer so it fails fast instead of
+ *  waiting out the signaling/ICE timeout. Best-effort — a racing socket close
+ *  just drops it. */
+const sendNack = (channelId: string, reason: TRtcNackReason): void => {
+  const send = sendFrame;
+  if (send === null) return;
+  try {
+    send({ type: "rtc_nack", channel_id: channelId, reason });
+  } catch {
+    // control socket racing a close
+  }
 };
 
 /**
@@ -236,9 +267,13 @@ export const handleRtcOffer = async (frame: {
     logWarn("rtc-host", "rtc_offer refused: rtc disabled", {
       channelId: frame.channel_id,
     });
+    // Posture won't change soon — nack so the offerer caches + skips RTC.
+    sendNack(frame.channel_id, "disabled");
     return;
   }
   if (sessions.has(frame.channel_id)) {
+    // A retransmit of an in-flight offer, not a reject — stay silent (a nack
+    // would tear the caller's healthy pending attempt).
     logWarn("rtc-host", "duplicate rtc_offer", {
       channelId: frame.channel_id,
     });
@@ -249,6 +284,8 @@ export const handleRtcOffer = async (frame: {
       channelId: frame.channel_id,
       cap: MAX_CONCURRENT_RTC,
     });
+    // Transient — nack so the offerer fails fast; it applies a short/no cache.
+    sendNack(frame.channel_id, "overloaded");
     return;
   }
 
@@ -290,6 +327,10 @@ export const handleRtcOffer = async (frame: {
       channelId: frame.channel_id,
       reason: gate.reason,
     });
+    // The offer WAS authenticated (sealed proof opened + fb bound) — the vault
+    // is just locked. Nack so the offerer surfaces "unlock to connect" instead
+    // of timing out.
+    sendNack(frame.channel_id, "seedgate");
     return;
   }
 
@@ -303,6 +344,9 @@ export const handleRtcOffer = async (frame: {
       channelId: frame.channel_id,
       sdpMax: offerSdpMax,
     });
+    // Offer authenticated but its SCTP limit can't carry a mux frame — a
+    // capability mismatch, not a transient. Nack so the offerer stops probing.
+    sendNack(frame.channel_id, "not_capable");
     return;
   }
 
@@ -313,6 +357,7 @@ export const handleRtcOffer = async (frame: {
     logWarn("rtc-host", "RTCPeerConnection construct failed", {
       err: err instanceof Error ? err.message : String(err),
     });
+    sendNack(frame.channel_id, "not_capable");
     return;
   }
 
@@ -429,6 +474,15 @@ export const handleRtcIce = async (frame: {
     if (parsed === null || typeof parsed !== "object") return;
     init = parsed as typeof init;
   } catch {
+    return;
+  }
+  // Off-LAN, an mDNS `.local` candidate makes werift issue a 10s multicast-DNS
+  // query that never resolves, stalling ICE. Preflight it: skip fast when the
+  // name doesn't resolve quickly, keep it on a LAN where it does.
+  if (!(await preflightIceCandidate(init))) {
+    logDebug("rtc-host", "skipping unresolvable mDNS candidate", {
+      channelId: frame.channel_id,
+    });
     return;
   }
   try {

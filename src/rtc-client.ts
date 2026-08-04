@@ -7,7 +7,11 @@
  * RTC → relay mux → JSON splice, while this module warms RTC for later hops.
  */
 import { randomBytes } from "node:crypto";
-import type { TRelayFrame } from "@openllmsh/protocol";
+import type {
+  TIceServer,
+  TRelayFrame,
+  TRtcNackReason,
+} from "@openllmsh/protocol";
 import { MAX_PAYLOAD_BYTES } from "@openllmsh/tunnel/codec";
 import type { TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
@@ -18,12 +22,13 @@ import {
   maxMessageSizeFromSdp,
   negotiateRtcPayloadCap,
   RTC_AUTH_NONCE_BYTES,
-  RTC_DEFAULT_STUN,
+  resolveIceServers,
   sdpFingerprintsMatch,
   verifyAnswerInner,
 } from "@openllmsh/tunnel/rtc-auth";
 import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
+import { preflightIceCandidate } from "@openllmsh/tunnel/rtc-ice";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
 import type { TEphKeypair } from "./keypair";
@@ -58,27 +63,40 @@ type TRtcClientSession = {
 };
 
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
+/** Cloud-served ICE servers from the daemon's own channel handshake, if any. */
+let handshakeIceServers: ReadonlyArray<TIceServer> | null = null;
 const sessionsByKey = new Map<string, TRtcClientSession>();
 const sessionsByChannel = new Map<string, TRtcClientSession>();
 const failedUntil = new Map<string, number>();
 
-/** Wire the control-channel sender (idempotent; re-called on reconnect). */
+/** Wire the control-channel sender (idempotent; re-called on reconnect).
+ *  `iceServers` carries the cloud handshake config when present. */
 export const configureRtcClient = (options: {
   readonly send: (frame: TRelayFrame) => void;
+  readonly iceServers?: ReadonlyArray<TIceServer> | null;
 }): void => {
   sendFrame = options.send;
+  if (options.iceServers !== undefined) {
+    handshakeIceServers = options.iceServers;
+  }
 };
 
-const iceServers = (): ReadonlyArray<{ urls: string }> => {
-  const raw = process.env.OPENLLM_RTC_STUN?.trim();
-  if (raw === undefined || raw.length === 0)
-    return [{ urls: RTC_DEFAULT_STUN }];
-  return raw
-    .split(",")
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0)
-    .map((urls) => ({ urls }));
-};
+/** ICE-server precedence: local env (`OPENLLM_RTC_ICE_SERVERS`, or the
+ *  deprecated `OPENLLM_RTC_STUN` legacy alias) → cloud handshake → default.
+ *  Mapped into werift's mutable `RTCIceServer` shape. */
+const iceServers = (): Array<{
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}> =>
+  resolveIceServers(
+    process.env.OPENLLM_RTC_ICE_SERVERS ?? process.env.OPENLLM_RTC_STUN,
+    handshakeIceServers,
+  ).map((s) => ({
+    urls: typeof s.urls === "string" ? s.urls : [...s.urls],
+    ...(s.username !== undefined ? { username: s.username } : {}),
+    ...(s.credential !== undefined ? { credential: s.credential } : {}),
+  }));
 
 const asRtcDataChannelLike = (dc: RTCDataChannel): TRtcDataChannelLike => ({
   get readyState() {
@@ -436,6 +454,36 @@ export const handleRtcAnswer = async (frame: {
   }
 };
 
+/**
+ * Handle a serving peer's `rtc_nack` — an explicit reject. Fail the pending
+ * offer immediately (no 10–20s signaling/ICE wait) and set the failure-cache
+ * policy per reason:
+ *   - `disabled` / `not_capable` → cache (peer posture won't change soon);
+ *   - `overloaded` → NO cache (transient — let the next attempt retry);
+ *   - `seedgate` → the peer's vault is locked; cache the window so we don't
+ *     hammer it, and let a later presence/caps flap clear it.
+ * Unknown channel ids no-op.
+ */
+export const handleRtcNack = (frame: {
+  readonly channel_id: string;
+  readonly reason: TRtcNackReason;
+}): void => {
+  const session = sessionsByChannel.get(frame.channel_id);
+  if (session === undefined || session.closed) return;
+  const keyId = session.keyId;
+  logWarn("rtc-client", "rtc offer nacked", {
+    keyId,
+    channelId: frame.channel_id,
+    reason: frame.reason,
+  });
+  if (frame.reason === "overloaded") {
+    // Transient — tear down without caching so a later attempt can retry.
+    closeSession(session, `nack_${frame.reason}`);
+    return;
+  }
+  markRtcFailure(keyId);
+};
+
 /** Feed a trickle ICE candidate to an offerer session. Unknown channel ids no-op. */
 export const handleRtcClientIce = async (frame: {
   readonly channel_id: string;
@@ -446,6 +494,9 @@ export const handleRtcClientIce = async (frame: {
   try {
     const parsed: unknown = JSON.parse(frame.candidate);
     if (parsed === null || typeof parsed !== "object") return;
+    const init = parsed as { candidate?: string | null };
+    // Off-LAN mDNS `.local` candidates stall werift for 10s each — skip fast.
+    if (!(await preflightIceCandidate(init))) return;
     await session.pc.addIceCandidate(parsed as RTCIceCandidate);
   } catch {
     // Candidate timing races are expected.

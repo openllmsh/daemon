@@ -1,5 +1,9 @@
 import type { TChannelCloseReason, TRelayFrame } from "@openllmsh/protocol";
-import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
+import { MUX_CAP, MUX2_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
+import {
+  decodeChannelEnvelope,
+  encodeChannelEnvelope,
+} from "@openllmsh/tunnel/channel-envelope";
 import { encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
@@ -19,12 +23,16 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
 
 /**
  * Base capabilities advertised on hello/status.
- * `mux1` = binary mux over the relay WS; `rtc1` = WebRTC data-channel mux host
- * and fleet consumer offerer (RTC → relay mux → JSON splice).
- * `seedgate1` is layered on when a device-access pubkey is pinned — see
- * {@link currentDaemonCaps}.
+ * `mux1` = binary mux over the relay WS; `mux2` = the channel-id envelope on
+ * each relay-WS binary message, which lets ONE relay socket carry several
+ * concurrent channels (the daemon always envelopes its relay-WS channels — the
+ * relay bridges to a legacy `mux1`-only peer, so no peer-cap knowledge is
+ * needed); `rtc1` = WebRTC data-channel mux host and fleet consumer offerer
+ * (RTC → relay mux → JSON splice). RTC data channels are NEVER enveloped —
+ * they carry a single mux directly, with no relay hop. `seedgate1` is layered
+ * on when a device-access pubkey is pinned — see {@link currentDaemonCaps}.
  */
-export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP] as const;
+export const DAEMON_MUX_CAPS = [MUX_CAP, MUX2_CAP, RTC_CAP] as const;
 
 /**
  * `OPENLLM_RTC_DISABLE=1` withdraws `rtc1` only.
@@ -50,10 +58,22 @@ export const currentDaemonCaps = (): string[] => {
   return caps;
 };
 
-let active: TMuxChannel | null = null;
-let sink: ((bytes: Uint8Array | null) => void) | null = null;
+/**
+ * One live relay-WS mux channel. Several may coexist (`mux2`): a serving
+ * channel the daemon accepted (`side: "daemon"`), or a consumer channel it
+ * opened to a fleet peer (`side: "consumer"`, keyed by that peer's `keyId`).
+ */
+type TRelayChannel = {
+  readonly channelId: string;
+  readonly keyId: string | null;
+  readonly channel: TMuxChannel;
+  sink: ((bytes: Uint8Array | null) => void) | null;
+};
+
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
 let sendBinary: ((bytes: Uint8Array) => void) | null = null;
+/** Live channels by relay-assigned channel id. */
+const channels = new Map<string, TRelayChannel>();
 const peerCaps = new Map<string, ReadonlySet<string>>();
 const opening = new Map<
   string,
@@ -64,10 +84,6 @@ const opening = new Map<
   }
 >();
 const failedUntil = new Map<string, number>();
-let activeKeyId: string | null = null;
-/** Relay-assigned id of {@link active}, so an inbound `channel_close` can be
- *  matched to the channel it refers to. */
-let activeChannelId: string | null = null;
 const MUX_ACK_TIMEOUT_MS = 5_000;
 const MUX_FAILURE_CACHE_MS = 60_000;
 let muxAckTimeoutMs = MUX_ACK_TIMEOUT_MS;
@@ -105,6 +121,13 @@ export const replaceMuxPeerCaps = (
     updateMuxPeerCaps(keyId, values);
 };
 
+/** The consumer channel already open to `keyId`, if any. */
+const consumerChannelFor = (keyId: string): TRelayChannel | undefined => {
+  for (const channel of channels.values())
+    if (channel.keyId === keyId) return channel;
+  return undefined;
+};
+
 const failOpen = (keyId: string, reason?: TChannelCloseReason): void => {
   const pending = opening.get(keyId);
   if (pending === undefined) return;
@@ -119,7 +142,7 @@ const failOpen = (keyId: string, reason?: TChannelCloseReason): void => {
   pending.resolve(null);
 };
 
-/** Consumer-side negotiation. One mux channel may exist on this relay socket. */
+/** Consumer-side negotiation. `mux2` permits one channel per fleet peer. */
 export const muxChannelTo = async (
   keyId: string,
 ): Promise<TMuxChannel | null> => {
@@ -128,7 +151,8 @@ export const muxChannelTo = async (
   if (caps === undefined || !caps.has(MUX_CAP)) return null;
   const failedAt = failedUntil.get(keyId);
   if (failedAt !== undefined && failedAt > Date.now()) return null;
-  if (active !== null) return activeKeyId === keyId ? active : null;
+  const existing = consumerChannelFor(keyId);
+  if (existing !== undefined) return existing.channel;
   const pending = opening.get(keyId);
   if (pending !== undefined)
     return new Promise((resolve) => {
@@ -174,7 +198,8 @@ export const handleChannelOpenAck = (frame: {
   }
   const pending = opening.get(keyId);
   if (pending === undefined) return;
-  if (sendBinary === null || active !== null) {
+  const binary = sendBinary;
+  if (binary === null) {
     opening.delete(keyId);
     clearTimeout(pending.timer);
     failedUntil.set(keyId, Date.now() + MUX_FAILURE_CACHE_MS);
@@ -188,22 +213,44 @@ export const handleChannelOpenAck = (frame: {
   }
   opening.delete(keyId);
   clearTimeout(pending.timer);
-  const duplex = relayDuplex(sendBinary, (callback) => {
-    sink = callback;
-  });
-  active = createChannel({
+  const record = registerChannel(pending.channelId, keyId, "consumer");
+  pending.resolve(record.channel);
+};
+
+/**
+ * Register a relay-WS channel (both consumer + serving sides). The duplex
+ * envelopes every outbound message with the channel id and reads its inbound
+ * bytes from the shared {@link muxHostOnBytes} demux — so several channels can
+ * share the one relay socket.
+ */
+const registerChannel = (
+  channelId: string,
+  keyId: string | null,
+  side: "consumer" | "daemon",
+): TRelayChannel => {
+  const record: TRelayChannel = {
+    channelId,
+    keyId,
+    channel: null as unknown as TMuxChannel,
+    sink: null,
+  };
+  const duplex = relayDuplex(
+    (bytes) => sendBinary?.(encodeChannelEnvelope(channelId, bytes)),
+    (callback) => {
+      record.sink = callback;
+    },
+  );
+  (record as { channel: TMuxChannel }).channel = createChannel({
     duplex,
-    side: "consumer",
+    side,
+    ...(side === "daemon" ? { onStream: serveMuxOnStream } : {}),
     onClose: () => {
-      active = null;
-      activeKeyId = null;
-      activeChannelId = null;
-      sink = null;
+      if (channels.get(channelId) === record) channels.delete(channelId);
+      record.sink = null;
     },
   });
-  activeKeyId = keyId;
-  activeChannelId = pending.channelId;
-  pending.resolve(active);
+  channels.set(channelId, record);
+  return record;
 };
 
 /** Host transport seam: control-channel owns the WebSocket, this module owns mux state. */
@@ -326,7 +373,7 @@ export const serveMuxOnStream = serveStream({
   invalidOpenCode: "invalid_tunnel",
 });
 
-/** Accept the relay-authorized channel. D2 allows only one active channel/socket. */
+/** Accept the relay-authorized channel. `mux2` allows several concurrent. */
 export const acceptChannel = (frame: {
   readonly channel_id: string;
   readonly grant?: string;
@@ -351,11 +398,9 @@ export const acceptChannel = (frame: {
     });
     return;
   }
-  if (active !== null || opening.size > 0) {
-    logWarn("mux-host", "channel_open rejected: channel exists", {
+  if (channels.has(frame.channel_id)) {
+    logWarn("mux-host", "channel_open rejected: duplicate id", {
       channelId: frame.channel_id,
-      activeChannelId,
-      opening: opening.size,
     });
     send({
       type: "channel_open_ack",
@@ -391,29 +436,7 @@ export const acceptChannel = (frame: {
       return;
     }
   }
-  if (active !== null) {
-    send({
-      type: "channel_open_ack",
-      channel_id: frame.channel_id,
-      ok: false,
-      error: "channel_exists",
-    });
-    return;
-  }
-  const duplex = relayDuplex(binary, (callback) => {
-    sink = callback;
-  });
-  active = createChannel({
-    duplex,
-    side: "daemon",
-    onStream: serveMuxOnStream,
-    onClose: () => {
-      active = null;
-      activeChannelId = null;
-      sink = null;
-    },
-  });
-  activeChannelId = frame.channel_id;
+  registerChannel(frame.channel_id, null, "daemon");
   logInfo("mux-host", "channel_open accepted", {
     channelId: frame.channel_id,
     consumer: frame.consumer ?? "browser",
@@ -438,27 +461,31 @@ export const closeChannelFromRelay = (frame: {
   for (const [keyId, pending] of [...opening.entries()]) {
     if (pending.channelId === frame.channel_id) failOpen(keyId, frame.reason);
   }
-  if (activeChannelId !== frame.channel_id) return;
-  const channel = active;
-  active = null;
-  activeKeyId = null;
-  activeChannelId = null;
-  sink = null;
-  channel?.close(frame.reason ?? "peer_gone");
+  const record = channels.get(frame.channel_id);
+  if (record === undefined) return;
+  channels.delete(frame.channel_id);
+  record.sink = null;
+  record.channel.close(frame.reason ?? "peer_gone");
 };
 
-/** Feed a complete binary websocket message to the active mux channel. */
-export const muxHostOnBytes = (bytes: Uint8Array): void => {
-  sink?.(bytes);
+/** Feed a complete binary websocket message to the channel its envelope tags. */
+export const muxHostOnBytes = (bytes: Uint8Array | null): void => {
+  if (bytes === null) {
+    // Transport died — fan the null through every channel so each resets.
+    for (const record of [...channels.values()]) record.sink?.(null);
+    return;
+  }
+  const envelope = decodeChannelEnvelope(bytes);
+  if (!envelope.ok) return;
+  channels.get(envelope.channelId)?.sink?.(envelope.payload);
 };
 
 /** A dead relay socket tears down all stream state without killing PTYs. */
 export const resetAllChannels = (): void => {
   for (const keyId of [...opening.keys()]) failOpen(keyId);
-  const channel = active;
-  active = null;
-  activeKeyId = null;
-  activeChannelId = null;
-  sink = null;
-  channel?.close("relay_restart");
+  for (const record of [...channels.values()]) {
+    channels.delete(record.channelId);
+    record.sink = null;
+    record.channel.close("relay_restart");
+  }
 };

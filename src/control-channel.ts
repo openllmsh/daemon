@@ -6,7 +6,11 @@
  * status over the socket. See `docs/proposals/daemon-relay-websocket-push.md`.
  */
 
-import type { TDaemonCommandAck, TRelayFrame } from "@openllmsh/protocol";
+import type {
+  TDaemonCommandAck,
+  TIceServer,
+  TRelayFrame,
+} from "@openllmsh/protocol";
 import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
@@ -30,6 +34,7 @@ import {
   configureRtcClient,
   handleRtcAnswer,
   handleRtcClientIce,
+  handleRtcNack,
   resetUnmountedRtcClientSessions,
 } from "./rtc-client";
 import {
@@ -535,6 +540,10 @@ const dispatchFrame = (frame: TRelayFrame): void => {
         });
       });
       return;
+    case "rtc_nack":
+      // This daemon is the fleet OFFERER: a serving peer refused our offer.
+      handleRtcNack(frame);
+      return;
     case "presence":
       updateMuxPeerCaps(frame.key_id, frame.active ? frame.caps : undefined);
       return;
@@ -600,6 +609,14 @@ const channelUrl = async (): Promise<string> => {
   const channel = await fetchChannel();
   ticket = channel.ticket;
   connectedWssOrigin = wssOrigin(channel.wss_url);
+  // Thread the cloud-served ICE config (B2) into the RTC configs so both the
+  // host (responder) and client (fleet offerer) prefer it over the default
+  // STUN. A locally-set `OPENLLM_RTC_ICE_SERVERS` still wins (resolveIceServers
+  // precedence); this just fills the surface when the daemon has no env value.
+  const iceServers: ReadonlyArray<TIceServer> | null =
+    channel.ice_servers ?? null;
+  configureRtcHost({ send, iceServers });
+  configureRtcClient({ send, iceServers });
   return channel.wss_url;
 };
 
