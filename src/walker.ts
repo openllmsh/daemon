@@ -1629,6 +1629,10 @@ export type TLocalSubscriptionAuth = {
   readonly detail: string | null;
 };
 
+/** Bound on the auth-gate `status()` probe — a hung keychain/CLI read must
+ *  not stall the hop; timeout → not-connected → fleet tunnel. */
+const LOCAL_STATUS_TIMEOUT_MS = 5_000;
+
 export const ensureLocalSubscription = async (
   provider: string,
   connectedByProvider: Map<string, TLocalSubscriptionAuth>,
@@ -1648,8 +1652,16 @@ export const ensureLocalSubscription = async (
     return miss;
   }
 
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const status = await delegate.status();
+    const status = await Promise.race([
+      delegate.status(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${provider} status timed out`));
+        }, LOCAL_STATUS_TIMEOUT_MS);
+      }),
+    ]);
     const result: TLocalSubscriptionAuth = {
       connected: status.connected,
       detail: status.connected
@@ -1663,6 +1675,8 @@ export const ensureLocalSubscription = async (
     );
     return result;
   } catch (error) {
+    // Timeout, throw, or hung CLI — all mean "this box can't serve"; fleet
+    // (or hop fail) is the right next step, never a stalled walker.
     const result: TLocalSubscriptionAuth = {
       connected: false,
       detail:
@@ -1673,45 +1687,40 @@ export const ensureLocalSubscription = async (
     connectedByProvider.set(provider, result);
     accountHashByProvider.set(provider, null);
     return result;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 };
 
 export const usageForActiveAccount = async (
   provider: string,
   accountHashByProvider: Map<string, string | null>,
-  connectedByProvider?: Map<string, TLocalSubscriptionAuth>,
+  connectedByProvider: Map<string, TLocalSubscriptionAuth> = new Map(),
 ): Promise<TProviderUsageSnapshot | null> => {
-  // Prefer the shared auth probe when the walker already paid for it.
-  if (connectedByProvider !== undefined) {
+  // Single resolution path:
+  //   1. If the auth cache already says not-connected → null (walker auth gate
+  //      already paid for status()).
+  //   2. If the account hash is not yet known → ensureLocalSubscription fills
+  //      both maps (same probe the hop auth gate uses).
+  //   3. Peek the usage cache for that account. A pre-seeded account hash
+  //      (unit tests) is honored without a live status() re-probe.
+  const known = connectedByProvider.get(provider);
+  if (known !== undefined && !known.connected) return null;
+
+  if (!accountHashByProvider.has(provider)) {
     const auth = await ensureLocalSubscription(
       provider,
       connectedByProvider,
       accountHashByProvider,
     );
     if (!auth.connected) return null;
-    const accountHash = accountHashByProvider.get(provider) ?? null;
-    if (accountHash === null) return null;
-    const delegate = getDelegate(provider);
-    if (delegate === null) return null;
-    return peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
   }
 
+  const accountHash = accountHashByProvider.get(provider) ?? null;
+  if (accountHash === null) return null;
   const delegate = getDelegate(provider);
   if (delegate === null) return null;
-
-  let accountHash = accountHashByProvider.get(provider);
-  if (accountHash === undefined) {
-    try {
-      const status = await delegate.status();
-      accountHash = status.connected ? (status.account_hash ?? null) : null;
-    } catch {
-      accountHash = null;
-    }
-    accountHashByProvider.set(provider, accountHash);
-  }
-  return accountHash === null
-    ? null
-    : peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
+  return peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
 };
 
 /**

@@ -129,11 +129,13 @@ export const localMethodsForHop = (
     return ["bridge"];
   }
 
-  const selected = selectSubMethod(provider, requested, originator);
   const capability =
     SUB_METHOD_CAPABILITIES[provider as TSubscriptionProviderSlug];
-  if (capability === undefined) return [selected];
+  // Unknown provider: no declared local transports. Walker treats empty as
+  // local-exhausted and tries the fleet tunnel (matches the doc comment above).
+  if (capability === undefined) return [];
 
+  const selected = selectSubMethod(provider, requested, originator);
   if (selected === "handrolled") return ["handrolled"];
   // Bridge selected (preference or default): try bridge first; fall through
   // to handrolled on the same hop when the capability table declares it.
