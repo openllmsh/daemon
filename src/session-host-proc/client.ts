@@ -83,18 +83,26 @@ const isSessionHostMeta = (value: unknown): value is TSessionHostMeta => {
   );
 };
 
-const pidAlive = (pid: number): boolean => {
+const processStartTime = (pid: number): string | null => {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (
-      error !== null &&
-      typeof error === "object" &&
-      "code" in error &&
-      (error as { readonly code?: unknown }).code === "EPERM"
-    );
+    const output = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (output.exitCode !== 0) return null;
+    const value = new TextDecoder().decode(output.stdout).trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
   }
+};
+
+/** Match session-host.ts: pid + recorded process start time must both agree. */
+const sessionHostProcessAlive = (
+  meta: Pick<TSessionHostMeta, "pid" | "processStartTime">,
+): boolean => {
+  const startTime = processStartTime(meta.pid);
+  return startTime !== null && startTime === meta.processStartTime;
 };
 
 const socketPresent = (path: string): boolean => {
@@ -128,7 +136,8 @@ export const discoverSessionHosts = (): readonly TLiveSessionHost[] => {
       meta = null;
     }
     const socketReady = socketPresent(socketPath);
-    if (meta !== null && pidAlive(meta.pid) && !socketReady) {
+    const processAlive = meta !== null && sessionHostProcessAlive(meta);
+    if (meta !== null && processAlive && !socketReady) {
       // Live host still within the ctl.sock bind grace window — keep it.
       let startedAtMs: number | null = meta.startedAtMs;
       try {
@@ -142,7 +151,7 @@ export const discoverSessionHosts = (): readonly TLiveSessionHost[] => {
       )
         continue;
     }
-    if (meta === null || !socketReady || !pidAlive(meta.pid)) {
+    if (meta === null || !socketReady || !processAlive) {
       try {
         rmSync(directory, { recursive: true, force: true });
       } catch {

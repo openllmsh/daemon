@@ -420,7 +420,14 @@ const pipeSessionStreams = (
   });
   relay.onEnd(closeHost);
   host.onData((bytes) => {
-    void relay.write(bytes).catch(closeHost);
+    void relay.write(bytes).catch(() => {
+      // Mirror the host-write rejection path: tear down both sides so a
+      // rejected relay write cannot leave the TSessionStream half-open.
+      if (closed) return;
+      closed = true;
+      host.reset();
+      relay.reset();
+    });
   });
   host.onCtrl((payload) => relay.sendCtrl(payload));
   host.onReset((payload) => {

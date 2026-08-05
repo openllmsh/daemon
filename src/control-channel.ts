@@ -545,10 +545,22 @@ const dispatchFrame = (frame: TRelayFrame): void => {
   }
 };
 
-const enqueueBinaryFrame = (read: () => Promise<Uint8Array>): void => {
+/**
+ * Queue a binary frame for ordered delivery, tagged with the connection
+ * generation that received it. After a reconnect/reset, a late Blob conversion
+ * from the prior socket must not feed muxHostOnBytes for the successor.
+ */
+const enqueueBinaryFrame = (
+  generation: number,
+  read: () => Promise<Uint8Array>,
+): void => {
   binaryFrameTail = binaryFrameTail
-    .then(read)
-    .then((bytes) => muxHostOnBytes(bytes))
+    .then(async () => {
+      const bytes = await read();
+      if (generation !== connectionGeneration) return;
+      if (ws === null || ws.readyState !== ws.OPEN) return;
+      muxHostOnBytes(bytes);
+    })
     .catch((err: unknown) => {
       logWarn("control-channel", "blob binary frame read failed", {
         err: err instanceof Error ? err.message : String(err),
@@ -557,23 +569,29 @@ const enqueueBinaryFrame = (read: () => Promise<Uint8Array>): void => {
 };
 
 const onMessage = (data: unknown): void => {
+  // Capture generation at receive time so async Blob reads cannot deliver into
+  // a later connection after reconnect/reset.
+  const generation = connectionGeneration;
   if (data instanceof ArrayBuffer) {
-    enqueueBinaryFrame(async () => new Uint8Array(data));
+    enqueueBinaryFrame(generation, async () => new Uint8Array(data));
     return;
   }
   if (data instanceof Uint8Array) {
-    enqueueBinaryFrame(async () => data);
+    enqueueBinaryFrame(generation, async () => data);
     return;
   }
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
-    enqueueBinaryFrame(async () => new Uint8Array(data));
+    enqueueBinaryFrame(generation, async () => new Uint8Array(data));
     return;
   }
   // partysocket defaults binaryType to "blob". We force "arraybuffer" on
   // open, but a reconnect race can still deliver a Blob once — convert
   // rather than drop (silent Blob drops hang fleet tunnels forever).
   if (typeof Blob !== "undefined" && data instanceof Blob) {
-    enqueueBinaryFrame(async () => new Uint8Array(await data.arrayBuffer()));
+    enqueueBinaryFrame(
+      generation,
+      async () => new Uint8Array(await data.arrayBuffer()),
+    );
     return;
   }
   if (typeof data !== "string") return;
@@ -721,6 +739,9 @@ export const startControlChannel = (): void => {
     // no longer send (its captured generation mismatches), so keeping it as
     // the tail would only delay this session's first status behind dead work.
     statusPublishTail = Promise.resolve();
+    // Same for binary frames: a late Blob conversion from the prior socket
+    // must not sit ahead of this connection's first mux bytes.
+    binaryFrameTail = Promise.resolve();
     const generation = connectionGeneration;
     heartbeat.start(); // begin pinging + arm the liveness window off pong receipt
     // Do not block registration on provider/CLI probes. The relay needs identity
