@@ -355,8 +355,10 @@ silent signaling timeouts. Detail lives in
   mux** for daemon→daemon fleet hops (mirrors browser `tunnelFetch`).
 - `tunnel-server.ts` maps a closed tunnel-surface vocabulary to the daemon's
   in-process `/v1/*` handler and streams the result. Stamps
-  `x-openllm-tunneled` so a fleet walker cannot re-tunnel a tunnel-borne
-  request.
+  `x-openllm-tunneled` **only** when the stream OPEN carries
+  `consumer:"daemon"` (fleet hop from another daemon) so the peer walker
+  cannot re-tunnel. Browser tunnels omit the stamp so the selected device
+  may still `tryFleetTunnel` once (browser→A→B).
 - `device-access-verify.ts` verifies vault-signed device grants (node:crypto)
   with ts window + nonce map; browser-only enforcement (daemon fleet hops
   skip grant). Locked-vault consumers fail closed before probing transports.

@@ -12,6 +12,12 @@
  * every other command). The vendor subscription credential is injected by
  * the walker locally, exactly as for a loopback request; only OpenLLM-wire
  * request/response bytes cross the relay.
+ *
+ * Loop-guard stamp (`x-openllm-tunneled`): set ONLY for daemon→daemon fleet
+ * hops (`open.consumer === "daemon"`). Browser→device tunnels must NOT stamp
+ * it — otherwise the selected device's walker loop-guards `tryFleetTunnel`
+ * and never forwards a missing-sub hop to a peer (browser→A→B). See
+ * `docs/proposals/browser-selected-device-tunnel-contract.md`.
  */
 
 import type { TTunnelSurface } from "@openllmsh/protocol";
@@ -47,6 +53,7 @@ const surfacePath = (surface: TTunnelSurface): string => {
 let muxServedCount = 0;
 
 const forwardedHeaders = (open: {
+  readonly consumer?: "browser" | "daemon";
   readonly headers?: {
     readonly content_type?: "application/json";
     readonly accept?: "application/json" | "text/event-stream";
@@ -62,12 +69,18 @@ const forwardedHeaders = (open: {
     headers.set("anthropic-version", open.headers.anthropic_version);
   if (open.headers?.anthropic_beta !== undefined)
     headers.set("anthropic-beta", open.headers.anthropic_beta);
-  headers.set(TUNNELED_REQUEST_HEADER, TUNNELED_REQUEST_VALUE);
+  // Only fleet-daemon hops are tunnel-borne for the walker loop-guard.
+  // Browser (or omitted consumer) leaves the header off so the selected
+  // device may still tryFleetTunnel once.
+  if (open.consumer === "daemon") {
+    headers.set(TUNNELED_REQUEST_HEADER, TUNNELED_REQUEST_VALUE);
+  }
   return headers;
 };
 
 type TTunneledOpen = {
   readonly surface: TTunnelSurface;
+  readonly consumer?: "browser" | "daemon";
   readonly headers?: {
     readonly content_type?: "application/json";
     readonly accept?: "application/json" | "text/event-stream";

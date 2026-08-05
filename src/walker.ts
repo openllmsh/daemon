@@ -1756,8 +1756,10 @@ const largestContextHop = (
  * relay; the peer walks it with its own credential (its local plan fetch
  * pins the same alias, so the same chain policy applies). Returns null —
  * meaning "fall through like any failed hop" — when: the request is
- * itself tunnel-borne (loop guard), no peer serves the provider, or the
- * tunnel fails before the response head.
+ * itself tunnel-borne from a fleet daemon (loop guard — stamped by
+ * tunnel-server only for `consumer:"daemon"`; browser→device omits it so
+ * this selected device can still fleet once), no peer serves the
+ * provider, or the tunnel fails before the response head.
  */
 const tryFleetTunnel = async (
   hop: THop,

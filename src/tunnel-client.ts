@@ -8,6 +8,10 @@
  * `tunnel_*` splice — if neither RTC nor mux is available the hop fails and
  * the walker continues.
  *
+ * Stream OPENs set `consumer:"daemon"` so the peer's tunnel-server stamps
+ * `x-openllm-tunneled` and the peer walker loop-guards further fleet.
+ * Browser `tunnelFetch` omits that field — selected-device contract.
+ *
  * Mirrors the browser's `tunnelFetch` (lib/stores/daemon-store.ts).
  * Any failure rejects — the walker treats it as a failed hop and continues
  * the walk (degradation preserved).
@@ -90,14 +94,22 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
     hasSeedgate1: peerCaps?.has(SEEDGATE_CAP) ?? false,
   });
 
+  // Fleet hop identity rides the stream OPEN so the peer's tunnel-server can
+  // stamp the walker loop-guard. Browser tunnels omit `consumer` and must
+  // remain free to tryFleetTunnel once (selected-device contract).
+  const fleetOpen = {
+    headers,
+    body: args.body,
+    signal: args.signal,
+    consumer: "daemon" as const,
+  };
+
   const rtc = getRtcMuxChannel(args.keyId);
   if (rtc !== null) {
     try {
       const result = await tunnelStream(rtc, {
         surface: args.surface,
-        headers,
-        body: args.body,
-        signal: args.signal,
+        ...fleetOpen,
       });
       return new Response(result.body, {
         status: result.status,
@@ -133,9 +145,7 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
   try {
     const result = await tunnelStream(mux, {
       surface: args.surface,
-      headers,
-      body: args.body,
-      signal: args.signal,
+      ...fleetOpen,
     });
     return new Response(result.body, {
       status: result.status,
