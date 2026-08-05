@@ -5,7 +5,7 @@
  */
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { stateDir } from "../env";
 import type { TOpenllmClientId } from "./types";
 
@@ -27,7 +27,8 @@ export const grokSessionsDir = (): string => join(grokHome(), "sessions");
 
 export const opencodeDataDir = (): string => {
   const xdg = process.env.XDG_DATA_HOME;
-  if (xdg !== undefined && xdg.length > 0) return join(xdg, "opencode");
+  if (xdg !== undefined && xdg.length > 0 && isAbsolute(xdg))
+    return join(xdg, "opencode");
   return join(userHome(), ".local", "share", "opencode");
 };
 export const opencodeDbPath = (): string =>

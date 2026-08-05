@@ -12,6 +12,7 @@ import type {
   TRelayFrame,
   TRtcNackReason,
 } from "@openllmsh/protocol";
+import { normalizeRtcNackReason } from "@openllmsh/protocol";
 import { MAX_PAYLOAD_BYTES } from "@openllmsh/tunnel/codec";
 import type { TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
@@ -465,19 +466,20 @@ export const handleRtcAnswer = async (frame: {
  */
 export const handleRtcNack = (frame: {
   readonly channel_id: string;
-  readonly reason: TRtcNackReason;
+  readonly reason: string;
 }): void => {
+  const reason: TRtcNackReason = normalizeRtcNackReason(frame.reason);
   const session = sessionsByChannel.get(frame.channel_id);
   if (session === undefined || session.closed) return;
   const keyId = session.keyId;
   logWarn("rtc-client", "rtc offer nacked", {
     keyId,
     channelId: frame.channel_id,
-    reason: frame.reason,
+    reason,
   });
-  if (frame.reason === "overloaded") {
+  if (reason === "overloaded") {
     // Transient — tear down without caching so a later attempt can retry.
-    closeSession(session, `nack_${frame.reason}`);
+    closeSession(session, `nack_${reason}`);
     return;
   }
   markRtcFailure(keyId);

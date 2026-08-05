@@ -110,7 +110,7 @@ const pruneExpiredNonces = (now: number): void => {
   const kept: string[] = [];
   for (const n of nonceOrder) {
     const exp = nonceSeen.get(n);
-    if (exp !== undefined && exp > now) {
+    if (exp !== undefined && exp >= now) {
       kept.push(n);
       continue;
     }

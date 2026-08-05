@@ -57,7 +57,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
 // both sides only dereference the other's exports lazily inside functions.
 import { logWarn } from "./logger";
@@ -165,8 +165,12 @@ const DEV_CLOUD_ORIGIN = "http://127.0.0.1:3000";
  * home) and must still resolve the DAEMON's state dir. See
  * `sandbox/exec.ts` `HOME_FLAG`.
  */
-export const stateDir = (home?: string): string =>
-  process.env.OPENLLM_DAEMON_STATE_DIR ?? join(home ?? homedir(), ".openllm");
+export const stateDir = (home?: string): string => {
+  const override = process.env.OPENLLM_DAEMON_STATE_DIR;
+  return override !== undefined && override.length > 0 && isAbsolute(override)
+    ? override
+    : join(home ?? homedir(), ".openllm");
+};
 
 /**
  * The SHARED OpenLLM env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the

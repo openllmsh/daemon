@@ -60,7 +60,8 @@ export const refreshCliState = async (): Promise<TDaemonCliState> => {
   if (
     cache.path === bin &&
     cache.signature === signature &&
-    (cache.version !== null || cache.failedProbes >= MAX_FAILED_VERSION_PROBES)
+    (cache.failedProbes === 0 ||
+      cache.failedProbes >= MAX_FAILED_VERSION_PROBES)
   ) {
     return { installed: true, version: cache.version };
   }
@@ -71,9 +72,8 @@ export const refreshCliState = async (): Promise<TDaemonCliState> => {
   const failedProbes =
     probedVersion === null ? (sameBinary ? cache.failedProbes : 0) + 1 : 0;
   const keepPreviousVersion =
-    sameBinary &&
+    cache.path === bin &&
     cache.version !== null &&
-    cache.failedProbes > 0 &&
     failedProbes < MAX_FAILED_VERSION_PROBES;
   const version = probedVersion ?? (keepPreviousVersion ? cache.version : null);
   cache = { path: bin, signature, version, failedProbes };

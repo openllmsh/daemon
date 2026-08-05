@@ -17,15 +17,15 @@
 import { statSync } from "node:fs";
 
 /**
- * A compact `size:mtime` signature of the RESOLVED binary at `path`, or `null`
- * when it can't be statted (missing / broken symlink). Two calls returning the
- * same non-null string mean the binary is unchanged; any difference (or a
- * null↔non-null transition) means re-probe.
+ * A compact `dev:ino:size:mtime:ctime` signature of the RESOLVED binary at
+ * `path`, or `null` when it can't be statted (missing / broken symlink). Two
+ * calls returning the same non-null string mean the binary is unchanged; any
+ * difference (or a null↔non-null transition) means re-probe.
  */
 export const binarySignature = (path: string): string | null => {
   try {
     const s = statSync(path); // follows symlinks — see module doc
-    return `${s.size}:${s.mtimeMs.toString(36)}`;
+    return `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs.toString(36)}:${s.ctimeMs.toString(36)}`;
   } catch {
     return null; // missing / unresolvable — caller treats as "changed"
   }

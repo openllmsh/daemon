@@ -75,6 +75,8 @@ const isSessionHostMeta = (value: unknown): value is TSessionHostMeta => {
     (meta.title === null || typeof meta.title === "string") &&
     typeof meta.startedAtMs === "number" &&
     Number.isFinite(meta.startedAtMs) &&
+    typeof meta.processStartTime === "string" &&
+    meta.processStartTime.length > 0 &&
     typeof meta.generation === "number" &&
     Number.isInteger(meta.generation) &&
     meta.generation >= 1
@@ -125,7 +127,22 @@ export const discoverSessionHosts = (): readonly TLiveSessionHost[] => {
     } catch {
       meta = null;
     }
-    if (meta === null || !pidAlive(meta.pid) || !socketPresent(socketPath)) {
+    const socketReady = socketPresent(socketPath);
+    if (meta !== null && pidAlive(meta.pid) && !socketReady) {
+      // Live host still within the ctl.sock bind grace window — keep it.
+      let startedAtMs: number | null = meta.startedAtMs;
+      try {
+        startedAtMs ??= statSync(directory).mtimeMs;
+      } catch {
+        startedAtMs = null;
+      }
+      if (
+        startedAtMs !== null &&
+        Date.now() - startedAtMs < SPAWN_SOCKET_TIMEOUT_MS
+      )
+        continue;
+    }
+    if (meta === null || !socketReady || !pidAlive(meta.pid)) {
       try {
         rmSync(directory, { recursive: true, force: true });
       } catch {
@@ -222,6 +239,7 @@ class CliPipeSessionStream implements TSessionStream {
     private readonly proc: ReturnType<typeof Bun.spawn>,
     private readonly stdin: {
       write: (data: Uint8Array | string) => number | Promise<number>;
+      flush: () => number | Promise<number>;
     },
   ) {
     const stdout = proc.stdout;
@@ -315,6 +333,7 @@ class CliPipeSessionStream implements TSessionStream {
   write = async (bytes: Uint8Array): Promise<void> => {
     if (this.closed) throw new Error("session pipe closed");
     await this.stdin.write(bytes);
+    await this.stdin.flush();
   };
 
   private writeControl = (control: object): void => {
@@ -322,7 +341,9 @@ class CliPipeSessionStream implements TSessionStream {
       this.stdin.write(
         `${String.fromCharCode(PIPE_CTRL)}${JSON.stringify(control)}\n`,
       ),
-    ).catch(() => this.fireEnd());
+    )
+      .then(() => this.stdin.flush())
+      .catch(() => this.fireEnd());
   };
 
   sendCtrl = (payload: Uint8Array): void => {

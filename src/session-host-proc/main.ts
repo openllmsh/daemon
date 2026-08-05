@@ -40,6 +40,23 @@ import {
 const SESSION_DIR_MODE = 0o700;
 const ACTIVITY_POLL_MS = 15_000;
 
+const processStartTime = (): string | null => {
+  try {
+    const output = Bun.spawnSync(
+      ["ps", "-o", "lstart=", "-p", String(process.pid)],
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+      },
+    );
+    if (output.exitCode !== 0) return null;
+    const value = new TextDecoder().decode(output.stdout).trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+};
+
 export type TSessionHostArgs = {
   readonly id: string;
   readonly cli: TDeviceSessionCli;
@@ -60,6 +77,7 @@ export type TSessionHostMeta = {
   readonly vendorSessionId: string | null;
   readonly title: string | null;
   readonly startedAtMs: number;
+  readonly processStartTime: string;
   readonly generation: number;
 };
 
@@ -400,9 +418,19 @@ export const runSessionHost = (
     return;
   }
 
-  rmSync(stagingDirectory, { recursive: true, force: true });
-  mkdirSync(stagingDirectory, { mode: SESSION_DIR_MODE });
-  chmodSync(stagingDirectory, SESSION_DIR_MODE);
+  try {
+    rmSync(stagingDirectory, { recursive: true, force: true });
+    mkdirSync(stagingDirectory, { mode: SESSION_DIR_MODE });
+    chmodSync(stagingDirectory, SESSION_DIR_MODE);
+  } catch {
+    fail();
+    return;
+  }
+  const ownProcessStartTime = processStartTime();
+  if (ownProcessStartTime === null) {
+    fail();
+    return;
+  }
 
   setSessionLifecycleHooks({
     onSpawn: (session) => {
@@ -414,6 +442,7 @@ export const runSessionHost = (
         vendorSessionId: session.vendorSessionId,
         title: session.title,
         startedAtMs: session.startedAtMs,
+        processStartTime: ownProcessStartTime,
         generation: session.generation,
       };
       writeMeta();

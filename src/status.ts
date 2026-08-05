@@ -6,7 +6,7 @@
  * auth/store read), so callers should not hammer it — the SSE watcher
  * recomputes on a gentle interval and only while a client is listening.
  */
-import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TDaemonStatus } from "@openllmsh/protocol";
@@ -28,7 +28,6 @@ import { DAEMON_VERSION } from "./version";
 /** True when `path` is a regular file the process can execute. */
 const isExecutableFile = (path: string): boolean => {
   try {
-    if (!existsSync(path)) return false;
     if (!statSync(path).isFile()) return false;
     accessSync(path, constants.X_OK);
     return true;
@@ -37,16 +36,28 @@ const isExecutableFile = (path: string): boolean => {
   }
 };
 
+const OPENCODE_PROBE_TTL_MS = 30_000;
+let opencodeProbe: { readonly at: number; readonly found: boolean } | null =
+  null;
+
 /** OpenCode is a device-session client (not a subscription delegate). Surface
  *  install presence so the device picker can offer it when the binary exists. */
 const opencodeInstalled = (): boolean => {
+  if (
+    opencodeProbe !== null &&
+    Date.now() - opencodeProbe.at < OPENCODE_PROBE_TTL_MS
+  ) {
+    return opencodeProbe.found;
+  }
   const home = homedir();
   const candidates = [
     join(home, ".opencode", "bin", "opencode"),
     join(home, ".local", "bin", "opencode"),
     ...resolveOnPath("opencode"),
   ];
-  return candidates.some((p) => isExecutableFile(p));
+  const found = candidates.some((path) => isExecutableFile(path));
+  opencodeProbe = { at: Date.now(), found };
+  return found;
 };
 
 const computeStatusFresh = async (): Promise<TDaemonStatus> => {

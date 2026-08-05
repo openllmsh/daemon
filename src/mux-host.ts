@@ -1,4 +1,4 @@
-import type { TChannelCloseReason, TRelayFrame } from "@openllmsh/protocol";
+import type { TRelayFrame } from "@openllmsh/protocol";
 import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
 import {
   decodeChannelEnvelope,
@@ -200,7 +200,7 @@ const consumerChannelFor = (keyId: string): TRelayChannel | undefined => {
   return undefined;
 };
 
-const failOpen = (keyId: string, reason?: TChannelCloseReason): void => {
+const failOpen = (keyId: string, reason?: string): void => {
   const pending = opening.get(keyId);
   if (pending === undefined) return;
   opening.delete(keyId);
@@ -612,7 +612,8 @@ export const acceptChannel = (frame: {
  */
 export const closeChannelFromRelay = (frame: {
   readonly channel_id: string;
-  readonly reason?: TChannelCloseReason;
+  /** Open-vocabulary reason from a forward-compatible relay peer. */
+  readonly reason?: string;
 }): void => {
   // A close for a channel still being negotiated settles that open instead.
   for (const [keyId, pending] of [...opening.entries()]) {

@@ -221,6 +221,7 @@ export const cliInstallState = async (
   if (
     cached?.result.installed === true &&
     cached.result.version !== null &&
+    signature !== null &&
     cached.signature === signature &&
     generation === cacheGeneration
   ) {

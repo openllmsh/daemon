@@ -13,7 +13,7 @@
  *     home/            the CLI's home/config + credentials (isolated)
  */
 
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
@@ -172,12 +172,19 @@ export const sessionWorkspace = (sessionId: string): string =>
  * `daemonTempDir` must succeed — a missing temp root would leave vendor CLIs
  * writing under an unusable TMPDIR and surface as opaque spawn failures.
  */
-export const sessionEnv = (): Record<string, string> => {
+const verifiedDaemonTempDir = (): string => {
   const tmp = daemonTempDir();
   // daemonTempDir swallows mkdir errors; fail closed before spawn if unusable.
-  if (!existsSync(tmp)) {
-    throw new Error(`daemon temp dir missing: ${tmp}`);
+  try {
+    if (statSync(tmp).isDirectory()) return tmp;
+  } catch {
+    // Fall through to the consistent failure below.
   }
+  throw new Error(`daemon temp dir missing: ${tmp}`);
+};
+
+export const sessionEnv = (): Record<string, string> => {
+  const tmp = verifiedDaemonTempDir();
   return {
     HOME: homedir(),
     TMPDIR: tmp,
@@ -235,7 +242,7 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
   const root = cliRoot(provider);
   const config = cliConfigDir(provider);
   // The daemon-owned, sandbox-granted staging dir for `mktemp -d` (see above).
-  const tmp = daemonTempDir();
+  const tmp = verifiedDaemonTempDir();
   switch (provider) {
     case "claude_code":
       return {

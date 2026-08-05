@@ -124,6 +124,9 @@ let daemonSessionId: string | null = null;
 let supportsOrderedStatus: boolean | null = null;
 let statusSeq = 0;
 let statusPublishTail: Promise<void> = Promise.resolve();
+/** Binary WebSocket frames can arrive as a mix of Blobs and ArrayBuffers. Blob
+ * conversion is async, so queue all binary delivery to preserve wire order. */
+let binaryFrameTail: Promise<void> = Promise.resolve();
 /** Whether THIS connection's `hello` has been sent. The relay 4001-closes any
  *  connection whose FIRST frame isn't a hello, and an out-of-band status push
  *  (the bootstrap scheduler fires `pushStatusIfChanged` the moment
@@ -542,31 +545,35 @@ const dispatchFrame = (frame: TRelayFrame): void => {
   }
 };
 
+const enqueueBinaryFrame = (read: () => Promise<Uint8Array>): void => {
+  binaryFrameTail = binaryFrameTail
+    .then(read)
+    .then((bytes) => muxHostOnBytes(bytes))
+    .catch((err: unknown) => {
+      logWarn("control-channel", "blob binary frame read failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+};
+
 const onMessage = (data: unknown): void => {
   if (data instanceof ArrayBuffer) {
-    muxHostOnBytes(new Uint8Array(data));
+    enqueueBinaryFrame(async () => new Uint8Array(data));
     return;
   }
   if (data instanceof Uint8Array) {
-    muxHostOnBytes(data);
+    enqueueBinaryFrame(async () => data);
     return;
   }
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
-    muxHostOnBytes(new Uint8Array(data));
+    enqueueBinaryFrame(async () => new Uint8Array(data));
     return;
   }
   // partysocket defaults binaryType to "blob". We force "arraybuffer" on
   // open, but a reconnect race can still deliver a Blob once — convert
   // rather than drop (silent Blob drops hang fleet tunnels forever).
   if (typeof Blob !== "undefined" && data instanceof Blob) {
-    void data
-      .arrayBuffer()
-      .then((buffer) => muxHostOnBytes(new Uint8Array(buffer)))
-      .catch((err: unknown) => {
-        logWarn("control-channel", "blob binary frame read failed", {
-          err: err instanceof Error ? err.message : String(err),
-        });
-      });
+    enqueueBinaryFrame(async () => new Uint8Array(await data.arrayBuffer()));
     return;
   }
   if (typeof data !== "string") return;

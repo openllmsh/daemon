@@ -11,5 +11,7 @@ export const truncate = (s: string): string => {
   // survives readLocalSessions' own `.slice(0, TITLE_MAX)` unchanged.
   return t.length <= TITLE_MAX
     ? t
-    : `${t.slice(0, TITLE_MAX - ELLIPSIS.length)}${ELLIPSIS}`;
+    : `${t
+        .slice(0, TITLE_MAX - ELLIPSIS.length)
+        .replace(/[\uD800-\uDBFF]$/, "")}${ELLIPSIS}`;
 };
