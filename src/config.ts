@@ -26,6 +26,7 @@ import {
   publishIdentity,
 } from "./cloud-client";
 import { setDeviceAccessPubkey } from "./device-access-verify";
+import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { clearPlanCache } from "./plan-cache";
 
@@ -136,12 +137,16 @@ export const planCacheEnabled = (): boolean => snapshot.plan_cache === true;
 /**
  * The fleet-peer key id serving `provider` (subscription tunnel — feature
  * §1), from the last bootstrap. Null when no online fleet daemon serves it
- * (or the cloud predates the field) — the walker then falls through exactly
- * as before the tunnel existed.
+ * (or the cloud predates the field), or when a stale cloud snapshot names this
+ * daemon's own key — local serving is handled separately and must not tunnel
+ * back to itself.
  */
-export const fleetSubscriptionServerFor = (provider: string): string | null =>
-  snapshot.fleet_subscriptions?.find((f) => f.provider === provider)?.key_id ??
-  null;
+export const fleetSubscriptionServerFor = (provider: string): string | null => {
+  const keyId =
+    snapshot.fleet_subscriptions?.find((f) => f.provider === provider)
+      ?.key_id ?? null;
+  return keyId === daemonApiKeyId() ? null : keyId;
+};
 
 /** Serving daemon X25519 pubkey for a fleet peer, when its bootstrap status supplied one. */
 export const fleetSubscriptionPubkeyFor = (keyId: string): string | null =>
