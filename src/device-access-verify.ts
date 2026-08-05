@@ -227,7 +227,6 @@ export const checkDeviceGrant = (
 };
 
 export type TEnforceSeedGateResult =
-  | { readonly mode: "off" }
   | { readonly mode: "reject"; readonly reason: string }
   | { readonly mode: "ok" };
 
@@ -238,12 +237,15 @@ export type TEnforceSeedGateExpect = {
 };
 
 /**
- * Single seed-gate decision tree for mux / tunnel / RTC.
- * - pin null → mode "off" (legacy, skip enforcement)
+ * Single seed-gate decision tree for browser mux / tunnel / RTC.
+ * - pin null → reject "unprovisioned"
  * - missing keyId → reject "no_api_key_id"
  * - missing/empty grant → reject "missing_grant"
  * - checkDeviceGrant fail → reject with checked.reason
  * - else ok
+ *
+ * Fleet daemon-to-daemon mux hops deliberately bypass this browser gate in
+ * mux-host: they do not have a browser vault DEK with which to mint a grant.
  *
  * Callers pass `daemonApiKeyId()` / `daemonPublicKey()` so this module stays
  * free of env/keypair imports (no circular deps).
@@ -253,7 +255,7 @@ export const enforceSeedGate = (
   expect: TEnforceSeedGateExpect,
 ): TEnforceSeedGateResult => {
   if (getDeviceAccessPubkey() === null) {
-    return { mode: "off" };
+    return { mode: "reject", reason: "unprovisioned" };
   }
   if (expect.keyId === null) {
     return { mode: "reject", reason: "no_api_key_id" };
@@ -278,17 +280,17 @@ export const enforceSeedGate = (
 };
 
 /**
- * RTC offer seed-gate: when provisioned, require offerVersion 2 and a valid
- * nested grant. Unprovisioned daemons return mode "off" so the host keeps
- * accepting legacy v1 offers. Single entry for the outer pin + v1 branch that
- * previously lived inline in rtc-host.
+ * RTC offer seed-gate: require a provisioned pin, offerVersion 2, and a valid
+ * nested grant. Unprovisioned daemons fail closed rather than accepting legacy
+ * v1 offers. Single entry for the outer pin + v1 branch that previously lived
+ * inline in rtc-host.
  */
 export const enforceRtcSeedGate = (
   grant: string | undefined,
   expect: TEnforceSeedGateExpect & { readonly offerVersion: number },
 ): TEnforceSeedGateResult => {
   if (getDeviceAccessPubkey() === null) {
-    return { mode: "off" };
+    return { mode: "reject", reason: "unprovisioned" };
   }
   if (expect.offerVersion !== 2) {
     return { mode: "reject", reason: "v1_offer" };

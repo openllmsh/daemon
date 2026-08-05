@@ -309,9 +309,9 @@ export const handleRtcOffer = async (frame: {
     return;
   }
 
-  // Seed-gate: when provisioned, require a v2 offer carrying a valid grant.
-  // Un-provisioned daemons still accept legacy v1 (no grant). No open-ack
-  // frame exists for RTC — rejects stay silent (no answer), same as bad proof.
+  // Seed-gate: require a provisioned pin plus a v2 offer carrying a valid
+  // grant. Authenticated failures, including an unprovisioned daemon, nack so
+  // the browser fails fast rather than waiting for the signaling timeout.
   const gate = enforceRtcSeedGate("grant" in inner ? inner.grant : undefined, {
     keyId: daemonApiKeyId(),
     cid: frame.channel_id,
