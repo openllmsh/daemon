@@ -169,7 +169,7 @@ import {
 import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
-import { isClaudeCodeOriginator, selectSubMethod } from "./sub-method";
+import { isClaudeCodeOriginator, localMethodsForHop } from "./sub-method";
 import { tunnelToPeer } from "./tunnel-client";
 import { peekUsageForQuotaGate, sampleUsageAfterRequest } from "./usage-cache";
 
@@ -1618,10 +1618,84 @@ const serveKimiBuiltinSearch = async (
  * is a misuse of the daemon surface (clients reach it only via the
  * gateway's 307, which always carries a plan) → 400.
  */
+/**
+ * Local subscription readiness for one provider — shared by the auth gate
+ * and the quota-account lookup so a hop pays `status()` at most once.
+ * `connected: false` means install-only / not signed in / status failed;
+ * the walker must not spawn a bridge or attempt handrolled on that box.
+ */
+export type TLocalSubscriptionAuth = {
+  readonly connected: boolean;
+  readonly detail: string | null;
+};
+
+export const ensureLocalSubscription = async (
+  provider: string,
+  connectedByProvider: Map<string, TLocalSubscriptionAuth>,
+  accountHashByProvider: Map<string, string | null>,
+): Promise<TLocalSubscriptionAuth> => {
+  const cached = connectedByProvider.get(provider);
+  if (cached !== undefined) return cached;
+
+  const delegate = getDelegate(provider);
+  if (delegate === null) {
+    const miss: TLocalSubscriptionAuth = {
+      connected: false,
+      detail: `${provider} is not a local subscription provider`,
+    };
+    connectedByProvider.set(provider, miss);
+    accountHashByProvider.set(provider, null);
+    return miss;
+  }
+
+  try {
+    const status = await delegate.status();
+    const result: TLocalSubscriptionAuth = {
+      connected: status.connected,
+      detail: status.connected
+        ? null
+        : (status.detail ?? `${provider} not signed in on this device`),
+    };
+    connectedByProvider.set(provider, result);
+    accountHashByProvider.set(
+      provider,
+      status.connected ? (status.account_hash ?? null) : null,
+    );
+    return result;
+  } catch (error) {
+    const result: TLocalSubscriptionAuth = {
+      connected: false,
+      detail:
+        error instanceof Error
+          ? error.message
+          : `${provider} status check failed`,
+    };
+    connectedByProvider.set(provider, result);
+    accountHashByProvider.set(provider, null);
+    return result;
+  }
+};
+
 export const usageForActiveAccount = async (
   provider: string,
   accountHashByProvider: Map<string, string | null>,
+  connectedByProvider?: Map<string, TLocalSubscriptionAuth>,
 ): Promise<TProviderUsageSnapshot | null> => {
+  // Prefer the shared auth probe when the walker already paid for it.
+  if (connectedByProvider !== undefined) {
+    const auth = await ensureLocalSubscription(
+      provider,
+      connectedByProvider,
+      accountHashByProvider,
+    );
+    if (!auth.connected) return null;
+    const accountHash = accountHashByProvider.get(provider) ?? null;
+    if (accountHash === null) return null;
+    const delegate = getDelegate(provider);
+    if (delegate === null) return null;
+    return peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
+  }
+
   const delegate = getDelegate(provider);
   if (delegate === null) return null;
 
@@ -1662,15 +1736,11 @@ const largestContextHop = (
  * Fleet subscription tunnel — the consuming-daemon fallback for a
  * subscription hop this box could not serve locally.
  *
- * Call sites cover every "local serve exhausted" exit for a hop:
- *   - handrolled `serveSubscription` → hopRetry (no usable credential, …)
- *   - bridge-only compliance continues (non-CC `claude_code`, `cursor`)
- *     after the native runtime declined or was unavailable
- *
- * The trigger is "this box can't serve", NOT "handrolled failed" — fleet
- * must run before a hop is abandoned, otherwise browser→B→A never
- * exercises for the common claude_code non-CC path (bridge decline +
- * compliance continue used to skip the tunnel entirely).
+ * Single call site after local serve is exhausted for ANY subscription
+ * provider (auth gate miss, bridge decline, handrolled hopRetry, empty
+ * local method list). The trigger is "this box can't serve" — never a
+ * per-slug branch. Without this, browser→B→A never exercises when B has
+ * the CLI installed but no login, or when a bridge-only hop declines.
  *
  * When the bootstrap snapshot names an online fleet peer serving the
  * provider, the ORIGINAL inbound request tunnels to the peer over the
@@ -1858,6 +1928,9 @@ const walkPlan = async (
   hops: ReadonlyArray<THop>,
 ): Promise<Response> => {
   const accountHashByProvider = new Map<string, string | null>();
+  // Shared per-request cache of `delegate.status()` — the local auth gate and
+  // the quota-account lookup both read through it so a hop pays status once.
+  const connectedByProvider = new Map<string, TLocalSubscriptionAuth>();
   // Canonical view of the inbound for native-runtime eligibility and encoding.
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
   const baseEstimate = estimateBodyTokens(args.rawBody);
@@ -1866,13 +1939,9 @@ const walkPlan = async (
   // overrides — sampled ONCE per request from the cached bootstrap
   // snapshot so it can never switch mid-hop (a bootstrap refresh landing
   // mid-walk applies to the NEXT request). Resolved per hop against the
-  // provider's declared methods in `selectSubMethod`, with the provider's
-  // override winning over the global preference — EXCEPT a `claude_code`
-  // hop whose inbound request comes from the real Claude Code client,
-  // which is always handrolled (the ToS-alignment override inside
-  // `selectSubMethod`: forwarding the genuine client's own request on the
-  // CLI's credential IS the official-client flow; the bridge would nest a
-  // second Claude Code around it).
+  // provider's declared methods in `localMethodsForHop` (capability table +
+  // preference + ToS: CC originator → handrolled-only; non-CC claude_code →
+  // bridge-only; cursor → bridge-only).
   const requestedSubMethod = activeSubMethod();
   const subMethodOverrides = activeSubMethodOverrides();
   const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
@@ -2008,10 +2077,6 @@ const walkPlan = async (
     queueIndex += 1;
     const { hop, forceContextAttempt } = candidate;
     attempted.push(hop.modelId);
-    // THIS iteration's native-bridge decline reason (if any). Scoped per hop so
-    // a bridge-only provider's failure row reports its OWN decline, never a
-    // prior hop's stale `lastError`.
-    let nativeDecline: string | null = null;
     // A skipped ordinary candidate means the physical queue still has a
     // forced-context epilogue. Its successor must remain walkable until that
     // retry receives the tokenizer's final verdict.
@@ -2074,10 +2139,31 @@ const walkPlan = async (
       continue;
     }
     if (isSubscriptionSlug(hop.provider)) {
+      // ── Local auth gate (every subscription provider) ─────────────────
+      // Install ≠ signed-in. status().connected is the same signal the cloud
+      // uses for fleet_subscriptions. Without a local login, skip every local
+      // transport (bridge spawn / handrolled credential) and go straight to
+      // fleet — a doomed ACP handshake ("Invalid params") or credential throw
+      // is not a hop resolution strategy.
+      const localAuth = await ensureLocalSubscription(
+        hop.provider,
+        connectedByProvider,
+        accountHashByProvider,
+      );
+      if (!localAuth.connected) {
+        lastError =
+          localAuth.detail ?? `${hop.provider} not signed in on this device`;
+        const tunneled = await tryFleetTunnel(hop, args);
+        if (tunneled !== null) return withHopTrailHeaders(tunneled);
+        addHopFailure(hop, lastError);
+        continue;
+      }
+
       const decision = quotaGateDecision({
         snapshot: await usageForActiveAccount(
           hop.provider,
           accountHashByProvider,
+          connectedByProvider,
         ),
         meter: lookupCatalogEntry(hop.modelId)?.subscription_meter,
         finalHop,
@@ -2094,158 +2180,135 @@ const walkPlan = async (
         clearPlanCache();
         continue;
       }
-    }
-    // Native-runtime providers (claude_code, chatgpt) — try the OFFICIAL vendor
-    // runtime FIRST (Claude Code stream-json / Codex app-server). On a native
-    // DECLINE (unsupported request — tools/images/structured-output — or a
-    // pre-commit failure) fall through to the MANUAL transport on the SAME hop
-    // (below) so no workflow is blocked; auth/refresh still run through the CLI
-    // via the delegate either way.
-    //
-    // The cloud's `active_sub_method` preference gates the attempt: a
-    // `handrolled` selection executes the manual transport ONLY — it never
-    // probes or spawns the bridge; a `bridge` selection (or no preference,
-    // since bridge is those providers' default) keeps the pre-commit
-    // fallback above. Selection is per hop, deterministic
-    // (`selectSubMethod`), and never switches after first committed output
-    // (the commit rule below is method-agnostic).
-    if (
-      isNativeRuntimeProvider(hop.provider) &&
-      selectSubMethod(
+
+      // Ordered local transports for THIS hop — capability table + preference
+      // + ToS policy (non-CC claude_code → bridge only; cursor → bridge only;
+      // handrolled preference → handrolled only). No per-slug branches here.
+      const methods = localMethodsForHop(
         hop.provider,
         subMethodOverrides[hop.provider] ?? requestedSubMethod,
         { isClaudeCode: claudeCodeOriginator },
-      ) === "bridge"
-    ) {
-      const native = await tryServeNativeRuntime({
-        provider: hop.provider,
-        providerModelId: hop.providerModelId,
-        surface: args.surface,
-        rawBody: args.rawBody,
-        canonical,
-        wantsStream:
-          (args.rawBody as { stream?: unknown } | null)?.stream === true,
-        signal: args.req.signal,
-        record: (tokens, status) =>
-          report(
-            {
-              model: hop.modelId,
-              provider: hop.provider,
-              status,
-              latency_ms: Date.now() - args.startedAt,
-              endpoint: args.endpoint,
-              ...tokens,
-            },
-            args.originParam,
-            accountHashByProvider.get(hop.provider) ?? undefined,
-          ),
-      });
-      if (native instanceof Response) {
-        if (
-          native.status === 408 ||
-          native.status === 429 ||
-          native.status >= 500
-        ) {
-          clearPlanCache();
-        }
-        return withHopTrailHeaders(native);
-      }
-      nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
-      lastError = nativeDecline;
-      // ↓ fall through to the manual transport for this hop (no `continue`)
-      //   — EXCEPT for a non-CC claude_code request (see the gate below).
-    }
-    // Compliance gate: the manual (handrolled) transport is a legitimate path
-    // for claude_code ONLY when the originator is the genuine Claude Code CLI
-    // — it forwards that client's OWN request verbatim on its OWN credential,
-    // the official-client flow. For ANY other originator the manual
-    // claude_code path would have to SPOOF the Claude Code identity to pass
-    // Anthropic's OAuth spoof-guard (inject a "You are Claude Code" preamble
-    // the client never sent), which we refuse. So a non-CC claude_code hop is
-    // BRIDGE-ONLY on THIS box. If the bridge declined (or wasn't selected),
-    // try the fleet tunnel FIRST — a peer that holds a real Claude login can
-    // still serve under ITS local policy (browser→B→A). Only when no peer
-    // accepts do we advance the plan; never fall to the spoof-prone manual
-    // transport on this box.
-    if (hop.provider === "claude_code" && !claudeCodeOriginator) {
-      lastError =
-        lastError ??
-        `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
-      const tunneled = await tryFleetTunnel(hop, args);
-      if (tunneled !== null) return withHopTrailHeaders(tunneled);
-      addHopFailure(hop, lastError);
-      continue;
-    }
-    // cursor is BRIDGE-ONLY on this box: no UPSTREAM_WIRE entry
-    // (api2.cursor.sh is a dashboard host, not a model endpoint) and no
-    // cloud path (subscription hops never forward). If the ACP bridge
-    // declined above, a fleet peer that CAN run cursor-agent may still
-    // serve — try that before abandoning the hop.
-    if (hop.provider === "cursor") {
-      const reason =
-        nativeDecline ??
-        `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp)`;
-      lastError = reason;
-      const tunneled = await tryFleetTunnel(hop, args);
-      if (tunneled !== null) return withHopTrailHeaders(tunneled);
-      addHopFailure(hop, reason);
-      continue;
-    }
-    const wire = UPSTREAM_WIRE[hop.provider];
-    if (wire !== undefined) {
-      // Manual subscription transport — the fallback for native declines
-      // (claude_code + chatgpt) and the sole path for kimi_code + grok.
-      const served = await serveSubscription(
-        hop,
-        wire,
-        args,
-        finalHop,
-        sampleQuotaUsage,
       );
-      if (!isHopRetry(served)) {
-        if (
-          forceContextAttempt &&
-          !served.ok &&
-          firstTerminalResponse !== null
-        ) {
-          return withHopTrailHeaders(firstTerminalResponse);
+      let nativeDecline: string | null = null;
+      let handrolledRetry: THopRetry | null = null;
+
+      if (methods.includes("bridge") && isNativeRuntimeProvider(hop.provider)) {
+        // Official vendor runtime (Claude stream-json / Codex app-server /
+        // cursor ACP). Pre-commit declines fall through to handrolled when
+        // `methods` still allows it; otherwise fleet (below).
+        const native = await tryServeNativeRuntime({
+          provider: hop.provider,
+          providerModelId: hop.providerModelId,
+          surface: args.surface,
+          rawBody: args.rawBody,
+          canonical,
+          wantsStream:
+            (args.rawBody as { stream?: unknown } | null)?.stream === true,
+          signal: args.req.signal,
+          record: (tokens, status) =>
+            report(
+              {
+                model: hop.modelId,
+                provider: hop.provider,
+                status,
+                latency_ms: Date.now() - args.startedAt,
+                endpoint: args.endpoint,
+                ...tokens,
+              },
+              args.originParam,
+              accountHashByProvider.get(hop.provider) ?? undefined,
+            ),
+        });
+        if (native instanceof Response) {
+          if (
+            native.status === 408 ||
+            native.status === 429 ||
+            native.status >= 500
+          ) {
+            clearPlanCache();
+          }
+          return withHopTrailHeaders(native);
         }
-        return withHopTrailHeaders(served);
+        nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
+        lastError = nativeDecline;
       }
-      // Fleet tunnel (feature §1): local handrolled couldn't serve — a fleet
-      // peer may. Same helper as the bridge-only continues above; the
-      // trigger is "this box can't serve", not "handrolled specifically".
-      // Loop guard lives inside tryFleetTunnel.
+
+      const wire = UPSTREAM_WIRE[hop.provider];
+      if (methods.includes("handrolled") && wire !== undefined) {
+        // Manual subscription transport — sole path for kimi/grok; fallback
+        // for bridge declines on claude_code + chatgpt when policy allows.
+        const served = await serveSubscription(
+          hop,
+          wire,
+          args,
+          finalHop,
+          sampleQuotaUsage,
+        );
+        if (!isHopRetry(served)) {
+          if (
+            forceContextAttempt &&
+            !served.ok &&
+            firstTerminalResponse !== null
+          ) {
+            return withHopTrailHeaders(firstTerminalResponse);
+          }
+          return withHopTrailHeaders(served);
+        }
+        handrolledRetry = served;
+        lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
+        preserveTerminalResponse(served.upstreamResponse, forceContextAttempt);
+      }
+
+      // Local serve exhausted (auth-gated, method-gated, or both declined) —
+      // a fleet peer may still hold the login. ONE tunnel site for every
+      // subscription provider; loop guard lives inside tryFleetTunnel.
       const tunneled = await tryFleetTunnel(hop, args);
       if (tunneled !== null) return withHopTrailHeaders(tunneled);
-      // Pre-stream candidate failure: record + trail, then walk. Never throw.
-      lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
-      preserveTerminalResponse(served.upstreamResponse, forceContextAttempt);
-      if (served.cooldownReason === "context_overflow") {
-        const requiredTokens =
-          contextOverflowRequiredTokens(served.bodySnippet ?? served.reason) ??
-          baseEstimate;
-        const nextModel = nextLargerContextModel(
-          hops.map((candidate) => candidate.modelId),
-          hop.modelId,
-          requiredTokens,
-          (modelId) => lookupCatalogEntry(modelId)?.input_token_limit ?? null,
+
+      if (handrolledRetry !== null) {
+        if (handrolledRetry.cooldownReason === "context_overflow") {
+          const requiredTokens =
+            contextOverflowRequiredTokens(
+              handrolledRetry.bodySnippet ?? handrolledRetry.reason,
+            ) ?? baseEstimate;
+          const nextModel = nextLargerContextModel(
+            hops.map((candidate) => candidate.modelId),
+            hop.modelId,
+            requiredTokens,
+            (modelId) => lookupCatalogEntry(modelId)?.input_token_limit ?? null,
+          );
+          if (nextModel !== null && !args.req.signal.aborted) {
+            hopTrail.push({
+              modelId: hop.modelId,
+              provider: hop.provider,
+              reason: handrolledRetry.reason,
+              ...(handrolledRetry.status !== undefined
+                ? { status: handrolledRetry.status }
+                : {}),
+            });
+            contextDemotionTarget = nextModel;
+            continue;
+          }
+          if (handrolledRetry.upstreamResponse !== undefined) {
+            return withHopTrailHeaders(handrolledRetry.upstreamResponse);
+          }
+        }
+        addHopFailure(
+          hop,
+          handrolledRetry.reason,
+          handrolledRetry.status,
+          handrolledRetry.cooldownReason,
         );
-        if (nextModel !== null && !args.req.signal.aborted) {
-          hopTrail.push({
-            modelId: hop.modelId,
-            provider: hop.provider,
-            reason: served.reason,
-            ...(served.status !== undefined ? { status: served.status } : {}),
-          });
-          contextDemotionTarget = nextModel;
-          continue;
-        }
-        if (served.upstreamResponse !== undefined) {
-          return withHopTrailHeaders(served.upstreamResponse);
-        }
+        continue;
       }
-      addHopFailure(hop, served.reason, served.status, served.cooldownReason);
+
+      lastError =
+        nativeDecline ??
+        (methods.length === 0
+          ? `${hop.provider} hop ${hop.modelId} has no local transport on this box`
+          : (lastError ??
+            `${hop.provider} hop ${hop.modelId} could not be served locally`));
+      addHopFailure(hop, lastError);
       continue;
     }
     // API-key hop: forward to the cloud pinned to this concrete model.

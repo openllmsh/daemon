@@ -101,3 +101,44 @@ export const selectSubMethod = (
     ? requested
     : capability.methods[0];
 };
+
+/**
+ * Ordered local transports this box may attempt for one subscription hop.
+ * Provider-agnostic: capability table + preference + the two ToS policies
+ * already owned by {@link selectSubMethod} / the non-CC claude_code rule.
+ *
+ * Walker uses this instead of hard-coding per-slug branches:
+ *   - `["bridge"]`            — bridge-only (cursor), or non-CC claude_code
+ *                               (handrolled would spoof Claude Code identity)
+ *   - `["handrolled"]`        — handrolled preference, or CC originator
+ *                               (selectSubMethod forces handrolled)
+ *   - `["bridge","handrolled"]` — bridge preference with handrolled fallback
+ *
+ * Empty only for an unknown provider with no declared methods (walker then
+ * treats local serve as exhausted and tries the fleet tunnel).
+ */
+export const localMethodsForHop = (
+  provider: string,
+  requested: TSubMethod | null,
+  originator?: { readonly isClaudeCode: boolean },
+): readonly TSubMethod[] => {
+  // Non-CC claude_code: never attempt handrolled on this box (would require
+  // spoofing a "You are Claude Code" identity the client never sent). Bridge
+  // only; fleet covers a peer that can serve under its own policy.
+  if (provider === "claude_code" && originator?.isClaudeCode !== true) {
+    return ["bridge"];
+  }
+
+  const selected = selectSubMethod(provider, requested, originator);
+  const capability =
+    SUB_METHOD_CAPABILITIES[provider as TSubscriptionProviderSlug];
+  if (capability === undefined) return [selected];
+
+  if (selected === "handrolled") return ["handrolled"];
+  // Bridge selected (preference or default): try bridge first; fall through
+  // to handrolled on the same hop when the capability table declares it.
+  if (capability.methods.includes("handrolled")) {
+    return ["bridge", "handrolled"];
+  }
+  return ["bridge"];
+};
