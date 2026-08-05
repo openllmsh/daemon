@@ -555,6 +555,20 @@ const onMessage = (data: unknown): void => {
     muxHostOnBytes(new Uint8Array(data));
     return;
   }
+  // partysocket defaults binaryType to "blob". We force "arraybuffer" on
+  // open, but a reconnect race can still deliver a Blob once — convert
+  // rather than drop (silent Blob drops hang fleet tunnels forever).
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    void data
+      .arrayBuffer()
+      .then((buffer) => muxHostOnBytes(new Uint8Array(buffer)))
+      .catch((err: unknown) => {
+        logWarn("control-channel", "blob binary frame read failed", {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+    return;
+  }
   if (typeof data !== "string") return;
   let json: unknown;
   try {
@@ -668,6 +682,12 @@ export const startControlChannel = (): void => {
     maxReconnectionDelay: 30_000,
   });
   ws = socket;
+  // partysocket defaults binaryType to "blob". Fleet mux frames must arrive
+  // as ArrayBuffer/Uint8Array — a Blob is dropped by onMessage and the peer
+  // hang looks like "channel accepted, zero stream activity, idle reaped".
+  // Set before open so the native socket inherits it (same fix as the browser
+  // store in lib/stores/daemon-store.ts).
+  socket.binaryType = "arraybuffer";
   socket.onopen = (): void => {
     logInfo(
       "control-channel",
@@ -679,6 +699,9 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
+    // Re-assert on every open: partysocket re-applies its cached binaryType
+    // to the native socket in _handleOpen, but be explicit after reconnect.
+    socket.binaryType = "arraybuffer";
     resetRelayScopedState();
     daemonSessionId = null;
     supportsOrderedStatus = null;

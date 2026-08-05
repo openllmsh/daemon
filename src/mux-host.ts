@@ -121,13 +121,23 @@ const reapIdleChannels = (): void => {
   const now = Date.now();
   for (const record of [...channels.values()]) {
     // Consumer records are relay-owned channels opened to fleet peers. Closing
-    // one locally without a matching relay close leaves the peer bound to it.
+    // one locally without a matching relay close leaves the peer bound to it —
+    // still true for serving records if we only tear the local map: the peer
+    // keeps a live consumer half and the next hop reuses a zombie channel.
+    // Always notify the relay so both ends free the id.
     if (record.keyId !== null) continue;
     if (record.channel.openStreamCount() > 0) continue;
     if (now - record.lastActivityAt < muxChannelIdleTtlMs) continue;
     logInfo("mux-host", "mux channel reaped: idle", {
       channelId: record.channelId,
       idleMs: now - record.lastActivityAt,
+    });
+    // Tell the relay first so the consumer is unbound before we drop local
+    // state (closeChannelFromRelay only mutates this daemon's map).
+    sendFrame?.({
+      type: "channel_close",
+      channel_id: record.channelId,
+      reason: "done",
     });
     closeChannelFromRelay({
       channel_id: record.channelId,
