@@ -1660,14 +1660,25 @@ const largestContextHop = (
 
 /**
  * Fleet subscription tunnel — the consuming-daemon fallback for a
- * subscription hop this box could not serve locally (`serveSubscription` →
- * "retry", usually "no usable credential"). When the bootstrap snapshot
- * names an online fleet peer serving the provider, the ORIGINAL inbound
- * request tunnels to the peer over the relay; the peer walks it with its
- * own credential (its local plan fetch pins the same alias, so the same
- * chain policy applies). Returns null — meaning "fall through like any
- * failed hop" — when: the request is itself tunnel-borne (loop guard), no
- * peer serves the provider, or the tunnel fails before the response head.
+ * subscription hop this box could not serve locally.
+ *
+ * Call sites cover every "local serve exhausted" exit for a hop:
+ *   - handrolled `serveSubscription` → hopRetry (no usable credential, …)
+ *   - bridge-only compliance continues (non-CC `claude_code`, `cursor`)
+ *     after the native runtime declined or was unavailable
+ *
+ * The trigger is "this box can't serve", NOT "handrolled failed" — fleet
+ * must run before a hop is abandoned, otherwise browser→B→A never
+ * exercises for the common claude_code non-CC path (bridge decline +
+ * compliance continue used to skip the tunnel entirely).
+ *
+ * When the bootstrap snapshot names an online fleet peer serving the
+ * provider, the ORIGINAL inbound request tunnels to the peer over the
+ * relay; the peer walks it with its own credential (its local plan fetch
+ * pins the same alias, so the same chain policy applies). Returns null —
+ * meaning "fall through like any failed hop" — when: the request is
+ * itself tunnel-borne (loop guard), no peer serves the provider, or the
+ * tunnel fails before the response head.
  */
 const tryFleetTunnel = async (
   hop: THop,
@@ -2151,25 +2162,32 @@ const walkPlan = async (
     // claude_code path would have to SPOOF the Claude Code identity to pass
     // Anthropic's OAuth spoof-guard (inject a "You are Claude Code" preamble
     // the client never sent), which we refuse. So a non-CC claude_code hop is
-    // BRIDGE-ONLY: the real vendor CLI is the sole compliant path. If the
-    // bridge declined (or wasn't selected), advance the plan rather than fall
-    // to the spoof-prone manual transport.
+    // BRIDGE-ONLY on THIS box. If the bridge declined (or wasn't selected),
+    // try the fleet tunnel FIRST — a peer that holds a real Claude login can
+    // still serve under ITS local policy (browser→B→A). Only when no peer
+    // accepts do we advance the plan; never fall to the spoof-prone manual
+    // transport on this box.
     if (hop.provider === "claude_code" && !claudeCodeOriginator) {
       lastError =
         lastError ??
         `claude_code hop ${hop.modelId} is bridge-only for a non-Claude-Code client`;
+      const tunneled = await tryFleetTunnel(hop, args);
+      if (tunneled !== null) return withHopTrailHeaders(tunneled);
       addHopFailure(hop, lastError);
       continue;
     }
-    // cursor is BRIDGE-ONLY: no UPSTREAM_WIRE entry (api2.cursor.sh is a
-    // dashboard host, not a model endpoint) and no cloud path (subscription
-    // hops never forward). If the ACP bridge declined above, advance the plan
-    // with the decline reason — never fall to the cloud-forward branch below.
+    // cursor is BRIDGE-ONLY on this box: no UPSTREAM_WIRE entry
+    // (api2.cursor.sh is a dashboard host, not a model endpoint) and no
+    // cloud path (subscription hops never forward). If the ACP bridge
+    // declined above, a fleet peer that CAN run cursor-agent may still
+    // serve — try that before abandoning the hop.
     if (hop.provider === "cursor") {
       const reason =
         nativeDecline ??
         `cursor hop ${hop.modelId} requires the ACP bridge (cursor-agent acp)`;
       lastError = reason;
+      const tunneled = await tryFleetTunnel(hop, args);
+      if (tunneled !== null) return withHopTrailHeaders(tunneled);
       addHopFailure(hop, reason);
       continue;
     }
@@ -2194,11 +2212,10 @@ const walkPlan = async (
         }
         return withHopTrailHeaders(served);
       }
-      // Fleet tunnel (feature §1): no local credential — a fleet peer may
-      // serve this provider over the relay. Never for a tunnel-borne
-      // request (loop guard) — a two-daemon credential gap must fail the
-      // hop, not ping-pong. Any tunnel failure degrades to the ordinary
-      // failed-hop fall-through.
+      // Fleet tunnel (feature §1): local handrolled couldn't serve — a fleet
+      // peer may. Same helper as the bridge-only continues above; the
+      // trigger is "this box can't serve", not "handrolled specifically".
+      // Loop guard lives inside tryFleetTunnel.
       const tunneled = await tryFleetTunnel(hop, args);
       if (tunneled !== null) return withHopTrailHeaders(tunneled);
       // Pre-stream candidate failure: record + trail, then walk. Never throw.

@@ -34,12 +34,7 @@ const isPreDispatchTunnelError = (error: unknown): boolean => {
   );
 };
 
-/**
- * Tunnel one request to the fleet peer serving `keyId`. Resolves once the
- * response head arrives (body streams thereafter); rejects when neither RTC
- * nor mux is available, or when the stream fails.
- */
-export const tunnelToPeer = async (args: {
+export type TTunnelToPeerArgs = {
   keyId: string;
   surface: TTunnelSurface;
   body: Uint8Array;
@@ -47,7 +42,25 @@ export const tunnelToPeer = async (args: {
   anthropicVersion?: string | null;
   anthropicBeta?: string | null;
   signal: AbortSignal;
-}): Promise<Response> => {
+};
+
+type TTunnelToPeerImpl = (args: TTunnelToPeerArgs) => Promise<Response>;
+
+/**
+ * Test-only override for {@link tunnelToPeer}. Production always uses the
+ * real RTC→mux ladder; walker fleet-tunnel unit tests inject a stub so they
+ * can assert peer selection without standing up a second daemon.
+ */
+let tunnelToPeerOverride: TTunnelToPeerImpl | null = null;
+
+/** Install (or clear with `null`) a test-only tunnelToPeer implementation. */
+export const setTunnelToPeerForTest = (
+  impl: TTunnelToPeerImpl | null,
+): void => {
+  tunnelToPeerOverride = impl;
+};
+
+const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
   const headers = {
     content_type: "application/json" as const,
     accept: args.accept,
@@ -137,3 +150,15 @@ export const tunnelToPeer = async (args: {
     throw error instanceof Error ? error : new Error(String(error));
   }
 };
+
+/**
+ * Tunnel one request to the fleet peer serving `keyId`. Resolves once the
+ * response head arrives (body streams thereafter); rejects when neither RTC
+ * nor mux is available, or when the stream fails.
+ */
+export const tunnelToPeer = async (
+  args: TTunnelToPeerArgs,
+): Promise<Response> =>
+  tunnelToPeerOverride !== null
+    ? tunnelToPeerOverride(args)
+    : tunnelToPeerLive(args);
