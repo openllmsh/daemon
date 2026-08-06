@@ -24,6 +24,7 @@ import { DeviceSessionCli, SESSION_ID_PATTERN } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
 import { resolveOpenllmCli } from "../cli-self-update";
+import { spawnCommand } from "../command";
 import { isDevMode, stateDir } from "../env";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
@@ -439,8 +440,7 @@ export const attachSessionHostViaCli = (
   const bin = openllmCliBinary();
   if (bin === null) return null;
   const proc = Bun.spawn(
-    [
-      bin,
+    spawnCommand(process.platform, bin, [
       "sessions",
       "attach",
       open.session_id,
@@ -449,7 +449,7 @@ export const attachSessionHostViaCli = (
       String(open.cols),
       "--rows",
       String(open.rows),
-    ],
+    ]),
     {
       stdin: "pipe",
       stdout: "pipe",

@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
+import { spawnCommand } from "../command";
 import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -116,7 +117,12 @@ export const runCapture = async (
   opts?: { readonly probe?: boolean },
 ): Promise<string | null> => {
   try {
-    const proc = Bun.spawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
+    const command = spawnCommand(
+      process.platform,
+      argv[0] ?? "",
+      argv.slice(1),
+    );
+    const proc = Bun.spawn(sandboxSpawnArgs(command, { probe: opts?.probe }), {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
