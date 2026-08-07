@@ -393,11 +393,14 @@ export const chatgptDelegate: TProviderDelegate = {
     // on any failure (never an empty list).
     const token = await readToken();
     if (token === null) return null;
-    // The backend wants a BARE semver (the CLI's own cache stores
-    // `"0.142.0"`); `codex --version` prints `codex-cli 0.142.0`, and
-    // sending that verbatim is a 400 (verified live). Extract the x.y.z.
-    const raw = (await cliVersion(bin(), env())) ?? "";
-    const ver = raw.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.0.0";
+    // The backend wants a BARE semver (the CLI's own cache stores `"0.142.0"`).
+    // Read it from `cliInstallState` — the SAME source `status()` reports and
+    // `model-report` tags the list with — so the `client_version` we query with
+    // and the `cli_version` stamped on the resulting report can never disagree
+    // (which would let the cloud's older-semver guard drop a freshly-fetched
+    // list). `cliInstallState` already extracts the bare x.y.z; `0.0.0` fallback
+    // keeps the query well-formed when the version can't be read.
+    const ver = (await cliInstallState(PROVIDER)).version ?? "0.0.0";
     return fetchModelList(
       await resolveProviderUrl(
         PROVIDER,

@@ -124,6 +124,34 @@ const linkSidecars = (isolatedBin: string): void => {
 };
 
 /**
+ * Re-point the isolated main symlink at the currently-preferred host binary when
+ * they diverge — the fix for an out-of-band vendor update that installs to a
+ * DIFFERENT preferred path (e.g. a new `~/.codex/bin/codex` while an older
+ * `~/.local/bin/codex` still exists, or a brew/npm relocation). Without this the
+ * link, once created, would track the old binary forever and freeze the reported
+ * version. Cheap: a `realpath` compare, with `linkIsolatedCli` (rm + symlink)
+ * only when they actually differ. Best-effort — a stat/link failure leaves the
+ * existing link intact and surfaces through the probe below.
+ *
+ * Returns `true` when the link was re-pointed (the caller must then recompute the
+ * binary signature, since the resolved target changed).
+ */
+const reconcileIsolatedLink = async (
+  provider: TCliProvider,
+  bin: string,
+): Promise<boolean> => {
+  const host = hostCliCandidates(provider).find((c) => existsSync(c));
+  if (host === undefined) return false;
+  try {
+    if (realpathSync(bin) === realpathSync(host)) return false;
+  } catch {
+    // Broken link / unresolvable host — fall through to re-link defensively.
+  }
+  await linkIsolatedCli(provider, host);
+  return true;
+};
+
+/**
  * Is the vendor CLI the daemon runs installed + runnable? SELF-HEALING: the
  * daemon never installs, so the isolated run-view symlink is created lazily here —
  * if `cliBin(provider)` is absent but the user's host binary exists
@@ -131,22 +159,53 @@ const linkSidecars = (isolatedBin: string): void => {
  * out of band (the daemon install script, or by hand) therefore shows as
  * installed on the next status read with no command. Best-effort version read.
  *
- * Results are cached for `CLI_INSTALL_STATE_TTL_MS` (default 30 s) so the
- * 2.5 s status watcher does not spawn `--version` on every tick. The version
- * of an installed CLI only changes on self-update, which restarts the daemon
- * anyway — so a short cache is safe for status accuracy.
+ * VENDOR updates happen OUT OF BAND, WITHOUT a daemon restart (the user runs
+ * `codex`/`claude`/`kimi` self-update, brew, npm, etc.), so freshness cannot
+ * assume a restart clears anything. Two paths defend against a frozen version:
+ *   1. The isolated main symlink is RE-RECONCILED against the preferred host
+ *      candidate on every probe (not only when absent) — an update that moves
+ *      the binary to a different preferred path re-points the link.
+ *   2. A real `--version` re-runs when the resolved binary's stat signature
+ *      changes OR the cached version is older than `CLI_VERSION_HARD_MAX_MS`
+ *      (catches a stable launcher/wrapper whose own stat never moves).
+ * The short TTL only throttles how often we re-stat / re-reconcile on the hot
+ * 2.5 s status path; it never pins a version past a detected binary change.
  */
 
-/** Cache TTL — 30 s balances accuracy against the 2.5 s status watcher. */
-const CLI_INSTALL_STATE_TTL_MS = 30_000;
+/** Numeric env override (tests only) — returns `fallback` unless the var parses
+ *  to a non-negative integer. Lets a test collapse the TTL / hard-max windows to
+ *  drive the refresh/re-probe paths deterministically. */
+const envMs = (name: string, fallback: number): number => {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+/** Cache TTL — 30 s throttles the re-stat / re-reconcile on the hot status
+ *  path; a detected signature change re-probes even inside this window. */
+const CLI_INSTALL_STATE_TTL_MS = envMs("OPENLLM_CLI_STATE_TTL_MS", 30_000);
+
+/** Hard ceiling on version staleness: even with an unchanged stat signature
+ *  (a stable launcher that execs a versioned binary without moving its own
+ *  metadata), re-spawn `--version` at least this often so an out-of-band vendor
+ *  update is picked up. Model discovery is version-gated (Codex), so this bounds
+ *  how long a new vendor version can stay undetected. */
+const CLI_VERSION_HARD_MAX_MS = envMs(
+  "OPENLLM_CLI_VERSION_MAX_MS",
+  10 * 60_000,
+);
 
 interface CliInstallCacheEntry {
   readonly result: TCliInstallState;
   readonly expiresAt: number;
   /** Stat signature of the resolved binary at probe time — an unchanged
-   *  signature past `expiresAt` reuses the version instead of re-spawning
-   *  `--version` (see {@link binarySignature}). */
+   *  signature reuses the version instead of re-spawning `--version` (see
+   *  {@link binarySignature}), unless {@link CLI_VERSION_HARD_MAX_MS} elapsed. */
   readonly signature: string | null;
+  /** Wall-clock ms of the last real `--version` spawn (not a cache renewal) —
+   *  gates the {@link CLI_VERSION_HARD_MAX_MS} forced re-probe. */
+  readonly probedAt: number;
 }
 
 /** Per-provider cache of `cliInstallState` results. */
@@ -160,8 +219,8 @@ let cacheGeneration = 0;
 
 /**
  * Clear the `cliInstallState` cache — used by tests that change
- * `OPENLLM_DAEMON_STATE_DIR` between calls, and by the self-update handler
- * after a CLI binary is swapped on disk.
+ * `OPENLLM_DAEMON_STATE_DIR` between calls, and after the isolated link is
+ * re-pointed at a moved host binary (so the next read re-probes `--version`).
  */
 export const clearCliInstallStateCache = (): void => {
   cliInstallStateCache.clear();
@@ -172,9 +231,7 @@ export const cliInstallState = async (
   provider: TCliProvider,
 ): Promise<TCliInstallState> => {
   const cached = cliInstallStateCache.get(provider);
-  if (cached !== undefined && cached.expiresAt > Date.now()) {
-    return cached.result;
-  }
+  const now = Date.now();
 
   // Capture generation at probe start to guard against stale writes after clear.
   const generation = cacheGeneration;
@@ -189,13 +246,22 @@ export const cliInstallState = async (
       if (generation === cacheGeneration) {
         cliInstallStateCache.set(provider, {
           result,
-          expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+          expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
           signature: null,
+          probedAt: now,
         });
       }
       return result;
     }
     await linkIsolatedCli(provider, host);
+  } else if (cached !== undefined && cached.expiresAt <= now) {
+    // Link exists AND we've probed it before (a genuine mid-lifetime REFRESH,
+    // not a cold start): RE-RECONCILE it against the preferred host candidate so
+    // an out-of-band update that moved the binary re-points the link. Gated to
+    // the refresh path — a cold daemon trusts its existing link (whatever the
+    // user last linked), and a `realpath` compare per 2.5s tick would be needless
+    // churn. A re-point changes the resolved target, forcing a `--version` probe.
+    await reconcileIsolatedLink(provider, bin);
   }
   const notInstalled: TCliInstallState = { installed: false, version: null };
   if (!existsSync(bin)) {
@@ -203,38 +269,57 @@ export const cliInstallState = async (
     if (generation === cacheGeneration) {
       cliInstallStateCache.set(provider, {
         result: notInstalled,
-        expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+        expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
         signature: null,
+        probedAt: now,
       });
     }
     return notInstalled;
   }
-  // Self-heal SIDECARS for installs whose main link predates sidecar linking
-  // (the main link existing skips `linkIsolatedCli` above forever). Idempotent
-  // — an up-to-date link is a readlink+compare, so the 30s probe stays cheap.
-  linkSidecars(bin);
-  // Unchanged binary since the last successful probe → reuse the version WITHOUT
-  // re-spawning `--version`. This is what lets the probe stay CONFINED
-  // (sandbox-wrapped) without the per-tick shim cost: the spawn fires only when
-  // the binary's stat signature changes (a self-update / a repointed run-view).
+
+  // The resolved binary's stat signature — the cheap change-detector. Computed
+  // even on the TTL-fresh path so a binary swap re-probes immediately instead of
+  // waiting out the TTL.
   const signature = binarySignature(bin);
-  if (
+  const reusable =
     cached?.result.installed === true &&
     cached.result.version !== null &&
     signature !== null &&
     cached.signature === signature &&
-    generation === cacheGeneration
+    generation === cacheGeneration;
+
+  // TTL-fresh AND the binary hasn't changed AND we're within the hard-max
+  // staleness ceiling → serve the cached version untouched (the hot path).
+  if (
+    cached !== undefined &&
+    cached.expiresAt > now &&
+    reusable &&
+    now - cached.probedAt < CLI_VERSION_HARD_MAX_MS
   ) {
+    return cached.result;
+  }
+
+  // Self-heal SIDECARS for installs whose main link predates sidecar linking
+  // (the main link existing skips `linkIsolatedCli` above forever). Idempotent
+  // — an up-to-date link is a readlink+compare, so the 30s probe stays cheap.
+  linkSidecars(bin);
+
+  // Past the TTL but the binary is unchanged AND still inside the hard-max
+  // window → reuse the version without re-spawning `--version`, just renewing
+  // the TTL. Keeps the probe CONFINED (sandbox-wrapped) off the hot path.
+  if (reusable && now - (cached?.probedAt ?? 0) < CLI_VERSION_HARD_MAX_MS) {
     cliInstallStateCache.set(provider, {
       result: cached.result,
-      expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+      expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
       signature,
+      probedAt: cached.probedAt,
     });
     return cached.result;
   }
+
   // Confined `--version` (no `probe`): the sandbox shim wraps it like any vendor
-  // spawn. It runs rarely (only on a signature change), so the ~300ms shim cost
-  // never lands on the hot path.
+  // spawn. It runs only on a signature change or once the hard-max elapses, so
+  // the ~300ms shim cost never lands on the hot path.
   const out = await runCapture([bin, "--version"], cliEnv(provider));
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };
@@ -242,8 +327,9 @@ export const cliInstallState = async (
   if (generation === cacheGeneration) {
     cliInstallStateCache.set(provider, {
       result,
-      expiresAt: Date.now() + CLI_INSTALL_STATE_TTL_MS,
+      expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
       signature,
+      probedAt: now,
     });
   }
   return result;
