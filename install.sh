@@ -102,9 +102,10 @@ install_component() {
   esac
 
   # Skip a tens-of-MB download when what's installed already matches.
-  # On macOS the ad-hoc codesign below REWRITES the bytes, so a direct compare
-  # never matches there; a stamp pairs the published digest with the
-  # post-signing on-disk digest to prove "same release AND untampered".
+  # Developer-ID-signed + notarized binaries keep their published digest on
+  # disk (we no longer force ad-hoc re-sign when codesign --verify passes).
+  # The stamp remains for the fallback ad-hoc path (unsigned/invalid) where
+  # re-signing rewrites bytes after the published digest check.
   if [ -x "$dest" ]; then
     installed="$(sha256_of "$dest" || true)"
     if [ -n "$installed" ]; then
@@ -154,11 +155,15 @@ install_component() {
   chmod 0755 "$bin"
   mv -f "$bin" "$dest"
 
-  # macOS: strip the quarantine bit and ad-hoc sign, else arm64 refuses to exec.
+  # macOS: strip quarantine. Preserve a valid Developer ID / notarized
+  # signature (codesign --verify). Only ad-hoc sign when the signature is
+  # missing/invalid — force ad-hoc would strip notarization and rewrite bytes.
   if [ "$OS" = "darwin" ]; then
     xattr -d com.apple.quarantine "$dest" >/dev/null 2>&1 || true
-    codesign --force --sign - "$dest" >/dev/null 2>&1 || true
-    printf '%s %s\n' "$published" "$(sha256_of "$dest")" > "$stamp" 2>/dev/null || true
+    if ! codesign --verify "$dest" >/dev/null 2>&1; then
+      codesign --force --sign - "$dest" >/dev/null 2>&1 || true
+      printf '%s %s\n' "$published" "$(sha256_of "$dest")" > "$stamp" 2>/dev/null || true
+    fi
   fi
   echo "  $name installed → $dest"
 }
