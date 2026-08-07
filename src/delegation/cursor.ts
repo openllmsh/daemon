@@ -1,10 +1,9 @@
 /**
  * Cursor subscription delegate through the official `cursor-agent` CLI.
  *
- * ⚠️ RESEARCH-UNVERIFIED: Cursor's CLI/store details below are derived from
- * openusage and public CLI research, not a live cursor-agent installation.
- * Cursor inference is ACP-only (`cursor-agent acp`); this delegate deliberately
- * exposes login/status/usage only until the daemon ACP bridge is implemented.
+ * Login URL stream and token store are live-verified; inference remains ACP-only
+ * (`cursor-agent acp`). This delegate deliberately exposes login/status/usage only
+ * until the daemon ACP bridge is implemented.
  */
 import { platform } from "node:os";
 import { join } from "node:path";
@@ -28,7 +27,7 @@ import { accountHashField } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
-import { loginSlot } from "./login-flow";
+import { loginSlot, makeCancelConnect } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
 import {
@@ -63,7 +62,7 @@ let cursorModelsInflight: Promise<ReadonlyArray<TProviderModelEntry> | null> | n
 const redactUrls = (value: string): string =>
   value.replace(/(https?:\/\/[^\s?]+)\?\S*/g, "$1?<redacted>");
 
-/** ⚠️ RESEARCH-UNVERIFIED: tolerate cursor.com and generic OIDC authorize URLs. */
+/** Live-verified: `cursor-agent login` prints a deep-control URL on stdout. */
 const parseAuthUrl = (raw: string): string | null => {
   const clean = stripAnsi(raw);
   return (
@@ -165,8 +164,8 @@ export const parseCursorUsage = (
 };
 
 /**
- * ⚠️ RESEARCH-UNVERIFIED: macOS cursor-agent stores tokens as generic-password
- * items (services `cursor-access-token` / `cursor-refresh-token`).
+ * Live-verified: macOS cursor-agent stores tokens as generic-password items
+ * (services `cursor-access-token` / `cursor-refresh-token`, account `cursor-user`).
  *
  * Read them ONLY from the ISOLATED login keychain (the one under the CLI's
  * isolated HOME), exactly like claude_code: `readIsolatedKeychain` targets the
@@ -185,13 +184,13 @@ type TCursorFileStore = {
   readonly refreshToken?: string;
 };
 
-/** ⚠️ RESEARCH-UNVERIFIED: Linux credential persistence path/shape. */
+/** Live-verified: Linux file store is `~/.cursor/auth.json` with camelCase tokens. */
 const readFileTokens = async (): Promise<{
   readonly accessToken: string;
   readonly refreshTokenPresent: boolean;
 } | null> => {
   const store = await readJsonFile<TCursorFileStore>(
-    join(cliConfigDir(PROVIDER), "credentials.json"),
+    join(cliConfigDir(PROVIDER), "auth.json"),
   );
   const accessToken = store?.access_token ?? store?.accessToken;
   if (typeof accessToken !== "string" || accessToken.length === 0) return null;
@@ -275,7 +274,8 @@ const connectDirect = makeStreamConnect({
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
-  env,
+  env: () => ({ ...cliEnv(PROVIDER), NO_OPEN_BROWSER: "1" }),
+  stream: "stdout",
   parse: (buffer) => {
     const url = parseAuthUrl(buffer);
     return url === null ? null : { url, code: "" };
@@ -312,6 +312,11 @@ const connectDirect = makeStreamConnect({
     "Couldn't start Cursor sign-in. Retry, or run `cursor-agent login` on the box.",
 });
 
+const cancelConnect = makeCancelConnect(PROVIDER, slot, {
+  cancelled: "Cursor sign-in cancelled",
+  none: "no sign-in was in progress",
+});
+
 const dashboardHeaders = (accessToken: string): Record<string, string> => ({
   authorization: `Bearer ${accessToken}`,
   "content-type": "application/json",
@@ -321,6 +326,7 @@ const dashboardHeaders = (accessToken: string): Record<string, string> => ({
 export const cursorDelegate: TProviderDelegate = {
   slug: PROVIDER,
   connect: connectDirect,
+  cancelConnect,
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);

@@ -92,6 +92,8 @@ export type TStreamConnectConfig = {
   readonly inProgressDetail: string;
   readonly argv: () => ReadonlyArray<string>;
   readonly env: () => Record<string, string>;
+  /** Which fd carries the authorize URL. Codex/Grok: stderr. Cursor: stdout. Default stderr. */
+  readonly stream?: "stdout" | "stderr";
   /** Parse the authorize URL off the chosen fd → `{ url, code }` (code: ""). */
   readonly parse: (buf: string) => { url: string; code: string } | null;
   readonly onConnected?: () => void | Promise<void>;
@@ -130,7 +132,7 @@ export const makeStreamConnect = (
           slot: cfg.slot,
           argv: cfg.argv(),
           env: cfg.env(),
-          stream: "stderr",
+          stream: cfg.stream ?? "stderr",
           parse: cfg.parse,
           isConnected: cfg.connected,
           onConnected: cfg.onConnected,
