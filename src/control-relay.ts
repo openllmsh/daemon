@@ -67,7 +67,17 @@ export const runCommandInner = async (
           resetModelReportThrottle(cmd.payload.slug);
           void maybeReportModels().catch(() => {});
         }
-        return { id: cmd.id, status: "done", result: r };
+        // A connect that neither landed a credential NOR opened a pending flow
+        // is a FAILURE (e.g. cursor's `cursor-agent login` printed no auth URL
+        // on a remote box). Ack `error` — mirroring `connect_device_code` — so
+        // the relay routes a real `command_lifecycle` error to the originating
+        // watcher and the dashboard surfaces the delegate's `detail` instead of
+        // a silent "done" with no dialog (issue #2).
+        return {
+          id: cmd.id,
+          status: r.connected || r.pending === true ? "done" : "error",
+          result: r,
+        };
       }
       case "connect_device_code": {
         // Start a device-code login (codex remote; kimi falls back to its
