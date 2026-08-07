@@ -187,9 +187,31 @@ export const envFilePath = (): string =>
   process.env.OPENLLM_DAEMON_ENV_FILE ??
   join(stateDir(), isDevMode() ? ".dev.env" : ".env");
 
-/** The SHARED (prod/installed) env file — read-only in dev, used solely for
- *  the live `OPENLLM_API_KEY` fallback in `loadApiKey`. */
-const sharedEnvFilePath = (): string => join(stateDir(), ".env");
+/**
+ * The SHARED (prod/installed) env file — always `.env`, NEVER dev-resolved.
+ *
+ * Two callers depend on this staying prod-forced regardless of `isDevMode()`:
+ *   1. `loadApiKey`'s live, read-only `OPENLLM_API_KEY` fallback in dev.
+ *   2. Service INSTALLATION (`renderPlist` / `renderUnit` / `writeEnvFileIfNeeded`
+ *      in `service.ts`). Installing a service is inherently a PRODUCTION action,
+ *      so the unit/plist must pin `.env` — using the dev-aware `envFilePath()`
+ *      would freeze `.dev.env` into a permanent prod service definition if the
+ *      install ran with `OPENLLM_DAEMON_DEV=1` in the environment, so the
+ *      installed daemon would then boot from dev config forever.
+ */
+export const sharedEnvFilePath = (): string => join(stateDir(), ".env");
+
+/**
+ * The env-file path a SERVICE INSTALL should pin — an explicit
+ * `OPENLLM_DAEMON_ENV_FILE` still wins (a custom install may point elsewhere),
+ * but the dev-mode `.dev.env` branch is NEVER taken: installing is a production
+ * action, so absent an explicit override it forces the shared `.env`. This is
+ * the ONLY difference from `envFilePath()` — which resolves `.dev.env` under
+ * `OPENLLM_DAEMON_DEV=1` and would otherwise freeze dev config into the plist /
+ * systemd unit. Used by `service.ts` renderers + `writeEnvFileIfNeeded`.
+ */
+export const serviceEnvFilePath = (): string =>
+  process.env.OPENLLM_DAEMON_ENV_FILE ?? sharedEnvFilePath();
 
 /**
  * Load the daemon's `KEY=value` env file into `process.env`.
@@ -240,13 +262,18 @@ const parseEnvLines = (text: string): Map<string, string> => {
  * `OPENLLM_DEVICE_ID`) and re-pointed config (`OPENLLM_CLOUD_ORIGIN`,
  * `OPENLLM_DAEMON_PORT`) get persisted back to the one file both dev and the
  * service boot from. Returns true on successful write, false on failure.
+ *
+ * `targetPath` defaults to `envFilePath()` (dev-aware). The service installer
+ * passes `serviceEnvFilePath()` so it seeds the PROD `.env` even under the dev
+ * flag — see `serviceEnvFilePath` / `service.ts writeEnvFileIfNeeded`.
  */
 export const writeEnvFileVars = (
   updates: Readonly<Record<string, string>>,
+  targetPath: string = envFilePath(),
 ): boolean => {
   let existing: string[] = [];
   try {
-    existing = readFileSync(envFilePath(), "utf-8").split("\n");
+    existing = readFileSync(targetPath, "utf-8").split("\n");
   } catch {
     // no file yet — start fresh
   }
@@ -267,9 +294,9 @@ export const writeEnvFileVars = (
   while (out.length > 0 && out[out.length - 1].trim().length === 0) out.pop();
   for (const [key, value] of pending) out.push(`${key}=${value}`);
   try {
-    const parentDir = dirname(envFilePath());
+    const parentDir = dirname(targetPath);
     mkdirSync(parentDir, { recursive: true });
-    writeFileSync(envFilePath(), `${out.join("\n")}\n`, { mode: 0o600 });
+    writeFileSync(targetPath, `${out.join("\n")}\n`, { mode: 0o600 });
     return true;
   } catch {
     return false;

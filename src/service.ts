@@ -27,7 +27,12 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
-import { daemonEnv, envFilePath, stateDir, writeEnvFileVars } from "./env";
+import {
+  daemonEnv,
+  serviceEnvFilePath,
+  stateDir,
+  writeEnvFileVars,
+} from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import type { TDaemonHealth } from "./health";
 import { DAEMON_VERSION } from "./version";
@@ -92,12 +97,19 @@ const writeEnvFileIfNeeded = (): void => {
   const explicitOverride =
     process.env.OPENLLM_CLOUD_ORIGIN !== undefined ||
     process.env.OPENLLM_DAEMON_PORT !== undefined;
-  if (existsSync(envFilePath()) && !explicitOverride) return;
+  // Seed the PROD `.env` the installed service actually boots from — NEVER the
+  // dev-resolved `.dev.env`, even under `OPENLLM_DAEMON_DEV=1` (installing is a
+  // production action; see `serviceEnvFilePath`).
+  const target = serviceEnvFilePath();
+  if (existsSync(target) && !explicitOverride) return;
   const env = daemonEnv();
-  writeEnvFileVars({
-    OPENLLM_CLOUD_ORIGIN: env.cloudOrigin,
-    OPENLLM_DAEMON_PORT: String(daemonPort()),
-  });
+  writeEnvFileVars(
+    {
+      OPENLLM_CLOUD_ORIGIN: env.cloudOrigin,
+      OPENLLM_DAEMON_PORT: String(daemonPort()),
+    },
+    target,
+  );
 };
 
 /**
@@ -157,7 +169,7 @@ export const renderPlist = (binPath: string): string => {
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key><array><string>${binPath}</string></array>
   <key>EnvironmentVariables</key><dict>
-    <key>OPENLLM_DAEMON_ENV_FILE</key><string>${envFilePath()}</string>
+    <key>OPENLLM_DAEMON_ENV_FILE</key><string>${serviceEnvFilePath()}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -268,7 +280,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=20
 
 [Service]
-EnvironmentFile=${envFilePath()}
+EnvironmentFile=${serviceEnvFilePath()}
 ExecStart=${binPath}
 ${renderUnitRestart(systemdMajor())}${renderUnitLogging(systemdMajor())}${renderUnitHardening()}
 [Install]
