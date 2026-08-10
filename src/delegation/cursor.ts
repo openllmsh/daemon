@@ -184,7 +184,10 @@ type TCursorFileStore = {
   readonly refreshToken?: string;
 };
 
-/** Live-verified: Linux file store is `~/.cursor/auth.json` with camelCase tokens. */
+/** Live-verified (cursor-agent 2026.07.23): Linux file store is the XDG path
+ *  `$XDG_CONFIG_HOME/cursor/auth.json` (= `<home>/.config/cursor/auth.json` with
+ *  HOME + XDG_CONFIG_HOME pinned to the isolated home), camelCase tokens.
+ *  `cliConfigDir("cursor")` resolves to that dir. */
 const readFileTokens = async (): Promise<{
   readonly accessToken: string;
   readonly refreshTokenPresent: boolean;

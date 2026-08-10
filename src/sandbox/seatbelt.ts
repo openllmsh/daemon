@@ -2,7 +2,7 @@
  * macOS in-process Seatbelt sandbox — the darwin counterpart to Linux Landlock
  * (`sandbox/landlock.ts`). Applied once at boot via `sandbox_init` (libsandbox)
  * through `bun:ffi`, BEFORE the listener binds: a deny-by-default SBPL profile
- * grants filesystem access ONLY to the daemon's working set (`working-set.ts`)
+ * grants filesystem access ONLY to the daemon's working set (`working-set/`)
  * plus the system trees the runtime needs, and is inherited by every spawned
  * child — the same confinement model `sandbox-exec` uses. Both WRITES and READS
  * are deny-by-default whitelists (parity with Landlock): reads are open outside
@@ -118,7 +118,7 @@ export const homeAncestorPaths = (
  * whitelists — parity with Linux Landlock (`landlock.ts`):
  *
  *   WRITES — only the daemon working set + the workflow targets
- *   (`working-set.ts`, incl. the scoped ~/.claude subtrees, ~/.codex,
+ *   (`working-set/`, incl. the scoped ~/.claude subtrees, ~/.codex,
  *   ~/.grok/config.toml)
  *   + the macOS runtime ({@link macRuntimeWrite}) are writable. Everything else
  *   (the rest of `$HOME`, the system) is write-denied — tamper protection.

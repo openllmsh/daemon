@@ -1,12 +1,29 @@
 /**
- * The daemon's filesystem working set — the SINGLE allow-list both sandbox
- * backends consume (the Landlock ruleset in `./landlock.ts`, and the systemd
- * unit hardening rendered by `service.ts`). Derived from the existing path
- * helpers (`env.ts` / `cli-paths.ts`), never re-hardcoded, so a relocated
- * state dir or a new provider home is picked up here automatically. See
- * `docs/proposals/daemon-os-sandbox-and-typed-control.md` §3.1.
+ * Working-set FOUNDATIONS — shared helpers + the base grant set every daemon
+ * sub-process layer sits on top of. See `./index.ts` for the composition and
+ * `docs/proposals/daemon-subprocess-isolation.md` §3.1 for the layer split.
  *
- * Everything the daemon legitimately touches is deliberately centralised:
+ * This module holds the pieces that are NOT specific to any one sub-process
+ * layer:
+ *   - the `TWorkingSet` shape,
+ *   - the path-safety helpers (`existing`, `SENSITIVE_ROOTS`) both layers and
+ *     the sandbox backends rely on,
+ *   - the dynamic vendor-CLI exec-dir resolver (`resolveCliExecDirs`) + the
+ *     hardcoded vendor exec-dir floor (`vendorExecDirs`) — shared because BOTH
+ *     the `auth-state` layer (login/usage delegation) and the
+ *     `vendor-cli-tunnel` layer (device PTY sessions) exec the vendor CLIs,
+ *   - `daemonTempDir`,
+ *   - `baseWorkingSet()` — the state dir, the daemon-owned temp, the binary's
+ *     own dir, `/dev`, and the read-only system trees: everything shared by all
+ *     four layers (the parent supervisor lives here too).
+ *
+ * The layer modules (`auth-state.ts`, `browser-chat.ts`, `fleet.ts`,
+ * `vendor-cli-tunnel.ts`) import from here; they NEVER import each other, so no
+ * process can pull in another layer's working set (R2-T9).
+ *
+ * Original single-file rationale (2026-07-03 working-set-exposure audit
+ * §5-A/B/C and the `daemon-os-sandbox-and-typed-control.md` §3.1 derivation)
+ * moves here verbatim — it is load-bearing audit trail:
  *
  *   read-write
  *     - the state dir (`~/.openllm`): the shared .env (0600, holds the key + device
@@ -16,42 +33,23 @@
  *       the installer places the binary inside the state dir);
  *     - the executable's real directory (belt-and-braces when `execPath`
  *       lives outside the state dir — a manual install);
- *     - the claude-code integration footprint — SCOPED to the subtrees the
- *       SHA-gated plugin/setup scripts actually write
- *       (`~/.claude/{skills,plugins,commands,hooks,plugin-state,downloads}`
- *       + the `settings.json` FILE + `~/.claude.json`), NEVER the whole
- *       `~/.claude`: the user's real Claude OAuth token
- *       (`~/.claude/.credentials.json` on Linux) sits at that root and must
- *       stay outside the working set on BOTH backends (the
- *       2026-07-03 working-set-exposure audit §5-A parity fix);
- *     - the grok-build setup's `~/.grok/config.toml` — a FILE grant, NEVER
- *       the `~/.grok` dir: the user's xAI session (`~/.grok/auth.json`) sits
- *       at that root and must stay outside the working set on BOTH backends
- *       (same posture as the scoped `~/.claude` grants);
- *     - the opencode setup's `~/.config/opencode` — SCOPED to that leaf only
- *       (never bare `~/.config`, which holds gcloud/gh tokens). The credential
- *       store at `~/.local/share/opencode/auth.json` is never granted; the
- *       setup writes the key inline under `provider.openllm.options.apiKey`.
+ *     - the claude XDG STATE + CACHE dirs (isolated claude writes these at run
+ *       time on Linux; absent on macOS) — SCOPED to the claude subdirs;
+ *     - bun's global install cache (`~/.bun/install/cache`) — the RW half of the
+ *       split `~/.bun` grant (the bin dir is read+exec only).
  *
  *   read-only
  *     - the system trees the runtime + spawned tools (`bash`, `curl`, the
  *       vendor CLIs' loaders) need: `/usr`, `/lib*`, `/bin`, `/sbin`, `/opt`,
  *       `/etc` (resolv.conf + TLS trust), `/proc`, `/sys`, `/run`, `/var`;
- *     - `~/.bun/bin` (exec `bun` — read+exec only; the RW half of the old
- *       whole-tree `~/.bun` grant survives only as `~/.bun/install/cache`,
- *       the dir `bun install` populates during plugin installs).
+ *     - the vendor-CLI binary dirs — READ+EXEC only (the daemon runs the CLIs
+ *       but never installs or updates them; that is user-run + unsandboxed);
+ *     - `~/.bun/bin` (exec `bun` — read+exec only, launcher-trojan guard).
  *
  *   deny (implicit — everything else, notably the rest of `$HOME`)
  *     - `~/.ssh`, `~/.aws`, `~/.gnupg`, browser profiles, documents,
- *       `~/.claude/.credentials.json` (outside the scoped `~/.claude` grants),
- *       the shell rc files (`~/.zshrc` etc.), and WRITES to the provider-CLI
- *       binary dirs (`~/.local/bin`, `~/.local/share/claude`, `~/.grok/bin` are
- *       read+exec only — the daemon runs the CLIs but never installs or updates
- *       them; that is user-run + unsandboxed) and `~/.bun/bin`
- *       (launcher-trojan guard). Known residual (documented in the audit,
- *       closed by the §3 broker): `~/.codex/auth.json` remains inside a
- *       still-granted setup-target dir on Linux (Landlock has no deny rules);
- *       macOS re-denies it (`seatbelt.ts` `credentialDeny`).
+ *       `~/.claude/.credentials.json`, the shell rc files (`~/.zshrc` etc.),
+ *       and WRITES to the provider-CLI binary dirs.
  *
  * Note the system `/tmp` is deliberately NOT granted (granting it would leak
  * every other process's temp files — and the user unit no longer sets
@@ -70,9 +68,9 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../cli-paths";
-import { stateDir } from "../env";
-import { DAEMON_VERSION } from "../version";
+import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../../cli-paths";
+import { stateDir } from "../../env";
+import { DAEMON_VERSION } from "../../version";
 
 export type TWorkingSet = {
   /** Paths (recursive) the daemon and its children may read AND write. */
@@ -105,14 +103,14 @@ export type TWorkingSet = {
  *  `resolveCliExecDirs()` (never grant a bare root a symlink chain resolves
  *  into). `~/.cache`/`~/.local` are deliberately NOT here — `~/.cache/openllm`
  *  legitimately climbs to `~/.cache` (documented + tested, no secrets). */
-const SENSITIVE_ROOTS = (home: string): readonly string[] => [
+export const SENSITIVE_ROOTS = (home: string): readonly string[] => [
   join(home, ".bun"),
   join(home, ".grok"),
   join(home, ".config"),
   join(home, ".claude"),
 ];
 
-const existing = (paths: readonly string[]): string[] => {
+export const existing = (paths: readonly string[]): string[] => {
   const home = homedir();
   const sensitiveRoots = SENSITIVE_ROOTS(home);
   const underSensitiveRoot = (p: string): boolean =>
@@ -279,9 +277,91 @@ export const daemonTempDir = (home?: string): string => {
 };
 
 /**
- * The daemon's base working set (no user grants — the §3.4 consent flow
- * unions persisted grants in here when it lands). Resolved at call time so
- * `OPENLLM_DAEMON_STATE_DIR` overrides are honoured.
+ * The hardcoded vendor-CLI exec-dir FLOOR + the dynamic `resolveCliExecDirs`
+ * resolution, as a READ+EXEC set. Shared by the `auth-state` layer (the daemon
+ * execs vendor CLIs for login/usage/credential delegation) AND the
+ * `vendor-cli-tunnel` layer (device PTY sessions exec the same binaries). The
+ * daemon RUNS the vendor CLIs but never WRITES them: installs are user-run +
+ * unsandboxed, and vendor self-update happens out of band. Read+exec, not
+ * read-write.
+ *
+ * Emits the hardcoded floor (grok bin/downloads, ~/.local/bin, cursor + claude
+ * versioned dirs) AND, for every provider, the real dir of every node along its
+ * isolated run-view symlink chain (`cliBin`) and its host launcher candidates
+ * (`hostCliCandidates`) — self-correcting for whatever non-standard /
+ * version-specific / custom-install dir a vendor buries its ELF in. Bounded by
+ * `resolveCliExecDirs` (existing dirs only, never $HOME/root/a bare sensitive
+ * root). Absent CLIs contribute nothing (missing seeds skip).
+ */
+export const vendorExecDirs = (home: string): string[] => {
+  // Pre-create the vendor-CLI dirs the daemon EXECS through. REQUIRED on
+  // Linux: Landlock can only grant an EXISTING path (`existing()` drops a
+  // missing leaf rather than widening the grant to bare $HOME), so a fresh box
+  // would leave these ungranted and every vendor spawn would EACCES. macOS
+  // Seatbelt grants by pattern, so pre-creating is a harmless no-op there.
+  const floor = [
+    // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
+    // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch>. So
+    // EXEC reads through to downloads/, and BOTH need READ+EXEC. Pre-create
+    // both so the grants land on real leaves (NOT bare ~/.grok — the user's
+    // ~/.grok/auth.json must stay out of the working set).
+    join(home, ".grok", "bin"),
+    join(home, ".grok", "downloads"),
+    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher and versioned binaries live
+    // under ~/.local, so grant only executable-bearing leaves, never ~/.cursor.
+    join(home, ".local", "bin"),
+    join(home, ".local", "share", "cursor-agent", "versions"),
+    join(home, ".local", "share", "claude"),
+  ];
+  for (const d of floor) {
+    try {
+      mkdirSync(d, { recursive: true });
+    } catch {
+      // best-effort — an ungranted leaf just means that vendor's install falls
+      // back / fails visibly, not a daemon-boot failure.
+    }
+  }
+  const dirs = new Set<string>([
+    //   ~/.local/bin        — the `claude`/`codex` launchers + the `openllmd`
+    //                         PATH symlink (the daemon install script writes
+    //                         this one, unsandboxed; the daemon only reads it);
+    join(home, ".local", "bin"),
+    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher resolves into this versioned
+    // executable directory; hostCliCandidates + symlink resolution add any live path.
+    join(home, ".local", "share", "cursor-agent", "versions"),
+    //   ~/.local/share/claude — the claude launcher resolves to
+    //                         `versions/<v>` here; exec reads through to it;
+    join(home, ".local", "share", "claude"),
+    //   ~/.grok/bin         — the grok launcher SYMLINK (bin/grok →
+    //                         ../downloads/grok-<arch>); the isolated grok
+    //                         symlink execs it;
+    join(home, ".grok", "bin"),
+    //   ~/.grok/downloads   — the REAL grok ELF the bin/grok symlink points at.
+    //                         Exec of grok reads THROUGH bin/grok to this dir, so
+    //                         it must be read+exec too (a dropped grant here
+    //                         EACCESes every `grok` spawn — the connect/login
+    //                         flow then never emits its device URL). Holds the
+    //                         binary only, no credentials (auth.json is a sibling
+    //                         under ~/.grok, left UNgranted).
+    join(home, ".grok", "downloads"),
+  ]);
+  // DYNAMIC exec-dir resolution — the robustness backstop for the hardcoded
+  // floor above. For every provider, FOLLOW the symlink chain of its isolated
+  // run-view (`cliBin`, seeded lazily by `cliInstallState`) AND its host
+  // launcher candidates (`hostCliCandidates`, present as soon as the CLI is
+  // installed), and grant the real dir of every node read+exec.
+  for (const provider of CLI_PROVIDERS) {
+    for (const seed of [...hostCliCandidates(provider), cliBin(provider)]) {
+      for (const dir of resolveCliExecDirs(seed, home)) dirs.add(dir);
+    }
+  }
+  return [...dirs];
+};
+
+/**
+ * The base grant set shared by ALL four sub-process layers (and the parent
+ * supervisor). Resolved at call time so `OPENLLM_DAEMON_STATE_DIR` overrides
+ * are honoured.
  *
  * `homeOverride` supplies the DAEMON's home explicitly instead of reading
  * `homedir()`. Load-bearing for the `--sandbox-exec` shim: it is spawned with
@@ -292,123 +372,32 @@ export const daemonTempDir = (home?: string): string => {
  * very credential store the child was spawned to read. (Passing `HOME` through
  * the env instead does NOT work: Bun caches `os.homedir()` on first call, and
  * module-load code has already called it by then.)
+ *
+ * TODO(R2-M2): the whole `state` dir is granted here because it is genuinely
+ * shared (auth-state, vendor-cli-tunnel, and the parent all sit under it) AND
+ * to keep the M1.5 union byte-identical to the pre-split single builder. When
+ * the `--sub` subprocesses actually drop the shared grant, decompose `state`
+ * into its sub-paths (`<state>/cli` → auth-state, `<state>/run` +
+ * `<state>/sessions` → vendor-cli-tunnel) so each subprocess carries only its
+ * own slice.
  */
-export const daemonWorkingSet = (homeOverride?: string): TWorkingSet => {
-  const home = homeOverride ?? homedir();
+export const baseWorkingSet = (homeOverride?: string): TWorkingSet => {
   const state = stateDir(homeOverride);
   // Daemon-owned temp directory under the state dir. The unit hardening no
   // longer sets PrivateTmp (removed due to --user unit compatibility issues),
   // so granting global /tmp would leak access to every other process's temp
   // files. Instead we create and use our own isolated temp under stateDir.
   const daemonTmp = daemonTempDir(homeOverride);
-  // Pre-create the vendor-CLI dirs the daemon EXECS through. REQUIRED on
-  // Linux: Landlock can only grant an EXISTING path (`existing()` drops a
-  // missing leaf rather than widening the grant to bare $HOME), so a fresh box
-  // would leave these ungranted and every vendor spawn would EACCES. macOS
-  // Seatbelt grants by pattern, so pre-creating is a harmless no-op there.
-  //
-  // This list used to also pre-create every CLIENT CONFIG dir (~/.claude
-  // subtrees, ~/.codex, ~/.config/{raycast/ai,opencode}) because the daemon ran
-  // the registry install scripts, which edited those files IN PLACE under
-  // confinement. It doesn't any more — `openllm <client>` applies the config at
-  // RUN time, in the USER's own process, outside this sandbox — so none of them
-  // are granted (or created) here. See
-  // `docs/proposals/remove-registry-runtime-config-merge.md` §8.1.
-  for (const d of [
-    // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
-    // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch>. So
-    // EXEC reads through to downloads/, and BOTH need READ+EXEC below.
-    // Pre-create both so the grants land on real leaves (NOT bare ~/.grok —
-    // the user's ~/.grok/auth.json must stay out of the working set).
-    join(home, ".grok", "bin"),
-    join(home, ".grok", "downloads"),
-    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher and versioned binaries live
-    // under ~/.local, so grant only executable-bearing leaves, never ~/.cursor.
-    join(home, ".local", "bin"),
-    join(home, ".local", "share", "cursor-agent", "versions"),
-    join(home, ".local", "share", "claude"),
-    // claude's XDG dirs — its runtime writes these ON LINUX; absent on macOS.
-    join(home, ".local", "state", "claude"),
-    join(home, ".cache", "claude"),
-  ]) {
-    try {
-      mkdirSync(d, { recursive: true });
-    } catch {
-      // best-effort — an ungranted leaf just means that vendor's install falls
-      // back / fails visibly, not a daemon-boot failure.
-    }
-  }
-  // NOTE: no client-config seeding here any more. The daemon used to
-  // pre-create + FILE-grant ~/.claude/settings.json, ~/.claude.json,
-  // ~/.claude/CLAUDE.md, ~/.grok/config.toml and
-  // ~/.config/opencode/opencode.json so the registry install scripts could
-  // merge into them under confinement. Those scripts are gone: a client's
-  // config is composed at RUN time by `openllm <client>` in the user's own
-  // process, and for session clients it is never written at all. The daemon
-  // therefore needs ZERO third-party config grants — including for Raycast,
-  // whose in-place writer is likewise a user-invoked CLI command, never a
-  // daemon command (there is no control-channel command that could ask the
-  // daemon to touch it).
-  // bun's global install cache — the RW half of the split ~/.bun grant (bin is
-  // read+exec only, below). Only pre-create it when bun IS installed: absent
-  // bun means the plugin install fails its own `command -v bun` check, and
-  // fabricating ~/.bun on a bun-less box would be pure noise.
-  const bunCache = join(home, ".bun", "install", "cache");
-  if (existsSync(join(home, ".bun"))) {
-    try {
-      mkdirSync(bunCache, { recursive: true });
-    } catch {
-      // best-effort — see the vendor-dir loop above.
-    }
-  }
   const readWrite = new Set<string>([
     // The whole state dir: the shared .env (config + key + device id) + logs + isolated CLI roots
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
-    // + the installed binary and its self-update temp (`<state>/bin`).
+    // + the installed binary and its self-update temp (`<state>/bin`)
+    // + the local-session registry (`<state>/run`, `<state>/sessions`).
     state,
-    // The canonical install-state file ($HOME/.openllm/state.json) — a FILE
-    // grant, never the whole ~/.openllm dir: the runtime writes it in place
-    // (settings.json posture). Hardcoded in the scripts, NOT derived from the
-    // state dir; redundant with `state` in the default layout, load-bearing
-    // when OPENLLM_DAEMON_STATE_DIR points elsewhere.
-    // The scripts' write-once original-config backups ($HOME/.openllm/backups
-    // — hardcoded in backup_once; pre-created above so the grant lands on the
-    // real leaf even when the parent grant failed to create).
-    // Legacy per-file install stamps — the migration fallback reads.
     // Belt-and-braces for a binary installed OUTSIDE the state dir (manual
     // placement): self-update renames a temp over `process.execPath`, so its
     // real directory must be writable.
     dirname(process.execPath),
-    // ── NO client-config grants ───────────────────────────────────────
-    // Every path that used to be granted here (~/.claude subtrees +
-    // settings.json + ~/.claude.json + CLAUDE.md, ~/.codex,
-    // ~/.grok/config.toml, ~/.config/raycast/ai, ~/.config/opencode) existed so
-    // the daemon could run a registry install script that edited the user's
-    // client config in place. There are no such scripts, and no
-    // control-channel command that installs anything — so the daemon has no
-    // business writing any of them. `openllm <client>` does that work in the
-    // user's own unconfined process.
-    //   bun's global install cache ONLY (the SPLIT ~/.bun grant — audit §5-B):
-    //   the claude-context plugin install runs `bun install`, which populates
-    //   ~/.bun/install/cache. The `bun` BINARY dir (~/.bun/bin) is read+exec in
-    //   the readOnly set below — write access there would let a compromised
-    //   daemon trojan the user's `bun` launcher. Absent when bun isn't
-    //   installed — the install then fails its own `command -v bun` check,
-    //   correctly. Holds no credentials.
-    bunCache,
-    //   claude's XDG STATE + CACHE dirs — the isolated claude WRITES these at
-    //   RUN time (logs/state + cache) on Linux; absent on macOS. Scoped to the
-    //   claude subdirs (not the whole `~/.local/state` / `~/.cache`) — no
-    //   secrets there. (`~/.local/share/claude`, the BINARY dir, is read+exec in
-    //   readOnly — the daemon execs but never writes it.)
-    join(home, ".local", "state", "claude"),
-    join(home, ".cache", "claude"),
-    //   (NO shell rc / profile grants. They were the single worst tamper
-    //   lever — an rc append is code exec in every future shell. The daemon no
-    //   longer installs vendor CLIs, so there are no in-sandbox installer PATH
-    //   edits to worry about: installs run in the UNSANDBOXED user context (the
-    //   daemon install script), where the native installers do their normal
-    //   rc/PATH edits.)
     // Daemon-owned temp directory (NOT global /tmp). Vendor install scripts
     // stage downloads here. Created above with 0o700 so it's isolated.
     daemonTmp,
@@ -434,46 +423,8 @@ export const daemonWorkingSet = (homeOverride?: string): TWorkingSet => {
     // of the daemon's cwd, and it's disjoint from `$HOME` secrets like
     // `~/.ssh`, so the confinement guarantee still holds.
     ...(DAEMON_VERSION === "0.0.0-dev"
-      ? [resolve(import.meta.dir, "..", "..", "..", "..")]
+      ? [resolve(import.meta.dir, "..", "..", "..", "..", "..")]
       : []),
-    // ── Provider-CLI binary dirs — READ+EXEC only ─────────────────────
-    // The daemon RUNS the vendor CLIs (each isolated run-view is a symlink to
-    // the host binary), so it must EXEC through these — but it never WRITES
-    // them: installs are user-run + unsandboxed (the daemon install script),
-    // and vendor self-update likewise happens out of band when the user re-runs
-    // the installer. Read+exec, not read-write:
-    //   ~/.local/bin        — the `claude`/`codex` launchers + the `openllmd`
-    //                         PATH symlink (the daemon install script writes
-    //                         this one, unsandboxed; the daemon only reads it);
-    //   ~/.local/share/claude — the claude launcher resolves to
-    //                         `versions/<v>` here; exec reads through to it;
-    //   ~/.grok/bin         — the grok launcher SYMLINK (bin/grok →
-    //                         ../downloads/grok-<arch>); the isolated grok
-    //                         symlink execs it;
-    //   ~/.grok/downloads   — the REAL grok ELF the bin/grok symlink points at.
-    //                         Exec of grok reads THROUGH bin/grok to this dir, so
-    //                         it must be read+exec too (a dropped grant here
-    //                         EACCESes every `grok` spawn — the connect/login
-    //                         flow then never emits its device URL). Holds the
-    //                         binary only, no credentials (auth.json is a sibling
-    //                         under ~/.grok, left UNgranted).
-    // The user's real ~/.grok/auth.json stays UNgranted (it's a sibling file, not
-    // under bin/ or downloads/). `cliInstallState`'s auto-link writes only the
-    // isolated symlink under the state dir (read-write), never these dirs.
-    join(home, ".local", "bin"),
-    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher resolves into this versioned
-    // executable directory; hostCliCandidates + symlink resolution add any live path.
-    join(home, ".local", "share", "cursor-agent", "versions"),
-    join(home, ".local", "share", "claude"),
-    join(home, ".grok", "bin"),
-    join(home, ".grok", "downloads"),
-    // bun's BINARY dir — read+exec only (the split ~/.bun grant, audit §5-B):
-    // the plugin install must EXEC `bun`, but a write grant here would let a
-    // compromised daemon replace the user's `bun` launcher. The cache half
-    // (~/.bun/install/cache) is read-write above. `existing()` returns the
-    // path unchanged when bun isn't installed, and the missing-path rule is
-    // skipped at apply time — correct (nothing to exec anyway).
-    join(home, ".bun", "bin"),
     // Toolchain + loaders for spawned children (bash, curl, vendor CLIs).
     "/usr",
     "/lib",
@@ -489,26 +440,8 @@ export const daemonWorkingSet = (homeOverride?: string): TWorkingSet => {
     "/run",
     "/var",
   ]);
-  // DYNAMIC exec-dir resolution — the robustness backstop for the hardcoded
-  // provider bin grants above. For every provider, FOLLOW the symlink chain of
-  // its isolated run-view (`cliBin`, seeded lazily by `cliInstallState`) AND its
-  // host launcher candidates (`hostCliCandidates`, present as soon as the CLI is
-  // installed), and grant the real dir of every node read+exec. Self-correcting:
-  // whatever non-standard / version-specific / custom-install dir a vendor buries
-  // the ELF in (the grok `~/.grok/downloads` regression, codex's version dir
-  // behind `current`, a user's `GROK_BIN_DIR`), exec-through is granted because
-  // we followed the ACTUAL link. Additive — never removes the hardcoded floor;
-  // `resolveCliExecDirs` bounds every grant (existing dirs only, never $HOME/root/
-  // a bare sensitive root). Absent CLIs contribute nothing (missing seeds skip).
-  for (const provider of CLI_PROVIDERS) {
-    for (const seed of [...hostCliCandidates(provider), cliBin(provider)]) {
-      for (const dir of resolveCliExecDirs(seed, home)) readOnly.add(dir);
-    }
-  }
-  // A read-write grant subsumes a read-only one — keep the lists disjoint.
-  for (const rw of readWrite) readOnly.delete(rw);
   return {
-    readWrite: existing([...readWrite]),
-    readOnly: existing([...readOnly]),
+    readWrite: [...readWrite],
+    readOnly: [...readOnly],
   };
 };

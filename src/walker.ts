@@ -1177,6 +1177,15 @@ const serveSubscription = async (
         ),
       });
     }
+    if (args.req.signal.aborted) {
+      // Client hung up before the first output byte (deliberate Ctrl-C).
+      // Terminal but NOT an upstream fault: writing an error row here would
+      // cool the provider on the cloud (daemon-record maps a bare `error`
+      // status to `upstream_rejection`). Skip the row and return 499 — the
+      // same rule the pre-commit 499, `recordStreamFailure`, and
+      // `refusalWalks` already apply for an aborted request.
+      return errorJson(499, "client aborted request");
+    }
     report(
       {
         ...baseRow,

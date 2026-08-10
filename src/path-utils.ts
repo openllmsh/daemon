@@ -12,7 +12,7 @@ import { delimiter, join } from "node:path";
  * `bun` lands in ~/.bun/bin via the official installer; many tools live under
  * Homebrew) aren't found and a script that relies on one half-applies or acks
  * `status:error`. Every entry is within the OS-sandbox working set (`/opt`,
- * `/usr`, ~/.local/bin, ~/.bun — see `sandbox/working-set.ts`), so a spawn never
+ * `/usr`, ~/.local/bin, ~/.bun — see `sandbox/working-set/`), so a spawn never
  * hits a Landlock denial; absent dirs are simply ignored by the shell. Evaluated
  * once at module load (`homedir()` is stable for the process).
  */
