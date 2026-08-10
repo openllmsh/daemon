@@ -57,7 +57,7 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
  *  can never drift from the `Record<TCliProvider, …>` (adding a provider to the
  *  type forces a `SPECS` entry, which appears here automatically). Consumers that
  *  must iterate every provider (e.g. the sandbox exec-dir resolver in
- *  `working-set.ts`) use this instead of re-listing the slugs. */
+ *  `working-set/`) use this instead of re-listing the slugs. */
 export const CLI_PROVIDERS = Object.keys(SPECS) as readonly TCliProvider[];
 
 export const cliRoot = (provider: TCliProvider): string =>
@@ -88,10 +88,10 @@ export const cliBin = (provider: TCliProvider): string =>
  *
  * The symlink target must be EXEC-able under the OS sandbox: the codex home
  * (`~/.codex`, a read-write working-set setup target), claude's binary dir
- * (`~/.local/share/claude`, read+exec in `working-set.ts`), grok's bin dirs
+ * (`~/.local/share/claude`, read+exec in `working-set/`), grok's bin dirs
  * (`~/.grok/{bin,downloads}`, read+exec) + anything outside `$HOME` all
  * qualify. Any OTHER in-`$HOME` location (kimi's `~/.kimi-code/bin`, a
- * non-standard dir a PATH scan surfaces) is covered too: `working-set.ts`
+ * non-standard dir a PATH scan surfaces) is covered too: `working-set/`
  * seeds `resolveCliExecDirs` from THIS list and follows the real symlink
  * chain, granting read+exec on whatever dirs the binary actually lives in
  * (bounded — never `$HOME`/root/a sensitive root).
@@ -228,7 +228,7 @@ export const cliConfigDir = (provider: TCliProvider): string => {
  * the installer doesn't touch the user's shell profiles.
  *
  * ALL three additionally get `TMPDIR` pointed at the daemon-owned temp dir
- * (`<state>/tmp`). The OS sandbox (`./sandbox/working-set.ts`) does NOT grant
+ * (`<state>/tmp`). The OS sandbox (`./sandbox/working-set/`) does NOT grant
  * the system `/tmp` — only `<state>/tmp`. The codex + kimi vendor installers
  * stage their download/extract in `mktemp -d`, which falls back to `/tmp`
  * when `TMPDIR` is unset; under the sandbox that first `mktemp -d` EACCESes

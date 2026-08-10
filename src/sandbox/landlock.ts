@@ -4,7 +4,7 @@
  * §3.3a. `applyDaemonSandbox` dispatches by platform: **Linux → Landlock**
  * (here), **macOS → Seatbelt** (`./seatbelt.ts`), other → unsupported. Both
  * backends are in-process, unprivileged, derived from the same working set
- * (`./working-set.ts`), and inherited across `execve`. The sandbox is
+ * (`./working-set/`), and inherited across `execve`. The sandbox is
  * PER-CHILD, not process-wide: the daemon itself boots unconfined (so device
  * session PTYs can run the user's real CLI over their real files) and each
  * risky child is wrapped through the `--sandbox-exec` self-re-exec shim
