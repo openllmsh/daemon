@@ -210,10 +210,16 @@ export const cliConfigDir = (provider: TCliProvider): string => {
     // grok caches its OAuth token at <home>/.grok/auth.json.
     case "grok":
       return join(home, ".grok");
-    // ⚠️ RESEARCH-UNVERIFIED: cursor-agent stores CLI channel configuration
-    // under ~/.cursor; credentials are read separately from the host keychain.
+    // Live-verified (Linux, cursor-agent 2026.07.23): the credential store is
+    // the XDG path `$XDG_CONFIG_HOME/cursor/auth.json`, i.e. `<home>/.config/
+    // cursor/auth.json` once HOME is isolated (the CLI's own app data —
+    // cli-config, acp-sessions, skills — is HOME-rooted under `<home>/.cursor`
+    // and is NOT the credential dir). `cliEnv` pins `XDG_CONFIG_HOME` at
+    // `<home>/.config` so this is where the token lands regardless of any
+    // ambient `XDG_CONFIG_HOME`, keeping write + read on the same isolated path
+    // (Codex parity via `CODEX_HOME`).
     case "cursor":
-      return join(home, ".cursor");
+      return join(home, ".config", "cursor");
   }
 };
 
@@ -281,12 +287,18 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
         HOME: home,
         TMPDIR: tmp,
       };
-    // ⚠️ RESEARCH-UNVERIFIED: Cursor appears HOME-rooted for its ~/.cursor
-    // configuration. Its macOS Keychain credentials remain host-managed.
+    // cursor-agent resolves its credential store as
+    // `($XDG_CONFIG_HOME || $HOME/.config)/cursor/auth.json`. Pin
+    // `XDG_CONFIG_HOME` at the isolated `<home>/.config` so the token can never
+    // land in the user's real `~/.config/cursor` even when the host exports an
+    // ambient `XDG_CONFIG_HOME` (Codex parity via `CODEX_HOME`). `config` here
+    // is `<home>/.config/cursor` (see `cliConfigDir`), so its parent is the
+    // XDG config root. macOS Keychain credentials remain host-managed.
     case "cursor":
       return {
         HOME: home,
         TMPDIR: tmp,
+        XDG_CONFIG_HOME: join(home, ".config"),
       };
   }
 };
