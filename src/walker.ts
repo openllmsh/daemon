@@ -206,11 +206,6 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   // chatgpt (Responses) adapter with the CLI's genuine bearer. It does NOT get
   // the Codex preamble (see `wantsCodexPreamble`).
   grok: "chatgpt",
-  // OpenCode Go serves open coding models over a plain OpenAI-compatible
-  // endpoint (`opencode.ai/zen/go/v1/chat/completions`) with a bare Bearer key
-  // read from the isolated OpenCode `auth.json` — same handrolled openai wire
-  // as kimi_code, no captured URL (the delegate returns the fixed gateway URL).
-  opencode_go: "openai",
 };
 
 // The Codex system preamble ("You are Codex…") is a Codex IDENTITY the ChatGPT

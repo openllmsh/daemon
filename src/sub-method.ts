@@ -53,9 +53,6 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
   // UPSTREAM_WIRE entry), so it is the one BRIDGE-ONLY provider: a bridge
   // decline advances the plan instead of falling to a manual transport.
   cursor: { methods: ["bridge"] },
-  // OpenCode Go is a static-key forward over the openai wire — handrolled only,
-  // no native runtime bridge.
-  opencode_go: { methods: ["handrolled"] },
 };
 
 /**

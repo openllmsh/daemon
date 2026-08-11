@@ -51,12 +51,6 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   // ⚠️ RESEARCH-UNVERIFIED: Cursor's official installer is reported to place
   // this launcher at ~/.local/bin/cursor-agent.
   cursor: { binRel: "home/.local/bin/cursor-agent", cmd: "cursor-agent" },
-  // OpenCode Go needs NO vendor CLI at runtime — the credential is a static
-  // key the delegate writes into an isolated OpenCode `auth.json` and the
-  // walker forwards handrolled. This spec is nominal (kept for symmetry and a
-  // possible future CLI-driven `listModels`); the installer drops `opencode`
-  // at ~/.opencode/bin/opencode.
-  opencode_go: { binRel: "home/.opencode/bin/opencode", cmd: "opencode" },
 };
 
 /** The closed runtime list of CLI providers — derived from `SPECS` keys so it
@@ -134,14 +128,6 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
       // `resolveOnPath` below covers other installation layouts.
       case "cursor":
         return [join(home, ".local", "bin", "cursor-agent")];
-      // OpenCode's official installer drops the launcher at ~/.opencode/bin,
-      // with a ~/.local/bin/opencode fallback. Only relevant if we ever run
-      // the CLI — the static-key forward needs no binary.
-      case "opencode_go":
-        return [
-          join(home, ".opencode", "bin", "opencode"),
-          join(home, ".local", "bin", "opencode"),
-        ];
     }
   })();
   const out: string[] = [];
@@ -234,12 +220,6 @@ export const cliConfigDir = (provider: TCliProvider): string => {
     // (Codex parity via `CODEX_HOME`).
     case "cursor":
       return join(home, ".config", "cursor");
-    // OpenCode keeps `auth.json` in its data dir, default `~/.local/share/
-    // opencode` (overridable via OPENCODE_DATA_DIR — see `cliEnv`). The
-    // delegate reads/writes `<this>/auth.json`, isolated from the user's real
-    // OpenCode data dir.
-    case "opencode_go":
-      return join(home, ".local", "share", "opencode");
   }
 };
 
@@ -319,15 +299,6 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
         HOME: home,
         TMPDIR: tmp,
         XDG_CONFIG_HOME: join(home, ".config"),
-      };
-    // Pin OPENCODE_DATA_DIR at the isolated data dir so its `auth.json` can
-    // never land in the user's real OpenCode home — both the delegate's
-    // read/write and any future isolated CLI run resolve to the same path.
-    case "opencode_go":
-      return {
-        HOME: home,
-        TMPDIR: tmp,
-        OPENCODE_DATA_DIR: config,
       };
   }
 };

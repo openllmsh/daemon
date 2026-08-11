@@ -3,7 +3,6 @@ import { claudeCodeDelegate } from "./claude-code";
 import { cursorDelegate } from "./cursor";
 import { grokDelegate } from "./grok";
 import { kimiCodeDelegate } from "./kimi-code";
-import { opencodeGoDelegate } from "./opencode-go";
 import type { TProviderDelegate } from "./types";
 
 export type { TProviderDelegate } from "./types";
@@ -19,7 +18,6 @@ export const DELEGATES: Readonly<Record<string, TProviderDelegate>> = {
   kimi_code: kimiCodeDelegate,
   grok: grokDelegate,
   cursor: cursorDelegate,
-  opencode_go: opencodeGoDelegate,
 };
 
 export const isSubscriptionSlug = (slug: string): boolean =>
