@@ -317,10 +317,13 @@ export const cliInstallState = async (
     return cached.result;
   }
 
-  // Confined `--version` (no `probe`): the sandbox shim wraps it like any vendor
-  // spawn. It runs only on a signature change or once the hard-max elapses, so
-  // the ~300ms shim cost never lands on the hot path.
-  const out = await runCapture([bin, "--version"], cliEnv(provider));
+  // `--version` runs as a read-only probe: skip the sandbox shim so the version
+  // check can execute a deep release binary path directly (including symlinked
+  // release trees like Codex), while still only re-running on change / stale
+  // thresholds.
+  const out = await runCapture([bin, "--version"], cliEnv(provider), {
+    probe: true,
+  });
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };
   // Only write to cache if generation hasn't changed (cache not cleared).
