@@ -85,6 +85,11 @@ import {
   stripResponsesEncryptedContent,
 } from "@openllmsh/wire/lib/encrypted-content";
 import {
+  isThinkingSignatureError,
+  messagesBodyHasStrippableThinking,
+  stripMessagesThinkingBlocks,
+} from "@openllmsh/wire/lib/thinking-signature";
+import {
   CONTEXT_OVERFLOW_BODY,
   classifyHopError,
 } from "@openllmsh/wire/lib/error-class";
@@ -460,15 +465,26 @@ export const postUpstream = async (
 };
 
 /**
- * POST a Responses-wire (chatgpt + grok) body, plus ONE same-hop retry that
- * STRIPS replayed `reasoning.encrypted_content` when the upstream rejects it
- * as undecryptable. A fallback that switched account/model replays the prior
- * hop's encrypted reasoning into a hop that can't decrypt it → a 400; stripping
- * the ciphertext lets the model re-reason instead of the client seeing a hard
- * error (audit 2026-07-14-codex-upstream-wire §F2). Non-Responses wires and
- * bodies without encrypted state fall straight through to {@link postUpstream}.
+ * POST an upstream body, plus ONE same-hop retry that STRIPS replayed
+ * model-bound reasoning state when the upstream rejects it pre-stream.
+ *
+ * Two wire-gated recoveries (both pre-stream 400 only; one retry; no chain
+ * advance — the caller still owns walk-on-failure):
+ *
+ * 1. **Responses (`chatgpt` wire, + grok):** strip `reasoning.encrypted_content`
+ *    the hop can't decrypt (audit 2026-07-14-codex-upstream-wire §F2).
+ * 2. **Anthropic (`anthropic` wire, claude_code):** strip historical
+ *    `thinking`/`redacted_thinking` blocks whose `signature` the hop model
+ *    rejects (issue #420). Active tool-use continuation thinking is preserved
+ *    by {@link stripMessagesThinkingBlocks} — see that helper's header for the
+ *    tool_use limitation. Origin model is not knowable from the wire, so there
+ *    is no proactive strip (over-stripping would bust prompt cache on healthy
+ *    same-model multi-turn); this reactive path is the correctness backstop.
+ *
+ * Non-matching wires / statuses / bodies fall straight through to
+ * {@link postUpstream}. Exported for the daemon-level strip-retry unit test.
  */
-const postWithDecryptRetry = async (
+export const postWithReplayStripRetry = async (
   url: string,
   headers: Record<string, string>,
   body: unknown,
@@ -486,27 +502,45 @@ const postWithDecryptRetry = async (
       onTransportFailure,
     );
   const first = await send(body);
-  // `chatgpt` is the only encrypted-content-bearing upstream wire (grok maps to
-  // it in UPSTREAM_WIRE). Anything else, an OK response, a non-400, or a body
-  // with no encrypted state → nothing to strip.
-  if (
-    first === null ||
-    first.ok ||
-    first.status !== 400 ||
-    wire !== "chatgpt" ||
-    !responsesBodyHasEncryptedContent(body)
-  ) {
+  // Anything other than a pre-stream 400 → nothing to recover from.
+  if (first === null || first.ok || first.status !== 400) {
     return first;
   }
-  // Peek the error body via `clone()` so the caller can still read `first` on
-  // the terminal path if this turns out NOT to be a decrypt failure.
-  const raw = await first
-    .clone()
-    .text()
-    .catch(() => "");
-  if (!isEncryptedContentError(raw)) return first;
-  const retried = await send(stripResponsesEncryptedContent(body));
-  return retried ?? first;
+
+  // ── Responses: undecryptable reasoning.encrypted_content ────────────────
+  // `chatgpt` is the only encrypted-content-bearing upstream wire (grok maps
+  // to it in UPSTREAM_WIRE).
+  if (wire === "chatgpt" && responsesBodyHasEncryptedContent(body)) {
+    // Peek via `clone()` so the caller can still read `first` if this is not
+    // a decrypt failure.
+    const raw = await first
+      .clone()
+      .text()
+      .catch(() => "");
+    if (isEncryptedContentError(raw)) {
+      const retried = await send(stripResponsesEncryptedContent(body));
+      return retried ?? first;
+    }
+    return first;
+  }
+
+  // ── Anthropic: invalid thinking.signature on a model hop ────────────────
+  // Only attempt when the body has thinking the strip would actually remove
+  // (historical turns). Active tool-use-continuation thinking is preserved,
+  // so a body whose only thinking is that turn is not strippable.
+  if (wire === "anthropic" && messagesBodyHasStrippableThinking(body)) {
+    const raw = await first
+      .clone()
+      .text()
+      .catch(() => "");
+    if (isThinkingSignatureError(raw)) {
+      const retried = await send(stripMessagesThinkingBlocks(body));
+      return retried ?? first;
+    }
+    return first;
+  }
+
+  return first;
 };
 
 /** Map the daemon's upstream wire to the classifier's provider format
@@ -1016,7 +1050,7 @@ const serveSubscription = async (
         })()
       : null;
   const dispatch = (): Promise<Response | null> =>
-    postWithDecryptRetry(
+    postWithReplayStripRetry(
       url,
       headers,
       body,
@@ -1482,7 +1516,7 @@ const serveKimiBuiltinSearch = async (
     );
 
   for (let round = 0; ; round++) {
-    const resp = await postWithDecryptRetry(
+    const resp = await postWithReplayStripRetry(
       acquired.url,
       acquired.headers,
       body,
