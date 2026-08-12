@@ -425,6 +425,27 @@ export const sampleUsageAfterRequest = (
   requestSamples.set(key, sample);
 };
 
+/**
+ * Sample usage IMMEDIATELY on a quota exhaustion signal — no debounce, no
+ * per-request min-interval floor. Unlike {@link sampleUsageAfterRequest} (the
+ * success path, which coalesces a burst and waits), an exhausted account emits
+ * no successful request, so nothing else would ever re-sample it; we want the
+ * rejected snapshot in the cache NOW so the quota gate can route on it for the
+ * rest of the window. Still safe: `cachedUsage`'s in-flight single-flight check
+ * precedes its force/freshness logic, so a concurrent herd of exhaustion signals
+ * collapses to ONE vendor read. Fire-and-forget; never throws.
+ */
+export const sampleUsageOnExhaustion = (
+  slug: string,
+  fetcher: () => Promise<TProviderUsageSnapshot>,
+  accountHash?: string,
+): void => {
+  // Fire-and-forget: attach a rejection handler so a `persist()` failure that
+  // escapes `cachedUsage`'s internal catch can never surface as an unhandled
+  // rejection — the documented "never throws" contract holds.
+  void cachedUsage(slug, fetcher, { force: true, accountHash }).catch(() => {});
+};
+
 /** Test-only cleanup for the module-global request sampler. */
 export const clearRequestUsageSamples = (): void => {
   for (const sample of requestSamples.values()) {
