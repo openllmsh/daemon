@@ -63,7 +63,9 @@ import {
   nextLargerContextModel,
 } from "@openllmsh/wire/features/context-demote";
 import {
-  compactionTargetFor,
+  COMPACTION_OVERFLOW_SAFETY,
+  COMPACTION_TARGET_FLOOR,
+  compactionTargetFromOverflow,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
 import {
@@ -1933,57 +1935,108 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   if (!(await isContextOverflowResponse(firstPass))) return firstPass;
 
   const largest = largestContextHop(hops);
-  // Shrink the target by the target hop's provider calibration factor, so the
-  // compacted body fits the VENDOR's tokenizer (which counts ~1.4× more than our
-  // ruler for Claude), not just our local ruler.
-  const compactionTarget =
-    largest === null
-      ? null
-      : compactionTargetFor(largest.hop.provider, largest.window);
   // Measure with the ruler family that matches the wire (Claude for `messages`,
   // o200k otherwise) — the same choice the compactor's fit check uses.
   const encoding = encodingForSurface(args.surface);
-  // Warm the BPE ruler before the size gate AND the compactor's internal fit
-  // checks — this is the one place an exact count decides whether to compact and
-  // by how much. The ~160 ms one-time load per isolate is trivial next to the
-  // re-walk it gates (the alternative here is a hard 502), and every later
-  // oversized request on this warm daemon process reuses the counter for free;
-  // the healthy path never warms it and stays on the cheap `chars/4` fallback.
-  if (
-    largest !== null &&
-    compactionTarget !== null &&
-    !args.req.signal.aborted
-  ) {
-    await getTokenCounter(encoding);
-  }
-  if (
-    largest === null ||
-    compactionTarget === null ||
-    args.req.signal.aborted ||
-    estimateBodyTokensExact(args.rawBody, encoding) <= compactionTarget
-  ) {
-    return firstPass;
-  }
+  // A CONFIRMED vendor overflow forces a real shrink. We do NOT bail merely
+  // because the local ruler thinks the body already "fits" a static target
+  // (RC1) — the vendor's own tokenizer already rejected it, so a false local fit
+  // must not veto compaction. Bail only when there is no sized hop to aim the
+  // cut at, or the client went away.
+  if (largest === null || args.req.signal.aborted) return firstPass;
+  // Warm the BPE ruler before the compactor's internal fit checks — this is the
+  // one place an exact count decides HOW MUCH to cut. The ~160 ms one-time load
+  // per isolate is trivial next to the re-walk it gates (the alternative here is
+  // a hard 502), and every later oversized request on this warm daemon process
+  // reuses the counter for free; the healthy path never warms it and stays on
+  // the cheap `chars/4` fallback.
+  await getTokenCounter(encoding);
   // The daemon forwards the RAW inbound body per surface, so the compactor must
   // match: `responses` (Codex) is `{ input: item[] }`, `messages` (Claude) is
   // Anthropic-shaped, `chat_completions` is canonical OpenAI.
   const surface: TCompactionSurface = args.surface;
-  const compacted = compactRequestToFit(
-    args.rawBody,
-    surface,
-    compactionTarget,
-    encoding,
-  );
-  if (!compacted.compacted) return firstPass;
-  // Re-walk ONCE with the shrunk body. The compacted retry is itself never
-  // re-compacted (only this outer pass compacts), so this can't loop.
-  const compactedArgs: TWalkArgs = {
-    ...args,
-    rawBody: compacted.body,
-    rawBytes: new TextEncoder().encode(JSON.stringify(compacted.body))
-      .buffer as ArrayBuffer,
-  };
-  return walkPlan(compactedArgs, hops);
+  // BOUNDED vendor-grounded retry. Each round sizes the cut from the FRESH
+  // vendor numbers in the latest overflow envelope (the ruler→vendor ratio
+  // self-calibrates and converges), compacts, and re-walks. Hard-capped so a
+  // persistently-rejecting upstream can never spin an infinite compaction loop.
+  let currentBody = args.rawBody;
+  let overflowResponse = firstPass;
+  for (let round = 0; round < MAX_LAST_RESORT_COMPACTION_ROUNDS; round++) {
+    if (args.req.signal.aborted) return overflowResponse;
+    // Size the cut from the vendor's own count for the body we just sent — the
+    // observed ratio is exact calibration for THIS conversation. Clamped no
+    // looser than the static target; falls back to it when the vendor gave no
+    // count.
+    const localEstimate = estimateBodyTokensExact(currentBody, encoding);
+    const target = compactionTargetFromOverflow({
+      requiredTokens: await overflowRequiredTokensOf(overflowResponse),
+      window: largest.window,
+      localEstimate,
+      provider: largest.hop.provider,
+    });
+    // A confirmed overflow always forces a real shrink: if the calibrated
+    // target is still at/above the current local estimate (vendor numbers
+    // absent, or ratio already inside the window), tighten below the current
+    // body so the cut is never a no-op re-send of the same bytes.
+    const forcedTarget =
+      target < localEstimate
+        ? target
+        : Math.max(
+            COMPACTION_TARGET_FLOOR,
+            Math.floor(localEstimate * COMPACTION_OVERFLOW_SAFETY),
+          );
+    const compacted = compactRequestToFit(
+      currentBody,
+      surface,
+      forcedTarget,
+      encoding,
+    );
+    // Nothing left to reduce (or the cut didn't actually shrink the body) —
+    // surface the last overflow rather than re-sending an identical body.
+    if (
+      !compacted.compacted ||
+      compacted.estimatedTokens >= localEstimate
+    ) {
+      return overflowResponse;
+    }
+    const compactedArgs: TWalkArgs = {
+      ...args,
+      rawBody: compacted.body,
+      rawBytes: new TextEncoder().encode(JSON.stringify(compacted.body))
+        .buffer as ArrayBuffer,
+    };
+    const retry = await walkPlan(compactedArgs, hops);
+    if (!(await isContextOverflowResponse(retry))) return retry;
+    // Still overflowing — recompute the target from the retry's FRESH vendor
+    // numbers and compact tighter on the next bounded round.
+    overflowResponse = retry;
+    currentBody = compacted.body;
+  }
+  return overflowResponse;
+};
+
+/**
+ * Hard cap on last-resort compaction rounds. The vendor-grounded ratio converges
+ * fast (usually one tighter round after a static undercorrect), so three rounds
+ * is ample headroom; the cap's real job is to make an infinite compaction loop
+ * structurally impossible when an upstream keeps rejecting.
+ */
+const MAX_LAST_RESORT_COMPACTION_ROUNDS = 3;
+
+/**
+ * The upstream tokenizer's authoritative request size carried in a walk's
+ * overflow Response body, or null when the envelope carried no parseable count
+ * (then the caller falls back to the static target). Clones so the Response body
+ * is left intact for the caller.
+ */
+const overflowRequiredTokensOf = async (
+  response: Response,
+): Promise<number | null> => {
+  const text = await response
+    .clone()
+    .text()
+    .catch(() => "");
+  return contextOverflowRequiredTokens(text);
 };
 
 /**
