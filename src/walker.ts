@@ -85,11 +85,6 @@ import {
   stripResponsesEncryptedContent,
 } from "@openllmsh/wire/lib/encrypted-content";
 import {
-  isThinkingSignatureError,
-  messagesBodyHasStrippableThinking,
-  stripMessagesThinkingBlocks,
-} from "@openllmsh/wire/lib/thinking-signature";
-import {
   CONTEXT_OVERFLOW_BODY,
   classifyHopError,
 } from "@openllmsh/wire/lib/error-class";
@@ -112,6 +107,11 @@ import {
   UpstreamStreamError,
   upstreamErrorFrom,
 } from "@openllmsh/wire/lib/streaming/upstream-error";
+import {
+  isThinkingSignatureError,
+  messagesBodyHasStrippableThinking,
+  stripMessagesThinkingBlocks,
+} from "@openllmsh/wire/lib/thinking-signature";
 import {
   normalizeSchemaRefs,
   stripSchemaKeywords,
@@ -165,7 +165,13 @@ import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
 import { forwardToCloud } from "./forward";
-import { isHopCoolingDown, markHopCooldown } from "./hop-cooldown";
+import {
+  clearHopCooldown,
+  isHopCoolingDown,
+  markHopCooldown,
+  peekHopCooldown,
+  TRANSIENT_COOLDOWN_REASONS,
+} from "./hop-cooldown";
 import { logWarn } from "./logger";
 import {
   isNativeRuntimeProvider,
@@ -176,7 +182,11 @@ import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
 import { isClaudeCodeOriginator, localMethodsForHop } from "./sub-method";
 import { tunnelToPeer } from "./tunnel-client";
-import { peekUsageForQuotaGate, sampleUsageAfterRequest } from "./usage-cache";
+import {
+  peekUsageForQuotaGate,
+  sampleUsageAfterRequest,
+  sampleUsageOnExhaustion,
+} from "./usage-cache";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
 // the one constant that stays in the walker. The upstream URL is no longer
@@ -390,6 +400,27 @@ const retryAfterDelayMs = (resp: Response): number => {
     }
   }
   return FINAL_HOP_RETRY_DELAY_MS;
+};
+
+/**
+ * Absolute recover time from a 429/5xx response's `Retry-After` (seconds or
+ * HTTP-date) — the authoritative "provably doomed until" floor threaded into
+ * the hop cooldown. Unlike {@link retryAfterDelayMs} this is NOT capped: a
+ * vendor that says "retry in 60s" must not be truncated to 10s, or the doom
+ * oracle would let a recovery pass re-dial a hop the vendor already refused.
+ * Returns `undefined` when the header is absent or unparseable.
+ */
+const retryAfterRecoverAtMs = (
+  resp: Response,
+  now: number = Date.now(),
+): number | undefined => {
+  const raw = resp.headers.get("retry-after");
+  if (raw === null) return undefined;
+  const secs = Number(raw);
+  if (!Number.isNaN(secs)) return now + Math.max(0, secs * 1000);
+  const at = Date.parse(raw);
+  if (!Number.isNaN(at)) return at;
+  return undefined;
 };
 
 /** Resolve after `ms` — or immediately once the client disconnects, so a
@@ -896,6 +927,8 @@ export type THopRetry = {
   readonly cooldownReason?: TCooldownReason;
   /** Original upstream error retained when a later forced retry must fail back. */
   readonly upstreamResponse?: Response;
+  /** Absolute vendor `Retry-After` recover time — the authoritative doom floor. */
+  readonly recoverAtMs?: number;
 };
 
 export type THopServeOutcome = Response | THopRetry;
@@ -914,6 +947,7 @@ export const hopRetry = (
     readonly bodySnippet?: string;
     readonly cooldownReason?: TCooldownReason;
     readonly upstreamResponse?: Response;
+    readonly recoverAtMs?: number;
   },
 ): THopRetry => ({
   kind: "retry",
@@ -927,6 +961,9 @@ export const hopRetry = (
     : {}),
   ...(detail?.upstreamResponse !== undefined
     ? { upstreamResponse: detail.upstreamResponse }
+    : {}),
+  ...(detail?.recoverAtMs !== undefined
+    ? { recoverAtMs: detail.recoverAtMs }
     : {}),
 });
 
@@ -1087,6 +1124,11 @@ const serveSubscription = async (
       args.req.signal.aborted,
     );
     if (!finalHop && cls.kind === "transient") {
+      // Capture the vendor's Retry-After as an ABSOLUTE recover floor (the
+      // generic doom oracle). Never shortens the 180s policy TTL — it's an
+      // ADDITIONAL fact a recovery pass consults before bypassing a transient
+      // cooldown.
+      const recoverAtMs = retryAfterRecoverAtMs(resp);
       return hopRetry(
         `HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`,
         {
@@ -1097,6 +1139,7 @@ const serveSubscription = async (
             status: resp.status,
             headers: passthroughHeaders(resp),
           }),
+          ...(recoverAtMs !== undefined ? { recoverAtMs } : {}),
         },
       );
     }
@@ -1977,10 +2020,30 @@ const isContextOverflowResponse = async (
  * walk with a shrunk body. All plan/signature validation stays in `runWalker`
  * (it must not re-run on the compacted retry).
  */
+// Monotonic, per-process walk counter → a hermetic walk-local session key (no
+// crypto / Date-based entropy, so tests are deterministic). Identifies which
+// walk set a hop cooldown, so a recovery pass can distinguish "a sibling cooled
+// this" (bypassable) from "I cooled this" (already tried — never re-dial).
+let walkCounter = 0;
+
+// Sentinel returned by `serveSubscriptionHop` meaning "this hop produced no
+// terminal response — keep walking" (the extracted stand-in for a `continue`).
+const HOP_CONTINUE: unique symbol = Symbol("hop-continue");
+type THopContinue = typeof HOP_CONTINUE;
+
+// A committed terminal Response from a subscription hop, tagged with its ORIGIN.
+// `servedLocally` is true when THIS box's native-runtime or handrolled transport
+// produced the Response (so a 2xx proves THIS box's account recovered); false
+// when a fleet peer served it over the tunnel (a DIFFERENT account — no proof
+// about this box, so it must not clear this box's cooldown sign).
+type THopServed = { readonly response: Response; readonly servedLocally: boolean };
+
 const walkPlan = async (
   args: TWalkArgs,
   hops: ReadonlyArray<THop>,
 ): Promise<Response> => {
+  walkCounter += 1;
+  const walkSessionKey = `walk-${walkCounter}`;
   const accountHashByProvider = new Map<string, string | null>();
   // Shared per-request cache of `delegate.status()` — the local auth gate and
   // the quota-account lookup both read through it so a hop pays status once.
@@ -2012,6 +2075,23 @@ const walkPlan = async (
     const delegate = getDelegate(provider);
     if (delegate === null) return;
     sampleUsageAfterRequest(
+      provider,
+      () => delegate.usage(),
+      accountHash ?? undefined,
+    );
+  };
+  const sampleQuotaUsageImmediate = (
+    provider: string,
+    accountHash: string | null | undefined,
+  ): void => {
+    const delegate = getDelegate(provider);
+    if (delegate === null) return;
+    // The vendor just told us this account is exhausted. Sample NOW (no
+    // debounce / min-interval floor) so the quota gate has a rejected snapshot
+    // to route on — an exhausted account emits no successful request, so
+    // nothing else would re-sample it. Single-flight in `cachedUsage` collapses
+    // a concurrent herd to one vendor read.
+    sampleUsageOnExhaustion(
       provider,
       () => delegate.usage(),
       accountHash ?? undefined,
@@ -2049,6 +2129,7 @@ const walkPlan = async (
     reason: string,
     status?: number,
     cooldownReason?: TCooldownReason,
+    recoverAtMs?: number,
   ): void => {
     hopTrail.push({
       modelId: hop.modelId,
@@ -2058,17 +2139,27 @@ const walkPlan = async (
     });
     // Cool the hop on THIS box too — the cloud mark is best-effort and
     // cross-process, so without a local table an exhausted account is
-    // re-dialled on every subsequent request (see hop-cooldown.ts).
+    // re-dialled on every subsequent request (see hop-cooldown.ts). Stamp the
+    // walk's session key + the vendor recover floor as provenance so a recovery
+    // pass can tell whose mark this is and whether it's provably doomed.
     if (cooldownReason !== undefined) {
-      markHopCooldown(hop.provider, hop.modelId, cooldownReason);
+      markHopCooldown(
+        hop.provider,
+        hop.modelId,
+        cooldownReason,
+        walkSessionKey,
+        recoverAtMs,
+      );
     }
-    // The vendor just TOLD us this account is out of quota. Schedule the same
-    // debounced, rate-limited usage sample a successful request schedules, so
-    // the quota gate gets a rejected snapshot to route on for the rest of the
-    // window — an exhausted account produces no successful request, so nothing
-    // else would ever re-sample it.
+    // The vendor just TOLD us this account is out of quota. Sample its usage
+    // IMMEDIATELY (no debounce) so the quota gate gets a rejected snapshot to
+    // route on for the rest of the window — an exhausted account produces no
+    // successful request, so nothing else would ever re-sample it.
     if (cooldownReason === "quota_exhausted") {
-      sampleQuotaUsage(hop.provider, accountHashByProvider.get(hop.provider));
+      sampleQuotaUsageImmediate(
+        hop.provider,
+        accountHashByProvider.get(hop.provider),
+      );
     }
     reportHopFailure(hop, reason, status, cooldownReason);
   };
@@ -2083,6 +2174,26 @@ const walkPlan = async (
     }
     return new Response(resp.body, { status: resp.status, headers });
   };
+  // Commit a subscription hop's terminal Response. A SUCCESS (HTTP < 400) proves
+  // the hop is healthy right now, so drop any stale cooldown sign IMMEDIATELY:
+  // sibling walks and the next request then skip the whole exhaust-then-recover
+  // detour instead of re-earning quota for the full TTL. A committed ERROR
+  // Response (4xx/5xx) is not proof of health and never clears; nor does
+  // HOP_CONTINUE (no committed response). The final-hop success path flows
+  // through here too, so a final hop dialled while cooled also clears.
+  //
+  // The clear fires ONLY on a LOCALLY-served 2xx. A fleet-tunnel 2xx is served
+  // by a REMOTE peer using a DIFFERENT subscription account, so it proves
+  // nothing about THIS box's account — clearing on it could erase a live
+  // `quota_exhausted` backstop and let concurrent siblings re-storm the still-
+  // exhausted local account during the usage-sample lag. The clear stays GLOBAL
+  // (it benefits all local consumers); only the trigger narrows to local serves.
+  const commitSubscriptionServe = (hop: THop, served: THopServed): Response => {
+    if (served.servedLocally && served.response.status < 400) {
+      clearHopCooldown(hop.provider, hop.modelId);
+    }
+    return withHopTrailHeaders(served.response);
+  };
   // Context skips preserve priority without permanently excluding a model:
   // once ordinary candidates are exhausted, retry the skipped candidates once
   // in original order with the heuristic bypassed. The final forced candidate
@@ -2092,6 +2203,16 @@ const walkPlan = async (
     readonly forceContextAttempt: boolean;
   }> = hops.map((hop) => ({ hop, forceContextAttempt: false }));
   const contextSkipped: THop[] = [];
+  // Subscription hops the pass-1 cooldown gate skipped — candidates for the
+  // post-loop recovery pass (a transient cooldown may be advisory).
+  const cooldownSkipped: THop[] = [];
+  // Hop identities (`provider|modelId`) THIS walk actually DIALLED in pass 1.
+  // The authoritative at-most-once guard for the recovery pass: a concurrent
+  // sibling can overwrite a cooldown entry's `setterSessionKey` (last-writer-
+  // wins), so when the same model appears at two chain positions the setter
+  // check alone can let recovery re-dial a hop pass 1 already tried. This set
+  // is walk-local and immune to sibling writes.
+  const dialedHops = new Set<string>();
   let requeuedSkipped = false;
   const preserveTerminalResponse = (
     response: Response | undefined,
@@ -2106,6 +2227,203 @@ const walkPlan = async (
     ) {
       firstTerminalResponse = response;
     }
+  };
+  // The per-subscription-hop serve body, extracted verbatim so the post-loop
+  // recovery pass can re-dial a cooling hop directly (`bypassCooldown: true`),
+  // bypassing the loop's cooldown gate. Returns a committed raw Response (the
+  // caller wraps it with `withHopTrailHeaders`) or {@link HOP_CONTINUE} meaning
+  // "keep walking" (the extracted stand-in for a `continue`). Pass 1 calls it
+  // with `bypassCooldown: false`; its behavior is byte-identical to the inline
+  // block it replaced.
+  const serveSubscriptionHop = async (
+    hop: THop,
+    finalHop: boolean,
+    opts: {
+      readonly bypassCooldown: boolean;
+      readonly forceContextAttempt: boolean;
+    },
+  ): Promise<THopServed | THopContinue> => {
+    const { forceContextAttempt } = opts;
+    void opts.bypassCooldown;
+    // ── Local auth gate (every subscription provider) ─────────────────
+    // Install ≠ signed-in. status().connected is the same signal the cloud
+    // uses for fleet_subscriptions. Without a local login, skip every local
+    // transport (bridge spawn / handrolled credential) and go straight to
+    // fleet — a doomed ACP handshake ("Invalid params") or credential throw
+    // is not a hop resolution strategy.
+    const localAuth = await ensureLocalSubscription(
+      hop.provider,
+      connectedByProvider,
+      accountHashByProvider,
+    );
+    if (!localAuth.connected) {
+      lastError =
+        localAuth.detail ?? `${hop.provider} not signed in on this device`;
+      const tunneled = await tryFleetTunnel(hop, args);
+      if (tunneled !== null) {
+        return { response: tunneled, servedLocally: false };
+      }
+      addHopFailure(hop, lastError);
+      return HOP_CONTINUE;
+    }
+
+    const decision = quotaGateDecision({
+      snapshot: await usageForActiveAccount(
+        hop.provider,
+        accountHashByProvider,
+        connectedByProvider,
+      ),
+      meter: lookupCatalogEntry(hop.modelId)?.subscription_meter,
+      finalHop,
+      staleCapMs: GATE_STALE_CAP_MS,
+      now: Date.now(),
+    });
+    if (decision.kind === "skip") {
+      lastError = decision.reason;
+      hopTrail.push({
+        modelId: hop.modelId,
+        provider: hop.provider,
+        reason: decision.reason,
+      });
+      clearPlanCache();
+      return HOP_CONTINUE;
+    }
+
+    // Ordered local transports for THIS hop — capability table + preference
+    // + ToS policy (non-CC claude_code → bridge only; cursor → bridge only;
+    // handrolled preference → handrolled only). No per-slug branches here.
+    const methods = localMethodsForHop(
+      hop.provider,
+      subMethodOverrides[hop.provider] ?? requestedSubMethod,
+      { isClaudeCode: claudeCodeOriginator },
+    );
+    let nativeDecline: string | null = null;
+    let handrolledRetry: THopRetry | null = null;
+
+    if (methods.includes("bridge") && isNativeRuntimeProvider(hop.provider)) {
+      // Official vendor runtime (Claude stream-json / Codex app-server /
+      // cursor ACP). Pre-commit declines fall through to handrolled when
+      // `methods` still allows it; otherwise fleet (below).
+      const native = await tryServeNativeRuntime({
+        provider: hop.provider,
+        providerModelId: hop.providerModelId,
+        surface: args.surface,
+        rawBody: args.rawBody,
+        canonical,
+        wantsStream:
+          (args.rawBody as { stream?: unknown } | null)?.stream === true,
+        signal: args.req.signal,
+        record: (tokens, status) =>
+          report(
+            {
+              model: hop.modelId,
+              provider: hop.provider,
+              status,
+              latency_ms: Date.now() - args.startedAt,
+              endpoint: args.endpoint,
+              ...tokens,
+            },
+            args.originParam,
+            accountHashByProvider.get(hop.provider) ?? undefined,
+          ),
+      });
+      if (native instanceof Response) {
+        if (
+          native.status === 408 ||
+          native.status === 429 ||
+          native.status >= 500
+        ) {
+          clearPlanCache();
+        }
+        return { response: native, servedLocally: true };
+      }
+      nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
+      lastError = nativeDecline;
+    }
+
+    const wire = UPSTREAM_WIRE[hop.provider];
+    if (methods.includes("handrolled") && wire !== undefined) {
+      // Manual subscription transport — sole path for kimi/grok; fallback
+      // for bridge declines on claude_code + chatgpt when policy allows.
+      const served = await serveSubscription(
+        hop,
+        wire,
+        args,
+        finalHop,
+        sampleQuotaUsage,
+      );
+      if (!isHopRetry(served)) {
+        if (
+          forceContextAttempt &&
+          !served.ok &&
+          firstTerminalResponse !== null
+        ) {
+          return { response: firstTerminalResponse, servedLocally: true };
+        }
+        return { response: served, servedLocally: true };
+      }
+      handrolledRetry = served;
+      lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
+      preserveTerminalResponse(served.upstreamResponse, forceContextAttempt);
+    }
+
+    // Local serve exhausted (auth-gated, method-gated, or both declined) —
+    // a fleet peer may still hold the login. ONE tunnel site for every
+    // subscription provider; loop guard lives inside tryFleetTunnel.
+    const tunneled = await tryFleetTunnel(hop, args);
+    if (tunneled !== null) {
+      return { response: tunneled, servedLocally: false };
+    }
+
+    if (handrolledRetry !== null) {
+      if (handrolledRetry.cooldownReason === "context_overflow") {
+        const requiredTokens =
+          contextOverflowRequiredTokens(
+            handrolledRetry.bodySnippet ?? handrolledRetry.reason,
+          ) ?? baseEstimate;
+        const nextModel = nextLargerContextModel(
+          hops.map((candidate) => candidate.modelId),
+          hop.modelId,
+          requiredTokens,
+          (modelId) => lookupCatalogEntry(modelId)?.input_token_limit ?? null,
+        );
+        if (nextModel !== null && !args.req.signal.aborted) {
+          hopTrail.push({
+            modelId: hop.modelId,
+            provider: hop.provider,
+            reason: handrolledRetry.reason,
+            ...(handrolledRetry.status !== undefined
+              ? { status: handrolledRetry.status }
+              : {}),
+          });
+          contextDemotionTarget = nextModel;
+          return HOP_CONTINUE;
+        }
+        if (handrolledRetry.upstreamResponse !== undefined) {
+          return {
+            response: handrolledRetry.upstreamResponse,
+            servedLocally: true,
+          };
+        }
+      }
+      addHopFailure(
+        hop,
+        handrolledRetry.reason,
+        handrolledRetry.status,
+        handrolledRetry.cooldownReason,
+        handrolledRetry.recoverAtMs,
+      );
+      return HOP_CONTINUE;
+    }
+
+    lastError =
+      nativeDecline ??
+      (methods.length === 0
+        ? `${hop.provider} hop ${hop.modelId} has no local transport on this box`
+        : (lastError ??
+          `${hop.provider} hop ${hop.modelId} could not be served locally`));
+    addHopFailure(hop, lastError);
+    return HOP_CONTINUE;
   };
   let queueIndex = 0;
   while (true) {
@@ -2163,6 +2481,11 @@ const walkPlan = async (
         provider: hop.provider,
         reason: lastError,
       });
+      // Record subscription hops skipped by the cooldown gate for the post-loop
+      // recovery pass (API-key hops cool via the cloud — excluded). A transient
+      // sibling-set cooldown may be bypassable once the authoritative usage
+      // floor confirms the shared account still has quota.
+      if (isSubscriptionSlug(hop.provider)) cooldownSkipped.push(hop);
       continue;
     }
     // ── Context gate, per hop (shared with the cloud chain —
@@ -2193,177 +2516,15 @@ const walkPlan = async (
       continue;
     }
     if (isSubscriptionSlug(hop.provider)) {
-      // ── Local auth gate (every subscription provider) ─────────────────
-      // Install ≠ signed-in. status().connected is the same signal the cloud
-      // uses for fleet_subscriptions. Without a local login, skip every local
-      // transport (bridge spawn / handrolled credential) and go straight to
-      // fleet — a doomed ACP handshake ("Invalid params") or credential throw
-      // is not a hop resolution strategy.
-      const localAuth = await ensureLocalSubscription(
-        hop.provider,
-        connectedByProvider,
-        accountHashByProvider,
-      );
-      if (!localAuth.connected) {
-        lastError =
-          localAuth.detail ?? `${hop.provider} not signed in on this device`;
-        const tunneled = await tryFleetTunnel(hop, args);
-        if (tunneled !== null) return withHopTrailHeaders(tunneled);
-        addHopFailure(hop, lastError);
-        continue;
-      }
-
-      const decision = quotaGateDecision({
-        snapshot: await usageForActiveAccount(
-          hop.provider,
-          accountHashByProvider,
-          connectedByProvider,
-        ),
-        meter: lookupCatalogEntry(hop.modelId)?.subscription_meter,
-        finalHop,
-        staleCapMs: GATE_STALE_CAP_MS,
-        now: Date.now(),
+      // Record the DIALLED identity before serving so the recovery pass can
+      // never re-dial it, independent of the (sibling-overwritable) setter key.
+      dialedHops.add(`${hop.provider}|${hop.modelId}`);
+      const served = await serveSubscriptionHop(hop, finalHop, {
+        bypassCooldown: false,
+        forceContextAttempt,
       });
-      if (decision.kind === "skip") {
-        lastError = decision.reason;
-        hopTrail.push({
-          modelId: hop.modelId,
-          provider: hop.provider,
-          reason: decision.reason,
-        });
-        clearPlanCache();
-        continue;
-      }
-
-      // Ordered local transports for THIS hop — capability table + preference
-      // + ToS policy (non-CC claude_code → bridge only; cursor → bridge only;
-      // handrolled preference → handrolled only). No per-slug branches here.
-      const methods = localMethodsForHop(
-        hop.provider,
-        subMethodOverrides[hop.provider] ?? requestedSubMethod,
-        { isClaudeCode: claudeCodeOriginator },
-      );
-      let nativeDecline: string | null = null;
-      let handrolledRetry: THopRetry | null = null;
-
-      if (methods.includes("bridge") && isNativeRuntimeProvider(hop.provider)) {
-        // Official vendor runtime (Claude stream-json / Codex app-server /
-        // cursor ACP). Pre-commit declines fall through to handrolled when
-        // `methods` still allows it; otherwise fleet (below).
-        const native = await tryServeNativeRuntime({
-          provider: hop.provider,
-          providerModelId: hop.providerModelId,
-          surface: args.surface,
-          rawBody: args.rawBody,
-          canonical,
-          wantsStream:
-            (args.rawBody as { stream?: unknown } | null)?.stream === true,
-          signal: args.req.signal,
-          record: (tokens, status) =>
-            report(
-              {
-                model: hop.modelId,
-                provider: hop.provider,
-                status,
-                latency_ms: Date.now() - args.startedAt,
-                endpoint: args.endpoint,
-                ...tokens,
-              },
-              args.originParam,
-              accountHashByProvider.get(hop.provider) ?? undefined,
-            ),
-        });
-        if (native instanceof Response) {
-          if (
-            native.status === 408 ||
-            native.status === 429 ||
-            native.status >= 500
-          ) {
-            clearPlanCache();
-          }
-          return withHopTrailHeaders(native);
-        }
-        nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
-        lastError = nativeDecline;
-      }
-
-      const wire = UPSTREAM_WIRE[hop.provider];
-      if (methods.includes("handrolled") && wire !== undefined) {
-        // Manual subscription transport — sole path for kimi/grok; fallback
-        // for bridge declines on claude_code + chatgpt when policy allows.
-        const served = await serveSubscription(
-          hop,
-          wire,
-          args,
-          finalHop,
-          sampleQuotaUsage,
-        );
-        if (!isHopRetry(served)) {
-          if (
-            forceContextAttempt &&
-            !served.ok &&
-            firstTerminalResponse !== null
-          ) {
-            return withHopTrailHeaders(firstTerminalResponse);
-          }
-          return withHopTrailHeaders(served);
-        }
-        handrolledRetry = served;
-        lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;
-        preserveTerminalResponse(served.upstreamResponse, forceContextAttempt);
-      }
-
-      // Local serve exhausted (auth-gated, method-gated, or both declined) —
-      // a fleet peer may still hold the login. ONE tunnel site for every
-      // subscription provider; loop guard lives inside tryFleetTunnel.
-      const tunneled = await tryFleetTunnel(hop, args);
-      if (tunneled !== null) return withHopTrailHeaders(tunneled);
-
-      if (handrolledRetry !== null) {
-        if (handrolledRetry.cooldownReason === "context_overflow") {
-          const requiredTokens =
-            contextOverflowRequiredTokens(
-              handrolledRetry.bodySnippet ?? handrolledRetry.reason,
-            ) ?? baseEstimate;
-          const nextModel = nextLargerContextModel(
-            hops.map((candidate) => candidate.modelId),
-            hop.modelId,
-            requiredTokens,
-            (modelId) => lookupCatalogEntry(modelId)?.input_token_limit ?? null,
-          );
-          if (nextModel !== null && !args.req.signal.aborted) {
-            hopTrail.push({
-              modelId: hop.modelId,
-              provider: hop.provider,
-              reason: handrolledRetry.reason,
-              ...(handrolledRetry.status !== undefined
-                ? { status: handrolledRetry.status }
-                : {}),
-            });
-            contextDemotionTarget = nextModel;
-            continue;
-          }
-          if (handrolledRetry.upstreamResponse !== undefined) {
-            return withHopTrailHeaders(handrolledRetry.upstreamResponse);
-          }
-        }
-        addHopFailure(
-          hop,
-          handrolledRetry.reason,
-          handrolledRetry.status,
-          handrolledRetry.cooldownReason,
-        );
-        continue;
-      }
-
-      lastError =
-        nativeDecline ??
-        (methods.length === 0
-          ? `${hop.provider} hop ${hop.modelId} has no local transport on this box`
-          : (lastError ??
-            `${hop.provider} hop ${hop.modelId} could not be served locally`));
-      addHopFailure(hop, lastError);
-      continue;
+      if (served === HOP_CONTINUE) continue;
+      return commitSubscriptionServe(hop, served);
     }
     // API-key hop: forward to the cloud pinned to this concrete model.
     let resp: Response;
@@ -2439,6 +2600,84 @@ const walkPlan = async (
         headers: passthroughHeaders(resp),
       }),
     );
+  }
+  // ── Recovery pass ─────────────────────────────────────────────────────
+  // The whole chain walked to a terminal failure, but some subscription hops
+  // were skipped by the ADVISORY cooldown gate. Under N concurrent agents on
+  // ONE shared subscription account, the first agent's transient 429 cools the
+  // hop process-globally and every sibling then skips the entire all-one-account
+  // chain — where N direct vendor connections would each just retry and succeed.
+  // Re-dial such a hop ONCE, but only when it is provably NOT doomed: a transient
+  // cooldown set by a DIFFERENT walk, past any vendor Retry-After floor, AND with
+  // the authoritative usage cache confirming the account still has quota (the
+  // stricter gate — never the bare pass-1 "allow").
+  //
+  // Restart from the TOP of the chain, not from the leftover skip list: iterate
+  // the plan's hops in CHAIN ORDER from index 0 so the request lands on the
+  // HIGHEST-PRIORITY usable hop (e.g. opus-5), not whatever degraded lower hop
+  // happened to be skipped. Only a hop pass 1 SKIPPED by the advisory cooldown
+  // gate is a candidate (`cooldownSkippedSet`) — a hop pass 1 already DIALLED
+  // (and failed) is never re-dialled; `recoveryDialed` keeps it at-most-once
+  // across the recovery loop too. The FIRST successful dial wins and returns.
+  const cooldownSkippedSet = new Set(cooldownSkipped.map((h) => h.modelId));
+  const recoveryDialed = new Set<string>();
+  for (const hop of hops) {
+    if (args.req.signal.aborted) break;
+    // Skipped by the advisory cooldown gate in pass 1 — never a dialled-and-
+    // failed hop, and never an API-key hop (those cool via the cloud).
+    if (!cooldownSkippedSet.has(hop.modelId)) continue;
+    // Authoritative at-most-once: never re-dial a hop identity pass 1 already
+    // dialled, even when a concurrent sibling overwrote its cooldown setter key
+    // (last-writer-wins) so the `setterSessionKey` check below no longer sees
+    // this walk. Covers a chain that lists the same model at two positions.
+    if (dialedHops.has(`${hop.provider}|${hop.modelId}`)) continue;
+    if (recoveryDialed.has(hop.modelId)) continue; // at-most-once per hop
+    const cd = peekHopCooldown(hop.provider, hop.modelId);
+    if (cd === undefined) continue; // expired — leave to the next request
+    if (!TRANSIENT_COOLDOWN_REASONS.has(cd.reason)) continue; // hard reason
+    if (cd.setterSessionKey === walkSessionKey) continue; // I set it — already tried
+    // Past the vendor's authoritative recover floor (or none given).
+    if (cd.recoverAtMs !== undefined && Date.now() < cd.recoverAtMs) continue;
+    // HARD usage floor — the STRICTER predicate: a confirmed quota snapshot that
+    // the gate says still has room. Absent / null / rejected → never bypass.
+    const snap = await usageForActiveAccount(
+      hop.provider,
+      accountHashByProvider,
+      connectedByProvider,
+    );
+    if (snap === null || snap.kind !== "quota") continue;
+    const gate = quotaGateDecision({
+      snapshot: snap,
+      meter: lookupCatalogEntry(hop.modelId)?.subscription_meter,
+      finalHop: false,
+      staleCapMs: GATE_STALE_CAP_MS,
+      now: Date.now(),
+    });
+    if (gate.kind !== "allow") continue;
+    // Provably doomed by size: pass 1's cooldown gate runs BEFORE its context
+    // gate, so a cooldown-skipped hop was never size-checked. Mirror pass 1's
+    // `shouldSkipHopForContext` (finalHop:false — the recovery dial is never
+    // final) so a context-ineligible hop is not re-dialled into a guaranteed
+    // context_overflow (which doesn't even cool — pure waste).
+    if (
+      shouldSkipHopForContext({
+        estimatedTokens: baseEstimate,
+        inputTokenLimit:
+          lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null,
+        finalHop: false,
+      })
+    ) {
+      continue;
+    }
+    recoveryDialed.add(hop.modelId);
+    const served = await serveSubscriptionHop(hop, false, {
+      bypassCooldown: true,
+      forceContextAttempt: false,
+    });
+    // A bypass failure re-marks the hop with THIS walk's session key (setter ==
+    // mine), so it can never be reconsidered here — at-most-once, no loop. A
+    // success clears the stale cooldown sign (`commitSubscriptionServe`).
+    if (served !== HOP_CONTINUE) return commitSubscriptionServe(hop, served);
   }
   // Every hop in the plan failed pre-stream. Surface the trail so the client
   // (and Overview once rows land in Neon) can see WHY earlier hops walked.
