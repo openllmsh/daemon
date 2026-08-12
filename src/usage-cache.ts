@@ -440,7 +440,10 @@ export const sampleUsageOnExhaustion = (
   fetcher: () => Promise<TProviderUsageSnapshot>,
   accountHash?: string,
 ): void => {
-  void cachedUsage(slug, fetcher, { force: true, accountHash });
+  // Fire-and-forget: attach a rejection handler so a `persist()` failure that
+  // escapes `cachedUsage`'s internal catch can never surface as an unhandled
+  // rejection — the documented "never throws" contract holds.
+  void cachedUsage(slug, fetcher, { force: true, accountHash }).catch(() => {});
 };
 
 /** Test-only cleanup for the module-global request sampler. */

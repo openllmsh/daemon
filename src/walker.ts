@@ -2229,22 +2229,20 @@ const walkPlan = async (
     }
   };
   // The per-subscription-hop serve body, extracted verbatim so the post-loop
-  // recovery pass can re-dial a cooling hop directly (`bypassCooldown: true`),
-  // bypassing the loop's cooldown gate. Returns a committed raw Response (the
-  // caller wraps it with `withHopTrailHeaders`) or {@link HOP_CONTINUE} meaning
-  // "keep walking" (the extracted stand-in for a `continue`). Pass 1 calls it
-  // with `bypassCooldown: false`; its behavior is byte-identical to the inline
-  // block it replaced.
+  // recovery pass can re-dial a cooling hop directly, after the caller loop's
+  // cooldown gate has already decided eligibility. Cooldown gating is owned by
+  // the caller loop (pass 1's gate + the recovery pass's advisory bypass), NOT
+  // this helper. Returns a committed raw Response (the caller wraps it with
+  // `withHopTrailHeaders`) or {@link HOP_CONTINUE} meaning "keep walking" (the
+  // extracted stand-in for a `continue`).
   const serveSubscriptionHop = async (
     hop: THop,
     finalHop: boolean,
     opts: {
-      readonly bypassCooldown: boolean;
       readonly forceContextAttempt: boolean;
     },
   ): Promise<THopServed | THopContinue> => {
     const { forceContextAttempt } = opts;
-    void opts.bypassCooldown;
     // ── Local auth gate (every subscription provider) ─────────────────
     // Install ≠ signed-in. status().connected is the same signal the cloud
     // uses for fleet_subscriptions. Without a local login, skip every local
@@ -2520,7 +2518,6 @@ const walkPlan = async (
       // never re-dial it, independent of the (sibling-overwritable) setter key.
       dialedHops.add(`${hop.provider}|${hop.modelId}`);
       const served = await serveSubscriptionHop(hop, finalHop, {
-        bypassCooldown: false,
         forceContextAttempt,
       });
       if (served === HOP_CONTINUE) continue;
@@ -2619,25 +2616,43 @@ const walkPlan = async (
   // gate is a candidate (`cooldownSkippedSet`) — a hop pass 1 already DIALLED
   // (and failed) is never re-dialled; `recoveryDialed` keeps it at-most-once
   // across the recovery loop too. The FIRST successful dial wins and returns.
-  const cooldownSkippedSet = new Set(cooldownSkipped.map((h) => h.modelId));
+  const cooldownSkippedSet = new Set(
+    cooldownSkipped.map((h) => `${h.provider}|${h.modelId}`),
+  );
   const recoveryDialed = new Set<string>();
   for (const hop of hops) {
     if (args.req.signal.aborted) break;
     // Skipped by the advisory cooldown gate in pass 1 — never a dialled-and-
     // failed hop, and never an API-key hop (those cool via the cloud).
-    if (!cooldownSkippedSet.has(hop.modelId)) continue;
+    if (!cooldownSkippedSet.has(`${hop.provider}|${hop.modelId}`)) continue;
     // Authoritative at-most-once: never re-dial a hop identity pass 1 already
     // dialled, even when a concurrent sibling overwrote its cooldown setter key
     // (last-writer-wins) so the `setterSessionKey` check below no longer sees
     // this walk. Covers a chain that lists the same model at two positions.
     if (dialedHops.has(`${hop.provider}|${hop.modelId}`)) continue;
-    if (recoveryDialed.has(hop.modelId)) continue; // at-most-once per hop
+    if (recoveryDialed.has(`${hop.provider}|${hop.modelId}`)) continue; // at-most-once per hop
     const cd = peekHopCooldown(hop.provider, hop.modelId);
     if (cd === undefined) continue; // expired — leave to the next request
     if (!TRANSIENT_COOLDOWN_REASONS.has(cd.reason)) continue; // hard reason
     if (cd.setterSessionKey === walkSessionKey) continue; // I set it — already tried
     // Past the vendor's authoritative recover floor (or none given).
     if (cd.recoverAtMs !== undefined && Date.now() < cd.recoverAtMs) continue;
+    // Provably doomed by size: pass 1's cooldown gate runs BEFORE its context
+    // gate, so a cooldown-skipped hop was never size-checked. Mirror pass 1's
+    // `shouldSkipHopForContext` (finalHop:false — the recovery dial is never
+    // final) so a context-ineligible hop is not re-dialled into a guaranteed
+    // context_overflow (which doesn't even cool — pure waste). Checked BEFORE
+    // the usage read so an ineligible hop never pays for a vendor usage probe.
+    if (
+      shouldSkipHopForContext({
+        estimatedTokens: baseEstimate,
+        inputTokenLimit:
+          lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null,
+        finalHop: false,
+      })
+    ) {
+      continue;
+    }
     // HARD usage floor — the STRICTER predicate: a confirmed quota snapshot that
     // the gate says still has room. Absent / null / rejected → never bypass.
     const snap = await usageForActiveAccount(
@@ -2654,24 +2669,8 @@ const walkPlan = async (
       now: Date.now(),
     });
     if (gate.kind !== "allow") continue;
-    // Provably doomed by size: pass 1's cooldown gate runs BEFORE its context
-    // gate, so a cooldown-skipped hop was never size-checked. Mirror pass 1's
-    // `shouldSkipHopForContext` (finalHop:false — the recovery dial is never
-    // final) so a context-ineligible hop is not re-dialled into a guaranteed
-    // context_overflow (which doesn't even cool — pure waste).
-    if (
-      shouldSkipHopForContext({
-        estimatedTokens: baseEstimate,
-        inputTokenLimit:
-          lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null,
-        finalHop: false,
-      })
-    ) {
-      continue;
-    }
-    recoveryDialed.add(hop.modelId);
+    recoveryDialed.add(`${hop.provider}|${hop.modelId}`);
     const served = await serveSubscriptionHop(hop, false, {
-      bypassCooldown: true,
       forceContextAttempt: false,
     });
     // A bypass failure re-marks the hop with THIS walk's session key (setter ==

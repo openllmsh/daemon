@@ -61,6 +61,25 @@ const key = (provider: string, modelId: string): string =>
  * but the existing one is transient, the stored reason/recover time is UPGRADED
  * to the stricter (non-transient) provenance.
  */
+/**
+ * Merge a stored recover floor with an incoming one: keep the LATER of the two
+ * (the vendor's authoritative `Retry-After` should only ever move forward), but
+ * only while it is still in the future — a floor already in the past is inert,
+ * so it collapses to `undefined`. A re-mark that omits `recoverAtMs` therefore
+ * preserves an existing future floor instead of clobbering it.
+ */
+const mergeRecoverAt = (
+  existing: number | undefined,
+  incoming: number | undefined,
+  now: number,
+): number | undefined => {
+  const later =
+    existing !== undefined && incoming !== undefined
+      ? Math.max(existing, incoming)
+      : (existing ?? incoming);
+  return later !== undefined && later > now ? later : undefined;
+};
+
 export const markHopCooldown = (
   provider: string,
   modelId: string,
@@ -87,7 +106,7 @@ export const markHopCooldown = (
         reason,
         setterSessionKey,
         setAtMs: now,
-        recoverAtMs,
+        recoverAtMs: mergeRecoverAt(existing.recoverAtMs, recoverAtMs, now),
       });
     }
     return;
@@ -105,7 +124,7 @@ export const markHopCooldown = (
       reason: existing.reason,
       setterSessionKey: existing.setterSessionKey,
       setAtMs: existing.setAtMs,
-      recoverAtMs: existing.recoverAtMs,
+      recoverAtMs: mergeRecoverAt(existing.recoverAtMs, recoverAtMs, now),
     });
     return;
   }
@@ -114,7 +133,7 @@ export const markHopCooldown = (
     reason,
     setterSessionKey,
     setAtMs: now,
-    recoverAtMs,
+    recoverAtMs: mergeRecoverAt(existing?.recoverAtMs, recoverAtMs, now),
   });
 };
 
