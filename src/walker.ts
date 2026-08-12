@@ -63,9 +63,9 @@ import {
   nextLargerContextModel,
 } from "@openllmsh/wire/features/context-demote";
 import {
-  COMPACTION_OVERFLOW_SAFETY,
-  COMPACTION_TARGET_FLOOR,
+  MAX_LAST_RESORT_COMPACTION_ROUNDS,
   compactionTargetFromOverflow,
+  forcedCompactionTarget,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
 import {
@@ -1974,17 +1974,10 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       localEstimate,
       provider: largest.hop.provider,
     });
-    // A confirmed overflow always forces a real shrink: if the calibrated
-    // target is still at/above the current local estimate (vendor numbers
-    // absent, or ratio already inside the window), tighten below the current
-    // body so the cut is never a no-op re-send of the same bytes.
-    const forcedTarget =
-      target < localEstimate
-        ? target
-        : Math.max(
-            COMPACTION_TARGET_FLOOR,
-            Math.floor(localEstimate * COMPACTION_OVERFLOW_SAFETY),
-          );
+    // A confirmed overflow always forces a real shrink (see
+    // forcedCompactionTarget) so a false local fit never re-sends the same
+    // body.
+    const forcedTarget = forcedCompactionTarget(target, localEstimate);
     const compacted = compactRequestToFit(
       currentBody,
       surface,
@@ -2014,14 +2007,6 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   }
   return overflowResponse;
 };
-
-/**
- * Hard cap on last-resort compaction rounds. The vendor-grounded ratio converges
- * fast (usually one tighter round after a static undercorrect), so three rounds
- * is ample headroom; the cap's real job is to make an infinite compaction loop
- * structurally impossible when an upstream keeps rejecting.
- */
-const MAX_LAST_RESORT_COMPACTION_ROUNDS = 3;
 
 /**
  * The upstream tokenizer's authoritative request size carried in a walk's
