@@ -45,6 +45,56 @@ export class InvalidApiKeyError extends Error {
   }
 }
 
+/**
+ * Thrown when `GET /api/daemon/channel` returns 403 `device_limit_exceeded`.
+ * Distinct from {@link InvalidApiKeyError}: the key is fine, the plan's
+ * concurrent-device cap is full. Carries the numbers so logs/UI can render
+ * "N of M devices" without a second round-trip.
+ */
+export class DeviceLimitExceededError extends Error {
+  readonly deviceCap: number;
+  readonly deviceCount: number;
+  constructor(deviceCap: number, deviceCount: number) {
+    super(`device limit exceeded (${deviceCount}/${deviceCap} active devices)`);
+    this.name = "DeviceLimitExceededError";
+    this.deviceCap = deviceCap;
+    this.deviceCount = deviceCount;
+  }
+}
+
+/**
+ * Parse a 403 channel body for the structured device-limit envelope. Returns
+ * the typed error when the body matches; `null` for any other 403 shape
+ * (auth rejection, etc.) so the caller can fall through to InvalidApiKeyError.
+ */
+const parseDeviceLimitError = async (
+  resp: Response,
+): Promise<DeviceLimitExceededError | null> => {
+  try {
+    const body = (await resp.json()) as {
+      error?: {
+        type?: unknown;
+        device_cap?: unknown;
+        device_count?: unknown;
+      };
+    };
+    const err = body.error;
+    if (
+      err !== undefined &&
+      err.type === "device_limit_exceeded" &&
+      typeof err.device_cap === "number" &&
+      typeof err.device_count === "number" &&
+      Number.isFinite(err.device_cap) &&
+      Number.isFinite(err.device_count)
+    ) {
+      return new DeviceLimitExceededError(err.device_cap, err.device_count);
+    }
+  } catch {
+    // Malformed body → treat as a generic key rejection below.
+  }
+  return null;
+};
+
 // `os.hostname()` is almost always plain ASCII, but a header value must be —
 // strip anything outside printable ASCII and cap the length so an exotic
 // hostname can't make `fetch` throw on an invalid header.
@@ -153,14 +203,22 @@ export const fetchPlan = async (
  * stable per-env WSS URL + a short-lived connect ticket the daemon presents in
  * its `hello` frame. The daemon then holds ONE WebSocket to the relay — its
  * only control transport. Throws `NoApiKeyError`/`InvalidApiKeyError` so the
- * channel loop can back off. See `docs/proposals/daemon-relay-websocket-push.md`.
+ * channel loop can back off, and {@link DeviceLimitExceededError} when the
+ * plan's concurrent-device cap is full (403 with a structured body — must NOT
+ * be collapsed into InvalidApiKeyError, or a soft cap looks like a bad key).
+ * See `docs/proposals/daemon-relay-websocket-push.md`.
  */
 export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
   const resp = await cloudFetch(cloudUrl("/api/daemon/channel"), {
     method: "GET",
     headers: authHeaders(),
   });
-  if (resp.status === 401 || resp.status === 403) {
+  if (resp.status === 403) {
+    const deviceLimit = await parseDeviceLimitError(resp);
+    if (deviceLimit !== null) throw deviceLimit;
+    throw new InvalidApiKeyError(resp.status);
+  }
+  if (resp.status === 401) {
     throw new InvalidApiKeyError(resp.status);
   }
   if (!resp.ok) throw new Error(`channel fetch failed: ${resp.status}`);

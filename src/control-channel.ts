@@ -14,8 +14,12 @@ import type {
 import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
-import { fetchChannel } from "./cloud-client";
+import { DeviceLimitExceededError, fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
+import {
+  createDeviceLimitBackoff,
+  deviceLimitBackoffConfig,
+} from "./device-limit-backoff";
 import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
@@ -75,6 +79,13 @@ const SUPERSEDE_BASE_MS = 15_000;
 const SUPERSEDE_MAX_MS = 300_000;
 // An eviction after this much uptime is a fresh conflict, not an escalation.
 const SUPERSEDE_STABLE_MS = 120_000;
+// Stand-down when the plan's concurrent-device cap is full
+// (`403 device_limit_exceeded` on GET /api/daemon/channel). Slots free when an
+// incumbent disconnects or ages out of the 90s presence window — so base at
+// 60s (order of that window) rather than partysocket's 1–30s reconnect, and
+// escalate to a few minutes under sustained over-cap. Values live on the pure
+// module so unit tests pin the same pair. See `device-limit-backoff.ts` and
+// docs/audit/device-cap-mechanism.md §7 item 5.
 /** Check a healthy relay connection for a deploy handoff without waiting for
  * the five-minute bootstrap loop. Small jitter prevents fleet lockstep. */
 const MIGRATION_CHECK_MS = 45_000;
@@ -111,6 +122,8 @@ const supersedeBackoff = createSupersedeBackoff({
   stableAfterMs: SUPERSEDE_STABLE_MS,
   jitterMs: RECONNECT_JITTER_MS,
 });
+/** Escalating stand-down when the plan's concurrent-device cap is full. */
+const deviceLimitBackoff = createDeviceLimitBackoff(deviceLimitBackoffConfig);
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
 /** Origin of the wss url the CURRENT connection dialed (set by `channelUrl`).
@@ -607,15 +620,44 @@ const onMessage = (data: unknown): void => {
 
 /** partysocket calls this before every (re)connect — fetch a fresh channel so
  *  each connection presents a fresh short-lived ticket. Throws when keyless /
- *  unreachable; partysocket backs off and retries. */
+ *  unreachable / over the device cap; partysocket backs off and retries. The
+ *  daemon process keeps running either way — only the reconnect cadence changes. */
 const channelUrl = async (): Promise<string> => {
-  // De-sync fleet reconnect storms (relay redeploy). First connect is immediate;
-  // only re-dials are delayed. partysocket calls this before every (re)connect.
-  // Normally that is plain jitter; after a `4000 superseded` it is the
-  // escalating stand-down that ends a same-key eviction war (partysocket's own
-  // backoff cannot — it resets on every open, and a superseded dial DOES open).
-  if (hasConnected) await sleep(supersedeBackoff.nextDelayMs());
-  const channel = await fetchChannel();
+  // Device-limit stand-down can apply even before the first successful open
+  // (a new daemon can be over-cap at boot). Supersede stand-down only applies
+  // after we've connected at least once. The two are mutually exclusive on a
+  // given dial (device-limit never opens; supersede only fires after an open),
+  // so prefer the active device-limit delay when present.
+  const deviceLimitDelay = deviceLimitBackoff.nextDelayMs();
+  if (deviceLimitDelay > 0) {
+    await sleep(deviceLimitDelay);
+  } else if (hasConnected) {
+    // De-sync fleet reconnect storms (relay redeploy). First connect is
+    // immediate; only re-dials are delayed. Normally that is plain jitter;
+    // after a `4000 superseded` it is the escalating stand-down that ends a
+    // same-key eviction war (partysocket's own backoff cannot — it resets on
+    // every open, and a superseded dial DOES open).
+    await sleep(supersedeBackoff.nextDelayMs());
+  }
+  let channel: Awaited<ReturnType<typeof fetchChannel>>;
+  try {
+    channel = await fetchChannel();
+  } catch (err) {
+    // Soft plan cap — not an auth failure, not a process-ending condition.
+    // Escalate the stand-down and rethrow so partysocket retries after its
+    // own short delay; the long sleep above applies on the NEXT dial.
+    if (err instanceof DeviceLimitExceededError) {
+      deviceLimitBackoff.noteDenied();
+      logWarn(
+        "control-channel",
+        `device limit reached (${err.deviceCount}/${err.deviceCap} active devices) — standing down ~${Math.round(deviceLimitBackoff.standDownMs() / 1000)}s before retry`,
+      );
+    }
+    throw err;
+  }
+  // Admitted — clear any prior over-cap stand-down so a later unrelated denial
+  // restarts at the base delay rather than inheriting a multi-minute ceiling.
+  deviceLimitBackoff.noteSuccess();
   ticket = channel.ticket;
   connectedWssOrigin = wssOrigin(channel.wss_url);
   // Thread the cloud-served ICE config (B2) into the RTC configs so both the

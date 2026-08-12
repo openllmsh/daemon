@@ -446,6 +446,15 @@ export const daemonEnv = (): TDaemonEnv => {
 };
 
 /**
+ * Test-only: clear the memoized {@link daemonEnv} cache so the next call
+ * re-reads `process.env`. Mirrors `resetSessionsForTest`. Never called in
+ * production.
+ */
+export const resetDaemonEnvCacheForTest = (): void => {
+  cached = null;
+};
+
+/**
  * Persist a new API key (set from the dashboard) into the env file (`0600`) and
  * update the in-memory cache so the next cloud call uses it immediately. Pass
  * `null`/empty to clear it. Removes any legacy standalone `api-key` file so
