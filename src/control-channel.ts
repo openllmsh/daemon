@@ -16,7 +16,10 @@ import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { DeviceLimitExceededError, fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
-import { createDeviceLimitBackoff } from "./device-limit-backoff";
+import {
+  createDeviceLimitBackoff,
+  deviceLimitBackoffConfig,
+} from "./device-limit-backoff";
 import { daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
@@ -80,10 +83,9 @@ const SUPERSEDE_STABLE_MS = 120_000;
 // (`403 device_limit_exceeded` on GET /api/daemon/channel). Slots free when an
 // incumbent disconnects or ages out of the 90s presence window — so base at
 // 60s (order of that window) rather than partysocket's 1–30s reconnect, and
-// escalate to a few minutes under sustained over-cap. See
-// `device-limit-backoff.ts` and docs/audit/device-cap-mechanism.md §7 item 5.
-const DEVICE_LIMIT_BASE_MS = 60_000;
-const DEVICE_LIMIT_MAX_MS = 300_000;
+// escalate to a few minutes under sustained over-cap. Values live on the pure
+// module so unit tests pin the same pair. See `device-limit-backoff.ts` and
+// docs/audit/device-cap-mechanism.md §7 item 5.
 /** Check a healthy relay connection for a deploy handoff without waiting for
  * the five-minute bootstrap loop. Small jitter prevents fleet lockstep. */
 const MIGRATION_CHECK_MS = 45_000;
@@ -121,10 +123,7 @@ const supersedeBackoff = createSupersedeBackoff({
   jitterMs: RECONNECT_JITTER_MS,
 });
 /** Escalating stand-down when the plan's concurrent-device cap is full. */
-const deviceLimitBackoff = createDeviceLimitBackoff({
-  baseMs: DEVICE_LIMIT_BASE_MS,
-  maxMs: DEVICE_LIMIT_MAX_MS,
-});
+const deviceLimitBackoff = createDeviceLimitBackoff(deviceLimitBackoffConfig);
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
 /** Origin of the wss url the CURRENT connection dialed (set by `channelUrl`).

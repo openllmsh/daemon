@@ -37,6 +37,20 @@ export type TDeviceLimitBackoffDeps = {
   readonly random?: () => number;
 };
 
+/**
+ * Production stand-down pair for device-cap denials. Base sits at the order of
+ * the 90s presence window; max caps escalation under sustained over-cap. Shared
+ * by `control-channel.ts` and the pure-module unit tests so the values cannot
+ * drift.
+ */
+export const deviceLimitBackoffConfig: Pick<
+  TDeviceLimitBackoffDeps,
+  "baseMs" | "maxMs"
+> = {
+  baseMs: 60_000,
+  maxMs: 300_000,
+};
+
 export type TDeviceLimitBackoff = {
   /** Record a `DeviceLimitExceededError` from the channel handshake. */
   readonly noteDenied: () => void;
