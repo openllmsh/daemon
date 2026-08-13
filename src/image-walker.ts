@@ -3,8 +3,10 @@ import type {
   TImageGenerationResponse,
 } from "@openllmsh/protocol";
 import {
+  base64ToBytes,
   ImageGenerationRequest,
   ImageGenerationResponse,
+  normalizeContentType,
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
@@ -25,14 +27,6 @@ import {
 const parseImageRequest = Schema.decodeUnknownSync(ImageGenerationRequest);
 const parseImageResponse = Schema.decodeUnknownSync(ImageGenerationResponse);
 
-const bytesFromBase64 = (value: string): ArrayBuffer => {
-  const bytes = Buffer.from(value, "base64");
-  return bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength,
-  );
-};
-
 type TImageUpstream = {
   readonly headers: Record<string, string>;
   readonly url: string;
@@ -50,11 +44,11 @@ const persistImageDataItem = async (
   includeBase64: boolean,
   args: TWalkArgs,
 ): Promise<TImageDataItem> => {
-  let bytes: ArrayBuffer;
+  let bytes: ArrayBuffer | Uint8Array;
   let contentType = "image/png";
 
   if (item.b64_json !== undefined) {
-    bytes = bytesFromBase64(item.b64_json);
+    bytes = base64ToBytes(item.b64_json);
   } else if (item.url !== undefined && item.url.length > 0) {
     const image = await (args.fetchImpl ?? fetch)(item.url, {
       method: "GET",
@@ -63,7 +57,10 @@ const persistImageDataItem = async (
     if (!image.ok) {
       throw new Error("upstream image download failed");
     }
-    contentType = image.headers.get("content-type") ?? "image/png";
+    contentType = normalizeContentType(
+      image.headers.get("content-type"),
+      "image/png",
+    );
     bytes = await image.arrayBuffer();
   } else {
     throw new Error("image item has no content");

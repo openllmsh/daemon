@@ -277,6 +277,9 @@ export type TUploadMediaOptions = {
   readonly kind: string;
   readonly sourceRef?: string;
   readonly filename?: string;
+  /** Pre-minted media row id — sent as `x-media-id` so the cloud row's PK is
+   *  known to the daemon up front (keeps `/api/media/<id>` stable). */
+  readonly id?: string;
 };
 
 export type TUploadMediaResponse = {
@@ -306,6 +309,7 @@ export const uploadMedia = async (
       ...(opts.filename === undefined
         ? {}
         : { "x-media-filename": opts.filename }),
+      ...(opts.id === undefined ? {} : { "x-media-id": opts.id }),
     };
     const resp = await fetch(cloudUrl("/api/daemon/media", origin), {
       method: "POST",

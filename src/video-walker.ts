@@ -8,6 +8,7 @@ import type {
 import {
   decodeVideoId,
   encodeVideoId,
+  normalizeContentType,
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
@@ -15,6 +16,7 @@ import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
+import { logWarn } from "./logger";
 import type { TWalkArgs } from "./walker";
 import {
   parsePlan,
@@ -444,33 +446,56 @@ export const runVideoContent = async (
   }
   if (!content.ok) return upstreamError(content);
 
-  let bytes: ArrayBuffer;
-  try {
-    bytes = await content.arrayBuffer();
-  } catch {
-    return errorJson(502, "Failed to persist generated video");
+  const body = content.body;
+  if (body === null) {
+    return errorJson(502, "upstream video has no content body");
   }
 
-  const saved = await uploadMedia(
-    bytes,
-    {
-      contentType: content.headers.get("content-type") ?? "video/mp4",
-      kind: "video",
-      sourceRef: videoId,
-    },
-    args.originParam,
+  const id = videoId;
+  if (id === undefined) {
+    return errorJson(404, "No such video");
+  }
+  const contentType = normalizeContentType(
+    content.headers.get("content-type"),
+    "video/mp4",
   );
+  const [clientBranch, persistBranch] = body.tee();
 
-  if (saved === null) {
-    return errorJson(502, "Failed to persist generated video");
+  void (async () => {
+    const bytes = await new Response(persistBranch).arrayBuffer();
+    await uploadMedia(
+      bytes,
+      {
+        contentType,
+        kind: "video",
+        sourceRef: videoId,
+        id,
+      },
+      args.originParam,
+    );
+  })().catch((err) => {
+    logWarn("video-walker", "Failed to persist generated video", {
+      error: err instanceof Error ? err.message : String(err),
+      videoId,
+    });
+  });
+
+  const durable = args.originParam
+    ? `${args.originParam}/api/media/${id}`
+    : null;
+
+  const responseHeaders: Record<string, string> = {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    "x-openllm-media-id": id,
+  };
+  if (durable !== null) {
+    responseHeaders["x-openllm-media-url"] = durable;
   }
 
-  return new Response(null, {
-    status: 302,
-    headers: {
-      location: saved.url,
-      "cache-control": "no-store",
-    },
+  return new Response(clientBranch, {
+    status: 200,
+    headers: responseHeaders,
   });
 };
 

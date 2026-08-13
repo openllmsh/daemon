@@ -105,6 +105,7 @@ export const corsHeaders = (req: Request): Record<string, string> => ({
   "access-control-allow-origin": allowOrigin(req),
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers": `content-type, authorization, ${NO_DAEMON_HEADER}`,
+  "access-control-expose-headers": "x-openllm-media-id, x-openllm-media-url",
   "access-control-allow-private-network": "true",
   vary: "origin",
 });
