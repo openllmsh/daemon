@@ -18,6 +18,7 @@ import {
   AnthropicCountTokensRequest,
   AnthropicRequest,
   ChatCompletionRequest,
+  ImageGenerationRequest,
   ResponsesRequest,
 } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
@@ -28,6 +29,7 @@ import { notePresenceActivity } from "./control-channel";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
+import { runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
 import { lookupPlan, storePlan } from "./plan-cache";
 import {
@@ -40,6 +42,7 @@ import {
 
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
+const parseImageRequest = Schema.decodeUnknownSync(ImageGenerationRequest);
 const parseResponsesRequest = Schema.decodeUnknownSync(ResponsesRequest);
 const parseCountTokensRequest = Schema.decodeUnknownSync(
   AnthropicCountTokensRequest,
@@ -77,6 +80,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // verbatim vendor passthrough (`runResponsesCompact`) — no surface
   // schema, no walk.
   const isResponsesCompact = url.pathname.endsWith("/responses/compact");
+  const isImages = url.pathname.endsWith("/images/generations");
   // Anthropic's PREFLIGHT, not inference. It must be matched BEFORE the
   // `/messages` test below (which it does not satisfy) or it falls through to
   // the `chat_completions` default and gets served as a real Opus generation —
@@ -109,6 +113,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
     if (isResponsesCompact) {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
+    else if (isImages) parseImageRequest(rawBody);
     else if (surface === "messages") parseAnthropicRequest(rawBody);
     else if (surface === "responses") parseResponsesRequest(rawBody);
     else parseOpenAIRequest(rawBody);
@@ -227,6 +232,8 @@ export const handleInference = async (req: Request): Promise<Response> => {
       ? runResponsesCompact(walkArgs)
       : isCountTokens
         ? runCountTokens(walkArgs)
-        : runWalker(walkArgs)),
+        : isImages
+          ? runImageWalker(walkArgs)
+          : runWalker(walkArgs)),
   );
 };

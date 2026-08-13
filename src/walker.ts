@@ -633,7 +633,7 @@ export const classifyPrecommitResponse = (
 ): ReturnType<typeof classifyHopError> =>
   classifyRawResponse(status, raw, hopFormat(wire), aborted);
 
-const statusFor = (httpStatus: number): TRequestStatus =>
+export const statusFor = (httpStatus: number): TRequestStatus =>
   httpStatus < 400
     ? "success"
     : httpStatus === 429
@@ -656,7 +656,7 @@ const passthroughHeaders = (resp: Response): Headers => {
   return headers;
 };
 
-const report = (
+export const report = (
   row: TDaemonRecordRequest,
   origin: string | null,
   accountHash?: string,
@@ -765,7 +765,7 @@ const decodeUpstreamJson = (
  * `credentialForUpstream`). Returns "retry" when no usable local credential is
  * available, so the walker falls through.
  */
-const acquireUpstream = async (
+export const acquireUpstream = async (
   provider: string,
   args: TWalkArgs,
 ): Promise<

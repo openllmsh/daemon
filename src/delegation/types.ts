@@ -158,6 +158,17 @@ export type TProviderDelegate = {
   }>;
 
   /**
+   * Produce a credential for the provider's image-generation endpoint. The
+   * daemon uses it only locally, just like `credentialForUpstream`.
+   */
+  credentialForImage?: (inbound?: Headers) => Promise<{
+    readonly access_token: string;
+    readonly headers: Readonly<Record<string, string>>;
+    readonly url: string;
+    readonly account_hash?: string;
+  }>;
+
+  /**
    * Sign out of the official CLI's LOGIN credential on this box: run the
    * vendor's own logout (revoking server-side where it supports it) and/or
    * clear the isolated store. Idempotent: already-signed-out is success.
