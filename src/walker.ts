@@ -1782,6 +1782,8 @@ export const ensureLocalSubscription = async (
         accountHash,
         observedAtMs: Date.now(),
       });
+    } else {
+      lastKnownGoodLocalSubscriptionByProvider.delete(provider);
     }
     return result;
   } catch (error) {
