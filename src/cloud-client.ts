@@ -131,6 +131,7 @@ const authHeaders = (): Record<string, string> => {
 // Bounding every call with an AbortSignal lets a stalled connection reject
 // promptly so the channel loop's backoff (or the caller) retries cleanly.
 const CLOUD_FETCH_TIMEOUT_MS = 15_000;
+const MEDIA_UPLOAD_TIMEOUT_MS = 120_000;
 
 const cloudFetch = (url: string, init: RequestInit): Promise<Response> =>
   fetch(url, {
@@ -268,6 +269,67 @@ export const recordRequest = async (
     });
   } catch {
     // swallow — usage recording is non-critical telemetry
+  }
+};
+
+export type TUploadMediaOptions = {
+  readonly contentType: string;
+  readonly kind: string;
+  readonly sourceRef?: string;
+  readonly filename?: string;
+};
+
+export type TUploadMediaResponse = {
+  readonly id: string;
+  readonly url: string;
+};
+
+/**
+ * Best-effort ingest of locally generated media into the cloud library. Media
+ * bytes can be large, so this deliberately uses a longer timeout than the
+ * daemon control plane. Failures are swallowed so callers can choose a local
+ * fallback without failing the generation itself.
+ */
+export const uploadMedia = async (
+  bytes: ArrayBuffer | Uint8Array,
+  opts: TUploadMediaOptions,
+  origin?: string | null,
+): Promise<TUploadMediaResponse | null> => {
+  try {
+    const headers = {
+      ...authHeaders(),
+      "content-type": opts.contentType,
+      "x-media-kind": opts.kind,
+      ...(opts.sourceRef === undefined
+        ? {}
+        : { "x-media-source-ref": opts.sourceRef }),
+      ...(opts.filename === undefined
+        ? {}
+        : { "x-media-filename": opts.filename }),
+    };
+    const resp = await fetch(cloudUrl("/api/daemon/media", origin), {
+      method: "POST",
+      headers,
+      body: new Blob([
+        bytes instanceof Uint8Array ? new Uint8Array(bytes) : bytes,
+      ]),
+      signal: AbortSignal.timeout(MEDIA_UPLOAD_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    const body: unknown = await resp.json();
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      !("id" in body) ||
+      !("url" in body) ||
+      typeof body.id !== "string" ||
+      typeof body.url !== "string"
+    ) {
+      return null;
+    }
+    return { id: body.id, url: body.url };
+  } catch {
+    return null;
   }
 };
 
