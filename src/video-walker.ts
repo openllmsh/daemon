@@ -20,6 +20,7 @@ import { logWarn } from "./logger";
 import type { TWalkArgs } from "./walker";
 import {
   parsePlan,
+  passthroughHeaders,
   planSignatureOk,
   postUpstream,
   report,
@@ -99,7 +100,7 @@ const upstreamError = async (resp: Response): Promise<Response> => {
   const body = await resp.text().catch(() => "");
   return new Response(body.length > 0 ? body : null, {
     status: resp.status,
-    headers: { "content-type": "application/json" },
+    headers: passthroughHeaders(resp),
   });
 };
 
