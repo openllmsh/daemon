@@ -19,6 +19,7 @@
  * boot history can't be read/written the guard simply can't fire — the daemon
  * boots anyway and, on Linux, systemd's start-limit still bounds the churn.
  */
+import { isDevMode } from "./env";
 import { logError } from "./logger";
 import { serviceStop } from "./service";
 import { readBootHistory, writeBootHistory } from "./state-file";
@@ -58,6 +59,9 @@ export const shouldPark = (
  * also what triggers the one-shot legacy-file migration (`state-file.ts`).
  */
 export const guardCrashLoop = (): void => {
+  // `bun --watch` dev daemons are unsupervised, so this breaker has no role
+  // there and must never alter prod's shared history or installed service.
+  if (isDevMode()) return;
   const now = Date.now();
   const { recent, park } = shouldPark(readBootHistory(), now);
   writeBootHistory(recent);
@@ -86,6 +90,7 @@ export const guardCrashLoop = (): void => {
  * Keeps transient failures from converting into a sticky parked state.
  */
 export const markHealthyBoot = (): void => {
+  if (isDevMode()) return;
   try {
     writeBootHistory([]);
   } catch {
