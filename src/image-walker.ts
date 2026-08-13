@@ -56,7 +56,7 @@ const persistImageDataItem = async (
   if (item.b64_json !== undefined) {
     bytes = bytesFromBase64(item.b64_json);
   } else if (item.url !== undefined && item.url.length > 0) {
-    const image = await fetch(item.url, {
+    const image = await (args.fetchImpl ?? fetch)(item.url, {
       method: "GET",
       signal: AbortSignal.timeout(30_000),
     });

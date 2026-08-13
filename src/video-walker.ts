@@ -242,7 +242,7 @@ const getStatus = async (
 ): Promise<Response | TXaiVideoStatus> => {
   let resp: Response;
   try {
-    resp = await fetch(
+    resp = await (args.fetchImpl ?? fetch)(
       `${upstream.url}/videos/${encodeURIComponent(payload.u)}`,
       {
         method: "GET",
@@ -430,7 +430,7 @@ export const runVideoContent = async (
   }
   let content: Response;
   try {
-    content = await fetch(contentUrl, {
+    content = await (args.fetchImpl ?? fetch)(contentUrl, {
       method: "GET",
       signal: AbortSignal.any([
         args.req.signal,

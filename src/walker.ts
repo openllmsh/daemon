@@ -240,6 +240,8 @@ const ChatGptStreamEventSchema: Schema.Schema<TChatGptStreamEvent> =
 
 export type TWalkArgs = {
   readonly req: Request;
+  /** Test seam for local walker fetches; production uses the global fetch. */
+  readonly fetchImpl?: typeof fetch;
   readonly surface: "chat_completions" | "messages" | "responses";
   readonly endpoint: string;
   /** The parsed inbound JSON body (Anthropic- or OpenAI-shaped per surface). */
