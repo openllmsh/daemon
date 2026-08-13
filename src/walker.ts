@@ -1720,6 +1720,14 @@ export type TLocalSubscriptionAuth = {
 /** Bound on the auth-gate `status()` probe — a hung keychain/CLI read must
  * not stall the hop. */
 const LOCAL_STATUS_TIMEOUT_MS = 5_000;
+let localStatusTimeoutMs = LOCAL_STATUS_TIMEOUT_MS;
+
+/** Test-only timeout override for deterministic local subscription auth probe coverage. */
+export const setLocalStatusTimeoutForTest = (
+  timeoutMs: number | null,
+): void => {
+  localStatusTimeoutMs = timeoutMs ?? LOCAL_STATUS_TIMEOUT_MS;
+};
 
 // A recent successful local status check remains trustworthy through one slow
 // keychain/CLI probe. This process-local grace window avoids dropping a signed-in
@@ -1764,7 +1772,7 @@ export const ensureLocalSubscription = async (
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           reject(new Error(`${provider} status timed out`));
-        }, LOCAL_STATUS_TIMEOUT_MS);
+        }, localStatusTimeoutMs);
       }),
     ]);
     const result: TLocalSubscriptionAuth = {
