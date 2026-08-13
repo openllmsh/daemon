@@ -432,12 +432,14 @@ export const runVideoContent = async (
   }
   let content: Response;
   try {
+    // NOT tied to `args.req.signal`: the client (e.g. the browser tool) cancels
+    // the response body as soon as it has read the durable-url header, which
+    // aborts the inbound request. If this download were bound to that signal the
+    // teed persist branch would die mid-flight and nothing would ever land in the
+    // library. A timeout alone bounds it so persistence completes regardless.
     content = await (args.fetchImpl ?? fetch)(contentUrl, {
       method: "GET",
-      signal: AbortSignal.any([
-        args.req.signal,
-        AbortSignal.timeout(VIDEO_DOWNLOAD_TIMEOUT_MS),
-      ]),
+      signal: AbortSignal.timeout(VIDEO_DOWNLOAD_TIMEOUT_MS),
     });
   } catch {
     return args.req.signal.aborted
