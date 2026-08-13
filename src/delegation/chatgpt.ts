@@ -42,7 +42,7 @@ import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
-import type { TProviderDelegate } from "./types";
+import type { TImageCredential, TProviderDelegate } from "./types";
 import {
   reduceChatgptCredits,
   reduceChatgptPools,
@@ -465,6 +465,36 @@ export const chatgptDelegate: TProviderDelegate = {
       headers,
       url,
       // Which account this hop's cost attributes to (recorded on the row).
+      ...(token.accountId !== null
+        ? { account_hash: accountHash(PROVIDER, token.accountId) }
+        : {}),
+    };
+  },
+
+  credentialForImage: async (inbound?: Headers): Promise<TImageCredential> => {
+    const token = await readToken();
+    if (token === null) {
+      throw new Error("chatgpt: not signed in (no stored credential)");
+    }
+    // Image endpoint is a sibling of the captured `/responses` endpoint,
+    // so `resolveProviderUrl` keeps host drift from CLI version changes while
+    // enforcing same-host origin.
+    const url = await resolveProviderUrl(
+      PROVIDER,
+      "/backend-api/codex/images/generations",
+    );
+    const headers: Record<string, string> =
+      token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
+
+    // Codex-CLI identity BACKFILL. Keep parity with
+    // `credentialForUpstream`.
+    if (!hasCodexOriginator(inbound)) headers.originator = CODEX_ORIGINATOR;
+    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = await userAgent();
+
+    return {
+      access_token: token.accessToken,
+      headers,
+      url,
       ...(token.accountId !== null
         ? { account_hash: accountHash(PROVIDER, token.accountId) }
         : {}),

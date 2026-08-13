@@ -15,6 +15,18 @@ import type {
  * snapshot; `credentialForUpstream()` is consumed locally by the runner
  * and never serialized to the cloud.
  */
+/**
+ * Credential + target for one image-generation upstream call — the same
+ * locally-used shape as `credentialForUpstream`'s return. The daemon injects
+ * the bearer + identity headers for a single request.
+ */
+export type TImageCredential = {
+  readonly access_token: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly url: string;
+  readonly account_hash?: string;
+};
+
 export type TProviderDelegate = {
   readonly slug: string;
 
@@ -161,12 +173,7 @@ export type TProviderDelegate = {
    * Produce a credential for the provider's image-generation endpoint. The
    * daemon uses it only locally, just like `credentialForUpstream`.
    */
-  credentialForImage?: (inbound?: Headers) => Promise<{
-    readonly access_token: string;
-    readonly headers: Readonly<Record<string, string>>;
-    readonly url: string;
-    readonly account_hash?: string;
-  }>;
+  credentialForImage?: (inbound?: Headers) => Promise<TImageCredential>;
 
   /**
    * Produce a credential for the provider's video-generation API base. The

@@ -75,6 +75,11 @@ import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "grok" as const;
 
+// Image endpoint host differs from the chat/proxy host.
+// Grok image requests must go directly to `api.x.ai`, so we don't try to
+// resolve from captured upstream URL.
+const GROK_IMAGE_URL = "https://api.x.ai/v1/images/generations";
+
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
 // This is the CLI chat-proxy's own billing route (same host as inference), which
@@ -84,25 +89,6 @@ const USAGE_PATH = "/v1/billing";
 
 // Grok Imagine video generation uses the xAI API base, not the CLI chat proxy.
 const GROK_VIDEO_BASE = "https://api.x.ai/v1";
-
-const grokClientCredential = async (): Promise<{
-  readonly access_token: string;
-  readonly headers: Readonly<Record<string, string>>;
-  readonly account_hash?: string;
-}> => {
-  const token = await readToken();
-  if (token === null) {
-    throw new Error("grok: not signed in (no stored credential)");
-  }
-  return {
-    access_token: token.accessToken,
-    headers: {
-      "x-grok-client-version": await clientVersion(),
-      "x-grok-client-identifier": "xai-grok-cli",
-    },
-    ...accountHashField(PROVIDER, token.session.user_id),
-  };
-};
 
 // Trigger the CLI's OWN refresh when the access token is within this window of
 // `expires_at`. Mirrors codex's leeway.
@@ -243,6 +229,32 @@ const readToken = async (): Promise<{
   return fresh?.key !== undefined && fresh.key.length > 0
     ? { accessToken: fresh.key, session: fresh }
     : { accessToken: session.key, session };
+};
+
+/**
+ * The bearer + the CLI's genuine identity headers + account attribution,
+ * shared by every grok upstream credential path (`credentialForUpstream` /
+ * `credentialForImage`). The TARGET url is layered on by each caller. The
+ * `x-grok-client-*` headers satisfy the 426 CLI-version gate.
+ */
+const grokClientCredential = async (): Promise<{
+  readonly access_token: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly account_hash?: string;
+}> => {
+  const token = await readToken();
+  if (token === null) {
+    throw new Error("grok: not signed in (no stored credential)");
+  }
+  return {
+    access_token: token.accessToken,
+    headers: {
+      "x-grok-client-version": await clientVersion(),
+      "x-grok-client-identifier": "xai-grok-cli",
+    },
+    // Which account this hop's cost attributes to (recorded on the row).
+    ...accountHashField(PROVIDER, token.session.user_id),
+  };
 };
 
 // ─── Login wiring ────────────────────────────────────────────────────────
@@ -703,8 +715,8 @@ export const grokDelegate: TProviderDelegate = {
 
   credentialForUpstream: async () => {
     // cli-chat-proxy.grok.com gates on the CLI's genuine identity headers — a
-    // request without `x-grok-client-version` is rejected 426. We send the
-    // installed CLI's REAL version + client identifier (the same identity the
+    // request without `x-grok-client-version` is rejected 426. `grokClientCredential`
+    // supplies the CLI's REAL version + client identifier (the same identity the
     // official `grok` sends). The Responses TARGET URL is captured/default
     // per-hop; the originator's other headers ride through.
     return {
@@ -712,6 +724,16 @@ export const grokDelegate: TProviderDelegate = {
       url: await resolveUpstreamUrl(PROVIDER),
     };
   },
+
+  credentialForImage: async (): Promise<{
+    readonly access_token: string;
+    readonly headers: Readonly<Record<string, string>>;
+    readonly url: string;
+    readonly account_hash?: string;
+  }> => ({
+    ...(await grokClientCredential()),
+    url: GROK_IMAGE_URL,
+  }),
 
   credentialForVideo: async () => ({
     ...(await grokClientCredential()),
