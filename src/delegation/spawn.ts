@@ -11,6 +11,8 @@ import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
+import type { TSuperviseSpawnOptions } from "../child-supervisor";
+import { superviseSpawn } from "../child-supervisor";
 import { spawnCommand } from "../command";
 import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
@@ -105,16 +107,36 @@ const SIGNAL_NAMES: Record<number, string> = {
   15: "SIGTERM",
 };
 
+/** Hard ceiling for one-shot vendor CLI captures and probes. */
+export const DEFAULT_CAPTURE_TIMEOUT_MS = 5_000;
+
+export type TRunCaptureOpts = {
+  /** Skip the sandbox shim for a read-only probe that needs direct execution. */
+  readonly probe?: boolean;
+  /** Classify the disposable child independently of sandbox-shim behavior. */
+  readonly kind?: "probe" | "vendor-capture";
+  /** Hard ceiling for stdout capture plus child exit before group termination. */
+  readonly timeoutMs?: number;
+};
+
+type TCaptureOutcome =
+  | { readonly kind: "complete"; readonly out: string; readonly code: number }
+  | { readonly kind: "timeout" };
+
 /**
  * Run a command and capture trimmed stdout (best-effort). Returns null on
- * spawn failure or non-zero exit. stdin is ignored so it never blocks.
- * `env` is merged onto the parent env — used to run the isolated vendor
+ * spawn failure, non-zero exit, or a timeout. stdin is ignored so it never
+ * blocks. `env` is merged onto the parent env — used to run the isolated vendor
  * CLIs with their home pointed inside the OpenLLM dir.
+ *
+ * The stdout read and root child exit share one hard deadline. On expiry, use
+ * the supervisor's process-group termination rather than `proc.kill()`: a
+ * descendant holding the inherited stdout fd must be reaped for EOF to occur.
  */
 export const runCapture = async (
   argv: ReadonlyArray<string>,
   env?: Record<string, string>,
-  opts?: { readonly probe?: boolean },
+  opts?: TRunCaptureOpts,
 ): Promise<string | null> => {
   try {
     const command = spawnCommand(
@@ -122,19 +144,50 @@ export const runCapture = async (
       argv[0] ?? "",
       argv.slice(1),
     );
-    const proc = Bun.spawn(sandboxSpawnArgs(command, { probe: opts?.probe }), {
+    const spawnOptions: TSuperviseSpawnOptions = {
+      kind: opts?.kind ?? (opts?.probe === true ? "probe" : "vendor-capture"),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
       cwd: spawnCwd(env),
       ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
-    });
-    const out = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    logIfKilled(argv, proc);
-    if (code !== 0) return null;
-    const trimmed = out.trim();
-    return trimmed.length > 0 ? trimmed : null;
+    };
+    const child = superviseSpawn(
+      sandboxSpawnArgs(command, { probe: opts?.probe }),
+      spawnOptions,
+    );
+    const proc = child.subprocess;
+    const stdout = proc.stdout;
+    if (stdout === undefined || typeof stdout === "number") {
+      await child.terminate();
+      return null;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const complete = Promise.all([
+        new Response(stdout).text(),
+        proc.exited,
+      ]).then(
+        ([out, code]): TCaptureOutcome => ({ kind: "complete", out, code }),
+      );
+      const timeout = new Promise<TCaptureOutcome>((resolve) => {
+        timer = setTimeout(
+          () => resolve({ kind: "timeout" }),
+          opts?.timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS,
+        );
+      });
+      const outcome = await Promise.race([complete, timeout]);
+      if (outcome.kind === "timeout") {
+        await child.terminate();
+        return null;
+      }
+      logIfKilled(argv, proc);
+      if (outcome.code !== 0) return null;
+      const trimmed = outcome.out.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
   } catch {
     return null;
   }
@@ -147,7 +200,8 @@ export const runCapture = async (
 export const cliVersion = (
   bin: string,
   env?: Record<string, string>,
-): Promise<string | null> => runCapture([bin, "--version"], env);
+): Promise<string | null> =>
+  runCapture([bin, "--version"], env, { kind: "probe" });
 
 export type TLoginResult = {
   readonly code: number;

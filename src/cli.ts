@@ -12,7 +12,8 @@
  *   openllmd stop                 stop + disable self-restore
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
- *   openllmd logs [-f] [-n N]     show or follow the daemon log
+ *   openllmd logs [-f] [-n N]     show or follow daemon logs
+ *   openllmd doctor               print a copyable local diagnostic report
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd sessions <on|off|status>  opt in/out of remote terminal sessions (default off)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
@@ -22,8 +23,10 @@
  */
 import { isAbsolute } from "node:path";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
+import { runLinuxPdeathsigWrapper } from "./child-supervisor";
 import { COMMANDS, FLAGS } from "./commands";
 import { runCompletion } from "./completion";
+import { runDoctor } from "./doctor";
 import { logError } from "./logger";
 import { runLogs } from "./logs";
 import { ptySessionsEnabled, setPtySessions } from "./pty-sessions-pref";
@@ -168,6 +171,37 @@ export const runCli = (): boolean => {
     return true;
   }
 
+  // Linux-only disposable-child wrapper. Deliberately omitted from
+  // COMMANDS/help; its tail may contain `-h` or `-v`, so dispatch before global
+  // flag scans. Other platforms never need (or execute) the PDEATHSIG wrapper.
+  if (args[0] === "__child-supervisor-pdeathsig") {
+    if (process.platform !== "linux") return true;
+    const separator = args.indexOf("--");
+    const parentPid = Number.parseInt(args[2] ?? "", 10);
+    if (
+      args[1] !== "--parent-pid" ||
+      separator !== 3 ||
+      !Number.isSafeInteger(parentPid) ||
+      parentPid <= 0 ||
+      args.length <= separator + 1
+    ) {
+      process.stderr.write(
+        "usage: openllmd __child-supervisor-pdeathsig --parent-pid <pid> -- <command> [args...]\n",
+      );
+      process.exitCode = 2;
+      return true;
+    }
+    runLinuxPdeathsigWrapper(args.slice(separator + 1), parentPid).catch(
+      (err: unknown) => {
+        process.stderr.write(
+          `__child-supervisor-pdeathsig: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exit(1);
+      },
+    );
+    return true;
+  }
+
   // Internal durable-session host. Deliberately omitted from COMMANDS/help:
   // phase 1c starts it detached, so it must never bootstrap the daemon. This
   // must precede global flag scans because parser values can legitimately be
@@ -217,6 +251,21 @@ export const runCli = (): boolean => {
     case "logs":
       runLogs(rest);
       break;
+    case "doctor":
+      if (rest.length > 0) {
+        process.stderr.write("usage: openllmd doctor\n");
+        process.exit(2);
+      }
+      runDoctor()
+        .then((report) => {
+          process.stdout.write(report);
+          process.exit(0);
+        })
+        .catch((err: unknown) => {
+          logError("doctor", err);
+          process.exit(1);
+        });
+      return true;
     case "auto-update":
       runAutoUpdate(rest);
       break;

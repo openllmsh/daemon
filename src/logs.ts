@@ -1,27 +1,28 @@
 /**
- * `openllmd logs [-f] [-n N]` — show or follow the daemon's log.
+ * `openllmd logs [-f] [-n N]` — show or follow daemon logs.
  *
- * Linux: prefer the systemd journal (`journalctl --user -u openllmd.service`) —
- * it captures the native crash/OOM/signal output the app logger can't reach
- * (the daemon's own `~/.openllm/openllmd.log` only has what it managed to write
- * before dying). Falls back to tailing the app log file when `journalctl` is
- * absent or the unit isn't registered (a from-source run).
- * macOS: tail the app log file (`~/.openllm/openllmd.log`).
- *
- * `-f`/`--follow` streams until Ctrl-C; `-n N`/`--lines N` sets the initial tail
- * (default 200). Implemented by exec-ing `journalctl`/`tail` with INHERITED
- * stdio so the follow stream + Ctrl-C behave exactly as running them by hand.
+ * launchd writes daemon stdout/stderr to state-dir files, not journald. Linux
+ * prefers the user systemd journal when its unit is registered, then falls back
+ * to the same state-dir files for from-source and non-systemd installations.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { logFilePath } from "./env";
+import {
+  daemonStderrLogFilePath,
+  daemonStdoutLogFilePath,
+  logFilePath,
+} from "./env";
 
 /** Initial tail length when `-n`/`--lines` isn't given. */
 export const DEFAULT_LOG_LINES = 200;
 const UNIT = "openllmd.service";
-const isMac = process.platform === "darwin";
 
 export type TLogsOpts = { readonly follow: boolean; readonly lines: number };
+
+export type TLogSource =
+  | { readonly kind: "journal" }
+  | { readonly kind: "files"; readonly paths: readonly string[] }
+  | { readonly kind: "missing"; readonly paths: readonly string[] };
 
 /**
  * Parse `logs` args: `-f`/`--follow`, and `-n N` / `--lines N` / `-n10` for the
@@ -39,11 +40,11 @@ export const parseLogsArgs = (args: readonly string[]): TLogsOpts | null => {
     }
     let raw: string | undefined;
     if (a === "-n" || a === "--lines") {
-      raw = args[++i]; // value is the next token
+      raw = args[++i];
     } else if (a.startsWith("-n")) {
-      raw = a.slice(2); // glued form: -n50
+      raw = a.slice(2);
     } else {
-      return null; // unknown token
+      return null;
     }
     if (raw === undefined) return null;
     const n = Number.parseInt(raw, 10);
@@ -53,21 +54,36 @@ export const parseLogsArgs = (args: readonly string[]): TLogsOpts | null => {
   return { follow, lines };
 };
 
+/** Resolve the concrete log source without spawning, for tests and diagnostics. */
+export const resolveLogSource = (
+  platform: NodeJS.Platform,
+  journalIsAvailable: boolean,
+  exists: (path: string) => boolean = existsSync,
+): TLogSource => {
+  if (platform !== "darwin" && journalIsAvailable) return { kind: "journal" };
+  // stdout/stderr are the supervisor-owned logs. The structured app log remains
+  // a useful fallback for foreground/from-source runs that have not created them.
+  const candidates = [
+    daemonStdoutLogFilePath(),
+    daemonStderrLogFilePath(),
+    logFilePath(),
+  ];
+  const paths = candidates.filter(exists);
+  return paths.length > 0
+    ? { kind: "files", paths }
+    : { kind: "missing", paths: candidates };
+};
+
 /** journalctl present AND the unit known to the user manager (exit 0). */
 const journalAvailable = (): boolean =>
   spawnSync("journalctl", ["--user", "--unit", UNIT, "-n", "0"], {
     stdio: "ignore",
   }).status === 0;
 
-const tailFile = (opts: TLogsOpts): number => {
-  const file = logFilePath();
-  if (!existsSync(file)) {
-    process.stderr.write(`no log file yet at ${file}\n`);
-    return 1; // distinguish "nothing to show" from a clean tail for `$?` callers
-  }
+const tailFiles = (opts: TLogsOpts, paths: readonly string[]): number => {
   const args = ["-n", String(opts.lines)];
-  if (opts.follow) args.push("-F"); // -F follows across rotation (.log → .log.1)
-  args.push(file);
+  if (opts.follow) args.push("-F");
+  args.push(...paths);
   return spawnSync("tail", args, { stdio: "inherit" }).status ?? 0;
 };
 
@@ -77,6 +93,19 @@ const tailJournal = (opts: TLogsOpts): number => {
   return spawnSync("journalctl", args, { stdio: "inherit" }).status ?? 0;
 };
 
+/** Read the tail of locally available daemon log files for non-interactive diagnostics. */
+export const readRecentLogLines = (maxLines = 300): readonly string[] => {
+  const source = resolveLogSource(process.platform, false);
+  if (source.kind !== "files") return [];
+  const output = spawnSync("tail", ["-n", String(maxLines), ...source.paths], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return typeof output.stdout === "string"
+    ? output.stdout.split("\n").filter((line) => line.length > 0)
+    : [];
+};
+
 /** Run the `logs` subcommand. `args` is everything after `logs`. Exits. */
 export const runLogs = (args: readonly string[]): never => {
   const opts = parseLogsArgs(args);
@@ -84,8 +113,16 @@ export const runLogs = (args: readonly string[]): never => {
     process.stderr.write("usage: openllmd logs [-f] [-n N]\n");
     process.exit(2);
   }
-  // Linux → journald (richer; native crash output), file fallback. macOS → file.
+  const source = resolveLogSource(process.platform, journalAvailable());
+  if (source.kind === "missing") {
+    process.stderr.write(
+      `no daemon logs found; looked in:\n${source.paths.map((path) => `  ${path}`).join("\n")}\n`,
+    );
+    process.exit(1);
+  }
   const code =
-    !isMac && journalAvailable() ? tailJournal(opts) : tailFile(opts);
+    source.kind === "journal"
+      ? tailJournal(opts)
+      : tailFiles(opts, source.paths);
   process.exit(code);
 };

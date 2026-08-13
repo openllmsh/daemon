@@ -29,6 +29,8 @@ import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
 import {
   daemonEnv,
+  daemonStderrLogFilePath,
+  daemonStdoutLogFilePath,
   logFilePath,
   serviceEnvFilePath,
   stateDir,
@@ -121,9 +123,9 @@ const writeEnvFileIfNeeded = (): void => {
  * per-renderer copies that drift (the bug: macOS captured an err.log, Linux
  * didn't).
  */
-const serviceLogPaths = (): { out: string; err: string } => ({
-  out: join(stateDir(), "openllmd.out.log"),
-  err: join(stateDir(), "openllmd.err.log"),
+export const serviceLogPaths = (): { out: string; err: string } => ({
+  out: daemonStdoutLogFilePath(),
+  err: daemonStderrLogFilePath(),
 });
 
 /**
@@ -161,9 +163,18 @@ export const renderUnitLogging = (systemdMajorVersion: number): string => {
   return s;
 };
 
+/**
+ * launchd must retain its default process-group cleanup when the daemon exits;
+ * durable session hosts deliberately run detached, while disposable children
+ * remain in the daemon's group. Exported so service-rendering tests can guard
+ * against accidentally adding `AbandonProcessGroup=true`.
+ */
+export const plistUsesLaunchdProcessGroupCleanup = (plist: string): boolean =>
+  !/<key>AbandonProcessGroup<\/key>\s*<true\s*\/>/.test(plist);
+
 export const renderPlist = (binPath: string): string => {
   const { out, err } = serviceLogPaths();
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -184,6 +195,10 @@ export const renderPlist = (binPath: string): string => {
 </dict>
 </plist>
 `;
+  if (!plistUsesLaunchdProcessGroupCleanup(plist)) {
+    throw new Error("LaunchAgent must not abandon the daemon process group");
+  }
+  return plist;
 };
 
 /**
@@ -446,7 +461,7 @@ export const renderLaunchdSupervisor = (s: {
   return `not running${exit}`;
 };
 
-const supervisorState = (): string => {
+export const supervisorState = (): string => {
   if (isMac) {
     // `launchctl print` exits non-zero (empty capture) when the label isn't
     // bootstrapped at all.

@@ -22,6 +22,10 @@
  */
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { guardCrashLoop, markHealthyBoot } from "./boot-guard";
+import {
+  sweepStaleChildrenOnBoot,
+  terminateAllDisposable,
+} from "./child-supervisor";
 import { runCli } from "./cli";
 import { maybeUpdateCli } from "./cli-self-update";
 import {
@@ -122,6 +126,11 @@ const main = async (): Promise<void> => {
   // fatal error leaves the process in an indeterminate state; exiting lets the
   // launch agent / systemd unit restart it clean. `logError` writes
   // synchronously (appendFileSync), so the line is flushed before exit.
+  const exitAfterDisposableDrain = (code: number): void => {
+    void terminateAllDisposable()
+      .catch((err) => logError("child-supervisor", err))
+      .finally(() => process.exit(code));
+  };
   process.on("uncaughtException", (err) => {
     // A remote peer's dead socket is not this process's problem — see
     // `crash-policy.ts`. Exiting over one turned an unreachable WebRTC ICE
@@ -134,7 +143,7 @@ const main = async (): Promise<void> => {
     // Durable local session hosts are detached sibling processes. A daemon
     // fatal exit must never terminate their vendor PTYs; attached browser
     // clients simply lose their transport until Phase 2 reconnects them.
-    process.exit(1);
+    exitAfterDisposableDrain(1);
   });
   process.on("unhandledRejection", (reason) => {
     if (isTransientNetworkError(reason)) {
@@ -143,7 +152,7 @@ const main = async (): Promise<void> => {
     }
     logError("unhandledRejection", reason);
     // See uncaughtException: session-host processes own their own lifecycle.
-    process.exit(1);
+    exitAfterDisposableDrain(1);
   });
 
   // Opt the usage cache into disk-backed survival across restarts, and hydrate
@@ -239,14 +248,25 @@ const main = async (): Promise<void> => {
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.
   let shuttingDown = false;
+  const finishShutdown = async (signal: NodeJS.Signals): Promise<void> => {
+    try {
+      await stopControlChannel();
+    } catch (err) {
+      logError("control-channel", err);
+    }
+    try {
+      // Durable local session hosts are detached from this daemon. The
+      // supervisor tracks only disposable children, leaving their PTYs alone.
+      await terminateAllDisposable();
+    } catch (err) {
+      logError("child-supervisor", err);
+    }
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
   const shutdown = (signal: NodeJS.Signals): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Durable local session hosts are detached from this daemon. Stop only the
-    // control transport; their own process owns PTY teardown and idle reaping.
-    void stopControlChannel().finally(() => {
-      process.exit(signal === "SIGINT" ? 130 : 143);
-    });
+    void finishShutdown(signal);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -384,8 +404,20 @@ const main = async (): Promise<void> => {
       );
       logError("boot", err);
     }
-    process.exit(1);
+    exitAfterDisposableDrain(1);
+    return;
   }
+
+  // Reap verified disposable children left by a prior daemon instance —
+  // FIRE-AND-FORGET. This must NOT gate cloud registration: on a machine with a
+  // pile of orphaned probes the TERM→grace→KILL sweep can take seconds, and the
+  // `hello`/registration handshake must not wait on it (that delay was a boot
+  // wedge — the relay saw connect→disconnect and registration never stuck). The
+  // sweep only touches prior-instance orphans, never this daemon's own work, so
+  // running it concurrently with startup is safe.
+  void sweepStaleChildrenOnBoot().catch((err: unknown) => {
+    logError("child-supervisor", err);
+  });
 
   // Dial OUT to the cloud relay over a WebSocket: it delivers dashboard
   // commands and marks this key's daemon "online" server-side — so the

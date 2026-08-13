@@ -16,6 +16,7 @@ import type {
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
+import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
 import { getCliState } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
@@ -43,10 +44,15 @@ const OPENCODE_PROBE_TTL_MS = 30_000;
 let opencodeProbe: { readonly at: number; readonly found: boolean } | null =
   null;
 
-// Status runs at hello/reconnect plus the flow watcher cadence. A vendor CLI
-// version/auth probe that takes longer than this is degraded for this snapshot
-// instead of blocking daemon presence forever; the next snapshot retries it.
+// Status runs at hello/reconnect plus the flow watcher cadence. Each delegate's
+// version/auth capture self-terminates its process group at
+// `DEFAULT_CAPTURE_TIMEOUT_MS`; this wider snapshot ceiling leaves that cleanup
+// time to finish before status degrades and the next snapshot retries it.
 const DELEGATE_STATUS_TIMEOUT_MS = 10_000;
+
+if (DELEGATE_STATUS_TIMEOUT_MS < DEFAULT_CAPTURE_TIMEOUT_MS) {
+  throw new Error("delegate status timeout must cover the capture timeout");
+}
 
 const statusFailure = (slug: string): TDaemonProviderConnection => ({
   provider: slug,

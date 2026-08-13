@@ -176,6 +176,14 @@ export const stateDir = (home?: string): string => {
 export const logFilePath = (): string =>
   join(stateDir(), isDevMode() ? "openllmd.dev.log" : "openllmd.log");
 
+/** Native stdout capture written by the installed launchd/systemd service. */
+export const daemonStdoutLogFilePath = (): string =>
+  join(stateDir(), "openllmd.out.log");
+
+/** Native stderr capture written by the installed launchd/systemd service. */
+export const daemonStderrLogFilePath = (): string =>
+  join(stateDir(), "openllmd.err.log");
+
 /**
  * The SHARED OpenLLM env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the
  * macOS launch agent points us here because launchd can't read a native

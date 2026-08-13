@@ -1,0 +1,148 @@
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import { stateDir } from "../env";
+
+export type TDisposableChildKind =
+  | "probe"
+  | "vendor-capture"
+  | "mcp-helper"
+  | "login"
+  | "native-runtime";
+
+export type TChildRegistryRecord = {
+  readonly instanceId: string;
+  readonly kind: TDisposableChildKind;
+  readonly pid: number;
+  readonly pgid: number;
+  readonly processStartTime: string;
+  readonly argvDigest: string;
+  readonly startedAtMs: number;
+};
+
+const childrenDir = (): string => join(stateDir(), "children");
+
+const recordPath = (pid: number): string => join(childrenDir(), `${pid}.json`);
+
+const isKind = (value: unknown): value is TDisposableChildKind =>
+  value === "probe" ||
+  value === "vendor-capture" ||
+  value === "mcp-helper" ||
+  value === "login" ||
+  value === "native-runtime";
+
+const isRecord = (value: unknown): value is TChildRegistryRecord => {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.instanceId === "string" &&
+    record.instanceId.length > 0 &&
+    isKind(record.kind) &&
+    typeof record.pid === "number" &&
+    Number.isInteger(record.pid) &&
+    record.pid > 0 &&
+    typeof record.pgid === "number" &&
+    Number.isInteger(record.pgid) &&
+    record.pgid > 0 &&
+    typeof record.processStartTime === "string" &&
+    record.processStartTime.length > 0 &&
+    typeof record.argvDigest === "string" &&
+    /^[a-f0-9]{64}$/.test(record.argvDigest) &&
+    typeof record.startedAtMs === "number" &&
+    Number.isFinite(record.startedAtMs)
+  );
+};
+
+/** PID-reuse-safe process identity. Mirrors the durable session-host lstart check. */
+export const processStartTime = (pid: number): string | null => {
+  try {
+    const output = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (output.exitCode !== 0) return null;
+    const value = new TextDecoder().decode(output.stdout).trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+};
+
+export const currentDaemonInstanceId = (): string => {
+  const startTime = processStartTime(process.pid);
+  // The boot process must be distinguishable even on a platform where its
+  // creation timestamp cannot be read. The random-like startup timestamp is
+  // intentionally process-local rather than durable state.
+  return `${process.pid}:${startTime ?? String(Date.now())}`;
+};
+
+const daemonInstanceId = currentDaemonInstanceId();
+
+export const currentChildSupervisorInstanceId = (): string => daemonInstanceId;
+
+export const argvDigest = (argv: ReadonlyArray<string>): string =>
+  createHash("sha256").update(JSON.stringify(argv)).digest("hex");
+
+export const addChildRegistryRecord = (record: TChildRegistryRecord): void => {
+  const directory = childrenDir();
+  const target = recordPath(record.pid);
+  const temporary = join(directory, `.${record.pid}.${process.pid}.tmp`);
+  try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    renameSync(temporary, target);
+  } catch {
+    try {
+      rmSync(temporary, { force: true });
+    } catch {
+      // Best-effort registry cleanup.
+    }
+  }
+};
+
+export const removeChildRegistryRecord = (pid: number): void => {
+  try {
+    rmSync(recordPath(pid), { force: true });
+  } catch {
+    // A concurrent reaper or an already-exited child may own cleanup.
+  }
+};
+
+export const listChildRegistryRecords = (): readonly TChildRegistryRecord[] => {
+  let entries: string[];
+  try {
+    entries = readdirSync(childrenDir());
+  } catch {
+    return [];
+  }
+  const records: TChildRegistryRecord[] = [];
+  for (const entry of entries) {
+    if (!/^\d+\.json$/.test(entry)) continue;
+    try {
+      const parsed: unknown = JSON.parse(
+        readFileSync(join(childrenDir(), entry), "utf8"),
+      );
+      if (isRecord(parsed)) records.push(parsed);
+      else rmSync(join(childrenDir(), entry), { force: true });
+    } catch {
+      try {
+        rmSync(join(childrenDir(), entry), { force: true });
+      } catch {
+        // Retry an unreadable record at the next boot.
+      }
+    }
+  }
+  return records;
+};
+
+export const childProcessMatchesRecord = (
+  record: TChildRegistryRecord,
+): boolean => processStartTime(record.pid) === record.processStartTime;

@@ -196,6 +196,20 @@ const CLI_VERSION_HARD_MAX_MS = envMs(
   10 * 60_000,
 );
 
+/**
+ * Per-spawn kill deadline for a `--version` probe — distinct from
+ * {@link CLI_VERSION_HARD_MAX_MS} (a cache-staleness interval, NOT a process
+ * timeout). A vendor CLI can wedge indefinitely under the isolated HOME/config
+ * (a corrupt `.claude.json`, a first-run prompt with stdin ignored, a launcher
+ * update/keychain probe), and a hung probe on the status sweep is what stalls a
+ * boot. Resolved LAZILY on each call — NOT a module-level constant — because
+ * `.env` is loaded by `daemonPort()` AFTER this module is first evaluated, so a
+ * module-eval read would miss an `~/.openllm/.env` override (only a plist-injected
+ * value would be visible that early). The 3s default is daemon-owned, so the
+ * guard holds with no `.env` or plist edit at all. */
+const cliVersionProbeTimeoutMs = (): number =>
+  envMs("OPENLLM_CLI_VERSION_PROBE_TIMEOUT_MS", 3_000);
+
 interface CliInstallCacheEntry {
   readonly result: TCliInstallState;
   readonly expiresAt: number;
@@ -323,6 +337,7 @@ export const cliInstallState = async (
   // thresholds.
   const out = await runCapture([bin, "--version"], cliEnv(provider), {
     probe: true,
+    timeoutMs: cliVersionProbeTimeoutMs(),
   });
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
   const result: TCliInstallState = { installed: true, version };

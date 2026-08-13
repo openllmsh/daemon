@@ -23,7 +23,11 @@ export const COMMANDS: readonly TCommand[] = [
   {
     name: "logs",
     args: "[-f] [-n N]",
-    description: "Show or follow the daemon log",
+    description: "Show or follow daemon logs",
+  },
+  {
+    name: "doctor",
+    description: "Print a copyable local diagnostic report",
   },
   {
     name: "auto-update",
