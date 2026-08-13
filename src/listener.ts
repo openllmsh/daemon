@@ -20,6 +20,7 @@ import {
   ChatCompletionRequest,
   ImageGenerationRequest,
   ResponsesRequest,
+  VideoGenerationRequest,
 } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { Schema } from "effect";
@@ -33,6 +34,12 @@ import { runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
 import { lookupPlan, storePlan } from "./plan-cache";
 import {
+  runVideoCancel,
+  runVideoContent,
+  runVideoCreate,
+  runVideoPoll,
+} from "./video-walker";
+import {
   parsePlan,
   planSignatureOk,
   runCountTokens,
@@ -43,6 +50,7 @@ import {
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
 const parseImageRequest = Schema.decodeUnknownSync(ImageGenerationRequest);
+const parseVideoRequest = Schema.decodeUnknownSync(VideoGenerationRequest);
 const parseResponsesRequest = Schema.decodeUnknownSync(ResponsesRequest);
 const parseCountTokensRequest = Schema.decodeUnknownSync(
   AnthropicCountTokensRequest,
@@ -81,6 +89,21 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // schema, no walk.
   const isResponsesCompact = url.pathname.endsWith("/responses/compact");
   const isImages = url.pathname.endsWith("/images/generations");
+  const videoPath = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
+  const videoMatch = videoPath.match(/^\/v1\/videos\/([^/]+)(?:\/(content))?$/);
+  const videoId = videoMatch?.[1];
+  const videoOperation =
+    req.method === "POST" && videoPath === "/v1/videos"
+      ? "create"
+      : req.method === "GET" &&
+          videoId !== undefined &&
+          videoMatch?.[2] === "content"
+        ? "content"
+        : req.method === "GET" && videoId !== undefined
+          ? "poll"
+          : req.method === "DELETE" && videoId !== undefined
+            ? "cancel"
+            : null;
   // Anthropic's PREFLIGHT, not inference. It must be matched BEFORE the
   // `/messages` test below (which it does not satisfy) or it falls through to
   // the `chat_completions` default and gets served as a real Opus generation —
@@ -98,7 +121,12 @@ export const handleInference = async (req: Request): Promise<Response> => {
   let rawBody: unknown;
   try {
     rawBytes = await req.arrayBuffer();
-    rawBody = JSON.parse(new TextDecoder().decode(rawBytes));
+    rawBody =
+      videoOperation === "poll" ||
+      videoOperation === "content" ||
+      videoOperation === "cancel"
+        ? null
+        : JSON.parse(new TextDecoder().decode(rawBytes));
   } catch {
     return withCors(req, errorJson(400, "Body must be valid JSON"));
   }
@@ -113,6 +141,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
     if (isResponsesCompact) {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
+    else if (videoOperation === "create") parseVideoRequest(rawBody);
     else if (isImages) parseImageRequest(rawBody);
     else if (surface === "messages") parseAnthropicRequest(rawBody);
     else if (surface === "responses") parseResponsesRequest(rawBody);
@@ -228,12 +257,20 @@ export const handleInference = async (req: Request): Promise<Response> => {
   };
   return withCors(
     req,
-    await (isResponsesCompact
-      ? runResponsesCompact(walkArgs)
-      : isCountTokens
-        ? runCountTokens(walkArgs)
-        : isImages
-          ? runImageWalker(walkArgs)
-          : runWalker(walkArgs)),
+    await (videoOperation === "create"
+      ? runVideoCreate(walkArgs)
+      : videoOperation === "poll"
+        ? runVideoPoll(walkArgs, videoId)
+        : videoOperation === "content"
+          ? runVideoContent(walkArgs, videoId)
+          : videoOperation === "cancel"
+            ? runVideoCancel(walkArgs, videoId)
+            : isResponsesCompact
+              ? runResponsesCompact(walkArgs)
+              : isCountTokens
+                ? runCountTokens(walkArgs)
+                : isImages
+                  ? runImageWalker(walkArgs)
+                  : runWalker(walkArgs)),
   );
 };
