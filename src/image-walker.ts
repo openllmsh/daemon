@@ -68,11 +68,18 @@ export const buildImageUpstreamBody = (
   providerModelId: string,
 ): Record<string, unknown> => {
   if (provider === "chatgpt") {
+    // Forward the `gpt-image`-supported options so client settings aren't
+    // silently dropped. `style` + `response_format` are DALL·E-era params that
+    // gpt-image (what Codex serves) rejects — forwarding them would 400, so
+    // they're intentionally omitted (gpt-image always returns b64_json).
     return {
       model: providerModelId,
       prompt: req.prompt,
       ...(req.n !== undefined ? { n: req.n } : {}),
       ...(req.size !== undefined ? { size: req.size } : {}),
+      ...(req.quality !== undefined ? { quality: req.quality } : {}),
+      ...(req.background !== undefined ? { background: req.background } : {}),
+      ...(req.user !== undefined ? { user: req.user } : {}),
     };
   }
   if (provider === "grok") {
@@ -92,11 +99,15 @@ export const normalizeImageResponse = (
   upstream: unknown,
 ): TImageGenerationResponse => {
   const data =
-    upstream !== null &&
-    typeof upstream === "object" &&
-    Array.isArray((upstream as { readonly data?: unknown }).data)
-      ? (upstream as { readonly data: unknown }).data
-      : [];
+    upstream !== null && typeof upstream === "object"
+      ? (upstream as { readonly data?: unknown }).data
+      : undefined;
+  // A "success" upstream body with no `data` array is malformed — surface it
+  // as a 502 (the caller converts this throw) rather than fabricating an empty
+  // but 200-OK image response the client would read as a successful no-op.
+  if (!Array.isArray(data)) {
+    throw new Error("upstream image response missing a data array");
+  }
   return parseImageResponse({
     created: Math.floor(Date.now() / 1000),
     data,
