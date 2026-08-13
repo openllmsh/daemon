@@ -457,10 +457,18 @@ export const runVideoContent = async (
   if (id === undefined) {
     return errorJson(404, "No such video");
   }
-  const contentType = normalizeContentType(
+  // This is a video content endpoint, so the payload IS a video. Pin a video
+  // content-type when the upstream CDN serves a generic one (e.g.
+  // application/octet-stream): the library allowlist keys on the exact type,
+  // and the ingest rejects an x-media-kind that disagrees with the content-type
+  // — a non-video type would fail-close a legitimate video.
+  const rawContentType = normalizeContentType(
     content.headers.get("content-type"),
     "video/mp4",
   );
+  const contentType = rawContentType.startsWith("video/")
+    ? rawContentType
+    : "video/mp4";
   const [clientBranch, persistBranch] = body.tee();
 
   void (async () => {
