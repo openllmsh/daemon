@@ -80,3 +80,15 @@ export const guardCrashLoop = (): void => {
   writeBootHistory([]);
   process.exit(0);
 };
+
+/**
+ * Clears crash-loop history after the daemon reaches a confirmed healthy boot.
+ * Keeps transient failures from converting into a sticky parked state.
+ */
+export const markHealthyBoot = (): void => {
+  try {
+    writeBootHistory([]);
+  } catch {
+    // best-effort + never throws
+  }
+};

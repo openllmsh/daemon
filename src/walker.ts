@@ -1718,8 +1718,25 @@ export type TLocalSubscriptionAuth = {
 };
 
 /** Bound on the auth-gate `status()` probe — a hung keychain/CLI read must
- *  not stall the hop; timeout → not-connected → fleet tunnel. */
+ * not stall the hop. */
 const LOCAL_STATUS_TIMEOUT_MS = 5_000;
+
+// A recent successful local status check remains trustworthy through one slow
+// keychain/CLI probe. This process-local grace window avoids dropping a signed-in
+// provider from a request chain on older Macs, while quickly requiring a fresh
+// status result after the daemon's local state may have changed.
+const LOCAL_STATUS_LAST_KNOWN_GOOD_TTL_MS = 5 * 60_000;
+
+type TLastKnownGoodLocalSubscription = {
+  readonly auth: TLocalSubscriptionAuth;
+  readonly accountHash: string | null;
+  readonly observedAtMs: number;
+};
+
+const lastKnownGoodLocalSubscriptionByProvider = new Map<
+  string,
+  TLastKnownGoodLocalSubscription
+>();
 
 export const ensureLocalSubscription = async (
   provider: string,
@@ -1757,14 +1774,30 @@ export const ensureLocalSubscription = async (
         : (status.detail ?? `${provider} not signed in on this device`),
     };
     connectedByProvider.set(provider, result);
-    accountHashByProvider.set(
-      provider,
-      status.connected ? (status.account_hash ?? null) : null,
-    );
+    const accountHash = status.connected ? (status.account_hash ?? null) : null;
+    accountHashByProvider.set(provider, accountHash);
+    if (result.connected) {
+      lastKnownGoodLocalSubscriptionByProvider.set(provider, {
+        auth: result,
+        accountHash,
+        observedAtMs: Date.now(),
+      });
+    }
     return result;
   } catch (error) {
-    // Timeout, throw, or hung CLI — all mean "this box can't serve"; fleet
-    // (or hop fail) is the right next step, never a stalled walker.
+    const lastKnownGood =
+      lastKnownGoodLocalSubscriptionByProvider.get(provider);
+    if (
+      lastKnownGood !== undefined &&
+      Date.now() - lastKnownGood.observedAtMs <=
+        LOCAL_STATUS_LAST_KNOWN_GOOD_TTL_MS
+    ) {
+      connectedByProvider.set(provider, lastKnownGood.auth);
+      accountHashByProvider.set(provider, lastKnownGood.accountHash);
+      return lastKnownGood.auth;
+    }
+    // Timeout, throw, or hung CLI without a recent connected observation means
+    // this box cannot serve; fleet (or hop fail) is the right next step.
     const result: TLocalSubscriptionAuth = {
       connected: false,
       detail:

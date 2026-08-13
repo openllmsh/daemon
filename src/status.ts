@@ -9,7 +9,10 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { TDaemonStatus } from "@openllmsh/protocol";
+import type {
+  TDaemonProviderConnection,
+  TDaemonStatus,
+} from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
@@ -40,6 +43,38 @@ const OPENCODE_PROBE_TTL_MS = 30_000;
 let opencodeProbe: { readonly at: number; readonly found: boolean } | null =
   null;
 
+// Status runs at hello/reconnect plus the flow watcher cadence. A vendor CLI
+// version/auth probe that takes longer than this is degraded for this snapshot
+// instead of blocking daemon presence forever; the next snapshot retries it.
+const DELEGATE_STATUS_TIMEOUT_MS = 10_000;
+
+const statusFailure = (slug: string): TDaemonProviderConnection => ({
+  provider: slug,
+  connected: false,
+  cli_installed: false,
+  detail: "status check failed",
+});
+
+const boundedDelegateStatus = async (
+  slug: string,
+  status: () => Promise<TDaemonProviderConnection>,
+): Promise<TDaemonProviderConnection> => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      status(),
+      new Promise<TDaemonProviderConnection>((resolve) => {
+        timer = setTimeout(
+          () => resolve(statusFailure(slug)),
+          DELEGATE_STATUS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+};
+
 /** OpenCode is a device-session client (not a subscription delegate). Surface
  *  install presence so the device picker can offer it when the binary exists. */
 const opencodeInstalled = (): boolean => {
@@ -64,7 +99,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
-        const conn = await d.status();
+        const conn = await boundedDelegateStatus(d.slug, d.status);
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
         if (!conn.connected) return conn;
@@ -85,12 +120,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
         logWarn("status", `status() failed for ${d.slug}`, {
           err: err instanceof Error ? err.message : String(err),
         });
-        return {
-          provider: d.slug,
-          connected: false,
-          cli_installed: false,
-          detail: "status check failed",
-        };
+        return statusFailure(d.slug);
       }
     }),
   );

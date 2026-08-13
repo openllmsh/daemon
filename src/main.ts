@@ -21,7 +21,7 @@
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
-import { guardCrashLoop } from "./boot-guard";
+import { guardCrashLoop, markHealthyBoot } from "./boot-guard";
 import { runCli } from "./cli";
 import { maybeUpdateCli } from "./cli-self-update";
 import {
@@ -386,6 +386,13 @@ const main = async (): Promise<void> => {
     }
     process.exit(1);
   }
+  // Mark this boot as healthy once the listener is bound and a small stabilization
+  // window has elapsed, then clear the crash-loop history so transient restarts do
+  // not accumulate into a permanent park.
+  setTimeout(() => {
+    markHealthyBoot();
+  }, 3_000);
+
   // Single line to stdout so the install-time launcher can confirm boot.
   process.stdout.write(
     `openllmd v${DAEMON_VERSION}${isDevMode() ? " (dev)" : ""} listening on http://127.0.0.1:${port}\n`,
