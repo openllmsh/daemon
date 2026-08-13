@@ -161,28 +161,21 @@ const main = async (): Promise<void> => {
   // interval until the snapshot is healthy, then relax to the TTL — so a
   // just-set key (or a `next dev` that just finished booting) is picked
   // up within seconds, not after a 5-minute wait.
-  await refreshBootstrap();
-  // Converge to the cloud's published daemon version (no-op from source / when
-  // already current). Fire-and-forget: it self-guards and, when it updates,
-  // swaps the binary + exits once `/v1` is idle so the supervisor relaunches.
-  void maybeSelfUpdate(latestVersion());
-  // Converge the installed openllm CLI too — same toggle, same tick. Daemon
-  // first: if the daemon swaps + exits mid-flight, the relaunch's boot call
-  // finishes the CLI converge within seconds.
-  void maybeUpdateCli(latestCliVersion());
-  // Eager manifest-driven device-state walk (`install.sh -s` per registry item)
-  // once the cloud is reachable, so the dashboard's Integrations tab paints
-  // installed-state on first connect. Fire-and-forget + cloud-gated; the status
-  // watcher re-pushes when the cache lands. Re-walked after install/uninstall
-  // and on a whole-daemon refresh (control-relay.ts).
-  if (getCloudState() === "ok") {
-    void refreshCliState()
-      .then(() => pushStatusIfChanged())
-      .catch((err) => logError("main", err));
-    // First model-list report — connected delegates' live lists reach
-    // the cloud's model cache at boot instead of on the first 5-min tick.
-    void maybeReportModels().catch((err) => logError("main", err));
-  }
+  const runCloudReadyWork = (): void => {
+    if (getCloudState() === "ok") {
+      // Eager manifest-driven device-state walk (`install.sh -s` per registry item)
+      // once the cloud is reachable, so the dashboard's Integrations tab paints
+      // installed-state on first connect. Fire-and-forget + cloud-gated; the status
+      // watcher re-pushes when the cache lands. Re-walked after install/uninstall
+      // and on a whole-daemon refresh (control-relay.ts).
+      void refreshCliState()
+        .then(() => pushStatusIfChanged())
+        .catch((err) => logError("main", err));
+      // First model-list report — connected delegates' live lists reach
+      // the cloud's model cache at boot instead of on the first 5-min tick.
+      void maybeReportModels().catch((err) => logError("main", err));
+    }
+  };
   const scheduleBootstrap = (): void => {
     const delay =
       getCloudState() === "ok" ? BOOTSTRAP_TTL_MS : BOOTSTRAP_RETRY_MS;
@@ -223,18 +216,25 @@ const main = async (): Promise<void> => {
       }
     }, delay);
   };
-  scheduleBootstrap();
-
-  // Dial OUT to the cloud relay over a WebSocket: it delivers dashboard
-  // commands and marks this key's daemon "online" server-side — so the
-  // dashboard never reaches loopback (no Private Network Access prompt). See
-  // `docs/proposals/daemon-relay-websocket-push.md`.
-  // Reconcile the durable session-host registry before accepting connections.
-  // A live socket directory belongs to an independent session process and is
-  // adopted (kept); only incomplete or dead entries are removed.
-  reconcileSessionHostsAtBoot();
-
-  startControlChannel();
+  const startBootstrapLoop = (): void => {
+    void refreshBootstrap()
+      .then(() => {
+        // Converge to the cloud's published daemon version (no-op from source /
+        // when already current). Fire-and-forget: it self-guards and, when it
+        // updates, swaps the binary + exits once `/v1` is idle so the supervisor
+        // relaunches.
+        void maybeSelfUpdate(latestVersion());
+        // Converge the installed openllm CLI too — same toggle, same tick. Daemon
+        // first: if the daemon swaps + exits mid-flight, the relaunch's boot call
+        // finishes the CLI converge within seconds.
+        void maybeUpdateCli(latestCliVersion());
+        runCloudReadyWork();
+      })
+      .catch((err) => logError("main", err))
+      .finally(() => {
+        scheduleBootstrap();
+      });
+  };
 
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.
@@ -386,6 +386,25 @@ const main = async (): Promise<void> => {
     }
     process.exit(1);
   }
+
+  // Dial OUT to the cloud relay over a WebSocket: it delivers dashboard
+  // commands and marks this key's daemon "online" server-side — so the
+  // dashboard never reaches loopback (no Private Network Access prompt). See
+  // `docs/proposals/daemon-relay-websocket-push.md`.
+  startControlChannel();
+
+  // Reconcile the durable session-host registry before the relay can deliver
+  // commands. `startControlChannel` only creates the socket synchronously; its
+  // connection callbacks cannot run until this boot turn yields. A live socket
+  // directory belongs to an independent session process and is adopted (kept);
+  // only incomplete or dead entries are removed.
+  reconcileSessionHostsAtBoot();
+
+  // Bootstrap is intentionally last: the listener is already bound and relay
+  // presence can only be published after it is routeable. Keep cloud-dependent
+  // device/model work chained to the initial refresh.
+  startBootstrapLoop();
+
   // Mark this boot as healthy once the listener is bound and a small stabilization
   // window has elapsed, then clear the crash-loop history so transient restarts do
   // not accumulate into a permanent park.
