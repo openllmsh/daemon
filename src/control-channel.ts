@@ -70,6 +70,25 @@ const LIVENESS_TIMEOUT_MS = 70_000;
 // connect stays immediate). Small vs the 35s presence grace, so it never surfaces
 // as a flap. See `docs/audit/presence-reconnect-prior-art.md` §3.
 const RECONNECT_JITTER_MS = 3_000;
+
+// Partysocket's default 4_000ms connection timeout is too short for WSS upgrades
+// through the Vercel relay/sandbox path, where TLS handshakes can stall past
+// that budget and drop healthy links as `TIMEOUT` before OPEN. Keep 20s to give
+// each pre-open attempt enough time to complete before partysocket bails.
+export const CONTROL_CHANNEL_CONNECT_TIMEOUT_MS = 20_000;
+
+export const controlSocketOptions = (): {
+  readonly WebSocket: typeof WebSocket;
+  readonly minReconnectionDelay: number;
+  readonly maxReconnectionDelay: number;
+  readonly connectionTimeout: number;
+} => ({
+  WebSocket: globalThis.WebSocket,
+  minReconnectionDelay: 1_000,
+  maxReconnectionDelay: 30_000,
+  connectionTimeout: CONTROL_CHANNEL_CONNECT_TIMEOUT_MS,
+});
+
 // Stand-down when ANOTHER daemon on the same API key evicts us (`4000
 // superseded`). partysocket resets its backoff on every OPEN, and in a
 // supersede war every dial opens — so without this the two contenders re-dial
@@ -743,11 +762,11 @@ export const startControlChannel = (): void => {
   configureMuxHost({ send, sendBytes });
   configureRtcHost({ send });
   configureRtcClient({ send });
-  const socket = new ReconnectingWebSocket(channelUrl, undefined, {
-    WebSocket: globalThis.WebSocket,
-    minReconnectionDelay: 1_000,
-    maxReconnectionDelay: 30_000,
-  });
+  const socket = new ReconnectingWebSocket(
+    channelUrl,
+    undefined,
+    controlSocketOptions(),
+  );
   ws = socket;
   // partysocket defaults binaryType to "blob". Fleet mux frames must arrive
   // as ArrayBuffer/Uint8Array — a Blob is dropped by onMessage and the peer

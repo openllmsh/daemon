@@ -226,11 +226,17 @@ export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
   // Validate before we dial: a malformed `wss_url`/`ticket` would otherwise
   // surface as a cryptic WebSocket construction failure. Throwing here routes
   // through the channel loop's backoff like any other channel-fetch error.
+  const raw = await resp.text();
+  if (raw.trim() === "") {
+    throw new Error(
+      `invalid channel response: empty body (status ${resp.status}, content-length ${resp.headers.get("content-length") ?? "unknown"})`,
+    );
+  }
   try {
-    return decodeChannel(await resp.json());
+    return decodeChannel(JSON.parse(raw));
   } catch (err) {
     throw new Error(
-      `invalid channel response: ${err instanceof Error ? err.message : "decode failed"}`,
+      `invalid channel response: status ${resp.status}: ${err instanceof Error ? err.message : "decode failed"}`,
     );
   }
 };
