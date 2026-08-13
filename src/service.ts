@@ -29,6 +29,7 @@ import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
 import {
   daemonEnv,
+  logFilePath,
   serviceEnvFilePath,
   stateDir,
   writeEnvFileVars,
@@ -575,7 +576,7 @@ export const serviceStatus = async (): Promise<void> => {
       `  port:       ${port}`,
       `  binary:     ${process.execPath}`,
       `  state dir:  ${stateDir()}`,
-      `  logs:       ${join(stateDir(), "openllmd.log")}`,
+      `  logs:       ${logFilePath()}`,
       `  stdout:     ${logs.out}`,
       `  stderr:     ${logs.err}`,
       "",

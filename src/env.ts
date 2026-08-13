@@ -172,6 +172,10 @@ export const stateDir = (home?: string): string => {
     : join(home ?? homedir(), ".openllm");
 };
 
+/** The structured log file, isolated from the installed daemon in dev mode. */
+export const logFilePath = (): string =>
+  join(stateDir(), isDevMode() ? "openllmd.dev.log" : "openllmd.log");
+
 /**
  * The SHARED OpenLLM env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the
  * macOS launch agent points us here because launchd can't read a native

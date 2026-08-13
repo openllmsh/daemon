@@ -28,12 +28,10 @@
  * down the daemon), depends only on `stateDir`, rotates past a size cap.
  */
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
-import { join } from "node:path";
-import { stateDir } from "./env";
+import { logFilePath, stateDir } from "./env";
 
-const logFile = (): string => join(stateDir(), "openllmd.log");
-// Rotate past 5MB → `openllmd.log.1` (one generation; the daemon is chatty
-// only on errors, and we only need the recent tail to debug).
+// Rotate past 5MB → `<log file>.1` (one generation; the daemon is chatty only
+// on errors, and we only need the recent tail to debug).
 const MAX_BYTES = 5 * 1024 * 1024;
 
 type TLevel = "error" | "warn" | "info" | "debug";
@@ -83,8 +81,9 @@ const write = (
   let wroteCombinedLog = false;
   try {
     mkdirSync(stateDir(), { recursive: true });
-    rotateIfBig(logFile());
-    appendFileSync(logFile(), line, { mode: 0o600 });
+    const file = logFilePath();
+    rotateIfBig(file);
+    appendFileSync(file, line, { mode: 0o600 });
     wroteCombinedLog = true;
   } catch {
     // Logging is best-effort — never let it throw into the caller.

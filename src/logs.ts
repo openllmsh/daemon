@@ -14,8 +14,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { stateDir } from "./env";
+import { logFilePath } from "./env";
 
 /** Initial tail length when `-n`/`--lines` isn't given. */
 export const DEFAULT_LOG_LINES = 200;
@@ -61,7 +60,7 @@ const journalAvailable = (): boolean =>
   }).status === 0;
 
 const tailFile = (opts: TLogsOpts): number => {
-  const file = join(stateDir(), "openllmd.log");
+  const file = logFilePath();
   if (!existsSync(file)) {
     process.stderr.write(`no log file yet at ${file}\n`);
     return 1; // distinguish "nothing to show" from a clean tail for `$?` callers
