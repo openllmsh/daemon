@@ -75,6 +75,11 @@ import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "grok" as const;
 
+// Image endpoint host differs from the chat/proxy host.
+// Grok image requests must go directly to `api.x.ai`, so we don't try to
+// resolve from captured upstream URL.
+const GROK_IMAGE_URL = "https://api.x.ai/v1/images/generations";
+
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
 // This is the CLI chat-proxy's own billing route (same host as inference), which
@@ -697,6 +702,23 @@ export const grokDelegate: TProviderDelegate = {
         "x-grok-client-identifier": "xai-grok-cli",
       },
       url,
+      // Which account this hop's cost attributes to (recorded on the row).
+      ...accountHashField(PROVIDER, token.session.user_id),
+    };
+  },
+
+  credentialForImage: async () => {
+    const token = await readToken();
+    if (token === null) {
+      throw new Error("grok: not signed in (no stored credential)");
+    }
+    return {
+      access_token: token.accessToken,
+      headers: {
+        "x-grok-client-version": await clientVersion(),
+        "x-grok-client-identifier": "xai-grok-cli",
+      },
+      url: GROK_IMAGE_URL,
       // Which account this hop's cost attributes to (recorded on the row).
       ...accountHashField(PROVIDER, token.session.user_id),
     };
