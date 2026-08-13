@@ -42,7 +42,7 @@ import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
-import type { TProviderDelegate } from "./types";
+import type { TImageCredential, TProviderDelegate } from "./types";
 import {
   reduceChatgptCredits,
   reduceChatgptPools,
@@ -471,7 +471,7 @@ export const chatgptDelegate: TProviderDelegate = {
     };
   },
 
-  credentialForImage: async (inbound?: Headers) => {
+  credentialForImage: async (inbound?: Headers): Promise<TImageCredential> => {
     const token = await readToken();
     if (token === null) {
       throw new Error("chatgpt: not signed in (no stored credential)");
