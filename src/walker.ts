@@ -63,9 +63,9 @@ import {
   nextLargerContextModel,
 } from "@openllmsh/wire/features/context-demote";
 import {
-  MAX_LAST_RESORT_COMPACTION_ROUNDS,
   compactionTargetFromOverflow,
   forcedCompactionTarget,
+  MAX_LAST_RESORT_COMPACTION_ROUNDS,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
 import {
@@ -2029,10 +2029,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     );
     // Nothing left to reduce (or the cut didn't actually shrink the body) —
     // surface the last overflow rather than re-sending an identical body.
-    if (
-      !compacted.compacted ||
-      compacted.estimatedTokens >= localEstimate
-    ) {
+    if (!compacted.compacted || compacted.estimatedTokens >= localEstimate) {
       return overflowResponse;
     }
     const compactedArgs: TWalkArgs = {
@@ -2117,7 +2114,10 @@ type THopContinue = typeof HOP_CONTINUE;
 // produced the Response (so a 2xx proves THIS box's account recovered); false
 // when a fleet peer served it over the tunnel (a DIFFERENT account — no proof
 // about this box, so it must not clear this box's cooldown sign).
-type THopServed = { readonly response: Response; readonly servedLocally: boolean };
+type THopServed = {
+  readonly response: Response;
+  readonly servedLocally: boolean;
+};
 
 const walkPlan = async (
   args: TWalkArgs,
