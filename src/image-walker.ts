@@ -8,6 +8,7 @@ import {
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
+import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TWalkArgs } from "./walker";
@@ -24,10 +25,72 @@ import {
 const parseImageRequest = Schema.decodeUnknownSync(ImageGenerationRequest);
 const parseImageResponse = Schema.decodeUnknownSync(ImageGenerationResponse);
 
+const bytesFromBase64 = (value: string): ArrayBuffer => {
+  const bytes = Buffer.from(value, "base64");
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  );
+};
+
 type TImageUpstream = {
   readonly headers: Record<string, string>;
   readonly url: string;
   readonly accountHash: string | null;
+};
+
+type TImageDataItem = {
+  readonly url: string;
+  readonly revised_prompt?: string;
+  readonly b64_json?: string;
+};
+
+const persistImageDataItem = async (
+  item: TImageGenerationResponse["data"][number],
+  includeBase64: boolean,
+  args: TWalkArgs,
+): Promise<TImageDataItem> => {
+  let bytes: ArrayBuffer;
+  let contentType = "image/png";
+
+  if (item.b64_json !== undefined) {
+    bytes = bytesFromBase64(item.b64_json);
+  } else if (item.url !== undefined && item.url.length > 0) {
+    const image = await fetch(item.url, {
+      method: "GET",
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!image.ok) {
+      throw new Error("upstream image download failed");
+    }
+    contentType = image.headers.get("content-type") ?? "image/png";
+    bytes = await image.arrayBuffer();
+  } else {
+    throw new Error("image item has no content");
+  }
+
+  const saved = await uploadMedia(
+    bytes,
+    {
+      contentType,
+      kind: "image",
+      sourceRef: undefined,
+    },
+    args.originParam,
+  );
+
+  if (saved === null) {
+    throw new Error("failed to upload image");
+  }
+  return {
+    url: saved.url,
+    ...(includeBase64 && item.b64_json !== undefined
+      ? { b64_json: item.b64_json }
+      : {}),
+    ...(item.revised_prompt !== undefined
+      ? { revised_prompt: item.revised_prompt }
+      : {}),
+  };
 };
 
 const acquireImageUpstream = async (
@@ -243,6 +306,23 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         : "upstream image provider returned invalid data",
     );
   }
+
+  const includeBase64 = imageRequest.response_format === "b64_json";
+  let persistedItems: ReadonlyArray<TImageDataItem>;
+  try {
+    persistedItems = await Promise.all(
+      normalized.data.map((item) =>
+        persistImageDataItem(item, includeBase64, args),
+      ),
+    );
+  } catch {
+    return errorJson(502, "Failed to persist generated image");
+  }
+
+  const response = {
+    ...normalized,
+    data: persistedItems,
+  };
   report(
     {
       model: hop.modelId,
@@ -258,7 +338,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
     },
     args.originParam,
   );
-  return new Response(JSON.stringify(normalized), {
+  return new Response(JSON.stringify(response), {
     status: 200,
     headers: { "content-type": "application/json" },
   });

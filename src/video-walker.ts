@@ -12,6 +12,7 @@ import {
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
+import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TWalkArgs } from "./walker";
@@ -442,10 +443,32 @@ export const runVideoContent = async (
       : errorJson(502, "video download is unreachable");
   }
   if (!content.ok) return upstreamError(content);
-  return new Response(content.body, {
-    status: 200,
+
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await content.arrayBuffer();
+  } catch {
+    return errorJson(502, "Failed to persist generated video");
+  }
+
+  const saved = await uploadMedia(
+    bytes,
+    {
+      contentType: content.headers.get("content-type") ?? "video/mp4",
+      kind: "video",
+      sourceRef: videoId,
+    },
+    args.originParam,
+  );
+
+  if (saved === null) {
+    return errorJson(502, "Failed to persist generated video");
+  }
+
+  return new Response(null, {
+    status: 302,
     headers: {
-      "content-type": content.headers.get("content-type") ?? "video/mp4",
+      location: saved.url,
       "cache-control": "no-store",
     },
   });
