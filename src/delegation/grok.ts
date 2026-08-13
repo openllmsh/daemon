@@ -70,7 +70,7 @@ import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
-import type { TProviderDelegate } from "./types";
+import type { TImageCredential, TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "grok" as const;
@@ -725,12 +725,7 @@ export const grokDelegate: TProviderDelegate = {
     };
   },
 
-  credentialForImage: async (): Promise<{
-    readonly access_token: string;
-    readonly headers: Readonly<Record<string, string>>;
-    readonly url: string;
-    readonly account_hash?: string;
-  }> => ({
+  credentialForImage: async (): Promise<TImageCredential> => ({
     ...(await grokClientCredential()),
     url: GROK_IMAGE_URL,
   }),

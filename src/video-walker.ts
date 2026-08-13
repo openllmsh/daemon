@@ -61,7 +61,9 @@ const acquireVideoUpstream = async (
   }
 };
 
-const videoHop = (args: TWalkArgs) => {
+const videoHop = (
+  args: TWalkArgs,
+): ReturnType<typeof resolveHop> | undefined => {
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
   return parsePlan(args.planParam)
     .map((modelId, index) => resolveHop(modelId, pmids[index]))
@@ -166,10 +168,13 @@ export const buildVideoUpstreamBody = (
   if (provider !== "grok") {
     throw new Error(`Unsupported subscription video provider: ${provider}`);
   }
-  // Only forward `duration` when `seconds` is a positive integer — a
-  // non-numeric string would parse to NaN and serialize as `duration: null`.
+  // Only forward `duration` when `seconds` is a whole positive-integer string.
+  // Require a full `\d+` match so "6.5"/"6junk" are omitted rather than
+  // truncated to 6; `parseInt` alone would forward a wrong value.
   const duration =
-    req.seconds !== undefined ? Number.parseInt(req.seconds, 10) : Number.NaN;
+    req.seconds !== undefined && /^\d+$/.test(req.seconds)
+      ? Number.parseInt(req.seconds, 10)
+      : Number.NaN;
   return {
     model: providerModelId,
     prompt: req.prompt,
@@ -223,6 +228,11 @@ const decodeJob = (videoId: string | undefined): TVideoIdPayload | Response => {
 // Bound a single xAI status GET so a hung upstream can't stall the poll —
 // combined with the client's own abort signal (same pattern as cloud-client).
 const VIDEO_STATUS_TIMEOUT_MS = 30_000;
+
+// Bound the presigned MP4 download so a hung transfer can't stall indefinitely
+// even if the client stays connected. Generous — a Grok clip is ≤15s of video,
+// so a real download finishes well inside this.
+const VIDEO_DOWNLOAD_TIMEOUT_MS = 120_000;
 
 const getStatus = async (
   args: TWalkArgs,
@@ -304,7 +314,9 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       body: JSON.stringify(body),
       signal: args.req.signal,
     },
-    true,
+    // finalHop=false: creating a video job is non-idempotent (spends quota),
+    // so never auto-retry — a retry could enqueue a second render.
+    false,
     args.req.signal,
   );
   if (resp === null) {
@@ -419,7 +431,10 @@ export const runVideoContent = async (
   try {
     content = await fetch(contentUrl, {
       method: "GET",
-      signal: args.req.signal,
+      signal: AbortSignal.any([
+        args.req.signal,
+        AbortSignal.timeout(VIDEO_DOWNLOAD_TIMEOUT_MS),
+      ]),
     });
   } catch {
     return args.req.signal.aborted
@@ -451,7 +466,10 @@ export const runVideoCancel = async (
       await fetch(`${upstream.url}/videos/${encodeURIComponent(payload.u)}`, {
         method: "DELETE",
         headers: upstreamHeaders(upstream.headers),
-        signal: args.req.signal,
+        signal: AbortSignal.any([
+          args.req.signal,
+          AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
+        ]),
       }).catch(() => {});
     }
   }

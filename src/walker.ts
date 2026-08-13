@@ -643,7 +643,7 @@ export const statusFor = (httpStatus: number): TRequestStatus =>
         : "error";
 
 /** Strip hop-by-hop headers so the body re-streams cleanly to the client. */
-const passthroughHeaders = (resp: Response): Headers => {
+export const passthroughHeaders = (resp: Response): Headers => {
   const headers = new Headers(resp.headers);
   for (const h of [
     "content-length",

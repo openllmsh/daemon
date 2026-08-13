@@ -13,6 +13,7 @@ import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TWalkArgs } from "./walker";
 import {
   parsePlan,
+  passthroughHeaders,
   planSignatureOk,
   postUpstream,
   report,
@@ -187,7 +188,10 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
       body: JSON.stringify(upstreamBody),
       signal: args.req.signal,
     },
-    true,
+    // finalHop=false: image generation is non-idempotent (each call spends
+    // quota / renders a new image), so never auto-retry — a 5xx retry could
+    // double-generate if the first attempt actually succeeded upstream.
+    false,
     args.req.signal,
   );
   if (resp === null) {
@@ -213,9 +217,12 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
       },
       args.originParam,
     );
+    // Preserve upstream headers (retry-after, the real content-type) minus
+    // hop-by-hop; forcing application/json here would drop rate-limit hints and
+    // mislabel non-JSON error bodies.
     return new Response(body.length > 0 ? body : null, {
       status: resp.status,
-      headers: { "content-type": "application/json" },
+      headers: passthroughHeaders(resp),
     });
   }
 

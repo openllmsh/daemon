@@ -179,12 +179,7 @@ export type TProviderDelegate = {
    * Produce a credential for the provider's video-generation API base. The
    * daemon uses it only locally, just like `credentialForImage`.
    */
-  credentialForVideo?: (inbound?: Headers) => Promise<{
-    readonly access_token: string;
-    readonly headers: Readonly<Record<string, string>>;
-    readonly url: string;
-    readonly account_hash?: string;
-  }>;
+  credentialForVideo?: (inbound?: Headers) => Promise<TImageCredential>;
 
   /**
    * Sign out of the official CLI's LOGIN credential on this box: run the
