@@ -228,6 +228,32 @@ const readToken = async (): Promise<{
     : { accessToken: session.key, session };
 };
 
+/**
+ * The bearer + the CLI's genuine identity headers + account attribution,
+ * shared by every grok upstream credential path (`credentialForUpstream` /
+ * `credentialForImage`). The TARGET url is layered on by each caller. The
+ * `x-grok-client-*` headers satisfy the 426 CLI-version gate.
+ */
+const grokClientCredential = async (): Promise<{
+  readonly access_token: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly account_hash?: string;
+}> => {
+  const token = await readToken();
+  if (token === null) {
+    throw new Error("grok: not signed in (no stored credential)");
+  }
+  return {
+    access_token: token.accessToken,
+    headers: {
+      "x-grok-client-version": await clientVersion(),
+      "x-grok-client-identifier": "xai-grok-cli",
+    },
+    // Which account this hop's cost attributes to (recorded on the row).
+    ...accountHashField(PROVIDER, token.session.user_id),
+  };
+};
+
 // ─── Login wiring ────────────────────────────────────────────────────────
 //
 // Grok has BOTH native flows, so we wire both (mirroring codex). They share ONE
@@ -685,44 +711,26 @@ export const grokDelegate: TProviderDelegate = {
   unsupportedToolSchemaKeywords: ["minContains", "maxContains"],
 
   credentialForUpstream: async () => {
-    const token = await readToken();
-    if (token === null) {
-      throw new Error("grok: not signed in (no stored credential)");
-    }
     // cli-chat-proxy.grok.com gates on the CLI's genuine identity headers — a
-    // request without `x-grok-client-version` is rejected 426. We send the
-    // installed CLI's REAL version + client identifier (the same identity the
+    // request without `x-grok-client-version` is rejected 426. `grokClientCredential`
+    // supplies the CLI's REAL version + client identifier (the same identity the
     // official `grok` sends). The Responses TARGET URL is captured/default
     // per-hop; the originator's other headers ride through.
-    const url = await resolveUpstreamUrl(PROVIDER);
     return {
-      access_token: token.accessToken,
-      headers: {
-        "x-grok-client-version": await clientVersion(),
-        "x-grok-client-identifier": "xai-grok-cli",
-      },
-      url,
-      // Which account this hop's cost attributes to (recorded on the row).
-      ...accountHashField(PROVIDER, token.session.user_id),
+      ...(await grokClientCredential()),
+      url: await resolveUpstreamUrl(PROVIDER),
     };
   },
 
-  credentialForImage: async () => {
-    const token = await readToken();
-    if (token === null) {
-      throw new Error("grok: not signed in (no stored credential)");
-    }
-    return {
-      access_token: token.accessToken,
-      headers: {
-        "x-grok-client-version": await clientVersion(),
-        "x-grok-client-identifier": "xai-grok-cli",
-      },
-      url: GROK_IMAGE_URL,
-      // Which account this hop's cost attributes to (recorded on the row).
-      ...accountHashField(PROVIDER, token.session.user_id),
-    };
-  },
+  credentialForImage: async (): Promise<{
+    readonly access_token: string;
+    readonly headers: Readonly<Record<string, string>>;
+    readonly url: string;
+    readonly account_hash?: string;
+  }> => ({
+    ...(await grokClientCredential()),
+    url: GROK_IMAGE_URL,
+  }),
 
   logout: async () => {
     // `grok logout` clears the cached credentials; then ensure the isolated
