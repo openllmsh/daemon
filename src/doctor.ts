@@ -7,7 +7,7 @@ import {
 import { getCloudState } from "./config";
 import { daemonPort, isDevMode, stateDir } from "./env";
 import { readRecentLogLines } from "./logs";
-import { supervisorState } from "./service";
+import { supervisorPid, supervisorState } from "./service";
 import { computeStatus } from "./status";
 import { DAEMON_VERSION } from "./version";
 
@@ -61,6 +61,17 @@ const processSnapshot = (): readonly TDoctorProcess[] => {
 const redact = (value: string): string =>
   value
     .replace(/sk-llm-[A-Za-z0-9._-]+/g, "sk-llm-[REDACTED]")
+    // Vendor key prefixes (Anthropic sk-ant-, OpenAI sk-proj-, OpenRouter
+    // sk-or-, GitHub tokens) — doctor output is copyable, so a leaked isolated
+    // credential in a log line or status detail must never survive.
+    .replace(
+      /\b(sk-(?:ant|proj|or)|ghp|gho|github_pat)[-_][A-Za-z0-9._-]+/g,
+      "$1-[REDACTED]",
+    )
+    // Compact JWTs (access/refresh tokens often embed one).
+    .replace(/\beyJ[A-Za-z0-9._-]{20,}/g, "[REDACTED_JWT]")
+    // Account email addresses (identity, not a secret, but still PII).
+    .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, "[REDACTED_EMAIL]")
     .replace(/(bearer\s+)[A-Za-z0-9._-]+/gi, "$1[REDACTED]")
     .replace(
       /([?&](?:token|access_token|refresh_token|code)=)[^\s&]+/gi,
@@ -99,11 +110,24 @@ export const runDoctor = async (): Promise<string> => {
     }, false),
   ]);
   const processes = processSnapshot();
-  const daemonPid = process.pid;
-  const daemon = processes.find((candidate) => candidate.pid === daemonPid);
-  const children = processes.filter(
-    (candidate) => candidate.ppid === daemonPid,
-  );
+  // `openllmd doctor` runs as a SEPARATE process, so process.pid is the CLI, not
+  // the daemon — use the supervisor-reported daemon PID. When none is live,
+  // process metrics are rendered unavailable rather than measuring the CLI.
+  const daemonPid = ((): number | null => {
+    try {
+      return supervisorPid();
+    } catch {
+      return null;
+    }
+  })();
+  const daemon =
+    daemonPid === null
+      ? undefined
+      : processes.find((candidate) => candidate.pid === daemonPid);
+  const children =
+    daemonPid === null
+      ? []
+      : processes.filter((candidate) => candidate.ppid === daemonPid);
   const records = listChildRegistryRecords();
   const byKind = new Map<string, number>();
   for (const record of records) {
@@ -148,7 +172,7 @@ export const runDoctor = async (): Promise<string> => {
     "",
     "Processes",
     `  daemon RSS: ${daemon === undefined ? "unavailable" : `${daemon.rssKiB} KiB`}`,
-    `  direct children: ${children.length}; total RSS: ${childRssKiB} KiB`,
+    `  direct children: ${daemonPid === null ? "unavailable" : `${children.length}; total RSS: ${childRssKiB} KiB`}`,
     "",
     "Relay / control channel",
     `  connected: ${status?.cloud_state === "ok" && listening ? "likely" : "not confirmed"}`,

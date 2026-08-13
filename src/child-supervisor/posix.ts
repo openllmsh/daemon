@@ -3,7 +3,11 @@ export const DEFAULT_TERMINATE_GRACE_MS = 2_000;
 const pause = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-const signalGroup = (pgid: number, signal: NodeJS.Signals): boolean => {
+export const signalGroup = (pgid: number, signal: NodeJS.Signals): boolean => {
+  // `kill(-1, sig)` is a broadcast to EVERY signallable process and `kill(0,
+  // sig)` targets our OWN group — neither is ever a supervised child, so a
+  // bogus pgid must never reach process.kill.
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
   try {
     process.kill(-pgid, signal);
     return true;

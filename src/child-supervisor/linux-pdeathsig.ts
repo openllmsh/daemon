@@ -45,14 +45,33 @@ export const runLinuxPdeathsigWrapper = async (
   if (argv.length === 0 || argv[0] === undefined)
     throw new Error("PDEATHSIG wrapper requires a command");
   const { dlopen, FFIType, ptr } = await import("bun:ffi");
-  const { symbols } = dlopen("libc.so.6", {
+  const libcSymbols = {
     prctl: {
       args: [FFIType.i32, FFIType.i32, FFIType.i64, FFIType.i64, FFIType.i64],
       returns: FFIType.i32,
     },
     getppid: { args: [], returns: FFIType.i32 },
     execvp: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
-  });
+  } as const;
+  // glibc ships `libc.so.6`; musl (Alpine, and the linux-*-baseline targets can
+  // land there) ships `libc.musl-<arch>.so.1` and has no `libc.so.6`. Try the
+  // common sonames in turn so the wrapper works on both libc flavors.
+  const libcCandidates = [
+    "libc.so.6",
+    "libc.musl-x86_64.so.1",
+    "libc.musl-aarch64.so.1",
+    "libc.so",
+  ];
+  let symbols: ReturnType<typeof dlopen>["symbols"] | null = null;
+  for (const soname of libcCandidates) {
+    try {
+      symbols = dlopen(soname, libcSymbols).symbols;
+      break;
+    } catch {
+      // Try the next libc soname.
+    }
+  }
+  if (symbols === null) throw new Error("PDEATHSIG: no loadable libc found");
   const prctl = symbols.prctl as unknown as (
     option: number,
     argument2: number,

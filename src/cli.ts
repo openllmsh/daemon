@@ -175,7 +175,13 @@ export const runCli = (): boolean => {
   // COMMANDS/help; its tail may contain `-h` or `-v`, so dispatch before global
   // flag scans. Other platforms never need (or execute) the PDEATHSIG wrapper.
   if (args[0] === "__child-supervisor-pdeathsig") {
-    if (process.platform !== "linux") return true;
+    // Never a no-op success: the wrapper is only ever exec'd as argv[0] of a
+    // supervised child, so reaching it off-Linux or with a malformed tail is a
+    // programming error — fail loudly and deterministically like --sandbox-exec.
+    if (process.platform !== "linux") {
+      process.stderr.write("__child-supervisor-pdeathsig: Linux-only\n");
+      process.exit(2);
+    }
     const separator = args.indexOf("--");
     const parentPid = Number.parseInt(args[2] ?? "", 10);
     if (
@@ -188,8 +194,7 @@ export const runCli = (): boolean => {
       process.stderr.write(
         "usage: openllmd __child-supervisor-pdeathsig --parent-pid <pid> -- <command> [args...]\n",
       );
-      process.exitCode = 2;
-      return true;
+      process.exit(2);
     }
     runLinuxPdeathsigWrapper(args.slice(separator + 1), parentPid).catch(
       (err: unknown) => {

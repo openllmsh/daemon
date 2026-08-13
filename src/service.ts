@@ -483,6 +483,29 @@ export const supervisorState = (): string => {
 };
 
 /**
+ * The RUNNING daemon's PID as reported by the service supervisor — launchd on
+ * macOS, systemd `MainPID` on Linux — or null when no supervised daemon is
+ * live. Callers running as a SEPARATE process (e.g. `openllmd doctor`) must use
+ * this, never `process.pid`, to inspect the daemon's own process tree.
+ */
+export const supervisorPid = (): number | null => {
+  if (isMac) {
+    const out = capture("launchctl", ["print", guiTarget()]);
+    return out.length === 0 ? null : parseLaunchctlPrint(out).pid;
+  }
+  const out = capture("systemctl", [
+    "--user",
+    "show",
+    "-p",
+    "MainPID",
+    "openllmd.service",
+  ]);
+  const match = out.match(/MainPID=(\d+)/);
+  const pid = match ? Number.parseInt(match[1], 10) : 0;
+  return pid > 0 ? pid : null;
+};
+
+/**
  * Probe the running daemon's read-only `/status` (see `health.ts`/`main.ts`).
  * A successful fetch is the authoritative "actually serving" signal — and the
  * only source of the LIVE sandbox posture (the CLI never ran the sandbox). Short

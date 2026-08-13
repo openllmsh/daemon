@@ -1,5 +1,9 @@
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
-import { DEFAULT_TERMINATE_GRACE_MS, terminateProcessGroup } from "./posix";
+import {
+  DEFAULT_TERMINATE_GRACE_MS,
+  signalGroup,
+  terminateProcessGroup,
+} from "./posix";
 import type { TChildRegistryRecord, TDisposableChildKind } from "./registry";
 import {
   addChildRegistryRecord,
@@ -77,26 +81,8 @@ const waitForTrackedExit = async (
   await exited(tracked.handle);
 };
 
-const signalProcessGroup = (pgid: number, signal: NodeJS.Signals): void => {
-  try {
-    process.kill(-pgid, signal);
-  } catch (error) {
-    // ESRCH (already gone) and EPERM (pgid recycled to a foreign process we
-    // neither own nor may signal) both mean "stop" — never crash the reaper.
-    const code =
-      error instanceof Error && "code" in error
-        ? (error as NodeJS.ErrnoException).code
-        : undefined;
-    if (code === "ESRCH" || code === "EPERM") return;
-    throw error;
-  }
-};
-
 const sleep = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-const processAlive = (record: TChildRegistryRecord): boolean =>
-  childProcessMatchesRecord(record);
 
 const terminateTrackedChild = (
   tracked: TTrackedChild,
@@ -105,7 +91,7 @@ const terminateTrackedChild = (
   if (tracked.terminating !== null) return tracked.terminating;
   const graceMs = opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS;
   tracked.terminating = (async (): Promise<void> => {
-    signalProcessGroup(tracked.handle.pgid, "SIGTERM");
+    signalGroup(tracked.handle.pgid, "SIGTERM");
     await waitForTrackedExit(tracked, Math.max(0, graceMs));
     await finishTrackedChild(tracked.handle);
   })();
@@ -203,7 +189,14 @@ export const terminate = async (
   await terminateTrackedChild(tracked, opts);
 };
 
-/** TERM → grace → KILL every disposable child owned by this daemon instance. */
+/**
+ * TERM → grace → KILL every IDLE disposable child owned by this daemon instance.
+ * A child with an open task lease (`beginTask`) is deliberately SPARED so a
+ * graceful reap (self-update / SIGTERM) never kills a child serving live work;
+ * it self-exits when its task ends, and on a hard daemon exit Linux PDEATHSIG /
+ * macOS launchd process-group cleanup stops it. Explicit `terminate(handle)` and
+ * the boot sweep still stop a child unconditionally.
+ */
 export const terminateAllDisposable = async (
   opts: TTerminateOptions = {},
 ): Promise<void> => {
@@ -223,9 +216,9 @@ const terminateStaleRecord = async (
     removeChildRegistryRecord(record.pid);
     return;
   }
-  signalProcessGroup(record.pgid, "SIGTERM");
+  signalGroup(record.pgid, "SIGTERM");
   await sleep(Math.max(0, opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS));
-  if (processAlive(record)) signalProcessGroup(record.pgid, "SIGKILL");
+  if (childProcessMatchesRecord(record)) signalGroup(record.pgid, "SIGKILL");
   removeChildRegistryRecord(record.pid);
 };
 
