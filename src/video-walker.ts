@@ -14,7 +14,6 @@ import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
-import { sizeToAspect } from "./image-walker";
 import type { TWalkArgs } from "./walker";
 import {
   parsePlan,
@@ -126,9 +125,24 @@ const videoRequestIdFrom = (body: unknown): string | null => {
     : null;
 };
 
-/** Map xAI's asynchronous video statuses to OpenLLM's job lifecycle. */
-export { sizeToAspect } from "./image-walker";
+/**
+ * Derive Grok's `aspect_ratio` from a `WIDTHxHEIGHT` size by reducing the
+ * ratio; defaults to `1:1` when the size is absent or unparsable. (Video needs
+ * its own W:H derivation — the image walker's `sizeToAspect` only recognizes a
+ * few fixed image sizes and would map, e.g., 1280x720 to 1:1.)
+ */
+export const videoAspectRatio = (size?: string): string => {
+  const match = size?.match(/^(\d+)x(\d+)$/i);
+  if (!match) return "1:1";
+  const width = Number.parseInt(match[1] ?? "", 10);
+  const height = Number.parseInt(match[2] ?? "", 10);
+  if (!(width > 0 && height > 0)) return "1:1";
+  const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+  const divisor = gcd(width, height);
+  return `${width / divisor}:${height / divisor}`;
+};
 
+/** Map xAI's asynchronous video statuses to OpenLLM's job lifecycle. */
 export const mapVideoStatus = (status: unknown): TVideoJobStatus => {
   if (status === "done") return "completed";
   if (status === "failed" || status === "expired") return "failed";
@@ -152,6 +166,10 @@ export const buildVideoUpstreamBody = (
   if (provider !== "grok") {
     throw new Error(`Unsupported subscription video provider: ${provider}`);
   }
+  // Only forward `duration` when `seconds` is a positive integer — a
+  // non-numeric string would parse to NaN and serialize as `duration: null`.
+  const duration =
+    req.seconds !== undefined ? Number.parseInt(req.seconds, 10) : Number.NaN;
   return {
     model: providerModelId,
     prompt: req.prompt,
@@ -168,10 +186,8 @@ export const buildVideoUpstreamBody = (
           })),
         }
       : {}),
-    ...(req.seconds !== undefined
-      ? { duration: Number.parseInt(req.seconds, 10) }
-      : {}),
-    aspect_ratio: sizeToAspect(req.size),
+    ...(Number.isInteger(duration) && duration > 0 ? { duration } : {}),
+    aspect_ratio: videoAspectRatio(req.size),
     resolution: sizeToResolution(req.size),
   };
 };
@@ -204,6 +220,10 @@ const decodeJob = (videoId: string | undefined): TVideoIdPayload | Response => {
   return payload ?? errorJson(404, `No such video: ${videoId}`);
 };
 
+// Bound a single xAI status GET so a hung upstream can't stall the poll —
+// combined with the client's own abort signal (same pattern as cloud-client).
+const VIDEO_STATUS_TIMEOUT_MS = 30_000;
+
 const getStatus = async (
   args: TWalkArgs,
   upstream: TVideoUpstream,
@@ -216,7 +236,10 @@ const getStatus = async (
       {
         method: "GET",
         headers: upstreamHeaders(upstream.headers),
-        signal: args.req.signal,
+        signal: AbortSignal.any([
+          args.req.signal,
+          AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
+        ]),
       },
     );
   } catch {
@@ -351,6 +374,7 @@ export const runVideoPoll = async (
     return errorJson(404, `No video credential available for ${hop.provider}`);
   const status = await getStatus(args, upstream, payload);
   if (status instanceof Response) return status;
+  const errorMessage = errorMessageFrom(status);
   const job: TVideoJob = {
     id: videoId ?? "",
     object: "video",
@@ -360,9 +384,7 @@ export const runVideoPoll = async (
     ...(typeof status.progress === "number"
       ? { progress: status.progress }
       : {}),
-    ...(errorMessageFrom(status) !== undefined
-      ? { error: { message: errorMessageFrom(status) } }
-      : {}),
+    ...(errorMessage !== undefined ? { error: { message: errorMessage } } : {}),
   };
   return responseJson(job);
 };

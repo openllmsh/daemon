@@ -89,11 +89,15 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // schema, no walk.
   const isResponsesCompact = url.pathname.endsWith("/responses/compact");
   const isImages = url.pathname.endsWith("/images/generations");
-  const videoPath = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
-  const videoMatch = videoPath.match(/^\/v1\/videos\/([^/]+)(?:\/(content))?$/);
+  // Normalize the optional `/api` prefix once; reused for video routing + the
+  // recorded `endpoint`.
+  const normalizedPath = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
+  const videoMatch = normalizedPath.match(
+    /^\/v1\/videos\/([^/]+)(?:\/(content))?$/,
+  );
   const videoId = videoMatch?.[1];
   const videoOperation =
-    req.method === "POST" && videoPath === "/v1/videos"
+    req.method === "POST" && normalizedPath === "/v1/videos"
       ? "create"
       : req.method === "GET" &&
           videoId !== undefined &&
@@ -115,7 +119,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
       : url.pathname.endsWith("/responses") || isResponsesCompact
         ? "responses"
         : "chat_completions";
-  const endpoint = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
+  const endpoint = normalizedPath;
 
   let rawBytes: ArrayBuffer;
   let rawBody: unknown;
