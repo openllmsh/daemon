@@ -33,6 +33,7 @@ import { passthroughToOrigin } from "./forward";
 import { runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
 import { lookupPlan, storePlan } from "./plan-cache";
+import { isBodylessVideoOp, videoOperationFor } from "./video-ops";
 import {
   runVideoCancel,
   runVideoContent,
@@ -92,22 +93,10 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // Normalize the optional `/api` prefix once; reused for video routing + the
   // recorded `endpoint`.
   const normalizedPath = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
-  const videoMatch = normalizedPath.match(
-    /^\/v1\/videos\/([^/]+)(?:\/(content))?$/,
+  const { operation: videoOperation, videoId } = videoOperationFor(
+    req.method,
+    normalizedPath,
   );
-  const videoId = videoMatch?.[1];
-  const videoOperation =
-    req.method === "POST" && normalizedPath === "/v1/videos"
-      ? "create"
-      : req.method === "GET" &&
-          videoId !== undefined &&
-          videoMatch?.[2] === "content"
-        ? "content"
-        : req.method === "GET" && videoId !== undefined
-          ? "poll"
-          : req.method === "DELETE" && videoId !== undefined
-            ? "cancel"
-            : null;
   // Anthropic's PREFLIGHT, not inference. It must be matched BEFORE the
   // `/messages` test below (which it does not satisfy) or it falls through to
   // the `chat_completions` default and gets served as a real Opus generation —
@@ -125,12 +114,9 @@ export const handleInference = async (req: Request): Promise<Response> => {
   let rawBody: unknown;
   try {
     rawBytes = await req.arrayBuffer();
-    rawBody =
-      videoOperation === "poll" ||
-      videoOperation === "content" ||
-      videoOperation === "cancel"
-        ? null
-        : JSON.parse(new TextDecoder().decode(rawBytes));
+    rawBody = isBodylessVideoOp(videoOperation)
+      ? null
+      : JSON.parse(new TextDecoder().decode(rawBytes));
   } catch {
     return withCors(req, errorJson(400, "Body must be valid JSON"));
   }
@@ -146,7 +132,10 @@ export const handleInference = async (req: Request): Promise<Response> => {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
     else if (videoOperation === "create") parseVideoRequest(rawBody);
-    else if (isImages) parseImageRequest(rawBody);
+    else if (isBodylessVideoOp(videoOperation)) {
+      // no-op — id-addressed video ops carry no body (rawBody is null); the
+      // signed plan rides the query string, so there's nothing to validate.
+    } else if (isImages) parseImageRequest(rawBody);
     else if (surface === "messages") parseAnthropicRequest(rawBody);
     else if (surface === "responses") parseResponsesRequest(rawBody);
     else parseOpenAIRequest(rawBody);
