@@ -139,6 +139,13 @@ const systemdMajor = (): number => {
   return m === null ? 0 : Number.parseInt(m[1], 10);
 };
 
+/** Raw env override is relative — `stateDir()` would ignore it and fall back
+ *  to `~/.openllm`, which is absolute, so the unit must not emit `append:`. */
+const hasRelativeStateDirOverride = (): boolean => {
+  const override = process.env.OPENLLM_DAEMON_STATE_DIR;
+  return override !== undefined && override.length > 0 && !isAbsolute(override);
+};
+
 /**
  * Service-log directives for the systemd unit. Always tags journald with a
  * greppable identity; ADDITIONALLY mirrors stdout/stderr to files — parity with
@@ -156,7 +163,12 @@ const systemdMajor = (): number => {
 export const renderUnitLogging = (systemdMajorVersion: number): string => {
   const { out, err } = serviceLogPaths();
   let s = "SyslogIdentifier=openllmd\n";
-  if (systemdMajorVersion >= 240 && isAbsolute(out) && isAbsolute(err)) {
+  if (
+    systemdMajorVersion >= 240 &&
+    !hasRelativeStateDirOverride() &&
+    isAbsolute(out) &&
+    isAbsolute(err)
+  ) {
     s += `StandardOutput=append:${out}\n`;
     s += `StandardError=append:${err}\n`;
   }

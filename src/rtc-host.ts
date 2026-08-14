@@ -256,6 +256,13 @@ export const handleRtcOffer = async (frame: {
   readonly key_id: string;
   readonly sdp: string;
   readonly fingerprint_proof: string;
+  /**
+   * Who offered. The relay stamps this from the authenticated socket role
+   * (`daemon` vs `browser`); a self-asserted value is not a trust signal.
+   * Fleet hops skip seedgate — they have no vault DEK (parity with
+   * mux-host `admitBySeedGate`).
+   */
+  readonly consumer?: "browser" | "daemon";
 }): Promise<void> => {
   const send = sendFrame;
   if (send === null) return;
@@ -309,25 +316,31 @@ export const handleRtcOffer = async (frame: {
     return;
   }
 
-  // Seed-gate: require a provisioned pin plus a v2 offer carrying a valid
-  // grant. Authenticated failures, including an unprovisioned daemon, nack so
-  // the browser fails fast rather than waiting for the signaling timeout.
-  const gate = enforceRtcSeedGate("grant" in inner ? inner.grant : undefined, {
-    keyId: daemonApiKeyId(),
-    cid: frame.channel_id,
-    aud: daemonPublicKey(),
-    offerVersion: inner.v,
-  });
-  if (gate.mode === "reject") {
-    logWarn("rtc-host", "seedgate rejected", {
-      channelId: frame.channel_id,
-      reason: gate.reason,
-    });
-    // The offer WAS authenticated (sealed proof opened + fb bound) — the vault
-    // is just locked. Nack so the offerer surfaces "unlock to connect" instead
-    // of timing out.
-    sendNack(frame.channel_id, "seedgate");
-    return;
+  // Seed-gate: browser consumers need a provisioned pin + v2 grant.
+  // Fleet daemon→daemon hops (`consumer: "daemon"`) have no vault DEK —
+  // skip, matching mux-host. The relay (or an in-process loopback that
+  // stands in for it) stamps this from the authenticated socket role.
+  if (frame.consumer !== "daemon") {
+    const gate = enforceRtcSeedGate(
+      "grant" in inner ? inner.grant : undefined,
+      {
+        keyId: daemonApiKeyId(),
+        cid: frame.channel_id,
+        aud: daemonPublicKey(),
+        offerVersion: inner.v,
+      },
+    );
+    if (gate.mode === "reject") {
+      logWarn("rtc-host", "seedgate rejected", {
+        channelId: frame.channel_id,
+        reason: gate.reason,
+      });
+      // The offer WAS authenticated (sealed proof opened + fb bound) — the
+      // vault is just locked. Nack so the offerer surfaces "unlock to
+      // connect" instead of timing out.
+      sendNack(frame.channel_id, "seedgate");
+      return;
+    }
   }
 
   const offerSdpMax = maxMessageSizeFromSdp(frame.sdp);
