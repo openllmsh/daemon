@@ -26,10 +26,6 @@ export const COMMANDS: readonly TCommand[] = [
     description: "Show or follow daemon logs",
   },
   {
-    name: "doctor",
-    description: "Print a copyable local diagnostic report",
-  },
-  {
     name: "auto-update",
     args: "<on|off|status>",
     description:
@@ -75,4 +71,29 @@ export const PROVIDERS = [
 export const AUTO_UPDATE_ACTIONS = ["on", "off", "status"] as const;
 
 export const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;
+
+/**
+ * Per-command second-level completion tokens. Keys are canonical subcommand names.
+ * This powers shell completion for subcommand arguments.
+ */
+export const COMMAND_ARGS: Readonly<Record<string, readonly string[]>> = {
+  completion: [...COMPLETION_SHELLS, "install"],
+  "auto-update": [...AUTO_UPDATE_ACTIONS],
+  sessions: [...AUTO_UPDATE_ACTIONS],
+  logs: ["-f", "--follow", "-n", "--lines"],
+  uninstall: ["--yes", "-y"],
+};
+
+const padRight = (value: string, width: number): string =>
+  value.length >= width ? value : `${value}${" ".repeat(width - value.length)}`;
+
+export const formatHelpRows = (
+  rows: ReadonlyArray<{ readonly left: string; readonly right: string }>,
+): string => {
+  const width = Math.max(1, ...rows.map((row) => row.left.length));
+  return rows
+    .map((row) => `  ${padRight(row.left, width)}  ${row.right}`)
+    .join("\n");
+};
+
 export type TCompletionShell = (typeof COMPLETION_SHELLS)[number];

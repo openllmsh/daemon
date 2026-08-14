@@ -497,7 +497,7 @@ export const supervisorState = (): string => supervisorInfo().state;
 /**
  * The RUNNING daemon's PID as reported by the service supervisor — launchd on
  * macOS, systemd `MainPID` on Linux — or null when no supervised daemon is
- * live. Callers running as a SEPARATE process (e.g. `openllmd doctor`) must use
+ * live. Callers running as a SEPARATE process (e.g. `openllm doctor`) must use
  * this, never `process.pid`, to inspect the daemon's own process tree.
  */
 export const supervisorPid = (): number | null => supervisorInfo().pid;
@@ -584,6 +584,94 @@ export const serviceUninstall = (): string | null => {
   return existed ? path : null;
 };
 
+export type TStatusFields = {
+  readonly version: string;
+  readonly registered: boolean;
+  readonly supervisor: string;
+  readonly health: TDaemonHealth | null;
+  readonly port: number;
+  readonly binary: string;
+  readonly stateDir: string;
+  readonly logFile: string;
+  readonly stdoutLog: string;
+  readonly stderrLog: string;
+};
+
+const padStatusLabel = (label: string, width: number): string => {
+  const spaces = Math.max(1, width - label.length);
+  return `  ${label}: ${" ".repeat(spaces)}`;
+};
+
+/**
+ * Format the daemon status block in one place so it can be tested independently.
+ * Keep labels aligned so the values scan quickly and the output can evolve safely.
+ */
+export const formatStatus = (fields: TStatusFields): string => {
+  const unknown = "unknown (daemon not responding)";
+  const rows: ReadonlyArray<{
+    readonly label: string;
+    readonly value: string;
+  }> = [
+    {
+      label: "service",
+      value: fields.registered ? "registered" : "not registered",
+    },
+    {
+      label: "supervisor",
+      value: fields.supervisor,
+    },
+    {
+      label: "health",
+      value:
+        fields.health !== null
+          ? `serving on 127.0.0.1:${fields.port}`
+          : `NOT responding on 127.0.0.1:${fields.port}`,
+    },
+    {
+      label: "sandbox",
+      value: fields.health !== null ? fields.health.sandbox : unknown,
+    },
+    {
+      label: "cloud",
+      value: fields.health !== null ? fields.health.cloud_state : unknown,
+    },
+    {
+      label: "cloud origin",
+      value: fields.health !== null ? fields.health.cloud_origin : unknown,
+    },
+    {
+      label: "port",
+      value: String(fields.port),
+    },
+    {
+      label: "binary",
+      value: fields.binary,
+    },
+    {
+      label: "state dir",
+      value: fields.stateDir,
+    },
+    {
+      label: "logs",
+      value: fields.logFile,
+    },
+    {
+      label: "stdout",
+      value: fields.stdoutLog,
+    },
+    {
+      label: "stderr",
+      value: fields.stderrLog,
+    },
+  ];
+  const width = Math.max(...rows.map((row) => row.label.length)) + 1;
+  return [
+    `openllmd v${fields.version}`,
+    ...rows.map((row) => `${padStatusLabel(row.label, width)}${row.value}`),
+    "",
+  ].join("\n");
+};
+
 /**
  * Print the service's registration + RUN state. Three independent signals:
  *   - service:    is a launch agent / systemd unit registered (file on disk);
@@ -599,22 +687,18 @@ export const serviceStatus = async (): Promise<void> => {
   const supervisor = supervisorState();
   const health = await probeHealth(port);
   const logs = serviceLogPaths();
-  const unknown = "unknown (daemon not responding)";
   process.stdout.write(
-    [
-      `openllmd v${DAEMON_VERSION}`,
-      `  service:    ${registered ? "registered" : "not registered"}`,
-      `  supervisor: ${supervisor}`,
-      `  health:     ${health !== null ? `serving on 127.0.0.1:${port}` : `NOT responding on :${port}`}`,
-      `  sandbox:    ${health !== null ? health.sandbox : unknown}`,
-      `  cloud:      ${health !== null ? health.cloud_state : unknown}`,
-      `  port:       ${port}`,
-      `  binary:     ${process.execPath}`,
-      `  state dir:  ${stateDir()}`,
-      `  logs:       ${logFilePath()}`,
-      `  stdout:     ${logs.out}`,
-      `  stderr:     ${logs.err}`,
-      "",
-    ].join("\n"),
+    formatStatus({
+      version: DAEMON_VERSION,
+      registered,
+      supervisor,
+      health,
+      port,
+      binary: process.execPath,
+      stateDir: stateDir(),
+      logFile: logFilePath(),
+      stdoutLog: logs.out,
+      stderrLog: logs.err,
+    }),
   );
 };

@@ -2,8 +2,9 @@
  * Shell completion for `openllmd` — `openllmd completion <bash|zsh|fish>` emits
  * a completion script; `openllmd completion install` detects the current shell
  * (`$SHELL`) and wires it into the user's rc (idempotent). Every subcommand,
- * flag, provider, and shell is derived from the shared definitions in
- * `commands.ts`, so completion can't drift from the actual CLI surface.
+ * flag, provider, shell, and per-command argument choice is derived from the
+ * shared definitions in `commands.ts`, so completion can't drift from the actual
+ * CLI surface.
  *
  * The bash/zsh scripts are sourced dynamically (`source <(openllmd completion
  * <shell>)`) so they always reflect the installed binary; fish writes a static
@@ -20,37 +21,41 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { TCompletionShell } from "./commands";
-import {
-  AUTO_UPDATE_ACTIONS,
-  COMMANDS,
-  COMPLETION_SHELLS,
-  FLAGS,
-} from "./commands";
+import { COMMAND_ARGS, COMMANDS, COMPLETION_SHELLS, FLAGS } from "./commands";
 
 export type { TCompletionShell } from "./commands";
 
 /** Top-level completion tokens: every subcommand + every flag alias. */
 const TOP_LEVEL = [...COMMANDS.map((c) => c.name), ...FLAGS.map((f) => f.name)];
-/** `completion`'s own argument choices. */
-const COMPLETION_ARGS = [...COMPLETION_SHELLS, "install"];
-/** The integration groups' shared `<install|uninstall|list>` action choices. */
-/** `auto-update`'s `<on|off|status>` argument choices. */
-const AUTO_UPDATE_ARGS = [...AUTO_UPDATE_ACTIONS];
 
-const bashScript = (): string => {
+const HELP_FLAGS = ["-h", "--help"] as const;
+
+/** Per-command second-level completion branches, including -h/--help. */
+const COMMAND_ARG_LINES: ReadonlyArray<readonly [string, readonly string[]]> =
+  COMMANDS.map((command) => {
+    const extra = COMMAND_ARGS[command.name] ?? [];
+    return [command.name, [...extra, ...HELP_FLAGS]] as const;
+  });
+
+const commandArgCompletionByName = (indent: string): string =>
+  COMMAND_ARG_LINES.map(
+    ([command, args]) =>
+      `${indent}${command}) COMPREPLY=( $(compgen -W "${args.join(" ")}" -- "$cur") ) ;;`,
+  ).join("\n");
+
+export const bashScript = (): string => {
   const top = TOP_LEVEL.join(" ");
   return `# openllmd bash completion
 _openllmd() {
   local cur cmd
-  cur="\${COMP_WORDS[COMP_CWORD]}"
+  cur="\${COMP_WORDS[\${COMP_CWORD}]}"
   cmd="\${COMP_WORDS[1]}"
   if [ "$COMP_CWORD" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "${top}" -- "$cur") )
     return
   fi
   case "$cmd" in
-    completion) COMPREPLY=( $(compgen -W "${COMPLETION_ARGS.join(" ")}" -- "$cur") ) ;;
-    auto-update|sessions) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${AUTO_UPDATE_ARGS.join(" ")}" -- "$cur") ) ;;
+${commandArgCompletionByName("    ")}
   esac
 }
 complete -F _openllmd openllmd
@@ -62,12 +67,18 @@ complete -F _openllmd openllmd
  *  must degrade to a weird description, not a parse error in the user's rc. */
 const zq = (s: string): string => s.replace(/'/g, `'\\''`);
 
-const zshScript = (): string => {
+export const zshScript = (): string => {
   // Descriptions are colon-free (commands.ts), so the `value:desc` specs parse.
   const specs = [
     ...COMMANDS.map((c) => `'${zq(c.name)}:${zq(c.description)}'`),
     ...FLAGS.map((f) => `'${zq(f.name)}:${zq(f.description)}'`),
   ].join("\n    ");
+
+  const args = COMMAND_ARG_LINES.map(
+    ([command, args]) =>
+      `        ${command}) _values 'arg' ${args.join(" ")} ;;`,
+  ).join("\n");
+
   return `# openllmd zsh completion
 _openllmd() {
   local -a _cmds
@@ -79,8 +90,7 @@ _openllmd() {
     cmd) _describe -t commands 'openllmd command' _cmds ;;
     args)
       case "$line[1]" in
-        completion) _values 'shell' ${COMPLETION_ARGS.join(" ")} ;;
-        auto-update|sessions) _values 'action' ${AUTO_UPDATE_ARGS.join(" ")} ;;
+${args}
       esac ;;
   esac
 }
@@ -88,17 +98,23 @@ compdef _openllmd openllmd
 `;
 };
 
-const fishScript = (): string => {
+export const fishScript = (): string => {
   const lines = COMMANDS.map(
     (c) =>
       `complete -c openllmd -n __fish_use_subcommand -a ${c.name} -d '${zq(c.description)}'`,
   );
+
+  const argumentLines = COMMAND_ARG_LINES.map(
+    ([command, args]) =>
+      `complete -c openllmd -n '__fish_seen_subcommand_from ${command}' -f -a '${args.join(" ")}'`,
+  );
+
   lines.push(
-    `complete -c openllmd -n '__fish_seen_subcommand_from completion' -a '${COMPLETION_ARGS.join(" ")}'`,
-    `complete -c openllmd -n '__fish_seen_subcommand_from auto-update sessions' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
+    ...argumentLines,
     `complete -c openllmd -s h -l help -d 'Show help'`,
     `complete -c openllmd -s v -l version -d 'Print the version'`,
   );
+
   return `# openllmd fish completion\ncomplete -c openllmd -f\n${lines.join("\n")}\n`;
 };
 
@@ -215,6 +231,7 @@ export const uninstallCompletion = (): string[] => {
  * Exits the process.
  */
 export const runCompletion = (args: readonly string[]): never => {
+  const completionArgs = COMMAND_ARGS.completion;
   const what = args[0];
   if (what === "install") {
     const file = installCompletion();
@@ -234,7 +251,7 @@ export const runCompletion = (args: readonly string[]): never => {
     process.exit(0);
   }
   process.stderr.write(
-    `usage: openllmd completion <${COMPLETION_SHELLS.join("|")}|install>\n`,
+    `usage: openllmd completion <${completionArgs.join("|")}>\n`,
   );
   process.exit(2);
 };

@@ -13,7 +13,6 @@
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
  *   openllmd logs [-f] [-n N]     show or follow daemon logs
- *   openllmd doctor               print a copyable local diagnostic report
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd sessions <on|off|status>  opt in/out of remote terminal sessions (default off)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
@@ -24,9 +23,8 @@
 import { isAbsolute } from "node:path";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { runLinuxPdeathsigWrapper } from "./child-supervisor";
-import { COMMANDS, FLAGS } from "./commands";
+import { COMMANDS, FLAGS, formatHelpRows } from "./commands";
 import { runCompletion } from "./completion";
-import { runDoctor } from "./doctor";
 import { logError } from "./logger";
 import { runLogs } from "./logs";
 import { ptySessionsEnabled, setPtySessions } from "./pty-sessions-pref";
@@ -41,23 +39,25 @@ import { runSessionHostProcess } from "./session-host-proc";
 import { runUninstall } from "./uninstall";
 import { DAEMON_VERSION } from "./version";
 
-const COL = 36;
-const row = (left: string, desc: string): string =>
-  `  ${left.padEnd(COL)}${desc}`;
+const HELP = `openllmd v${DAEMON_VERSION}  —  OpenLLM local daemon
 
-// Rendered from the shared command/flag definitions so help and completion
-// (completion.ts, same source) can't drift.
-const HELP = `openllmd — OpenLLM local daemon (v${DAEMON_VERSION})
-
-Usage:
+Usage
   openllmd [command]
 
-Commands:
-${row("(none)", "Run the daemon in the foreground (used by the service)")}
-${COMMANDS.map((c) => row(c.args ? `${c.name} ${c.args}` : c.name, c.description)).join("\n")}
+Commands
+${formatHelpRows([
+  {
+    left: "(none)",
+    right: "Run the daemon in the foreground (used by the service)",
+  },
+  ...COMMANDS.map((c) => ({
+    left: c.args === undefined ? c.name : `${c.name} ${c.args}`,
+    right: c.description,
+  })),
+])}
 
-Flags:
-${FLAGS.map((f) => row(f.name, f.description)).join("\n")}
+Flags
+${formatHelpRows(FLAGS.map((f) => ({ left: f.name, right: f.description })))}
 
 State lives under ~/.openllm (override with OPENLLM_DAEMON_STATE_DIR).
 `;
@@ -256,21 +256,6 @@ export const runCli = (): boolean => {
     case "logs":
       runLogs(rest);
       break;
-    case "doctor":
-      if (rest.length > 0) {
-        process.stderr.write("usage: openllmd doctor\n");
-        process.exit(2);
-      }
-      runDoctor()
-        .then((report) => {
-          process.stdout.write(report);
-          process.exit(0);
-        })
-        .catch((err: unknown) => {
-          logError("doctor", err);
-          process.exit(1);
-        });
-      return true;
     case "auto-update":
       runAutoUpdate(rest);
       break;

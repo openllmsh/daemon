@@ -5,7 +5,7 @@
  * prefers the user systemd journal when its unit is registered, then falls back
  * to the same state-dir files for from-source and non-systemd installations.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   daemonStderrLogFilePath,
@@ -96,17 +96,144 @@ const journalAvailable = (): boolean => {
   }
 };
 
-const tailFiles = (opts: TLogsOpts, paths: readonly string[]): number => {
+const padRight = (value: string, width: number): string =>
+  value.length >= width ? value : `${value}${" ".repeat(width - value.length)}`;
+
+const formatTs = (iso: string): string => {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${month}-${day} ${hours}:${minutes}:${seconds}`;
+};
+
+const formatMeta = (meta: unknown): string => {
+  if (meta === undefined || meta === null) return "";
+  if (typeof meta !== "object") return String(meta);
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
+    if (value === undefined || value === null) continue;
+    const raw =
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+        ? String(value)
+        : JSON.stringify(value);
+    const clipped = raw.length > 48 ? `${raw.slice(0, 47)}…` : raw;
+    parts.push(`${key}=${clipped}`);
+    if (parts.length >= 6) break;
+  }
+  return parts.join(" ");
+};
+
+/**
+ * Turn one daemon log line into a scannable row. Structured JSON becomes
+ * `MM-DD HH:MM:SS  level  scope  message  k=v`; anything else (supervisor
+ * stdout, journald text, tail file headers) is left readable.
+ */
+export const formatLogLine = (line: string): string => {
+  const trimmed = line.trimEnd();
+  if (trimmed.length === 0) return "";
+  const header = trimmed.match(/^==>\s+(.+?)\s+<==$/);
+  if (header !== null) return `\n── ${header[1]} ──`;
+  if (!trimmed.startsWith("{")) return trimmed;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+  if (parsed === null || typeof parsed !== "object") return trimmed;
+  const rec = parsed as Record<string, unknown>;
+  const ts = typeof rec.ts === "string" ? formatTs(rec.ts) : "";
+  const level = typeof rec.level === "string" ? rec.level.toLowerCase() : "";
+  const scope = typeof rec.scope === "string" ? rec.scope : "";
+  const message = typeof rec.message === "string" ? rec.message : "";
+  if (ts.length === 0 && level.length === 0 && message.length === 0) {
+    return trimmed;
+  }
+  const metaText = formatMeta(rec.meta);
+  const row = [ts, padRight(level, 5), padRight(scope, 16), message]
+    .filter((part) => part.length > 0)
+    .join("  ");
+  return metaText.length === 0 ? row : `${row}  ${metaText}`;
+};
+
+const writeFormatted = (text: string): void => {
+  for (const line of text.split("\n")) {
+    if (line.length === 0) continue;
+    process.stdout.write(`${formatLogLine(line)}\n`);
+  }
+};
+
+const runFormattedSync = (command: string, args: readonly string[]): number => {
+  const result = spawnSync(command, [...args], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  writeFormatted(typeof result.stdout === "string" ? result.stdout : "");
+  if (result.error !== undefined || result.status === null) return 1;
+  return result.status;
+};
+
+const runFormattedFollow = (
+  command: string,
+  args: readonly string[],
+): Promise<number> =>
+  new Promise<number>((resolve) => {
+    const child = spawn(command, [...args], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let leftover = "";
+    let settled = false;
+    const finish = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      if (leftover.length > 0) {
+        process.stdout.write(`${formatLogLine(leftover)}\n`);
+      }
+      resolve(code);
+    };
+    const onSignal = (): void => {
+      child.kill("SIGTERM");
+    };
+    child.stdout?.on("data", (chunk: Buffer) => {
+      leftover += chunk.toString("utf-8");
+      const parts = leftover.split("\n");
+      leftover = parts.pop() ?? "";
+      for (const part of parts) {
+        process.stdout.write(`${formatLogLine(part)}\n`);
+      }
+    });
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    child.on("error", () => {
+      finish(1);
+    });
+    child.on("close", (code) => {
+      finish(code ?? 1);
+    });
+  });
+
+const tailArgs = (
+  opts: TLogsOpts,
+  paths: readonly string[],
+): readonly string[] => {
   const args = ["-n", String(opts.lines)];
   if (opts.follow) args.push("-F");
   args.push(...paths);
-  return spawnSync("tail", args, { stdio: "inherit" }).status ?? 0;
+  return args;
 };
 
-const tailJournal = (opts: TLogsOpts): number => {
+const journalArgs = (opts: TLogsOpts): readonly string[] => {
   const args = ["--user", "--unit", UNIT, "-n", String(opts.lines)];
   if (opts.follow) args.push("-f");
-  return spawnSync("journalctl", args, { stdio: "inherit" }).status ?? 0;
+  return args;
 };
 
 /** Read the tail of locally available daemon log files for non-interactive diagnostics. */
@@ -123,7 +250,7 @@ export const readRecentLogLines = (maxLines = 300): readonly string[] => {
 };
 
 /** Run the `logs` subcommand. `args` is everything after `logs`. Exits. */
-export const runLogs = (args: readonly string[]): never => {
+export const runLogs = (args: readonly string[]): void => {
   const opts = parseLogsArgs(args);
   if (opts === null) {
     process.stderr.write("usage: openllmd logs [-f] [-n N]\n");
@@ -136,9 +263,15 @@ export const runLogs = (args: readonly string[]): never => {
     );
     process.exit(1);
   }
-  const code =
+  const command = source.kind === "journal" ? "journalctl" : "tail";
+  const commandArgs =
     source.kind === "journal"
-      ? tailJournal(opts)
-      : tailFiles(opts, source.paths);
-  process.exit(code);
+      ? journalArgs(opts)
+      : tailArgs(opts, source.paths);
+  if (!opts.follow) {
+    process.exit(runFormattedSync(command, commandArgs));
+  }
+  void runFormattedFollow(command, commandArgs)
+    .then((code) => process.exit(code))
+    .catch(() => process.exit(1));
 };
