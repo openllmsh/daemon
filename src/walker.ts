@@ -68,6 +68,7 @@ import {
   MAX_LAST_RESORT_COMPACTION_ROUNDS,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
+import { applyOutputTokenBackfill } from "@openllmsh/wire/features/max-tokens-backfill";
 import {
   GATE_STALE_CAP_MS,
   quotaGateDecision,
@@ -1033,7 +1034,14 @@ const serveSubscription = async (
   let body = await applyDelegateModelCompat(
     getDelegate(hop.provider),
     hop.providerModelId,
-    built.body,
+    applyOutputTokenBackfill(built.body, {
+      hopModelId: hop.modelId,
+      rawBody: args.rawBody,
+      getOutputTokenLimit: (modelId) =>
+        lookupCatalogEntry(modelId)?.output_token_limit ?? null,
+      wire,
+      codexInstructions: wantsCodexPreamble(hop.provider),
+    }),
   );
   // Provider-native search: the client DECLARED the Anthropic
   // `web_search_*` server tool — an explicit platform-executes-search

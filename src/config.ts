@@ -9,8 +9,9 @@
  *
  * The walker makes ZERO routing decisions (the cloud resolved the chain
  * and 307'd it as `?__plan=`), so the daemon only needs from the snapshot:
- * model id → `provider_model_id` (catalog), the per-user plan-signing key,
- * and the cloud-state for `/status`. The fallback/binding/token-limit
+ * model id → `provider_model_id` (catalog), per-model `output_token_limit`
+ * (raise-only max-tokens backfill on alias hops), the per-user
+ * plan-signing key, and the cloud-state for `/status`. Fallback/binding
  * fields ride along in the wire shape but are unused on the box.
  */
 
