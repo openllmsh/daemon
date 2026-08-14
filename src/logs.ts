@@ -7,6 +7,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import {
   daemonStderrLogFilePath,
   daemonStdoutLogFilePath,
@@ -110,18 +111,36 @@ const formatTs = (iso: string): string => {
   return `${month}-${day} ${hours}:${minutes}:${seconds}`;
 };
 
+/** Keep a formatted row on one line: visible escapes for controls and `\`. */
+const escapeLogField = (value: string): string => {
+  let out = "";
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (ch === "\\") out += "\\\\";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\t") out += "\\t";
+    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      out += `\\u${code.toString(16).padStart(4, "0")}`;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+};
+
 const formatMeta = (meta: unknown): string => {
   if (meta === undefined || meta === null) return "";
-  if (typeof meta !== "object") return String(meta);
+  if (typeof meta !== "object") return escapeLogField(String(meta));
   const parts: string[] = [];
   for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
     if (value === undefined || value === null) continue;
     const raw =
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean"
-        ? String(value)
-        : JSON.stringify(value);
+      typeof value === "string"
+        ? escapeLogField(value)
+        : typeof value === "number" || typeof value === "boolean"
+          ? String(value)
+          : JSON.stringify(value);
     const clipped = raw.length > 48 ? `${raw.slice(0, 47)}…` : raw;
     parts.push(`${key}=${clipped}`);
     if (parts.length >= 6) break;
@@ -150,8 +169,9 @@ export const formatLogLine = (line: string): string => {
   const rec = parsed as Record<string, unknown>;
   const ts = typeof rec.ts === "string" ? formatTs(rec.ts) : "";
   const level = typeof rec.level === "string" ? rec.level.toLowerCase() : "";
-  const scope = typeof rec.scope === "string" ? rec.scope : "";
-  const message = typeof rec.message === "string" ? rec.message : "";
+  const scope = typeof rec.scope === "string" ? escapeLogField(rec.scope) : "";
+  const message =
+    typeof rec.message === "string" ? escapeLogField(rec.message) : "";
   if (ts.length === 0 && level.length === 0 && message.length === 0) {
     return trimmed;
   }
@@ -179,6 +199,29 @@ const runFormattedSync = (command: string, args: readonly string[]): number => {
   return result.status;
 };
 
+/** Incremental UTF-8 line splitter so multi-byte chars survive chunk boundaries. */
+export const createUtf8LineBuffer = (): {
+  readonly push: (chunk: Buffer) => readonly string[];
+  readonly flush: () => string;
+} => {
+  const decoder = new StringDecoder("utf8");
+  let leftover = "";
+  return {
+    push: (chunk: Buffer): readonly string[] => {
+      leftover += decoder.write(chunk);
+      const parts = leftover.split("\n");
+      leftover = parts.pop() ?? "";
+      return parts;
+    },
+    flush: (): string => {
+      leftover += decoder.end();
+      const rest = leftover;
+      leftover = "";
+      return rest;
+    },
+  };
+};
+
 const runFormattedFollow = (
   command: string,
   args: readonly string[],
@@ -187,13 +230,14 @@ const runFormattedFollow = (
     const child = spawn(command, [...args], {
       stdio: ["ignore", "pipe", "inherit"],
     });
-    let leftover = "";
+    const lines = createUtf8LineBuffer();
     let settled = false;
     const finish = (code: number): void => {
       if (settled) return;
       settled = true;
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      const leftover = lines.flush();
       if (leftover.length > 0) {
         process.stdout.write(`${formatLogLine(leftover)}\n`);
       }
@@ -203,10 +247,7 @@ const runFormattedFollow = (
       child.kill("SIGTERM");
     };
     child.stdout?.on("data", (chunk: Buffer) => {
-      leftover += chunk.toString("utf-8");
-      const parts = leftover.split("\n");
-      leftover = parts.pop() ?? "";
-      for (const part of parts) {
+      for (const part of lines.push(chunk)) {
         process.stdout.write(`${formatLogLine(part)}\n`);
       }
     });
