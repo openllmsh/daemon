@@ -27,8 +27,10 @@ export const signalGroup = (pgid: number, signal: NodeJS.Signals): boolean => {
 export const terminateProcessGroup = async (
   pgid: number,
   graceMs: number = DEFAULT_TERMINATE_GRACE_MS,
+  isStillOwned?: () => boolean,
 ): Promise<void> => {
   if (!signalGroup(pgid, "SIGTERM")) return;
   await pause(Math.max(0, graceMs));
+  if (isStillOwned !== undefined && !isStillOwned()) return;
   signalGroup(pgid, "SIGKILL");
 };

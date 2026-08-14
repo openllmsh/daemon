@@ -23,8 +23,8 @@
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { guardCrashLoop, markHealthyBoot } from "./boot-guard";
 import {
+  drainDisposableChildren,
   sweepStaleChildrenOnBoot,
-  terminateAllDisposable,
 } from "./child-supervisor";
 import { runCli } from "./cli";
 import { maybeUpdateCli } from "./cli-self-update";
@@ -127,9 +127,7 @@ const main = async (): Promise<void> => {
   // launch agent / systemd unit restart it clean. `logError` writes
   // synchronously (appendFileSync), so the line is flushed before exit.
   const exitAfterDisposableDrain = (code: number): void => {
-    void terminateAllDisposable()
-      .catch((err) => logError("child-supervisor", err))
-      .finally(() => process.exit(code));
+    void drainDisposableChildren().finally(() => process.exit(code));
   };
   process.on("uncaughtException", (err) => {
     // A remote peer's dead socket is not this process's problem — see
@@ -254,13 +252,9 @@ const main = async (): Promise<void> => {
     } catch (err) {
       logError("control-channel", err);
     }
-    try {
-      // Durable local session hosts are detached from this daemon. The
-      // supervisor tracks only disposable children, leaving their PTYs alone.
-      await terminateAllDisposable();
-    } catch (err) {
-      logError("child-supervisor", err);
-    }
+    // Durable local session hosts are detached from this daemon. The supervisor
+    // tracks only disposable children, leaving their PTYs alone.
+    await drainDisposableChildren();
     process.exit(signal === "SIGINT" ? 130 : 143);
   };
   const shutdown = (signal: NodeJS.Signals): void => {

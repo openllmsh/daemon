@@ -1,3 +1,4 @@
+export * from "./drain";
 export * from "./linux-pdeathsig";
 export * from "./posix";
 export * from "./registry";

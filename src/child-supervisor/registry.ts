@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { stateDir } from "../env";
+import { logDebug } from "../logger";
 
 export type TDisposableChildKind =
   | "probe"
@@ -76,15 +77,12 @@ export const processStartTime = (pid: number): string | null => {
   }
 };
 
-export const currentDaemonInstanceId = (): string => {
-  const startTime = processStartTime(process.pid);
-  // The boot process must be distinguishable even on a platform where its
-  // creation timestamp cannot be read. The random-like startup timestamp is
-  // intentionally process-local rather than durable state.
-  return `${process.pid}:${startTime ?? String(Date.now())}`;
-};
+// The boot process must be distinguishable even on a platform where its
+// creation timestamp cannot be read. The random-like startup timestamp is
+// intentionally process-local rather than durable state.
+const daemonInstanceId = `${process.pid}:${processStartTime(process.pid) ?? String(Date.now())}`;
 
-const daemonInstanceId = currentDaemonInstanceId();
+export const currentDaemonInstanceId = (): string => daemonInstanceId;
 
 export const currentChildSupervisorInstanceId = (): string => daemonInstanceId;
 
@@ -99,7 +97,12 @@ export const addChildRegistryRecord = (record: TChildRegistryRecord): void => {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     renameSync(temporary, target);
-  } catch {
+  } catch (error) {
+    logDebug("child-supervisor", "failed to persist child registry record", {
+      pid: record.pid,
+      kind: record.kind,
+      error: error instanceof Error ? error.message : String(error),
+    });
     try {
       rmSync(temporary, { force: true });
     } catch {

@@ -75,10 +75,26 @@ export const resolveLogSource = (
 };
 
 /** journalctl present AND the unit known to the user manager (exit 0). */
-const journalAvailable = (): boolean =>
-  spawnSync("journalctl", ["--user", "--unit", UNIT, "-n", "0"], {
-    stdio: "ignore",
-  }).status === 0;
+const journalAvailable = (): boolean => {
+  try {
+    const unitRegistered =
+      spawnSync(
+        "systemctl",
+        ["--user", "show", "--property", "LoadState", UNIT],
+        {
+          stdio: "ignore",
+        },
+      ).status === 0;
+    if (!unitRegistered) return false;
+    return (
+      spawnSync("journalctl", ["--user", "--unit", UNIT, "-n", "0"], {
+        stdio: "ignore",
+      }).status === 0
+    );
+  } catch {
+    return false;
+  }
+};
 
 const tailFiles = (opts: TLogsOpts, paths: readonly string[]): number => {
   const args = ["-n", String(opts.lines)];

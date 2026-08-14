@@ -12,14 +12,11 @@ import { isDevMode, stateDir } from "../env";
  */
 export const daemonSelfInvocation = (): readonly string[] => {
   const sourceRunner = process.argv[1];
-  if (isDevMode()) {
-    return sourceRunner === undefined
+  const fallback =
+    sourceRunner === undefined
       ? [process.execPath]
       : [process.execPath, sourceRunner];
-  }
+  if (isDevMode()) return fallback;
   const installed = join(stateDir(), "bin", "openllmd");
-  if (existsSync(installed)) return [installed];
-  return sourceRunner === undefined
-    ? [process.execPath]
-    : [process.execPath, sourceRunner];
+  return existsSync(installed) ? [installed] : fallback;
 };

@@ -7,7 +7,7 @@ import {
 import { getCloudState } from "./config";
 import { daemonPort, isDevMode, stateDir } from "./env";
 import { readRecentLogLines } from "./logs";
-import { supervisorPid, supervisorState } from "./service";
+import { supervisorInfo } from "./service";
 import { computeStatus } from "./status";
 import { DAEMON_VERSION } from "./version";
 
@@ -58,7 +58,7 @@ const processSnapshot = (): readonly TDoctorProcess[] => {
   }
 };
 
-const redact = (value: string): string =>
+export const redact = (value: string): string =>
   value
     .replace(/sk-llm-[A-Za-z0-9._-]+/g, "sk-llm-[REDACTED]")
     // Vendor key prefixes (Anthropic sk-ant-, OpenAI sk-proj-, OpenRouter
@@ -68,6 +68,9 @@ const redact = (value: string): string =>
       /\b(sk-(?:ant|proj|or)|ghp|gho|github_pat)[-_][A-Za-z0-9._-]+/g,
       "$1-[REDACTED]",
     )
+    // Generic API keys after vendor-specific forms so their prefixes retain the
+    // established redacted shape above.
+    .replace(/\bsk-(?!(?:llm|ant|proj|or)-)[A-Za-z0-9._-]+/g, "sk-[REDACTED]")
     // Compact JWTs (access/refresh tokens often embed one).
     .replace(/\beyJ[A-Za-z0-9._-]{20,}/g, "[REDACTED_JWT]")
     // Account email addresses (identity, not a secret, but still PII).
@@ -113,13 +116,14 @@ export const runDoctor = async (): Promise<string> => {
   // `openllmd doctor` runs as a SEPARATE process, so process.pid is the CLI, not
   // the daemon — use the supervisor-reported daemon PID. When none is live,
   // process metrics are rendered unavailable rather than measuring the CLI.
-  const daemonPid = ((): number | null => {
+  const supervisor = (() => {
     try {
-      return supervisorPid();
+      return supervisorInfo();
     } catch {
-      return null;
+      return { state: "unavailable", pid: null };
     }
   })();
+  const daemonPid = supervisor.pid;
   const daemon =
     daemonPid === null
       ? undefined
@@ -148,21 +152,13 @@ export const runDoctor = async (): Promise<string> => {
     (total, child) => total + child.rssKiB,
     0,
   );
-  const supervisor = (() => {
-    try {
-      return supervisorState();
-    } catch {
-      return "unavailable";
-    }
-  })();
-
   return [
     "OpenLLM daemon doctor",
     "",
     "Daemon",
     `  version: ${DAEMON_VERSION}`,
     `  listening: ${listening ? `yes (127.0.0.1:${port})` : `no (127.0.0.1:${port})`}`,
-    `  service supervisor: ${supervisor}`,
+    `  service supervisor: ${supervisor.state}`,
     `  cloud state: ${status?.cloud_state ?? getCloudState()}`,
     "",
     "Child supervisor",

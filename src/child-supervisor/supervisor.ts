@@ -1,3 +1,4 @@
+import { logError } from "../logger";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
 import {
   DEFAULT_TERMINATE_GRACE_MS,
@@ -169,7 +170,9 @@ export const superviseSpawn = (
       argvDigest: argvDigest(argv),
       startedAtMs: Date.now(),
     });
-  void finishTrackedChild(handle);
+  void finishTrackedChild(handle).catch((error) =>
+    logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
+  );
   return handle;
 };
 

@@ -56,10 +56,15 @@ export const runLinuxPdeathsigWrapper = async (
   // glibc ships `libc.so.6`; musl (Alpine, and the linux-*-baseline targets can
   // land there) ships `libc.musl-<arch>.so.1` and has no `libc.so.6`. Try the
   // common sonames in turn so the wrapper works on both libc flavors.
+  const muslArch =
+    process.arch === "arm64"
+      ? "aarch64"
+      : process.arch === "x64"
+        ? "x86_64"
+        : null;
   const libcCandidates = [
     "libc.so.6",
-    "libc.musl-x86_64.so.1",
-    "libc.musl-aarch64.so.1",
+    ...(muslArch === null ? [] : [`libc.musl-${muslArch}.so.1`]),
     "libc.so",
   ];
   let symbols: ReturnType<typeof dlopen>["symbols"] | null = null;

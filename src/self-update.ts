@@ -29,7 +29,7 @@ import { DAEMON_RELEASE } from "../manifest";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
-import { terminateAllDisposable } from "./child-supervisor";
+import { drainDisposableChildren } from "./child-supervisor";
 import { daemonEnv } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn } from "./logger";
@@ -232,13 +232,9 @@ export const maybeSelfUpdate = async (
       `updated ${DAEMON_VERSION} → ${latest}; restarting when idle`,
     );
     await waitUntilIdle();
-    try {
-      await terminateAllDisposable();
-    } catch (err) {
-      // The binary has already swapped; a supervisor failure must not prevent
-      // the exit that lets launchd/systemd start the replacement daemon.
-      logError("child-supervisor", err);
-    }
+    // The binary has already swapped; bounded cleanup must not prevent the exit
+    // that lets launchd/systemd start the replacement daemon.
+    await drainDisposableChildren();
     process.exit(0);
   } catch (err) {
     logError("self-update", err, { target, latest });

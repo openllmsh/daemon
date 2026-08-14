@@ -208,9 +208,7 @@ const CLI_VERSION_HARD_MAX_MS = envMs(
  * value would be visible that early). The 3s default is daemon-owned, so the
  * guard holds with no `.env` or plist edit at all. */
 const cliVersionProbeTimeoutMs = (): number =>
-  // Floor at 250ms: envMs accepts 0 (>= 0), and a 0ms deadline would kill every
-  // probe before it can print, reporting every installed CLI as absent.
-  Math.max(250, envMs("OPENLLM_CLI_VERSION_PROBE_TIMEOUT_MS", 3_000));
+  envMs("OPENLLM_CLI_VERSION_PROBE_TIMEOUT_MS", 3_000);
 
 interface CliInstallCacheEntry {
   readonly result: TCliInstallState;

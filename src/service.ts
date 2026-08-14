@@ -461,26 +461,38 @@ export const renderLaunchdSupervisor = (s: {
   return `not running${exit}`;
 };
 
-export const supervisorState = (): string => {
+export type TSupervisorInfo = {
+  readonly pid: number | null;
+  readonly state: string;
+};
+
+/** Capture the daemon supervisor once for callers that need both state and PID. */
+export const supervisorInfo = (): TSupervisorInfo => {
   if (isMac) {
     // `launchctl print` exits non-zero (empty capture) when the label isn't
     // bootstrapped at all.
     const out = capture("launchctl", ["print", guiTarget()]);
-    return out.length === 0
-      ? "not loaded"
-      : renderLaunchdSupervisor(parseLaunchctlPrint(out));
+    if (out.length === 0) return { state: "not loaded", pid: null };
+    const parsed = parseLaunchctlPrint(out);
+    return { state: renderLaunchdSupervisor(parsed), pid: parsed.pid };
   }
   const out = capture("systemctl", [
     "--user",
     "show",
     "-p",
-    "ActiveState,SubState,NRestarts,ExecMainStatus,Result",
+    "ActiveState,SubState,NRestarts,ExecMainStatus,Result,MainPID",
     "openllmd.service",
   ]);
-  return out.length === 0
-    ? "unknown"
-    : renderSystemdSupervisor(parseKeyValues(out));
+  if (out.length === 0) return { state: "unknown", pid: null };
+  const fields = parseKeyValues(out);
+  const pid = Number.parseInt(fields.MainPID ?? "", 10);
+  return {
+    state: renderSystemdSupervisor(fields),
+    pid: Number.isFinite(pid) && pid > 0 ? pid : null,
+  };
 };
+
+export const supervisorState = (): string => supervisorInfo().state;
 
 /**
  * The RUNNING daemon's PID as reported by the service supervisor — launchd on
@@ -488,22 +500,7 @@ export const supervisorState = (): string => {
  * live. Callers running as a SEPARATE process (e.g. `openllmd doctor`) must use
  * this, never `process.pid`, to inspect the daemon's own process tree.
  */
-export const supervisorPid = (): number | null => {
-  if (isMac) {
-    const out = capture("launchctl", ["print", guiTarget()]);
-    return out.length === 0 ? null : parseLaunchctlPrint(out).pid;
-  }
-  const out = capture("systemctl", [
-    "--user",
-    "show",
-    "-p",
-    "MainPID",
-    "openllmd.service",
-  ]);
-  const match = out.match(/MainPID=(\d+)/);
-  const pid = match ? Number.parseInt(match[1], 10) : 0;
-  return pid > 0 ? pid : null;
-};
+export const supervisorPid = (): number | null => supervisorInfo().pid;
 
 /**
  * Probe the running daemon's read-only `/status` (see `health.ts`/`main.ts`).

@@ -109,6 +109,10 @@ const SIGNAL_NAMES: Record<number, string> = {
 
 /** Hard ceiling for one-shot vendor CLI captures and probes. */
 export const DEFAULT_CAPTURE_TIMEOUT_MS = 5_000;
+const MIN_CAPTURE_TIMEOUT_MS = 250;
+
+const captureTimeoutMs = (timeoutMs: number | undefined): number =>
+  Math.max(MIN_CAPTURE_TIMEOUT_MS, timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS);
 
 export type TRunCaptureOpts = {
   /** Skip the sandbox shim for a read-only probe that needs direct execution. */
@@ -173,7 +177,7 @@ export const runCapture = async (
       const timeout = new Promise<TCaptureOutcome>((resolve) => {
         timer = setTimeout(
           () => resolve({ kind: "timeout" }),
-          opts?.timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS,
+          captureTimeoutMs(opts?.timeoutMs),
         );
       });
       const outcome = await Promise.race([complete, timeout]);
