@@ -141,6 +141,7 @@ import {
   buildUpstreamRequest,
   canonicalFromInbound,
   clientWireOf,
+  UnsupportedContentError,
 } from "@openllmsh/wire/providers/upstream-request";
 import { Schema } from "effect";
 import type { TCacheProbe } from "./cache-probe";
@@ -266,6 +267,13 @@ type THop = {
   readonly modelId: string;
   readonly provider: string;
   readonly providerModelId: string;
+  /**
+   * Catalog capabilities for this hop. Always present: `[]` when the
+   * daemon catalog has no row (or an older cloud omitted the field) —
+   * unknown, never treated as known-non-vision. Not part of the signed
+   * plan payload; resolved locally from the bootstrap catalog.
+   */
+  readonly capabilities: ReadonlyArray<string>;
 };
 
 /** Parse `?__plan=provider/model,provider/model` into ordered model ids.
@@ -288,20 +296,27 @@ export const parsePlan = (planParam: string | null): ReadonlyArray<string> =>
 export const resolveHop = (modelId: string, providerModelId?: string): THop => {
   const slash = modelId.indexOf("/");
   const provider = slash > 0 ? modelId.slice(0, slash) : modelId;
-  if (providerModelId !== undefined && providerModelId.length > 0) {
-    return { modelId, provider, providerModelId };
-  }
   const entry = lookupCatalogEntry(modelId);
+  const capabilities = entry?.capabilities ?? [];
+  if (providerModelId !== undefined && providerModelId.length > 0) {
+    return { modelId, provider, providerModelId, capabilities };
+  }
   if (entry !== null) {
     return {
       modelId,
       provider: entry.provider,
       providerModelId: entry.provider_model_id,
+      capabilities,
     };
   }
   return slash > 0
-    ? { modelId, provider, providerModelId: modelId.slice(slash + 1) }
-    : { modelId, provider: modelId, providerModelId: modelId };
+    ? {
+        modelId,
+        provider,
+        providerModelId: modelId.slice(slash + 1),
+        capabilities,
+      }
+    : { modelId, provider: modelId, providerModelId: modelId, capabilities };
 };
 
 /**
@@ -1018,18 +1033,29 @@ const serveSubscription = async (
   const clientWantsStream =
     (args.rawBody as { stream?: unknown } | null)?.stream === true;
   // ONE shared recipe — body + headers — for the (clientWire × upstreamWire)
-  // pairing (the cloud runner calls the same builder).
-  const built = buildUpstreamRequest({
-    surface: args.surface,
-    upstreamWire: wire,
-    rawBody: args.rawBody,
-    providerModelId: hop.providerModelId,
-    stream: clientWantsStream,
-    baseHeaders,
-    inboundBeta: inboundBetaOf(args),
-    isOAuth: wire === "anthropic",
-    codexInstructions: wantsCodexPreamble(hop.provider),
-  });
+  // pairing (the cloud runner calls the same builder). Capabilities come
+  // from the bootstrap catalog via `resolveHop` — never injected by hand.
+  let built: ReturnType<typeof buildUpstreamRequest>;
+  try {
+    built = buildUpstreamRequest({
+      surface: args.surface,
+      upstreamWire: wire,
+      rawBody: args.rawBody,
+      providerModelId: hop.providerModelId,
+      stream: clientWantsStream,
+      baseHeaders,
+      inboundBeta: inboundBetaOf(args),
+      isOAuth: wire === "anthropic",
+      codexInstructions: wantsCodexPreamble(hop.provider),
+      capabilities: hop.capabilities,
+    });
+  } catch (err) {
+    if (err instanceof UnsupportedContentError) {
+      if (!finalHop) return hopRetry("unsupported_content");
+      return errorJson(400, err.message, "unsupported_content");
+    }
+    throw err;
+  }
   const headers = built.headers;
   let body = await applyDelegateModelCompat(
     getDelegate(hop.provider),
@@ -2902,18 +2928,27 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
   if (url === null) {
     return estimate("captured upstream url is not a /messages endpoint");
   }
-  const built = buildUpstreamRequest({
-    surface: "messages",
-    upstreamWire: "anthropic",
-    rawBody: args.rawBody,
-    providerModelId: hop.providerModelId,
-    // `undefined` preserves the body's own stream flag — a count_tokens body
-    // carries none, and injecting one would diverge from the real CLI.
-    stream: undefined,
-    baseHeaders: acquired.headers,
-    inboundBeta: inboundBetaOf(args),
-    isOAuth: true,
-  });
+  let built: ReturnType<typeof buildUpstreamRequest>;
+  try {
+    built = buildUpstreamRequest({
+      surface: "messages",
+      upstreamWire: "anthropic",
+      rawBody: args.rawBody,
+      providerModelId: hop.providerModelId,
+      // `undefined` preserves the body's own stream flag — a count_tokens body
+      // carries none, and injecting one would diverge from the real CLI.
+      stream: undefined,
+      baseHeaders: acquired.headers,
+      inboundBeta: inboundBetaOf(args),
+      isOAuth: true,
+      capabilities: hop.capabilities,
+    });
+  } catch (err) {
+    if (err instanceof UnsupportedContentError) {
+      return estimate("unsupported_content");
+    }
+    throw err;
+  }
   let resp: Response;
   let text: string;
   try {
@@ -2969,6 +3004,12 @@ export const runResponsesCompact = async (
     planTrusted ? args.pmidsParam : null,
     args.rawBody,
   );
+  const compactPlan = parsePlan(planTrusted ? args.planParam : null);
+  const compactPmids =
+    planTrusted && args.pmidsParam !== null ? args.pmidsParam.split(",") : [];
+  const compactHop = compactPlan
+    .map((modelId, i) => resolveHop(modelId, compactPmids[i]))
+    .find((h) => h.provider === "chatgpt");
   const acquired = await acquireUpstream("chatgpt", args);
   if (acquired === "retry") {
     return errorJson(
@@ -2976,17 +3017,26 @@ export const runResponsesCompact = async (
       "no usable chatgpt credential on this daemon — connect the Codex CLI on /providers first",
     );
   }
-  const built = buildUpstreamRequest({
-    surface: "responses",
-    upstreamWire: "chatgpt",
-    rawBody: args.rawBody,
-    providerModelId,
-    stream: false,
-    baseHeaders: acquired.headers,
-    inboundBeta: null,
-    isOAuth: false,
-    codexInstructions: wantsCodexPreamble("chatgpt"),
-  });
+  let built: ReturnType<typeof buildUpstreamRequest>;
+  try {
+    built = buildUpstreamRequest({
+      surface: "responses",
+      upstreamWire: "chatgpt",
+      rawBody: args.rawBody,
+      providerModelId,
+      stream: false,
+      baseHeaders: acquired.headers,
+      inboundBeta: null,
+      isOAuth: false,
+      codexInstructions: wantsCodexPreamble("chatgpt"),
+      capabilities: compactHop?.capabilities ?? [],
+    });
+  } catch (err) {
+    if (err instanceof UnsupportedContentError) {
+      return errorJson(400, err.message, "unsupported_content");
+    }
+    throw err;
+  }
   // Compact is strictly non-streaming — codex-rs DELETES the stream flag
   // rather than sending `stream: false`.
   const body =

@@ -179,3 +179,14 @@ export const latestCliVersion = (): string | null =>
 export const lookupCatalogEntry = (
   modelId: string,
 ): TDaemonCatalogEntry | null => byModelId.get(modelId) ?? null;
+
+/**
+ * Test seam: pin the in-memory catalog the walker resolves hops against.
+ * Production never calls this — bootstrap is the only writer.
+ */
+export const setCatalogForTest = (
+  catalog: ReadonlyArray<TDaemonCatalogEntry>,
+): void => {
+  snapshot = { ...EMPTY, catalog: [...catalog] };
+  byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
+};

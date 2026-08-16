@@ -116,11 +116,23 @@ export const isPreflight = (req: Request): boolean => req.method === "OPTIONS";
 export const preflightResponse = (req: Request): Response =>
   new Response(null, { status: 204, headers: corsHeaders(req) });
 
-/** A JSON error envelope (`{ error: { message } }`) — the daemon's standard
- *  error shape, shared by the listener + the walker. CORS is layered on by
- *  the caller's `withCors`. */
-export const errorJson = (status: number, message: string): Response =>
-  new Response(JSON.stringify({ error: { message } }), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+/** A JSON error envelope (`{ error: { message, type? } }`) — the daemon's
+ *  standard error shape, shared by the listener + the walker. CORS is
+ *  layered on by the caller's `withCors`. */
+export const errorJson = (
+  status: number,
+  message: string,
+  type?: string,
+): Response =>
+  new Response(
+    JSON.stringify({
+      error: {
+        message,
+        ...(type !== undefined ? { type } : {}),
+      },
+    }),
+    {
+      status,
+      headers: { "content-type": "application/json" },
+    },
+  );
