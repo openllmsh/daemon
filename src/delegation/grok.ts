@@ -1,7 +1,9 @@
 /**
  * xAI Grok ("Grok Build", x.ai/cli) delegate.
  *
- * Native delegation: use the installed `grok` CLI's OWN bearer + identity.
+ * Native delegation: use the installed `grok` CLI's OWN bearer, under OUR OWN
+ * client identity (`user-agent: openllm/<ver>`, mirroring the OpenClaw client's
+ * `openclaw/<ver>`) — we do NOT present the Grok CLI's `x-grok-client-identifier`.
  * Grok Build is a subscription-OAuth coding agent (SuperGrok / X Premium+). We
  * never mint/forge/export the token — the daemon reads the CLI's own store and
  * injects the bearer for ONE inference call.
@@ -27,8 +29,8 @@
  *   - Usage: available at `cli-chat-proxy.grok.com/v1/billing` (the CLI chat
  *     proxy's OWN billing route — SAME host as inference — which the CLI's
  *     `billing.rs` reads for "View credit usage"). Bearer-authed with the CLI
- *     OAuth token (401 on a bad/absent token; the extra `x-grok-client-*`
- *     headers aren't required but are sent for parity). Returns
+ *     OAuth token (401 on a bad/absent token; the extra `x-grok-client-version`
+ *     header isn't required here but is sent for gate parity). Returns
  *     `{ config: { monthlyLimit:{val}, used:{val}, billingPeriodStart/End, … } }`
  *     for the MONTHLY view, and `?format=credits` for the WEEKLY Grok Build pool
  *     (`creditUsagePercent` / `productUsage[GrokBuild]` / `currentPeriod`) — the
@@ -59,6 +61,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { DAEMON_VERSION } from "../version";
 import { accountHashField } from "./account-id";
 import {
   ensureAuthConfig,
@@ -180,12 +183,18 @@ const parseExpiryMs = (iso: string | undefined): number | null => {
   return Number.isNaN(t) ? null : t;
 };
 
-// cli-chat-proxy.grok.com GATES on the CLI version header: a request without
-// `x-grok-client-version` (or with an old one) is rejected 426 "Your Grok CLI
-// version (none) is outdated. Please update to version 0.1.202 or later". We
-// send the INSTALLED binary's real version (the genuine CLI identity), read
-// once + memoized (it only changes on a CLI update); fall back to a known-good
-// floor if `--version` can't be read.
+// We identify as OURSELVES, not the Grok CLI. Mirroring the OpenClaw client
+// (`ref/openclaw/extensions/xai/xai-oauth.ts` — `User-Agent: openclaw/<ver>`,
+// and NO `x-grok-client-*` identity headers on the proxy), we present a
+// `user-agent: openllm/<ver>` and do NOT send `x-grok-client-identifier`. The
+// only `x-grok-*` header retained is the version below, and solely because
+// cli-chat-proxy.grok.com GATES on it: a request without `x-grok-client-version`
+// (or with an old one) is rejected 426 "Your Grok CLI version (none) is
+// outdated. Please update to version 0.1.202 or later". We send the INSTALLED
+// binary's real version, read once + memoized; fall back to a known-good floor
+// if `--version` can't be read. (Full OpenClaw parity would drop this header
+// too; that needs a live 426-gate test the audit never ran.)
+const OPENLLM_USER_AGENT = `openllm/${DAEMON_VERSION}`;
 let cachedVersion: string | null = null;
 const clientVersion = async (): Promise<string> => {
   if (cachedVersion !== null) return cachedVersion;
@@ -232,10 +241,12 @@ const readToken = async (): Promise<{
 };
 
 /**
- * The bearer + the CLI's genuine identity headers + account attribution,
- * shared by every grok upstream credential path (`credentialForUpstream` /
- * `credentialForImage`). The TARGET url is layered on by each caller. The
- * `x-grok-client-*` headers satisfy the 426 CLI-version gate.
+ * The bearer + our OWN client identity (`user-agent: openllm/<ver>`, like
+ * OpenClaw's `openclaw/<ver>`) + account attribution, shared by every grok
+ * upstream credential path (`credentialForUpstream` / `credentialForImage`).
+ * The TARGET url is layered on by each caller. `x-grok-client-version` is the
+ * only vendor-CLI header kept, solely to satisfy the 426 version gate; we do
+ * NOT send `x-grok-client-identifier` (we are not the Grok CLI).
  */
 const grokClientCredential = async (): Promise<{
   readonly access_token: string;
@@ -249,8 +260,8 @@ const grokClientCredential = async (): Promise<{
   return {
     access_token: token.accessToken,
     headers: {
+      "user-agent": OPENLLM_USER_AGENT,
       "x-grok-client-version": await clientVersion(),
-      "x-grok-client-identifier": "xai-grok-cli",
     },
     // Which account this hop's cost attributes to (recorded on the row).
     ...accountHashField(PROVIDER, token.session.user_id),
@@ -509,15 +520,16 @@ const fetchModelRows =
     if (token === null) return null;
     try {
       // Host derived from the CAPTURED inference URL via `resolveProviderUrl`;
-      // bearer + the CLI's genuine identity headers, mirroring the usage read.
+      // bearer + our own `openllm/<ver>` identity (+ the gate version header),
+      // mirroring the usage read.
       const resp = await fetch(
         await resolveProviderUrl(PROVIDER, "/v1/models"),
         {
           method: "GET",
           headers: {
             authorization: `Bearer ${token.accessToken}`,
+            "user-agent": OPENLLM_USER_AGENT,
             "x-grok-client-version": await clientVersion(),
-            "x-grok-client-identifier": "xai-grok-cli",
             accept: "application/json",
           },
           signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
@@ -625,12 +637,12 @@ export const grokDelegate: TProviderDelegate = {
     }
     // Same host as inference (`resolveProviderUrl` derives it from the captured
     // upstream, never spawning the CLI). The plain OAuth bearer is accepted; we
-    // send the CLI's genuine identity headers too, mirroring
-    // `credentialForUpstream`.
+    // send our own `openllm/<ver>` identity (+ the gate version header),
+    // mirroring `credentialForUpstream`.
     const headers = {
       authorization: `Bearer ${token.accessToken}`,
+      "user-agent": OPENLLM_USER_AGENT,
       "x-grok-client-version": await clientVersion(),
-      "x-grok-client-identifier": "xai-grok-cli",
       accept: "application/json",
     };
     // One authed billing GET → the parsed body, or a `{ error }` marker carrying
@@ -714,11 +726,11 @@ export const grokDelegate: TProviderDelegate = {
   unsupportedToolSchemaKeywords: ["minContains", "maxContains"],
 
   credentialForUpstream: async () => {
-    // cli-chat-proxy.grok.com gates on the CLI's genuine identity headers — a
-    // request without `x-grok-client-version` is rejected 426. `grokClientCredential`
-    // supplies the CLI's REAL version + client identifier (the same identity the
-    // official `grok` sends). The Responses TARGET URL is captured/default
-    // per-hop; the originator's other headers ride through.
+    // cli-chat-proxy.grok.com's 426 gate requires `x-grok-client-version`, so
+    // `grokClientCredential` supplies the installed CLI's REAL version — but we
+    // identify as ourselves (`user-agent: openllm/<ver>`) and do NOT send
+    // `x-grok-client-identifier`; we are not the Grok CLI. The Responses TARGET
+    // URL is captured/default per-hop; the originator's other headers ride through.
     return {
       ...(await grokClientCredential()),
       url: await resolveUpstreamUrl(PROVIDER),
