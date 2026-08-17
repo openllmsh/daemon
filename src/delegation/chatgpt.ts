@@ -1,9 +1,12 @@
 /**
  * ChatGPT (Codex) delegate.
  *
- * Native delegation: use the installed Codex CLI's OWN bearer + identity.
- * Replaces the server-side synthesis in `chatgpt/common.ts`. Residual T3:
- * Codex rides the private `backend-api/codex` API (proposal §5).
+ * Native delegation: use the installed Codex CLI's OWN bearer, under OUR OWN
+ * client identity (`user-agent: openllm/<ver>`, `originator: openllm`) — we do
+ * NOT synthesize the Codex CLI's `codex_cli_rs` identity. A genuine `codex`
+ * request proxied through the daemon keeps its OWN identity byte-for-byte; only
+ * a NON-codex caller gets our openllm identity. Codex rides the private
+ * `backend-api/codex` API (proposal §5).
  *
  * ISOLATED install: the daemon runs its OWN `codex` under
  * `~/.openllm/cli/chatgpt/` with `CODEX_HOME` pointed inside it (see
@@ -14,9 +17,11 @@
  *     auth_mode:"chatgpt".
  *   - Upstream identity: originator `codex_cli_rs`, User-Agent
  *     `codex_cli_rs/<ver> (<os>; <arch>) <terminal>`, plus
- *     `ChatGPT-Account-Id: <account_id>`. On inference the first two are
- *     BACKFILLED only when the originator doesn't already present them —
- *     the backend gates some models (gpt-5.6-luna) on that identity.
+ *     `ChatGPT-Account-Id: <account_id>`. On inference, a genuine codex
+ *     caller's identity flows through verbatim; a non-codex caller is served
+ *     under our own `openllm/<ver>` identity (a 2026-07-14 live probe found
+ *     luna 200s with a generic originator, so the old codex-identity gate is
+ *     lifted/moved).
  *   - Usage: GET https://chatgpt.com/backend-api/wham/usage.
  */
 import { rm } from "node:fs/promises";
@@ -30,6 +35,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { DAEMON_VERSION } from "../version";
 import { accountHash } from "./account-id";
 import {
   ensureAuthConfig,
@@ -49,7 +55,7 @@ import {
   reduceChatgptWindows,
   reduceQuotaStatus,
 } from "./usage-reduce";
-import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
+import { readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "chatgpt" as const;
 // Usage endpoint LEAF path — the host is derived from the captured inference
@@ -179,11 +185,13 @@ const readToken = async (): Promise<{
   };
 };
 
-const userAgent = async (): Promise<string> => {
-  const v = await cliVersion(bin(), env());
-  const semver = v?.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.0.0";
-  return `codex_cli_rs/${semver} (${process.platform}; ${process.arch}) openllmd`;
-};
+// We identify as OURSELVES, not the Codex CLI (mirroring the grok delegate).
+// A NON-codex caller's request is served under `openllm/<ver>` + `originator:
+// openllm`; a genuine codex request keeps its own identity (see the backfill
+// guards below). Verified posture: a 2026-07-14 live probe found luna 200s with
+// a generic originator, so self-identifying no longer trips the old gate.
+const OPENLLM_USER_AGENT = `openllm/${DAEMON_VERSION}`;
+const OPENLLM_ORIGINATOR = "openllm";
 
 /** The originator string the Codex CLI stamps on its own requests. */
 const CODEX_ORIGINATOR = "codex_cli_rs";
@@ -337,8 +345,8 @@ export const chatgptDelegate: TProviderDelegate = {
           ...(token.accountId !== null
             ? { "chatgpt-account-id": token.accountId }
             : {}),
-          "user-agent": await userAgent(),
-          originator: CODEX_ORIGINATOR,
+          "user-agent": OPENLLM_USER_AGENT,
+          originator: OPENLLM_ORIGINATOR,
           accept: "application/json",
         },
       });
@@ -448,17 +456,16 @@ export const chatgptDelegate: TProviderDelegate = {
     const headers: Record<string, string> =
       token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
 
-    // Codex-CLI identity BACKFILL. Historically the Codex backend gated some
-    // models on the caller being codex (`gpt-5.6-luna` 404'd without
-    // `originator: codex_cli_rs` + a `codex_cli_rs/<ver>` user-agent). A
-    // 2026-07-14 live probe found luna now 200s with a generic originator, so
-    // that gate appears lifted or moved — but presenting the delegated CLI's
-    // genuine identity is correct for our posture regardless (we ARE that CLI's
-    // credential), and it preserves upstream request-correlation. We only fill
-    // in what the originator does NOT already present, so a genuine `codex`
-    // request still reaches the vendor byte-for-byte.
-    if (!hasCodexOriginator(inbound)) headers.originator = CODEX_ORIGINATOR;
-    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = await userAgent();
+    // Client identity. A genuine `codex` request (the real CLI proxied through
+    // the daemon) already presents `originator: codex_cli_rs` + a
+    // `codex_cli_rs/<ver>` user-agent — we leave those untouched so it reaches
+    // the vendor byte-for-byte. A NON-codex caller is served under OUR OWN
+    // identity (`openllm/<ver>`, `originator: openllm`); we do NOT fabricate the
+    // codex identity. The old model gate (`gpt-5.6-luna` 404'd without codex
+    // identity) was found lifted by a 2026-07-14 live probe (luna 200s with a
+    // generic originator), so self-identifying no longer trips it.
+    if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = OPENLLM_USER_AGENT;
 
     return {
       access_token: token.accessToken,
@@ -488,8 +495,8 @@ export const chatgptDelegate: TProviderDelegate = {
 
     // Codex-CLI identity BACKFILL. Keep parity with
     // `credentialForUpstream`.
-    if (!hasCodexOriginator(inbound)) headers.originator = CODEX_ORIGINATOR;
-    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = await userAgent();
+    if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = OPENLLM_USER_AGENT;
 
     return {
       access_token: token.accessToken,
