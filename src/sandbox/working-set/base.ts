@@ -351,7 +351,10 @@ export const vendorExecDirs = (home: string): string[] => {
   // launcher candidates (`hostCliCandidates`, present as soon as the CLI is
   // installed), and grant the real dir of every node read+exec.
   for (const provider of CLI_PROVIDERS) {
-    for (const seed of [...hostCliCandidates(provider), cliBin(provider)]) {
+    for (const seed of [
+      ...hostCliCandidates(provider, home),
+      cliBin(provider, home),
+    ]) {
       for (const dir of resolveCliExecDirs(seed, home)) dirs.add(dir);
     }
   }

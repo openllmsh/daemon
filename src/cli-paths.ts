@@ -60,16 +60,16 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
  *  `working-set/`) use this instead of re-listing the slugs. */
 export const CLI_PROVIDERS = Object.keys(SPECS) as readonly TCliProvider[];
 
-export const cliRoot = (provider: TCliProvider): string =>
-  join(stateDir(), "cli", provider);
+export const cliRoot = (provider: TCliProvider, home?: string): string =>
+  join(stateDir(home), "cli", provider);
 
 /** The CLI's isolated home/config dir (passed as the CLI's home env). */
-export const cliHome = (provider: TCliProvider): string =>
-  join(cliRoot(provider), "home");
+export const cliHome = (provider: TCliProvider, home?: string): string =>
+  join(cliRoot(provider, home), "home");
 
 /** Absolute path to the installed isolated binary. */
-export const cliBin = (provider: TCliProvider): string =>
-  join(cliRoot(provider), SPECS[provider].binRel);
+export const cliBin = (provider: TCliProvider, home?: string): string =>
+  join(cliRoot(provider, home), SPECS[provider].binRel);
 
 /**
  * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
@@ -96,8 +96,11 @@ export const cliBin = (provider: TCliProvider): string =>
  * chain, granting read+exec on whatever dirs the binary actually lives in
  * (bounded — never `$HOME`/root/a sensitive root).
  */
-export const hostCliCandidates = (provider: TCliProvider): string[] => {
-  const home = homedir();
+export const hostCliCandidates = (
+  provider: TCliProvider,
+  homeOverride?: string,
+): string[] => {
+  const home = homeOverride ?? homedir();
   const vendorDefaults = ((): string[] => {
     switch (provider) {
       case "claude_code":
