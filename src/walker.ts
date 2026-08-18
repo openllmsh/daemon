@@ -36,7 +36,9 @@
  * pricing table is shipped to the box).
  */
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { appendFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import type {
   TAnthropicResponse,
   TChatCompletionChunk,
@@ -168,6 +170,7 @@ import {
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TProviderDelegate } from "./delegation/types";
+import { stateDir } from "./env";
 import { forwardToCloud } from "./forward";
 import {
   clearHopCooldown,
@@ -715,6 +718,119 @@ export {
   peekFirstChunk,
 } from "@openllmsh/wire/lib/streaming/peek";
 
+type TDebugStreamReason = "end" | "error" | "aborted";
+
+const formatCodexDebugFrame = (frame: string): string =>
+  frame.replace(/\r/g, "").replace(/\n/g, "\\n");
+
+type TSseFrameBoundary = {
+  readonly index: number;
+  readonly length: number;
+};
+
+const nextSseFrameBoundary = (buffer: string): TSseFrameBoundary | null => {
+  const lf = buffer.indexOf("\n\n");
+  const crlf = buffer.indexOf("\r\n\r\n");
+  if (lf === -1 && crlf === -1) return null;
+  if (lf === -1 || (crlf !== -1 && crlf < lf)) {
+    return { index: crlf, length: 4 };
+  }
+  return { index: lf, length: 2 };
+};
+
+const codexSseDebugPath = (streamStartedMs: number): string => {
+  const stamp = new Date(streamStartedMs).toISOString().replace(/[:.]/g, "-");
+  const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
+  return join(stateDir(), "debug", `codex-sse-${stamp}-${suffix}.log`);
+};
+
+const writeDebugLine = (filePath: string, line: string): Promise<void> =>
+  appendFile(filePath, line, { encoding: "utf8", mode: 0o600 });
+
+const debugCodexStream = async (
+  source: ReadableStream<Uint8Array>,
+  streamStartMs: number,
+  filePath: string,
+): Promise<void> => {
+  const reader = source.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let outputReady = false;
+  let writes = Promise.resolve();
+
+  const enqueueLine = (line: string): void => {
+    // Keep draining the tee branch while file I/O is pending. The queue is
+    // debug-only, bounded by the response size, and cannot backpressure decode.
+    writes = writes
+      .then(() => writeDebugLine(filePath, line))
+      .catch(() => undefined);
+  };
+
+  const enqueueFrame = (frame: string): void => {
+    enqueueLine(
+      `${Date.now() - streamStartMs} ${new Date().toISOString()} | ${formatCodexDebugFrame(frame)}\n`,
+    );
+  };
+
+  const enqueueEnd = (
+    reason: TDebugStreamReason,
+    message: string | null,
+  ): void => {
+    const detail = message === null ? "" : `: ${message}`;
+    enqueueLine(
+      `--- STREAM ENDED (reason=${reason}${detail}) ms=${Date.now() - streamStartMs} ---\n`,
+    );
+  };
+
+  try {
+    await mkdir(join(stateDir(), "debug"), { recursive: true });
+    outputReady = true;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        if (buffer.length > 0) enqueueFrame(buffer);
+        enqueueEnd("end", null);
+        await writes;
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      for (;;) {
+        const boundary = nextSseFrameBoundary(buffer);
+        if (boundary === null) break;
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        enqueueFrame(frame);
+      }
+    }
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? `${error.name}: ${error.message}`
+        : String(error);
+    const isAbort =
+      message.includes("Abort") ||
+      message.includes("aborted") ||
+      error instanceof DOMException;
+    if (outputReady) {
+      enqueueEnd(isAbort ? "aborted" : "error", message);
+      await writes;
+    }
+    await reader.cancel("codex SSE debug capture ended").catch(() => undefined);
+  }
+};
+
+const tapCodexSseStream = (
+  body: ReadableStream<Uint8Array>,
+  streamStartMs: number,
+): ReadableStream<Uint8Array> => {
+  const [toDecode, toDebug] = body.tee();
+  const filePath = codexSseDebugPath(streamStartMs);
+  // Drain the observer branch independently so it cannot stall the decoder.
+  void debugCodexStream(toDebug, streamStartMs, filePath);
+  return toDecode;
+};
+
 /** Decode an upstream SSE stream into canonical chunks, per upstream wire. */
 export const decodeUpstreamStream = (
   wire: TUpstreamWire,
@@ -1239,6 +1355,10 @@ const serveSubscription = async (
     ...(accountHash !== null ? { account_hash: accountHash } : {}),
   } satisfies Partial<TDaemonRecordRequest>;
   const elapsed = (): number => Date.now() - args.startedAt;
+  const upstreamBody =
+    wire === "chatgpt" && process.env.OPENLLM_DEBUG_CODEX_SSE === "1"
+      ? tapCodexSseStream(resp.body, Date.now())
+      : resp.body;
   const recordTokens = (u: TNativeTokens): void => {
     if (cacheProbe !== null) cacheProbeOutcome(cacheProbe, u);
     report({ ...baseRow, latency_ms: elapsed(), ...u }, args.originParam);
@@ -1359,7 +1479,7 @@ const serveSubscription = async (
       // etc.) surfaces BEFORE the byte-verbatim response is committed, so
       // a non-final hop can walk instead of dying inside a committed
       // stream. The client branch stays byte-verbatim either way.
-      const [toClient, toMeter] = resp.body.tee();
+      const [toClient, toMeter] = upstreamBody.tee();
       const peeked = await peekFirstChunk(
         decodeUpstreamStream(wire, toMeter, hop.providerModelId),
         isMeaningfulChunk,
@@ -1391,7 +1511,7 @@ const serveSubscription = async (
     // hop instead of dying inside a committed stream — however long the
     // vendor's prefill takes to produce it.
     const peeked = await peekFirstChunk(
-      decodeUpstreamStream(wire, resp.body, hop.providerModelId),
+      decodeUpstreamStream(wire, upstreamBody, hop.providerModelId),
       isMeaningfulChunk,
       { isRefusal: isRefusalChunk },
     );
@@ -1424,7 +1544,7 @@ const serveSubscription = async (
     // vendor already spent tokens on this turn, so it is never
     // re-dispatched.
     const peeked = await peekFirstChunk(
-      decodeUpstreamStream(wire, resp.body, hop.providerModelId),
+      decodeUpstreamStream(wire, upstreamBody, hop.providerModelId),
       isMeaningfulChunk,
       { isRefusal: isRefusalChunk },
     );
