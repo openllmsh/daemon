@@ -123,7 +123,10 @@ import {
 } from "@openllmsh/wire/lib/tool-schema";
 import { fromAnthropicResponse } from "@openllmsh/wire/providers/anthropic/response";
 import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
-import { buildChatGptToolNameMap } from "@openllmsh/wire/providers/chatgpt/request";
+import {
+  buildChatGptToolNameMap,
+  ChatGptToolNameCollisionError,
+} from "@openllmsh/wire/providers/chatgpt/request";
 import type { TChatGptStreamEvent } from "@openllmsh/wire/providers/chatgpt/streaming";
 import {
   chatGptEventToChunk,
@@ -1176,6 +1179,9 @@ const serveSubscription = async (
     if (err instanceof UnsupportedContentError) {
       if (!finalHop) return hopRetry("unsupported_content");
       return errorJson(400, err.message, "unsupported_content");
+    }
+    if (err instanceof ChatGptToolNameCollisionError) {
+      return errorJson(400, err.message, err.type);
     }
     throw err;
   }
@@ -3179,6 +3185,9 @@ export const runResponsesCompact = async (
   } catch (err) {
     if (err instanceof UnsupportedContentError) {
       return errorJson(400, err.message, "unsupported_content");
+    }
+    if (err instanceof ChatGptToolNameCollisionError) {
+      return errorJson(400, err.message, err.type);
     }
     throw err;
   }
