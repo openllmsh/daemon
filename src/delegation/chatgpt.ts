@@ -309,7 +309,13 @@ export const chatgptDelegate: TProviderDelegate = {
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
       ...(pending !== null
-        ? { pending_auth: { url: pending.url, code: pending.code } }
+        ? {
+            pending_auth: {
+              url: pending.url,
+              code: pending.code,
+              started_at_ms: pending.startedAt,
+            },
+          }
         : {}),
       ...(token === null
         ? {

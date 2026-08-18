@@ -13,6 +13,8 @@
  * it. Not a secret (a device code is single-use + short-lived), so no
  * persistence and nothing sensitive is held.
  */
+import { PENDING_AUTH_TTL_MS } from "@openllmsh/protocol";
+
 export type TPendingAuth = {
   readonly url: string;
   readonly code: string;
@@ -22,16 +24,37 @@ export type TPendingAuth = {
    *  — `code` is empty, the dashboard renders a paste input). Absent ⇒
    *  `device_code`. See `docs/proposals/headless-claude-login-paste-back.md`. */
   readonly mode?: "device_code" | "paste_code";
+  /** Epoch ms this flow was created — stamped by {@link setPendingAuth} (callers
+   *  need not pass it). Drives TTL expiry (see {@link PENDING_AUTH_TTL_MS}) and
+   *  is surfaced on the wire as `started_at_ms` so the browser mirrors the same
+   *  expiry against the PERSISTED status. */
+  readonly startedAt?: number;
 };
 
-const pending = new Map<string, TPendingAuth>();
+type TStoredAuth = TPendingAuth & { readonly startedAt: number };
+
+const pending = new Map<string, TStoredAuth>();
+
+const isExpired = (auth: TStoredAuth): boolean =>
+  Date.now() - auth.startedAt > PENDING_AUTH_TTL_MS;
 
 export const setPendingAuth = (slug: string, auth: TPendingAuth): void => {
-  pending.set(slug, auth);
+  pending.set(slug, { ...auth, startedAt: auth.startedAt ?? Date.now() });
 };
 
-export const getPendingAuth = (slug: string): TPendingAuth | null =>
-  pending.get(slug) ?? null;
+/** The live pending flow for a provider, or null. A STALE entry (older than the
+ *  TTL — its login was abandoned, or the daemon restarted and dropped the live
+ *  child without the background-exit cleanup running) is treated as absent and
+ *  evicted, so a dead flow can never be re-surfaced or persisted. */
+export const getPendingAuth = (slug: string): TPendingAuth | null => {
+  const auth = pending.get(slug);
+  if (auth === undefined) return null;
+  if (isExpired(auth)) {
+    pending.delete(slug);
+    return null;
+  }
+  return auth;
+};
 
 export const clearPendingAuth = (slug: string): void => {
   pending.delete(slug);
@@ -39,8 +62,18 @@ export const clearPendingAuth = (slug: string): void => {
 
 /** Any provider awaiting device-code authorization — gates the status-change
  *  watcher so a background login completing flips the card without a manual
- *  refresh. See `docs/proposals/daemon-browser-status-sync.md` §2.2. */
-export const hasPendingAuth = (): boolean => pending.size > 0;
+ *  refresh. See `docs/proposals/daemon-browser-status-sync.md` §2.2. Expired
+ *  entries are evicted here too, so a stale one can't keep the watcher hot. */
+export const hasPendingAuth = (): boolean => {
+  for (const [slug, auth] of pending) {
+    if (isExpired(auth)) {
+      pending.delete(slug);
+      continue;
+    }
+    return true;
+  }
+  return false;
+};
 
 /** A human-facing one-liner for the dashboard `detail` while a pending auth is
  *  live. `paste_code` (claude headless) asks the user to paste the code the
