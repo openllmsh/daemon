@@ -123,10 +123,11 @@ import {
 } from "@openllmsh/wire/lib/tool-schema";
 import { fromAnthropicResponse } from "@openllmsh/wire/providers/anthropic/response";
 import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
+import { buildChatGptToolNameMap } from "@openllmsh/wire/providers/chatgpt/request";
+import type { TChatGptStreamEvent } from "@openllmsh/wire/providers/chatgpt/streaming";
 import {
   chatGptEventToChunk,
   newChatGptStreamState,
-  type TChatGptStreamEvent,
 } from "@openllmsh/wire/providers/chatgpt/streaming";
 import { withChatGptNativeSearch } from "@openllmsh/wire/providers/chatgpt/web-search";
 import { withGrokNativeSearch } from "@openllmsh/wire/providers/grok/web-search";
@@ -836,8 +837,14 @@ export const decodeUpstreamStream = (
   wire: TUpstreamWire,
   body: ReadableStream<Uint8Array>,
   providerModelId: string,
+  toolNameMap?: ReadonlyMap<string, string>,
 ): ReadableStream<TChatCompletionChunk> => {
-  const options = { providerModelId };
+  const options = {
+    providerModelId,
+    ...(toolNameMap !== undefined && toolNameMap.size > 0
+      ? { toolNameMap }
+      : {}),
+  };
   if (wire === "anthropic") {
     return decodeAnthropicEventStream(body, providerModelId);
   }
@@ -1173,6 +1180,14 @@ const serveSubscription = async (
     throw err;
   }
   const headers = built.headers;
+  // Build from the same canonical request that `buildUpstreamRequest` encoded.
+  // Empty maps stay absent from decoder state, preserving the normal path.
+  const toolNameMap =
+    wire === "chatgpt"
+      ? buildChatGptToolNameMap(
+          canonicalFromInbound(args.surface, args.rawBody),
+        )
+      : undefined;
   let body = await applyDelegateModelCompat(
     getDelegate(hop.provider),
     hop.providerModelId,
@@ -1481,7 +1496,7 @@ const serveSubscription = async (
       // stream. The client branch stays byte-verbatim either way.
       const [toClient, toMeter] = upstreamBody.tee();
       const peeked = await peekFirstChunk(
-        decodeUpstreamStream(wire, toMeter, hop.providerModelId),
+        decodeUpstreamStream(wire, toMeter, hop.providerModelId, toolNameMap),
         isMeaningfulChunk,
         // The meter's decoded view is LOSSY (schema-unknown frames are
         // dropped): an empty decode of a byte-verbatim passthrough must
@@ -1511,7 +1526,12 @@ const serveSubscription = async (
     // hop instead of dying inside a committed stream — however long the
     // vendor's prefill takes to produce it.
     const peeked = await peekFirstChunk(
-      decodeUpstreamStream(wire, upstreamBody, hop.providerModelId),
+      decodeUpstreamStream(
+        wire,
+        upstreamBody,
+        hop.providerModelId,
+        toolNameMap,
+      ),
       isMeaningfulChunk,
       { isRefusal: isRefusalChunk },
     );
@@ -1544,7 +1564,12 @@ const serveSubscription = async (
     // vendor already spent tokens on this turn, so it is never
     // re-dispatched.
     const peeked = await peekFirstChunk(
-      decodeUpstreamStream(wire, upstreamBody, hop.providerModelId),
+      decodeUpstreamStream(
+        wire,
+        upstreamBody,
+        hop.providerModelId,
+        toolNameMap,
+      ),
       isMeaningfulChunk,
       { isRefusal: isRefusalChunk },
     );
