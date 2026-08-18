@@ -103,7 +103,13 @@ export type TStreamConnectConfig = {
   readonly onParsed?: (url: string) => void;
   readonly onParseFail?: (captured: string) => void;
   readonly pendingDetail: (url: string) => string;
+  /** Detail when NO prompt was parsed — the benign case (the child is still
+   *  running its browser flow, or timed out): a generic "Retry" is right. */
   readonly failDetail: string;
+  /** Detail when the login child CRASHED (exited non-zero before a prompt).
+   *  A retry can't fix a deterministic crash, so surface the captured error
+   *  instead of `failDetail`. Optional — omit to keep the generic message. */
+  readonly crashDetail?: (captured: string, exitCode: number | null) => string;
 };
 
 /**
@@ -142,7 +148,14 @@ export const makeStreamConnect = (
         });
         if (res.found === null) {
           cfg.onParseFail?.(res.captured);
-          return { connected: false, detail: cfg.failDetail };
+          // A deterministic crash (non-zero self-exit before a prompt) is not
+          // retryable — surface the captured error so the user can act on it,
+          // rather than the generic "Retry" reserved for the timeout case.
+          const detail =
+            res.crashed && cfg.crashDetail !== undefined
+              ? cfg.crashDetail(res.captured, res.exitCode)
+              : cfg.failDetail;
+          return { connected: false, detail };
         }
         cfg.onParsed?.(res.found.url);
         setPendingAuth(cfg.provider, {

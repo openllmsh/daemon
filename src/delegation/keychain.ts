@@ -63,7 +63,12 @@ const runSecurity = async (
     // itself; a sandbox kill of the `security` child is attributed by the
     // SHIM's own log line (`runSandboxExec` logs command name only — already
     // redacted, never the `-w` OAuth payload). Kept for the unwrapped paths.
-    logIfKilled(redactSecurityArgv(["security", ...argv]), proc);
+    // `security` is spawned with the same `probe` flag used above, so its
+    // confinement matches: unwrapped on macOS (securityd refuses a confined
+    // caller) ⇒ an unconfined kill, never a sandbox denial.
+    logIfKilled(redactSecurityArgv(["security", ...argv]), proc, {
+      confined: unwrapKeychainSpawn() !== true,
+    });
     return code === 0;
   } catch {
     return false;

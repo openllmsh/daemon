@@ -325,6 +325,13 @@ const connectDirect = makeStreamConnect({
     `Authorize Grok in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
   failDetail:
     "Couldn't start Grok sign-in. Retry, or run `grok login` on the box.",
+  crashDetail: (captured, exitCode) => {
+    const err = redactUrls(captured.slice(0, 400)).trim();
+    const code = exitCode === null ? "" : ` (exit ${exitCode})`;
+    return err.length > 0
+      ? `\`grok login\` exited before starting sign-in${code} — retrying won't help until it's fixed. It reported:\n${err}\nRun \`grok login\` on the box for the full output.`
+      : `\`grok login\` exited without starting sign-in${code} — retrying won't help. Run \`grok login\` on the box to see why.`;
+  },
 });
 
 // Device-code flow: `grok login --device-auth` prints the verification URL +

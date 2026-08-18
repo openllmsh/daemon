@@ -59,12 +59,26 @@ export const spawnCwd = (env: Record<string, string> | undefined): string => {
  * kill was detected (so callers can treat it as a definite failure). No-op for
  * a clean exit.
  */
+export type TLogIfKilledOpts = {
+  /**
+   * Whether the killed child ran through the `--sandbox-exec` shim. The
+   * "OS sandbox denial" hint is only defensible for a CONFINED child; a
+   * `probe:true` spawn runs UNWRAPPED (see {@link sandboxSpawnArgs}), so a
+   * signal death there cannot be a Seatbelt denial — it's an external signal
+   * (a daemon restart/drain, a manual kill). Blaming the sandbox there actively
+   * misdirects diagnosis. Defaults to `true` (confined) when the caller can't
+   * say, preserving the historical hint for unknown call sites.
+   */
+  readonly confined?: boolean;
+};
+
 export const logIfKilled = (
   argv: ReadonlyArray<string>,
   proc: {
     readonly signalCode: string | null;
     readonly exitCode: number | null;
   },
+  opts?: TLogIfKilledOpts,
 ): boolean => {
   // The `--sandbox-exec` shim mirrors a signal death of its tail as exit code
   // `128 + N` (the daemon-side proc is the SHIM, so its signalCode is null) —
@@ -78,12 +92,19 @@ export const logIfKilled = (
       ? (SIGNAL_NAMES[proc.exitCode - 128] ?? `signal ${proc.exitCode - 128}`)
       : null);
   if (signal === null) return false;
+  // Only a CONFINED child can be Seatbelt-denied. An unconfined (`probe`) kill
+  // is an EXTERNAL signal — attributing it to the sandbox sent a real incident's
+  // diagnosis down a dead end. Default to the sandbox hint only when confinement
+  // is unknown or true.
+  const confined = opts?.confined !== false;
   logError("delegation", `child killed by ${signal}`, {
     command: argv[0],
     argv: [...argv],
     signal,
-    // The dominant cause on a sandboxed daemon: the child hit a denied op.
-    hint: "likely an OS sandbox denial — see DaemonStatus.sandbox / the sandbox working set",
+    confined,
+    hint: confined
+      ? "likely an OS sandbox denial — see DaemonStatus.sandbox / the sandbox working set"
+      : "external signal on an unconfined child — likely a daemon restart/drain or manual kill (the sandbox was not involved)",
   });
   return true;
 };
@@ -185,7 +206,9 @@ export const runCapture = async (
         await child.terminate();
         return null;
       }
-      logIfKilled(argv, proc);
+      // `probe:true` runs UNWRAPPED — a signal death there is not a sandbox
+      // denial (this was the mislabeled `--version` status-probe drain).
+      logIfKilled(argv, proc, { confined: opts?.probe !== true });
       if (outcome.code !== 0) return null;
       const trimmed = outcome.out.trim();
       return trimmed.length > 0 ? trimmed : null;
@@ -332,7 +355,7 @@ export const spawnLogin = async (
 
   // Only surface a SIGNAL kill we did NOT cause (a sandbox/OS kill) — our own
   // `until`/timeout kill is expected and its output is valid.
-  if (!abandoned) logIfKilled(argv, proc);
+  if (!abandoned) logIfKilled(argv, proc, { confined: opts?.probe !== true });
   // Join with a newline, NOT bare concatenation: a token printed as the last
   // bytes of stdout (no trailing newline) must not fuse with the first bytes
   // of stderr, or a greedy token match would swallow the spillover.
@@ -469,7 +492,7 @@ export const spawnLoginPty = async (
   await proc.exited;
   captured = await readFile(); // final read (token written just before exit)
   await rm(tsFile, { force: true }).catch(() => {});
-  if (!abandoned) logIfKilled(scriptArgv, proc);
+  if (!abandoned) logIfKilled(scriptArgv, proc, { confined: opts?.probe !== true });
   return { code: proc.exitCode ?? -1, output: stripAnsi(captured), abandoned };
 };
 

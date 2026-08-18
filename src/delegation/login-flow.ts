@@ -227,11 +227,25 @@ export type TStreamLoginOpts<T> = {
  * Single-flight is marked AFTER a successful spawn (a `Bun.spawn` throw must not
  * wedge the slot), mirroring the pre-refactor "set loginInFlight after spawn".
  */
+export type TStreamLoginResult<T> =
+  | { readonly found: T }
+  | {
+      readonly found: null;
+      readonly captured: string;
+      /** The child's exit code, when it exited on its OWN before a prompt was
+       *  seen (a crash). `null` when the child was killed at the prompt timeout
+       *  (still running) or the spawn itself threw. */
+      readonly exitCode: number | null;
+      /** True iff the child exited NON-ZERO on its own before printing a prompt
+       *  — a deterministic failure a "Retry" can't fix (e.g. `grok login`
+       *  crashing with a traceback). False for a benign prompt timeout, so the
+       *  connect layer can surface the captured error only when it's real. */
+      readonly crashed: boolean;
+    };
+
 export const spawnStreamLogin = async <T>(
   opts: TStreamLoginOpts<T>,
-): Promise<
-  { readonly found: T } | { readonly found: null; readonly captured: string }
-> => {
+): Promise<TStreamLoginResult<T>> => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
@@ -244,7 +258,7 @@ export const spawnStreamLogin = async <T>(
       env: { ...process.env, ...opts.env },
     });
   } catch {
-    return { found: null, captured: "" };
+    return { found: null, captured: "", exitCode: null, crashed: false };
   }
   opts.slot.start(() => {
     try {
@@ -266,6 +280,10 @@ export const spawnStreamLogin = async <T>(
     opts.stream === "stdout" ? proc.stdout : proc.stderr
   ) as ReadableStream<Uint8Array>;
   let captured = "";
+  // Set ONLY by the prompt-timeout timer. Distinguishes the two null outcomes:
+  // a timeout (child still running → kill it, not a crash) vs the reader
+  // reaching EOF because the child EXITED on its own before a prompt (a crash).
+  let timedOut = false;
   const found = await new Promise<T | null>((resolve) => {
     let settled = false;
     const settle = (v: T | null): void => {
@@ -273,10 +291,10 @@ export const spawnStreamLogin = async <T>(
       settled = true;
       resolve(v);
     };
-    const timer = setTimeout(
-      () => settle(null),
-      opts.timeoutMs ?? STREAM_PROMPT_TIMEOUT_MS,
-    );
+    const timer = setTimeout(() => {
+      timedOut = true;
+      settle(null);
+    }, opts.timeoutMs ?? STREAM_PROMPT_TIMEOUT_MS);
     void (async (): Promise<void> => {
       const decoder = new TextDecoder();
       try {
@@ -298,12 +316,22 @@ export const spawnStreamLogin = async <T>(
   });
 
   if (found === null) {
+    if (!timedOut) {
+      // The reader hit EOF before the timer — the child EXITED on its own
+      // without printing a prompt. It has already exited, so awaiting its
+      // status resolves promptly; a non-zero code is a real crash the caller
+      // must surface instead of inviting a doomed retry.
+      const exitCode = await proc.exited;
+      return { found: null, captured, exitCode, crashed: exitCode !== 0 };
+    }
+    // Prompt timeout: the child may still be running its localhost callback, so
+    // kill it and return WITHOUT blocking on a possibly-wedged exit. Not a crash.
     try {
       proc.kill();
     } catch {
       // already gone
     }
-    return { found: null, captured };
+    return { found: null, captured, exitCode: null, crashed: false };
   }
   return { found };
 };
