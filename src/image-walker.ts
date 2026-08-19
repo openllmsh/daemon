@@ -181,6 +181,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
       args.planParam,
       args.pmidsParam,
       args.originParam,
+      args.contextOverflowStrategy ?? null,
       args.sigParam,
     )
   ) {

@@ -86,6 +86,7 @@ const signedPlanError = (args: TWalkArgs): Response | null => {
       args.planParam,
       args.pmidsParam,
       args.originParam,
+      args.contextOverflowStrategy ?? null,
       args.sigParam,
     )
   ) {

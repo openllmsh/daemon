@@ -22,6 +22,8 @@ import {
   ResponsesRequest,
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
+import type { TContextOverflowStrategy } from "@openllmsh/protocol";
+import { resolveContextOverflowStrategy } from "@openllmsh/wire/features/context-overflow-strategy";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { Schema } from "effect";
 import { fetchPlan } from "./cloud-client";
@@ -71,6 +73,11 @@ const withCors = (req: Request, res: Response): Response => {
     headers,
   });
 };
+
+const contextOverflowStrategyParam = (
+  raw: string | null,
+): TContextOverflowStrategy | null =>
+  raw === null ? null : resolveContextOverflowStrategy(raw);
 
 export const handleInference = async (req: Request): Promise<Response> => {
   // CORS/PNA preflight — the dashboard fetches this surface cross-origin
@@ -168,17 +175,40 @@ export const handleInference = async (req: Request): Promise<Response> => {
   let planParam = url.searchParams.get("__plan");
   let pmidsParam = url.searchParams.get("__pmids");
   let originParam = url.searchParams.get("__origin");
+  let contextOverflowStrategy = contextOverflowStrategyParam(
+    url.searchParams.get("__context_overflow_strategy"),
+  );
   let sigParam = url.searchParams.get("__sig");
   const alias = (rawBody as { model?: unknown } | null)?.model;
   if (planCacheEnabled() && typeof alias === "string" && alias.length > 0) {
     if (planParam !== null) {
-      if (planSignatureOk(planParam, pmidsParam, originParam, sigParam)) {
-        storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
+      if (
+        planSignatureOk(
+          planParam,
+          pmidsParam,
+          originParam,
+          contextOverflowStrategy,
+          sigParam,
+        )
+      ) {
+        storePlan(alias, {
+          planParam,
+          pmidsParam,
+          originParam,
+          contextOverflowStrategy,
+          sigParam,
+        });
       }
     } else {
       const cached = lookupPlan(alias);
       if (cached !== null) {
-        ({ planParam, pmidsParam, originParam, sigParam } = cached);
+        ({
+          planParam,
+          pmidsParam,
+          originParam,
+          contextOverflowStrategy,
+          sigParam,
+        } = cached);
       }
     }
   }
@@ -211,10 +241,13 @@ export const handleInference = async (req: Request): Promise<Response> => {
     if (fetched === null) {
       return withCors(req, await passthroughToOrigin(req, rawBytes));
     }
+    const fetchedContextOverflowStrategy =
+      fetched.context_overflow_strategy ?? null;
     const verified = planSignatureOk(
       fetched.plan,
       fetched.pmids,
       fetched.origin,
+      fetchedContextOverflowStrategy,
       fetched.sig,
     );
     const hasSubscriptionHop =
@@ -230,9 +263,16 @@ export const handleInference = async (req: Request): Promise<Response> => {
     planParam = fetched.plan;
     pmidsParam = fetched.pmids;
     originParam = fetched.origin;
+    contextOverflowStrategy = fetchedContextOverflowStrategy;
     sigParam = fetched.sig;
     if (planCacheEnabled()) {
-      storePlan(alias, { planParam, pmidsParam, originParam, sigParam });
+      storePlan(alias, {
+        planParam,
+        pmidsParam,
+        originParam,
+        contextOverflowStrategy,
+        sigParam,
+      });
     }
   }
 
@@ -245,6 +285,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
     planParam,
     pmidsParam,
     originParam,
+    contextOverflowStrategy,
     sigParam,
     startedAt,
   };

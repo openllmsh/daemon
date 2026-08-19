@@ -70,6 +70,12 @@ import {
   MAX_LAST_RESORT_COMPACTION_ROUNDS,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
+import {
+  resolveContextOverflowStrategy,
+  shouldDemoteOnContextOverflow,
+  shouldSkipHopForSize,
+} from "@openllmsh/wire/features/context-overflow-strategy";
+import type { TContextOverflowStrategy } from "@openllmsh/wire/features/context-overflow-strategy";
 import { applyOutputTokenBackfill } from "@openllmsh/wire/features/max-tokens-backfill";
 import {
   GATE_STALE_CAP_MS,
@@ -164,6 +170,7 @@ import { recordRequest } from "./cloud-client";
 import {
   activeSubMethod,
   activeSubMethodOverrides,
+  contextOverflowStrategy as bootstrapContextOverflowStrategy,
   fleetSubscriptionServerFor,
   lookupCatalogEntry,
   planSigningKey,
@@ -262,7 +269,9 @@ export type TWalkArgs = {
   /** The `?__origin=` value — the deployment that issued the 307; the daemon
    *  forwards API-key hops + records usage back here. Null → pinned origin. */
   readonly originParam: string | null;
-  /** The `?__sig=` HMAC of the signed payload (plan+pmids+origin), or null. */
+  /** Signed plan policy; null falls back to the bootstrap/default hop setting. */
+  readonly contextOverflowStrategy?: TContextOverflowStrategy | null;
+  /** The `?__sig=` HMAC of the signed payload (plan+pmids+origin+strategy), or null. */
   readonly sigParam: string | null;
   readonly startedAt: number;
 };
@@ -353,6 +362,7 @@ export const planSignatureOk = (
   planParam: string | null,
   pmidsParam: string | null,
   originParam: string | null,
+  contextOverflowStrategy: TContextOverflowStrategy | null,
   sigParam: string | null,
 ): boolean => {
   const sigKey = planSigningKey();
@@ -363,6 +373,7 @@ export const planSignatureOk = (
         planParam ?? "",
         pmidsParam ?? "",
         originParam ?? "",
+        contextOverflowStrategy,
       ),
       sigParam,
       sigKey,
@@ -1414,17 +1425,28 @@ const serveSubscription = async (
   // recorded as an ERROR row.
   const peekedError = (error: unknown): THopServeOutcome => {
     const detail = streamFailureDetail(error);
+    const cls = classifyRawResponse(
+      502,
+      detail,
+      hopFormat(wire),
+      args.req.signal.aborted,
+    );
+    const upstreamResponse = errorJson(
+      502,
+      `upstream stream ended before producing output: ${detail}`,
+    );
     if (!finalHop && !args.req.signal.aborted) {
       // Preserve the terminal response this pre-output error would have
       // produced on the final hop, so a forced-context epilogue that also
       // fails surfaces IT (the authentic upstream failure) instead of the
       // generic all-hops-failed 502 — mirroring the non-final HTTP
-      // pre-commit branch above.
+      // pre-commit branch above. Critically, classify the body before
+      // returning: HTTP 200 stream failures can still be context overflow.
       return hopRetry(detail, {
-        upstreamResponse: errorJson(
-          502,
-          `upstream stream ended before producing output: ${detail}`,
-        ),
+        status: 502,
+        bodySnippet: detail,
+        ...(cls.kind === "transient" ? { cooldownReason: cls.reason } : {}),
+        upstreamResponse,
       });
     }
     if (args.req.signal.aborted) {
@@ -1435,6 +1457,14 @@ const serveSubscription = async (
       // same rule the pre-commit 499, `recordStreamFailure`, and
       // `refusalWalks` already apply for an aborted request.
       return errorJson(499, "client aborted request");
+    }
+    if (cls.kind === "transient" && cls.reason === "context_overflow") {
+      return hopRetry(detail, {
+        status: 502,
+        bodySnippet: detail,
+        cooldownReason: cls.reason,
+        upstreamResponse,
+      });
     }
     report(
       {
@@ -2116,6 +2146,10 @@ const tryFleetTunnel = async (
 };
 
 export const runWalker = async (args: TWalkArgs): Promise<Response> => {
+  const strategy = resolveContextOverflowStrategy(
+    args.contextOverflowStrategy ??
+      (args.sigParam === null ? bootstrapContextOverflowStrategy() : null),
+  );
   const planModelIds = parsePlan(args.planParam);
   if (planModelIds.length === 0) {
     return errorJson(
@@ -2133,6 +2167,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       args.planParam,
       args.pmidsParam,
       args.originParam,
+      args.contextOverflowStrategy ?? null,
       args.sigParam,
     )
   ) {
@@ -2156,9 +2191,24 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   // pays for a rewrite (same last-resort-only rule as the cloud chain; see
   // wire/features/context-skip.ts).
   const firstPass = await walkPlan(args, hops);
-  if (!(await isContextOverflowResponse(firstPass))) return firstPass;
+  if (!(await isContextOverflowResponse(firstPass))) {
+    return withoutContextOverflowHopTag(firstPass);
+  }
 
-  const largest = largestContextHop(hops);
+  const compactHop = shouldDemoteOnContextOverflow(strategy)
+    ? largestContextHop(hops)
+    : (() => {
+        const modelId = firstPass.headers.get(CONTEXT_OVERFLOW_HOP_HEADER);
+        if (modelId === null) return null;
+        const hop = hops.find((candidate) => candidate.modelId === modelId);
+        const window =
+          hop === undefined
+            ? null
+            : (lookupCatalogEntry(hop.modelId)?.input_token_limit ?? null);
+        return hop === undefined || window === null ? null : { hop, window };
+      })();
+
+  const largest = compactHop;
   // Measure with the ruler family that matches the wire (Claude for `messages`,
   // o200k otherwise) — the same choice the compactor's fit check uses.
   const encoding = encodingForSurface(args.surface);
@@ -2167,7 +2217,9 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   // (RC1) — the vendor's own tokenizer already rejected it, so a false local fit
   // must not veto compaction. Bail only when there is no sized hop to aim the
   // cut at, or the client went away.
-  if (largest === null || args.req.signal.aborted) return firstPass;
+  if (largest === null || args.req.signal.aborted) {
+    return withoutContextOverflowHopTag(firstPass);
+  }
   // Warm the BPE ruler before the compactor's internal fit checks — this is the
   // one place an exact count decides HOW MUCH to cut. The ~160 ms one-time load
   // per isolate is trivial next to the re-walk it gates (the alternative here is
@@ -2219,14 +2271,19 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
       rawBytes: new TextEncoder().encode(JSON.stringify(compacted.body))
         .buffer as ArrayBuffer,
     };
-    const retry = await walkPlan(compactedArgs, hops);
-    if (!(await isContextOverflowResponse(retry))) return retry;
+    const retry = await walkPlan(
+      compactedArgs,
+      shouldDemoteOnContextOverflow(strategy) ? hops : [largest.hop],
+    );
+    if (!(await isContextOverflowResponse(retry))) {
+      return withoutContextOverflowHopTag(retry);
+    }
     // Still overflowing — recompute the target from the retry's FRESH vendor
     // numbers and compact tighter on the next bounded round.
     overflowResponse = retry;
     currentBody = compacted.body;
   }
-  return overflowResponse;
+  return withoutContextOverflowHopTag(overflowResponse);
 };
 
 /**
@@ -2290,6 +2347,24 @@ let walkCounter = 0;
 const HOP_CONTINUE: unique symbol = Symbol("hop-continue");
 type THopContinue = typeof HOP_CONTINUE;
 
+// Internal only: lets `runWalker` retain the actual overflowing hop while
+// `walkPlan` continues to return a Response for its normal path. It is removed
+// before any terminal response reaches the localhost client.
+const CONTEXT_OVERFLOW_HOP_HEADER = "x-openllm-internal-context-overflow-hop";
+
+const tagContextOverflowHop = (response: Response, hop: THop): Response => {
+  const headers = passthroughHeaders(response);
+  headers.set(CONTEXT_OVERFLOW_HOP_HEADER, hop.modelId);
+  return new Response(response.body, { status: response.status, headers });
+};
+
+const withoutContextOverflowHopTag = (response: Response): Response => {
+  if (!response.headers.has(CONTEXT_OVERFLOW_HOP_HEADER)) return response;
+  const headers = passthroughHeaders(response);
+  headers.delete(CONTEXT_OVERFLOW_HOP_HEADER);
+  return new Response(response.body, { status: response.status, headers });
+};
+
 // A committed terminal Response from a subscription hop, tagged with its ORIGIN.
 // `servedLocally` is true when THIS box's native-runtime or handrolled transport
 // produced the Response (so a 2xx proves THIS box's account recovered); false
@@ -2313,6 +2388,10 @@ const walkPlan = async (
   // Canonical view of the inbound for native-runtime eligibility and encoding.
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
   const baseEstimate = estimateBodyTokens(args.rawBody);
+  const contextOverflowStrategy = resolveContextOverflowStrategy(
+    args.contextOverflowStrategy ??
+      (args.sigParam === null ? bootstrapContextOverflowStrategy() : null),
+  );
 
   // The cloud's execution preference — a global value plus per-provider
   // overrides — sampled ONCE per request from the cached bootstrap
@@ -2588,6 +2667,39 @@ const walkPlan = async (
           ),
       });
       if (native instanceof Response) {
+        if (!native.ok) {
+          const raw = await native
+            .clone()
+            .text()
+            .catch(() => "");
+          const cls = classifyRawResponse(
+            native.status,
+            raw,
+            "openai",
+            args.req.signal.aborted,
+          );
+          if (cls.kind === "transient" && cls.reason === "context_overflow") {
+            if (!shouldDemoteOnContextOverflow(contextOverflowStrategy)) {
+              return {
+                response: tagContextOverflowHop(native, hop),
+                servedLocally: true,
+              };
+            }
+            const requiredTokens =
+              contextOverflowRequiredTokens(raw) ?? baseEstimate;
+            const nextModel = nextLargerContextModel(
+              hops.map((candidate) => candidate.modelId),
+              hop.modelId,
+              requiredTokens,
+              (modelId) =>
+                lookupCatalogEntry(modelId)?.input_token_limit ?? null,
+            );
+            if (nextModel !== null && !args.req.signal.aborted) {
+              contextDemotionTarget = nextModel;
+              return HOP_CONTINUE;
+            }
+          }
+        }
         if (
           native.status === 408 ||
           native.status === 429 ||
@@ -2637,6 +2749,25 @@ const walkPlan = async (
 
     if (handrolledRetry !== null) {
       if (handrolledRetry.cooldownReason === "context_overflow") {
+        if (!shouldDemoteOnContextOverflow(contextOverflowStrategy)) {
+          if (handrolledRetry.upstreamResponse !== undefined) {
+            return {
+              response: tagContextOverflowHop(
+                handrolledRetry.upstreamResponse,
+                hop,
+              ),
+              servedLocally: true,
+            };
+          }
+          addHopFailure(
+            hop,
+            handrolledRetry.reason,
+            handrolledRetry.status,
+            handrolledRetry.cooldownReason,
+            handrolledRetry.recoverAtMs,
+          );
+          return HOP_CONTINUE;
+        }
         const requiredTokens =
           contextOverflowRequiredTokens(
             handrolledRetry.bodySnippet ?? handrolledRetry.reason,
@@ -2758,6 +2889,7 @@ const walkPlan = async (
     // skipped hops once everything else exhausts, and the pre-output peek
     // walk below is the backstop for estimate misses.
     if (
+      shouldSkipHopForSize(contextOverflowStrategy) &&
       !forceContextAttempt &&
       shouldSkipHopForContext({
         estimatedTokens: baseEstimate,
@@ -2813,6 +2945,19 @@ const walkPlan = async (
         "openai",
         args.req.signal.aborted,
       );
+      if (
+        cls.kind === "transient" &&
+        cls.reason === "context_overflow" &&
+        !shouldDemoteOnContextOverflow(contextOverflowStrategy)
+      ) {
+        return tagContextOverflowHop(
+          new Response(resp.body, {
+            status: resp.status,
+            headers: passthroughHeaders(resp),
+          }),
+          hop,
+        );
+      }
       if (cls.kind === "transient" && !finalHop) {
         lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
         const reason =
@@ -2906,6 +3051,7 @@ const walkPlan = async (
     // context_overflow (which doesn't even cool — pure waste). Checked BEFORE
     // the usage read so an ineligible hop never pays for a vendor usage probe.
     if (
+      shouldSkipHopForSize(contextOverflowStrategy) &&
       shouldSkipHopForContext({
         estimatedTokens: baseEstimate,
         inputTokenLimit:
@@ -3048,6 +3194,7 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
       args.planParam,
       args.pmidsParam,
       args.originParam,
+      args.contextOverflowStrategy ?? null,
       args.sigParam,
     )
   ) {
@@ -3142,6 +3289,7 @@ export const runResponsesCompact = async (
     args.planParam,
     args.pmidsParam,
     args.originParam,
+    args.contextOverflowStrategy ?? null,
     args.sigParam,
   );
   const providerModelId = resolveCompactModelId(

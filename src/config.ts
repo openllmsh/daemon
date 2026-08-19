@@ -16,10 +16,12 @@
  */
 
 import type {
+  TContextOverflowStrategy,
   TDaemonBootstrap,
   TDaemonCatalogEntry,
   TSubMethod,
 } from "@openllmsh/protocol";
+import { resolveContextOverflowStrategy } from "@openllmsh/wire";
 import {
   fetchBootstrap,
   InvalidApiKeyError,
@@ -105,6 +107,10 @@ export const refreshBootstrap = async (): Promise<boolean> => {
  */
 export const planSigningKey = (): string | null =>
   snapshot.plan_signing_key ?? null;
+
+/** Per-user context-overflow policy from bootstrap; absence preserves hopping. */
+export const contextOverflowStrategy = (): TContextOverflowStrategy =>
+  resolveContextOverflowStrategy(snapshot.context_overflow_strategy);
 
 /**
  * The cloud's resolved `ACTIVE_SUB_METHOD` preference from the last

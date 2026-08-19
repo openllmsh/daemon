@@ -28,10 +28,14 @@
  *  drift stays irrelevant (the quota windows are hours, not seconds). */
 export const PLAN_CACHE_TTL_MS = 45_000;
 
+import type { TContextOverflowStrategy } from "@openllmsh/protocol";
+
 export type TCachedPlan = {
   readonly planParam: string;
   readonly pmidsParam: string | null;
   readonly originParam: string | null;
+  /** Signed 307 context-overflow policy; null preserves bootstrap/default hop. */
+  readonly contextOverflowStrategy: TContextOverflowStrategy | null;
   readonly sigParam: string | null;
   readonly storedAtMs: number;
 };
