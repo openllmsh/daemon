@@ -2742,7 +2742,16 @@ const walkPlan = async (
         ) {
           return { response: firstTerminalResponse, servedLocally: true };
         }
-        return { response: served, servedLocally: true };
+        // Final-hop handrolled overflow returns a Response, not hopRetry, so
+        // tag it here or compact-in-place cannot find the overflowing hop.
+        return {
+          response:
+            !served.ok &&
+            !shouldDemoteOnContextOverflow(contextOverflowStrategy)
+              ? tagContextOverflowHop(served, hop)
+              : served,
+          servedLocally: true,
+        };
       }
       handrolledRetry = served;
       lastError = `subscription hop ${hop.modelId} failed pre-stream: ${served.reason}`;

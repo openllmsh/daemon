@@ -195,9 +195,11 @@ export const runCommandInner = async (
       case "bust_plan_cache":
         // Config saves use this existing control command. Refresh bootstrap
         // first so per-user routing preferences take effect immediately rather
-        // than waiting for the normal bootstrap TTL; always clear the cache,
-        // including when the refresh fails, to preserve the prior behaviour.
-        if (!(await refreshBootstrap())) clearPlanCache();
+        // than waiting for the normal bootstrap TTL. `refreshBootstrap` returns
+        // whether cloudState changed, not success — always clear the cache so a
+        // failed refresh cannot leave a stale signed plan / overflow strategy.
+        await refreshBootstrap();
+        clearPlanCache();
         return { id: cmd.id, status: "done" };
       // Force a live model-list re-report. The dashboard's "Available
       // models" refresh button enqueues this mid-TTL so the user doesn't
