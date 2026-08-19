@@ -2200,7 +2200,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   // whole walk fails on SIZE — every hop oversized — so a healthy request never
   // pays for a rewrite (same last-resort-only rule as the cloud chain; see
   // wire/features/context-skip.ts).
-  const firstPass = await walkPlan(args, hops);
+  const firstPass = await walkPlan(args, hops, strategy);
   if (!(await isContextOverflowResponse(firstPass))) {
     return withoutContextOverflowHopTag(firstPass);
   }
@@ -2286,6 +2286,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     const retry = await walkPlan(
       compactedArgs,
       shouldDemoteOnContextOverflow(strategy) ? hops : [largest.hop],
+      strategy,
     );
     if (!(await isContextOverflowResponse(retry))) {
       return withoutContextOverflowHopTag(retry);
@@ -2390,6 +2391,7 @@ type THopServed = {
 const walkPlan = async (
   args: TWalkArgs,
   hops: ReadonlyArray<THop>,
+  contextOverflowStrategy: TContextOverflowStrategy,
 ): Promise<Response> => {
   walkCounter += 1;
   const walkSessionKey = `walk-${walkCounter}`;
@@ -2400,10 +2402,6 @@ const walkPlan = async (
   // Canonical view of the inbound for native-runtime eligibility and encoding.
   const canonical = canonicalFromInbound(args.surface, args.rawBody);
   const baseEstimate = estimateBodyTokens(args.rawBody);
-  const contextOverflowStrategy = resolveContextOverflowStrategy(
-    args.contextOverflowStrategy ??
-      (args.sigParam === null ? bootstrapContextOverflowStrategy() : null),
-  );
 
   // The cloud's execution preference — a global value plus per-provider
   // overrides — sampled ONCE per request from the cached bootstrap

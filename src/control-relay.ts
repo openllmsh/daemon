@@ -197,8 +197,7 @@ export const runCommandInner = async (
         // first so per-user routing preferences take effect immediately rather
         // than waiting for the normal bootstrap TTL; always clear the cache,
         // including when the refresh fails, to preserve the prior behaviour.
-        await refreshBootstrap();
-        clearPlanCache();
+        if (!(await refreshBootstrap())) clearPlanCache();
         return { id: cmd.id, status: "done" };
       // Force a live model-list re-report. The dashboard's "Available
       // models" refresh button enqueues this mid-TTL so the user doesn't
