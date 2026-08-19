@@ -1459,6 +1459,16 @@ const serveSubscription = async (
       return errorJson(499, "client aborted request");
     }
     if (cls.kind === "transient" && cls.reason === "context_overflow") {
+      report(
+        {
+          ...baseRow,
+          status: "error",
+          ...ZERO_TOKENS,
+          latency_ms: elapsed(),
+          error: `upstream stream ended before producing output: ${detail}`,
+        },
+        args.originParam,
+      );
       return hopRetry(detail, {
         status: 502,
         bodySnippet: detail,
@@ -2238,7 +2248,9 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
   let currentBody = args.rawBody;
   let overflowResponse = firstPass;
   for (let round = 0; round < MAX_LAST_RESORT_COMPACTION_ROUNDS; round++) {
-    if (args.req.signal.aborted) return overflowResponse;
+    if (args.req.signal.aborted) {
+      return withoutContextOverflowHopTag(overflowResponse);
+    }
     // Size the cut from the vendor's own count for the body we just sent — the
     // observed ratio is exact calibration for THIS conversation. Clamped no
     // looser than the static target; falls back to it when the vendor gave no
@@ -2263,7 +2275,7 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
     // Nothing left to reduce (or the cut didn't actually shrink the body) —
     // surface the last overflow rather than re-sending an identical body.
     if (!compacted.compacted || compacted.estimatedTokens >= localEstimate) {
-      return overflowResponse;
+      return withoutContextOverflowHopTag(overflowResponse);
     }
     const compactedArgs: TWalkArgs = {
       ...args,

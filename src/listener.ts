@@ -23,7 +23,6 @@ import {
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
 import type { TContextOverflowStrategy } from "@openllmsh/protocol";
-import { resolveContextOverflowStrategy } from "@openllmsh/wire/features/context-overflow-strategy";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { Schema } from "effect";
 import { fetchPlan } from "./cloud-client";
@@ -77,7 +76,7 @@ const withCors = (req: Request, res: Response): Response => {
 const contextOverflowStrategyParam = (
   raw: string | null,
 ): TContextOverflowStrategy | null =>
-  raw === null ? null : resolveContextOverflowStrategy(raw);
+  raw === "compact_in_place" ? "compact_in_place" : null;
 
 export const handleInference = async (req: Request): Promise<Response> => {
   // CORS/PNA preflight — the dashboard fetches this surface cross-origin
