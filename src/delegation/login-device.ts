@@ -242,7 +242,13 @@ export const makeStreamDeviceConnect = (
           probe: unwrapKeychainSpawn(cfg.provider),
         });
         if (res.found === null) {
-          return { connected: false, detail: cfg.failDetail };
+          return {
+            connected: false,
+            detail:
+              res.spawnFailure === undefined
+                ? cfg.failDetail
+                : `${cfg.failDetail} [${res.spawnFailure.code}] ${res.spawnFailure.message}`,
+          };
         }
         setPendingAuth(cfg.provider, {
           url: res.found.url,

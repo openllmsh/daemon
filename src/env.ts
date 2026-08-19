@@ -323,6 +323,28 @@ export const DEFAULT_DAEMON_PORT = 8787;
 export const DEV_DEFAULT_DAEMON_PORT = 8788;
 
 /**
+ * Parse a raw daemon port from env/raw values.
+ *
+ * Must match the CLI-side parser in `packages/cli/src/clients/gateway.ts` so both
+ * sides resolve the same loopback port from the same raw value.
+ */
+const parseDaemonPort = (raw: string, fallback: number): number => {
+  const trimmed = raw.trim();
+  const unquoted =
+    trimmed.startsWith("\"") && trimmed.endsWith("\"") && trimmed.length >= 2
+      ? trimmed.slice(1, -1)
+      : trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2
+        ? trimmed.slice(1, -1)
+        : trimmed;
+  const stripped = unquoted.replace(/^(.*)\s#.*$/, "$1").trim();
+  if (!/^\d+$/.test(stripped)) return fallback;
+  const parsed = Number.parseInt(stripped, 10);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535
+    ? parsed
+    : fallback;
+};
+
+/**
  * The loopback port the daemon listens on (`OPENLLM_DAEMON_PORT`, default
  * `8787`; `8788` in dev mode). Single source — `main.ts` binds it and
  * `status.ts` publishes it on `TDaemonStatus.port` so the dashboard can probe
@@ -337,9 +359,7 @@ export const daemonPort = (): number => {
   const fallback = isDevMode() ? DEV_DEFAULT_DAEMON_PORT : DEFAULT_DAEMON_PORT;
   const raw = process.env.OPENLLM_DAEMON_PORT;
   if (raw === undefined) return fallback;
-  // Whole-string integer in the valid TCP range — reject `8787abc`, `0`, > 65535.
-  const n = Number(raw.trim());
-  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
+  return parseDaemonPort(raw, fallback);
 };
 
 const apiKeyFile = (): string => join(stateDir(), "api-key");

@@ -74,7 +74,13 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
-import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
+import {
+  cliVersion,
+  readJsonFile,
+  redactUrls,
+  runCapture,
+  stripAnsi,
+} from "./util";
 
 const PROVIDER = "grok" as const;
 
@@ -99,12 +105,6 @@ const REFRESH_LEEWAY_MS = 5 * 60_000;
 
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
-
-/** Strip query strings from any URL in a diagnostic string, so OAuth authorize
- *  params (client_id / code_challenge / state) are never persisted to the local
- *  log. Keeps the scheme+host+path for debugging. */
-const redactUrls = (s: string): string =>
-  s.replace(/(https?:\/\/[^\s?]+)\?\S*/g, "$1?<redacted>");
 
 /**
  * Parse the browser authorize URL `grok login` prints. The user clicks an

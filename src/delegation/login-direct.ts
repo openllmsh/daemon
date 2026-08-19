@@ -147,6 +147,12 @@ export const makeStreamConnect = (
           probe: unwrapKeychainSpawn(cfg.provider),
         });
         if (res.found === null) {
+          if (res.spawnFailure !== undefined) {
+            return {
+              connected: false,
+              detail: `${cfg.failDetail} [${res.spawnFailure.code}] ${res.spawnFailure.message}`,
+            };
+          }
           cfg.onParseFail?.(res.captured);
           // A deterministic crash (non-zero self-exit before a prompt) is not
           // retryable — surface the captured error so the user can act on it,

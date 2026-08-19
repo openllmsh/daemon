@@ -25,7 +25,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
-import { spawnCwd } from "./util";
+import { redactUrls, spawnCwd } from "./util";
 
 /** The shared return shape of `connect()` / `connectDeviceCode()`. */
 export type TConnectResult = {
@@ -227,6 +227,34 @@ export type TStreamLoginOpts<T> = {
  * Single-flight is marked AFTER a successful spawn (a `Bun.spawn` throw must not
  * wedge the slot), mirroring the pre-refactor "set loginInFlight after spawn".
  */
+const SPAWN_FAILURE_MAX_ERROR_CHARS = 400;
+
+const redactSpawnFailure = (raw: string): string =>
+  redactUrls(raw.slice(0, SPAWN_FAILURE_MAX_ERROR_CHARS)).trim();
+
+type TSpawnFailure = Readonly<{
+  readonly code: string;
+  /** Short, redacted message suitable for surfacing to the dashboard. */
+  readonly message: string;
+}>;
+
+const spawnFailureFromError = (error: unknown): TSpawnFailure => {
+  const code =
+    error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    typeof error.code === "string"
+      ? error.code
+      : "unknown";
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "no error message was provided";
+  return { code, message: redactSpawnFailure(message) };
+};
+
 export type TStreamLoginResult<T> =
   | { readonly found: T }
   | {
@@ -241,6 +269,10 @@ export type TStreamLoginResult<T> =
        *  crashing with a traceback). False for a benign prompt timeout, so the
        *  connect layer can surface the captured error only when it's real. */
       readonly crashed: boolean;
+      /** Spawn-level failure (e.g. `EPERM`, `ENOENT`) with a short redacted
+       *  message. Set when `Bun.spawn(...)` itself throws before a child exists.
+       */
+      readonly spawnFailure?: TSpawnFailure;
     };
 
 export const spawnStreamLogin = async <T>(
@@ -257,8 +289,15 @@ export const spawnStreamLogin = async <T>(
       cwd: spawnCwd(opts.env),
       env: { ...process.env, ...opts.env },
     });
-  } catch {
-    return { found: null, captured: "", exitCode: null, crashed: false };
+  } catch (error) {
+    const spawnFailure = spawnFailureFromError(error);
+    return {
+      found: null,
+      captured: spawnFailure.message,
+      exitCode: null,
+      crashed: false,
+      spawnFailure,
+    };
   }
   opts.slot.start(() => {
     try {

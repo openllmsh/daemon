@@ -381,6 +381,11 @@ const ANSI_RE = new RegExp(
  */
 export const stripAnsi = (s: string): string => s.replace(ANSI_RE, "");
 
+/** Strip URL query strings from diagnostics so OAuth parameters never surface
+ * in a local log or dashboard error while retaining the actionable origin/path. */
+export const redactUrls = (value: string): string =>
+  value.replace(/(https?:\/\/[^\s?]+)\?\S*/g, "$1?<redacted>");
+
 /**
  * Build the `script(1)` argv that runs `argv` under a PSEUDO-TERMINAL, writing
  * the terminal capture to `typescript` — or null on an OS without `script`
@@ -492,7 +497,8 @@ export const spawnLoginPty = async (
   await proc.exited;
   captured = await readFile(); // final read (token written just before exit)
   await rm(tsFile, { force: true }).catch(() => {});
-  if (!abandoned) logIfKilled(scriptArgv, proc, { confined: opts?.probe !== true });
+  if (!abandoned)
+    logIfKilled(scriptArgv, proc, { confined: opts?.probe !== true });
   return { code: proc.exitCode ?? -1, output: stripAnsi(captured), abandoned };
 };
 
