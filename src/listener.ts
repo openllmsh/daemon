@@ -14,6 +14,7 @@
  * is no API-key auth gate here (unlike the cloud handler).
  */
 
+import type { TContextOverflowStrategy } from "@openllmsh/protocol";
 import {
   AnthropicCountTokensRequest,
   AnthropicRequest,
@@ -22,7 +23,6 @@ import {
   ResponsesRequest,
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
-import type { TContextOverflowStrategy } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { Schema } from "effect";
 import { fetchPlan } from "./cloud-client";

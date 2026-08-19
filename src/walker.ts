@@ -64,18 +64,18 @@ import {
   contextOverflowRequiredTokens,
   nextLargerContextModel,
 } from "@openllmsh/wire/features/context-demote";
+import type { TContextOverflowStrategy } from "@openllmsh/wire/features/context-overflow-strategy";
+import {
+  resolveContextOverflowStrategy,
+  shouldDemoteOnContextOverflow,
+  shouldSkipHopForSize,
+} from "@openllmsh/wire/features/context-overflow-strategy";
 import {
   compactionTargetFromOverflow,
   forcedCompactionTarget,
   MAX_LAST_RESORT_COMPACTION_ROUNDS,
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
-import {
-  resolveContextOverflowStrategy,
-  shouldDemoteOnContextOverflow,
-  shouldSkipHopForSize,
-} from "@openllmsh/wire/features/context-overflow-strategy";
-import type { TContextOverflowStrategy } from "@openllmsh/wire/features/context-overflow-strategy";
 import { applyOutputTokenBackfill } from "@openllmsh/wire/features/max-tokens-backfill";
 import {
   GATE_STALE_CAP_MS,
