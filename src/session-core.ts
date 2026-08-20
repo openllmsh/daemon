@@ -1169,6 +1169,10 @@ export const openSession = (
     }
     const cli: TDeviceSessionCli = frame.cli;
     const existing = sessions.get(frame.session_id);
+    if (existing !== undefined && existing.cli !== cli) {
+      nack("spawn_failed");
+      return;
+    }
     const rawResumeId =
       typeof frame.resume_session_id === "string" &&
       frame.resume_session_id.length > 0

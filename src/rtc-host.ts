@@ -54,6 +54,7 @@ type TRtcSession = {
   readonly pc: RTCPeerConnection;
   mux: TMuxChannel | null;
   closed: boolean;
+  nacked: boolean;
   handshakeTimer: ReturnType<typeof setTimeout> | null;
 };
 
@@ -100,6 +101,19 @@ const sendNack = (channelId: string, reason: TRtcNackReason): void => {
   } catch {
     // control socket racing a close
   }
+};
+
+/** One handshake_failed nack then close, for any pre-mux failure path. */
+const failUnmountedHandshake = (
+  session: TRtcSession,
+  closeReason: string,
+): void => {
+  if (session.closed || session.mux !== null) return;
+  if (!session.nacked) {
+    session.nacked = true;
+    sendNack(session.channelId, "handshake_failed");
+  }
+  closeSession(session.channelId, closeReason);
 };
 
 /**
@@ -375,13 +389,12 @@ export const handleRtcOffer = async (frame: {
     pc,
     mux: null,
     closed: false,
+    nacked: false,
     handshakeTimer: null,
   };
   sessions.set(frame.channel_id, session);
   session.handshakeTimer = setTimeout(() => {
-    if (session.closed || session.mux !== null) return;
-    sendNack(frame.channel_id, "handshake_failed");
-    closeSession(frame.channel_id, "handshake_timeout");
+    failUnmountedHandshake(session, "handshake_timeout");
   }, RTC_HANDSHAKE_TIMEOUT_MS);
 
   pc.ondatachannel = (ev) => {
@@ -412,7 +425,8 @@ export const handleRtcOffer = async (frame: {
   pc.onconnectionstatechange = () => {
     const state = pc.connectionState;
     if (state === "failed" && session.mux === null) {
-      sendNack(frame.channel_id, "handshake_failed");
+      failUnmountedHandshake(session, "pc_failed");
+      return;
     }
     if (state === "failed" || state === "closed" || state === "disconnected") {
       closeSession(frame.channel_id, `pc_${state}`);
@@ -428,7 +442,7 @@ export const handleRtcOffer = async (frame: {
 
     const fd = localFingerprint(pc);
     if (fd === null) {
-      closeSession(frame.channel_id, "no_local_fingerprint");
+      failUnmountedHandshake(session, "no_local_fingerprint");
       return;
     }
 
@@ -447,7 +461,7 @@ export const handleRtcOffer = async (frame: {
       logWarn("rtc-host", "seal answer failed", {
         err: err instanceof Error ? err.message : String(err),
       });
-      closeSession(frame.channel_id, "seal_failed");
+      failUnmountedHandshake(session, "seal_failed");
       return;
     }
 
@@ -465,7 +479,7 @@ export const handleRtcOffer = async (frame: {
       channelId: frame.channel_id,
       err: err instanceof Error ? err.message : String(err),
     });
-    closeSession(frame.channel_id, "offer_failed");
+    failUnmountedHandshake(session, "offer_failed");
   }
 };
 
