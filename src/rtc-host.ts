@@ -380,6 +380,7 @@ export const handleRtcOffer = async (frame: {
   sessions.set(frame.channel_id, session);
   session.handshakeTimer = setTimeout(() => {
     if (session.closed || session.mux !== null) return;
+    sendNack(frame.channel_id, "handshake_failed");
     closeSession(frame.channel_id, "handshake_timeout");
   }, RTC_HANDSHAKE_TIMEOUT_MS);
 
@@ -410,6 +411,9 @@ export const handleRtcOffer = async (frame: {
 
   pc.onconnectionstatechange = () => {
     const state = pc.connectionState;
+    if (state === "failed" && session.mux === null) {
+      sendNack(frame.channel_id, "handshake_failed");
+    }
     if (state === "failed" || state === "closed" || state === "disconnected") {
       closeSession(frame.channel_id, `pc_${state}`);
     }

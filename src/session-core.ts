@@ -6,7 +6,7 @@
  * or call openSession; this module never imports relay frame types.
  */
 
-import { realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import type {
@@ -219,8 +219,6 @@ export type TSession = {
   lastExitReason: "evicted" | "reaped" | "done" | "killed" | null;
   /** Child status, when Bun's PTY-backed process supplied one. */
   exitCode: number | null;
-  /** Optional adapter for output/close when no stream is attached. */
-  fallback: TSessionFallback | null;
 };
 
 const sessions = new Map<string, TSession>();
@@ -475,6 +473,8 @@ const openllmClientId = (cli: TDeviceSessionCli): string => {
       return "opencode";
     case "hermes":
       return "hermes";
+    case "shell":
+      throw new Error("shell is not an openllm client");
   }
 };
 
@@ -509,6 +509,8 @@ const pushResumeArgs = (
     case "hermes":
       args.push("--resume", vendorSessionId);
       break;
+    case "shell":
+      break;
     default:
       break;
   }
@@ -529,6 +531,14 @@ const argvFor = (
   vendorSessionId: string | null,
   vendorArgs: readonly string[] = [],
 ): ReadonlyArray<string> => {
+  if (cli === "shell") {
+    const shell =
+      process.env.SHELL ??
+      (process.platform === "darwin" ? "/bin/zsh" : "/bin/bash");
+    if (!existsSync(shell))
+      throw new Error(`login shell does not exist: ${shell}`);
+    return [shell, "-l"];
+  }
   const clientId = openllmClientId(cli);
   const bin = openllmBin();
   const canDangerous = dangerous && sessionSupportsDangerous(cli);
@@ -679,11 +689,7 @@ const fanOut = (session: TSession, chunk: Uint8Array): void => {
 
 /** Fan out one out-direction chunk to every attached transport-neutral consumer. */
 const sendOut = (session: TSession, chunk: Uint8Array): void => {
-  if (isAttached(session)) {
-    fanOut(session, chunk);
-    return;
-  }
-  session.fallback?.onOutput(session, chunk);
+  if (isAttached(session)) fanOut(session, chunk);
 };
 
 /** Paint the current screen for a newly attached consumer: one serialize of the
@@ -920,9 +926,8 @@ const setConsumerViewport = (
   }
 };
 
-const terminalClose = (session: TSession, reason: "done" | "killed"): void => {
+const terminalClose = (session: TSession): void => {
   const consumers = [...session.consumers];
-  if (consumers.length === 0) session.fallback?.onClose(session, reason);
   // Exit codes are delivered on natural exits before each local broker stream
   // closes. An explicit kill intentionally has no late exit envelope.
   for (const consumer of consumers) {
@@ -1039,7 +1044,7 @@ export const closeSession = (id: string): boolean => {
   const session = sessions.get(id);
   if (session === undefined) return false;
   endPty(session, "killed");
-  terminalClose(session, "killed");
+  terminalClose(session);
   logInfo("session", "session closed", { id, reason: "close" });
   return true;
 };
@@ -1101,14 +1106,8 @@ export type TSessionOpenAck =
       readonly lastExitReason?: "evicted" | "reaped" | "done" | "killed";
     };
 
-export type TSessionFallback = {
-  readonly onOutput: (session: TSession, chunk: Uint8Array) => void;
-  readonly onClose: (session: TSession, reason: "done" | "killed") => void;
-};
-
 export type TOpenSessionOptions = {
   readonly vendorArgs?: readonly string[];
-  readonly fallback?: TSessionFallback;
   readonly onSessionReady?: (session: TSession) => void;
   readonly onAck: (ack: TSessionOpenAck) => void;
 };
@@ -1117,7 +1116,7 @@ export const openSession = (
   frame: TSessionOpen,
   options: TOpenSessionOptions,
 ): void => {
-  const { vendorArgs, fallback, onSessionReady, onAck } = options;
+  const { vendorArgs, onSessionReady, onAck } = options;
   const nack = (
     error:
       | "pty_unsupported"
@@ -1170,9 +1169,6 @@ export const openSession = (
     }
     const cli: TDeviceSessionCli = frame.cli;
     const existing = sessions.get(frame.session_id);
-    // The relay adapter supplies a new fallback for every legacy attachment;
-    // stream attachments deliberately clear it because output has consumers.
-    if (existing !== undefined) existing.fallback = fallback ?? null;
     const rawResumeId =
       typeof frame.resume_session_id === "string" &&
       frame.resume_session_id.length > 0
@@ -1185,6 +1181,10 @@ export const openSession = (
       return;
     }
     const resumeId = rawResumeId;
+    if (cli === "shell" && resumeId !== null) {
+      nack("spawn_failed");
+      return;
+    }
 
     // ── attach: re-bind a live PTY ────────────────────────────────────
     if (frame.mode === "attach") {
@@ -1235,7 +1235,7 @@ export const openSession = (
     // Device sessions must launch through the OpenLLM CLI so the gateway,
     // catalog, config, and environment overlay is always applied. Only enforce
     // this for the real spawner — injected test spawners never exec a binary.
-    if (spawner === bunPtySpawner && openllmBin() === null) {
+    if (cli !== "shell" && spawner === bunPtySpawner && openllmBin() === null) {
       nack("cli_not_installed");
       return;
     }
@@ -1274,13 +1274,11 @@ export const openSession = (
       generation: 0,
       lastExitReason: null,
       exitCode: null,
-      fallback: fallback ?? null,
     };
     // Refresh resume metadata on every spawn/continue.
     s.cwd = cwd;
     s.vendorSessionId = vendorSessionId;
     if (frame.title !== undefined) s.title = frame.title;
-    s.fallback = fallback ?? null;
     sessions.set(s.id, s);
     evictStaleDeadSessions();
 
@@ -1336,7 +1334,7 @@ export const openSession = (
           s.exitCode = typeof exitCode === "number" ? exitCode : null;
           const reason = s.lastExitReason ?? "done";
           endPty(s, reason, false);
-          terminalClose(s, reason === "done" ? "done" : "killed");
+          terminalClose(s);
           logInfo("session", "session CLI exited", { id: s.id });
         },
       });
@@ -1501,7 +1499,7 @@ export const bindSessionStream = (
       if (ctrl?.t === "close" && ctrl.intent === "kill") {
         endPty(session, "killed");
         // END is a clean terminal close to sessionStream.closed ("done").
-        terminalClose(session, "killed");
+        terminalClose(session);
       }
     }),
     stream.onReset(() => detachConsumer(session, consumer)),

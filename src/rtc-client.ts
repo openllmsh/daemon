@@ -458,7 +458,8 @@ export const handleRtcAnswer = async (frame: {
  * Handle a serving peer's `rtc_nack` — an explicit reject. Fail the pending
  * offer immediately (no 10–20s signaling/ICE wait) and set the failure-cache
  * policy per reason:
- *   - `disabled` / `not_capable` → cache (peer posture won't change soon);
+ *   - `disabled` / `not_capable` / `handshake_failed` → cache (peer posture
+ *     or a failed pre-mux handshake will not recover on an immediate retry);
  *   - `overloaded` → NO cache (transient — let the next attempt retry);
  *   - `seedgate` → the peer's vault is locked; cache the window so we don't
  *     hammer it, and let a later presence/caps flap clear it.

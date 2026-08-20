@@ -83,9 +83,9 @@ export const readLocalSessions = async (
 ): Promise<TLocalCliSession[]> => {
   const limit = clampLimit(opts.limit);
   const deps = opts.deps ?? {};
-  // Defense-in-depth: every current DeviceSessionCli is listable; keep the
-  // guard so a future non-listable slug fails closed to empty rather than
-  // half-reading an unknown store.
+  // Defense-in-depth: only CLIs with a local history reader are listable; keep
+  // the guard so shell and future non-listable slugs fail closed to empty rather
+  // than half-reading an unknown store.
   if (!isListableDeviceCli(cli)) return [];
 
   const readHistory = deps.readHistory ?? defaultHistory;

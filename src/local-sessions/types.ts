@@ -14,7 +14,7 @@ export type TOpenllmClientId =
   | "opencode"
   | "hermes";
 
-/** Device CLI slugs that have a local history reader in v1. */
+/** Device CLI slugs that have a local history reader in v1 (shell excluded). */
 export const LISTABLE_DEVICE_CLIS = [
   "claude_code",
   "chatgpt",
@@ -45,6 +45,8 @@ export const openllmClientIdOf = (
       return "opencode";
     case "hermes":
       return "hermes";
+    case "shell":
+      return null;
     default:
       return null;
   }
