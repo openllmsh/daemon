@@ -17,12 +17,14 @@
 
 ## Why this package exists
 
-Subscription-OAuth providers (`claude_code`, `chatgpt`, `kimi_code`)
-cannot be served by the hosted gateway without (T1) putting a third party
-in the credential path and (T2) forging a CLI identity. The daemon moves
-that data plane onto the user's machine and **delegates to the official
-vendor CLI** for each provider, clearing both triggers. API-key (BYOK)
-providers keep running on the cloud unchanged.
+Subscription-OAuth providers (`claude_code`, `chatgpt`, `kimi_code`, and
+`grok`) cannot be served by the hosted gateway without (T1) putting a third
+party in the credential path and (T2) forging a CLI identity. The daemon
+moves that data plane onto the user's machine and **delegates to the official
+vendor CLI** for each provider, clearing both triggers. It also owns the
+`cursor-agent` CLI's login, status, usage, and model discovery; Cursor
+inference uses its ACP bridge rather than a manual upstream HTTP transport.
+API-key (BYOK) providers keep running on the cloud unchanged.
 
 ## Dependency boundary (load-bearing)
 
@@ -94,22 +96,22 @@ daemon/
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
     mux-host.ts             mux2/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
     session-core.ts         transport-neutral PTY state machine: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping
-    session-host.ts         legacy browser/relay adapter plus durable socket-directory boot reconciler; retains only temporary in-daemon browser PTY ownership until Phase 2
+    session-host.ts         durable session-host registry/status adapter and boot reconciler; never owns a daemon PTY
     session-host-proc/      detached per-session host: owns one durable PTY, scrollback, idle reaping, meta.json, and ctl.sock
-    broker-listener.ts      legacy authenticated loopback broker surface retained for browser/relay compatibility during the Phase 2 transition
-    rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice + mux over data channel
-    rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice + mux over data channel
-    tunnel-client.ts        consuming subscription tunnel: RTC (when open) → relay mux only (no JSON splice)
+    rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice/nack + mux over data channel
+    rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice/nack + mux over data channel
+    tunnel-client.ts        consuming subscription tunnel: RTC (when open) → relay binary mux only (no JSON splice)
     tunnel-server.ts        serving in-process tunneled request dispatch for mux streams
-    record.ts/version/env   request recording, version, env (+ env-file loader)
+    image-walker.ts         locally delegated image generation + cloud media-library upload
+    video-walker.ts         locally delegated video operations + cloud media-library upload
+    version.ts/env.ts       version metadata and environment-file loader
     delegation/             isolated-CLI delegates per provider
       types.ts              TProviderDelegate contract
       auth-config.ts        per-provider `config.json` sidecar: capture the real CLI
-                            exec request's upstream URL (drift-safe) + CLI meta, and
-                            extract Claude's + Codex's OAuth client_id + token URL
-                            from the binary. Feeds the request TARGET + token refresh
-                            — NOT inference identity (the originator's headers do that)
-      claude-code.ts chatgpt.ts kimi-code.ts util.ts index.ts
+                            exec request's upstream URL (drift-safe) + CLI meta. Feeds
+                            the request TARGET — NOT inference identity (the originator's
+                            headers do that)
+      claude-code.ts chatgpt.ts kimi-code.ts grok.ts cursor.ts util.ts index.ts
 ```
 
 ## Integration triggers (skill / plugin / setup install + uninstall)
@@ -120,9 +122,10 @@ The daemon can install/uninstall any catalogued **skill**, **plugin**, or
 
 - **CLI:** `openllmd {skill|plugin|setup} <install|uninstall|list> [slug]` —
   foreground one-shot (no server boot), completion-derived from `commands.ts`.
-- **Relay:** the dashboard's "Install with the daemon" button enqueues an
-  `install_integration` / `uninstall_integration` command (via the existing
-  `POST /api/daemon/cmd` → poll), dispatched in `control-relay.ts`.
+- **Relay:** the dashboard's "Install with the daemon" button sends an
+  `install_integration` / `uninstall_integration` command over the live relay
+  control channel; `control-relay.ts` dispatches the typed command. There is no
+  cloud command mailbox or polling leg.
 
 `runIntegration` requests the gateway's validated non-executable pointer,
 validates its full-commit raw GitHub URL, downloads the script directly into a
@@ -143,29 +146,36 @@ refresh. See
 ## Coreless walker (the data path)
 
 `walker.ts` is the thin `@openllm/core`-free executor of the coreless
-proposal's §3.3 — the daemon's **sole** data path. Every `/v1/*` request
-carries the cloud's `?__plan=<provider/model,…>` (off the 307 — see
-[`coreless-daemon-passthrough.md`](../../docs/proposals/coreless-daemon-passthrough.md));
-`listener.ts` validates the body and hands the plan to the walker. (No
-`?__plan=` is a misuse of the daemon surface → clean 400; clients reach it
-only via the gateway's 307.) The walker makes **zero** routing decisions —
-the cloud already resolved the alias + cooldowns — it walks the ordered
-plan, serving each subscription hop locally (delegate credential injected,
-vendor called directly) and forwarding each API-key hop to the cloud
-(`forward.ts`, pinned). Every non-abort candidate failure before commitment
+proposal's §3.3 — the daemon's **sole** data path. A gateway redirect carries
+the cloud-signed `?__plan=<provider/model,…>` (see
+[`coreless-daemon-passthrough.md`](../../docs/proposals/coreless-daemon-passthrough.md)).
+For a direct local-first request, `listener.ts` first reuses a valid cached
+plan or fetches one from the cloud without sending the request body; a pure
+BYOK plan, or a failed plan fetch, is forwarded to the cloud. The listener
+validates the body and hands a subscription-containing plan to the walker.
+The walker makes **zero** routing decisions — the cloud already resolved the
+alias + cooldowns — it walks the ordered plan, serving each subscription hop
+locally (delegate credential injected, vendor called directly) and forwarding
+each API-key hop to the cloud (`forward.ts`, pinned). Every non-abort candidate failure before commitment
 walks via the same `@openllmsh/wire/lib/error-class` policy as the cloud;
 routing never depends on provider-specific status/message allow-lists. The
 walker commits on first output, after which switching models is intentionally
 unsafe. On chain exhaustion the final hop's real upstream response is preserved.
 
-**Serves all three subscription providers + cross-wire** (§9(a)) — a tiny
-per-hop mini-runner built from the `@openllmsh/wire` transforms:
+**The manual mini-runner serves four subscription providers + cross-wire**
+(§9(a)) — it is built from the `@openllmsh/wire` transforms:
 
 | Provider | Upstream wire | Anthropic-wire client | OpenAI-wire client |
 | --- | --- | --- | --- |
 | `claude_code` | anthropic | **passthrough** (verbatim) | `toAnthropicRequest` → decode/re-encode |
 | `chatgpt` | Codex/Responses | `toChatGptRequest` → decode → Anthropic SSE | `toChatGptRequest` → decode → OpenAI SSE |
 | `kimi_code` | openai | canonical re-encode | **passthrough** (verbatim) |
+| `grok` | Responses | `toChatGptRequest` → decode → Anthropic SSE | `toChatGptRequest` → decode → OpenAI SSE |
+
+`cursor` is intentionally absent from this manual-wire table: its official
+`cursor-agent acp` bridge is the walker's native-runtime transport, with no
+manual upstream HTTP transport to describe here. The same bridge supplies model
+discovery.
 
 The REQUEST side — body + wire-derived headers for every `(client wire ×
 upstream wire)` cell, including the passthrough-vs-transform decision and
@@ -217,21 +227,26 @@ lifecycle items are not yet re-emitted onto client wires; the grounded answer
 streams normally. The Claude native runtime still strips tools on the text path
 and claims no search support.
 
-**Cost is computed cloud-side.** The daemon reports only TOKEN COUNTS in
-its metadata row (`POST /api/daemon/requests`); the cloud's
-`daemonRecordHandler` recomputes `cost_usd` from those tokens (the single
-pricing source of truth — no pricing table is shipped to the box, and
-`cost_usd` is not even on the daemon→cloud wire). The row carries the
-prompt-cache split (`cached_tokens` / `cache_creation_tokens`, both optional
-so an older daemon still records) because `tokens_in` INCLUDES those tokens
-and the cloud prices them at the cache rates, not the input rate. Token
-counts are accurate for streaming too: the walker tees the canonical-chunk
-stream and accumulates usage off one branch while the client reads the other.
+**Cost is computed cloud-side.** For inference records, the daemon reports
+metadata only — token counts plus model/provider, outcome, latency, endpoint,
+and optional account/cache/cooldown fields — to `POST /api/daemon/requests`;
+it never records prompt or completion content. The cloud's
+`daemonRecordHandler` recomputes `cost_usd` from the tokens (the single pricing
+source of truth — no pricing table is shipped to the box, and `cost_usd` is not
+on the daemon→cloud record wire). The row carries the prompt-cache split
+(`cached_tokens` / `cache_creation_tokens`, both optional so an older daemon
+still records) because `tokens_in` INCLUDES those tokens and the cloud prices
+them at the cache rates, not the input rate. Token counts are accurate for
+streaming too: the walker tees the canonical-chunk stream and accumulates usage
+off one branch while the client reads the other. This does not describe the
+separate, explicit media-library feature: `image-walker.ts` and
+`video-walker.ts` may upload locally generated image/video bytes to
+`/api/daemon/media` so the user can retrieve them from the cloud library.
 
 **Validated live** (`RUN_DAEMON_LIVE=1`, `tests/server/daemon-walker-live
 .e2e.test.ts`) against the real authenticated CLIs, through the full
-production flow (client → cloud → signed 307 → walker → vendor): all three
-providers + cross-wire, stream + non-stream, and the
+production flow (client → cloud → signed 307 → walker → vendor): the core
+Claude/Codex/Kimi providers + cross-wire, stream + non-stream, and the
 forged-signature → 403 gate. The remaining §8 byte-identical-upstream diff
 is a belt-and-braces confidence check, not a ship gate.
 
@@ -422,13 +437,12 @@ and process-tree CPU have been idle for `OPENLLM_SESSION_IDLE_TIMEOUT_MIN`
 a daemon shutdown, fatal exit, update, or crash cannot kill a durable local
 session. On boot the daemon reconciles the socket-directory registry: valid
 `meta.json` + live host pid + present socket is **adopted** (kept, never
-signalled); a dead or incomplete directory is removed. The former pidfile killer
-is retained only for the temporary legacy browser/relay PTYs the daemon still
-owns in-process.
+signalled); a dead or incomplete directory is removed.
 
-`session-host.ts` deliberately keeps the legacy relay-frame and mux adapter for
-those browser sessions. Phase 2 will turn it into a client of `ctl.sock`; this
-phase does not change the remote-session gate or browser wire surface. See
+`mux-host.ts` attaches browser mux session streams to the durable host through
+`attachSessionHostViaCli`; `session-host.ts` is now only the durable
+registry/status adapter and boot reconciler. There is no legacy JSON
+`session_*` relay splice. See
 [`durable-session-host.md`](../../docs/proposals/durable-session-host.md) and
 [`shared-session-viewing.md`](../../docs/proposals/shared-session-viewing.md).
 
@@ -442,12 +456,13 @@ standalone host owns lifecycle and transport fan-out.
 by path:
 
 - **`/v1/*` — inference.** Mirrors the cloud's OpenAI/Anthropic surface.
-  `listener.ts` parses → `dispatch.runLocalDispatch` resolves the user's
-  fallback chain (from the cloud-pulled config) and runs `CoreLive` →
-  `encode.encodeDispatchResult` streams back and fire-and-forget POSTs a
-  metadata-only row to the cloud. Subscription hops use the delegate's
-  credential; an API-key hop inside a mixed chain is forwarded to the
-  cloud (`forward.ts`) rather than decrypted locally.
+  `listener.ts` validates the request, obtains/verifies the cloud-signed plan
+  (from the redirect, cache, or local-first plan fetch), then invokes the
+  coreless `walker.ts` (or the image/video walkers). The walker serves
+  subscription hops with the delegate's credential and forwards an API-key hop
+  in a mixed chain to the cloud (`forward.ts`) rather than decrypting it
+  locally. It fire-and-forget records inference metadata to the cloud; explicit
+  locally generated media may additionally be uploaded to the media library.
 - **Control surface** — called DIRECTLY by the dashboard browser. Reads
   (`GET /status`, `GET /events`, `GET /usage/:slug`) and writes
   (`POST /config/api-key`, `POST /connect/:slug`) are served to the
@@ -624,11 +639,13 @@ Two orthogonal hardenings from
 
 Each `TProviderDelegate` wraps the daemon's isolated CLI: `detect`
 (`cliInstallState`), `connect` (trigger the CLI's native login under the
-isolated env), `usage` (read locally with the CLI's own credential), and
-`credentialForUpstream` (bearer + only the credential-intrinsic headers, e.g.
-codex's account id + the captured upstream URL — the local runner adds the
-ORIGINATOR's headers and the wire-derived ones). Nothing the delegate reads from
-a CLI's store is ever sent off-box.
+isolated env), and `usage` (read locally with the CLI's own credential).
+Inference-capable delegates additionally provide `credentialForUpstream`
+(bearer + only the credential-intrinsic headers, e.g. Codex's account id + the
+captured upstream URL — the local runner adds the ORIGINATOR's headers and the
+wire-derived ones). Cursor has no manual credential-to-upstream path; the
+walker serves it through the `cursor-agent acp` native-runtime bridge instead.
+Nothing a delegate reads from a CLI store is sent off-box as request recording.
 
 **Usage is read ON DEMAND, never polled (`usage-cache.ts`).** The vendor usage
 endpoints (e.g. Claude's `api/oauth/usage`) rate-limit **independently of
@@ -744,6 +761,13 @@ connected/failed directly — the dashboard's Connect button stays in its
   shape (+ persist `device_id`). The status watcher then flips the card to
   connected (~5s). `connect` returns immediately with the device code /
   URL; no terminal, no TUI.
+- **grok** — `grok login` (or `grok login --device-auth` for a headless
+  device-code flow); when a refresh is needed, the daemon attempts a bounded
+  `grok models` run so the CLI can perform its own refresh. The isolated
+  run-view points to the user's `grok` executable.
+- **cursor** — `cursor-agent login`; its local credential store is checked for
+  status/usage and its ACP bridge supplies model discovery and the walker's
+  native-runtime inference transport.
 
 The dashboard's `/providers` OAuth tab drives a flow off `/status`'s
 per-provider `cli_installed` + `connected`: CLI missing (prompt to re-run
@@ -835,4 +859,5 @@ present (a re-run re-pairs in place; the minted `OPENLLM_DEVICE_ID` is kept).
   protocol), never `core`; no db/vault/vercel/next.
 - Holds no DEK; never decrypts a vault credential.
 - Never transmits a subscription token or CLI-store contents off-box;
-  cloud-bound payloads are metadata only.
+  request-recording payloads are metadata only. The separate media-library
+  feature may upload locally generated image/video bytes for cloud retrieval.
