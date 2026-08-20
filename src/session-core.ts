@@ -473,6 +473,8 @@ const openllmClientId = (cli: TDeviceSessionCli): string => {
       return "grok";
     case "opencode":
       return "opencode";
+    case "hermes":
+      return "hermes";
   }
 };
 
@@ -503,6 +505,9 @@ const pushResumeArgs = (
       break;
     case "opencode":
       args.push("--session", vendorSessionId);
+      break;
+    case "hermes":
+      args.push("--resume", vendorSessionId);
       break;
     default:
       break;
@@ -542,6 +547,8 @@ const argvFor = (
     pushResumeArgs(args, cli, vendorSessionId);
   } else if (mode === "continue" && cli === "claude_code") {
     args.push("--continue");
+  } else if (cli === "hermes" && vendorSessionId === null) {
+    args.push("--tui");
   }
   args.push(...vendorArgs);
   return args;

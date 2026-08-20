@@ -40,9 +40,10 @@ const isExecutableFile = (path: string): boolean => {
   }
 };
 
-const OPENCODE_PROBE_TTL_MS = 30_000;
+const SESSION_CLI_PROBE_TTL_MS = 30_000;
 let opencodeProbe: { readonly at: number; readonly found: boolean } | null =
   null;
+let hermesProbe: { readonly at: number; readonly found: boolean } | null = null;
 
 // Status runs at hello/reconnect plus the flow watcher cadence. Each delegate's
 // version/auth capture self-terminates its process group at
@@ -86,7 +87,7 @@ const boundedDelegateStatus = async (
 const opencodeInstalled = (): boolean => {
   if (
     opencodeProbe !== null &&
-    Date.now() - opencodeProbe.at < OPENCODE_PROBE_TTL_MS
+    Date.now() - opencodeProbe.at < SESSION_CLI_PROBE_TTL_MS
   ) {
     return opencodeProbe.found;
   }
@@ -98,6 +99,25 @@ const opencodeInstalled = (): boolean => {
   ];
   const found = candidates.some((path) => isExecutableFile(path));
   opencodeProbe = { at: Date.now(), found };
+  return found;
+};
+
+/** Hermes is a device-session client (not a subscription delegate). */
+const hermesInstalled = (): boolean => {
+  if (
+    hermesProbe !== null &&
+    Date.now() - hermesProbe.at < SESSION_CLI_PROBE_TTL_MS
+  ) {
+    return hermesProbe.found;
+  }
+  const home = homedir();
+  const candidates = [
+    join(home, ".hermes", "bin", "hermes"),
+    join(home, ".local", "bin", "hermes"),
+    ...resolveOnPath("hermes"),
+  ];
+  const found = candidates.some((path) => isExecutableFile(path));
+  hermesProbe = { at: Date.now(), found };
   return found;
 };
 
@@ -135,6 +155,13 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   if (opencodeInstalled()) {
     connections.push({
       provider: "opencode",
+      connected: false,
+      cli_installed: true,
+    });
+  }
+  if (hermesInstalled()) {
+    connections.push({
+      provider: "hermes",
       connected: false,
       cli_installed: true,
     });

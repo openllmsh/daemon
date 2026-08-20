@@ -7,7 +7,12 @@
 import type { TDeviceSessionCli, TLocalCliSession } from "@openllmsh/protocol";
 
 /** openllm client id used under `~/.openllm/run/<client>/`. */
-export type TOpenllmClientId = "claude" | "codex" | "grok" | "opencode";
+export type TOpenllmClientId =
+  | "claude"
+  | "codex"
+  | "grok"
+  | "opencode"
+  | "hermes";
 
 /** Device CLI slugs that have a local history reader in v1. */
 export const LISTABLE_DEVICE_CLIS = [
@@ -15,6 +20,7 @@ export const LISTABLE_DEVICE_CLIS = [
   "chatgpt",
   "grok",
   "opencode",
+  "hermes",
 ] as const satisfies readonly TDeviceSessionCli[];
 
 export type TListableDeviceCli = (typeof LISTABLE_DEVICE_CLIS)[number];
@@ -37,6 +43,8 @@ export const openllmClientIdOf = (
       return "grok";
     case "opencode":
       return "opencode";
+    case "hermes":
+      return "hermes";
     default:
       return null;
   }
@@ -54,6 +62,8 @@ export const deviceCliOfClientId = (
       return "grok";
     case "opencode":
       return "opencode";
+    case "hermes":
+      return "hermes";
   }
 };
 
