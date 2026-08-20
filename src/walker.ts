@@ -694,20 +694,24 @@ export const report = (
   origin: string | null,
   accountHash?: string,
 ): void => {
-  void recordRequest(row, origin);
+  const recordedRow: TDaemonRecordRequest = {
+    ...row,
+    idempotency_key: row.idempotency_key ?? randomUUID(),
+  };
+  void recordRequest(recordedRow, origin);
   if (
-    row.status !== "success" ||
-    !isSubscriptionSlug(row.provider) ||
-    row.tokens_in + row.tokens_out <= 0
+    recordedRow.status !== "success" ||
+    !isSubscriptionSlug(recordedRow.provider) ||
+    recordedRow.tokens_in + recordedRow.tokens_out <= 0
   ) {
     return;
   }
-  const delegate = getDelegate(row.provider);
+  const delegate = getDelegate(recordedRow.provider);
   if (delegate !== null) {
     sampleUsageAfterRequest(
-      row.provider,
+      recordedRow.provider,
       () => delegate.usage(),
-      row.account_hash ?? accountHash,
+      recordedRow.account_hash ?? accountHash,
     );
   }
 };

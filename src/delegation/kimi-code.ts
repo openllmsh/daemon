@@ -447,6 +447,9 @@ type TUsageRow = {
 };
 
 const toInt = (v: unknown): number | null => {
+  if (typeof v !== "number" && (typeof v !== "string" || v.trim() === "")) {
+    return null;
+  }
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : null;
 };
@@ -473,18 +476,16 @@ const toUsageRow = (raw: unknown, fallbackLabel: string): TUsageRow | null => {
     const remaining = toInt(raw.remaining);
     if (remaining !== null && limit !== null) used = limit - remaining;
   }
-  if (used === null && limit === null) return null;
+  if (limit === null || limit <= 0 || used === null) return null;
   const label =
     typeof raw.name === "string"
       ? raw.name
       : typeof raw.title === "string"
         ? raw.title
         : fallbackLabel;
-  const u = used ?? 0;
-  const l = limit ?? 0;
   return {
     label,
-    percentUsed: l > 0 ? Math.max(0, Math.min(100, (u / l) * 100)) : 0,
+    percentUsed: Math.max(0, Math.min(100, (used / limit) * 100)),
     resetAtMs: resetAtMsOf(raw),
   };
 };
@@ -534,6 +535,34 @@ const parseUsageWindows = (payload: unknown): ReadonlyArray<TUsageRow> => {
     });
   }
   return rows;
+};
+
+/** Parse a Kimi `/usages` response without fabricating a zero-percent window
+ * from missing quota fields. */
+export const parseKimiUsage = (payload: unknown): TProviderUsageSnapshot => {
+  const rows = parseUsageWindows(payload);
+  if (rows.length === 0) {
+    return {
+      kind: "unavailable",
+      reason: "/usages had no parseable window",
+    };
+  }
+  const windows = rows.map((row) => ({
+    label: row.label,
+    percent_used: row.percentUsed,
+    reset_at_ms: row.resetAtMs,
+  }));
+  const maxPct = windows.reduce(
+    (max, window) => Math.max(max, window.percent_used),
+    0,
+  );
+  return {
+    kind: "quota",
+    status:
+      maxPct >= 100 ? "rejected" : maxPct >= 80 ? "allowed_warning" : "allowed",
+    windows,
+    note: "Kimi Code — read locally via Kimi CLI",
+  };
 };
 
 // ─── Login wiring ────────────────────────────────────────────────────────
@@ -662,34 +691,8 @@ export const kimiCodeDelegate: TProviderDelegate = {
         return { kind: "unavailable", reason };
       }
       // Parse the `{ usage, limits[] }` payload into one window per limit
-      // (+ the rolled-up summary) — see parseUsageWindows.
-      const rows = parseUsageWindows(await resp.json());
-      if (rows.length === 0) {
-        return {
-          kind: "unavailable",
-          reason: "/usages had no parseable window",
-        };
-      }
-      const windows = rows.map((r) => ({
-        label: r.label,
-        percent_used: r.percentUsed,
-        reset_at_ms: r.resetAtMs,
-      }));
-      const maxPct = windows.reduce(
-        (a, w) => (w.percent_used > a ? w.percent_used : a),
-        0,
-      );
-      return {
-        kind: "quota",
-        status:
-          maxPct >= 100
-            ? "rejected"
-            : maxPct >= 80
-              ? "allowed_warning"
-              : "allowed",
-        windows,
-        note: "Kimi Code — read locally via Kimi CLI",
-      };
+      // (+ the rolled-up summary), skipping incomplete quota rows.
+      return parseKimiUsage(await resp.json());
     } catch (err) {
       return {
         kind: "unavailable",

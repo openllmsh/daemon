@@ -466,10 +466,11 @@ export const parseGrokWeeklyWindow = (
 
 /** Combine the weekly (`?format=credits`) + monthly (plain) views into ONE
  *  snapshot. Weekly is listed first (it's the pool that gates Grok Build
- *  inference; the CLI's `/usage` shows it). `creditsBody` may be null when that
- *  fetch failed — the snapshot then degrades to monthly-only rather than going
- *  unavailable. Pure (no network) so it can be unit-tested. Returns
- *  `unavailable` only when NEITHER view yields a window. */
+ *  inference; the CLI's `/usage` shows it). A null `creditsBody` means a
+ *  successful response with no parseable weekly window, so monthly-only is
+ *  valid. HTTP/network failures are handled by `grokWeeklyUsageUnavailable`
+ *  before this pure parser is called. Returns `unavailable` only when NEITHER
+ *  body yields a window. */
 export const parseGrokUsage = (
   billingBody: unknown,
   creditsBody: unknown,
@@ -499,6 +500,23 @@ export const parseGrokUsage = (
  *  {@link parseGrokUsage} to include the weekly Grok Build pool. */
 export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot =>
   parseGrokUsage(body, null);
+
+/** The weekly credits endpoint is the inference-gating envelope, so a failed
+ * fetch cannot fall back to the secondary monthly view. Kept separate from the
+ * body parser so `parseGrokUsage` stays pure. */
+export const grokWeeklyUsageUnavailable = (
+  status: number,
+): TProviderUsageSnapshot => {
+  const reason =
+    status === 401
+      ? "Grok authorization was rejected — re-sign in via `grok login`."
+      : status === 403
+        ? "No active SuperGrok / X Premium+ subscription on this account."
+        : status === 0
+          ? "Grok usage fetch failed."
+          : `Grok couldn't report usage (HTTP ${status}).`;
+  return { kind: "unavailable", reason, link: "https://grok.com" };
+};
 
 // ─── Live model rows (shared by listModels + per-hop capability reads) ─────
 //
@@ -686,17 +704,8 @@ export const grokDelegate: TProviderDelegate = {
       getBilling(USAGE_PATH),
     ]);
 
-    if ("error" in credits && "error" in monthly) {
-      const status = credits.error;
-      const reason =
-        status === 401
-          ? "Grok authorization was rejected — re-sign in via `grok login`."
-          : status === 403
-            ? "No active SuperGrok / X Premium+ subscription on this account."
-            : status === 0
-              ? "Grok usage fetch failed."
-              : `Grok couldn't report usage (HTTP ${status}).`;
-      return { kind: "unavailable", reason, link: "https://grok.com" };
+    if ("error" in credits) {
+      return grokWeeklyUsageUnavailable(credits.error);
     }
 
     return parseGrokUsage(

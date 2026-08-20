@@ -54,12 +54,33 @@ if (DELEGATE_STATUS_TIMEOUT_MS < DEFAULT_CAPTURE_TIMEOUT_MS) {
   throw new Error("delegate status timeout must cover the capture timeout");
 }
 
-const statusFailure = (slug: string): TDaemonProviderConnection => ({
-  provider: slug,
-  connected: false,
-  cli_installed: false,
-  detail: "status check failed",
-});
+// A failed probe cannot establish that a CLI was removed or a credential was
+// revoked. Preserve the last complete observation when this daemon has one;
+// otherwise omit the unknown installation state rather than serializing it as
+// a definitive `false` to the cloud.
+const lastKnownConnections = new Map<string, TDaemonProviderConnection>();
+
+/** Test-only: the last-known map is process-global and leaks across suites. */
+export const resetLastKnownConnectionsForTests = (): void => {
+  lastKnownConnections.clear();
+};
+
+const statusFailure = (slug: string): TDaemonProviderConnection => {
+  const lastKnown = lastKnownConnections.get(slug);
+  if (lastKnown !== undefined) {
+    return {
+      ...lastKnown,
+      detail: "status check failed",
+    };
+  }
+  return {
+    provider: slug,
+    // The protocol requires a connection boolean. This only means the current
+    // check did not establish a connection; it is not a logout assertion.
+    connected: false,
+    detail: "status check failed",
+  };
+};
 
 const boundedDelegateStatus = async (
   slug: string,
@@ -106,6 +127,9 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     Object.values(DELEGATES).map(async (d) => {
       try {
         const conn = await boundedDelegateStatus(d.slug, d.status);
+        if (conn.detail !== "status check failed") {
+          lastKnownConnections.set(d.slug, conn);
+        }
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
         if (!conn.connected) return conn;
