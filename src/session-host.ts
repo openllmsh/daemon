@@ -87,4 +87,4 @@ export const deviceSessionsForList = (): ReadonlyArray<{
     started_at_ms: host.startedAtMs,
   }));
 
-export * from "./session-core";
+export { ptySupported } from "./session-core";
