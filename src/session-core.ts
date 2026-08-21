@@ -8,7 +8,7 @@
 
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
@@ -117,11 +117,23 @@ export type TSessionStream = {
   readonly onEnd: (handler: () => void) => () => void;
 };
 
+/**
+ * Argv for a device "Terminal" session. Login+interactive (`-il`) so profile
+ * PATH loads and bash/zsh treat stdin as a tty. `fish` is already interactive
+ * on a tty; `-il` is not its flag set.
+ */
+export const shellSessionArgv = (shellPath: string): readonly string[] => {
+  const name = basename(shellPath).toLowerCase();
+  if (name === "fish") return [shellPath, "-l"];
+  return [shellPath, "-il"];
+};
+
 /** Production spawner over Bun's built-in PTY. */
 const bunPtySpawner: TPtySpawner = (args) => {
   const terminal = new Bun.Terminal({
     cols: args.cols,
     rows: args.rows,
+    name: "xterm-256color",
     data: (_t, chunk) => args.onData(chunk),
   });
   let proc: ReturnType<typeof Bun.spawn>;
@@ -130,6 +142,10 @@ const bunPtySpawner: TPtySpawner = (args) => {
       cwd: args.cwd,
       env: spawnEnv(args.env),
       terminal,
+      // New session + process-group leader so the PTY can become the
+      // controlling tty (TIOCSCTTY). Without this, bash -il prints
+      // "cannot set terminal process group" / "no job control".
+      detached: true,
     });
   } catch (err) {
     // Spawn threw (ENOENT etc.) — the terminal was already created above;
@@ -537,7 +553,7 @@ const argvFor = (
       (process.platform === "darwin" ? "/bin/zsh" : "/bin/bash");
     if (!existsSync(shell))
       throw new Error(`login shell does not exist: ${shell}`);
-    return [shell, "-l"];
+    return shellSessionArgv(shell);
   }
   const clientId = openllmClientId(cli);
   const bin = openllmBin();
