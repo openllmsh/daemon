@@ -454,6 +454,10 @@ export type TStreamLoginOpts<T> = {
   /** Hard ceiling (default {@link DEFAULT_LOGIN_TIMEOUT_MS}). Not the 30s
    *  first-prompt warn. */
   readonly timeoutMs?: number;
+  /** First-prompt WARN threshold (default {@link STREAM_PROMPT_WARN_MS}) — logs
+   *  a "still waiting" line, never kills. Overridable so a test can assert the
+   *  no-kill behaviour without a 30s wait. */
+  readonly warnMs?: number;
   /** Already-signed-in check for the background-exit cleanup. */
   readonly isConnected: () => Promise<boolean>;
   /** Runs in the background-exit cleanup when a credential landed. */
@@ -610,8 +614,9 @@ export const spawnStreamLogin = async <T>(
       settled = true;
       resolve(v);
     };
+    const warnMs = opts.warnMs ?? STREAM_PROMPT_WARN_MS;
     const warnTimer =
-      ceilingMs > STREAM_PROMPT_WARN_MS
+      ceilingMs > warnMs
         ? setTimeout(() => {
             if (!settled) {
               logWarn(
@@ -620,7 +625,7 @@ export const spawnStreamLogin = async <T>(
                 { provider: opts.provider },
               );
             }
-          }, STREAM_PROMPT_WARN_MS)
+          }, warnMs)
         : null;
     const ceilingTimer = setTimeout(() => {
       timedOut = true;
@@ -647,13 +652,28 @@ export const spawnStreamLogin = async <T>(
     const captured = combined();
     const cancelled = opts.slot.wasCancelled();
     if (!timedOut) {
-      const exitCode = await proc.exited;
+      // The prompt reader hit EOF before the ceiling — the child normally has
+      // already exited, so this resolves at once. Guard the rare case where the
+      // fd closed but the process lingers: race a short grace and kill on
+      // expiry, so a wedged child can't hang the connect indefinitely.
+      const EXIT_GRACE_MS = 2_000;
+      const exitCode = await Promise.race([
+        proc.exited,
+        sleep(EXIT_GRACE_MS).then(() => null),
+      ]);
+      if (exitCode === null) {
+        try {
+          proc.kill();
+        } catch {
+          // already gone
+        }
+      }
       opts.slot.end();
       return {
         found: null,
         captured,
         exitCode,
-        crashed: exitCode !== 0,
+        crashed: exitCode !== null && exitCode !== 0,
         cancelled,
         flow,
       };

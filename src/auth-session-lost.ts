@@ -89,11 +89,14 @@ export const noteConnectionsForSessionLost = (
       // Still (or freshly) connected — any stamped logout reason is stale.
       pendingLostReason.delete(slug);
     }
+    // Carry the last-known account hash forward when a still-connected snapshot
+    // omits it (a status push can report `connected` without re-deriving the
+    // hash), so the eventual disconnect still emits the right account. A fresh
+    // hash always wins; a genuine disconnect keeps whatever we last held.
+    const carriedHash = conn.account_hash ?? prev?.accountHash;
     lastConnected.set(slug, {
       connected: now,
-      ...(conn.account_hash !== undefined
-        ? { accountHash: conn.account_hash }
-        : {}),
+      ...(carriedHash !== undefined ? { accountHash: carriedHash } : {}),
     });
   }
 };
