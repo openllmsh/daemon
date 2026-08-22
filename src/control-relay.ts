@@ -13,10 +13,13 @@ import type {
   TDaemonCommandAck,
   TLocalCliSession,
 } from "@openllmsh/protocol";
+import { markSessionLostReason } from "./auth-session-lost";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
+import { runWithLoginCommand } from "./delegation/login-flow";
+import { daemonApiKeyId } from "./env";
 import { openSealed } from "./keypair";
 import { clampLimit, readLocalSessions } from "./local-sessions";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
@@ -56,7 +59,10 @@ export const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
-        const r = await delegate.connect();
+        const r = await runWithLoginCommand(
+          { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+          () => delegate.connect(),
+        );
         // A login that just landed is the freshest moment to report this
         // provider's live model list to the cloud's model cache. Clear
         // THIS slug's throttle first — pre-login attempts stamped it
@@ -90,10 +96,13 @@ export const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
-        const r =
-          delegate.connectDeviceCode !== undefined
-            ? await delegate.connectDeviceCode()
-            : await delegate.connect();
+        const r = await runWithLoginCommand(
+          { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+          () =>
+            delegate.connectDeviceCode !== undefined
+              ? delegate.connectDeviceCode()
+              : delegate.connect(),
+        );
         if (r.connected) invalidateUsage(cmd.payload.slug);
         return {
           id: cmd.id,
@@ -117,8 +126,12 @@ export const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
-        if (delegate.cancelConnect !== undefined) {
-          const r = await delegate.cancelConnect();
+        const cancelConnect = delegate.cancelConnect;
+        if (cancelConnect !== undefined) {
+          const r = await runWithLoginCommand(
+            { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+            () => cancelConnect(),
+          );
           return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
         }
         clearPendingAuth(cmd.payload.slug);
@@ -135,6 +148,11 @@ export const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
+        // Attribute the falling edge the post-command status push will observe
+        // to a `logout` (else it defaults to `credential_gone`). A failed logout
+        // leaves the provider connected, and the tracker drops the stamp on the
+        // next still-connected snapshot.
+        markSessionLostReason(cmd.payload.slug, "logout");
         const r = await delegate.logout();
         if (r.ok) invalidateUsage(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
@@ -160,7 +178,11 @@ export const runCommandInner = async (
             result: { error: "could not open sealed login code" },
           };
         }
-        const r = await delegate.submitLoginCode(code);
+        const submitLoginCode = delegate.submitLoginCode;
+        const r = await runWithLoginCommand(
+          { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+          () => submitLoginCode(code),
+        );
         if (r.ok) invalidateUsage(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }

@@ -20,10 +20,15 @@ import { pendingAuthDetail, setPendingAuth } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TConnectResult, TLoginSlot } from "./login-flow";
 import {
+  emitLoginFailed,
+  emitLoginPrompt,
+  emitLoginStarted,
   finishInBackground,
   guard,
   makeCancelConnect,
+  resolveLoginFlow,
   spawnStreamLogin,
+  streamLoginFail,
 } from "./login-flow";
 import type { THeadlessLogin } from "./util";
 import { openUrl, spawnHeadlessLogin } from "./util";
@@ -99,8 +104,10 @@ export const makePasteBackDevice = (
         shortCircuit: { connected: cfg.connected, detail: cfg.connectedDetail },
         slot: cfg.slot,
         inProgressDetail: cfg.inProgressDetail,
+        mode: "paste_code",
       },
       async () => {
+        const flow = resolveLoginFlow(cfg.provider, "paste_code");
         await cfg.beforeLogin?.();
         // Keychain-dependent paste-back login (claude) is unconfined on macOS
         // (`sandbox/policy.ts`).
@@ -108,12 +115,24 @@ export const makePasteBackDevice = (
           probe: unwrapKeychainSpawn(cfg.provider),
         });
         if ("error" in login) {
+          emitLoginFailed(flow, {
+            code: "cli_crash",
+            message: login.error,
+            retryable: false,
+          });
           return { connected: false, detail: login.error };
         }
         handle = login;
-        cfg.slot.start(() => login.cancel());
-        const auth = { url: login.url, code: "", mode: "paste_code" as const };
+        cfg.slot.start(() => login.cancel(), flow);
+        emitLoginStarted(flow);
+        const auth = {
+          url: login.url,
+          code: "",
+          mode: "paste_code" as const,
+          flowId: flow.flowId,
+        };
         setPendingAuth(cfg.provider, auth);
+        emitLoginPrompt(flow, { url: login.url, code: "" });
         // On exit (success, cancel, or expiry) drop the handle + the stale
         // pending URL; on success run onConnected (warn + refresh auth config).
         // Wait for any in-flight submit FIRST so the keychain grant lands before
@@ -196,6 +215,9 @@ export type TStreamDeviceConfig = {
   readonly onConnected?: () => void | Promise<void>;
   readonly pendingDetail: (found: { url: string; code: string }) => string;
   readonly failDetail: string;
+  /** Detail when the login child CRASHED (exited non-zero before a prompt).
+   *  Optional — omit to fall back to `failDetail` plus the redacted capture. */
+  readonly crashDetail?: (captured: string, exitCode: number | null) => string;
   /** cancelConnect wording. */
   readonly cancelMessages: {
     readonly cancelled: string;
@@ -226,6 +248,7 @@ export const makeStreamDeviceConnect = (
         shortCircuit: { connected: cfg.connected, detail: cfg.connectedDetail },
         slot: cfg.slot,
         inProgressDetail: cfg.inProgressDetail,
+        mode: "device_code",
       },
       async () => {
         const res = await spawnStreamLogin({
@@ -240,20 +263,24 @@ export const makeStreamDeviceConnect = (
           // codex/grok device-code login is file-backed → stays confined
           // (`sandbox/policy.ts`); the predicate returns false for them.
           probe: unwrapKeychainSpawn(cfg.provider),
+          mode: "device_code",
         });
         if (res.found === null) {
-          return {
-            connected: false,
-            detail:
-              res.spawnFailure === undefined
-                ? cfg.failDetail
-                : `${cfg.failDetail} [${res.spawnFailure.code}] ${res.spawnFailure.message}`,
-          };
+          if (res.cancelled === true) {
+            return { connected: false, detail: "sign-in cancelled" };
+          }
+          const fail = streamLoginFail(cfg.failDetail, res, cfg.crashDetail);
+          emitLoginFailed(res.flow, fail);
+          return { connected: false, detail: fail.message };
         }
+        const flow =
+          cfg.slot.flow() ?? resolveLoginFlow(cfg.provider, "device_code");
         setPendingAuth(cfg.provider, {
           url: res.found.url,
           code: res.found.code,
+          flowId: flow.flowId,
         });
+        emitLoginPrompt(flow, res.found);
         openUrl(res.found.url);
         return {
           connected: false,

@@ -18,6 +18,9 @@
  * stays guarded across both methods.
  */
 
+import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
+import { emitAuth, requestStatusPush } from "../auth-events";
+import { logWarn } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -25,7 +28,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
-import { redactUrls, spawnCwd } from "./util";
+import { DEFAULT_LOGIN_TIMEOUT_MS, redactUrls, spawnCwd } from "./spawn";
 
 /** The shared return shape of `connect()` / `connectDeviceCode()`. */
 export type TConnectResult = {
@@ -33,6 +36,47 @@ export type TConnectResult = {
   readonly detail?: string;
   readonly pending?: boolean;
 };
+
+/** One in-flight login's identity — `flowId` is the browser/relay command id. */
+export type TLoginFlowCtx = {
+  readonly flowId: string;
+  readonly keyId: string;
+  readonly slug: string;
+  readonly mode: TAuthLoginMode;
+};
+
+// ─── Per-command flow identity (threaded from control-relay) ─────────────
+
+let commandCtx: { flowId: string; keyId: string } | null = null;
+
+/**
+ * Bind the current control-command's id as `flow_id` for the duration of
+ * `run()`. Background work (stream readers, `finishInBackground`) must
+ * CAPTURE the resolved {@link TLoginFlowCtx} — this binding is restored
+ * when `run()` returns.
+ */
+export const runWithLoginCommand = async <T>(
+  ctx: { readonly flowId: string; readonly keyId: string },
+  run: () => Promise<T>,
+): Promise<T> => {
+  const prev = commandCtx;
+  commandCtx = ctx;
+  try {
+    return await run();
+  } finally {
+    commandCtx = prev;
+  }
+};
+
+export const resolveLoginFlow = (
+  slug: string,
+  mode: TAuthLoginMode,
+): TLoginFlowCtx => ({
+  flowId: commandCtx?.flowId ?? crypto.randomUUID(),
+  keyId: commandCtx?.keyId ?? "local",
+  slug,
+  mode,
+});
 
 // ─── Per-provider single-flight slot ─────────────────────────────────────
 
@@ -46,9 +90,13 @@ export type TConnectResult = {
 export type TLoginSlot = {
   /** True while a background login is in flight for this provider. */
   readonly inFlight: () => boolean;
+  /** The live flow's identity, or null when nothing is in flight. */
+  readonly flow: () => TLoginFlowCtx | null;
+  /** True after {@link TLoginSlot.cancelAll} until the next {@link TLoginSlot.start}. */
+  readonly wasCancelled: () => boolean;
   /** Mark in-flight + register the live flow's canceler. Call only AFTER the
    *  spawn/handle exists — an early mark wedges the slot if the spawn throws. */
-  readonly start: (canceler: () => void) => void;
+  readonly start: (canceler: () => void, flow?: TLoginFlowCtx) => void;
   /** Clear in-flight + drop all cancelers (the background-exit cleanup). */
   readonly end: () => void;
   /** Run every registered canceler and clear them. Returns how many ran (>0 ⇔
@@ -64,18 +112,27 @@ export const loginSlot = (provider: string): TLoginSlot => {
   const existing = slots.get(provider);
   if (existing !== undefined) return existing;
   let inFlight = false;
+  let cancelled = false;
+  let flow: TLoginFlowCtx | null = null;
   const cancelers = new Set<() => void>();
   const slot: TLoginSlot = {
     inFlight: () => inFlight,
-    start: (canceler) => {
+    flow: () => flow,
+    wasCancelled: () => cancelled,
+    start: (canceler, nextFlow) => {
       inFlight = true;
+      cancelled = false;
+      if (nextFlow !== undefined) flow = nextFlow;
       cancelers.add(canceler);
     },
     end: () => {
       inFlight = false;
       cancelers.clear();
+      flow = null;
+      cancelled = false;
     },
     cancelAll: () => {
+      cancelled = true;
       const n = cancelers.size;
       for (const fn of cancelers) {
         try {
@@ -90,6 +147,116 @@ export const loginSlot = (provider: string): TLoginSlot => {
   };
   slots.set(provider, slot);
   return slot;
+};
+
+// ─── Auth event helpers ──────────────────────────────────────────────────
+
+export const emitLoginStarted = (flow: TLoginFlowCtx): void => {
+  emitAuth({
+    event: "auth.login.started",
+    flow_id: flow.flowId,
+    key_id: flow.keyId,
+    slug: flow.slug,
+    mode: flow.mode,
+  });
+};
+
+export const emitLoginPrompt = (
+  flow: TLoginFlowCtx,
+  pending: { readonly url: string; readonly code: string },
+): void => {
+  emitAuth({
+    event: "auth.login.prompt",
+    flow_id: flow.flowId,
+    key_id: flow.keyId,
+    slug: flow.slug,
+    url: pending.url,
+    ...(pending.code.length > 0 ? { code: pending.code } : {}),
+    mode: flow.mode,
+  });
+};
+
+export const emitLoginSucceeded = (flow: TLoginFlowCtx): void => {
+  emitAuth({
+    event: "auth.login.succeeded",
+    flow_id: flow.flowId,
+    key_id: flow.keyId,
+    slug: flow.slug,
+  });
+};
+
+export const emitLoginFailed = (
+  flow: TLoginFlowCtx,
+  fail: {
+    readonly code: TAuthLoginFailedCode;
+    readonly message: string;
+    readonly retryable: boolean;
+  },
+): void => {
+  emitAuth({
+    event: "auth.login.failed",
+    flow_id: flow.flowId,
+    key_id: flow.keyId,
+    slug: flow.slug,
+    code: fail.code,
+    message: fail.message,
+    retryable: fail.retryable,
+  });
+};
+
+const CAPTURE_MAX = 400;
+
+const captureBody = (captured: string): string =>
+  redactUrls(captured).slice(0, CAPTURE_MAX).trim();
+
+const isInnerSpawnDenied = (
+  captured: string,
+  exitCode: number | null,
+): boolean =>
+  exitCode === 127 &&
+  /EPERM|posix_spawn|operation not permitted/i.test(captured);
+
+/**
+ * Map a stream-login miss onto an `auth.login.failed` code + the dashboard
+ * `detail`. The static `failDetail` is a TITLE — the body is the redacted
+ * capture (and `[code]` for an outer spawn throw). Never the title alone
+ * when we have anything else to say.
+ */
+export const streamLoginFail = (
+  title: string,
+  res: Extract<TStreamLoginResult<unknown>, { found: null }>,
+  crashDetail?: (captured: string, exitCode: number | null) => string,
+): {
+  readonly code: TAuthLoginFailedCode;
+  readonly message: string;
+  readonly retryable: boolean;
+} => {
+  if (res.spawnFailure !== undefined) {
+    return {
+      code: "spawn_denied",
+      message: `${title} [${res.spawnFailure.code}] ${res.spawnFailure.message}`,
+      retryable: false,
+    };
+  }
+  const body = captureBody(res.captured);
+  const titled = body.length > 0 ? `${title}\n${body}` : title;
+  if (isInnerSpawnDenied(res.captured, res.exitCode)) {
+    return { code: "spawn_denied", message: titled, retryable: false };
+  }
+  if (res.crashed) {
+    return {
+      code: "cli_crash",
+      message:
+        crashDetail !== undefined
+          ? crashDetail(res.captured, res.exitCode)
+          : titled,
+      retryable: false,
+    };
+  }
+  if (res.timedOut === true) {
+    return { code: "prompt_timeout", message: titled, retryable: true };
+  }
+  return { code: "poll_expired", message: titled, retryable: true };
 };
 
 // ─── Guard preamble ──────────────────────────────────────────────────────
@@ -113,6 +280,9 @@ export type TGuardOpts = {
   /** Override the default re-surface result (kimi's `connect` returns a fixed
    *  string with no `pending` flag, unlike codex/claude's pending re-surface). */
   readonly resurface?: (pending: TPendingAuth | null) => TConnectResult;
+  /** Login mode for events fired from the preamble (not_installed / short-circuit
+   *  / in-flight re-prompt). Default `browser`. */
+  readonly mode?: TAuthLoginMode;
 };
 
 /**
@@ -124,7 +294,14 @@ export const guard = async (
   opts: TGuardOpts,
   run: () => Promise<TConnectResult>,
 ): Promise<TConnectResult> => {
+  const mode = opts.mode ?? "browser";
   if (!(await opts.installed())) {
+    const flow = resolveLoginFlow(opts.provider, mode);
+    emitLoginFailed(flow, {
+      code: "not_installed",
+      message: opts.installHint,
+      retryable: false,
+    });
     return { connected: false, detail: opts.installHint };
   }
   if (
@@ -132,10 +309,16 @@ export const guard = async (
     (await opts.shortCircuit.connected())
   ) {
     clearPendingAuth(opts.provider);
+    const flow = resolveLoginFlow(opts.provider, mode);
+    emitLoginSucceeded(flow);
     return { connected: true, detail: opts.shortCircuit.detail };
   }
   if (opts.slot?.inFlight() === true) {
     const pending = getPendingAuth(opts.provider);
+    const live = opts.slot.flow();
+    if (pending !== null && live !== null) {
+      emitLoginPrompt(live, pending);
+    }
     if (opts.resurface !== undefined) return opts.resurface(pending);
     return {
       connected: false,
@@ -152,12 +335,23 @@ export const guard = async (
 
 // ─── Background-exit cleanup ─────────────────────────────────────────────
 
+/** One bounded re-read after a miss so a token written just after exit lands. */
+const CONNECTED_REREAD_MS = 400;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * The cleanup a background login runs when its process exits / its poll ends:
  * clear single-flight, then — if a credential landed — run `onConnected`
  * (e.g. refresh the auth config), else drop the stale pending code so the card
  * stops showing a dead one. `alwaysClearPending` also drops it on success
  * (claude's paste-back clears unconditionally; codex/kimi rely on `status()`).
+ *
+ * Samples `isConnected` once, then ONE bounded re-read if false. Emits
+ * `auth.login.succeeded` or `auth.login.failed` and triggers a status push —
+ * the connect command has already acked, so without this the card waits for
+ * the 2.5s watcher.
  */
 export const finishInBackground = async (opts: {
   readonly provider: string;
@@ -165,7 +359,12 @@ export const finishInBackground = async (opts: {
   readonly isConnected: () => Promise<boolean>;
   readonly onConnected?: () => void | Promise<void>;
   readonly alwaysClearPending?: boolean;
+  /** Child exit code when known. Non-zero + not-connected → `cli_crash`;
+   *  zero + not-connected → `poll_expired`. */
+  readonly exitCode?: number | null;
 }): Promise<void> => {
+  const flow = opts.slot.flow();
+  const cancelled = opts.slot.wasCancelled();
   opts.slot.end();
   // Both callbacks are BEST-EFFORT: this runs from a `void proc.exited.then(...)`
   // / `void login.done.then(...)`, so a throw here would be an unhandled
@@ -178,6 +377,14 @@ export const finishInBackground = async (opts: {
   } catch {
     // treat as not-connected — pending clears below, the next status corrects it
   }
+  if (!connected) {
+    await sleep(CONNECTED_REREAD_MS);
+    try {
+      connected = await opts.isConnected();
+    } catch {
+      // still treat as not-connected
+    }
+  }
   if (opts.alwaysClearPending === true || !connected) {
     clearPendingAuth(opts.provider);
   }
@@ -188,12 +395,30 @@ export const finishInBackground = async (opts: {
       // best-effort — a failed onConnected must not reject the cleanup
     }
   }
+  if (!cancelled && flow !== null) {
+    if (connected) {
+      emitLoginSucceeded(flow);
+    } else {
+      const crashed = opts.exitCode !== undefined && opts.exitCode !== 0;
+      emitLoginFailed(flow, {
+        code: crashed ? "cli_crash" : "poll_expired",
+        message: crashed
+          ? "sign-in process exited before a credential landed"
+          : "sign-in ended without a stored credential",
+        retryable: !crashed,
+      });
+    }
+  }
+  requestStatusPush();
 };
 
 // ─── Stream-spawn login primitive (codex) ────────────────────────────────
 
-/** Ceiling on first seeing the spawned CLI's auth prompt before giving up. */
-const STREAM_PROMPT_TIMEOUT_MS = 30_000;
+/**
+ * First-prompt *warn* mark. A still-alive child is NOT killed here — we keep
+ * reading until parse, self-exit, or {@link DEFAULT_LOGIN_TIMEOUT_MS}.
+ */
+const STREAM_PROMPT_WARN_MS = 30_000;
 
 export type TStreamLoginOpts<T> = {
   readonly provider: string;
@@ -205,6 +430,8 @@ export type TStreamLoginOpts<T> = {
   readonly stream: "stdout" | "stderr";
   /** Returns the parsed prompt the instant the buffered output contains it. */
   readonly parse: (buf: string) => T | null;
+  /** Hard ceiling (default {@link DEFAULT_LOGIN_TIMEOUT_MS}). Not the 30s
+   *  first-prompt warn. */
   readonly timeoutMs?: number;
   /** Already-signed-in check for the background-exit cleanup. */
   readonly isConnected: () => Promise<boolean>;
@@ -213,16 +440,19 @@ export type TStreamLoginOpts<T> = {
   /** Skip the sandbox wrap (macOS keychain-dependent login — see
    *  `sandbox/policy.ts`). Set from `unwrapKeychainSpawn(provider)`. */
   readonly probe?: boolean;
+  /** `auth.login.started` mode. Default `browser`. */
+  readonly mode?: TAuthLoginMode;
 };
 
 /**
- * Spawn a vendor CLI login, drain ONE fd, and resolve the instant `parse`
- * matches — then keep draining for the process's lifetime so a full pipe can't
- * stall the child's background callback/poll. The process is NOT killed on a
- * match (it runs its localhost callback / device poll until the credential
- * lands); `proc.exited` runs {@link finishInBackground}. On no match within the
- * timeout the child is killed and `{ found: null, captured }` is returned (the
- * captured output fuels codex's redacted no-URL log).
+ * Spawn a vendor CLI login, drain BOTH fds (the prompt-carrying one is parsed;
+ * the other is captured so an inner `--sandbox-exec` posix_spawn EPERM on
+ * stderr is not dropped when the prompt is on stdout), and resolve the instant
+ * `parse` matches — then keep draining for the process's lifetime so a full
+ * pipe can't stall the child's background callback/poll. The process is NOT
+ * killed on a match (it runs its localhost callback / device poll until the
+ * credential lands); `proc.exited` runs {@link finishInBackground}. On no
+ * match the child is reaped only at the hard login ceiling, not at 30s.
  *
  * Single-flight is marked AFTER a successful spawn (a `Bun.spawn` throw must not
  * wedge the slot), mirroring the pre-refactor "set loginInFlight after spawn".
@@ -260,9 +490,6 @@ export type TStreamLoginResult<T> =
   | {
       readonly found: null;
       readonly captured: string;
-      /** The child's exit code, when it exited on its OWN before a prompt was
-       *  seen (a crash). `null` when the child was killed at the prompt timeout
-       *  (still running) or the spawn itself threw. */
       readonly exitCode: number | null;
       /** True iff the child exited NON-ZERO on its own before printing a prompt
        *  — a deterministic failure a "Retry" can't fix (e.g. `grok login`
@@ -273,19 +500,47 @@ export type TStreamLoginResult<T> =
        *  message. Set when `Bun.spawn(...)` itself throws before a child exists.
        */
       readonly spawnFailure?: TSpawnFailure;
+      /** True iff we hit the hard login ceiling and reaped a still-alive child. */
+      readonly timedOut?: boolean;
+      /** True iff `cancelConnect` killed this child while we were still waiting
+       *  for a prompt — the cancel path already emitted `user_cancelled`. */
+      readonly cancelled?: boolean;
+      /** Captured before `slot.end()` so the handler can emit `failed` with the
+       *  same `flow_id` as `started`. */
+      readonly flow: TLoginFlowCtx;
     };
+
+const drainStream = async (
+  stream: ReadableStream<Uint8Array>,
+  onChunk: (text: string) => void,
+): Promise<void> => {
+  const decoder = new TextDecoder();
+  try {
+    const reader = stream.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value !== undefined) {
+        onChunk(decoder.decode(value, { stream: true }));
+      }
+    }
+  } catch {
+    // peer closed — the prompt loop settles on EOF
+  }
+};
 
 export const spawnStreamLogin = async <T>(
   opts: TStreamLoginOpts<T>,
 ): Promise<TStreamLoginResult<T>> => {
+  const flow = resolveLoginFlow(opts.provider, opts.mode ?? "browser");
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
       stdin: "ignore",
-      stdout: opts.stream === "stdout" ? "pipe" : "ignore",
-      // The unread fd is discarded (not piped) so an undrained pipe can't stall
-      // the child — only the prompt-carrying fd is read.
-      stderr: opts.stream === "stderr" ? "pipe" : "ignore",
+      // Always pipe BOTH fds: the prompt may be on stdout (device-code) while
+      // the `--sandbox-exec` shim writes inner posix_spawn EPERM to stderr.
+      stdout: "pipe",
+      stderr: "pipe",
       cwd: spawnCwd(opts.env),
       env: { ...process.env, ...opts.env },
     });
@@ -297,6 +552,7 @@ export const spawnStreamLogin = async <T>(
       exitCode: null,
       crashed: false,
       spawnFailure,
+      flow,
     };
   }
   opts.slot.start(() => {
@@ -305,24 +561,27 @@ export const spawnStreamLogin = async <T>(
     } catch {
       // already exited — its own exit handler ran
     }
-  });
-  void proc.exited.then(() =>
-    finishInBackground({
-      provider: opts.provider,
-      slot: opts.slot,
-      isConnected: opts.isConnected,
-      onConnected: opts.onConnected,
-    }),
-  );
+  }, flow);
+  emitLoginStarted(flow);
 
-  const readable = (
+  const promptStream = (
     opts.stream === "stdout" ? proc.stdout : proc.stderr
   ) as ReadableStream<Uint8Array>;
-  let captured = "";
-  // Set ONLY by the prompt-timeout timer. Distinguishes the two null outcomes:
+  const otherStream = (
+    opts.stream === "stdout" ? proc.stderr : proc.stdout
+  ) as ReadableStream<Uint8Array>;
+  let promptBuf = "";
+  let otherBuf = "";
+  const otherDone = drainStream(otherStream, (text) => {
+    otherBuf += text;
+  });
+  const combined = (): string =>
+    [promptBuf, otherBuf].filter((s) => s.length > 0).join("\n");
+  // Set ONLY by the hard-ceiling timer. Distinguishes the two null outcomes:
   // a timeout (child still running → kill it, not a crash) vs the reader
   // reaching EOF because the child EXITED on its own before a prompt (a crash).
   let timedOut = false;
+  const ceilingMs = opts.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
   const found = await new Promise<T | null>((resolve) => {
     let settled = false;
     const settle = (v: T | null): void => {
@@ -330,48 +589,82 @@ export const spawnStreamLogin = async <T>(
       settled = true;
       resolve(v);
     };
-    const timer = setTimeout(() => {
+    const warnTimer =
+      ceilingMs > STREAM_PROMPT_WARN_MS
+        ? setTimeout(() => {
+            if (!settled) {
+              logWarn(
+                "login-flow",
+                "vendor login has not printed an authorize prompt yet; waiting until the login ceiling",
+                { provider: opts.provider },
+              );
+            }
+          }, STREAM_PROMPT_WARN_MS)
+        : null;
+    const ceilingTimer = setTimeout(() => {
       timedOut = true;
       settle(null);
-    }, opts.timeoutMs ?? STREAM_PROMPT_TIMEOUT_MS);
+    }, ceilingMs);
     void (async (): Promise<void> => {
-      const decoder = new TextDecoder();
       try {
-        const reader = readable.getReader();
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          captured += decoder.decode(value, { stream: true });
-          const p = opts.parse(captured);
+        await drainStream(promptStream, (text) => {
+          promptBuf += text;
+          const p = opts.parse(promptBuf) ?? opts.parse(combined());
           if (p !== null) settle(p);
-        }
-      } catch {
-        /* ignore — settle(null) in finally */
+        });
       } finally {
-        clearTimeout(timer);
+        if (warnTimer !== null) clearTimeout(warnTimer);
+        clearTimeout(ceilingTimer);
         settle(null);
       }
     })();
   });
 
   if (found === null) {
+    // Pull any remaining other-fd bytes so inner EPERM isn't dropped.
+    await Promise.race([otherDone, sleep(200)]);
+    const captured = combined();
+    const cancelled = opts.slot.wasCancelled();
     if (!timedOut) {
-      // The reader hit EOF before the timer — the child EXITED on its own
-      // without printing a prompt. It has already exited, so awaiting its
-      // status resolves promptly; a non-zero code is a real crash the caller
-      // must surface instead of inviting a doomed retry.
       const exitCode = await proc.exited;
-      return { found: null, captured, exitCode, crashed: exitCode !== 0 };
+      opts.slot.end();
+      return {
+        found: null,
+        captured,
+        exitCode,
+        crashed: exitCode !== 0,
+        cancelled,
+        flow,
+      };
     }
-    // Prompt timeout: the child may still be running its localhost callback, so
-    // kill it and return WITHOUT blocking on a possibly-wedged exit. Not a crash.
     try {
       proc.kill();
     } catch {
       // already gone
     }
-    return { found: null, captured, exitCode: null, crashed: false };
+    opts.slot.end();
+    return {
+      found: null,
+      captured,
+      exitCode: null,
+      crashed: false,
+      timedOut: true,
+      cancelled,
+      flow,
+    };
   }
+
+  // Prompt parsed: keep the child alive for the localhost callback / device
+  // poll. finishInBackground is the ONLY terminal path from here.
+  void proc.exited.then((exitCode) =>
+    finishInBackground({
+      provider: opts.provider,
+      slot: opts.slot,
+      isConnected: opts.isConnected,
+      onConnected: opts.onConnected,
+      exitCode,
+    }),
+  );
   return { found };
 };
 
@@ -388,8 +681,16 @@ export const makeCancelConnect = (
   messages: { readonly cancelled: string; readonly none: string },
 ): (() => Promise<{ readonly ok: boolean; readonly detail: string }>) => {
   return async () => {
+    const flow = slot.flow();
     const n = slot.cancelAll();
     clearPendingAuth(provider);
+    if (n > 0 && flow !== null) {
+      emitLoginFailed(flow, {
+        code: "user_cancelled",
+        message: messages.cancelled,
+        retryable: false,
+      });
+    }
     return { ok: true, detail: n > 0 ? messages.cancelled : messages.none };
   };
 };

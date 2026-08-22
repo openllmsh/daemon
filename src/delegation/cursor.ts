@@ -347,6 +347,9 @@ export const cursorDelegate: TProviderDelegate = {
               url: pending.url,
               code: pending.code,
               started_at_ms: pending.startedAt,
+              ...(pending.flowId !== undefined
+                ? { flow_id: pending.flowId }
+                : {}),
             },
           }
         : {}),

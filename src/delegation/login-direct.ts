@@ -15,10 +15,20 @@
  * there is no cycle.
  */
 
+import { requestStatusPush } from "../auth-events";
 import { clearPendingAuth, setPendingAuth } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import type { TConnectResult, TLoginSlot } from "./login-flow";
-import { guard, spawnStreamLogin } from "./login-flow";
+import type { TConnectResult, TLoginFlowCtx, TLoginSlot } from "./login-flow";
+import {
+  emitLoginFailed,
+  emitLoginPrompt,
+  emitLoginStarted,
+  emitLoginSucceeded,
+  guard,
+  resolveLoginFlow,
+  spawnStreamLogin,
+  streamLoginFail,
+} from "./login-flow";
 import type { TLoginResult } from "./util";
 import { openUrl, spawnLogin } from "./util";
 
@@ -60,9 +70,12 @@ export const makeBlockingConnect = (
         provider: cfg.provider,
         installed: cfg.installed,
         installHint: cfg.installHint,
+        mode: "browser",
       },
       async () => {
+        const flow = resolveLoginFlow(cfg.provider, "browser");
         await cfg.beforeLogin?.();
+        emitLoginStarted(flow);
         // Keychain-dependent login (claude) runs unconfined on macOS — see
         // `sandbox/policy.ts`; codex/kimi/grok stay confined on both platforms.
         const result = await spawnLogin([...cfg.argv()], cfg.env(), {
@@ -71,9 +84,16 @@ export const makeBlockingConnect = (
         await cfg.afterLogin?.();
         if (await cfg.verifyConnected()) {
           await cfg.onConnected?.();
+          emitLoginSucceeded(flow);
           return { connected: true, detail: await cfg.successDetail() };
         }
-        return { connected: false, detail: cfg.failDetail(result) };
+        const detail = cfg.failDetail(result);
+        emitLoginFailed(flow, {
+          code: "cli_crash",
+          message: detail,
+          retryable: false,
+        });
+        return { connected: false, detail };
       },
     );
 };
@@ -130,6 +150,7 @@ export const makeStreamConnect = (
         shortCircuit: { connected: cfg.connected, detail: cfg.connectedDetail },
         slot: cfg.slot,
         inProgressDetail: cfg.inProgressDetail,
+        mode: "browser",
       },
       async () => {
         cfg.onStart?.();
@@ -145,29 +166,26 @@ export const makeStreamConnect = (
           // cursor's store is the macOS keychain → unconfined on mac; codex is
           // file-backed → stays confined (`sandbox/policy.ts`).
           probe: unwrapKeychainSpawn(cfg.provider),
+          mode: "browser",
         });
         if (res.found === null) {
-          if (res.spawnFailure !== undefined) {
-            return {
-              connected: false,
-              detail: `${cfg.failDetail} [${res.spawnFailure.code}] ${res.spawnFailure.message}`,
-            };
+          if (res.cancelled === true) {
+            return { connected: false, detail: "sign-in cancelled" };
           }
-          cfg.onParseFail?.(res.captured);
-          // A deterministic crash (non-zero self-exit before a prompt) is not
-          // retryable — surface the captured error so the user can act on it,
-          // rather than the generic "Retry" reserved for the timeout case.
-          const detail =
-            res.crashed && cfg.crashDetail !== undefined
-              ? cfg.crashDetail(res.captured, res.exitCode)
-              : cfg.failDetail;
-          return { connected: false, detail };
+          if (res.spawnFailure === undefined) cfg.onParseFail?.(res.captured);
+          const fail = streamLoginFail(cfg.failDetail, res, cfg.crashDetail);
+          emitLoginFailed(res.flow, fail);
+          return { connected: false, detail: fail.message };
         }
         cfg.onParsed?.(res.found.url);
+        const flow =
+          cfg.slot.flow() ?? resolveLoginFlow(cfg.provider, "browser");
         setPendingAuth(cfg.provider, {
           url: res.found.url,
           code: res.found.code,
+          flowId: flow.flowId,
         });
+        emitLoginPrompt(flow, res.found);
         return {
           connected: false,
           pending: true,
@@ -226,19 +244,27 @@ const sleep = (ms: number): Promise<void> =>
 const startDeviceCodePoll = (
   cfg: TDeviceCodeConnectConfig,
   auth: TDeviceAuth,
+  flow: TLoginFlowCtx,
 ): void => {
   let aborted = false;
+  let outcome: "success" | "stop" | "expired" | "aborted" = "expired";
   cfg.slot.start(() => {
     aborted = true;
-  });
+  }, flow);
   void (async () => {
     const deadline = Date.now() + auth.expiresInMs;
     let delayMs = auth.intervalMs;
     try {
       while (Date.now() < deadline) {
-        if (aborted) return;
+        if (aborted) {
+          outcome = "aborted";
+          return;
+        }
         await sleep(delayMs);
-        if (aborted) return;
+        if (aborted) {
+          outcome = "aborted";
+          return;
+        }
         let res: TDevicePoll;
         try {
           res = await cfg.pollToken(auth.deviceCode);
@@ -250,20 +276,41 @@ const startDeviceCodePoll = (
         }
         // Re-check AFTER the awaited poll: a cancel that arrived while the
         // request was in flight must win, or we'd sign in a cancelled login.
-        if (aborted) return;
+        if (aborted) {
+          outcome = "aborted";
+          return;
+        }
         if (res.kind === "success") {
           cfg.onCredential(res.wire);
           await cfg.onConnected?.();
+          outcome = "success";
           return;
         }
-        if (res.kind === "stop") return;
+        if (res.kind === "stop") {
+          outcome = "stop";
+          return;
+        }
         if (res.slowDown) delayMs += 5_000;
       }
     } catch {
       // swallow — the user can retry Connect
     } finally {
+      const cancelled = cfg.slot.wasCancelled() || aborted;
       cfg.slot.end();
+      if (outcome === "success") {
+        emitLoginSucceeded(flow);
+      } else if (!cancelled) {
+        emitLoginFailed(flow, {
+          code: outcome === "stop" ? "cli_crash" : "poll_expired",
+          message:
+            outcome === "stop"
+              ? "sign-in was rejected"
+              : "sign-in expired before a credential landed",
+          retryable: outcome !== "stop",
+        });
+      }
       clearPendingAuth(cfg.provider);
+      requestStatusPush();
     }
   })();
 };
@@ -288,12 +335,20 @@ export const makeDeviceCodeConnect = (
         shortCircuit: { connected: cfg.connected, detail: cfg.connectedDetail },
         slot: cfg.slot,
         resurface: () => ({ connected: false, detail: cfg.inProgressDetail }),
+        mode: "device_code",
       },
       async () => {
+        const flow = resolveLoginFlow(cfg.provider, "device_code");
         const auth = await cfg.requestDeviceAuth();
         if (auth === null) {
+          emitLoginFailed(flow, {
+            code: "cli_crash",
+            message: cfg.startFailDetail,
+            retryable: true,
+          });
           return { connected: false, detail: cfg.startFailDetail };
         }
+        emitLoginStarted(flow);
         // Surface URL+code to the dashboard (the daemon may be on a different
         // machine than the user's browser). `openUrl` brings up the browser on
         // this box; on a remote box it opens nothing useful but the dashboard
@@ -301,9 +356,14 @@ export const makeDeviceCodeConnect = (
         setPendingAuth(cfg.provider, {
           url: auth.verificationUriComplete,
           code: auth.userCode,
+          flowId: flow.flowId,
+        });
+        emitLoginPrompt(flow, {
+          url: auth.verificationUriComplete,
+          code: auth.userCode,
         });
         openUrl(auth.verificationUriComplete);
-        startDeviceCodePoll(cfg, auth);
+        startDeviceCodePoll(cfg, auth, flow);
         return {
           connected: false,
           pending: true,

@@ -24,6 +24,10 @@ export type TPendingAuth = {
    *  — `code` is empty, the dashboard renders a paste input). Absent ⇒
    *  `device_code`. See `docs/proposals/headless-claude-login-paste-back.md`. */
   readonly mode?: "device_code" | "paste_code";
+  /** Browser/relay command id of the login that produced this snapshot.
+   *  Surfaced on the wire as `flow_id` so a cold status still correlates to
+   *  an in-flight `auth.login.*` flow. */
+  readonly flowId?: string;
   /** Epoch ms this flow was created — stamped by {@link setPendingAuth} (callers
    *  need not pass it). Drives TTL expiry (see {@link PENDING_AUTH_TTL_MS}) and
    *  is surfaced on the wire as `started_at_ms` so the browser mirrors the same

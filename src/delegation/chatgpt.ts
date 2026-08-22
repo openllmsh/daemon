@@ -266,6 +266,13 @@ const connectDirect = makeStreamConnect({
     `Authorize Codex in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
   failDetail:
     "Couldn't start Codex sign-in. Retry, or run `codex login` on the box.",
+  crashDetail: (captured, exitCode) => {
+    const err = redactUrls(captured.slice(0, 400)).trim();
+    const code = exitCode === null ? "" : ` (exit ${exitCode})`;
+    return err.length > 0
+      ? `\`codex login\` exited before starting sign-in${code} — retrying won't help until it's fixed. It reported:\n${err}\nRun \`codex login\` on the box for the full output.`
+      : `\`codex login\` exited without starting sign-in${code} — retrying won't help. Run \`codex login\` on the box to see why.`;
+  },
 });
 
 // Device-code flow: `codex login --device-auth` prints the verification URL +
@@ -285,6 +292,13 @@ const deviceLogin = makeStreamDeviceConnect({
   pendingDetail: (found) => pendingAuthDetail(found),
   failDetail:
     "Couldn't start Codex device sign-in. Retry, or run `codex login --device-auth` on the box.",
+  crashDetail: (captured, exitCode) => {
+    const err = redactUrls(captured.slice(0, 400)).trim();
+    const code = exitCode === null ? "" : ` (exit ${exitCode})`;
+    return err.length > 0
+      ? `\`codex login --device-auth\` exited before starting sign-in${code} — retrying won't help until it's fixed. It reported:\n${err}\nRun \`codex login --device-auth\` on the box for the full output.`
+      : `\`codex login --device-auth\` exited without starting sign-in${code} — retrying won't help. Run \`codex login --device-auth\` on the box to see why.`;
+  },
   cancelMessages: {
     cancelled: "Codex sign-in cancelled",
     none: "no sign-in was in progress",
@@ -314,6 +328,9 @@ export const chatgptDelegate: TProviderDelegate = {
               url: pending.url,
               code: pending.code,
               started_at_ms: pending.startedAt,
+              ...(pending.flowId !== undefined
+                ? { flow_id: pending.flowId }
+                : {}),
             },
           }
         : {}),

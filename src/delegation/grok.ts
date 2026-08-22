@@ -353,6 +353,13 @@ const deviceLogin = makeStreamDeviceConnect({
   pendingDetail: (found) => pendingAuthDetail(found),
   failDetail:
     "Couldn't start Grok device sign-in. Retry, or run `grok login --device-auth` on the box.",
+  crashDetail: (captured, exitCode) => {
+    const err = redactUrls(captured.slice(0, 400)).trim();
+    const code = exitCode === null ? "" : ` (exit ${exitCode})`;
+    return err.length > 0
+      ? `\`grok login --device-auth\` exited before starting sign-in${code} — retrying won't help until it's fixed. It reported:\n${err}\nRun \`grok login --device-auth\` on the box for the full output.`
+      : `\`grok login --device-auth\` exited without starting sign-in${code} — retrying won't help. Run \`grok login --device-auth\` on the box to see why.`;
+  },
   cancelMessages: {
     cancelled: "Grok sign-in cancelled",
     none: "no sign-in was in progress",
@@ -639,6 +646,9 @@ export const grokDelegate: TProviderDelegate = {
               url: pending.url,
               code: pending.code,
               started_at_ms: pending.startedAt,
+              ...(pending.flowId !== undefined
+                ? { flow_id: pending.flowId }
+                : {}),
             },
           }
         : {}),

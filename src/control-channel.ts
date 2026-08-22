@@ -7,6 +7,7 @@
  */
 
 import type {
+  TAuthEvent,
   TDaemonCommandAck,
   TIceServer,
   TRelayFrame,
@@ -14,13 +15,15 @@ import type {
 import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
+import { setAuthSink } from "./auth-events";
+import { noteConnectionsForSessionLost } from "./auth-session-lost";
 import { DeviceLimitExceededError, fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
 } from "./device-limit-backoff";
-import { daemonEnv } from "./env";
+import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import {
@@ -208,6 +211,12 @@ const send = (frame: TRelayFrame): void => {
   }
 };
 
+const emitAuthFrame = (auth: TAuthEvent): void => {
+  const key_id = daemonApiKeyId();
+  if (key_id === null) return;
+  send({ type: "auth", key_id, auth });
+};
+
 /** Reset relay-owned work at a connection boundary. Mux channels and RTC
  * signaling sessions are tied to the old relay socket and must not continue
  * into the successor. Device PTYs DETACH (survive); the browser re-attaches
@@ -257,6 +266,9 @@ const enqueueStatusPublish = (
 const pushStatus = async (active?: boolean): Promise<void> =>
   enqueueStatusPublish(async () => {
     const status = await computeStatus();
+    // Falling-edge `auth.session.lost` — a provider that WAS connected and now
+    // reads not-connected (logout / credential gone) emits the mirror event.
+    noteConnectionsForSessionLost(status.connections);
     return { status, fingerprint: JSON.stringify(status) };
   }, active);
 
@@ -292,6 +304,10 @@ export const notePresenceActivity = (): void => {
 export const pushStatusIfChanged = async (): Promise<void> =>
   enqueueStatusPublish(async () => {
     const status = await computeStatus();
+    // Observe the falling edge on every computed snapshot — including the ~2.5s
+    // watcher's — so a background logout / credential loss emits the mirror
+    // event even when no command is in flight.
+    noteConnectionsForSessionLost(status.connections);
     const fingerprint = JSON.stringify(status);
     // Check inside the serialized publisher so concurrent probes cannot both
     // decide they are the next changed snapshot.
@@ -757,6 +773,12 @@ export const migrateIfRelayMoved = async (
 
 /** Start the WebSocket control loop (idempotent). */
 export const startControlChannel = (): void => {
+  setAuthSink({
+    emit: emitAuthFrame,
+    pushStatus: () => {
+      void pushStatus();
+    },
+  });
   if (ws !== null) return;
   logInfo("control-channel", "connecting over websocket");
   configureMuxHost({ send, sendBytes });
@@ -890,4 +912,5 @@ export const stopControlChannel = async (): Promise<void> => {
   resetRelayScopedState();
   ws.close(); // partysocket: a manual close() disables further reconnection
   ws = null;
+  setAuthSink(null);
 };

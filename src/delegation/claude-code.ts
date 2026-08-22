@@ -463,6 +463,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
                 code: pending.code,
                 ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
                 started_at_ms: pending.startedAt,
+                ...(pending.flowId !== undefined
+                  ? { flow_id: pending.flowId }
+                  : {}),
               },
               detail: pendingAuthDetail(pending),
             }
