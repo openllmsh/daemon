@@ -14,6 +14,7 @@ import type {
   TDaemonBootstrap,
   TDaemonModelReport,
   TDaemonPlanResponse,
+  TDaemonQuotaStatusReached,
   TDaemonRecordRequest,
   TDaemonSessionLost,
   TRelayChannelResponse,
@@ -310,6 +311,41 @@ export const notifySessionLost = async (
     } catch (error) {
       if (attempt === 1) {
         logWarn("auth-loss-notify", "session-loss notification failed", {
+          error_class: error instanceof Error ? error.name : typeof error,
+        });
+        return;
+      }
+    }
+  }
+};
+
+/**
+ * Report a fresh subscription quota warning or rejection to the cloud. This is
+ * best-effort operational telemetry: repeated status computation must not wait
+ * for it, and one transport retry is the complete delivery budget.
+ */
+export const notifyQuotaStatus = async (
+  body: TDaemonQuotaStatusReached,
+): Promise<void> => {
+  const request = (): Promise<Response> =>
+    cloudFetch(cloudUrl("/api/daemon/quota-status"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await request();
+      if (!response.ok) {
+        logWarn("quota-status-notify", "cloud rejected quota notification", {
+          status: response.status,
+        });
+      }
+      return;
+    } catch (error) {
+      if (attempt === 1) {
+        logWarn("quota-status-notify", "quota notification failed", {
           error_class: error instanceof Error ? error.name : typeof error,
         });
         return;

@@ -24,6 +24,7 @@ import { recentUserAuthAction } from "./auth-user-action";
 import {
   DeviceLimitExceededError,
   fetchChannel,
+  notifyQuotaStatus,
   notifySessionLost,
 } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
@@ -46,6 +47,7 @@ import {
   resetAllChannels,
   updateMuxPeerCaps,
 } from "./mux-host";
+import { noteConnectionsForQuota } from "./quota-status-notify";
 import {
   configureRtcClient,
   handleRtcAnswer,
@@ -368,6 +370,9 @@ const pushStatus = async (active?: boolean): Promise<void> =>
     // reads not-connected (logout / credential gone) emits the mirror event.
     noteConnectionsForSessionLost(status.connections);
     confirmSessionLosses(status.connections);
+    for (const transition of noteConnectionsForQuota(status.connections)) {
+      void notifyQuotaStatus(transition);
+    }
     return { status, fingerprint: JSON.stringify(status) };
   }, active);
 
@@ -408,6 +413,9 @@ export const pushStatusIfChanged = async (): Promise<void> =>
     // event even when no command is in flight.
     noteConnectionsForSessionLost(status.connections);
     confirmSessionLosses(status.connections);
+    for (const transition of noteConnectionsForQuota(status.connections)) {
+      void notifyQuotaStatus(transition);
+    }
     const fingerprint = JSON.stringify(status);
     // Check inside the serialized publisher so concurrent probes cannot both
     // decide they are the next changed snapshot.
