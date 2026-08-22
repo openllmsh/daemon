@@ -100,6 +100,15 @@ export const hostCliCandidates = (
   provider: TCliProvider,
   homeOverride?: string,
 ): string[] => {
+  // Hermetic-test guard. A test that drives a REAL delegate `.connect()` (e.g.
+  // `cursor-agent login`) must never let this probe discover the developer's
+  // real host CLI: the self-heal in `cliInstallState`/`reconcileIsolatedLink`
+  // would re-point the isolated symlink from the test's mock to that real
+  // binary, and spawning it opens a LIVE browser login on the dev's machine
+  // (CI has no such binary, so it only bit locally). Such a test sets this flag
+  // and provides its mock at the isolated `cliBin` path instead. NEVER set in
+  // production; unset there, so host discovery is unchanged.
+  if (process.env.OPENLLM_NO_HOST_CLI_DISCOVERY === "1") return [];
   const home = homeOverride ?? homedir();
   const vendorDefaults = ((): string[] => {
     switch (provider) {
