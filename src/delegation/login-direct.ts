@@ -25,12 +25,13 @@ import {
   emitLoginStarted,
   emitLoginSucceeded,
   guard,
+  openAuthUrlUnlessCancelled,
   resolveLoginFlow,
   spawnStreamLogin,
   streamLoginFail,
 } from "./login-flow";
 import type { TLoginResult } from "./util";
-import { openUrl, spawnLogin } from "./util";
+import { spawnLogin } from "./util";
 
 // ─── claude: blocking native login ───────────────────────────────────────
 
@@ -349,10 +350,26 @@ export const makeDeviceCodeConnect = (
           return { connected: false, detail: cfg.startFailDetail };
         }
         emitLoginStarted(flow);
+        // A cancel_connect can land while `requestDeviceAuth` was in flight —
+        // the slot isn't in-flight yet, but `cancelAll` still set `wasCancelled`.
+        // Check it BEFORE `startDeviceCodePoll`, whose `slot.start()` resets the
+        // flag: otherwise we'd open a browser + start polling a login the user
+        // already cancelled. Guarding the URL-open here is that last observation.
+        if (
+          !openAuthUrlUnlessCancelled(cfg.slot, auth.verificationUriComplete)
+        ) {
+          clearPendingAuth(cfg.provider);
+          emitLoginFailed(flow, {
+            code: "user_cancelled",
+            message: "sign-in cancelled",
+            retryable: true,
+          });
+          return { connected: false, detail: "sign-in cancelled" };
+        }
         // Surface URL+code to the dashboard (the daemon may be on a different
-        // machine than the user's browser). `openUrl` brings up the browser on
-        // this box; on a remote box it opens nothing useful but the dashboard
-        // shows these so the user authorizes from THEIR machine.
+        // machine than the user's browser). The browser is already up (above);
+        // on a remote box it opens nothing useful but the dashboard shows these
+        // so the user authorizes from THEIR machine.
         setPendingAuth(cfg.provider, {
           url: auth.verificationUriComplete,
           code: auth.userCode,
@@ -362,7 +379,6 @@ export const makeDeviceCodeConnect = (
           url: auth.verificationUriComplete,
           code: auth.userCode,
         });
-        openUrl(auth.verificationUriComplete);
         startDeviceCodePoll(cfg, auth, flow);
         return {
           connected: false,

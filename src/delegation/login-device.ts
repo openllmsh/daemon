@@ -26,12 +26,13 @@ import {
   finishInBackground,
   guard,
   makeCancelConnect,
+  openAuthUrlUnlessCancelled,
   resolveLoginFlow,
   spawnStreamLogin,
   streamLoginFail,
 } from "./login-flow";
 import type { THeadlessLogin } from "./util";
-import { openUrl, spawnHeadlessLogin } from "./util";
+import { spawnHeadlessLogin } from "./util";
 
 type TCancelConnect = () => Promise<{
   readonly ok: boolean;
@@ -273,6 +274,12 @@ export const makeStreamDeviceConnect = (
           emitLoginFailed(res.flow, fail);
           return { connected: false, detail: fail.message };
         }
+        // A cancel_connect can land between the prompt parsing and here; don't
+        // pop a browser on a user who already stopped. `spawnStreamLogin` kills
+        // the child on cancel, so only the URL-open needs guarding.
+        if (!openAuthUrlUnlessCancelled(cfg.slot, res.found.url)) {
+          return { connected: false, detail: "sign-in cancelled" };
+        }
         const flow =
           cfg.slot.flow() ?? resolveLoginFlow(cfg.provider, "device_code");
         setPendingAuth(cfg.provider, {
@@ -281,7 +288,6 @@ export const makeStreamDeviceConnect = (
           flowId: flow.flowId,
         });
         emitLoginPrompt(flow, res.found);
-        openUrl(res.found.url);
         return {
           connected: false,
           pending: true,

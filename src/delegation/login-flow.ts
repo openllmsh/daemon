@@ -29,6 +29,7 @@ import {
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DEFAULT_LOGIN_TIMEOUT_MS, redactUrls, spawnCwd } from "./spawn";
+import { openUrl } from "./util";
 
 /** The shared return shape of `connect()` / `connectDeviceCode()`. */
 export type TConnectResult = {
@@ -147,6 +148,26 @@ export const loginSlot = (provider: string): TLoginSlot => {
   };
   slots.set(provider, slot);
   return slot;
+};
+
+/**
+ * Open the vendor auth URL on the daemon's box ONLY if the login wasn't
+ * cancelled in the race window between parsing the prompt and this call. A
+ * `cancel_connect` can land after `spawnStreamLogin` resolved / `requestDeviceAuth`
+ * returned but before we open the browser; without this a browser tab would pop
+ * on the user AFTER they stopped the flow — and, worse, on the device-code path
+ * the subsequent `slot.start()` clears `wasCancelled`, so this is the last point
+ * the cancel is still observable. Returns whether it opened (false ⇒ cancelled,
+ * so the caller must abort the flow instead of surfacing a prompt). Best-effort:
+ * a status/UI cancel already tore down the dashboard side.
+ */
+export const openAuthUrlUnlessCancelled = (
+  slot: TLoginSlot,
+  url: string,
+): boolean => {
+  if (slot.wasCancelled()) return false;
+  openUrl(url);
+  return true;
 };
 
 // ─── Auth event helpers ──────────────────────────────────────────────────
