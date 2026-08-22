@@ -282,6 +282,15 @@ export const recordRequest = async (
 };
 
 /**
+ * A transient cloud failure worth one retry within the two-attempt budget:
+ * an overloaded server (500) or a rate limit (429). The cloud handler dedups
+ * by (user, kind, scope, key), so a retry after a partially-processed request
+ * cannot double-send. Every other status is a definitive reject — no retry.
+ */
+const isRetryableStatus = (status: number): boolean =>
+  status === 500 || status === 429;
+
+/**
  * Report a confirmed local subscription-session loss to the cloud. This is
  * best-effort operational telemetry: the status path must never wait for it.
  */
@@ -298,7 +307,8 @@ export const notifySessionLost = async (
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const response = await request();
-      if (!response.ok) {
+      if (response.ok) return;
+      if (!isRetryableStatus(response.status) || attempt === 1) {
         logWarn(
           "auth-loss-notify",
           "cloud rejected session-loss notification",
@@ -306,8 +316,8 @@ export const notifySessionLost = async (
             status: response.status,
           },
         );
+        return;
       }
-      return;
     } catch (error) {
       if (attempt === 1) {
         logWarn("auth-loss-notify", "session-loss notification failed", {
@@ -337,12 +347,13 @@ export const notifyQuotaStatus = async (
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const response = await request();
-      if (!response.ok) {
+      if (response.ok) return;
+      if (!isRetryableStatus(response.status) || attempt === 1) {
         logWarn("quota-status-notify", "cloud rejected quota notification", {
           status: response.status,
         });
+        return;
       }
-      return;
     } catch (error) {
       if (attempt === 1) {
         logWarn("quota-status-notify", "quota notification failed", {
