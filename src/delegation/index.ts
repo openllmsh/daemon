@@ -1,3 +1,4 @@
+import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
 import { chatgptDelegate } from "./chatgpt";
 import { claudeCodeDelegate } from "./claude-code";
 import { cursorDelegate } from "./cursor";
@@ -20,8 +21,9 @@ export const DELEGATES: Readonly<Record<string, TProviderDelegate>> = {
   cursor: cursorDelegate,
 };
 
-export const isSubscriptionSlug = (slug: string): boolean =>
-  Object.hasOwn(DELEGATES, slug);
+export const isSubscriptionSlug = (
+  slug: string,
+): slug is TSubscriptionProviderSlug => Object.hasOwn(DELEGATES, slug);
 
 export const getDelegate = (slug: string): TProviderDelegate | null =>
   DELEGATES[slug] ?? null;

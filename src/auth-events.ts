@@ -15,15 +15,35 @@ export type TAuthSink = {
 };
 
 let sink: TAuthSink | null = null;
+const observers = new Set<(event: TAuthEvent) => void>();
 
 /** Install (or clear) the transport sink. Called from `startControlChannel`. */
 export const setAuthSink = (next: TAuthSink | null): void => {
   sink = next;
 };
 
+/** Add an independent best-effort auth-event observer. */
+export const addAuthObserver = (
+  observer: (event: TAuthEvent) => void,
+): (() => void) => {
+  observers.add(observer);
+  return () => observers.delete(observer);
+};
+
 /** Best-effort: no-op when the control channel is not running (tests, headless). */
 export const emitAuth = (event: TAuthEvent): void => {
-  sink?.emit(event);
+  try {
+    sink?.emit(event);
+  } catch {
+    // Relay delivery must not prevent independent observers from running.
+  }
+  for (const observer of observers) {
+    try {
+      observer(event);
+    } catch {
+      // Observers are advisory and must never disrupt relay delivery or peers.
+    }
+  }
 };
 
 /** Best-effort status push so a background login finalize flips the card. */

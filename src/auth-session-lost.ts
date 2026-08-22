@@ -25,6 +25,7 @@ import type {
   TDaemonProviderConnection,
 } from "@openllmsh/protocol";
 import { emitAuth } from "./auth-events";
+import { resetUserAuthActionsForTests } from "./auth-user-action";
 import { isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
 import { daemonApiKeyId } from "./env";
@@ -105,4 +106,5 @@ export const noteConnectionsForSessionLost = (
 export const resetSessionLostTrackerForTests = (): void => {
   lastConnected.clear();
   pendingLostReason.clear();
+  resetUserAuthActionsForTests();
 };

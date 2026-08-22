@@ -14,6 +14,7 @@ import type {
   TLocalCliSession,
 } from "@openllmsh/protocol";
 import { markSessionLostReason } from "./auth-session-lost";
+import { noteUserAuthAction } from "./auth-user-action";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
@@ -153,6 +154,7 @@ export const runCommandInner = async (
         // leaves the provider connected, and the tracker drops the stamp on the
         // next still-connected snapshot.
         markSessionLostReason(cmd.payload.slug, "logout");
+        noteUserAuthAction(cmd.payload.slug);
         const r = await delegate.logout();
         if (r.ok) invalidateUsage(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };

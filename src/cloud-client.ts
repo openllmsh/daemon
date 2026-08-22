@@ -15,6 +15,7 @@ import type {
   TDaemonModelReport,
   TDaemonPlanResponse,
   TDaemonRecordRequest,
+  TDaemonSessionLost,
   TRelayChannelResponse,
 } from "@openllmsh/protocol";
 import {
@@ -25,6 +26,7 @@ import {
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
+import { logWarn } from "./logger";
 
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
 const decodePlan = Schema.decodeUnknownSync(DaemonPlanResponse);
@@ -275,6 +277,44 @@ export const recordRequest = async (
     });
   } catch {
     // swallow — usage recording is non-critical telemetry
+  }
+};
+
+/**
+ * Report a confirmed local subscription-session loss to the cloud. This is
+ * best-effort operational telemetry: the status path must never wait for it.
+ */
+export const notifySessionLost = async (
+  loss: TDaemonSessionLost,
+): Promise<void> => {
+  const request = (): Promise<Response> =>
+    cloudFetch(cloudUrl("/api/daemon/session-lost"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(loss),
+    });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await request();
+      if (!response.ok) {
+        logWarn(
+          "auth-loss-notify",
+          "cloud rejected session-loss notification",
+          {
+            status: response.status,
+          },
+        );
+      }
+      return;
+    } catch (error) {
+      if (attempt === 1) {
+        logWarn("auth-loss-notify", "session-loss notification failed", {
+          error_class: error instanceof Error ? error.name : typeof error,
+        });
+        return;
+      }
+    }
   }
 };
 

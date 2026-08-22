@@ -20,6 +20,7 @@
 
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { emitAuth, requestStatusPush } from "../auth-events";
+import { noteUserAuthAction } from "../auth-user-action";
 import { logWarn } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
@@ -173,6 +174,7 @@ export const openAuthUrlUnlessCancelled = (
 // ─── Auth event helpers ──────────────────────────────────────────────────
 
 export const emitLoginStarted = (flow: TLoginFlowCtx): void => {
+  noteUserAuthAction(flow.slug);
   emitAuth({
     event: "auth.login.started",
     flow_id: flow.flowId,
@@ -198,6 +200,7 @@ export const emitLoginPrompt = (
 };
 
 export const emitLoginSucceeded = (flow: TLoginFlowCtx): void => {
+  noteUserAuthAction(flow.slug);
   emitAuth({
     event: "auth.login.succeeded",
     flow_id: flow.flowId,
@@ -214,6 +217,7 @@ export const emitLoginFailed = (
     readonly retryable: boolean;
   },
 ): void => {
+  noteUserAuthAction(flow.slug);
   emitAuth({
     event: "auth.login.failed",
     flow_id: flow.flowId,

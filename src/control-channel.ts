@@ -9,16 +9,25 @@
 import type {
   TAuthEvent,
   TDaemonCommandAck,
+  TDaemonProviderConnection,
+  TDaemonSessionLost,
   TIceServer,
   TRelayFrame,
+  TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
 import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
-import { setAuthSink } from "./auth-events";
+import { addAuthObserver, setAuthSink } from "./auth-events";
 import { noteConnectionsForSessionLost } from "./auth-session-lost";
-import { DeviceLimitExceededError, fetchChannel } from "./cloud-client";
+import { recentUserAuthAction } from "./auth-user-action";
+import {
+  DeviceLimitExceededError,
+  fetchChannel,
+  notifySessionLost,
+} from "./cloud-client";
 import { runCommandInner } from "./control-relay";
+import { isSubscriptionSlug } from "./delegation";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
@@ -56,6 +65,8 @@ import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
 const WATCH_MS = 2_500;
+export const RECENT_USER_ACTION_MS = 120_000;
+export const SESSION_LOSS_SETTLE_STATUS_CYCLES = 2;
 // Heartbeat: the daemon sends its OWN `ping` on this interval and arms the
 // liveness watchdog off the relay's `pong` (not off arbitrary inbound frames),
 // so it detects a dead daemon→relay direction itself and reconnects — rather
@@ -217,6 +228,93 @@ const emitAuthFrame = (auth: TAuthEvent): void => {
   send({ type: "auth", key_id, auth });
 };
 
+type TPendingSessionLossNotification = Extract<
+  TAuthEvent,
+  { readonly event: "auth.session.lost" }
+> & { readonly slug: TSubscriptionProviderSlug };
+
+type TPendingSessionLoss = {
+  readonly loss: TPendingSessionLossNotification;
+  observations: number;
+};
+
+const pendingSessionLossNotifications = new Map<string, TPendingSessionLoss>();
+let disposeSessionLostNotifier: (() => void) | null = null;
+let notifySessionLoss: (loss: TDaemonSessionLost) => Promise<void> =
+  notifySessionLost;
+
+const observeSessionLoss = (event: TAuthEvent): void => {
+  if (event.event !== "auth.session.lost") return;
+  if (!isSubscriptionSlug(event.slug)) return;
+  if (
+    event.reason === "logout" ||
+    recentUserAuthAction(event.slug, RECENT_USER_ACTION_MS)
+  )
+    return;
+  pendingSessionLossNotifications.set(event.slug, {
+    loss: { ...event, slug: event.slug },
+    observations: 0,
+  });
+};
+
+/**
+ * Confirm pending loss events from each computed status snapshot. The first
+ * disconnected snapshot that emitted the edge counts as observation one; only
+ * a second consecutive disconnected observation is eligible to notify.
+ */
+const confirmSessionLosses = (
+  connections: ReadonlyArray<TDaemonProviderConnection>,
+): void => {
+  for (const [slug, pending] of pendingSessionLossNotifications) {
+    const connection = connections.find(
+      (candidate) => candidate.provider === slug,
+    );
+    if (connection?.connected !== false) {
+      pendingSessionLossNotifications.delete(slug);
+      continue;
+    }
+    pending.observations += 1;
+    if (pending.observations < SESSION_LOSS_SETTLE_STATUS_CYCLES) continue;
+    pendingSessionLossNotifications.delete(slug);
+    if (recentUserAuthAction(slug, RECENT_USER_ACTION_MS)) continue;
+    void notifySessionLoss({
+      slug: pending.loss.slug,
+      reason: pending.loss.reason,
+      ...(pending.loss.account_hash !== undefined
+        ? { account_hash: pending.loss.account_hash }
+        : {}),
+    });
+  }
+};
+
+const startSessionLostNotifier = (): void => {
+  if (disposeSessionLostNotifier !== null) return;
+  disposeSessionLostNotifier = addAuthObserver(observeSessionLoss);
+};
+
+const stopSessionLostNotifier = (): void => {
+  disposeSessionLostNotifier?.();
+  disposeSessionLostNotifier = null;
+  pendingSessionLossNotifications.clear();
+};
+
+/** Test-only seam for the observer and its status-cycle confirmation gate. */
+export const startSessionLostNotifierForTests = (
+  notify: (loss: TDaemonSessionLost) => Promise<void>,
+): (() => void) => {
+  notifySessionLoss = notify;
+  startSessionLostNotifier();
+  return () => {
+    stopSessionLostNotifier();
+    notifySessionLoss = notifySessionLost;
+  };
+};
+
+/** Test-only: feed one computed status snapshot into the confirmation gate. */
+export const noteSessionLossStatusForTests = (
+  connections: ReadonlyArray<TDaemonProviderConnection>,
+): void => confirmSessionLosses(connections);
+
 /** Reset relay-owned work at a connection boundary. Mux channels and RTC
  * signaling sessions are tied to the old relay socket and must not continue
  * into the successor. Device PTYs DETACH (survive); the browser re-attaches
@@ -269,6 +367,7 @@ const pushStatus = async (active?: boolean): Promise<void> =>
     // Falling-edge `auth.session.lost` — a provider that WAS connected and now
     // reads not-connected (logout / credential gone) emits the mirror event.
     noteConnectionsForSessionLost(status.connections);
+    confirmSessionLosses(status.connections);
     return { status, fingerprint: JSON.stringify(status) };
   }, active);
 
@@ -308,6 +407,7 @@ export const pushStatusIfChanged = async (): Promise<void> =>
     // watcher's — so a background logout / credential loss emits the mirror
     // event even when no command is in flight.
     noteConnectionsForSessionLost(status.connections);
+    confirmSessionLosses(status.connections);
     const fingerprint = JSON.stringify(status);
     // Check inside the serialized publisher so concurrent probes cannot both
     // decide they are the next changed snapshot.
@@ -773,6 +873,7 @@ export const migrateIfRelayMoved = async (
 
 /** Start the WebSocket control loop (idempotent). */
 export const startControlChannel = (): void => {
+  startSessionLostNotifier();
   setAuthSink({
     emit: emitAuthFrame,
     pushStatus: () => {
@@ -900,6 +1001,7 @@ export const startControlChannel = (): void => {
 
 /** Graceful-exit beacon: flip the key offline, then close. Best-effort. */
 export const stopControlChannel = async (): Promise<void> => {
+  stopSessionLostNotifier();
   if (ws === null) return;
   stopWatcher();
   stopMigrationCheck();
