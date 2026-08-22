@@ -677,15 +677,34 @@ export const spawnStreamLogin = async <T>(
 
   // Prompt parsed: keep the child alive for the localhost callback / device
   // poll. finishInBackground is the ONLY terminal path from here.
-  void proc.exited.then((exitCode) =>
-    finishInBackground({
+  //
+  // Abandonment ceiling: the child now holds its localhost callback / device
+  // poll waiting for the user. If the user neither finishes NOR cancels, nothing
+  // else bounds it — an abandoned `codex login` would sit alive holding that
+  // callback indefinitely (leaking a process + a stale pending_auth). Reap it at
+  // the login ceiling. A reap is an EXPIRY, not a crash, so report `exitCode: 0`
+  // → `finishInBackground` emits `poll_expired` (not `cli_crash`); a login that
+  // DID land a credential in the last moment still reports succeeded, since
+  // `finishInBackground` checks `isConnected()` before the exit code.
+  let reaped = false;
+  const reaper = setTimeout(() => {
+    reaped = true;
+    try {
+      proc.kill();
+    } catch {
+      // already exited — its own exit handler ran
+    }
+  }, ceilingMs);
+  void proc.exited.then((exitCode) => {
+    clearTimeout(reaper);
+    return finishInBackground({
       provider: opts.provider,
       slot: opts.slot,
       isConnected: opts.isConnected,
       onConnected: opts.onConnected,
-      exitCode,
-    }),
-  );
+      exitCode: reaped ? 0 : exitCode,
+    });
+  });
   return { found };
 };
 
