@@ -9,6 +9,10 @@
  * (relay persistence, the calibration estimator, the UI all consume only
  * the canonical struct).
  */
+import {
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import type { TProviderUsageWindow } from "@openllmsh/protocol";
 
 /**
@@ -291,7 +295,7 @@ export const reduceChatgptCredits = (
 /**
  * Overall quota status. The vendor's own verdict (`limit_reached` /
  * `allowed`) wins when it ships one — percent thresholds are only the
- * fallback, since a vendor can reject before any meter reads 100.
+ * fallback, since a vendor can reject before any meter reads QUOTA_REJECT_PERCENT.
  */
 export const reduceQuotaStatus = (
   rateLimit: unknown,
@@ -302,6 +306,10 @@ export const reduceQuotaStatus = (
   const rejected =
     verdict.limit_reached === true ||
     verdict.allowed === false ||
-    maxPct >= 100;
-  return rejected ? "rejected" : maxPct >= 80 ? "allowed_warning" : "allowed";
+    maxPct >= QUOTA_REJECT_PERCENT;
+  return rejected
+    ? "rejected"
+    : maxPct >= QUOTA_WARN_PERCENT
+      ? "allowed_warning"
+      : "allowed";
 };

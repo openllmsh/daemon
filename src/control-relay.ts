@@ -13,8 +13,6 @@ import type {
   TDaemonCommandAck,
   TLocalCliSession,
 } from "@openllmsh/protocol";
-import { markSessionLostReason } from "./auth-session-lost";
-import { noteUserAuthAction } from "./auth-user-action";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
@@ -28,7 +26,11 @@ import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
 import { maybeSelfUpdate } from "./self-update";
 import { discoverSessionHosts } from "./session-host-proc";
-import { refreshUsage } from "./status";
+import {
+  clearProviderSignedOut,
+  markProviderSignedOut,
+  refreshUsage,
+} from "./status";
 import { invalidateUsage } from "./usage-cache";
 
 /** Short TTL so picker double-fetch / remounts do not re-scan vendor stores. */
@@ -70,6 +72,7 @@ export const runCommandInner = async (
         // with a failure backoff, and a fresh credential must report
         // immediately. Fire-and-forget — never delays the ack.
         if (r.connected) {
+          clearProviderSignedOut(cmd.payload.slug);
           invalidateUsage(cmd.payload.slug);
           resetModelReportThrottle(cmd.payload.slug);
           void maybeReportModels().catch(() => {});
@@ -104,7 +107,10 @@ export const runCommandInner = async (
               ? delegate.connectDeviceCode()
               : delegate.connect(),
         );
-        if (r.connected) invalidateUsage(cmd.payload.slug);
+        if (r.connected) {
+          clearProviderSignedOut(cmd.payload.slug);
+          invalidateUsage(cmd.payload.slug);
+        }
         return {
           id: cmd.id,
           status: r.connected || r.pending === true ? "done" : "error",
@@ -149,14 +155,13 @@ export const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
-        // Attribute the falling edge the post-command status push will observe
-        // to a `logout` (else it defaults to `credential_gone`). A failed logout
-        // leaves the provider connected, and the tracker drops the stamp on the
-        // next still-connected snapshot.
-        markSessionLostReason(cmd.payload.slug, "logout");
-        noteUserAuthAction(cmd.payload.slug);
+        // Sticky signed_out at command receipt — before the (possibly slow)
+        // `delegate.logout()` — so interleaved status ticks never produce a
+        // `connected → disconnected` edge.
+        markProviderSignedOut(cmd.payload.slug);
         const r = await delegate.logout();
         if (r.ok) invalidateUsage(cmd.payload.slug);
+        else clearProviderSignedOut(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "submit_login_code": {
@@ -185,7 +190,10 @@ export const runCommandInner = async (
           { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
           () => submitLoginCode(code),
         );
-        if (r.ok) invalidateUsage(cmd.payload.slug);
+        if (r.ok) {
+          clearProviderSignedOut(cmd.payload.slug);
+          invalidateUsage(cmd.payload.slug);
+        }
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       // The on-demand usage read. The demand is the manual "Refresh usage"

@@ -12,7 +12,11 @@ import type {
   TProviderUsageSnapshot,
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
-import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
+import {
+  MODEL_LIST_FETCH_TIMEOUT_MS,
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logError, logInfo } from "../logger";
@@ -82,7 +86,11 @@ const statusForWindows = (
     (max, window) => Math.max(max, window.percent_used),
     0,
   );
-  return peak >= 100 ? "rejected" : peak >= 80 ? "allowed_warning" : "allowed";
+  return peak >= QUOTA_REJECT_PERCENT
+    ? "rejected"
+    : peak >= QUOTA_WARN_PERCENT
+      ? "allowed_warning"
+      : "allowed";
 };
 
 const numberOf = (value: unknown): number | null => {

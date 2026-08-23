@@ -1,11 +1,16 @@
 /**
- * Quota-status transition detector (LEAF module).
+ * Quota-status POST-rate optimizer (LEAF module).
  *
- * Status snapshots are often repeated by the control-channel watcher. This
- * module keeps a per-provider/account baseline and returns only fresh entries
- * into a state that merits a cloud notification. It has no delivery policy:
- * callers decide how and where to send returned transitions.
+ * The cloud is authoritative for de-escalation suppression and reset-flap
+ * filtering. This Map only skips an identical `(status, resetEpoch)` repeat
+ * so the ~2.5s status watcher does not POST the same transition over and
+ * over. It has no delivery policy: callers decide how and where to send
+ * returned transitions.
  */
+import {
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import type {
   TDaemonProviderConnection,
   TDaemonQuotaStatusReached,
@@ -19,7 +24,7 @@ type TQuotaBaseline = {
   readonly resetEpoch: number | undefined;
 };
 
-/** Last fresh quota status observed for each provider account. */
+/** Last `(status, resetEpoch)` actually emitted for each provider account. */
 const lastQuotaStatus = new Map<string, TQuotaBaseline>();
 
 const quotaKey = (slug: string, accountHash: string | undefined): string =>
@@ -33,18 +38,6 @@ const isSubscriptionProviderSlug = (
   slug === "kimi_code" ||
   slug === "grok" ||
   slug === "cursor";
-
-const isNotifiableTransition = (
-  previous: TQuotaStatus | undefined,
-  next: TQuotaStatus,
-): boolean => {
-  if (next === "allowed") return false;
-  if (previous === next) return false;
-  // A rejected account recovering only to warning is a de-escalation, not a
-  // new warning. A later fresh allowed baseline intentionally re-arms it.
-  if (previous === "rejected" && next === "allowed_warning") return false;
-  return true;
-};
 
 const farthestFiniteReset = (
   windows: ReadonlyArray<TProviderUsageWindow>,
@@ -64,31 +57,42 @@ const farthestFiniteReset = (
 
 /**
  * Reset epoch of the window that is still holding the current status.
- * Matches `reduceQuotaStatus` thresholds: ≥100 rejected, ≥80 warning.
- * Vendor `limit_reached` / `allowed === false` can reject with no window
- * at 100 — then use the farthest finite reset among all `windows`.
+ * Matches `reduceQuotaStatus` thresholds: ≥QUOTA_REJECT_PERCENT rejected,
+ * ≥QUOTA_WARN_PERCENT warning. Vendor `limit_reached` / `allowed === false`
+ * can reject with no window at cap — then use the farthest finite reset
+ * among all `windows`.
  */
 const sustainingWindowResetAtMs = (
   status: TQuotaStatus,
   windows: ReadonlyArray<TProviderUsageWindow>,
 ): number | undefined => {
   if (status === "rejected") {
-    const atCap = farthestFiniteReset(windows, 100);
+    const atCap = farthestFiniteReset(windows, QUOTA_REJECT_PERCENT);
     if (atCap !== undefined) return atCap;
     return farthestFiniteReset(windows, undefined);
   }
   if (status === "allowed_warning") {
-    return farthestFiniteReset(windows, 80);
+    return farthestFiniteReset(windows, QUOTA_WARN_PERCENT);
   }
   return undefined;
 };
 
+const samePostedPair = (
+  previous: TQuotaBaseline | undefined,
+  next: TQuotaStatus,
+  resetEpoch: number | undefined,
+): boolean =>
+  previous !== undefined &&
+  previous.status === next &&
+  previous.resetEpoch === resetEpoch;
+
 /**
- * Observe quota snapshots and return the newly reached notification states.
+ * Observe quota snapshots and return states that should POST.
  *
  * Cold-start warning/rejected snapshots intentionally emit: without a prior
  * baseline the user may already be affected, and cloud deduplication protects
- * against duplicate devices.
+ * against duplicate devices. De-escalation (`rejected → allowed_warning`)
+ * and epoch flap are NOT filtered here — the cloud owns those policies.
  */
 export const noteConnectionsForQuota = (
   connections: ReadonlyArray<TDaemonProviderConnection>,
@@ -108,16 +112,13 @@ export const noteConnectionsForQuota = (
     const resetEpoch = sustainingWindowResetAtMs(next, usage.windows);
     const key = quotaKey(connection.provider, connection.account_hash);
     const previous = lastQuotaStatus.get(key);
-    const prevEpoch = previous?.resetEpoch;
-    // Only a strictly later finite window re-arms. Missing or smaller epochs
-    // are vendor flaps of the same window, not a new billing period.
-    const epochAdvanced =
-      resetEpoch !== undefined &&
-      prevEpoch !== undefined &&
-      resetEpoch > prevEpoch;
+    if (next === "allowed") {
+      lastQuotaStatus.set(key, { status: next, resetEpoch });
+      continue;
+    }
     if (
       (next === "allowed_warning" || next === "rejected") &&
-      (isNotifiableTransition(previous?.status, next) || epochAdvanced)
+      !samePostedPair(previous, next, resetEpoch)
     ) {
       transitions.push({
         slug: connection.provider,
@@ -128,13 +129,8 @@ export const noteConnectionsForQuota = (
         ...(usage.plan === undefined ? {} : { plan: usage.plan }),
         ...(resetEpoch === undefined ? {} : { reset_at_ms: resetEpoch }),
       });
+      lastQuotaStatus.set(key, { status: next, resetEpoch });
     }
-    const effectiveEpoch =
-      resetEpoch !== undefined &&
-      (prevEpoch === undefined || resetEpoch >= prevEpoch)
-        ? resetEpoch
-        : prevEpoch;
-    lastQuotaStatus.set(key, { status: next, resetEpoch: effectiveEpoch });
   }
 
   return transitions;

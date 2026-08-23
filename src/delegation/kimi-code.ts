@@ -34,6 +34,10 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
+import {
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
@@ -568,7 +572,11 @@ export const parseKimiUsage = (payload: unknown): TProviderUsageSnapshot => {
   return {
     kind: "quota",
     status:
-      maxPct >= 100 ? "rejected" : maxPct >= 80 ? "allowed_warning" : "allowed",
+      maxPct >= QUOTA_REJECT_PERCENT
+        ? "rejected"
+        : maxPct >= QUOTA_WARN_PERCENT
+          ? "allowed_warning"
+          : "allowed",
     windows,
     note: "Kimi Code — read locally via Kimi CLI",
   };

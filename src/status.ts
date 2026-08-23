@@ -10,12 +10,14 @@ import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
+  TDaemonProviderAuthStatus,
   TDaemonProviderConnection,
   TDaemonStatus,
 } from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
-import { DELEGATES } from "./delegation";
+import { DELEGATES, isSubscriptionSlug } from "./delegation";
+import { loginSlot } from "./delegation/login-flow";
 import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { getCliState } from "./device-state";
@@ -62,8 +64,20 @@ if (DELEGATE_STATUS_TIMEOUT_MS < DEFAULT_CAPTURE_TIMEOUT_MS) {
 // a definitive `false` to the cloud.
 const lastKnownConnections = new Map<string, TDaemonProviderConnection>();
 
-/** Mechanical projection until Phase 2 can set `signed_out` on logout.
- *  Leaves an already-populated `status` (e.g. last-known) untouched. */
+/** User-initiated logout, sticky until the next successful login (or a
+ *  failed logout that never actually signed out). Set at command receipt. */
+const signedOutByUser = new Set<string>();
+
+/** Mark `slug` signed-out at logout command receipt, before `delegate.logout()`. */
+export const markProviderSignedOut = (slug: string): void => {
+  signedOutByUser.add(slug);
+};
+
+/** Clear sticky signed-out (successful login, or a logout that did not take). */
+export const clearProviderSignedOut = (slug: string): void => {
+  signedOutByUser.delete(slug);
+};
+
 const withAuthStatus = (
   conn: TDaemonProviderConnection,
 ): TDaemonProviderConnection =>
@@ -73,12 +87,47 @@ const withAuthStatus = (
         ...conn,
         status: conn.connected ? "connected" : "disconnected",
       };
+
+const applyAuthLiteral = (
+  slug: string,
+  conn: TDaemonProviderConnection,
+): TDaemonProviderConnection => {
+  const last = lastKnownConnections.get(slug);
+  const inFlight =
+    isSubscriptionSlug(slug) && loginSlot(slug).inFlight();
+  const indeterminate = conn.detail === STATUS_CHECK_FAILED_DETAIL;
+  if (inFlight || indeterminate) {
+    const preserved: TDaemonProviderAuthStatus =
+      last?.status ??
+      (signedOutByUser.has(slug)
+        ? "signed_out"
+        : conn.connected
+          ? "connected"
+          : "disconnected");
+    return {
+      ...(last !== undefined ? last : conn),
+      detail: conn.detail,
+      status: preserved,
+      connected: preserved === "connected",
+    };
+  }
+  if (signedOutByUser.has(slug)) {
+    return { ...conn, status: "signed_out", connected: false };
+  }
+  if (conn.connected) {
+    signedOutByUser.delete(slug);
+    return { ...conn, status: "connected", connected: true };
+  }
+  return { ...conn, status: "disconnected", connected: false };
+};
+
 const timedOutSlugs = new Set<string>();
 
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
   timedOutSlugs.clear();
+  signedOutByUser.clear();
 };
 
 const statusFailure = (slug: string): TDaemonProviderConnection => {
@@ -94,6 +143,7 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
     // The protocol requires a connection boolean. This only means the current
     // check did not establish a connection; it is not a logout assertion.
     connected: false,
+    status: "disconnected",
     detail: STATUS_CHECK_FAILED_DETAIL,
   };
 };
@@ -177,8 +227,14 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
-        const conn = await boundedDelegateStatus(d.slug, d.status);
-        if (conn.detail !== STATUS_CHECK_FAILED_DETAIL) {
+        const conn = applyAuthLiteral(
+          d.slug,
+          await boundedDelegateStatus(d.slug, d.status),
+        );
+        if (
+          conn.detail !== STATUS_CHECK_FAILED_DETAIL &&
+          !(isSubscriptionSlug(d.slug) && loginSlot(d.slug).inFlight())
+        ) {
           lastKnownConnections.set(d.slug, conn);
         }
         // Attach a metadata-only usage snapshot for connected providers so the
