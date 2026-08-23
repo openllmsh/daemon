@@ -242,6 +242,12 @@ const readStoredTokens = async (): Promise<
   const accessToken = await readMacKeychainSecret("cursor-access-token");
   if (accessToken.kind !== "present") return accessToken;
   const refreshToken = await readMacKeychainSecret("cursor-refresh-token");
+  // An indeterminate refresh-token read (locked/denied keychain item) must not
+  // be collapsed to "no refresh token" — that would assert absence from an
+  // uncertain read and skip refresh. Propagate indeterminate so status maps it
+  // to STATUS_CHECK_FAILED_DETAIL and last-known is preserved (C1). Only a
+  // definite `absent` sets refreshTokenPresent: false.
+  if (refreshToken.kind === "indeterminate") return refreshToken;
   return {
     kind: "present",
     value: {
