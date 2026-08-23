@@ -229,6 +229,46 @@ export const emitLoginFailed = (
   });
 };
 
+/**
+ * Shared login-terminal finalizer (audit A4): emit succeeded/failed (or
+ * nothing), optionally drop pending-auth, then request a status push.
+ * Callers keep polling-specific work (`slot.end`, connection re-read,
+ * `onConnected`) and decide which event to emit so stream vs device-code
+ * cancel/success semantics stay distinct.
+ */
+export type TLoginTerminalEvent =
+  | { readonly kind: "succeeded" }
+  | {
+      readonly kind: "failed";
+      readonly code: TAuthLoginFailedCode;
+      readonly message: string;
+      readonly retryable: boolean;
+    }
+  | { readonly kind: "none" };
+
+export const finalizeLoginTerminal = (opts: {
+  readonly flow: TLoginFlowCtx | null;
+  readonly event: TLoginTerminalEvent;
+  readonly provider: string;
+  readonly clearPending: boolean;
+}): void => {
+  if (opts.flow !== null) {
+    if (opts.event.kind === "succeeded") {
+      emitLoginSucceeded(opts.flow);
+    } else if (opts.event.kind === "failed") {
+      emitLoginFailed(opts.flow, {
+        code: opts.event.code,
+        message: opts.event.message,
+        retryable: opts.event.retryable,
+      });
+    }
+  }
+  if (opts.clearPending) {
+    clearPendingAuth(opts.provider);
+  }
+  requestStatusPush();
+};
+
 const CAPTURE_MAX = 400;
 
 const captureBody = (captured: string): string =>
@@ -410,9 +450,6 @@ export const finishInBackground = async (opts: {
       // still treat as not-connected
     }
   }
-  if (opts.alwaysClearPending === true || !connected) {
-    clearPendingAuth(opts.provider);
-  }
   if (connected && opts.onConnected !== undefined) {
     try {
       await opts.onConnected();
@@ -420,21 +457,26 @@ export const finishInBackground = async (opts: {
       // best-effort — a failed onConnected must not reject the cleanup
     }
   }
-  if (!cancelled && flow !== null) {
-    if (connected) {
-      emitLoginSucceeded(flow);
-    } else {
-      const crashed = opts.exitCode !== undefined && opts.exitCode !== 0;
-      emitLoginFailed(flow, {
-        code: crashed ? "cli_crash" : "poll_expired",
-        message: crashed
-          ? "sign-in process exited before a credential landed"
-          : "sign-in ended without a stored credential",
-        retryable: !crashed,
-      });
-    }
-  }
-  requestStatusPush();
+  const crashed = opts.exitCode !== undefined && opts.exitCode !== 0;
+  const event: TLoginTerminalEvent =
+    cancelled || flow === null
+      ? { kind: "none" }
+      : connected
+        ? { kind: "succeeded" }
+        : {
+            kind: "failed",
+            code: crashed ? "cli_crash" : "poll_expired",
+            message: crashed
+              ? "sign-in process exited before a credential landed"
+              : "sign-in ended without a stored credential",
+            retryable: !crashed,
+          };
+  finalizeLoginTerminal({
+    flow,
+    event,
+    provider: opts.provider,
+    clearPending: opts.alwaysClearPending === true || !connected,
+  });
 };
 
 // ─── Stream-spawn login primitive (codex) ────────────────────────────────

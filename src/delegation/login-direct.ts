@@ -15,15 +15,20 @@
  * there is no cycle.
  */
 
-import { requestStatusPush } from "../auth-events";
 import { clearPendingAuth, setPendingAuth } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import type { TConnectResult, TLoginFlowCtx, TLoginSlot } from "./login-flow";
+import type {
+  TConnectResult,
+  TLoginFlowCtx,
+  TLoginSlot,
+  TLoginTerminalEvent,
+} from "./login-flow";
 import {
   emitLoginFailed,
   emitLoginPrompt,
   emitLoginStarted,
   emitLoginSucceeded,
+  finalizeLoginTerminal,
   guard,
   openAuthUrlUnlessCancelled,
   resolveLoginFlow,
@@ -298,20 +303,26 @@ const startDeviceCodePoll = (
     } finally {
       const cancelled = cfg.slot.wasCancelled() || aborted;
       cfg.slot.end();
-      if (outcome === "success") {
-        emitLoginSucceeded(flow);
-      } else if (!cancelled) {
-        emitLoginFailed(flow, {
-          code: outcome === "stop" ? "cli_crash" : "poll_expired",
-          message:
-            outcome === "stop"
-              ? "sign-in was rejected"
-              : "sign-in expired before a credential landed",
-          retryable: outcome !== "stop",
-        });
-      }
-      clearPendingAuth(cfg.provider);
-      requestStatusPush();
+      const event: TLoginTerminalEvent =
+        outcome === "success"
+          ? { kind: "succeeded" }
+          : cancelled
+            ? { kind: "none" }
+            : {
+                kind: "failed",
+                code: outcome === "stop" ? "cli_crash" : "poll_expired",
+                message:
+                  outcome === "stop"
+                    ? "sign-in was rejected"
+                    : "sign-in expired before a credential landed",
+                retryable: outcome !== "stop",
+              };
+      finalizeLoginTerminal({
+        flow,
+        event,
+        provider: cfg.provider,
+        clearPending: true,
+      });
     }
   })();
 };
