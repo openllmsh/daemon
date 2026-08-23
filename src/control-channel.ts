@@ -285,6 +285,9 @@ const confirmSessionLosses = (
       ...(pending.loss.account_hash !== undefined
         ? { account_hash: pending.loss.account_hash }
         : {}),
+      ...(pending.loss.diagnostic_code !== undefined
+        ? { diagnostic_code: pending.loss.diagnostic_code }
+        : {}),
     });
   }
 };

@@ -21,6 +21,7 @@
  * (`vendor_revoked` has no local signal, so it is never inferred here.)
  */
 import type {
+  TAuthSessionLostDiagnosticCode,
   TAuthSessionLostReason,
   TDaemonProviderConnection,
 } from "@openllmsh/protocol";
@@ -42,6 +43,52 @@ const lastConnected = new Map<string, TConnSnapshot>();
 /** A command-attributed reason for the NEXT falling edge of a slug (else the
  *  default `credential_gone` is used). Consumed on emit or on reconnect. */
 const pendingLostReason = new Map<string, TAuthSessionLostReason>();
+
+/**
+ * Map free-form `conn.detail` to a bounded diagnostic code. Never returns
+ * the input string — unknown / empty details fall back to `unclassified`.
+ * Does not infer `vendor_revoked` as a session-loss *reason*.
+ */
+export const classifyLossDetail = (
+  detail?: string,
+): TAuthSessionLostDiagnosticCode => {
+  if (detail === undefined || detail.trim() === "") return "unclassified";
+  const d = detail.toLowerCase();
+  if (d.includes("keychain")) return "keychain_unavailable";
+  if (
+    d.includes("unreadable") ||
+    d.includes("eacces") ||
+    d.includes("permission denied") ||
+    d.includes("parse")
+  ) {
+    return "store_unreadable";
+  }
+  if (
+    d.includes("timeout") ||
+    d.includes("timed out") ||
+    d === "status check failed"
+  ) {
+    return "probe_timeout";
+  }
+  if (d.includes("not installed") || d.includes("cli not installed")) {
+    return "cli_unavailable";
+  }
+  if (
+    d.includes("revoked") ||
+    d.includes("unauthorized") ||
+    d.includes("401")
+  ) {
+    return "vendor_revoked_unknown";
+  }
+  if (
+    d.includes("not signed in") ||
+    d.includes("no stored credential") ||
+    (d.includes("credential") && d.includes("absent"))
+  ) {
+    return "credential_absent";
+  }
+  return "unclassified";
+};
 
 /**
  * Attribute the next falling edge of `slug` to `reason` (e.g. a `logout`
@@ -78,10 +125,11 @@ export const noteConnectionsForSessionLost = (
     if (prev?.connected === true && !now) {
       const reason = pendingLostReason.get(slug) ?? "credential_gone";
       pendingLostReason.delete(slug);
+      const diagnostic_code = classifyLossDetail(conn.detail);
       logWarn("auth-session-lost", "subscription session lost", {
         slug,
         reason,
-        ...(conn.detail !== undefined ? { detail: conn.detail } : {}),
+        diagnostic_code,
         ...(prev.accountHash !== undefined
           ? { account_hash: prev.accountHash }
           : {}),
@@ -91,6 +139,7 @@ export const noteConnectionsForSessionLost = (
         key_id: daemonApiKeyId() ?? "local",
         slug,
         reason,
+        diagnostic_code,
         ...(prev.accountHash !== undefined
           ? { account_hash: prev.accountHash }
           : {}),
