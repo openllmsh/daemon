@@ -314,6 +314,7 @@ const classifyUnlockFailure = (stderr: string): "auth" | "transient" => {
 const createIsolatedKeychain = async (
   home: string,
   kc: string,
+  signal?: AbortSignal,
 ): Promise<boolean> => {
   const dir = dirname(kc);
   await mkdir(dir, { recursive: true });
@@ -330,9 +331,13 @@ const createIsolatedKeychain = async (
   } catch {
     // dir unreadable / race — non-fatal
   }
-  const created = await runSecurity(["create-keychain", "-p", "", staging], home);
+  const created = await runSecurity(
+    ["create-keychain", "-p", "", staging],
+    home,
+    signal,
+  );
   if (created) {
-    await runSecurity(["set-keychain-settings", staging], home);
+    await runSecurity(["set-keychain-settings", staging], home, signal);
     try {
       await rename(staging, kc);
     } catch {
@@ -349,6 +354,7 @@ const createIsolatedKeychain = async (
 const recreateIsolatedKeychain = async (
   home: string,
   kc: string,
+  signal?: AbortSignal,
 ): Promise<boolean> => {
   const aside = `${kc}.broken-${process.pid}-${Date.now()}`;
   try {
@@ -362,8 +368,8 @@ const recreateIsolatedKeychain = async (
     }
   }
   logSelfHeal(kc);
-  if (!(await createIsolatedKeychain(home, kc))) return false;
-  return runSecurity(["unlock-keychain", "-p", "", kc], home);
+  if (!(await createIsolatedKeychain(home, kc, signal))) return false;
+  return runSecurity(["unlock-keychain", "-p", "", kc], home, signal);
 };
 
 /** Ensure the isolated login keychain exists and is UNLOCKED for this call,
@@ -398,7 +404,7 @@ const ensureKeychainNow = async (
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
   if (!existsSync(kc)) {
-    if (!(await createIsolatedKeychain(home, kc))) {
+    if (!(await createIsolatedKeychain(home, kc, signal))) {
       // A later `claude auth login` would pop "Keychain Not Found" and wedge.
       logKeychainFailure(kc);
       return { kind: "indeterminate", cause: "keychain_create_failed" };
@@ -424,7 +430,8 @@ const ensureKeychainNow = async (
   if (classifyUnlockFailure(res.stderr) === "auth") {
     if (!healedKeychains.has(kc)) {
       healedKeychains.add(kc);
-      if (await recreateIsolatedKeychain(home, kc)) return noteUnlockSuccess(kc);
+      if (await recreateIsolatedKeychain(home, kc, signal))
+        return noteUnlockSuccess(kc);
     }
     // Auth-drift and (already healed OR recreate failed) → terminal.
     unusableKeychains.add(kc);

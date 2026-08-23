@@ -8,6 +8,7 @@
 import { platform } from "node:os";
 import { join } from "node:path";
 import type {
+  TDaemonProviderConnection,
   TProviderModelEntry,
   TProviderUsageSnapshot,
   TProviderUsageWindow,
@@ -33,6 +34,7 @@ import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
+import type { TRefreshOutcome } from "./refresh";
 import type { TProviderDelegate } from "./types";
 import type { TStoreRead } from "./util";
 import {
@@ -228,31 +230,44 @@ const readFileTokens = async (): Promise<
   };
 };
 
-let statusProbeSignal: AbortSignal | undefined;
-
-const triggerRefresh = async (): Promise<void> => {
+const triggerRefresh = async (signal?: AbortSignal): Promise<void> => {
   // Mirror Claude: a locked/unusable isolated keychain must NOT reach
   // `cursor-agent status` (SecurityAgent dialog + 60s spawn). Skip when not
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
   if (
-    (await ensureKeychainReady(cliHome(PROVIDER), statusProbeSignal)).kind !==
-    "present"
+    (await ensureKeychainReady(cliHome(PROVIDER), signal)).kind !== "present"
   ) {
     return;
   }
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
-    ...(statusProbeSignal !== undefined ? { signal: statusProbeSignal } : {}),
+    ...(signal !== undefined ? { signal } : {}),
   });
 };
 
-const refresh = makeRefresher({
+const refreshBase = makeRefresher({
   slug: PROVIDER,
   label: "Cursor",
   leewayMs: REFRESH_LEEWAY_MS,
-  trigger: triggerRefresh,
+  trigger: () => triggerRefresh(),
 });
+
+const refresh = async (
+  expiresAtMs: number | null,
+  signal?: AbortSignal,
+): Promise<TRefreshOutcome> => {
+  if (signal === undefined) return refreshBase(expiresAtMs);
+  if (expiresAtMs === null) return "fresh";
+  const remaining = expiresAtMs - Date.now();
+  if (remaining >= REFRESH_LEEWAY_MS) return "fresh";
+  if (remaining > 0) {
+    void triggerRefresh(signal);
+    return "kicked";
+  }
+  await triggerRefresh(signal);
+  return "awaited";
+};
 
 const readStoredTokens = async (
   signal?: AbortSignal,
@@ -296,7 +311,7 @@ const readToken = async (
   const stored = storeReadValue(await readStoredTokens(signal));
   if (stored === null) return null;
   const outcome = stored.refreshTokenPresent
-    ? await refresh(jwtExpiryMs(stored.accessToken))
+    ? await refresh(jwtExpiryMs(stored.accessToken), signal)
     : "fresh";
   if (outcome !== "awaited") return stored;
   // CLI remains the sole token-store owner. Re-read after a hard-expiry refresh.
@@ -377,9 +392,9 @@ export const cursorDelegate: TProviderDelegate = {
   connect: connectDirect,
   cancelConnect,
 
-  status: async (signal) => {
-    statusProbeSignal = signal;
-    try {
+  status: async (
+    signal?: AbortSignal,
+  ): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
     if (installed && (await readStoredTokens(signal)).kind === "indeterminate") {
       return {
@@ -427,9 +442,6 @@ export const cursorDelegate: TProviderDelegate = {
             ),
           }),
     };
-    } finally {
-      if (statusProbeSignal === signal) statusProbeSignal = undefined;
-    }
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {

@@ -79,6 +79,15 @@ const joinChangeKeyParts = (parts: readonly string[]): string =>
   parts.map(changeKeySegment).join(":");
 
 /**
+ * Distinguishes omitted optional arrays from explicit `[]` in the change key
+ * (JSON omits vs emits the field). Does not alter the snapshot itself.
+ */
+const optionalArrayChangeKey = (
+  value: readonly unknown[] | undefined,
+  encodedItems: string,
+): string => joinChangeKeyParts([value === undefined ? "0" : "1", encodedItems]);
+
+/**
  * Cheap change key: concatenates wire-visible primitives. Nested `usage` /
  * `pending_auth` are small optional blobs; they are stringified individually
  * rather than walking the whole snapshot. Each primitive is JSON-encoded
@@ -105,21 +114,24 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
       ]),
     )
     .join("|");
-  const sessions = (status.sessions ?? [])
-    .map((s) =>
-      joinChangeKeyParts([
-        s.id,
-        s.cli,
-        String(s.started_at_ms),
-        s.attached ? "1" : "0",
-        s.live ? "1" : "0",
-        s.busy === undefined ? "" : String(s.busy),
-        s.title ?? "",
-        s.last_exit_reason ?? "",
-        s.vendor_session_id ?? "",
-      ]),
-    )
-    .join("|");
+  const sessions = optionalArrayChangeKey(
+    status.sessions,
+    (status.sessions ?? [])
+      .map((s) =>
+        joinChangeKeyParts([
+          s.id,
+          s.cli,
+          String(s.started_at_ms),
+          s.attached ? "1" : "0",
+          s.live ? "1" : "0",
+          s.busy === undefined ? "" : String(s.busy),
+          s.title ?? "",
+          s.last_exit_reason ?? "",
+          s.vendor_session_id ?? "",
+        ]),
+      )
+      .join("|"),
+  );
   return [
     status.daemon_version,
     status.key_configured ? "1" : "0",
@@ -135,7 +147,7 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
           String(status.cli.installed),
           status.cli.version ?? "",
         ]),
-    (status.caps ?? []).join(","),
+    optionalArrayChangeKey(status.caps, (status.caps ?? []).join(",")),
     status.pty_supported === undefined ? "" : String(status.pty_supported),
     connections,
     sessions,
