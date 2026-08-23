@@ -290,59 +290,30 @@ export const recordRequest = async (
 const isRetryableStatus = (status: number): boolean =>
   status === 500 || status === 429;
 
-/**
- * Report a confirmed local subscription-session loss to the cloud. This is
- * best-effort operational telemetry: the status path must never wait for it.
- */
-export const notifySessionLost = async (
-  loss: TDaemonSessionLost,
-): Promise<void> => {
-  const request = (): Promise<Response> =>
-    cloudFetch(cloudUrl("/api/daemon/session-lost"), {
-      method: "POST",
-      headers: authHeaders(),
-      body: JSON.stringify(loss),
-    });
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const response = await request();
-      if (response.ok) return;
-      if (!isRetryableStatus(response.status) || attempt === 1) {
-        logWarn(
-          "auth-loss-notify",
-          "cloud rejected session-loss notification",
-          {
-            status: response.status,
-            slug: loss.slug,
-            reason: loss.reason,
-          },
-        );
-        return;
-      }
-    } catch (error) {
-      if (attempt === 1) {
-        logWarn("auth-loss-notify", "session-loss notification failed", {
-          error_class: error instanceof Error ? error.name : typeof error,
-          slug: loss.slug,
-          reason: loss.reason,
-        });
-        return;
-      }
-    }
-  }
+type TNotifyCloudEventLog = {
+  readonly scope: string;
+  readonly rejectedMessage: string;
+  readonly failedMessage: string;
+  readonly slug: string;
+  readonly reason?: string;
 };
 
 /**
- * Report a fresh subscription quota warning or rejection to the cloud. This is
- * best-effort operational telemetry: repeated status computation must not wait
- * for it, and one transport retry is the complete delivery budget.
+ * Two-attempt best-effort POST of a daemon cloud event. Retry only 500/429
+ * (and thrown transport errors) on attempt 0; terminal otherwise. The cloud
+ * handler dedups, so a retry after a partial process cannot double-send.
  */
-export const notifyQuotaStatus = async (
-  body: TDaemonQuotaStatusReached,
+const notifyCloudEvent = async (
+  path: string,
+  body: unknown,
+  log: TNotifyCloudEventLog,
 ): Promise<void> => {
+  const fields = {
+    slug: log.slug,
+    ...(log.reason === undefined ? {} : { reason: log.reason }),
+  };
   const request = (): Promise<Response> =>
-    cloudFetch(cloudUrl("/api/daemon/quota-status"), {
+    cloudFetch(cloudUrl(path), {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify(body),
@@ -353,20 +324,54 @@ export const notifyQuotaStatus = async (
       const response = await request();
       if (response.ok) return;
       if (!isRetryableStatus(response.status) || attempt === 1) {
-        logWarn("quota-status-notify", "cloud rejected quota notification", {
+        logWarn(log.scope, log.rejectedMessage, {
           status: response.status,
+          ...fields,
         });
         return;
       }
     } catch (error) {
       if (attempt === 1) {
-        logWarn("quota-status-notify", "quota notification failed", {
+        logWarn(log.scope, log.failedMessage, {
           error_class: error instanceof Error ? error.name : typeof error,
+          ...fields,
         });
         return;
       }
     }
   }
+};
+
+/**
+ * Report a confirmed local subscription-session loss to the cloud. This is
+ * best-effort operational telemetry: the status path must never wait for it.
+ */
+export const notifySessionLost = async (
+  loss: TDaemonSessionLost,
+): Promise<void> => {
+  await notifyCloudEvent("/api/daemon/session-lost", loss, {
+    scope: "auth-loss-notify",
+    rejectedMessage: "cloud rejected session-loss notification",
+    failedMessage: "session-loss notification failed",
+    slug: loss.slug,
+    reason: loss.reason,
+  });
+};
+
+/**
+ * Report a fresh subscription quota warning or rejection to the cloud. This is
+ * best-effort operational telemetry: repeated status computation must not wait
+ * for it, and one transport retry is the complete delivery budget.
+ */
+export const notifyQuotaStatus = async (
+  body: TDaemonQuotaStatusReached,
+): Promise<void> => {
+  await notifyCloudEvent("/api/daemon/quota-status", body, {
+    scope: "quota-status-notify",
+    rejectedMessage: "cloud rejected quota notification",
+    failedMessage: "quota notification failed",
+    slug: body.slug,
+  });
 };
 
 export type TUploadMediaOptions = {
