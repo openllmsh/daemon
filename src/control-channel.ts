@@ -9,7 +9,6 @@
 import type {
   TAuthEvent,
   TDaemonCommandAck,
-  TDaemonProviderAuthStatus,
   TDaemonProviderConnection,
   TDaemonSessionLost,
   TIceServer,
@@ -19,8 +18,9 @@ import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { setAuthSink } from "./auth-events";
+import type { TAuthStatusBaseline } from "./auth-session-lost";
 import {
-  classifyLossDetail,
+  detectAuthLossEdge,
   noteConnectionsForSessionLost,
 } from "./auth-session-lost";
 import {
@@ -30,9 +30,6 @@ import {
   notifySessionLost,
 } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
-import { isSubscriptionSlug } from "./delegation";
-import { loginSlot } from "./delegation/login-flow";
-import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
@@ -232,18 +229,9 @@ const emitAuthFrame = (auth: TAuthEvent): void => {
   send({ type: "auth", key_id, auth });
 };
 
-type TPostedAuthStatus = {
-  readonly status: TDaemonProviderAuthStatus;
-  readonly accountHash?: string;
-};
-
-const lastPostedAuthStatus = new Map<string, TPostedAuthStatus>();
+const lastPostedAuthStatus = new Map<string, TAuthStatusBaseline>();
 let emitSessionLoss: (loss: TDaemonSessionLost) => Promise<void> =
   notifySessionLost;
-
-const literalOf = (
-  conn: TDaemonProviderConnection,
-): TDaemonProviderAuthStatus => conn.status;
 
 /**
  * POST session-lost on a pure `connected → disconnected` edge. No settle,
@@ -254,25 +242,21 @@ const observeAuthStatusEdges = (
   connections: ReadonlyArray<TDaemonProviderConnection>,
 ): void => {
   for (const conn of connections) {
-    const slug = conn.provider;
-    if (!isSubscriptionSlug(slug)) continue;
-    if (loginSlot(slug).inFlight()) continue;
-    if (conn.detail === STATUS_CHECK_FAILED_DETAIL) continue;
-    const next = literalOf(conn);
-    const prev = lastPostedAuthStatus.get(slug);
-    if (prev?.status === "connected" && next === "disconnected") {
-      const accountHash = conn.account_hash ?? prev.accountHash;
+    const edge = detectAuthLossEdge(
+      lastPostedAuthStatus.get(conn.provider),
+      conn,
+    );
+    if (edge === null) continue;
+    if (edge.lost) {
       void emitSessionLoss({
-        slug,
-        diagnostic_code: classifyLossDetail(conn.detail),
-        ...(accountHash !== undefined ? { account_hash: accountHash } : {}),
+        slug: edge.slug,
+        diagnostic_code: edge.diagnostic_code ?? "unclassified",
+        ...(edge.account_hash !== undefined
+          ? { account_hash: edge.account_hash }
+          : {}),
       });
     }
-    const accountHash = conn.account_hash ?? prev?.accountHash;
-    lastPostedAuthStatus.set(slug, {
-      status: next,
-      ...(accountHash !== undefined ? { accountHash } : {}),
-    });
+    lastPostedAuthStatus.set(edge.slug, edge.next);
   }
 };
 

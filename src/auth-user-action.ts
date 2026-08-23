@@ -14,30 +14,12 @@
  * ("Cannot access 'loginSlot' before initialization").
  */
 
-/**
- * Window within which a user-caused auth action suppresses a falling edge the
- * user themselves triggered (login/logout churn). Lives on this leaf so both
- * the notifier (`control-channel`) and the edge detector (`auth-session-lost`)
- * import the single value without a cycle.
- */
-export const RECENT_USER_ACTION_MS = 120_000;
-
 /** Last time the user intentionally started, completed, or cancelled auth. */
 const lastUserAuthActionAt = new Map<string, number>();
 
-/** Record a user-caused authentication action for notifier churn suppression. */
+/** Record a user-caused authentication action for login-flow churn tracking. */
 export const noteUserAuthAction = (slug: string, now = Date.now()): void => {
   lastUserAuthActionAt.set(slug, now);
-};
-
-/** Whether a user-caused authentication action occurred within `windowMs`. */
-export const recentUserAuthAction = (
-  slug: string,
-  windowMs: number,
-  now = Date.now(),
-): boolean => {
-  const actionAt = lastUserAuthActionAt.get(slug);
-  return actionAt !== undefined && now - actionAt <= windowMs;
 };
 
 /** Test-only: clear all recorded user actions. */

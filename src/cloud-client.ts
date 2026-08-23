@@ -296,6 +296,7 @@ type TNotifyCloudEventLog = {
   readonly failedMessage: string;
   readonly slug: string;
   readonly reason?: string;
+  readonly diagnostic_code?: string;
 };
 
 /**
@@ -311,6 +312,9 @@ const notifyCloudEvent = async (
   const fields = {
     slug: log.slug,
     ...(log.reason === undefined ? {} : { reason: log.reason }),
+    ...(log.diagnostic_code === undefined
+      ? {}
+      : { diagnostic_code: log.diagnostic_code }),
   };
   const request = (): Promise<Response> =>
     cloudFetch(cloudUrl(path), {

@@ -13,6 +13,7 @@ import type {
   TAuthSessionLostDiagnosticCode,
   TDaemonProviderAuthStatus,
   TDaemonProviderConnection,
+  TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
 import { emitAuth } from "./auth-events";
 import { isSubscriptionSlug } from "./delegation";
@@ -21,17 +22,21 @@ import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { daemonApiKeyId } from "./env";
 import { logWarn } from "./logger";
 
-type TConnSnapshot = {
+export type TAuthStatusBaseline = {
   readonly status: TDaemonProviderAuthStatus;
   readonly accountHash?: string;
 };
 
-/** Last observed auth-status literal per subscription slug. */
-const lastStatus = new Map<string, TConnSnapshot>();
+export type TAuthLossEdge = {
+  readonly slug: TSubscriptionProviderSlug;
+  readonly lost: boolean;
+  readonly diagnostic_code?: TAuthSessionLostDiagnosticCode;
+  readonly account_hash?: string;
+  readonly next: TAuthStatusBaseline;
+};
 
-const literalOf = (
-  conn: TDaemonProviderConnection,
-): TDaemonProviderAuthStatus => conn.status;
+/** Last observed auth-status literal per subscription slug. */
+const lastStatus = new Map<string, TAuthStatusBaseline>();
 
 /**
  * Map free-form `conn.detail` to a bounded diagnostic code. Never returns
@@ -80,6 +85,34 @@ export const classifyLossDetail = (
 };
 
 /**
+ * Pure connected→disconnected edge for one connection, plus the next baseline.
+ * Returns `null` when the slug is not a subscription, login is in-flight, or
+ * the tick is an indeterminate status-check failure (baseline unchanged).
+ */
+export const detectAuthLossEdge = (
+  prev: TAuthStatusBaseline | undefined,
+  conn: TDaemonProviderConnection,
+): TAuthLossEdge | null => {
+  const slug = conn.provider;
+  if (!isSubscriptionSlug(slug)) return null;
+  if (loginSlot(slug).inFlight()) return null;
+  if (conn.detail === STATUS_CHECK_FAILED_DETAIL) return null;
+  const nextStatus = conn.status;
+  const lost = prev?.status === "connected" && nextStatus === "disconnected";
+  const accountHash = conn.account_hash ?? prev?.accountHash;
+  return {
+    slug,
+    lost,
+    ...(lost ? { diagnostic_code: classifyLossDetail(conn.detail) } : {}),
+    ...(accountHash !== undefined ? { account_hash: accountHash } : {}),
+    next: {
+      status: nextStatus,
+      ...(accountHash !== undefined ? { accountHash } : {}),
+    },
+  };
+};
+
+/**
  * Observe one computed status snapshot's connections and emit
  * `auth.session.lost` for every subscription provider that transitioned
  * `connected → disconnected` with no in-flight login. Best-effort: `emitAuth`
@@ -89,36 +122,28 @@ export const noteConnectionsForSessionLost = (
   connections: ReadonlyArray<TDaemonProviderConnection>,
 ): void => {
   for (const conn of connections) {
-    const slug = conn.provider;
-    if (!isSubscriptionSlug(slug)) continue;
-    if (loginSlot(slug).inFlight()) continue;
-    if (conn.detail === STATUS_CHECK_FAILED_DETAIL) continue;
-    const next = literalOf(conn);
-    const prev = lastStatus.get(slug);
-    if (prev?.status === "connected" && next === "disconnected") {
-      const diagnostic_code = classifyLossDetail(conn.detail);
+    const edge = detectAuthLossEdge(lastStatus.get(conn.provider), conn);
+    if (edge === null) continue;
+    if (edge.lost) {
+      const diagnostic_code = edge.diagnostic_code ?? "unclassified";
       logWarn("auth-session-lost", "subscription session lost", {
-        slug,
+        slug: edge.slug,
         diagnostic_code,
-        ...(prev.accountHash !== undefined
-          ? { account_hash: prev.accountHash }
+        ...(edge.account_hash !== undefined
+          ? { account_hash: edge.account_hash }
           : {}),
       });
       emitAuth({
         event: "auth.session.lost",
         key_id: daemonApiKeyId() ?? "local",
-        slug,
+        slug: edge.slug,
         diagnostic_code,
-        ...(prev.accountHash !== undefined
-          ? { account_hash: prev.accountHash }
+        ...(edge.account_hash !== undefined
+          ? { account_hash: edge.account_hash }
           : {}),
       });
     }
-    const carriedHash = conn.account_hash ?? prev?.accountHash;
-    lastStatus.set(slug, {
-      status: next,
-      ...(carriedHash !== undefined ? { accountHash: carriedHash } : {}),
-    });
+    lastStatus.set(edge.slug, edge.next);
   }
 };
 
