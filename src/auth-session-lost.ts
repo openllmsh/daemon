@@ -26,9 +26,14 @@ import type {
   TDaemonProviderConnection,
 } from "@openllmsh/protocol";
 import { emitAuth } from "./auth-events";
-import { resetUserAuthActionsForTests } from "./auth-user-action";
+import {
+  RECENT_USER_ACTION_MS,
+  recentUserAuthAction,
+  resetUserAuthActionsForTests,
+} from "./auth-user-action";
 import { isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
+import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { daemonApiKeyId } from "./env";
 import { logWarn } from "./logger";
 
@@ -110,6 +115,7 @@ export const markSessionLostReason = (
  */
 export const noteConnectionsForSessionLost = (
   connections: ReadonlyArray<TDaemonProviderConnection>,
+  recentActionWindowMs: number = RECENT_USER_ACTION_MS,
 ): void => {
   for (const conn of connections) {
     const slug = conn.provider;
@@ -120,6 +126,9 @@ export const noteConnectionsForSessionLost = (
     // against the PRE-login baseline. Overwriting it here would erase the "was
     // connected" fact and swallow the loss.
     if (loginSlot(slug).inFlight()) continue;
+    // Indeterminate status (last-known preserved upstream). Same skip: do not
+    // emit, do not consume a pending logout stamp, do not rewrite lastConnected.
+    if (conn.detail === STATUS_CHECK_FAILED_DETAIL) continue;
     const now = conn.connected === true;
     const prev = lastConnected.get(slug);
     if (prev?.connected === true && !now) {
@@ -145,8 +154,12 @@ export const noteConnectionsForSessionLost = (
           : {}),
       });
     } else if (now) {
-      // Still (or freshly) connected — any stamped logout reason is stale.
-      pendingLostReason.delete(slug);
+      // Still (or freshly) connected — a stamped logout is stale only when the
+      // user has not just requested logout (in-window ticks can still read
+      // connected while the slow delegate is clearing tokens).
+      if (!recentUserAuthAction(slug, recentActionWindowMs)) {
+        pendingLostReason.delete(slug);
+      }
     }
     // Carry the last-known account hash forward when a still-connected snapshot
     // omits it (a status push can report `connected` without re-deriving the

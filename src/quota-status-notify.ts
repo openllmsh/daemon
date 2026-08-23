@@ -9,12 +9,18 @@
 import type {
   TDaemonProviderConnection,
   TDaemonQuotaStatusReached,
+  TProviderUsageWindow,
 } from "@openllmsh/protocol";
 
 type TQuotaStatus = "allowed" | "allowed_warning" | "rejected";
 
+type TQuotaBaseline = {
+  readonly status: TQuotaStatus;
+  readonly resetEpoch: number | undefined;
+};
+
 /** Last fresh quota status observed for each provider account. */
-const lastQuotaStatus = new Map<string, TQuotaStatus>();
+const lastQuotaStatus = new Map<string, TQuotaBaseline>();
 
 const quotaKey = (slug: string, accountHash: string | undefined): string =>
   `${slug}\0${accountHash ?? "-"}`;
@@ -40,6 +46,43 @@ const isNotifiableTransition = (
   return true;
 };
 
+const farthestFiniteReset = (
+  windows: ReadonlyArray<TProviderUsageWindow>,
+  minPercentUsed: number | undefined,
+): number | undefined => {
+  let farthest: number | undefined;
+  for (const window of windows) {
+    if (minPercentUsed !== undefined && window.percent_used < minPercentUsed) {
+      continue;
+    }
+    const resetAt = window.reset_at_ms;
+    if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) continue;
+    farthest = farthest === undefined ? resetAt : Math.max(farthest, resetAt);
+  }
+  return farthest;
+};
+
+/**
+ * Reset epoch of the window that is still holding the current status.
+ * Matches `reduceQuotaStatus` thresholds: ≥100 rejected, ≥80 warning.
+ * Vendor `limit_reached` / `allowed === false` can reject with no window
+ * at 100 — then use the farthest finite reset among all `windows`.
+ */
+const sustainingWindowResetAtMs = (
+  status: TQuotaStatus,
+  windows: ReadonlyArray<TProviderUsageWindow>,
+): number | undefined => {
+  if (status === "rejected") {
+    const atCap = farthestFiniteReset(windows, 100);
+    if (atCap !== undefined) return atCap;
+    return farthestFiniteReset(windows, undefined);
+  }
+  if (status === "allowed_warning") {
+    return farthestFiniteReset(windows, 80);
+  }
+  return undefined;
+};
+
 /**
  * Observe quota snapshots and return the newly reached notification states.
  *
@@ -62,11 +105,13 @@ export const noteConnectionsForQuota = (
       continue;
 
     const next = usage.status;
+    const resetEpoch = sustainingWindowResetAtMs(next, usage.windows);
     const key = quotaKey(connection.provider, connection.account_hash);
     const previous = lastQuotaStatus.get(key);
+    const epochChanged = previous?.resetEpoch !== resetEpoch;
     if (
       (next === "allowed_warning" || next === "rejected") &&
-      isNotifiableTransition(previous, next)
+      (isNotifiableTransition(previous?.status, next) || epochChanged)
     ) {
       transitions.push({
         slug: connection.provider,
@@ -75,9 +120,10 @@ export const noteConnectionsForQuota = (
           ? {}
           : { account_hash: connection.account_hash }),
         ...(usage.plan === undefined ? {} : { plan: usage.plan }),
+        ...(resetEpoch === undefined ? {} : { reset_at_ms: resetEpoch }),
       });
     }
-    lastQuotaStatus.set(key, next);
+    lastQuotaStatus.set(key, { status: next, resetEpoch });
   }
 
   return transitions;

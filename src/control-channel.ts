@@ -20,7 +20,7 @@ import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { addAuthObserver, setAuthSink } from "./auth-events";
 import { noteConnectionsForSessionLost } from "./auth-session-lost";
-import { recentUserAuthAction } from "./auth-user-action";
+import { RECENT_USER_ACTION_MS, recentUserAuthAction } from "./auth-user-action";
 import {
   DeviceLimitExceededError,
   fetchChannel,
@@ -67,7 +67,6 @@ import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
 const WATCH_MS = 2_500;
-export const RECENT_USER_ACTION_MS = 120_000;
 export const SESSION_LOSS_SETTLE_STATUS_CYCLES = 2;
 // Heartbeat: the daemon sends its OWN `ping` on this interval and arms the
 // liveness watchdog off the relay's `pong` (not off arbitrary inbound frames),
