@@ -142,6 +142,24 @@ export type TRunCaptureOpts = {
   readonly kind?: "probe" | "vendor-capture";
   /** Hard ceiling for stdout capture plus child exit before group termination. */
   readonly timeoutMs?: number;
+  /** Early-cancel: terminate the process group when aborted (status-probe race). */
+  readonly signal?: AbortSignal;
+};
+
+/** Subscribe to `signal` abort; invoke `onAbort` immediately if already aborted. */
+export const bindAbort = (
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): (() => void) => {
+  if (signal === undefined) return () => {};
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
+  signal.addEventListener("abort", onAbort, { once: true });
+  return (): void => {
+    signal.removeEventListener("abort", onAbort);
+  };
 };
 
 type TCaptureOutcome =
@@ -163,6 +181,7 @@ export const runCapture = async (
   env?: Record<string, string>,
   opts?: TRunCaptureOpts,
 ): Promise<string | null> => {
+  if (opts?.signal?.aborted === true) return null;
   try {
     const command = spawnCommand(
       process.platform,
@@ -188,6 +207,11 @@ export const runCapture = async (
       return null;
     }
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let aborted = false;
+    const unbind = bindAbort(opts?.signal, () => {
+      aborted = true;
+      void child.terminate();
+    });
     try {
       const complete = Promise.all([
         new Response(stdout).text(),
@@ -201,8 +225,16 @@ export const runCapture = async (
           captureTimeoutMs(opts?.timeoutMs),
         );
       });
-      const outcome = await Promise.race([complete, timeout]);
-      if (outcome.kind === "timeout") {
+      const abortWait =
+        opts?.signal === undefined
+          ? null
+          : new Promise<TCaptureOutcome>((resolve) => {
+              bindAbort(opts.signal, () => resolve({ kind: "timeout" }));
+            });
+      const outcome = await Promise.race(
+        abortWait === null ? [complete, timeout] : [complete, timeout, abortWait],
+      );
+      if (outcome.kind === "timeout" || aborted) {
         await child.terminate();
         return null;
       }
@@ -213,6 +245,7 @@ export const runCapture = async (
       const trimmed = outcome.out.trim();
       return trimmed.length > 0 ? trimmed : null;
     } finally {
+      unbind();
       if (timer !== null) clearTimeout(timer);
     }
   } catch {
@@ -257,6 +290,8 @@ export type TSpawnLoginOpts = {
    *  Seatbelt-confined caller, so a wrapped spawn reports "not signed in" and
    *  a wrapped refresh silently never persists the rotated token. */
   readonly probe?: boolean;
+  /** Early-cancel the login/refresh child (status-probe race). */
+  readonly signal?: AbortSignal;
 };
 
 /** Default login ceiling — long enough for a human to complete the browser
@@ -286,6 +321,9 @@ export const spawnLogin = async (
   env?: Record<string, string>,
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
+  if (opts?.signal?.aborted === true) {
+    return { code: -1, output: "", abandoned: true };
+  }
   const proc = Bun.spawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
     stdin: "ignore",
     stdout: "pipe",
@@ -310,6 +348,7 @@ export const spawnLogin = async (
   };
 
   killTimer = setTimeout(kill, opts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+  const unbindAbort = bindAbort(opts?.signal, kill);
 
   const pump = async (
     stream: ReadableStream<Uint8Array>,
@@ -350,6 +389,7 @@ export const spawnLogin = async (
     }),
     proc.exited,
   ]);
+  unbindAbort();
   if (killTimer !== null) clearTimeout(killTimer);
   if (settleTimer !== null) clearTimeout(settleTimer);
 
@@ -449,6 +489,9 @@ export const spawnLoginPty = async (
 ): Promise<TLoginResult> => {
   const os = platform();
   if (os !== "darwin" && os !== "linux") return spawnLogin(argv, env, opts);
+  if (opts?.signal?.aborted === true) {
+    return { code: -1, output: "", abandoned: true };
+  }
 
   const tsFile = join(
     daemonTempDir(),
@@ -476,25 +519,38 @@ export const spawnLoginPty = async (
       .catch(() => "");
   let abandoned = false;
   let captured = "";
-  for (;;) {
-    captured = await readFile();
-    if (opts?.until?.test(stripAnsi(captured)) === true) {
-      // Settle: let the rest of the token line render before we kill + parse.
-      await new Promise((r) => setTimeout(r, UNTIL_SETTLE_MS));
+  const kill = (): void => {
+    if (abandoned) return;
+    abandoned = true;
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      // already gone
+    }
+  };
+  const unbindAbort = bindAbort(opts?.signal, kill);
+  try {
+    for (;;) {
+      if (abandoned) break;
       captured = await readFile();
-      abandoned = true;
-      proc.kill("SIGTERM");
-      break;
+      if (opts?.until?.test(stripAnsi(captured)) === true) {
+        // Settle: let the rest of the token line render before we kill + parse.
+        await new Promise((r) => setTimeout(r, UNTIL_SETTLE_MS));
+        captured = await readFile();
+        kill();
+        break;
+      }
+      if (proc.exitCode !== null || proc.signalCode !== null) break; // exited
+      if (Date.now() >= deadline) {
+        kill();
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 400));
     }
-    if (proc.exitCode !== null || proc.signalCode !== null) break; // exited
-    if (Date.now() >= deadline) {
-      abandoned = true;
-      proc.kill("SIGTERM");
-      break;
-    }
-    await new Promise((r) => setTimeout(r, 400));
+    await proc.exited;
+  } finally {
+    unbindAbort();
   }
-  await proc.exited;
   captured = await readFile(); // final read (token written just before exit)
   await rm(tsFile, { force: true }).catch(() => {});
   if (!abandoned)

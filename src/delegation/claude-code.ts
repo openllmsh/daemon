@@ -93,13 +93,16 @@ type TClaudeOAuth = {
 };
 type TClaudeStore = { readonly claudeAiOauth?: TClaudeOAuth };
 
-const loadStore = async (): Promise<TStoreRead<TClaudeStore>> => {
+const loadStore = async (
+  signal?: AbortSignal,
+): Promise<TStoreRead<TClaudeStore>> => {
   if (platform() === "darwin") {
     // macOS stores the blob in the isolated login keychain (not a file).
     const raw = await readIsolatedKeychain(
       cliHome(PROVIDER),
       KEYCHAIN_SERVICE,
       (p) => p.includes("claudeAiOauth"),
+      signal,
     );
     if (raw.kind !== "present") return raw;
     try {
@@ -143,12 +146,18 @@ const triggerRefresh = async (): Promise<void> => {
   // A locked/unusable isolated keychain must NOT reach `claude -p ping`: the
   // vendor CLI would open it and pop the SecurityAgent dialog (and it can't
   // refresh a credential it can't read). Skip when not ready.
-  if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") return;
+  if (
+    (await ensureKeychainReady(cliHome(PROVIDER), statusProbeSignal)).kind !==
+    "present"
+  )
+    return;
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
   await spawnRefresh([bin(), "-p", "ping"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
+    timeoutMs: 10_000,
+    ...(statusProbeSignal !== undefined ? { signal: statusProbeSignal } : {}),
   });
 };
 
@@ -166,11 +175,13 @@ const refresh = makeRefresher({
  * the leeway of expiry. Used by `credentialForUpstream` (inference) and `usage`
  * so both carry a live token.
  */
-const readToken = async (): Promise<{
+const readToken = async (
+  signal?: AbortSignal,
+): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
 } | null> => {
-  const oauth = storeReadValue(await loadStore())?.claudeAiOauth;
+  const oauth = storeReadValue(await loadStore(signal))?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
     return null;
   }
@@ -192,7 +203,7 @@ const readToken = async (): Promise<{
   // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
   // store. Falls back to the stale token if it failed (the upstream then 401s
   // and the UI says re-sign-in).
-  const fresh = storeReadValue(await loadStore())?.claudeAiOauth;
+  const fresh = storeReadValue(await loadStore(signal))?.claudeAiOauth;
   if (fresh?.accessToken !== undefined && fresh.accessToken.length > 0) {
     return {
       accessToken: fresh.accessToken,
@@ -219,6 +230,8 @@ const userAgent = async (): Promise<string> => {
  * Mirrors `CLI_INSTALL_STATE_TTL_MS` in `../cli-install`.
  */
 const AUTH_STATUS_TTL_MS = 30_000;
+
+let statusProbeSignal: AbortSignal | undefined;
 
 let authStatusCache: { result: boolean | null; expiresAt: number } | null =
   null;
@@ -261,6 +274,9 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
     // Linux (`sandbox/policy.ts`).
     const out = await runCapture([bin(), "auth", "status"], env(), {
       probe: unwrapKeychainSpawn(PROVIDER),
+      ...(statusProbeSignal !== undefined
+        ? { signal: statusProbeSignal }
+        : {}),
     });
     if (out === null) return null;
     try {
@@ -293,8 +309,10 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
  * login turns an invisible, delayed failure into an explicit one. Returns null
  * when there is no credential at all.
  */
-const credentialRefreshable = async (): Promise<boolean | null> => {
-  const oauth = storeReadValue(await loadStore())?.claudeAiOauth;
+const credentialRefreshable = async (
+  signal?: AbortSignal,
+): Promise<boolean | null> => {
+  const oauth = storeReadValue(await loadStore(signal))?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
     return null;
   }
@@ -429,7 +447,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
   submitLoginCode: device.submitLoginCode,
   cancelConnect: device.cancelConnect,
 
-  status: async () => {
+  status: async (signal) => {
+    statusProbeSignal = signal;
+    try {
     const { installed, version } = await cliInstallState(PROVIDER);
     if (!installed) {
       return {
@@ -445,7 +465,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // and pop the SecurityAgent dialog on every ~2.5s tick — so stop here and
     // report a status-check failure (NOT signed-out). No-op `present`
     // elsewhere.
-    if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
+    if (
+      (await ensureKeychainReady(cliHome(PROVIDER), signal)).kind !== "present"
+    ) {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -455,9 +477,12 @@ export const claudeCodeDelegate: TProviderDelegate = {
       };
     }
     // Prefer the CLI's own `auth status`; fall back to the store read
-    // when it's unavailable / unparseable.
+    // when it's unavailable / unparseable. A definite `loggedIn: false` on
+    // a still-present store (bad unwrap / confined spawn) is inconclusive —
+    // never overwrite last-known with "not signed in".
     const viaAuth = await authStatusLoggedIn();
-    if (viaAuth === null && (await loadStore()).kind === "indeterminate") {
+    const store = await loadStore(signal);
+    if (viaAuth === null && store.kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -466,7 +491,17 @@ export const claudeCodeDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
+    if (viaAuth === false && store.kind !== "absent") {
+      return {
+        provider: PROVIDER,
+        status: "disconnected",
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
+    const connected =
+      viaAuth !== null ? viaAuth : (await readToken(signal)) !== null;
     // A live headless paste-back login (remote box) awaiting the user's code:
     // surface the authorize URL + paste mode so the dashboard renders the
     // paste panel; drop it the moment the credential lands.
@@ -476,7 +511,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // token) so the dashboard shows a persistent "re-sign in" hint instead of a
     // green card that silently dies at access-token expiry.
     const unrefreshable =
-      connected && (await credentialRefreshable()) === false;
+      connected && (await credentialRefreshable(signal)) === false;
     const acct = connected ? await readAccountHash() : null;
     return {
       provider: PROVIDER,
@@ -509,6 +544,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
             }
           : { detail: "claude CLI installed but not signed in" }),
     };
+    } finally {
+      if (statusProbeSignal === signal) statusProbeSignal = undefined;
+    }
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {

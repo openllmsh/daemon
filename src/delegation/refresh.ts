@@ -34,12 +34,18 @@ export type TRefreshErrorClass = "timeout" | "spawn_failed" | "rejected";
 export const spawnRefresh = async (
   argv: ReadonlyArray<string>,
   env: Record<string, string>,
-  opts?: { readonly pty?: boolean; readonly probe?: boolean },
+  opts?: {
+    readonly pty?: boolean;
+    readonly probe?: boolean;
+    readonly timeoutMs?: number;
+    readonly signal?: AbortSignal;
+  },
 ): Promise<void> => {
   const run = opts?.pty === true ? spawnLoginPty : spawnLogin;
   await run([...argv], env, {
-    timeoutMs: REFRESH_SPAWN_TIMEOUT_MS,
+    timeoutMs: opts?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
     probe: opts?.probe,
+    ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
   });
 };
 

@@ -30,14 +30,14 @@
  * chain that still can't unlock is negative-cached so it stops re-prompting.
  * See docs/plan/2026-08-22-daemon-keychain-gui-prompt-wedge-fix.md.
  */
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import { logIfKilled, spawnCwd } from "./spawn";
+import { bindAbort, logIfKilled, spawnCwd } from "./spawn";
 import type { TStoreRead } from "./util";
 
 const MAC = platform() === "darwin";
@@ -63,11 +63,11 @@ const redactSecurityArgv = (argv: ReadonlyArray<string>): string[] =>
 
 type TSpawnMode = "ignore" | "pipe";
 
-const DEFAULT_SECURITY_SPAWN_TIMEOUT_MS = 10_000;
+/** Under the 5s walker auth cutoff so a hung unlock cannot stall hops. */
+const DEFAULT_SECURITY_SPAWN_TIMEOUT_MS = 4_000;
 
 /** Per-call so tests can drive `OPENLLM_SECURITY_TIMEOUT_MS`. Finite + positive
- *  or the 10s default. Dump/unlock on a one-cred isolated chain is fast; 10s
- *  is generous enough to avoid false kills of a slow securityd. */
+ *  or the default. Dump/unlock on a one-cred isolated chain is fast. */
 const securitySpawnTimeoutMs = (): number => {
   const raw = process.env.OPENLLM_SECURITY_TIMEOUT_MS;
   if (raw === undefined) return DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
@@ -77,7 +77,8 @@ const securitySpawnTimeoutMs = (): number => {
 
 type TSecurityOutcome =
   | { readonly kind: "complete"; readonly code: number; readonly stdout: string; readonly stderr: string }
-  | { readonly kind: "timeout" };
+  | { readonly kind: "timeout" }
+  | { readonly kind: "aborted" };
 
 const FAILED_SPAWN = { code: -1, stdout: "", stderr: "" } as const;
 
@@ -88,11 +89,28 @@ const FAILED_SPAWN = { code: -1, stdout: "", stderr: "" } as const;
  *  stderr to classify a failure; dump/read need stdout). Never throws.
  *  Bounded: a hung `security` (e.g. blocked on SecurityAgent) is killed so
  *  `inFlightKeychains` can settle. */
+type TSecuritySpawnOpts = {
+  readonly stdout: TSpawnMode;
+  readonly stderr: TSpawnMode;
+  readonly signal?: AbortSignal;
+};
+
+type TSecurityResult = {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly timedOut: boolean;
+  readonly aborted: boolean;
+};
+
 const spawnSecurity = async (
   argv: ReadonlyArray<string>,
   home: string,
-  opts: { readonly stdout: TSpawnMode; readonly stderr: TSpawnMode },
-): Promise<{ code: number; stdout: string; stderr: string }> => {
+  opts: TSecuritySpawnOpts,
+): Promise<TSecurityResult> => {
+  if (opts.signal?.aborted === true) {
+    return { ...FAILED_SPAWN, timedOut: false, aborted: true };
+  }
   try {
     const proc = Bun.spawn(
       sandboxSpawnArgs(["security", ...argv], { probe: unwrapKeychainSpawn() }),
@@ -107,6 +125,13 @@ const spawnSecurity = async (
     // Drain both pipes AND exit under one deadline — a hung `exited` (GUI
     // dialog) used to poison `inFlightKeychains` forever.
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const unbind = bindAbort(opts.signal, () => {
+      try {
+        proc.kill();
+      } catch {
+        // already gone
+      }
+    });
     try {
       const complete = Promise.all([
         opts.stdout === "pipe"
@@ -134,13 +159,25 @@ const spawnSecurity = async (
           securitySpawnTimeoutMs(),
         );
       });
-      const outcome = await Promise.race([complete, timeout]);
+      const abortWait =
+        opts.signal === undefined
+          ? null
+          : new Promise<TSecurityOutcome>((resolve) => {
+              bindAbort(opts.signal, () => resolve({ kind: "aborted" }));
+            });
+      const outcome = await Promise.race(
+        abortWait === null ? [complete, timeout] : [complete, timeout, abortWait],
+      );
+      if (outcome.kind === "aborted") {
+        proc.kill();
+        return { ...FAILED_SPAWN, timedOut: false, aborted: true };
+      }
       if (outcome.kind === "timeout") {
         proc.kill();
         logError("keychain", "security command timed out", {
           argv: redactSecurityArgv(["security", ...argv]),
         });
-        return FAILED_SPAWN;
+        return { ...FAILED_SPAWN, timedOut: true, aborted: false };
       }
       // Through the `--sandbox-exec` shim the daemon sees `128 + signal` as an
       // exit CODE, not a signalCode, so this only fires for a kill of the shim
@@ -156,12 +193,15 @@ const spawnSecurity = async (
         code: outcome.code,
         stdout: outcome.stdout,
         stderr: outcome.stderr,
+        timedOut: false,
+        aborted: false,
       };
     } finally {
+      unbind();
       if (timer !== null) clearTimeout(timer);
     }
   } catch {
-    return FAILED_SPAWN;
+    return { ...FAILED_SPAWN, timedOut: false, aborted: false };
   }
 };
 
@@ -169,21 +209,43 @@ const spawnSecurity = async (
 const runSecurity = async (
   argv: ReadonlyArray<string>,
   home: string,
+  signal?: AbortSignal,
 ): Promise<boolean> =>
-  (await spawnSecurity(argv, home, { stdout: "ignore", stderr: "ignore" }))
-    .code === 0;
+  (
+    await spawnSecurity(argv, home, {
+      stdout: "ignore",
+      stderr: "ignore",
+      ...(signal !== undefined ? { signal } : {}),
+    })
+  ).code === 0;
 
 // In-flight ensures, keyed by keychain path — the SINGLE owner of the
-// create/heal race. The status watcher fires every ~2.5s and is NOT
-// serialized, so a slow `status()` lets ticks overlap; without this,
-// concurrent callers would race `create-keychain` (and rename-aside) on the
-// same path. Overlapping callers instead await the SAME operation. There is
-// deliberately NO positive "already unlocked" cache: it used to skip the
-// re-unlock on the assumption auto-lock was disabled — the exact assumption
-// that fails when a chain auto-locks or its password drifts, leaving a later
-// dump to hit a locked chain and prompt. `unlock -p ""` is cheap + idempotent
-// + silent on an empty-password chain, so we simply unlock every ensure.
+// create/heal race. Overlapping callers await the SAME operation.
+//
+// Positive TTL (UNLOCK_READY_TTL_MS): after a successful empty-password
+// unlock, skip re-poking securityd for a short window. Auto-lock is disabled
+// on the isolated chain we create, so a 15s skip is safe; a classified auth
+// failure still self-heals. Transient TIMEOUTS back off exponentially and
+// mark the chain unusable after N consecutive timeouts so a wedged securityd
+// cannot be poked every 2.5s forever.
 const inFlightKeychains = new Map<string, Promise<TStoreRead<void>>>();
+const UNLOCK_READY_TTL_MS = 15_000;
+const unlockedUntilMs = new Map<string, number>();
+const TRANSIENT_TIMEOUT_UNUSABLE_AFTER = 5;
+const transientTimeouts = new Map<
+  string,
+  { readonly count: number; readonly nextAtMs: number }
+>();
+
+const DUMP_CACHE_TTL_MS = 5_000;
+const dumpCache = new Map<
+  string,
+  {
+    readonly mtimeMs: number;
+    readonly atMs: number;
+    readonly value: TStoreRead<ReadonlyArray<string>>;
+  }
+>();
 
 // A chain we recreated once this process (bounds self-heal to one attempt per
 // path per process — launchd KeepAlive resets it on restart).
@@ -311,9 +373,29 @@ const recreateIsolatedKeychain = async (
  *  unusable so callers stop touching it. A transient unlock failure stays
  *  retryable (returns `indeterminate`, never recreates). No-op `present` off
  *  macOS. */
+const noteUnlockSuccess = (kc: string): TStoreRead<void> => {
+  unlockedUntilMs.set(kc, Date.now() + UNLOCK_READY_TTL_MS);
+  transientTimeouts.delete(kc);
+  return READY;
+};
+
+const noteUnlockTimeout = (kc: string): TStoreRead<void> => {
+  const prev = transientTimeouts.get(kc);
+  const count = (prev?.count ?? 0) + 1;
+  if (count >= TRANSIENT_TIMEOUT_UNUSABLE_AFTER) {
+    unusableKeychains.add(kc);
+    transientTimeouts.delete(kc);
+    return { kind: "indeterminate", cause: "keychain_unusable" };
+  }
+  const delayMs = 2_500 * 2 ** (count - 1);
+  transientTimeouts.set(kc, { count, nextAtMs: Date.now() + delayMs });
+  return { kind: "indeterminate", cause: "keychain_unlock_transient" };
+};
+
 const ensureKeychainNow = async (
   home: string,
   kc: string,
+  signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
   if (!existsSync(kc)) {
     if (!(await createIsolatedKeychain(home, kc))) {
@@ -328,13 +410,21 @@ const ensureKeychainNow = async (
   const res = await spawnSecurity(["unlock-keychain", "-p", "", kc], home, {
     stdout: "ignore",
     stderr: "pipe",
+    ...(signal !== undefined ? { signal } : {}),
   });
-  if (res.code === 0) return READY;
+  if (res.code === 0) return noteUnlockSuccess(kc);
+
+  // Caller abort (status-race cancel) is not a keychain fault — skip timeout
+  // accounting so a healthy chain is never marked unusable.
+  if (res.aborted) {
+    return { kind: "indeterminate", cause: "keychain_unlock_transient" };
+  }
+  if (res.timedOut) return noteUnlockTimeout(kc);
 
   if (classifyUnlockFailure(res.stderr) === "auth") {
     if (!healedKeychains.has(kc)) {
       healedKeychains.add(kc);
-      if (await recreateIsolatedKeychain(home, kc)) return READY;
+      if (await recreateIsolatedKeychain(home, kc)) return noteUnlockSuccess(kc);
     }
     // Auth-drift and (already healed OR recreate failed) → terminal.
     unusableKeychains.add(kc);
@@ -354,19 +444,37 @@ const ensureKeychainNow = async (
  */
 export const ensureKeychainReady = async (
   home: string,
+  signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
   if (!MAC) return READY;
   const kc = loginKeychainPath(home);
   if (unusableKeychains.has(kc)) {
     return { kind: "indeterminate", cause: "keychain_unusable" };
   }
+  const backoff = transientTimeouts.get(kc);
+  if (backoff !== undefined && backoff.nextAtMs > Date.now()) {
+    return { kind: "indeterminate", cause: "keychain_unlock_transient" };
+  }
+  const until = unlockedUntilMs.get(kc) ?? 0;
+  if (until > Date.now()) return READY;
   const pending = inFlightKeychains.get(kc);
   if (pending !== undefined) return pending;
-  const op = ensureKeychainNow(home, kc).finally(() => {
+  const op = ensureKeychainNow(home, kc, signal).finally(() => {
     inFlightKeychains.delete(kc);
   });
   inFlightKeychains.set(kc, op);
   return op;
+};
+
+/** Test-only: process-global keychain caches leak across suites. */
+export const resetKeychainStateForTests = (): void => {
+  inFlightKeychains.clear();
+  healedKeychains.clear();
+  unusableKeychains.clear();
+  lastKeychainFailureLogMs.clear();
+  unlockedUntilMs.clear();
+  transientTimeouts.clear();
+  dumpCache.clear();
 };
 
 /**
@@ -415,14 +523,38 @@ export const grantKeychainToolAccess = async (home: string): Promise<void> => {
  * but it DOES open the keychain, so callers MUST have a `present` readiness
  * first (a locked chain would prompt). `readIsolatedKeychain` enforces that.
  */
+const keychainMtimeMs = (kc: string): number => {
+  try {
+    return statSync(kc).mtimeMs;
+  } catch {
+    return -1;
+  }
+};
+
 export const findKeychainServices = async (
   home: string,
   prefix: string,
+  signal?: AbortSignal,
 ): Promise<TStoreRead<ReadonlyArray<string>>> => {
+  const kc = loginKeychainPath(home);
+  const mtimeMs = keychainMtimeMs(kc);
+  const cacheKey = `${kc}\0${prefix}`;
+  const cached = dumpCache.get(cacheKey);
+  if (
+    cached !== undefined &&
+    cached.mtimeMs === mtimeMs &&
+    Date.now() - cached.atMs < DUMP_CACHE_TTL_MS
+  ) {
+    return cached.value;
+  }
   const { code, stdout } = await spawnSecurity(
-    ["dump-keychain", loginKeychainPath(home)],
+    ["dump-keychain", kc],
     home,
-    { stdout: "pipe", stderr: "ignore" },
+    {
+      stdout: "pipe",
+      stderr: "ignore",
+      ...(signal !== undefined ? { signal } : {}),
+    },
   );
   if (code !== 0) {
     return { kind: "indeterminate", cause: `dump-keychain_exit_${code}` };
@@ -434,17 +566,27 @@ export const findKeychainServices = async (
       names.add(m[1]);
     }
   }
-  return { kind: "present", value: [...names] };
+  const value: TStoreRead<ReadonlyArray<string>> = {
+    kind: "present",
+    value: [...names],
+  };
+  dumpCache.set(cacheKey, { mtimeMs, atMs: Date.now(), value });
+  return value;
 };
 
 const readKeychainSecret = async (
   home: string,
   service: string,
+  signal?: AbortSignal,
 ): Promise<string | null> => {
   const { code, stdout } = await spawnSecurity(
     ["find-generic-password", "-s", service, "-w", loginKeychainPath(home)],
     home,
-    { stdout: "pipe", stderr: "ignore" },
+    {
+      stdout: "pipe",
+      stderr: "ignore",
+      ...(signal !== undefined ? { signal } : {}),
+    },
   );
   if (code !== 0) return null;
   const trimmed = stdout.trim();
@@ -465,17 +607,18 @@ export const readIsolatedKeychain = async (
   home: string,
   servicePrefix: string,
   validate?: (payload: string) => boolean,
+  signal?: AbortSignal,
 ): Promise<TStoreRead<string>> => {
   if (!MAC) return { kind: "absent" };
-  const ready = await ensureKeychainReady(home);
+  const ready = await ensureKeychainReady(home, signal);
   if (ready.kind !== "present") return ready; // locked / unusable — no dump
-  const services = await findKeychainServices(home, servicePrefix);
+  const services = await findKeychainServices(home, servicePrefix, signal);
   if (services.kind !== "present") return services;
   if (services.value.length === 0) return { kind: "absent" };
   let secretUnreadable = false;
   try {
     for (const service of services.value) {
-      const secret = await readKeychainSecret(home, service);
+      const secret = await readKeychainSecret(home, service, signal);
       if (secret === null) {
         secretUnreadable = true;
         continue;

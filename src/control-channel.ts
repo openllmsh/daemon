@@ -11,6 +11,7 @@ import type {
   TDaemonCommandAck,
   TDaemonProviderConnection,
   TDaemonSessionLost,
+  TDaemonStatus,
   TIceServer,
   TRelayFrame,
 } from "@openllmsh/protocol";
@@ -67,17 +68,110 @@ import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
-const WATCH_MS = 2_500;
+/** Full-snapshot stringify — only on a changed watcher tick / actual publish. */
+export const stringifyStatusSnapshot = (status: unknown): string =>
+  JSON.stringify(status);
+
+/** JSON-encode a key segment so `:` / `|` in free-text cannot collide. */
+const changeKeySegment = (value: string): string => JSON.stringify(value);
+
+const joinChangeKeyParts = (parts: readonly string[]): string =>
+  parts.map(changeKeySegment).join(":");
+
+/**
+ * Cheap change key: concatenates wire-visible primitives. Nested `usage` /
+ * `pending_auth` are small optional blobs; they are stringified individually
+ * rather than walking the whole snapshot. Each primitive is JSON-encoded
+ * before joining so free-text (`detail`, `title`, `last_exit_reason`, …)
+ * cannot collide across `:` / `|` field separators.
+ */
+export const statusChangeKey = (status: TDaemonStatus): string => {
+  const connections = status.connections
+    .map((c) =>
+      joinChangeKeyParts([
+        c.provider,
+        c.status,
+        c.cli_installed === undefined ? "" : String(c.cli_installed),
+        c.cli_version ?? "",
+        c.detail ?? "",
+        c.last_login_at_ms === undefined || c.last_login_at_ms === null
+          ? ""
+          : String(c.last_login_at_ms),
+        c.account_hash ?? "",
+        c.pending_auth === undefined || c.pending_auth === null
+          ? ""
+          : JSON.stringify(c.pending_auth),
+        c.usage === undefined || c.usage === null ? "" : JSON.stringify(c.usage),
+      ]),
+    )
+    .join("|");
+  const sessions = (status.sessions ?? [])
+    .map((s) =>
+      joinChangeKeyParts([
+        s.id,
+        s.cli,
+        String(s.started_at_ms),
+        s.attached ? "1" : "0",
+        s.live ? "1" : "0",
+        s.busy === undefined ? "" : String(s.busy),
+        s.title ?? "",
+        s.last_exit_reason ?? "",
+        s.vendor_session_id ?? "",
+      ]),
+    )
+    .join("|");
+  return [
+    status.daemon_version,
+    status.key_configured ? "1" : "0",
+    status.auto_update === undefined ? "" : String(status.auto_update),
+    status.pty_sessions === undefined ? "" : String(status.pty_sessions),
+    status.cloud_state,
+    status.pubkey ?? "",
+    status.port === undefined ? "" : String(status.port),
+    status.sandbox ?? "",
+    status.cli === undefined
+      ? ""
+      : joinChangeKeyParts([
+          String(status.cli.installed),
+          status.cli.version ?? "",
+        ]),
+    (status.caps ?? []).join(","),
+    status.pty_supported === undefined ? "" : String(status.pty_supported),
+    connections,
+    sessions,
+  ].join("\n");
+};
+
+export type TWatcherSnapshotPlan = {
+  readonly key: string;
+  readonly skipSerialize: boolean;
+};
+
+/** Decide whether a watcher tick should stringify the full snapshot. */
+export const planWatcherSnapshot = (
+  previousKey: string,
+  status: TDaemonStatus,
+  stringify: (status: unknown) => string = stringifyStatusSnapshot,
+): TWatcherSnapshotPlan => {
+  const key = statusChangeKey(status);
+  if (previousKey !== "" && key === previousKey) {
+    return { key, skipSerialize: true };
+  }
+  stringify(status);
+  return { key, skipSerialize: false };
+};
+
+export const WATCH_MS = 2_500;
 // Heartbeat: the daemon sends its OWN `ping` on this interval and arms the
 // liveness watchdog off the relay's `pong` (not off arbitrary inbound frames),
 // so it detects a dead daemon→relay direction itself and reconnects — rather
 // than waiting for the relay to terminate the socket (a `1006`). See `heartbeat.ts`
 // and R4 in docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
-const HEARTBEAT_MS = 20_000;
+export const HEARTBEAT_MS = 20_000;
 // Liveness window: if NO `pong` arrives within this, the link is a silent
 // half-open (no `close` fired) → `reconnect()`. 3.5× the heartbeat, so a single
 // slow round-trip never trips it. partysocket owns connect/backoff, not liveness.
-const LIVENESS_TIMEOUT_MS = 70_000;
+export const LIVENESS_TIMEOUT_MS = 70_000;
 // Reconnect jitter: a relay redeploy closes EVERY daemon's socket at once, and
 // partysocket's backoff is deterministic (no jitter of its own), so without this
 // the whole fleet re-dials in lockstep and stampedes the successor box. Add up to
@@ -146,6 +240,7 @@ const heartbeat = createHeartbeat({
     );
     ws?.reconnect();
   },
+  onFirstPong: () => armProbesAfterPong(),
   heartbeatMs: HEARTBEAT_MS,
   livenessMs: LIVENESS_TIMEOUT_MS,
 });
@@ -165,6 +260,11 @@ let ticket = "";
  *  deploy that moved the relay to a new content-addressed sandbox. */
 let connectedWssOrigin: string | null = null;
 let lastFingerprint = "";
+/** True once this socket has completed one ping/pong round-trip. */
+let probesArmed = false;
+/** Welcome arrived before the first pong — flush `pushStatus` on arm. */
+let pendingWelcomeStatus = false;
+let armProbesAfterPong = (): void => {};
 /** Relay session negotiated by the current connection. Null until welcome. */
 let daemonSessionId: string | null = null;
 /** Null while handshake is pending; false for an older relay welcome. */
@@ -341,7 +441,7 @@ const pushStatus = async (active?: boolean): Promise<void> =>
   enqueueStatusPublish(async () => {
     const status = await computeStatus();
     observeNotificationTransitions(status.connections);
-    return { status, fingerprint: JSON.stringify(status) };
+    return { status, fingerprint: statusChangeKey(status) };
   }, active);
 
 /** Throttle for `notePresenceActivity` — traffic-driven presence refreshes are
@@ -377,11 +477,13 @@ export const pushStatusIfChanged = async (): Promise<void> =>
   enqueueStatusPublish(async () => {
     const status = await computeStatus();
     observeNotificationTransitions(status.connections);
-    const fingerprint = JSON.stringify(status);
+    const plan = planWatcherSnapshot(lastFingerprint, status);
     // Check inside the serialized publisher so concurrent probes cannot both
-    // decide they are the next changed snapshot.
-    if (fingerprint === lastFingerprint) return null;
-    return { status, fingerprint };
+    // decide they are the next changed snapshot. Unchanged ticks skip the
+    // full-snapshot stringify (it already ran inside `planWatcherSnapshot`
+    // only when the cheap key moved).
+    if (plan.skipSerialize) return null;
+    return { status, fingerprint: plan.key };
   }).then(() => {});
 
 const startWatcher = (): void => {
@@ -392,6 +494,16 @@ const startWatcher = (): void => {
     });
   }, WATCH_MS);
   watchTimer.unref?.();
+};
+
+armProbesAfterPong = (): void => {
+  if (probesArmed) return;
+  probesArmed = true;
+  startWatcher();
+  if (pendingWelcomeStatus) {
+    pendingWelcomeStatus = false;
+    void pushStatus();
+  }
 };
 
 const stopWatcher = (): void => {
@@ -594,7 +706,11 @@ const dispatchFrame = (frame: TRelayFrame): void => {
       // publishes on this daemon's behalf, so our own publisher starts above it.
       statusSeq = 1;
       startMigrationCheck();
-      void pushStatus();
+      if (probesArmed) {
+        void pushStatus();
+      } else {
+        pendingWelcomeStatus = true;
+      }
       return;
     case "ping":
       // The relay's keepalive ping → answer so its missed-pong reap stays happy.
@@ -895,9 +1011,12 @@ export const startControlChannel = (): void => {
     // must not sit ahead of this connection's first mux bytes.
     binaryFrameTail = Promise.resolve();
     const generation = connectionGeneration;
-    heartbeat.start(); // begin pinging + arm the liveness window off pong receipt
+    probesArmed = false;
+    pendingWelcomeStatus = false;
     // Do not block registration on provider/CLI probes. The relay needs identity
     // first; welcome supplies this connection's session before status starts.
+    // Ping only AFTER hello is on the wire — `send` drops non-hello frames until
+    // then. Watcher + welcome `pushStatus` wait for the first pong (P1-A).
     if (generation === connectionGeneration) {
       helloSent = true;
       send({
@@ -906,7 +1025,7 @@ export const startControlChannel = (): void => {
         protocol_version: RELAY_PROTOCOL_VERSION,
         caps: currentDaemonCaps(),
       });
-      startWatcher();
+      heartbeat.start();
     }
   };
   socket.onmessage = (ev: MessageEvent): void => {

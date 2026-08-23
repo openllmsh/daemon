@@ -31,7 +31,7 @@ export type TProviderDelegate = {
   readonly slug: string;
 
   /** Current connection state for `GET /status` (includes `cli_installed`). */
-  status: () => Promise<TDaemonProviderConnection>;
+  status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>;
 
   /**
    * Trigger the official CLI's NATIVE login locally (no OpenLLM OAuth).

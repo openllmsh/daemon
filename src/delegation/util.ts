@@ -73,7 +73,12 @@ export const readJsonStore = async <T>(
   }
 };
 
-/** Collapsing wrapper for callers that only need present-or-null. */
+/**
+ * Collapsing wrapper for callers that only need present-or-null.
+ * MUST NOT be used as an auth-presence check: I/O/`indeterminate` collapses
+ * to `null` the same as `absent`. Remaining caller is auth-config sidecar
+ * (optional JSON; null → `{}`), not a login/logout edge.
+ */
 export const readJsonFile = async <T>(path: string): Promise<T | null> =>
   storeReadValue(await readJsonStore<T>(path));
 

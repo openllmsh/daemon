@@ -118,12 +118,14 @@ const applyAuthLiteral = (
 };
 
 const timedOutSlugs = new Set<string>();
+const inFlightSlugProbes = new Map<string, Promise<unknown>>();
 
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
   timedOutSlugs.clear();
   signedOutByUser.clear();
+  inFlightSlugProbes.clear();
 };
 
 const statusFailure = (slug: string): TDaemonProviderConnection => {
@@ -136,8 +138,9 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
   }
   return {
     provider: slug,
-    // Probe failure is not a logout assertion — the literal stays
-    // `disconnected` only when there is no last-known snapshot to hold.
+    // Probe failure is not a logout assertion. Protocol has no `unknown`
+    // literal; cold-start keeps `disconnected` + the sentinel detail and
+    // does not write last-known (so it cannot emit credential_gone).
     status: "disconnected",
     detail: STATUS_CHECK_FAILED_DETAIL,
   };
@@ -145,16 +148,32 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
 
 const boundedDelegateStatus = async (
   slug: string,
-  status: () => Promise<TDaemonProviderConnection>,
+  status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>,
 ): Promise<TDaemonProviderConnection> => {
+  if (inFlightSlugProbes.has(slug)) {
+    return statusFailure(slug);
+  }
+  const ac = new AbortController();
+  const work = status(ac.signal);
+  const tracked = work.then(
+    () => undefined,
+    () => undefined,
+  );
+  inFlightSlugProbes.set(slug, tracked);
+  void tracked.finally(() => {
+    if (inFlightSlugProbes.get(slug) === tracked) {
+      inFlightSlugProbes.delete(slug);
+    }
+  });
   let timer: ReturnType<typeof setTimeout> | null = null;
   let timedOut = false;
   try {
     const result = await Promise.race([
-      status(),
+      work,
       new Promise<TDaemonProviderConnection>((resolve) => {
         timer = setTimeout(() => {
           timedOut = true;
+          ac.abort();
           if (!timedOutSlugs.has(slug)) {
             timedOutSlugs.add(slug);
             logWarn("status", "delegate status probe timed out", {
@@ -222,7 +241,9 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
-        const raw = await boundedDelegateStatus(d.slug, d.status);
+        const raw = await boundedDelegateStatus(d.slug, (signal) =>
+          d.status(signal),
+        );
         const conn = applyAuthLiteral(d.slug, raw);
         if (
           conn.detail !== STATUS_CHECK_FAILED_DETAIL &&

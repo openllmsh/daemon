@@ -24,6 +24,9 @@ export type THeartbeatDeps = {
   /** Called when no `pong` has arrived within the liveness window — the relay
    *  (or the daemon→relay direction) is silent, so force a reconnect. */
   readonly onSilent: () => void;
+  /** First `pong` after `start()` — the new socket has completed a round-trip.
+   *  Used to defer probe re-arm until the link is confirmed healthy. */
+  readonly onFirstPong?: () => void;
   /** How often the daemon sends its heartbeat ping. */
   readonly heartbeatMs: number;
   /** How long with no `pong` before declaring the link silent. Keep it a
@@ -45,6 +48,7 @@ export type THeartbeat = {
 export const createHeartbeat = (deps: THeartbeatDeps): THeartbeat => {
   let pingTimer: ReturnType<typeof setInterval> | null = null;
   let livenessTimer: ReturnType<typeof setTimeout> | null = null;
+  let awaitingFirstPong = false;
 
   const armLiveness = (): void => {
     if (livenessTimer !== null) clearTimeout(livenessTimer);
@@ -56,7 +60,11 @@ export const createHeartbeat = (deps: THeartbeatDeps): THeartbeat => {
     if (pingTimer !== null) return; // already running
     // Arm the window immediately so a relay that never pongs is caught within
     // `livenessMs` of connecting, not only after the first ping interval.
+    awaitingFirstPong = true;
     armLiveness();
+    // Ping now (not only after `heartbeatMs`) so a reconnect can confirm the
+    // new socket with one round-trip instead of sitting silent for 20s.
+    deps.sendPing();
     pingTimer = setInterval(deps.sendPing, deps.heartbeatMs);
     pingTimer.unref?.();
   };
@@ -66,9 +74,14 @@ export const createHeartbeat = (deps: THeartbeatDeps): THeartbeat => {
     // resurrect the window.
     if (pingTimer === null) return;
     armLiveness();
+    if (awaitingFirstPong) {
+      awaitingFirstPong = false;
+      deps.onFirstPong?.();
+    }
   };
 
   const stop = (): void => {
+    awaitingFirstPong = false;
     if (pingTimer !== null) {
       clearInterval(pingTimer);
       pingTimer = null;

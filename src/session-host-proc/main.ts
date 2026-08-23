@@ -98,6 +98,17 @@ type TEnvelope = {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+/** Empty / unparseable RESET → `peer_gone` (channel teardown), not protocol_error. */
+export const sessionHostResetPayload = (
+  payload?: Uint8Array,
+): Record<string, unknown> => {
+  if (payload === undefined || payload.byteLength === 0) {
+    return { code: "peer_gone" };
+  }
+  const decoded = decodeJsonPayload(payload);
+  return isRecord(decoded) ? decoded : { code: "peer_gone" };
+};
+
 const isCli: (value: unknown) => value is TDeviceSessionCli =
   S.is(DeviceSessionCli);
 
@@ -259,12 +270,10 @@ class SessionHostStream implements TSessionStream {
   reset = (payload?: Uint8Array): void => {
     if (this.resetSent) return;
     this.resetSent = true;
-    const decoded =
-      payload === undefined ? undefined : decodeJsonPayload(payload);
     this.socket.sendText(
       JSON.stringify({
         t: "reset",
-        p: isRecord(decoded) ? decoded : { code: "protocol_error" },
+        p: sessionHostResetPayload(payload),
       }),
     );
     this.socket.close();

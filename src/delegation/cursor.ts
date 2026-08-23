@@ -37,6 +37,7 @@ import type { TProviderDelegate } from "./types";
 import type { TStoreRead } from "./util";
 import {
   ensureIsolatedKeychain,
+  ensureKeychainReady,
   grantKeychainToolAccess,
   readIsolatedKeychain,
   readJsonStore,
@@ -185,8 +186,11 @@ export const parseCursorUsage = (
  * found" error or a macOS GUI prompt, and nothing is created or mutated on a
  * read path beyond ensuring our own isolated keychain file exists.
  */
-const readMacKeychainSecret = (service: string): Promise<TStoreRead<string>> =>
-  readIsolatedKeychain(cliHome(PROVIDER), service);
+const readMacKeychainSecret = (
+  service: string,
+  signal?: AbortSignal,
+): Promise<TStoreRead<string>> =>
+  readIsolatedKeychain(cliHome(PROVIDER), service, undefined, signal);
 
 type TCursorFileStore = {
   readonly access_token?: string;
@@ -224,12 +228,22 @@ const readFileTokens = async (): Promise<
   };
 };
 
+let statusProbeSignal: AbortSignal | undefined;
+
 const triggerRefresh = async (): Promise<void> => {
-  // cursor-agent's token store is the macOS keychain, and securityd refuses a
-  // Seatbelt-confined caller; unconfined on macOS, confined on Linux
-  // (file-backed store) — `sandbox/policy.ts`.
+  // Mirror Claude: a locked/unusable isolated keychain must NOT reach
+  // `cursor-agent status` (SecurityAgent dialog + 60s spawn). Skip when not
+  // ready. Bound the spawn to the status budget so it cannot outlive the race.
+  if (
+    (await ensureKeychainReady(cliHome(PROVIDER), statusProbeSignal)).kind !==
+    "present"
+  ) {
+    return;
+  }
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
+    timeoutMs: 10_000,
+    ...(statusProbeSignal !== undefined ? { signal: statusProbeSignal } : {}),
   });
 };
 
@@ -240,16 +254,24 @@ const refresh = makeRefresher({
   trigger: triggerRefresh,
 });
 
-const readStoredTokens = async (): Promise<
+const readStoredTokens = async (
+  signal?: AbortSignal,
+): Promise<
   TStoreRead<{
     readonly accessToken: string;
     readonly refreshTokenPresent: boolean;
   }>
 > => {
   if (platform() !== "darwin") return readFileTokens();
-  const accessToken = await readMacKeychainSecret("cursor-access-token");
+  const accessToken = await readMacKeychainSecret(
+    "cursor-access-token",
+    signal,
+  );
   if (accessToken.kind !== "present") return accessToken;
-  const refreshToken = await readMacKeychainSecret("cursor-refresh-token");
+  const refreshToken = await readMacKeychainSecret(
+    "cursor-refresh-token",
+    signal,
+  );
   // An indeterminate refresh-token read (locked/denied keychain item) must not
   // be collapsed to "no refresh token" — that would assert absence from an
   // uncertain read and skip refresh. Propagate indeterminate so status maps it
@@ -265,18 +287,20 @@ const readStoredTokens = async (): Promise<
   };
 };
 
-const readToken = async (): Promise<{
+const readToken = async (
+  signal?: AbortSignal,
+): Promise<{
   readonly accessToken: string;
   readonly refreshTokenPresent: boolean;
 } | null> => {
-  const stored = storeReadValue(await readStoredTokens());
+  const stored = storeReadValue(await readStoredTokens(signal));
   if (stored === null) return null;
   const outcome = stored.refreshTokenPresent
     ? await refresh(jwtExpiryMs(stored.accessToken))
     : "fresh";
   if (outcome !== "awaited") return stored;
   // CLI remains the sole token-store owner. Re-read after a hard-expiry refresh.
-  return storeReadValue(await readStoredTokens()) ?? stored;
+  return storeReadValue(await readStoredTokens(signal)) ?? stored;
 };
 
 const INSTALL_HINT =
@@ -353,9 +377,11 @@ export const cursorDelegate: TProviderDelegate = {
   connect: connectDirect,
   cancelConnect,
 
-  status: async () => {
+  status: async (signal) => {
+    statusProbeSignal = signal;
+    try {
     const { installed, version } = await cliInstallState(PROVIDER);
-    if (installed && (await readStoredTokens()).kind === "indeterminate") {
+    if (installed && (await readStoredTokens(signal)).kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -364,7 +390,7 @@ export const cursorDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const token = installed ? await readToken() : null;
+    const token = installed ? await readToken(signal) : null;
     if (token !== null) clearPendingAuth(PROVIDER);
     const pending = token === null ? getPendingAuth(PROVIDER) : null;
     return {
@@ -401,6 +427,9 @@ export const cursorDelegate: TProviderDelegate = {
             ),
           }),
     };
+    } finally {
+      if (statusProbeSignal === signal) statusProbeSignal = undefined;
+    }
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
