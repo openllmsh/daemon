@@ -94,6 +94,9 @@ const applyAuthLiteral = (
       ...(last !== undefined ? last : conn),
       detail: conn.detail,
       status: preserved,
+      ...(conn.pending_auth !== undefined
+        ? { pending_auth: conn.pending_auth }
+        : {}),
     };
   }
   if (signedOutByUser.has(slug)) {

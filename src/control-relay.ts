@@ -159,7 +159,13 @@ export const runCommandInner = async (
         // `delegate.logout()` — so interleaved status ticks never produce a
         // `connected → disconnected` edge.
         markProviderSignedOut(cmd.payload.slug);
-        const r = await delegate.logout();
+        let r: Awaited<ReturnType<typeof delegate.logout>>;
+        try {
+          r = await delegate.logout();
+        } catch (err) {
+          clearProviderSignedOut(cmd.payload.slug);
+          throw err;
+        }
         if (r.ok) invalidateUsage(cmd.payload.slug);
         else clearProviderSignedOut(cmd.payload.slug);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };

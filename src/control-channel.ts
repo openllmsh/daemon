@@ -232,7 +232,12 @@ const emitAuthFrame = (auth: TAuthEvent): void => {
   send({ type: "auth", key_id, auth });
 };
 
-const lastPostedAuthStatus = new Map<string, TDaemonProviderAuthStatus>();
+type TPostedAuthStatus = {
+  readonly status: TDaemonProviderAuthStatus;
+  readonly accountHash?: string;
+};
+
+const lastPostedAuthStatus = new Map<string, TPostedAuthStatus>();
 let emitSessionLoss: (loss: TDaemonSessionLost) => Promise<void> =
   notifySessionLost;
 
@@ -255,16 +260,19 @@ const observeAuthStatusEdges = (
     if (conn.detail === STATUS_CHECK_FAILED_DETAIL) continue;
     const next = literalOf(conn);
     const prev = lastPostedAuthStatus.get(slug);
-    if (prev === "connected" && next === "disconnected") {
+    if (prev?.status === "connected" && next === "disconnected") {
+      const accountHash = conn.account_hash ?? prev.accountHash;
       void emitSessionLoss({
         slug,
         diagnostic_code: classifyLossDetail(conn.detail),
-        ...(conn.account_hash !== undefined
-          ? { account_hash: conn.account_hash }
-          : {}),
+        ...(accountHash !== undefined ? { account_hash: accountHash } : {}),
       });
     }
-    lastPostedAuthStatus.set(slug, next);
+    const accountHash = conn.account_hash ?? prev?.accountHash;
+    lastPostedAuthStatus.set(slug, {
+      status: next,
+      ...(accountHash !== undefined ? { accountHash } : {}),
+    });
   }
 };
 
