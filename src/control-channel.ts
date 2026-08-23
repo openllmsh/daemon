@@ -238,8 +238,7 @@ let emitSessionLoss: (loss: TDaemonSessionLost) => Promise<void> =
 
 const literalOf = (
   conn: TDaemonProviderConnection,
-): TDaemonProviderAuthStatus =>
-  conn.status ?? (conn.connected ? "connected" : "disconnected");
+): TDaemonProviderAuthStatus => conn.status;
 
 /**
  * POST session-lost on a pure `connected → disconnected` edge. No settle,
@@ -259,7 +258,6 @@ const observeAuthStatusEdges = (
     if (prev === "connected" && next === "disconnected") {
       void emitSessionLoss({
         slug,
-        reason: "credential_gone",
         diagnostic_code: classifyLossDetail(conn.detail),
         ...(conn.account_hash !== undefined
           ? { account_hash: conn.account_hash }

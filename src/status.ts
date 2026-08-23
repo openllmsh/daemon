@@ -78,16 +78,6 @@ export const clearProviderSignedOut = (slug: string): void => {
   signedOutByUser.delete(slug);
 };
 
-const withAuthStatus = (
-  conn: TDaemonProviderConnection,
-): TDaemonProviderConnection =>
-  conn.status !== undefined
-    ? conn
-    : {
-        ...conn,
-        status: conn.connected ? "connected" : "disconnected",
-      };
-
 const applyAuthLiteral = (
   slug: string,
   conn: TDaemonProviderConnection,
@@ -99,26 +89,21 @@ const applyAuthLiteral = (
   if (inFlight || indeterminate) {
     const preserved: TDaemonProviderAuthStatus =
       last?.status ??
-      (signedOutByUser.has(slug)
-        ? "signed_out"
-        : conn.connected
-          ? "connected"
-          : "disconnected");
+      (signedOutByUser.has(slug) ? "signed_out" : conn.status);
     return {
       ...(last !== undefined ? last : conn),
       detail: conn.detail,
       status: preserved,
-      connected: preserved === "connected",
     };
   }
   if (signedOutByUser.has(slug)) {
-    return { ...conn, status: "signed_out", connected: false };
+    return { ...conn, status: "signed_out" };
   }
-  if (conn.connected) {
+  if (conn.status === "connected") {
     signedOutByUser.delete(slug);
-    return { ...conn, status: "connected", connected: true };
+    return { ...conn, status: "connected" };
   }
-  return { ...conn, status: "disconnected", connected: false };
+  return { ...conn, status: "disconnected" };
 };
 
 const timedOutSlugs = new Set<string>();
@@ -140,9 +125,8 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
   }
   return {
     provider: slug,
-    // The protocol requires a connection boolean. This only means the current
-    // check did not establish a connection; it is not a logout assertion.
-    connected: false,
+    // Probe failure is not a logout assertion — the literal stays
+    // `disconnected` only when there is no last-known snapshot to hold.
     status: "disconnected",
     detail: STATUS_CHECK_FAILED_DETAIL,
   };
@@ -239,7 +223,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
         }
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
-        if (!conn.connected) return conn;
+        if (conn.status !== "connected") return conn;
         // PEEK only — never hit the vendor here. `computeStatus` runs on every
         // status push (hello/reconnect, the ~2.5s flow watcher, post-command),
         // and the vendor usage endpoint rate-limits independently of inference;
@@ -266,14 +250,14 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   if (opencodeInstalled()) {
     connections.push({
       provider: "opencode",
-      connected: false,
+      status: "disconnected",
       cli_installed: true,
     });
   }
   if (hermesInstalled()) {
     connections.push({
       provider: "hermes",
-      connected: false,
+      status: "disconnected",
       cli_installed: true,
     });
   }
@@ -287,7 +271,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     port: daemonPort(),
     sandbox: sandboxState(),
     caps: currentDaemonCaps(),
-    connections: connections.map(withAuthStatus),
+    connections,
     // TTL-cached CLI probe from `getCliState()`. It returns cached state when fresh
     // and schedules a background refresh when stale, so status can stay responsive
     // without blocking and without manifest scans.
@@ -335,7 +319,7 @@ export const refreshUsage = async (slug?: string): Promise<void> => {
       .map(async (d) => {
         // Only connected providers have a usage endpoint to read.
         const status = await d.status();
-        if (!status.connected) return;
+        if (status.status !== "connected") return;
         await cachedUsage(d.slug, () => d.usage(), {
           accountHash: status.account_hash,
         });

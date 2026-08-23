@@ -2001,13 +2001,15 @@ export const ensureLocalSubscription = async (
       }),
     ]);
     const result: TLocalSubscriptionAuth = {
-      connected: status.connected,
-      detail: status.connected
-        ? null
-        : (status.detail ?? `${provider} not signed in on this device`),
+      connected: status.status === "connected",
+      detail:
+        status.status === "connected"
+          ? null
+          : (status.detail ?? `${provider} not signed in on this device`),
     };
     connectedByProvider.set(provider, result);
-    const accountHash = status.connected ? (status.account_hash ?? null) : null;
+    const accountHash =
+      status.status === "connected" ? (status.account_hash ?? null) : null;
     accountHashByProvider.set(provider, accountHash);
     if (result.connected) {
       lastKnownGoodLocalSubscriptionByProvider.set(provider, {
@@ -2599,7 +2601,7 @@ const walkPlan = async (
   ): Promise<THopServed | THopContinue> => {
     const { forceContextAttempt } = opts;
     // ── Local auth gate (every subscription provider) ─────────────────
-    // Install ≠ signed-in. status().connected is the same signal the cloud
+    // Install ≠ signed-in. status().status === "connected" is the same signal the cloud
     // uses for fleet_subscriptions. Without a local login, skip every local
     // transport (bridge spawn / handrolled credential) and go straight to
     // fleet — a doomed ACP handshake ("Invalid params") or credential throw

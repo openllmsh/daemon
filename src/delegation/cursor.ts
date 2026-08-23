@@ -358,7 +358,7 @@ export const cursorDelegate: TProviderDelegate = {
     if (installed && (await readStoredTokens()).kind === "indeterminate") {
       return {
         provider: PROVIDER,
-        connected: false,
+        status: "disconnected",
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -369,7 +369,7 @@ export const cursorDelegate: TProviderDelegate = {
     const pending = token === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
-      connected: token !== null,
+      status: token !== null ? "connected" : "disconnected",
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
       ...(pending !== null

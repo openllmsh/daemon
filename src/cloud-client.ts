@@ -354,7 +354,9 @@ export const notifySessionLost = async (
     rejectedMessage: "cloud rejected session-loss notification",
     failedMessage: "session-loss notification failed",
     slug: loss.slug,
-    reason: loss.reason,
+    ...(loss.diagnostic_code === undefined
+      ? {}
+      : { diagnostic_code: loss.diagnostic_code }),
   });
 };
 

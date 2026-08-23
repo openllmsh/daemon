@@ -434,7 +434,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     if (!installed) {
       return {
         provider: PROVIDER,
-        connected: false,
+        status: "disconnected",
         cli_installed: false,
         detail: "claude CLI not installed",
       };
@@ -448,7 +448,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
       return {
         provider: PROVIDER,
-        connected: false,
+        status: "disconnected",
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -460,7 +460,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     if (viaAuth === null && (await loadStore()).kind === "indeterminate") {
       return {
         provider: PROVIDER,
-        connected: false,
+        status: "disconnected",
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -480,7 +480,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     const acct = connected ? await readAccountHash() : null;
     return {
       provider: PROVIDER,
-      connected,
+      status: connected ? "connected" : "disconnected",
       cli_installed: true,
       ...(version !== null ? { cli_version: version } : {}),
       ...(connected

@@ -31,8 +31,7 @@ const lastStatus = new Map<string, TConnSnapshot>();
 
 const literalOf = (
   conn: TDaemonProviderConnection,
-): TDaemonProviderAuthStatus =>
-  conn.status ?? (conn.connected ? "connected" : "disconnected");
+): TDaemonProviderAuthStatus => conn.status;
 
 /**
  * Map free-form `conn.detail` to a bounded diagnostic code. Never returns
@@ -97,11 +96,9 @@ export const noteConnectionsForSessionLost = (
     const next = literalOf(conn);
     const prev = lastStatus.get(slug);
     if (prev?.status === "connected" && next === "disconnected") {
-      const reason = "credential_gone" as const;
       const diagnostic_code = classifyLossDetail(conn.detail);
       logWarn("auth-session-lost", "subscription session lost", {
         slug,
-        reason,
         diagnostic_code,
         ...(prev.accountHash !== undefined
           ? { account_hash: prev.accountHash }
@@ -111,7 +108,6 @@ export const noteConnectionsForSessionLost = (
         event: "auth.session.lost",
         key_id: daemonApiKeyId() ?? "local",
         slug,
-        reason,
         diagnostic_code,
         ...(prev.accountHash !== undefined
           ? { account_hash: prev.accountHash }
