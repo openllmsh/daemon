@@ -24,6 +24,7 @@ import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { logIfKilled, spawnCwd } from "./spawn";
+import type { TStoreRead } from "./util";
 
 const MAC = platform() === "darwin";
 
@@ -225,10 +226,10 @@ export const grantKeychainToolAccess = async (home: string): Promise<void> => {
  * configs don't collide, so an exact-name lookup misses it. `dump-keychain`
  * lists attributes only (no `-d`), so it doesn't prompt for secrets.
  */
-const findKeychainServices = async (
+export const findKeychainServices = async (
   home: string,
   prefix: string,
-): Promise<ReadonlyArray<string>> => {
+): Promise<TStoreRead<ReadonlyArray<string>>> => {
   try {
     const proc = Bun.spawn(
       sandboxSpawnArgs(["security", "dump-keychain", loginKeychainPath(home)], {
@@ -242,7 +243,19 @@ const findKeychainServices = async (
       },
     );
     const out = await new Response(proc.stdout).text();
-    await proc.exited;
+    const code = await proc.exited;
+    logIfKilled(
+      redactSecurityArgv([
+        "security",
+        "dump-keychain",
+        loginKeychainPath(home),
+      ]),
+      proc,
+      { confined: unwrapKeychainSpawn() !== true },
+    );
+    if (code !== 0) {
+      return { kind: "indeterminate", cause: `dump-keychain_exit_${code}` };
+    }
     const names = new Set<string>();
     for (const line of out.split("\n")) {
       const m = line.match(/"svce"<blob>="([^"]*)"/);
@@ -250,9 +263,12 @@ const findKeychainServices = async (
         names.add(m[1]);
       }
     }
-    return [...names];
-  } catch {
-    return [];
+    return { kind: "present", value: [...names] };
+  } catch (err) {
+    return {
+      kind: "indeterminate",
+      cause: err instanceof Error ? err.name : "dump-keychain_failed",
+    };
   }
 };
 
@@ -294,25 +310,39 @@ const readKeychainSecret = async (
  * matching `servicePrefix` (Claude's service name carries a per-install
  * hash suffix, so we match by prefix and try each candidate). `validate`
  * rejects a wrong-but-matching item — the first valid payload wins.
- * Returns null off macOS / on any failure.
+ * Returns `absent` off macOS / when no matching item exists;
+ * `indeterminate` when dump-keychain or secret read fails.
  */
 export const readIsolatedKeychain = async (
   home: string,
   servicePrefix: string,
   validate?: (payload: string) => boolean,
-): Promise<string | null> => {
-  if (!MAC) return null;
+): Promise<TStoreRead<string>> => {
+  if (!MAC) return { kind: "absent" };
   await ensureIsolatedKeychain(home); // ensure present + unlocked
+  const services = await findKeychainServices(home, servicePrefix);
+  if (services.kind !== "present") return services;
+  if (services.value.length === 0) return { kind: "absent" };
+  let secretUnreadable = false;
   try {
-    for (const service of await findKeychainServices(home, servicePrefix)) {
+    for (const service of services.value) {
       const secret = await readKeychainSecret(home, service);
-      if (secret === null) continue;
+      if (secret === null) {
+        secretUnreadable = true;
+        continue;
+      }
       if (validate !== undefined && !validate(secret)) continue;
-      return secret;
+      return { kind: "present", value: secret };
     }
-    return null;
-  } catch {
-    return null;
+    if (secretUnreadable) {
+      return { kind: "indeterminate", cause: "keychain_secret_unreadable" };
+    }
+    return { kind: "absent" };
+  } catch (err) {
+    return {
+      kind: "indeterminate",
+      cause: err instanceof Error ? err.name : "keychain_read_failed",
+    };
   }
 };
 
@@ -337,7 +367,8 @@ export const writeIsolatedKeychain = async (
   if (!MAC) return false;
   await ensureIsolatedKeychain(home);
   await grantKeychainToolAccess(home); // authorize tool writes (no prompt)
-  const service = (await findKeychainServices(home, servicePrefix))[0];
+  const services = await findKeychainServices(home, servicePrefix);
+  const service = services.kind === "present" ? services.value[0] : undefined;
   if (service === undefined) return false;
   const account = process.env.USER ?? "";
   return runSecurity(

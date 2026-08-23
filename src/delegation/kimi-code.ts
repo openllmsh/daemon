@@ -54,7 +54,12 @@ import { makeDeviceCodeConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
-import { cliVersion, readJsonFile } from "./util";
+import {
+  cliVersion,
+  readJsonStore,
+  STATUS_CHECK_FAILED_DETAIL,
+  storeReadValue,
+} from "./util";
 
 const PROVIDER = "kimi_code" as const;
 // Usage endpoint LEAF path — the host is derived from the captured inference
@@ -228,7 +233,7 @@ const refresh = makeRefresher({
  * `usage`, and `credentialForUpstream` so each carries a live token.
  */
 const readToken = async (): Promise<{ accessToken: string } | null> => {
-  const tok = await readJsonFile<TKimiToken>(credentialPath());
+  const tok = storeReadValue(await readJsonStore<TKimiToken>(credentialPath()));
   if (tok?.access_token === undefined || tok.access_token.length === 0) {
     return null;
   }
@@ -254,7 +259,9 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
   // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
   // credential; fall back to the stale token if it failed (the upstream then
   // 401s and the UI says re-login).
-  const fresh = await readJsonFile<TKimiToken>(credentialPath());
+  const fresh = storeReadValue(
+    await readJsonStore<TKimiToken>(credentialPath()),
+  );
   return {
     accessToken:
       fresh?.access_token !== undefined && fresh.access_token.length > 0
@@ -621,6 +628,19 @@ export const kimiCodeDelegate: TProviderDelegate = {
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
+    if (
+      installed &&
+      (await readJsonStore<TKimiToken>(credentialPath())).kind ===
+        "indeterminate"
+    ) {
+      return {
+        provider: PROVIDER,
+        connected: false,
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
     const token = installed ? await readToken() : null;
     if (token !== null) clearPendingAuth(PROVIDER);
     const pending = token === null ? getPendingAuth(PROVIDER) : null;

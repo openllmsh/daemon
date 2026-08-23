@@ -74,11 +74,14 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
+import type { TStoreRead } from "./util";
 import {
   cliVersion,
-  readJsonFile,
+  readJsonStore,
   redactUrls,
   runCapture,
+  STATUS_CHECK_FAILED_DETAIL,
+  storeReadValue,
   stripAnsi,
 } from "./util";
 
@@ -157,13 +160,13 @@ type TGrokStore = Readonly<Record<string, TGrokSession>>;
 
 const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
 
-const loadStore = (): Promise<TGrokStore | null> =>
+const loadStore = (): Promise<TStoreRead<TGrokStore>> =>
   // Isolated HOME → <home>/.grok/auth.json (cliConfigDir).
-  readJsonFile<TGrokStore>(authPath());
+  readJsonStore<TGrokStore>(authPath());
 
 /** The newest session entry carrying a usable access token, or null. */
 const newestSession = async (): Promise<TGrokSession | null> => {
-  const store = await loadStore();
+  const store = storeReadValue(await loadStore());
   if (store === null) return null;
   const sessions = Object.values(store).filter(
     (s): s is TGrokSession & { readonly key: string } =>
@@ -632,6 +635,15 @@ export const grokDelegate: TProviderDelegate = {
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
+    if (installed && (await loadStore()).kind === "indeterminate") {
+      return {
+        provider: PROVIDER,
+        connected: false,
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
     const token = installed ? await readToken() : null;
     if (token !== null) clearPendingAuth(PROVIDER);
     const pending = token === null ? getPendingAuth(PROVIDER) : null;

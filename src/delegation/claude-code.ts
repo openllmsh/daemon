@@ -53,13 +53,16 @@ import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
+import type { TStoreRead } from "./util";
 import {
   cliVersion,
   ensureIsolatedKeychain,
   grantKeychainToolAccess,
   readIsolatedKeychain,
-  readJsonFile,
+  readJsonStore,
   runCapture,
+  STATUS_CHECK_FAILED_DETAIL,
+  storeReadValue,
   toEpochMs,
 } from "./util";
 
@@ -89,7 +92,7 @@ type TClaudeOAuth = {
 };
 type TClaudeStore = { readonly claudeAiOauth?: TClaudeOAuth };
 
-const loadStore = async (): Promise<TClaudeStore | null> => {
+const loadStore = async (): Promise<TStoreRead<TClaudeStore>> => {
   if (platform() === "darwin") {
     // macOS stores the blob in the isolated login keychain (not a file).
     const raw = await readIsolatedKeychain(
@@ -97,14 +100,14 @@ const loadStore = async (): Promise<TClaudeStore | null> => {
       KEYCHAIN_SERVICE,
       (p) => p.includes("claudeAiOauth"),
     );
-    if (raw === null) return null;
+    if (raw.kind !== "present") return raw;
     try {
-      return JSON.parse(raw) as TClaudeStore;
+      return { kind: "present", value: JSON.parse(raw.value) as TClaudeStore };
     } catch {
-      return null;
+      return { kind: "indeterminate", cause: "SyntaxError" };
     }
   }
-  return readJsonFile<TClaudeStore>(
+  return readJsonStore<TClaudeStore>(
     join(cliConfigDir(PROVIDER), ".credentials.json"),
   );
 };
@@ -116,9 +119,11 @@ const loadStore = async (): Promise<TClaudeStore | null> => {
  * survives token refresh. NOT `machineID`/`userID` — those are per-device.
  */
 const readAccountHash = async (): Promise<string | null> => {
-  const cfg = await readJsonFile<{
-    readonly oauthAccount?: { readonly accountUuid?: string };
-  }>(join(cliConfigDir(PROVIDER), ".claude.json"));
+  const cfg = storeReadValue(
+    await readJsonStore<{
+      readonly oauthAccount?: { readonly accountUuid?: string };
+    }>(join(cliConfigDir(PROVIDER), ".claude.json")),
+  );
   const id = nonEmpty(cfg?.oauthAccount?.accountUuid);
   return id === null ? null : accountHash(PROVIDER, id);
 };
@@ -159,7 +164,7 @@ const readToken = async (): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
 } | null> => {
-  const oauth = (await loadStore())?.claudeAiOauth;
+  const oauth = storeReadValue(await loadStore())?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
     return null;
   }
@@ -173,7 +178,7 @@ const readToken = async (): Promise<{
   // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
   // store. Falls back to the stale token if it failed (the upstream then 401s
   // and the UI says re-sign-in).
-  const fresh = (await loadStore())?.claudeAiOauth;
+  const fresh = storeReadValue(await loadStore())?.claudeAiOauth;
   if (fresh?.accessToken !== undefined && fresh.accessToken.length > 0) {
     return {
       accessToken: fresh.accessToken,
@@ -275,7 +280,7 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
  * when there is no credential at all.
  */
 const credentialRefreshable = async (): Promise<boolean | null> => {
-  const oauth = (await loadStore())?.claudeAiOauth;
+  const oauth = storeReadValue(await loadStore())?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
     return null;
   }
@@ -428,6 +433,15 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // Prefer the CLI's own `auth status`; fall back to the store read
     // when it's unavailable / unparseable.
     const viaAuth = await authStatusLoggedIn();
+    if (viaAuth === null && (await loadStore()).kind === "indeterminate") {
+      return {
+        provider: PROVIDER,
+        connected: false,
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
     const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
     // A live headless paste-back login (remote box) awaiting the user's code:
     // surface the authorize URL + paste mode so the dashboard renders the
@@ -613,7 +627,8 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // so the next read re-probes against the now-cleared credential.
     clearAuthStatusCache();
     const cleared =
-      (await loadStore())?.claudeAiOauth?.accessToken === undefined;
+      storeReadValue(await loadStore())?.claudeAiOauth?.accessToken ===
+      undefined;
     return cleared
       ? { ok: true, detail: "signed out of Claude Code" }
       : { ok: false, detail: "credential still present after logout" };

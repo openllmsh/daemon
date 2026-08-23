@@ -25,16 +25,62 @@ export * from "./headless-login";
 export * from "./keychain";
 export * from "./spawn";
 
-/** Read + JSON-parse a file, or null if absent / unparseable. */
-export const readJsonFile = async <T>(path: string): Promise<T | null> => {
+/**
+ * Result of reading a credential store. Callers must not treat
+ * `indeterminate` as "signed out" — that is a transient I/O or parse
+ * failure, not an authoritative absence.
+ */
+export type TStoreRead<T> =
+  | { readonly kind: "present"; readonly value: T }
+  | { readonly kind: "absent" }
+  | { readonly kind: "indeterminate"; readonly cause: string };
+
+/** Sentinel `detail` matching `statusFailure()` in status.ts. */
+export const STATUS_CHECK_FAILED_DETAIL = "status check failed";
+
+export const storeReadValue = <T>(read: TStoreRead<T>): T | null =>
+  read.kind === "present" ? read.value : null;
+
+const errorCause = (err: unknown): string => {
+  if (err instanceof Error) {
+    const code =
+      "code" in err && typeof err.code === "string" ? err.code : undefined;
+    return code !== undefined && code.length > 0
+      ? `${err.name}:${code}`
+      : err.name;
+  }
+  return "read_failed";
+};
+
+const isEnoent = (err: unknown): boolean =>
+  err instanceof Error && "code" in err && err.code === "ENOENT";
+
+/**
+ * Read + JSON-parse a file as a tri-state. `absent` is only a genuine
+ * missing file (ENOENT / exists() === false). Permission, I/O, and parse
+ * failures are `indeterminate`.
+ */
+export const readJsonStore = async <T>(
+  path: string,
+): Promise<TStoreRead<T>> => {
   try {
     const file = Bun.file(path);
-    if (!(await file.exists())) return null;
-    return (await file.json()) as T;
-  } catch {
-    return null;
+    if (!(await file.exists())) return { kind: "absent" };
+    try {
+      return { kind: "present", value: (await file.json()) as T };
+    } catch (err) {
+      if (isEnoent(err)) return { kind: "absent" };
+      return { kind: "indeterminate", cause: errorCause(err) };
+    }
+  } catch (err) {
+    if (isEnoent(err)) return { kind: "absent" };
+    return { kind: "indeterminate", cause: errorCause(err) };
   }
 };
+
+/** Collapsing wrapper for callers that only need present-or-null. */
+export const readJsonFile = async <T>(path: string): Promise<T | null> =>
+  storeReadValue(await readJsonStore<T>(path));
 
 /** Tolerant epoch parser — accepts ms-int, sec-float, or ISO string. */
 export const toEpochMs = (raw: unknown): number | null => {

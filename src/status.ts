@@ -17,6 +17,7 @@ import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
 import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
+import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { getCliState } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
 import { daemonPublicKey } from "./keypair";
@@ -60,10 +61,12 @@ if (DELEGATE_STATUS_TIMEOUT_MS < DEFAULT_CAPTURE_TIMEOUT_MS) {
 // otherwise omit the unknown installation state rather than serializing it as
 // a definitive `false` to the cloud.
 const lastKnownConnections = new Map<string, TDaemonProviderConnection>();
+const timedOutSlugs = new Set<string>();
 
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
+  timedOutSlugs.clear();
 };
 
 const statusFailure = (slug: string): TDaemonProviderConnection => {
@@ -71,7 +74,7 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
   if (lastKnown !== undefined) {
     return {
       ...lastKnown,
-      detail: "status check failed",
+      detail: STATUS_CHECK_FAILED_DETAIL,
     };
   }
   return {
@@ -79,7 +82,7 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
     // The protocol requires a connection boolean. This only means the current
     // check did not establish a connection; it is not a logout assertion.
     connected: false,
-    detail: "status check failed",
+    detail: STATUS_CHECK_FAILED_DETAIL,
   };
 };
 
@@ -88,16 +91,32 @@ const boundedDelegateStatus = async (
   status: () => Promise<TDaemonProviderConnection>,
 ): Promise<TDaemonProviderConnection> => {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       status(),
       new Promise<TDaemonProviderConnection>((resolve) => {
-        timer = setTimeout(
-          () => resolve(statusFailure(slug)),
-          DELEGATE_STATUS_TIMEOUT_MS,
-        );
+        timer = setTimeout(() => {
+          timedOut = true;
+          if (!timedOutSlugs.has(slug)) {
+            timedOutSlugs.add(slug);
+            logWarn("status", "delegate status probe timed out", {
+              slug,
+              phase: "delegate_status",
+              timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
+            });
+          }
+          resolve(statusFailure(slug));
+        }, DELEGATE_STATUS_TIMEOUT_MS);
       }),
     ]);
+    if (!timedOut) {
+      timedOutSlugs.delete(slug);
+      if (result.detail === STATUS_CHECK_FAILED_DETAIL) {
+        return statusFailure(slug);
+      }
+    }
+    return result;
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
@@ -147,7 +166,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     Object.values(DELEGATES).map(async (d) => {
       try {
         const conn = await boundedDelegateStatus(d.slug, d.status);
-        if (conn.detail !== "status check failed") {
+        if (conn.detail !== STATUS_CHECK_FAILED_DETAIL) {
           lastKnownConnections.set(d.slug, conn);
         }
         // Attach a metadata-only usage snapshot for connected providers so the

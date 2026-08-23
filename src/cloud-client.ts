@@ -314,6 +314,8 @@ export const notifySessionLost = async (
           "cloud rejected session-loss notification",
           {
             status: response.status,
+            slug: loss.slug,
+            reason: loss.reason,
           },
         );
         return;
@@ -322,6 +324,8 @@ export const notifySessionLost = async (
       if (attempt === 1) {
         logWarn("auth-loss-notify", "session-loss notification failed", {
           error_class: error instanceof Error ? error.name : typeof error,
+          slug: loss.slug,
+          reason: loss.reason,
         });
         return;
       }

@@ -29,6 +29,7 @@ import { resetUserAuthActionsForTests } from "./auth-user-action";
 import { isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
 import { daemonApiKeyId } from "./env";
+import { logWarn } from "./logger";
 
 type TConnSnapshot = {
   readonly connected: boolean;
@@ -77,6 +78,14 @@ export const noteConnectionsForSessionLost = (
     if (prev?.connected === true && !now) {
       const reason = pendingLostReason.get(slug) ?? "credential_gone";
       pendingLostReason.delete(slug);
+      logWarn("auth-session-lost", "subscription session lost", {
+        slug,
+        reason,
+        ...(conn.detail !== undefined ? { detail: conn.detail } : {}),
+        ...(prev.accountHash !== undefined
+          ? { account_hash: prev.accountHash }
+          : {}),
+      });
       emitAuth({
         event: "auth.session.lost",
         key_id: daemonApiKeyId() ?? "local",

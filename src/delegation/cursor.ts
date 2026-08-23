@@ -30,12 +30,15 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
+import type { TStoreRead } from "./util";
 import {
   ensureIsolatedKeychain,
   grantKeychainToolAccess,
   readIsolatedKeychain,
-  readJsonFile,
+  readJsonStore,
   runCapture,
+  STATUS_CHECK_FAILED_DETAIL,
+  storeReadValue,
   stripAnsi,
 } from "./util";
 
@@ -174,7 +177,7 @@ export const parseCursorUsage = (
  * found" error or a macOS GUI prompt, and nothing is created or mutated on a
  * read path beyond ensuring our own isolated keychain file exists.
  */
-const readMacKeychainSecret = (service: string): Promise<string | null> =>
+const readMacKeychainSecret = (service: string): Promise<TStoreRead<string>> =>
   readIsolatedKeychain(cliHome(PROVIDER), service);
 
 type TCursorFileStore = {
@@ -188,20 +191,28 @@ type TCursorFileStore = {
  *  `$XDG_CONFIG_HOME/cursor/auth.json` (= `<home>/.config/cursor/auth.json` with
  *  HOME + XDG_CONFIG_HOME pinned to the isolated home), camelCase tokens.
  *  `cliConfigDir("cursor")` resolves to that dir. */
-const readFileTokens = async (): Promise<{
-  readonly accessToken: string;
-  readonly refreshTokenPresent: boolean;
-} | null> => {
-  const store = await readJsonFile<TCursorFileStore>(
+const readFileTokens = async (): Promise<
+  TStoreRead<{
+    readonly accessToken: string;
+    readonly refreshTokenPresent: boolean;
+  }>
+> => {
+  const store = await readJsonStore<TCursorFileStore>(
     join(cliConfigDir(PROVIDER), "auth.json"),
   );
-  const accessToken = store?.access_token ?? store?.accessToken;
-  if (typeof accessToken !== "string" || accessToken.length === 0) return null;
-  const refreshToken = store?.refresh_token ?? store?.refreshToken;
+  if (store.kind !== "present") return store;
+  const accessToken = store.value.access_token ?? store.value.accessToken;
+  if (typeof accessToken !== "string" || accessToken.length === 0) {
+    return { kind: "absent" };
+  }
+  const refreshToken = store.value.refresh_token ?? store.value.refreshToken;
   return {
-    accessToken,
-    refreshTokenPresent:
-      typeof refreshToken === "string" && refreshToken.length > 0,
+    kind: "present",
+    value: {
+      accessToken,
+      refreshTokenPresent:
+        typeof refreshToken === "string" && refreshToken.length > 0,
+    },
   };
 };
 
@@ -219,42 +230,37 @@ const refresh = makeRefresher({
   trigger: triggerRefresh,
 });
 
+const readStoredTokens = async (): Promise<
+  TStoreRead<{
+    readonly accessToken: string;
+    readonly refreshTokenPresent: boolean;
+  }>
+> => {
+  if (platform() !== "darwin") return readFileTokens();
+  const accessToken = await readMacKeychainSecret("cursor-access-token");
+  if (accessToken.kind !== "present") return accessToken;
+  const refreshToken = await readMacKeychainSecret("cursor-refresh-token");
+  return {
+    kind: "present",
+    value: {
+      accessToken: accessToken.value,
+      refreshTokenPresent: refreshToken.kind === "present",
+    },
+  };
+};
+
 const readToken = async (): Promise<{
   readonly accessToken: string;
   readonly refreshTokenPresent: boolean;
 } | null> => {
-  const stored =
-    platform() === "darwin"
-      ? await (async (): Promise<{
-          readonly accessToken: string;
-          readonly refreshTokenPresent: boolean;
-        } | null> => {
-          const accessToken = await readMacKeychainSecret(
-            "cursor-access-token",
-          );
-          if (accessToken === null) return null;
-          const refreshToken = await readMacKeychainSecret(
-            "cursor-refresh-token",
-          );
-          return { accessToken, refreshTokenPresent: refreshToken !== null };
-        })()
-      : await readFileTokens();
+  const stored = storeReadValue(await readStoredTokens());
   if (stored === null) return null;
   const outcome = stored.refreshTokenPresent
     ? await refresh(jwtExpiryMs(stored.accessToken))
     : "fresh";
   if (outcome !== "awaited") return stored;
   // CLI remains the sole token-store owner. Re-read after a hard-expiry refresh.
-  return platform() === "darwin"
-    ? await (async (): Promise<typeof stored> => {
-        const accessToken = await readMacKeychainSecret("cursor-access-token");
-        if (accessToken === null) return stored;
-        const refreshToken = await readMacKeychainSecret(
-          "cursor-refresh-token",
-        );
-        return { accessToken, refreshTokenPresent: refreshToken !== null };
-      })()
-    : ((await readFileTokens()) ?? stored);
+  return storeReadValue(await readStoredTokens()) ?? stored;
 };
 
 const INSTALL_HINT =
@@ -333,6 +339,15 @@ export const cursorDelegate: TProviderDelegate = {
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
+    if (installed && (await readStoredTokens()).kind === "indeterminate") {
+      return {
+        provider: PROVIDER,
+        connected: false,
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
     const token = installed ? await readToken() : null;
     if (token !== null) clearPendingAuth(PROVIDER);
     const pending = token === null ? getPendingAuth(PROVIDER) : null;

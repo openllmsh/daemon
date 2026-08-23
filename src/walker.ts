@@ -2820,6 +2820,12 @@ const walkPlan = async (
           };
         }
       }
+      if (args.req.signal.aborted) {
+        return {
+          response: errorJson(499, "client aborted request"),
+          servedLocally: true,
+        };
+      }
       addHopFailure(
         hop,
         handrolledRetry.reason,
@@ -2951,8 +2957,13 @@ const walkPlan = async (
       );
     } catch {
       lastError = `forward of ${hop.modelId} to cloud failed`;
+      // Client hung up while the cloud fetch was in flight. Terminal but NOT
+      // an upstream fault: `addHopFailure` would report status "error" and the
+      // cloud record handler would cool the model as `upstream_rejection`.
+      if (args.req.signal.aborted) {
+        return withHopTrailHeaders(errorJson(499, "client aborted request"));
+      }
       addHopFailure(hop, lastError);
-      if (args.req.signal.aborted) break;
       continue;
     }
     if (!resp.ok) {

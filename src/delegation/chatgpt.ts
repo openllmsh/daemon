@@ -55,7 +55,14 @@ import {
   reduceChatgptWindows,
   reduceQuotaStatus,
 } from "./usage-reduce";
-import { readJsonFile, runCapture, stripAnsi } from "./util";
+import type { TStoreRead } from "./util";
+import {
+  readJsonStore,
+  runCapture,
+  STATUS_CHECK_FAILED_DETAIL,
+  storeReadValue,
+  stripAnsi,
+} from "./util";
 
 const PROVIDER = "chatgpt" as const;
 // Usage endpoint LEAF path — the host is derived from the captured inference
@@ -129,9 +136,9 @@ type TCodexStore = {
 
 const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
 
-const loadStore = (): Promise<TCodexStore | null> =>
+const loadStore = (): Promise<TStoreRead<TCodexStore>> =>
   // Isolated CODEX_HOME → auth.json lives there.
-  readJsonFile<TCodexStore>(authPath());
+  readJsonStore<TCodexStore>(authPath());
 
 /**
  * Trigger the codex CLI's OWN native token refresh: `codex doctor`. Its websocket
@@ -155,7 +162,7 @@ const readToken = async (): Promise<{
   accessToken: string;
   accountId: string | null;
 } | null> => {
-  const tokens = (await loadStore())?.tokens;
+  const tokens = storeReadValue(await loadStore())?.tokens;
   if (tokens?.access_token === undefined || tokens.access_token.length === 0) {
     return null;
   }
@@ -172,7 +179,7 @@ const readToken = async (): Promise<{
   // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
   // store. Falls back to the stale token if it failed (the upstream then 401s
   // and the UI says re-sign-in).
-  const fresh = (await loadStore())?.tokens;
+  const fresh = storeReadValue(await loadStore())?.tokens;
   if (fresh?.access_token !== undefined && fresh.access_token.length > 0) {
     return {
       accessToken: fresh.access_token,
@@ -314,6 +321,15 @@ export const chatgptDelegate: TProviderDelegate = {
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
+    if (installed && (await loadStore()).kind === "indeterminate") {
+      return {
+        provider: PROVIDER,
+        connected: false,
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
     const token = installed ? await readToken() : null;
     if (token !== null) clearPendingAuth(PROVIDER);
     const pending = token === null ? getPendingAuth(PROVIDER) : null;
