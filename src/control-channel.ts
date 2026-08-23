@@ -242,7 +242,7 @@ type TPendingSessionLoss = {
 
 const pendingSessionLossNotifications = new Map<string, TPendingSessionLoss>();
 let disposeSessionLostNotifier: (() => void) | null = null;
-let notifySessionLoss: (loss: TDaemonSessionLost) => Promise<void> =
+let emitSessionLoss: (loss: TDaemonSessionLost) => Promise<void> =
   notifySessionLost;
 
 const observeSessionLoss = (event: TAuthEvent): void => {
@@ -279,7 +279,7 @@ const confirmSessionLosses = (
     if (pending.observations < SESSION_LOSS_SETTLE_STATUS_CYCLES) continue;
     pendingSessionLossNotifications.delete(slug);
     if (recentUserAuthAction(slug, RECENT_USER_ACTION_MS)) continue;
-    void notifySessionLoss({
+    void emitSessionLoss({
       slug: pending.loss.slug,
       reason: pending.loss.reason,
       ...(pending.loss.account_hash !== undefined
@@ -307,11 +307,11 @@ const stopSessionLostNotifier = (): void => {
 export const startSessionLostNotifierForTests = (
   notify: (loss: TDaemonSessionLost) => Promise<void>,
 ): (() => void) => {
-  notifySessionLoss = notify;
+  emitSessionLoss = notify;
   startSessionLostNotifier();
   return () => {
     stopSessionLostNotifier();
-    notifySessionLoss = notifySessionLost;
+    emitSessionLoss = notifySessionLost;
   };
 };
 
@@ -366,16 +366,24 @@ const enqueueStatusPublish = (
   return statusPublishTail;
 };
 
+/**
+ * Shared observer choreography for a computed status snapshot: falling-edge
+ * session-loss, the two-cycle confirmation gate, then quota transitions.
+ */
+const observeNotificationTransitions = (
+  connections: ReadonlyArray<TDaemonProviderConnection>,
+): void => {
+  noteConnectionsForSessionLost(connections);
+  confirmSessionLosses(connections);
+  for (const transition of noteConnectionsForQuota(connections)) {
+    void notifyQuotaStatus(transition);
+  }
+};
+
 const pushStatus = async (active?: boolean): Promise<void> =>
   enqueueStatusPublish(async () => {
     const status = await computeStatus();
-    // Falling-edge `auth.session.lost` — a provider that WAS connected and now
-    // reads not-connected (logout / credential gone) emits the mirror event.
-    noteConnectionsForSessionLost(status.connections);
-    confirmSessionLosses(status.connections);
-    for (const transition of noteConnectionsForQuota(status.connections)) {
-      void notifyQuotaStatus(transition);
-    }
+    observeNotificationTransitions(status.connections);
     return { status, fingerprint: JSON.stringify(status) };
   }, active);
 
@@ -411,14 +419,7 @@ export const notePresenceActivity = (): void => {
 export const pushStatusIfChanged = async (): Promise<void> =>
   enqueueStatusPublish(async () => {
     const status = await computeStatus();
-    // Observe the falling edge on every computed snapshot — including the ~2.5s
-    // watcher's — so a background logout / credential loss emits the mirror
-    // event even when no command is in flight.
-    noteConnectionsForSessionLost(status.connections);
-    confirmSessionLosses(status.connections);
-    for (const transition of noteConnectionsForQuota(status.connections)) {
-      void notifyQuotaStatus(transition);
-    }
+    observeNotificationTransitions(status.connections);
     const fingerprint = JSON.stringify(status);
     // Check inside the serialized publisher so concurrent probes cannot both
     // decide they are the next changed snapshot.
