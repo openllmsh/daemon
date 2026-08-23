@@ -480,7 +480,11 @@ export const finishInBackground = async (opts: {
       // best-effort — a failed onConnected must not reject the cleanup
     }
   }
-  const crashed = opts.exitCode !== undefined && opts.exitCode !== 0;
+  // Only a definite non-zero exit code is a crash. `null` (killed by signal,
+  // no exit code) and `undefined` (unknown) are NOT crashes — keep the
+  // retryable poll_expired outcome rather than asserting a crash from an
+  // ambiguous exit.
+  const crashed = typeof opts.exitCode === "number" && opts.exitCode !== 0;
   const event: TLoginTerminalEvent =
     cancelled || flow === null
       ? { kind: "none" }

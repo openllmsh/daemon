@@ -56,22 +56,17 @@ const isEnoent = (err: unknown): boolean =>
   err instanceof Error && "code" in err && err.code === "ENOENT";
 
 /**
- * Read + JSON-parse a file as a tri-state. `absent` is only a genuine
- * missing file (ENOENT / exists() === false). Permission, I/O, and parse
- * failures are `indeterminate`.
+ * Read + JSON-parse a file as a tri-state. `absent` is ONLY a genuine missing
+ * file (ENOENT). Everything else — a directory at the path (EISDIR), a
+ * permission/I/O failure, or a parse error — is `indeterminate`. Read directly
+ * rather than pre-checking `exists()`: the extra syscall is racy, and a
+ * directory would pass `exists()` as `false` and be misreported as `absent`.
  */
 export const readJsonStore = async <T>(
   path: string,
 ): Promise<TStoreRead<T>> => {
   try {
-    const file = Bun.file(path);
-    if (!(await file.exists())) return { kind: "absent" };
-    try {
-      return { kind: "present", value: (await file.json()) as T };
-    } catch (err) {
-      if (isEnoent(err)) return { kind: "absent" };
-      return { kind: "indeterminate", cause: errorCause(err) };
-    }
+    return { kind: "present", value: (await Bun.file(path).json()) as T };
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     return { kind: "indeterminate", cause: errorCause(err) };
