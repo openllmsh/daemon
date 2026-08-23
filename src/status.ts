@@ -86,10 +86,25 @@ const applyAuthLiteral = (
   const inFlight =
     isSubscriptionSlug(slug) && loginSlot(slug).inFlight();
   const indeterminate = conn.detail === STATUS_CHECK_FAILED_DETAIL;
-  if (inFlight || indeterminate) {
-    const preserved: TDaemonProviderAuthStatus =
-      last?.status ??
-      (signedOutByUser.has(slug) ? "signed_out" : conn.status);
+  // Determinate = this tick's vendor read, not last-known overlay.
+  const determinate = !inFlight && !indeterminate;
+
+  if (determinate && conn.status === "connected") {
+    // Logout receipt sets the sticky flag while the vendor may still
+    // read connected until `delegate.logout()` finishes. Only a rising
+    // edge (fresh connected, last-known was not connected) is a login
+    // by any path and clears the flag.
+    if (signedOutByUser.has(slug) && last?.status === "connected") {
+      return { ...conn, status: "signed_out" };
+    }
+    signedOutByUser.delete(slug);
+    return { ...conn, status: "connected" };
+  }
+  if (signedOutByUser.has(slug)) {
+    return { ...conn, status: "signed_out" };
+  }
+  if (!determinate) {
+    const preserved: TDaemonProviderAuthStatus = last?.status ?? conn.status;
     return {
       ...(last !== undefined ? last : conn),
       detail: conn.detail,
@@ -98,13 +113,6 @@ const applyAuthLiteral = (
         ? { pending_auth: conn.pending_auth }
         : {}),
     };
-  }
-  if (signedOutByUser.has(slug)) {
-    return { ...conn, status: "signed_out" };
-  }
-  if (conn.status === "connected") {
-    signedOutByUser.delete(slug);
-    return { ...conn, status: "connected" };
   }
   return { ...conn, status: "disconnected" };
 };
@@ -214,13 +222,15 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
-        const conn = applyAuthLiteral(
-          d.slug,
-          await boundedDelegateStatus(d.slug, d.status),
-        );
+        const raw = await boundedDelegateStatus(d.slug, d.status);
+        const conn = applyAuthLiteral(d.slug, raw);
         if (
           conn.detail !== STATUS_CHECK_FAILED_DETAIL &&
-          !(isSubscriptionSlug(d.slug) && loginSlot(d.slug).inFlight())
+          !(isSubscriptionSlug(d.slug) && loginSlot(d.slug).inFlight()) &&
+          // Overlaying signed_out on a still-connected vendor read (logout
+          // in flight) must not rewrite last-known to signed_out, or the
+          // next connected tick would look like a login rising edge.
+          !(conn.status === "signed_out" && raw.status === "connected")
         ) {
           lastKnownConnections.set(d.slug, conn);
         }
