@@ -15,6 +15,20 @@
  * create + unlock the keychain at the HOME-derived path (which Claude
  * finds on its own) and READ it back by EXPLICIT path (the `security` CLI
  * resolves the default via the session, not HOME, so the path is required).
+ *
+ * ── Readiness gate (2026-08 GUI-prompt fix) ─────────────────────────────
+ * The isolated keychain is created empty-password. If that invariant ever
+ * breaks (a pre-existing file whose password drifted from `""`, e.g. one
+ * created under the old reserved-name-under-sandbox path that itself popped a
+ * dialog), `unlock-keychain -p ""` fails. Historically we still ran
+ * `dump-keychain` — and let the vendor CLI (`claude auth status`) open the
+ * locked chain — which raises a `builtin:unlock-keychain` SecurityAgent GUI
+ * dialog every status tick. So `ensureKeychainReady` now RETURNS a tri-state:
+ * NOTHING that could prompt (our dump/grant, or the vendor CLI in
+ * `claude-code.ts`) runs unless it reports `present` (unlocked THIS call). A
+ * genuine empty-password drift self-heals once (rename-aside + recreate); a
+ * chain that still can't unlock is negative-cached so it stops re-prompting.
+ * See docs/plan/2026-08-22-daemon-keychain-gui-prompt-wedge-fix.md.
  */
 import { existsSync } from "node:fs";
 import { mkdir, readdir, rename, rm } from "node:fs/promises";
@@ -28,69 +42,156 @@ import type { TStoreRead } from "./util";
 
 const MAC = platform() === "darwin";
 
+/** Readiness = the shared tri-state: `present` (created + unlocked this call),
+ *  `indeterminate` (create/unlock failed or the chain is unusable). Off macOS
+ *  there is nothing to gate, so it is always `present`. */
+const READY: TStoreRead<void> = { kind: "present", value: undefined };
+
 const loginKeychainPath = (home: string): string =>
   join(home, "Library", "Keychains", "login.keychain-db");
 
 /** The argv with secret-bearing option VALUES redacted for logging: `-w`
  *  carries the OAuth credential payload (`add-generic-password`), `-p` a
- *  keychain password — neither may reach `openllmd.err.log`. */
+ *  keychain password, `-k` the partition-list unlock password — none may
+ *  reach `openllmd.err.log`. */
 const redactSecurityArgv = (argv: ReadonlyArray<string>): string[] =>
   argv.map((arg, i) =>
-    i > 0 && (argv[i - 1] === "-w" || argv[i - 1] === "-p")
+    i > 0 && (argv[i - 1] === "-w" || argv[i - 1] === "-p" || argv[i - 1] === "-k")
       ? "<redacted>"
       : arg,
   );
 
-const runSecurity = async (
+type TSpawnMode = "ignore" | "pipe";
+
+const DEFAULT_SECURITY_SPAWN_TIMEOUT_MS = 10_000;
+
+/** Per-call so tests can drive `OPENLLM_SECURITY_TIMEOUT_MS`. Finite + positive
+ *  or the 10s default. Dump/unlock on a one-cred isolated chain is fast; 10s
+ *  is generous enough to avoid false kills of a slow securityd. */
+const securitySpawnTimeoutMs = (): number => {
+  const raw = process.env.OPENLLM_SECURITY_TIMEOUT_MS;
+  if (raw === undefined) return DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
+};
+
+type TSecurityOutcome =
+  | { readonly kind: "complete"; readonly code: number; readonly stdout: string; readonly stderr: string }
+  | { readonly kind: "timeout" };
+
+const FAILED_SPAWN = { code: -1, stdout: "", stderr: "" } as const;
+
+/** ONE `security` spawn helper (create/unlock/dump/read all route here).
+ *  Unconfined on macOS (`sandbox/policy.ts`): `security` talks to securityd,
+ *  which refuses a Seatbelt-confined caller. These paths are macOS-only.
+ *  `stdout`/`stderr` are captured only when the mode is `pipe` (unlock needs
+ *  stderr to classify a failure; dump/read need stdout). Never throws.
+ *  Bounded: a hung `security` (e.g. blocked on SecurityAgent) is killed so
+ *  `inFlightKeychains` can settle. */
+const spawnSecurity = async (
   argv: ReadonlyArray<string>,
   home: string,
-): Promise<boolean> => {
+  opts: { readonly stdout: TSpawnMode; readonly stderr: TSpawnMode },
+): Promise<{ code: number; stdout: string; stderr: string }> => {
   try {
-    // Unconfined on macOS (`sandbox/policy.ts`): `security` talks to securityd,
-    // which refuses a Seatbelt-confined caller. These paths are macOS-only.
     const proc = Bun.spawn(
       sandboxSpawnArgs(["security", ...argv], { probe: unwrapKeychainSpawn() }),
       {
         stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
+        stdout: opts.stdout,
+        stderr: opts.stderr,
         cwd: spawnCwd({ HOME: home }),
         env: { ...process.env, HOME: home },
       },
     );
-    const code = await proc.exited;
-    // Through the `--sandbox-exec` shim the daemon sees `128 + signal` as an
-    // exit CODE, not a signalCode, so this only fires for a kill of the shim
-    // itself; a sandbox kill of the `security` child is attributed by the
-    // SHIM's own log line (`runSandboxExec` logs command name only — already
-    // redacted, never the `-w` OAuth payload). Kept for the unwrapped paths.
-    // `security` is spawned with the same `probe` flag used above, so its
-    // confinement matches: unwrapped on macOS (securityd refuses a confined
-    // caller) ⇒ an unconfined kill, never a sandbox denial.
-    logIfKilled(redactSecurityArgv(["security", ...argv]), proc, {
-      confined: unwrapKeychainSpawn() !== true,
-    });
-    return code === 0;
+    // Drain both pipes AND exit under one deadline — a hung `exited` (GUI
+    // dialog) used to poison `inFlightKeychains` forever.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const complete = Promise.all([
+        opts.stdout === "pipe"
+          ? new Response(proc.stdout).text()
+          : Promise.resolve(""),
+        opts.stderr === "pipe"
+          ? new Response(proc.stderr).text()
+          : Promise.resolve(""),
+        proc.exited,
+      ]).then(
+        ([stdout, stderr, code]): TSecurityOutcome => ({
+          kind: "complete",
+          code,
+          stdout,
+          stderr,
+        }),
+      );
+      const timeout = new Promise<TSecurityOutcome>((resolve) => {
+        timer = setTimeout(
+          () => resolve({ kind: "timeout" }),
+          securitySpawnTimeoutMs(),
+        );
+      });
+      const outcome = await Promise.race([complete, timeout]);
+      if (outcome.kind === "timeout") {
+        proc.kill();
+        logError("keychain", "security command timed out", {
+          argv: redactSecurityArgv(["security", ...argv]),
+        });
+        return FAILED_SPAWN;
+      }
+      // Through the `--sandbox-exec` shim the daemon sees `128 + signal` as an
+      // exit CODE, not a signalCode, so this only fires for a kill of the shim
+      // itself; a sandbox kill of the `security` child is attributed by the
+      // SHIM's own log line (command name only — already redacted, never the
+      // `-w` OAuth payload). Kept for the unwrapped paths. `security` is spawned
+      // with the same `probe` flag, so its confinement matches: unwrapped on
+      // macOS (securityd refuses a confined caller) ⇒ an unconfined kill.
+      logIfKilled(redactSecurityArgv(["security", ...argv]), proc, {
+        confined: unwrapKeychainSpawn() !== true,
+      });
+      return {
+        code: outcome.code,
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+      };
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
   } catch {
-    return false;
+    return FAILED_SPAWN;
   }
 };
 
-// Keychains we've already created+unlocked this process. Auto-lock is
-// disabled, so a keychain stays unlocked for the daemon's lifetime — no
-// need to re-spawn `security` on every status poll (which runs ~every 5s).
-const ensuredKeychains = new Set<string>();
+/** Boolean convenience over `spawnSecurity` for the fire-and-check callers. */
+const runSecurity = async (
+  argv: ReadonlyArray<string>,
+  home: string,
+): Promise<boolean> =>
+  (await spawnSecurity(argv, home, { stdout: "ignore", stderr: "ignore" }))
+    .code === 0;
 
-// In-flight ensures, keyed by keychain path. The status watcher fires every
-// ~2.5s and is NOT serialized, so a slow `status()` lets ticks overlap; without
-// this, concurrent callers would race `security create-keychain` on the same
-// path and collide with `errSecDuplicateKeychain`. Overlapping callers instead
-// await the SAME operation.
-const inFlightKeychains = new Map<string, Promise<void>>();
+// In-flight ensures, keyed by keychain path — the SINGLE owner of the
+// create/heal race. The status watcher fires every ~2.5s and is NOT
+// serialized, so a slow `status()` lets ticks overlap; without this,
+// concurrent callers would race `create-keychain` (and rename-aside) on the
+// same path. Overlapping callers instead await the SAME operation. There is
+// deliberately NO positive "already unlocked" cache: it used to skip the
+// re-unlock on the assumption auto-lock was disabled — the exact assumption
+// that fails when a chain auto-locks or its password drifts, leaving a later
+// dump to hit a locked chain and prompt. `unlock -p ""` is cheap + idempotent
+// + silent on an empty-password chain, so we simply unlock every ensure.
+const inFlightKeychains = new Map<string, Promise<TStoreRead<void>>>();
+
+// A chain we recreated once this process (bounds self-heal to one attempt per
+// path per process — launchd KeepAlive resets it on restart).
+const healedKeychains = new Set<string>();
+
+// A chain whose empty-password unlock is auth-failed AND whose recreate also
+// failed: give up until restart. `ensureKeychainReady` short-circuits on these
+// with ZERO spawns, so a hopeless chain stops re-prompting every 2.5s.
+const unusableKeychains = new Set<string>();
 
 // Throttle the create-failure log so a persistent failure doesn't spam the
-// error stream on every ~2.5s status tick (it used to re-log forever because a
-// failure never entered `ensuredKeychains`). One line per keychain per window.
+// error stream on every ~2.5s status tick. One line per keychain per window.
 const lastKeychainFailureLogMs = new Map<string, number>();
 const KEYCHAIN_FAILURE_LOG_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -109,23 +210,152 @@ const logKeychainFailure = (kc: string): void => {
   );
 };
 
+const logSelfHeal = (kc: string): void =>
+  logError(
+    "keychain",
+    "recreated a drifted isolated login keychain (empty-password unlock failed); the provider will require re-login",
+    { keychain: kc },
+  );
+
+/** errSecAuthFailed (-25293) / errSecInvalidKeychain (-25295) / the passphrase
+ *  message ⇒ the empty password genuinely no longer works (recreate).
+ *  Everything else — incl. an empty stderr the sandbox shim may swallow, a
+ *  user-canceled (-128), or interaction-not-allowed (-25308) — is treated as
+ *  TRANSIENT: do NOT recreate (fail-safe; the readiness gate already prevents
+ *  any prompt), so a transient securityd hiccup never nukes a good credential. */
+const classifyUnlockFailure = (stderr: string): "auth" | "transient" => {
+  const s = stderr.toLowerCase();
+  if (
+    s.includes("-25293") ||
+    s.includes("-25295") ||
+    s.includes("passphrase you entered") ||
+    s.includes("username or passphrase")
+  )
+    return "auth";
+  return "transient";
+};
+
+/** Create + configure the isolated login keychain at `kc`. macOS `securityd`
+ *  REFUSES `create-keychain` at the RESERVED `login.keychain-db` name inside
+ *  the $HOME subtree under Seatbelt (it routes through session login-keychain
+ *  machinery that needs the real `~/Library/Keychains` the deny-$HOME policy
+ *  blocks → `errSec 161` or a GUI auth prompt). So create + configure at a
+ *  NON-reserved staging name, THEN atomically rename into place. Auto-lock is
+ *  disabled on the STAGING name only (set-keychain-settings on the reserved
+ *  name pops "User canceled" under the sandbox); the setting persists through
+ *  the rename. See docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §3.
+ *  Returns whether `kc` now exists. */
+const createIsolatedKeychain = async (
+  home: string,
+  kc: string,
+): Promise<boolean> => {
+  const dir = dirname(kc);
+  await mkdir(dir, { recursive: true });
+  const staging = join(dir, `.openllm-staging-${process.pid}.keychain-db`);
+  // Sweep orphaned staging files from a prior run that crashed between create +
+  // rename (the filename carries the pid). Best-effort. `.broken-*` files (a
+  // rename-aside from self-heal) are deliberately LEFT for forensics/recovery.
+  try {
+    for (const f of await readdir(dir)) {
+      if (f.startsWith(".openllm-staging-") && f.endsWith(".keychain-db")) {
+        await rm(join(dir, f), { force: true });
+      }
+    }
+  } catch {
+    // dir unreadable / race — non-fatal
+  }
+  const created = await runSecurity(["create-keychain", "-p", "", staging], home);
+  if (created) {
+    await runSecurity(["set-keychain-settings", staging], home);
+    try {
+      await rename(staging, kc);
+    } catch {
+      await rm(staging, { force: true });
+    }
+  } else {
+    await rm(staging, { force: true });
+  }
+  return existsSync(kc);
+};
+
+/** Rename the drifted chain aside (reversible, forensic), recreate fresh, and
+ *  unlock. Returns whether the fresh chain unlocked with the empty password. */
+const recreateIsolatedKeychain = async (
+  home: string,
+  kc: string,
+): Promise<boolean> => {
+  const aside = `${kc}.broken-${process.pid}-${Date.now()}`;
+  try {
+    await rename(kc, aside);
+  } catch {
+    // Can't preserve it — remove so create can proceed. Best-effort.
+    try {
+      await rm(kc, { force: true });
+    } catch {
+      // still there — create will no-op and we return false below
+    }
+  }
+  logSelfHeal(kc);
+  if (!(await createIsolatedKeychain(home, kc))) return false;
+  return runSecurity(["unlock-keychain", "-p", "", kc], home);
+};
+
+/** Ensure the isolated login keychain exists and is UNLOCKED for this call,
+ *  reporting readiness as a tri-state. Create when missing; unlock with the
+ *  empty password; on a classified empty-password DRIFT of an existing file,
+ *  self-heal once (rename-aside + recreate); if it still won't unlock, mark it
+ *  unusable so callers stop touching it. A transient unlock failure stays
+ *  retryable (returns `indeterminate`, never recreates). No-op `present` off
+ *  macOS. */
+const ensureKeychainNow = async (
+  home: string,
+  kc: string,
+): Promise<TStoreRead<void>> => {
+  if (!existsSync(kc)) {
+    if (!(await createIsolatedKeychain(home, kc))) {
+      // A later `claude auth login` would pop "Keychain Not Found" and wedge.
+      logKeychainFailure(kc);
+      return { kind: "indeterminate", cause: "keychain_create_failed" };
+    }
+  }
+  // Unlock at the FINAL path (securityd keys unlock state by path). Unlocking
+  // the reserved name by explicit path is fine — only `create-keychain` at it
+  // fails. Capture stderr to classify a failure.
+  const res = await spawnSecurity(["unlock-keychain", "-p", "", kc], home, {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  if (res.code === 0) return READY;
+
+  if (classifyUnlockFailure(res.stderr) === "auth") {
+    if (!healedKeychains.has(kc)) {
+      healedKeychains.add(kc);
+      if (await recreateIsolatedKeychain(home, kc)) return READY;
+    }
+    // Auth-drift and (already healed OR recreate failed) → terminal.
+    unusableKeychains.add(kc);
+    return { kind: "indeterminate", cause: "keychain_unusable" };
+  }
+  // Transient — retryable next call; no recreate, no negative-cache.
+  return { kind: "indeterminate", cause: "keychain_unlock_transient" };
+};
+
 /**
- * macOS only: ensure an isolated, unlocked login keychain exists at
- * `<home>/Library/Keychains/login.keychain-db` so a CLI run with
- * `HOME=<home>` (e.g. `claude auth login`) can WRITE its credential
- * without the "Keychain Not Found" dialog. Empty password; auto-lock
- * disabled so subsequent reads don't prompt. Idempotent + process-cached;
- * concurrency-deduped; no-op off macOS.
+ * macOS only: ensure an isolated, unlocked login keychain and REPORT
+ * readiness. `present` ⇒ safe to run any keychain-touching op (our
+ * `dump-keychain`, `set-key-partition-list`, or the vendor CLI reading the
+ * store). `indeterminate` ⇒ a create/unlock failure or an unusable chain —
+ * callers MUST NOT proceed (that is the GUI-prompt path). Concurrency-deduped;
+ * negative-cached; `present` off macOS.
  */
-export const ensureIsolatedKeychain = async (home: string): Promise<void> => {
-  if (!MAC) return;
+export const ensureKeychainReady = async (
+  home: string,
+): Promise<TStoreRead<void>> => {
+  if (!MAC) return READY;
   const kc = loginKeychainPath(home);
-  // The cache skips re-spawning `security` on the hot path (the ~2.5s status
-  // watcher), but ALWAYS re-verify the file still exists first — `existsSync`
-  // is cheap (no spawn) and a missing keychain (deleted out from under us, or a
-  // fresh install) must be recreated, or `claude auth login` later pops the
-  // "Keychain Not Found" dialog.
-  if (ensuredKeychains.has(kc) && existsSync(kc)) return;
+  if (unusableKeychains.has(kc)) {
+    return { kind: "indeterminate", cause: "keychain_unusable" };
+  }
   const pending = inFlightKeychains.get(kc);
   if (pending !== undefined) return pending;
   const op = ensureKeychainNow(home, kc).finally(() => {
@@ -135,76 +365,29 @@ export const ensureIsolatedKeychain = async (home: string): Promise<void> => {
   return op;
 };
 
-const ensureKeychainNow = async (home: string, kc: string): Promise<void> => {
-  if (!existsSync(kc)) {
-    ensuredKeychains.delete(kc); // stale cache entry — file is gone
-    const dir = dirname(kc);
-    await mkdir(dir, { recursive: true });
-    // macOS `securityd` REFUSES to `create-keychain` at the RESERVED
-    // `login.keychain-db` name when it sits inside the $HOME subtree under the
-    // Seatbelt sandbox: it routes through the session login-keychain machinery,
-    // which needs the real `~/Library/Keychains` the deny-$HOME read policy
-    // blocks → `errSec 161` (no file) or a GUI auth prompt. So create +
-    // configure at a NON-reserved staging name (which securityd treats as an
-    // ordinary keychain), THEN atomically rename the finished file into place.
-    // Claude finds `login.keychain-db` by default-resolution and our own reads
-    // use the explicit path. See
-    // docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §3.
-    const staging = join(dir, `.openllm-staging-${process.pid}.keychain-db`);
-    // Sweep orphaned staging files from a prior run that crashed between
-    // create + rename (the filename carries the pid, so they'd otherwise
-    // accumulate). Best-effort.
-    try {
-      for (const f of await readdir(dir)) {
-        if (f.startsWith(".openllm-staging-") && f.endsWith(".keychain-db")) {
-          await rm(join(dir, f), { force: true });
-        }
-      }
-    } catch {
-      // dir unreadable / race — non-fatal
-    }
-    const created = await runSecurity(
-      ["create-keychain", "-p", "", staging],
-      home,
-    );
-    if (created) {
-      // Disable auto-lock on the STAGING name (set-keychain-settings on the
-      // reserved name pops "User canceled the operation" under the sandbox);
-      // the setting persists in the file through the rename.
-      await runSecurity(["set-keychain-settings", staging], home);
-      try {
-        await rename(staging, kc);
-      } catch {
-        await rm(staging, { force: true });
-      }
-    } else {
-      await rm(staging, { force: true });
-    }
-    // If the file STILL isn't there, a later `claude auth login` will pop the
-    // "Keychain Not Found" dialog and WEDGE. Surface it (throttled) so the real
-    // cause is in openllmd.err.log without spamming every status tick.
-    if (!existsSync(kc)) {
-      logKeychainFailure(kc);
-      return; // not ensured; retried next call
-    }
-  }
-  // Unlock at the FINAL path (securityd keys unlock state by path, so re-unlock
-  // after the rename). Unlocking the reserved name by explicit path is fine —
-  // only `create-keychain` at it fails. Cache ONLY a successful unlock: a
-  // failed one must be retried on the next call, not remembered as ensured
-  // (a locked keychain wedges `claude auth login` just like a missing one).
-  const unlocked = await runSecurity(["unlock-keychain", "-p", "", kc], home);
-  if (unlocked) ensuredKeychains.add(kc);
+/**
+ * macOS only: ensure the isolated login keychain exists + is unlocked so a
+ * CLI run with `HOME=<home>` (e.g. `claude auth login`) can WRITE its
+ * credential without the "Keychain Not Found" dialog. Void wrapper over
+ * `ensureKeychainReady` for the create-so-login-can-write callers that
+ * legitimately ignore readiness (they must attempt creation regardless).
+ * No-op off macOS.
+ */
+export const ensureIsolatedKeychain = async (home: string): Promise<void> => {
+  await ensureKeychainReady(home);
 };
 
 /**
  * macOS only: grant command-line tools prompt-free access to the items in
  * the isolated keychain. Run AFTER a login writes them, so our later
  * `security find-generic-password` reads don't trigger the "security
- * wants to access the keychain" GUI prompt. Best-effort.
+ * wants to access the keychain" GUI prompt. Gated on readiness: a locked /
+ * unusable chain is skipped (its `set-key-partition-list` could prompt).
+ * Best-effort.
  */
 export const grantKeychainToolAccess = async (home: string): Promise<void> => {
   if (!MAC) return;
+  if ((await ensureKeychainReady(home)).kind !== "present") return;
   await runSecurity(
     [
       "set-key-partition-list",
@@ -224,85 +407,44 @@ export const grantKeychainToolAccess = async (home: string): Promise<void> => {
  * that STARTS WITH `prefix`. Claude suffixes its keychain service with a
  * per-install hash (e.g. `Claude Code-credentials-753e4afa`) so multiple
  * configs don't collide, so an exact-name lookup misses it. `dump-keychain`
- * lists attributes only (no `-d`), so it doesn't prompt for secrets.
+ * lists attributes only (no `-d`), so it doesn't prompt for item SECRETS —
+ * but it DOES open the keychain, so callers MUST have a `present` readiness
+ * first (a locked chain would prompt). `readIsolatedKeychain` enforces that.
  */
 export const findKeychainServices = async (
   home: string,
   prefix: string,
 ): Promise<TStoreRead<ReadonlyArray<string>>> => {
-  try {
-    const proc = Bun.spawn(
-      sandboxSpawnArgs(["security", "dump-keychain", loginKeychainPath(home)], {
-        probe: unwrapKeychainSpawn(),
-      }),
-      {
-        stdout: "pipe",
-        stderr: "ignore",
-        cwd: spawnCwd({ HOME: home }),
-        env: { ...process.env, HOME: home },
-      },
-    );
-    const out = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    logIfKilled(
-      redactSecurityArgv([
-        "security",
-        "dump-keychain",
-        loginKeychainPath(home),
-      ]),
-      proc,
-      { confined: unwrapKeychainSpawn() !== true },
-    );
-    if (code !== 0) {
-      return { kind: "indeterminate", cause: `dump-keychain_exit_${code}` };
-    }
-    const names = new Set<string>();
-    for (const line of out.split("\n")) {
-      const m = line.match(/"svce"<blob>="([^"]*)"/);
-      if (m?.[1]?.startsWith(prefix) === true) {
-        names.add(m[1]);
-      }
-    }
-    return { kind: "present", value: [...names] };
-  } catch (err) {
-    return {
-      kind: "indeterminate",
-      cause: err instanceof Error ? err.name : "dump-keychain_failed",
-    };
+  const { code, stdout } = await spawnSecurity(
+    ["dump-keychain", loginKeychainPath(home)],
+    home,
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  if (code !== 0) {
+    return { kind: "indeterminate", cause: `dump-keychain_exit_${code}` };
   }
+  const names = new Set<string>();
+  for (const line of stdout.split("\n")) {
+    const m = line.match(/"svce"<blob>="([^"]*)"/);
+    if (m?.[1]?.startsWith(prefix) === true) {
+      names.add(m[1]);
+    }
+  }
+  return { kind: "present", value: [...names] };
 };
 
 const readKeychainSecret = async (
   home: string,
   service: string,
 ): Promise<string | null> => {
-  try {
-    const proc = Bun.spawn(
-      sandboxSpawnArgs(
-        [
-          "security",
-          "find-generic-password",
-          "-s",
-          service,
-          "-w",
-          loginKeychainPath(home),
-        ],
-        { probe: unwrapKeychainSpawn() },
-      ),
-      {
-        stdout: "pipe",
-        stderr: "ignore",
-        cwd: spawnCwd({ HOME: home }),
-        env: { ...process.env, HOME: home },
-      },
-    );
-    const out = await new Response(proc.stdout).text();
-    if ((await proc.exited) !== 0) return null;
-    const trimmed = out.trim();
-    return trimmed.length > 0 ? trimmed : null;
-  } catch {
-    return null;
-  }
+  const { code, stdout } = await spawnSecurity(
+    ["find-generic-password", "-s", service, "-w", loginKeychainPath(home)],
+    home,
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  if (code !== 0) return null;
+  const trimmed = stdout.trim();
+  return trimmed.length > 0 ? trimmed : null;
 };
 
 /**
@@ -311,7 +453,9 @@ const readKeychainSecret = async (
  * hash suffix, so we match by prefix and try each candidate). `validate`
  * rejects a wrong-but-matching item — the first valid payload wins.
  * Returns `absent` off macOS / when no matching item exists;
- * `indeterminate` when dump-keychain or secret read fails.
+ * `indeterminate` when the keychain isn't ready (locked / unusable) or when
+ * dump-keychain / secret read fails. NEVER dumps a not-ready chain (that is
+ * the GUI-prompt path).
  */
 export const readIsolatedKeychain = async (
   home: string,
@@ -319,7 +463,8 @@ export const readIsolatedKeychain = async (
   validate?: (payload: string) => boolean,
 ): Promise<TStoreRead<string>> => {
   if (!MAC) return { kind: "absent" };
-  await ensureIsolatedKeychain(home); // ensure present + unlocked
+  const ready = await ensureKeychainReady(home);
+  if (ready.kind !== "present") return ready; // locked / unusable — no dump
   const services = await findKeychainServices(home, servicePrefix);
   if (services.kind !== "present") return services;
   if (services.value.length === 0) return { kind: "absent" };
@@ -344,45 +489,4 @@ export const readIsolatedKeychain = async (
       cause: err instanceof Error ? err.name : "keychain_read_failed",
     };
   }
-};
-
-/**
- * Update an existing generic-password item in the ISOLATED login keychain
- * (matching `servicePrefix` — Claude's suffixed service name) with a new
- * `payload`. Used to write a daemon-refreshed OAuth blob back so the
- * isolated CLI stays in sync (same access/refresh token + expiry).
- *
- * `-U` updates the item's secret IN PLACE. We deliberately do NOT pass
- * `-A`: that rewrites the item's ACL, which macOS gate-keeps behind a GUI
- * keychain-password prompt a headless daemon can't answer. Instead we
- * re-run the partition-list grant (password supplied inline via `-k ""`,
- * no prompt) so `security` keeps write access. Returns false off macOS /
- * when no matching item exists.
- */
-export const writeIsolatedKeychain = async (
-  home: string,
-  servicePrefix: string,
-  payload: string,
-): Promise<boolean> => {
-  if (!MAC) return false;
-  await ensureIsolatedKeychain(home);
-  await grantKeychainToolAccess(home); // authorize tool writes (no prompt)
-  const services = await findKeychainServices(home, servicePrefix);
-  const service = services.kind === "present" ? services.value[0] : undefined;
-  if (service === undefined) return false;
-  const account = process.env.USER ?? "";
-  return runSecurity(
-    [
-      "add-generic-password",
-      "-U",
-      "-s",
-      service,
-      "-a",
-      account,
-      "-w",
-      payload,
-      loginKeychainPath(home),
-    ],
-    home,
-  );
 };

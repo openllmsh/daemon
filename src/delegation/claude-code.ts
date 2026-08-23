@@ -57,6 +57,7 @@ import type { TStoreRead } from "./util";
 import {
   cliVersion,
   ensureIsolatedKeychain,
+  ensureKeychainReady,
   grantKeychainToolAccess,
   readIsolatedKeychain,
   readJsonStore,
@@ -139,7 +140,10 @@ const readAccountHash = async (): Promise<string | null> => {
  * capture stays disabled (`liveCapture:false`).
  */
 const triggerRefresh = async (): Promise<void> => {
-  await ensureIsolatedKeychain(cliHome(PROVIDER));
+  // A locked/unusable isolated keychain must NOT reach `claude -p ping`: the
+  // vendor CLI would open it and pop the SecurityAgent dialog (and it can't
+  // refresh a credential it can't read). Skip when not ready.
+  if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") return;
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
@@ -435,11 +439,21 @@ export const claudeCodeDelegate: TProviderDelegate = {
         detail: "claude CLI not installed",
       };
     }
-    // macOS: make sure the isolated login keychain is unlocked so
-    // `claude auth status` can read the credential it stored there (else
-    // it would falsely report signed-out). Process-cached, so this is
-    // free after the first call. No-op elsewhere.
-    await ensureIsolatedKeychain(cliHome(PROVIDER));
+    // macOS: the isolated login keychain must be unlocked so `claude auth
+    // status` can read the credential it stored there. If it is NOT ready
+    // (locked / drifted / unusable), the vendor CLI would open a locked chain
+    // and pop the SecurityAgent dialog on every ~2.5s tick — so stop here and
+    // report a status-check failure (NOT signed-out). No-op `present`
+    // elsewhere.
+    if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
+      return {
+        provider: PROVIDER,
+        connected: false,
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
     // Prefer the CLI's own `auth status`; fall back to the store read
     // when it's unavailable / unparseable.
     const viaAuth = await authStatusLoggedIn();
@@ -622,8 +636,13 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // `claude auth logout` clears the isolated login credential (keychain item
     // on macOS, .credentials.json on Linux).
     if ((await cliInstallState(PROVIDER)).installed) {
-      await ensureIsolatedKeychain(cliHome(PROVIDER)); // macOS: reach the store
-      await runCapture([bin(), "auth", "logout"], env());
+      // Only run `claude auth logout` when the keychain is reachable — a
+      // locked/unusable chain would pop the dialog, and the credential is
+      // effectively gone anyway. The Linux `.credentials.json` rm below still
+      // runs regardless.
+      if ((await ensureKeychainReady(cliHome(PROVIDER))).kind === "present") {
+        await runCapture([bin(), "auth", "logout"], env());
+      }
     }
     // Belt-and-braces on Linux: drop the credentials file if it lingers.
     if (platform() !== "darwin") {
