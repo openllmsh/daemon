@@ -108,10 +108,16 @@ export const noteConnectionsForQuota = (
     const resetEpoch = sustainingWindowResetAtMs(next, usage.windows);
     const key = quotaKey(connection.provider, connection.account_hash);
     const previous = lastQuotaStatus.get(key);
-    const epochChanged = previous?.resetEpoch !== resetEpoch;
+    const prevEpoch = previous?.resetEpoch;
+    // Only a strictly later finite window re-arms. Missing or smaller epochs
+    // are vendor flaps of the same window, not a new billing period.
+    const epochAdvanced =
+      resetEpoch !== undefined &&
+      prevEpoch !== undefined &&
+      resetEpoch > prevEpoch;
     if (
       (next === "allowed_warning" || next === "rejected") &&
-      (isNotifiableTransition(previous?.status, next) || epochChanged)
+      (isNotifiableTransition(previous?.status, next) || epochAdvanced)
     ) {
       transitions.push({
         slug: connection.provider,
@@ -123,7 +129,12 @@ export const noteConnectionsForQuota = (
         ...(resetEpoch === undefined ? {} : { reset_at_ms: resetEpoch }),
       });
     }
-    lastQuotaStatus.set(key, { status: next, resetEpoch });
+    const effectiveEpoch =
+      resetEpoch !== undefined &&
+      (prevEpoch === undefined || resetEpoch >= prevEpoch)
+        ? resetEpoch
+        : prevEpoch;
+    lastQuotaStatus.set(key, { status: next, resetEpoch: effectiveEpoch });
   }
 
   return transitions;

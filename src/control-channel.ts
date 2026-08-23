@@ -29,6 +29,7 @@ import {
 } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
 import { isSubscriptionSlug } from "./delegation";
+import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
@@ -274,6 +275,9 @@ const confirmSessionLosses = (
       pendingSessionLossNotifications.delete(slug);
       continue;
     }
+    // Indeterminate reads must not count as confirmations — hold the pending
+    // until a determinate snapshot recovers or confirms a real disconnect.
+    if (connection.detail === STATUS_CHECK_FAILED_DETAIL) continue;
     pending.observations += 1;
     if (pending.observations < SESSION_LOSS_SETTLE_STATUS_CYCLES) continue;
     pendingSessionLossNotifications.delete(slug);
