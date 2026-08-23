@@ -636,13 +636,18 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // `claude auth logout` clears the isolated login credential (keychain item
     // on macOS, .credentials.json on Linux).
     if ((await cliInstallState(PROVIDER)).installed) {
-      // Only run `claude auth logout` when the keychain is reachable — a
-      // locked/unusable chain would pop the dialog, and the credential is
-      // effectively gone anyway. The Linux `.credentials.json` rm below still
-      // runs regardless.
-      if ((await ensureKeychainReady(cliHome(PROVIDER))).kind === "present") {
-        await runCapture([bin(), "auth", "logout"], env());
+      // macOS: without a reachable isolated keychain we can neither run
+      // `claude auth logout` (it would pop the SecurityAgent dialog) nor verify
+      // the clear — report failure rather than a logout we didn't perform.
+      // Off macOS `ensureKeychainReady` is always `present`, so this is a no-op
+      // there and the Linux `.credentials.json` rm below still runs.
+      if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
+        return {
+          ok: false,
+          detail: "could not reach the credential store to sign out",
+        };
       }
+      await runCapture([bin(), "auth", "logout"], env());
     }
     // Belt-and-braces on Linux: drop the credentials file if it lingers.
     if (platform() !== "darwin") {

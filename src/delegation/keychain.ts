@@ -124,6 +124,10 @@ const spawnSecurity = async (
           stderr,
         }),
       );
+      // If the timeout wins the race, `complete` stays pending; consume a late
+      // rejection (an aborted pipe read after `proc.kill()`) so it can never
+      // surface as an unhandledRejection.
+      void complete.catch(() => {});
       const timeout = new Promise<TSecurityOutcome>((resolve) => {
         timer = setTimeout(
           () => resolve({ kind: "timeout" }),
