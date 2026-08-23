@@ -15,7 +15,7 @@
  * there is no cycle.
  */
 
-import { clearPendingAuth, setPendingAuth } from "../pending-auth";
+import { clearPendingAuth } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type {
   TConnectResult,
@@ -25,12 +25,12 @@ import type {
 } from "./login-flow";
 import {
   emitLoginFailed,
-  emitLoginPrompt,
   emitLoginStarted,
   emitLoginSucceeded,
   finalizeLoginTerminal,
   guard,
   openAuthUrlUnlessCancelled,
+  publishPendingAuth,
   resolveLoginFlow,
   spawnStreamLogin,
   streamLoginFail,
@@ -186,12 +186,7 @@ export const makeStreamConnect = (
         cfg.onParsed?.(res.found.url);
         const flow =
           cfg.slot.flow() ?? resolveLoginFlow(cfg.provider, "browser");
-        setPendingAuth(cfg.provider, {
-          url: res.found.url,
-          code: res.found.code,
-          flowId: flow.flowId,
-        });
-        emitLoginPrompt(flow, res.found);
+        publishPendingAuth(flow, cfg.provider, res.found);
         return {
           connected: false,
           pending: true,
@@ -381,12 +376,7 @@ export const makeDeviceCodeConnect = (
         // machine than the user's browser). The browser is already up (above);
         // on a remote box it opens nothing useful but the dashboard shows these
         // so the user authorizes from THEIR machine.
-        setPendingAuth(cfg.provider, {
-          url: auth.verificationUriComplete,
-          code: auth.userCode,
-          flowId: flow.flowId,
-        });
-        emitLoginPrompt(flow, {
+        publishPendingAuth(flow, cfg.provider, {
           url: auth.verificationUriComplete,
           code: auth.userCode,
         });

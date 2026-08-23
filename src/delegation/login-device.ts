@@ -16,17 +16,17 @@
  * cancels whichever flow is live. Provider atoms are injected — no delegate import.
  */
 
-import { pendingAuthDetail, setPendingAuth } from "../pending-auth";
+import { pendingAuthDetail } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TConnectResult, TLoginSlot } from "./login-flow";
 import {
   emitLoginFailed,
-  emitLoginPrompt,
   emitLoginStarted,
   finishInBackground,
   guard,
   makeCancelConnect,
   openAuthUrlUnlessCancelled,
+  publishPendingAuth,
   resolveLoginFlow,
   spawnStreamLogin,
   streamLoginFail,
@@ -130,10 +130,8 @@ export const makePasteBackDevice = (
           url: login.url,
           code: "",
           mode: "paste_code" as const,
-          flowId: flow.flowId,
         };
-        setPendingAuth(cfg.provider, auth);
-        emitLoginPrompt(flow, { url: login.url, code: "" });
+        publishPendingAuth(flow, cfg.provider, auth);
         // On exit (success, cancel, or expiry) drop the handle + the stale
         // pending URL; on success run onConnected (warn + refresh auth config).
         // Wait for any in-flight submit FIRST so the keychain grant lands before
@@ -282,12 +280,7 @@ export const makeStreamDeviceConnect = (
         }
         const flow =
           cfg.slot.flow() ?? resolveLoginFlow(cfg.provider, "device_code");
-        setPendingAuth(cfg.provider, {
-          url: res.found.url,
-          code: res.found.code,
-          flowId: flow.flowId,
-        });
-        emitLoginPrompt(flow, res.found);
+        publishPendingAuth(flow, cfg.provider, res.found);
         return {
           connected: false,
           pending: true,

@@ -27,6 +27,7 @@ import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
+  setPendingAuth,
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DEFAULT_LOGIN_TIMEOUT_MS, redactUrls, spawnCwd } from "./spawn";
@@ -197,6 +198,28 @@ export const emitLoginPrompt = (
     ...(pending.code.length > 0 ? { code: pending.code } : {}),
     mode: flow.mode,
   });
+};
+
+/** Store the pending snapshot then emit `auth.login.prompt` — the pair every
+ *  live login uses once a URL (± code) is known. `flow.flowId` is stamped onto
+ *  the stored snapshot; `mode` is only written when the caller supplies it
+ *  (`paste_code`). Order matches the former inline pair. */
+export const publishPendingAuth = (
+  flow: TLoginFlowCtx,
+  provider: string,
+  pending: {
+    readonly url: string;
+    readonly code: string;
+    readonly mode?: TPendingAuth["mode"];
+  },
+): void => {
+  setPendingAuth(provider, {
+    url: pending.url,
+    code: pending.code,
+    ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
+    flowId: flow.flowId,
+  });
+  emitLoginPrompt(flow, { url: pending.url, code: pending.code });
 };
 
 export const emitLoginSucceeded = (flow: TLoginFlowCtx): void => {
