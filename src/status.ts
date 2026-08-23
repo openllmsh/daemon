@@ -61,6 +61,18 @@ if (DELEGATE_STATUS_TIMEOUT_MS < DEFAULT_CAPTURE_TIMEOUT_MS) {
 // otherwise omit the unknown installation state rather than serializing it as
 // a definitive `false` to the cloud.
 const lastKnownConnections = new Map<string, TDaemonProviderConnection>();
+
+/** Mechanical projection until Phase 2 can set `signed_out` on logout.
+ *  Leaves an already-populated `status` (e.g. last-known) untouched. */
+const withAuthStatus = (
+  conn: TDaemonProviderConnection,
+): TDaemonProviderConnection =>
+  conn.status !== undefined
+    ? conn
+    : {
+        ...conn,
+        status: conn.connected ? "connected" : "disconnected",
+      };
 const timedOutSlugs = new Set<string>();
 
 /** Test-only: the last-known map is process-global and leaks across suites. */
@@ -219,7 +231,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     port: daemonPort(),
     sandbox: sandboxState(),
     caps: currentDaemonCaps(),
-    connections,
+    connections: connections.map(withAuthStatus),
     // TTL-cached CLI probe from `getCliState()`. It returns cached state when fresh
     // and schedules a background refresh when stale, so status can stay responsive
     // without blocking and without manifest scans.
