@@ -218,6 +218,8 @@ const triggerRefresh = async (): Promise<void> => {
 // Within leeway → refresh in the background (token still valid, no stall);
 // hard-expired → await it. Single-flight per provider.
 const refresh = makeRefresher({
+  slug: PROVIDER,
+  label: "Grok",
   leewayMs: REFRESH_LEEWAY_MS,
   trigger: triggerRefresh,
 });

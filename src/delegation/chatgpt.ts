@@ -29,7 +29,7 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
-import { logError, logInfo } from "../logger";
+import { logError, logInfo, logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -47,7 +47,7 @@ import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
-import { makeRefresher, spawnRefresh } from "./refresh";
+import { isStaleRefresh, makeRefresher, spawnRefresh } from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
 import {
   reduceChatgptCredits,
@@ -154,6 +154,8 @@ const triggerRefresh = async (): Promise<void> => {
 // Within the leeway window → fire the CLI refresh in the background (still
 // valid, no stall); hard-expired → await it. Single-flight per provider.
 const refresh = makeRefresher({
+  slug: PROVIDER,
+  label: "ChatGPT",
   leewayMs: REFRESH_LEEWAY_MS,
   trigger: triggerRefresh,
 });
@@ -170,6 +172,17 @@ const readToken = async (): Promise<{
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
   const outcome = tokens.refresh_token ? await refresh(expiresAtMs) : "fresh";
+  if (isStaleRefresh(outcome)) {
+    logWarn("refresh", "returning stale expired credential", {
+      provider: PROVIDER,
+      phase: "refresh_fallback",
+      error_class: outcome.reason,
+    });
+    return {
+      accessToken: tokens.access_token,
+      accountId: tokens.account_id ?? null,
+    };
+  }
   if (outcome !== "awaited") {
     return {
       accessToken: tokens.access_token,

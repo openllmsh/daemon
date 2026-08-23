@@ -15,12 +15,15 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
+import { logWarn } from "../logger";
 import { spawnLogin, spawnLoginPty } from "./util";
 
 /** Bound on a refresh spawn — generous for a slow first call, short enough that
  *  a wedged child is reaped (the refresh already landed mid-request before the
  *  child's slow exit, so the timeout never costs correctness). */
 export const REFRESH_SPAWN_TIMEOUT_MS = 60_000;
+
+export type TRefreshErrorClass = "timeout" | "spawn_failed" | "rejected";
 
 /**
  * Run a bounded CLI invocation whose SIDE EFFECT is the CLI refreshing +
@@ -48,8 +51,41 @@ export type TRefreshOutcome =
   /** Within the window but still valid — refresh KICKED in the background; the
    *  current token is returned as-is (the store updates before it's next used). */
   | "kicked"
-  /** Hard-expired — the refresh was AWAITED; re-read the store for the new token. */
-  | "awaited";
+  /** Hard-expired — the refresh was AWAITED and the trigger settled cleanly;
+   *  re-read the store for the new token. */
+  | "awaited"
+  /** Hard-expired — the trigger rejected; keep the stale credential (the
+   *  upstream then 401s → re-login). */
+  | { readonly kind: "stale"; readonly reason: TRefreshErrorClass };
+
+export const isStaleRefresh = (
+  outcome: TRefreshOutcome,
+): outcome is { readonly kind: "stale"; readonly reason: TRefreshErrorClass } =>
+  typeof outcome === "object" && outcome.kind === "stale";
+
+const classifyRefreshError = (err: unknown): TRefreshErrorClass => {
+  const name = err instanceof Error ? err.name : "";
+  const message = err instanceof Error ? err.message : "";
+  const text = `${name} ${message}`.toLowerCase();
+  if (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    text.includes("timeout") ||
+    text.includes("timed out")
+  ) {
+    return "timeout";
+  }
+  if (
+    text.includes("spawn") ||
+    text.includes("enoent") ||
+    text.includes("eacces") ||
+    text.includes("eperm") ||
+    text.includes("eagain")
+  ) {
+    return "spawn_failed";
+  }
+  return "rejected";
+};
 
 /**
  * Build a per-provider refresher around its `trigger` (the CLI-refresh spawn).
@@ -61,23 +97,43 @@ export type TRefreshOutcome =
  *   - `>= leewayMs` remaining → `"fresh"` (no trigger).
  *   - within the window but still valid → fire the trigger in the BACKGROUND,
  *     return `"kicked"` (caller returns the current still-valid token — no stall).
- *   - hard-expired → AWAIT the trigger, return `"awaited"` (caller re-reads).
+ *   - hard-expired → AWAIT the trigger, return `"awaited"` (caller re-reads)
+ *     or `{ kind: "stale" }` if the trigger rejected (caller keeps the current
+ *     token).
  */
 export const makeRefresher = (opts: {
+  readonly slug: string;
+  readonly label: string;
   readonly leewayMs: number;
   readonly trigger: () => Promise<void>;
 }): ((expiresAtMs: number | null) => Promise<TRefreshOutcome>) => {
   let inFlight: Promise<void> | null = null;
+  let lastErrorClass: TRefreshErrorClass | null = null;
   const fire = (): Promise<void> => {
     if (inFlight === null) {
-      // SWALLOW a failed trigger (e.g. a spawn error): a refresh is best-effort.
-      // Rejecting would (a) leak an unhandled rejection from the background
-      // `void fire()` path and (b) throw out of the awaited hard-expired path —
-      // both wrong. On failure the store simply isn't refreshed and `readToken`
-      // falls back to the stale token (surfacing the vendor's own 401 → re-login).
+      const started = Date.now();
+      // A failed trigger is still best-effort: rejecting would (a) leak an
+      // unhandled rejection from the background `void fire()` path and (b)
+      // throw out of the awaited hard-expired path — both wrong. On failure
+      // the store simply isn't refreshed and `readToken` falls back to the
+      // stale token (surfacing the vendor's own 401 → re-login). Log a
+      // REDACTED class only — never the raw error / token.
       inFlight = opts
         .trigger()
-        .catch(() => {})
+        .then(() => {
+          lastErrorClass = null;
+        })
+        .catch((err: unknown) => {
+          lastErrorClass = classifyRefreshError(err);
+          logWarn("refresh", "native refresh trigger failed", {
+            provider: opts.slug,
+            label: opts.label,
+            phase: "refresh_trigger",
+            error_class: lastErrorClass,
+            elapsed_ms: Date.now() - started,
+            timeout_ms: REFRESH_SPAWN_TIMEOUT_MS,
+          });
+        })
         .finally(() => {
           inFlight = null;
         });
@@ -93,6 +149,9 @@ export const makeRefresher = (opts: {
       return "kicked";
     }
     await fire();
+    if (lastErrorClass !== null) {
+      return { kind: "stale", reason: lastErrorClass };
+    }
     return "awaited";
   };
 };

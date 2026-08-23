@@ -50,7 +50,7 @@ import { fetchModelList } from "./fetch-model-list";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
-import { makeRefresher, spawnRefresh } from "./refresh";
+import { isStaleRefresh, makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
 import type { TStoreRead } from "./util";
@@ -151,6 +151,8 @@ const triggerRefresh = async (): Promise<void> => {
 // Within the leeway window → fire the CLI refresh in the background (still
 // valid, no stall); hard-expired → await it. Single-flight per provider.
 const refresh = makeRefresher({
+  slug: PROVIDER,
+  label: "Claude Code",
   leewayMs: REFRESH_LEEWAY_MS,
   trigger: triggerRefresh,
 });
@@ -172,6 +174,14 @@ const readToken = async (): Promise<{
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
   const outcome = oauth.refreshToken ? await refresh(expiresAtMs) : "fresh";
+  if (isStaleRefresh(outcome)) {
+    logWarn("refresh", "returning stale expired credential", {
+      provider: PROVIDER,
+      phase: "refresh_fallback",
+      error_class: outcome.reason,
+    });
+    return { accessToken: oauth.accessToken, expiresAtMs };
+  }
   if (outcome !== "awaited") {
     return { accessToken: oauth.accessToken, expiresAtMs };
   }

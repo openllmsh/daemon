@@ -222,6 +222,8 @@ const triggerRefresh = async (): Promise<void> => {
 // Within the leeway window → fire the CLI refresh in the background (still
 // valid, no stall); hard-expired → await it. Single-flight per provider.
 const refresh = makeRefresher({
+  slug: PROVIDER,
+  label: "Kimi Code",
   leewayMs: REFRESH_LEEWAY_MS,
   trigger: triggerRefresh,
 });

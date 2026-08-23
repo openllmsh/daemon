@@ -226,6 +226,8 @@ const triggerRefresh = async (): Promise<void> => {
 };
 
 const refresh = makeRefresher({
+  slug: PROVIDER,
+  label: "Cursor",
   leewayMs: REFRESH_LEEWAY_MS,
   trigger: triggerRefresh,
 });
