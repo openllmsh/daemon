@@ -46,6 +46,7 @@ import type {
   TCooldownReason,
   TDaemonRecordRequest,
   TErrorEnvelope,
+  TModelCaps,
   TProviderUsageSnapshot,
   TRequestStatus,
   TServerSearchCall,
@@ -287,6 +288,8 @@ type THop = {
    * plan payload; resolved locally from the bootstrap catalog.
    */
   readonly capabilities: ReadonlyArray<string>;
+  /** Catalog-declared final outbound-body constraints, resolved locally. */
+  readonly caps?: TModelCaps;
 };
 
 /** Parse `?__plan=provider/model,provider/model` into ordered model ids.
@@ -311,8 +314,9 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
   const provider = slash > 0 ? modelId.slice(0, slash) : modelId;
   const entry = lookupCatalogEntry(modelId);
   const capabilities = entry?.capabilities ?? [];
+  const caps = entry?.caps;
   if (providerModelId !== undefined && providerModelId.length > 0) {
-    return { modelId, provider, providerModelId, capabilities };
+    return { modelId, provider, providerModelId, capabilities, caps };
   }
   if (entry !== null) {
     return {
@@ -320,6 +324,7 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
       provider: entry.provider,
       providerModelId: entry.provider_model_id,
       capabilities,
+      caps,
     };
   }
   return slash > 0
@@ -328,8 +333,15 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
         provider,
         providerModelId: modelId.slice(slash + 1),
         capabilities,
+        caps,
       }
-    : { modelId, provider: modelId, providerModelId: modelId, capabilities };
+    : {
+        modelId,
+        provider: modelId,
+        providerModelId: modelId,
+        capabilities,
+        caps,
+      };
 };
 
 /**
@@ -1186,6 +1198,7 @@ const serveSubscription = async (
       inboundBeta: inboundBetaOf(args),
       isOAuth: wire === "anthropic",
       codexInstructions: wantsCodexPreamble(hop.provider),
+      caps: hop.caps,
       capabilities: hop.capabilities,
     });
   } catch (err) {
@@ -3271,6 +3284,7 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
       baseHeaders: acquired.headers,
       inboundBeta: inboundBetaOf(args),
       isOAuth: true,
+      caps: hop.caps,
       capabilities: hop.capabilities,
     });
   } catch (err) {
@@ -3361,6 +3375,7 @@ export const runResponsesCompact = async (
       inboundBeta: null,
       isOAuth: false,
       codexInstructions: wantsCodexPreamble("chatgpt"),
+      caps: compactHop?.caps,
       capabilities: compactHop?.capabilities ?? [],
     });
   } catch (err) {
