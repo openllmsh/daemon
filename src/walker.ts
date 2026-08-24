@@ -1179,6 +1179,7 @@ const serveSubscription = async (
       surface: args.surface,
       upstreamWire: wire,
       rawBody: args.rawBody,
+      provider: hop.provider,
       providerModelId: hop.providerModelId,
       stream: clientWantsStream,
       baseHeaders,
@@ -3262,6 +3263,7 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
       surface: "messages",
       upstreamWire: "anthropic",
       rawBody: args.rawBody,
+      provider: hop.provider,
       providerModelId: hop.providerModelId,
       // `undefined` preserves the body's own stream flag — a count_tokens body
       // carries none, and injecting one would diverge from the real CLI.
@@ -3352,6 +3354,7 @@ export const runResponsesCompact = async (
       surface: "responses",
       upstreamWire: "chatgpt",
       rawBody: args.rawBody,
+      provider: "chatgpt",
       providerModelId,
       stream: false,
       baseHeaders: acquired.headers,
