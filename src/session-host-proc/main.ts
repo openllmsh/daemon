@@ -359,6 +359,7 @@ export const runSessionHost = (
 
   let server: Bun.Server<TSocketData> | null = null;
   let activityTimer: ReturnType<typeof setInterval> | null = null;
+  let ownerTimer: ReturnType<typeof setInterval> | null = null;
   let cleaned = false;
   let ownsClaim = false;
   let meta: TSessionHostMeta | null = null;
@@ -374,6 +375,7 @@ export const runSessionHost = (
     if (cleaned) return;
     cleaned = true;
     if (activityTimer !== null) clearInterval(activityTimer);
+    if (ownerTimer !== null) clearInterval(ownerTimer);
     server?.stop(true);
     if (published) rmSync(directory, { recursive: true, force: true });
     rmSync(stagingDirectory, { recursive: true, force: true });
@@ -570,6 +572,24 @@ export const runSessionHost = (
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+
+  // The trace harness marks only its source-client children. A host launched
+  // from that client may be detached, so it must reap itself when that exact
+  // owner exits rather than relying on broad session-directory cleanup.
+  const ownerPid = Number.parseInt(
+    process.env.OPENLLM_SESSION_HOST_OWNER_PID ?? "",
+    10,
+  );
+  if (Number.isSafeInteger(ownerPid) && ownerPid > 1) {
+    ownerTimer = setInterval((): void => {
+      try {
+        process.kill(ownerPid, 0);
+      } catch {
+        shutdown();
+      }
+    }, 100);
+    ownerTimer.unref?.();
+  }
 };
 
 /** Entry for the hidden `openllmd __session-host` subcommand. */
