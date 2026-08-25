@@ -159,6 +159,8 @@ export type TNativeServeParams = {
   readonly rawBody: unknown;
   readonly canonical: TChatCompletionRequest;
   readonly wantsStream: boolean;
+  /** Catalog-gated client-output repair, resolved by the walker. */
+  readonly stripSubagentIsolation: boolean;
   readonly signal: AbortSignal;
   /** Report the hop's token counts + outcome to the cloud (walker's `report`):
    *  "success" with accumulated tokens, or "error" with the last usage observed
@@ -259,6 +261,7 @@ export const tryServeNativeRuntime = async (
       surface: params.surface,
       canonical: params.canonical,
       wantsStream: params.wantsStream,
+      stripSubagentIsolation: params.stripSubagentIsolation,
       bin: overrides?.bin ?? cliBin(params.provider),
       env: overrides?.env ?? cliEnv(params.provider),
       record: params.record,
@@ -379,6 +382,7 @@ export const tryServeNativeRuntime = async (
       providerModelId: params.providerModelId,
       onResponse: settle,
       onError: fail,
+      stripSubagentIsolation: params.stripSubagentIsolation,
     });
   }
 
@@ -399,7 +403,13 @@ export const tryServeNativeRuntime = async (
     );
   }
   settle(canonical);
-  return deliverJsonResponse(canonical, params.surface, clientWire);
+  return deliverJsonResponse(
+    canonical,
+    params.surface,
+    clientWire,
+    undefined,
+    params.stripSubagentIsolation,
+  );
 };
 
 /**
@@ -456,6 +466,7 @@ const serveCursorHop = async (
       providerModelId: params.providerModelId,
       onResponse: settle,
       onError: fail,
+      stripSubagentIsolation: params.stripSubagentIsolation,
     });
   }
   let canonical: Awaited<ReturnType<typeof accumulateChunksToResponse>>;
@@ -474,7 +485,13 @@ const serveCursorHop = async (
     );
   }
   settle(canonical);
-  return deliverJsonResponse(canonical, params.surface, clientWire);
+  return deliverJsonResponse(
+    canonical,
+    params.surface,
+    clientWire,
+    undefined,
+    params.stripSubagentIsolation,
+  );
 };
 
 export type { TChatCompletionChunk };

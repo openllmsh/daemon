@@ -75,6 +75,7 @@ export type TClaudeToolServeParams = {
   /** The client asked for SSE — the completion (with tool_calls) is streamed,
    *  not returned as a single JSON body. */
   readonly wantsStream: boolean;
+  readonly stripSubagentIsolation: boolean;
   readonly bin: string;
   readonly env: Record<string, string>;
   readonly record: (tokens: TNativeTokens, status: "success" | "error") => void;
@@ -182,10 +183,18 @@ export const tryServeNativeToolTurn = async (
       responseToChunkStream(canonicalResp),
       params.surface,
       clientWire,
+      undefined,
+      params.stripSubagentIsolation,
     );
   }
 
-  return deliverJsonResponse(canonicalResp, params.surface, clientWire);
+  return deliverJsonResponse(
+    canonicalResp,
+    params.surface,
+    clientWire,
+    undefined,
+    params.stripSubagentIsolation,
+  );
 };
 
 /** Render one prior message into the lossy multi-turn seed transcript. */

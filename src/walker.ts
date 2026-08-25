@@ -290,6 +290,8 @@ type THop = {
   readonly capabilities: ReadonlyArray<string>;
   /** Catalog-declared final outbound-body constraints, resolved locally. */
   readonly caps?: TModelCaps;
+  /** Catalog-gated client-output repair, resolved locally from bootstrap. */
+  readonly stripSubagentIsolation: boolean;
 };
 
 /** Parse `?__plan=provider/model,provider/model` into ordered model ids.
@@ -315,8 +317,16 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
   const entry = lookupCatalogEntry(modelId);
   const capabilities = entry?.capabilities ?? [];
   const caps = entry?.caps;
+  const stripSubagentIsolation = entry?.strip_subagent_isolation === true;
   if (providerModelId !== undefined && providerModelId.length > 0) {
-    return { modelId, provider, providerModelId, capabilities, caps };
+    return {
+      modelId,
+      provider,
+      providerModelId,
+      capabilities,
+      caps,
+      stripSubagentIsolation,
+    };
   }
   if (entry !== null) {
     return {
@@ -325,6 +335,7 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
       providerModelId: entry.provider_model_id,
       capabilities,
       caps,
+      stripSubagentIsolation,
     };
   }
   return slash > 0
@@ -334,6 +345,7 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
         providerModelId: modelId.slice(slash + 1),
         capabilities,
         caps,
+        stripSubagentIsolation,
       }
     : {
         modelId,
@@ -341,6 +353,7 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
         providerModelId: modelId,
         capabilities,
         caps,
+        stripSubagentIsolation,
       };
 };
 
@@ -1379,7 +1392,10 @@ const serveSubscription = async (
   const clientWire = clientWireOf(args.surface);
   // `responses` clients always need a Responses re-encode (never raw upstream
   // bytes), so they never take the verbatim passthrough.
-  const passthrough = wire === clientWire && args.surface !== "responses";
+  const passthrough =
+    wire === clientWire &&
+    args.surface !== "responses" &&
+    !hop.stripSubagentIsolation;
   // What the UPSTREAM produced, decided deterministically (not sniffed):
   // chatgpt's Codex/Responses endpoint ALWAYS streams (`toChatGptRequest`
   // forces `stream: true`); anthropic + kimi propagate the request's stream
@@ -1605,6 +1621,7 @@ const serveSubscription = async (
       status: resp.status,
       onResponse: (r) => recordTokens(tokensFromResponse(r)),
       onError: recordStreamFailure,
+      stripSubagentIsolation: hop.stripSubagentIsolation,
     });
   }
 
@@ -1661,6 +1678,7 @@ const serveSubscription = async (
       args.surface,
       clientWire,
       resp.status,
+      hop.stripSubagentIsolation,
     );
   }
 
@@ -1732,7 +1750,13 @@ const serveSubscription = async (
   // through the shared delivery tail.
   return passthrough
     ? new Response(text, { status: resp.status, headers: jsonHeaders })
-    : deliverJsonResponse(canonical, args.surface, clientWire, resp.status);
+    : deliverJsonResponse(
+        canonical,
+        args.surface,
+        clientWire,
+        resp.status,
+        hop.stripSubagentIsolation,
+      );
 };
 
 /**
@@ -1918,8 +1942,16 @@ const serveKimiBuiltinSearch = async (
             responseToChunkStream(final),
             args.surface,
             clientWire,
+            undefined,
+            hop.stripSubagentIsolation,
           )
-        : deliverJsonResponse(final, args.surface, clientWire);
+        : deliverJsonResponse(
+            final,
+            args.surface,
+            clientWire,
+            undefined,
+            hop.stripSubagentIsolation,
+          );
     }
 
     // Echo round: report each server-executed search (query is opaque to
@@ -2681,6 +2713,7 @@ const walkPlan = async (
         canonical,
         wantsStream:
           (args.rawBody as { stream?: unknown } | null)?.stream === true,
+        stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>
           report(

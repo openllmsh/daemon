@@ -23,6 +23,10 @@ import {
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
 import { chunksToSseBytes } from "@openllmsh/wire/lib/streaming/provider-decode";
 import { withFrameAlignedHeartbeat } from "@openllmsh/wire/lib/streaming/sse";
+import {
+  stripIsolationFromChunks,
+  stripIsolationFromResponse,
+} from "@openllmsh/wire/lib/strip-subagent-isolation";
 
 export type TClientSurface = "chat_completions" | "messages" | "responses";
 
@@ -92,6 +96,8 @@ export type TDeliverStreamParams = {
    *  so the row can carry WHY: the caller is the only place that reason is
    *  still available, and a row without it is not debuggable. */
   readonly onError: (error: unknown) => void;
+  /** Apply the catalog-gated subagent-control repair on the client branch. */
+  readonly stripSubagentIsolation?: boolean;
 };
 
 /**
@@ -105,10 +111,15 @@ export const sseResponseForClient = (
   surface: TClientSurface,
   clientWire: TClientWire,
   status?: number,
+  stripSubagentIsolation = false,
 ): Response =>
   new Response(
     withFrameAlignedHeartbeat(
-      sseBytesForClient(chunks, surface, clientWire),
+      sseBytesForClient(
+        stripSubagentIsolation ? stripIsolationFromChunks(chunks) : chunks,
+        surface,
+        clientWire,
+      ),
       heartbeatOptionsFor(surface),
     ),
     { status: status ?? 200, headers: SSE_RESPONSE_HEADERS },
@@ -133,6 +144,7 @@ export const deliverChunkStream = (
     params.surface,
     params.clientWire,
     params.status,
+    params.stripSubagentIsolation ?? false,
   );
 };
 
@@ -142,9 +154,18 @@ export const deliverJsonResponse = (
   surface: TClientSurface,
   clientWire: TClientWire,
   status?: number,
+  stripSubagentIsolation = false,
 ): Response =>
   new Response(
-    JSON.stringify(jsonBodyForClient(canonical, surface, clientWire)),
+    JSON.stringify(
+      jsonBodyForClient(
+        stripSubagentIsolation
+          ? stripIsolationFromResponse(canonical)
+          : canonical,
+        surface,
+        clientWire,
+      ),
+    ),
     {
       status: status ?? 200,
       headers: { "content-type": "application/json" },
