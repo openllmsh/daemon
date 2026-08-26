@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # OpenLLM installer — installs the local daemon (openllmd) AND the CLI
-# (openllm, plus the `ollm` alias), then starts the daemon service.
+# (openllm, plus the `ollm` alias). A daemon service starts only when a usable
+# API key is already supplied or persisted; keyless onboarding belongs to
+# `openllm start`, never this piped script.
 #
 #   curl -fsSL https://openllm.sh/install | bash
 #
@@ -33,6 +35,13 @@ has_command() { command -v "$1" >/dev/null 2>&1; }
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+has_line_break() { [[ "$1" == *$'\n'* || "$1" == *$'\r'* || "$1" == *$'\0'* ]]; }
+
+is_usable_api_key() {
+  local key="$1"
+  [[ "$key" =~ ^sk-llm-[^.[:space:]]+[.][^.[:space:]]+$ ]]
+}
+
 sha256_of() {
   if has_command shasum; then shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
   elif has_command sha256sum; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1
@@ -40,6 +49,8 @@ sha256_of() {
 }
 
 # --- preflight -------------------------------------------------------------
+has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
+[ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
 case "$(uname -s)" in
   Darwin) OS="darwin" ;;
   Linux)  OS="linux" ;;
@@ -191,6 +202,10 @@ if [ -f "$ENV_FILE" ]; then
   EXISTING_PTY_SESSIONS="$(sed -n 's/^OPENLLM_DAEMON_PTY_SESSIONS=//p' "$ENV_FILE" | head -1)"
 fi
 API_KEY="${OPENLLM_API_KEY:-$EXISTING_KEY}"
+if [ -n "$API_KEY" ]; then
+  has_line_break "$API_KEY" && die "OPENLLM_API_KEY must not contain a line break"
+  is_usable_api_key "$API_KEY" || die "OPENLLM_API_KEY has an invalid format"
+fi
 PTY_SESSIONS_INPUT="${OPENLLM_DAEMON_PTY_SESSIONS:-}"
 case "$PTY_SESSIONS_INPUT" in
   1|true) PTY_SESSIONS="1" ;;
@@ -222,9 +237,14 @@ fi
 
 # --- start the service -----------------------------------------------------
 # `openllmd start` owns service registration (launchd / systemd user unit,
-# restart-on-crash, boot start, linger) — the installer just hands off.
-echo "Starting the daemon..."
-"$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"
+# restart-on-crash, boot start, linger). A piped installer never prompts: with no
+# persisted key it deliberately leaves no unpaired service behind.
+if [ -n "$API_KEY" ]; then
+  echo "Starting the daemon..."
+  "$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"
+else
+  echo "OpenLLM is installed but not started."
+fi
 
 # --- provision the vendor subscription CLIs (background) -------------------
 # The daemon RUNS the official vendor CLIs but never INSTALLS them (it runs
@@ -323,7 +343,9 @@ EOF
 if [ -z "$API_KEY" ]; then
   cat <<EOF
 
-No API key configured yet — pair this machine from the dashboard, or re-run
-with OPENLLM_API_KEY=sk-llm-...
+OpenLLM needs an API key before it can start.
+Sign in at $ORIGIN/sign-in.
+New users will receive a key during onboarding. Already have an account? Open Keys after signing in.
+Then run: openllm start
 EOF
 fi

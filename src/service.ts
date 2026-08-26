@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
+import { requireServiceApiKey } from "./credential-gate";
 import {
   daemonEnv,
   daemonStderrLogFilePath,
@@ -535,7 +536,14 @@ const probeHealth = async (port: number): Promise<TDaemonHealth | null> => {
  * Register + start the service in full self-restore mode. Idempotent. Refuses
  * to register a from-source run (would point the service at `bun`).
  */
-export const serviceStart = (): void => {
+export const serviceStart = (skipCredentialGate = false): boolean => {
+  if (!skipCredentialGate) {
+    const gate = requireServiceApiKey("human");
+    if (!gate.ok) {
+      process.stderr.write(gate.message);
+      return false;
+    }
+  }
   if (DAEMON_VERSION === "0.0.0-dev") {
     process.stderr.write(
       "refusing to register a service from a source run.\n" +
@@ -559,6 +567,7 @@ export const serviceStart = (): void => {
   process.stdout.write(
     `openllmd v${DAEMON_VERSION} started in self-restore mode (listening on http://127.0.0.1:${daemonPort()}).\n`,
   );
+  return true;
 };
 
 /** Stop the service and disable all self-restore. Idempotent. */
@@ -568,10 +577,18 @@ export const serviceStop = (): void => {
   process.stdout.write("openllmd stopped; self-restore disabled.\n");
 };
 
-/** Stop then start — picks up a changed binary/config. */
-export const serviceRestart = (): void => {
+/**
+ * Stop then start — picks up a changed binary/config. Credential onboarding runs
+ * first, so a failed/cancelled restart leaves an existing service untouched.
+ */
+export const serviceRestart = (): boolean => {
+  const gate = requireServiceApiKey("human");
+  if (!gate.ok) {
+    process.stderr.write(gate.message);
+    return false;
+  }
   serviceStop();
-  serviceStart();
+  return serviceStart(true);
 };
 
 /**

@@ -10,7 +10,7 @@
 # feeds the embedded binary + its sha256 to the unchanged download+verify step,
 # so the binary needs no gateway/network. Every other step — checksum verify,
 # install to ~/.openllm/bin, PATH symlink, the shared .env, macOS codesign,
-# `openllmd start`, shell completion — runs EXACTLY as in production.
+# conditional daemon start, shell completion — runs EXACTLY as in production.
 #
 # Usage on a __TARGET__ machine (env names match the real install + the shared .env):
 #   OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... bash "$0"
@@ -21,7 +21,7 @@
 # cloud pinned to a different (or lower) release can't overwrite this locally-
 # built binary — it's stamped with the app version, not the cloud's published
 # daemon version. Re-enable by running with OPENLLM_DAEMON_AUTO_UPDATE=1, or
-# later via `openllmd auto-update on`.
+# later via `openllm auto-update on`.
 # ============================================================================
 set -euo pipefail
 
@@ -110,7 +110,7 @@ export GATEWAY_ORIGIN="$OPENLLM_CLOUD_ORIGIN"
 export API_KEY="$OPENLLM_API_KEY"
 export USAGE_URL="${USAGE_URL:-}"
 if [ -z "$API_KEY" ]; then
-  echo "Note: no OPENLLM_API_KEY set and none in the shared .env — the daemon will install and run locally but won't pair with a cloud." >&2
+  echo "No API key is configured; OpenLLM will install without starting the daemon." >&2
 fi
 
 # --- disable daemon self-update for this dist install (default) --------------
@@ -125,7 +125,7 @@ fi
 export OPENLLM_DAEMON_AUTO_UPDATE="${OPENLLM_DAEMON_AUTO_UPDATE:-0}"
 case "$OPENLLM_DAEMON_AUTO_UPDATE" in
   0 | false)
-    echo "Daemon self-update DISABLED for this dist install (re-enable: openllmd auto-update on)." >&2
+    echo "Daemon self-update DISABLED for this dist install (re-enable: openllm auto-update on)." >&2
     ;;
   *)
     echo "OPENLLM_DAEMON_AUTO_UPDATE=$OPENLLM_DAEMON_AUTO_UPDATE — leaving daemon self-update enabled." >&2

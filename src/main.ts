@@ -41,6 +41,7 @@ import {
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
 import { isTransientNetworkError } from "./crash-policy";
+import { requireServiceApiKey } from "./credential-gate";
 import { refreshCliState } from "./device-state";
 import {
   daemonEnv,
@@ -445,6 +446,13 @@ const main = async (): Promise<void> => {
   logInfo("boot", `openllmd v${DAEMON_VERSION} listening on :${port}`);
 };
 
-// Dispatch management subcommands (start/stop/status/completion/…);
-// a bare `openllmd` with no args falls through to boot the server. See `cli.ts`.
-if (!runCli()) void main();
+// Dispatch management subcommands (start/stop/status/completion/…); a bare
+// service boot is always machine mode and must never consume terminal input.
+if (!runCli()) {
+  const gate = requireServiceApiKey("machine");
+  if (!gate.ok) {
+    process.stderr.write(gate.message);
+    process.exit(1);
+  }
+  void main();
+}

@@ -231,16 +231,14 @@ export const runCli = (): boolean => {
   const rest = args.slice(1);
   switch (args[0]) {
     case "start":
-      serviceStart();
-      process.exit(0);
+      process.exit(serviceStart() ? 0 : 1);
       break;
     case "stop":
       serviceStop();
       process.exit(0);
       break;
     case "restart":
-      serviceRestart();
-      process.exit(0);
+      process.exit(serviceRestart() ? 0 : 1);
       break;
     case "status":
       // Async (it probes the running daemon's /status over loopback). Mirror the
