@@ -70,6 +70,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
 // both sides only dereference the other's exports lazily inside functions.
 import { logWarn } from "./logger";
@@ -447,28 +448,6 @@ export const DEFAULT_DAEMON_PORT = 8787;
 export const DEV_DEFAULT_DAEMON_PORT = 8788;
 
 /**
- * Parse a raw daemon port from env/raw values.
- *
- * Must match the CLI-side parser in `packages/cli/src/clients/gateway.ts` so both
- * sides resolve the same loopback port from the same raw value.
- */
-const parseDaemonPort = (raw: string, fallback: number): number => {
-  const trimmed = raw.trim();
-  const unquoted =
-    trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2
-      ? trimmed.slice(1, -1)
-      : trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2
-        ? trimmed.slice(1, -1)
-        : trimmed;
-  const stripped = unquoted.replace(/^(.*)\s#.*$/, "$1").trim();
-  if (!/^\d+$/.test(stripped)) return fallback;
-  const parsed = Number.parseInt(stripped, 10);
-  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535
-    ? parsed
-    : fallback;
-};
-
-/**
  * The loopback port the daemon listens on (`OPENLLM_DAEMON_PORT`, default
  * `8787`; `8788` in dev mode). Single source — `main.ts` binds it and
  * `status.ts` publishes it on `TDaemonStatus.port` so the dashboard can probe
@@ -483,7 +462,7 @@ export const daemonPort = (): number => {
   const fallback = isDevMode() ? DEV_DEFAULT_DAEMON_PORT : DEFAULT_DAEMON_PORT;
   const raw = process.env.OPENLLM_DAEMON_PORT;
   if (raw === undefined) return fallback;
-  return parseDaemonPort(raw, fallback);
+  return parseOpenllmDaemonPort(raw, fallback);
 };
 
 const apiKeyFile = (): string => join(stateDir(), "api-key");
