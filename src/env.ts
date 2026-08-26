@@ -198,18 +198,32 @@ export const daemonStderrLogFilePath = (): string =>
   join(stateDir(), "openllmd.err.log");
 
 /**
- * The SHARED OpenLLM env/config file. `OPENLLM_DAEMON_ENV_FILE` wins (the
- * macOS launch agent points us here because launchd can't read a native
- * `EnvironmentFile`); otherwise it's `.env` under the state dir — the same
- * path systemd's `EnvironmentFile=` and the installer write to, and the one
- * `bun dev:daemon` auto-loads. Shared product-wide: the CLI (`openllm`)
- * reads the same file for `OPENLLM_CLOUD_ORIGIN` / `OPENLLM_API_KEY`, so a
- * re-pair or a custom origin applies to every OpenLLM tool on the box.
- * In DEV mode this resolves `.dev.env` instead — the isolated dev config —
- * so dev never reads/writes the installed daemon's file (see header).
+ * An explicit daemon env-file override is valid only when it is an absolute,
+ * nonempty path. This is a service boundary: launchd and systemd must never be
+ * handed an empty or cwd-relative config path, and runtime reads/writes must
+ * resolve the same file that a registered service will use.
+ */
+const daemonEnvFileOverride = (): string | null => {
+  const override = process.env.OPENLLM_DAEMON_ENV_FILE;
+  return override !== undefined && override.length > 0 && isAbsolute(override)
+    ? override
+    : null;
+};
+
+/**
+ * The SHARED OpenLLM env/config file. A valid absolute
+ * `OPENLLM_DAEMON_ENV_FILE` wins (the macOS launch agent points us here because
+ * launchd can't read a native `EnvironmentFile`); otherwise it's `.env` under
+ * the state dir — the same path systemd's `EnvironmentFile=` and the installer
+ * write to, and the one `bun dev:daemon` auto-loads. Shared product-wide: the
+ * CLI (`openllm`) reads the same file for `OPENLLM_CLOUD_ORIGIN` /
+ * `OPENLLM_API_KEY`, so a re-pair or a custom origin applies to every OpenLLM
+ * tool on the box. In DEV mode this resolves `.dev.env` instead — the isolated
+ * dev config — so dev never reads/writes the installed daemon's file (see
+ * header).
  */
 export const envFilePath = (): string =>
-  process.env.OPENLLM_DAEMON_ENV_FILE ??
+  daemonEnvFileOverride() ??
   join(stateDir(), isDevMode() ? ".dev.env" : ".env");
 
 /**
@@ -236,7 +250,7 @@ export const sharedEnvFilePath = (): string => join(stateDir(), ".env");
  * systemd unit. Used by `service.ts` renderers + `writeEnvFileIfNeeded`.
  */
 export const serviceEnvFilePath = (): string =>
-  process.env.OPENLLM_DAEMON_ENV_FILE ?? sharedEnvFilePath();
+  daemonEnvFileOverride() ?? sharedEnvFilePath();
 
 /**
  * Load the daemon's `KEY=value` env file into `process.env`.

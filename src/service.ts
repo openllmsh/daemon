@@ -536,17 +536,19 @@ const probeHealth = async (port: number): Promise<TDaemonHealth | null> => {
  * Register + start the service in full self-restore mode. Idempotent. Refuses
  * to register a from-source run (would point the service at `bun`).
  */
+const rejectSourceServiceRegistration = (): never => {
+  process.stderr.write(
+    "refusing to register a service from a source run.\n" +
+      "Build + install the compiled binary first: bun run daemon:dist && bun run daemon:dist:install\n",
+  );
+  process.exit(2);
+};
+
 const startServiceAfterCredentialGate = (
   gate: ReturnType<typeof requireServiceApiKey>,
 ): boolean => {
   if (!hasCredentialProof(gate)) return false;
-  if (DAEMON_VERSION === "0.0.0-dev") {
-    process.stderr.write(
-      "refusing to register a service from a source run.\n" +
-        "Build + install the compiled binary first: bun run daemon:dist && bun run daemon:dist:install\n",
-    );
-    process.exit(2);
-  }
+  if (DAEMON_VERSION === "0.0.0-dev") rejectSourceServiceRegistration();
   const binPath = process.execPath;
   writeEnvFileIfNeeded();
   // An explicit OPENLLM_DAEMON_AUTO_UPDATE at registration is persisted to
@@ -593,7 +595,10 @@ export const serviceRestart = (): boolean => {
     return false;
   }
   // Keep the credential/persistence gate ahead of stop: cancelling or failing
-  // onboarding must leave a currently healthy service running.
+  // onboarding must leave a currently healthy service running. The source-build
+  // guard must also run before stop, otherwise a rejected dev restart could
+  // disable a healthy production service.
+  if (DAEMON_VERSION === "0.0.0-dev") rejectSourceServiceRegistration();
   serviceStop();
   return startServiceAfterCredentialGate(gate);
 };
