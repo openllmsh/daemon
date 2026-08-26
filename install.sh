@@ -6,14 +6,14 @@
 # `openllm start` (whose credential gate prompts on /dev/tty); with no terminal it
 # just prints the `openllm start` next step and exits zero.
 #
-#   curl -fsSL https://openllm.sh/install | bash
+#   curl -fsSL https://www.openllm.sh/install | bash
 #
 #   # with a key, so the daemon is paired immediately:
-#   curl -fsSL https://openllm.sh/install | OPENLLM_API_KEY=sk-llm-... bash
+#   curl -fsSL https://www.openllm.sh/install | OPENLLM_API_KEY=sk-llm-... bash
 #
 # Env (all optional):
 #   OPENLLM_CLOUD_ORIGIN   gateway origin (env → existing ~/.openllm/.env →
-#                          default https://openllm.sh; a re-run keeps your origin)
+#                          default https://www.openllm.sh; a re-run keeps your origin)
 #   OPENLLM_API_KEY        pair the daemon now; otherwise pair from the dashboard
 #   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
 #   OPENLLM_DAEMON_PTY_SESSIONS  enable remote terminal sessions (1/true; default off)
@@ -127,7 +127,7 @@ fi
 # OPENLLM_CLOUD_ORIGIN in the environment still wins.
 ORIGIN="${OPENLLM_CLOUD_ORIGIN:-}"
 [ -n "$ORIGIN" ] || ORIGIN="$(env_file_value OPENLLM_CLOUD_ORIGIN)"
-[ -n "$ORIGIN" ] || ORIGIN="https://openllm.sh"
+[ -n "$ORIGIN" ] || ORIGIN="https://www.openllm.sh"
 ORIGIN="${ORIGIN%/}"
 has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
 [ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
@@ -577,14 +577,23 @@ EOF
       #
       # A cancel (Ctrl-C / empty paste) or any nonzero exit must NOT fail the
       # install — the binaries and config are already in place; we just point the
-      # user back at `openllm start`. `set -e` is suppressed by the `if`.
-      starter="$BIN_DIR/openllm"; [ -x "$starter" ] || starter="$BIN_DIR/openllmd"
+      # user back at the start command. `set -e` is suppressed by the `if`.
+      # Prefer the public `openllm` mirror; fall back to `openllmd` when the CLI
+      # release isn't published yet — and name the recovery command for whichever
+      # binary this install actually has.
+      starter="$BIN_DIR/openllm"; start_cmd="openllm"
+      if [ ! -x "$starter" ]; then starter="$BIN_DIR/openllmd"; start_cmd="openllmd"; fi
       echo
       if ! "$starter" start < /dev/tty; then
+        # `$start_cmd start` already printed the specific reason to the terminal
+        # (key cancelled, save failed, or a service-registration error). Do NOT
+        # re-attribute every nonzero exit to a missing key — the failure may be
+        # operational. Stay cause-neutral and point back at the one command that
+        # finishes setup, named for the binary we used.
         cat <<EOF
 
-No API key was configured yet, so the daemon isn't running.
-When you have one (sign in at $ORIGIN/sign-in), run: openllm start
+The daemon isn't running yet. Finish setup any time with: $start_cmd start
+(If you still need an API key, sign in at $ORIGIN/sign-in.)
 EOF
       fi
     else

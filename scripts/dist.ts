@@ -74,7 +74,7 @@ const flagValue = (name: string): string | undefined => {
  *  the same default `compile.ts` bakes into the binary, so the env file and the
  *  binary agree when the runner doesn't override it. */
 const cloudDefault = (): string =>
-  process.env.OPENLLM_CLOUD_ORIGIN ?? "https://openllm.sh";
+  process.env.OPENLLM_CLOUD_ORIGIN ?? "https://www.openllm.sh";
 
 /** Insert a literal replacement once, function-form so `$1`/`$&`/`$$` inside
  *  the install.sh body (and the base64 payload) are NOT treated as

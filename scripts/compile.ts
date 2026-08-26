@@ -38,7 +38,7 @@ const PKG_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = join(PKG_ROOT, "src", "main.ts");
 const OUT_DIR = join(PKG_ROOT, "dist");
 
-const DEFAULT_CLOUD_ORIGIN = "https://openllm.sh";
+const DEFAULT_CLOUD_ORIGIN = "https://www.openllm.sh";
 
 /**
  * Validate the cloud origin BEFORE baking it into every shipped binary via
@@ -46,7 +46,7 @@ const DEFAULT_CLOUD_ORIGIN = "https://openllm.sh";
  * env point every daemon at a rogue origin, and an empty string is silently
  * accepted. So we fail closed:
  *
- * - empty / missing  → the public default (`https://openllm.sh`).
+ * - empty / missing  → the public default (`https://www.openllm.sh`).
  * - the default      → accepted verbatim.
  * - `https://` with a hostname that is `openllm.sh`, a `*.openllm.sh`
  *   subdomain (e.g. `dev.openllm.sh` staging), or an OpenLLM-owned

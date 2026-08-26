@@ -116,9 +116,9 @@ const compiledCloudOrigin = (): string => {
   try {
     return typeof __OPENLLM_CLOUD_ORIGIN_DEFAULT__ === "string"
       ? __OPENLLM_CLOUD_ORIGIN_DEFAULT__
-      : "https://openllm.sh";
+      : "https://www.openllm.sh";
   } catch {
-    return "https://openllm.sh";
+    return "https://www.openllm.sh";
   }
 };
 
