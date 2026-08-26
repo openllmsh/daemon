@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # OpenLLM installer — installs the local daemon (openllmd) AND the CLI
 # (openllm, plus the `ollm` alias). A daemon service starts only when a usable
-# API key is already supplied or persisted; keyless onboarding belongs to
-# `openllm start`, never this piped script.
+# API key is already supplied or persisted. For a keyless install the script does
+# not reimplement onboarding — on a controlling terminal it hands straight off to
+# `openllm start` (whose credential gate prompts on /dev/tty); with no terminal it
+# just prints the `openllm start` next step and exits zero.
 #
 #   curl -fsSL https://openllm.sh/install | bash
 #
@@ -45,6 +47,18 @@ INSTALLED_COMPONENTS=""
 has_command() { command -v "$1" >/dev/null 2>&1; }
 
 die() { echo "Error: $*" >&2; exit 1; }
+
+# Can we prompt the human running this install? A piped `curl … | bash` leaves
+# the script's own stdin as the download stream, but the user's terminal is still
+# addressable as /dev/tty. `openllm start`'s credential gate reads the key from
+# /dev/tty yet decides interactivity from stdin/stderr being TTYs — so we only
+# hand off to it when stderr is a real terminal AND /dev/tty is openable. In a
+# non-interactive install (CI, a pipe with no terminal) this is false and we fall
+# back to printing the manual `openllm start` next step.
+has_controlling_tty() {
+  [ -t 2 ] || return 1
+  { true < /dev/tty; } 2>/dev/null
+}
 
 # Bash strings cannot contain NUL bytes: command substitution and shell variables
 # discard them before this script can inspect a value. Do not add `$'\0'` to this
@@ -387,8 +401,9 @@ fi
 
 # --- start the service -----------------------------------------------------
 # `openllmd start` owns service registration (launchd / systemd user unit,
-# restart-on-crash, boot start, linger). A piped installer never prompts: with no
-# persisted key it deliberately leaves no unpaired service behind.
+# restart-on-crash, boot start, linger). With no persisted key the script never
+# prompts inline — it either hands off to the gated `openllm start` on a
+# controlling terminal (closing banner) or leaves no unpaired service behind.
 reconcile_keyless_service() {
   # Older installers registered a daemon before the user had a usable key. Do
   # not merely skip `start` on upgrade: stop, disable, and remove that stale
@@ -437,8 +452,10 @@ elif [ "$INSTALL_MODE" = update ]; then
   # first-install reconciliation, not an update action.
   echo "OpenLLM updated (no API key configured; daemon left as-is)."
 else
+  # Keyless first install: clear any stale unpaired registration now. The closing
+  # banner then either runs the interactive credential gate (`openllm start` on a
+  # controlling terminal) or prints the manual next step — see below.
   reconcile_keyless_service
-  echo "OpenLLM is installed but not started."
 fi
 
 # --- provision the vendor subscription CLIs (background) -------------------
@@ -550,12 +567,34 @@ Any missing vendor CLIs are installing in the background
 connect each vendor once its CLI is ready.
 EOF
   if [ -z "$API_KEY" ]; then
-    cat <<EOF
+    if has_controlling_tty && { [ -x "$BIN_DIR/openllm" ] || [ -x "$BIN_DIR/openllmd" ]; }; then
+      # Single-step onboarding: hand straight to the gated `openllm start` instead
+      # of asking the user to run a second command. Its credential gate prints the
+      # sign-in guidance, reads the key hidden from /dev/tty, validates the format
+      # (reprompting on a bad paste), persists it, then registers + starts the
+      # service. We bind the child's stdin to /dev/tty so the gate sees an
+      # interactive terminal even though this script's own stdin is the curl pipe.
+      #
+      # A cancel (Ctrl-C / empty paste) or any nonzero exit must NOT fail the
+      # install — the binaries and config are already in place; we just point the
+      # user back at `openllm start`. `set -e` is suppressed by the `if`.
+      starter="$BIN_DIR/openllm"; [ -x "$starter" ] || starter="$BIN_DIR/openllmd"
+      echo
+      if ! "$starter" start < /dev/tty; then
+        cat <<EOF
+
+No API key was configured yet, so the daemon isn't running.
+When you have one (sign in at $ORIGIN/sign-in), run: openllm start
+EOF
+      fi
+    else
+      cat <<EOF
 
 OpenLLM needs an API key before it can start.
 Sign in at $ORIGIN/sign-in.
 New users will receive a key during onboarding. Already have an account? Open Keys after signing in.
 Then run: openllm start
 EOF
+    fi
   fi
 fi
