@@ -38,6 +38,35 @@ if [ "${_d_os}-${_d_arch}" != "$OPENLLMD_DIST_TARGET" ]; then
   exit 1
 fi
 
+# --- credential preflight ----------------------------------------------------
+# Validate before extracting the embedded binary or making a staging directory.
+# Bash values cannot contain NUL bytes; `$'\0'` expands to empty and would make
+# a glob match every value, so only real line breaks need checking here.
+_dist_has_line_break() { [[ "$1" == *$'\n'* || "$1" == *$'\r'* ]]; }
+_dist_trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+_dist_is_minted_api_key() {
+  [[ "$1" =~ ^sk-llm-[A-Za-z0-9_-]{14}[.][A-Za-z0-9_-]{43}$ ]]
+}
+OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/.env"
+_openllmd_dist_reuse() {  # $1=key → its value in the existing env file (or "")
+  [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
+  grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true
+}
+OPENLLM_API_KEY="$(_dist_trim_whitespace "${OPENLLM_API_KEY:-}")"
+if [ -z "$OPENLLM_API_KEY" ]; then
+  OPENLLM_API_KEY="$(_dist_trim_whitespace "$(_openllmd_dist_reuse OPENLLM_API_KEY)")"
+fi
+if [ -n "$OPENLLM_API_KEY" ]; then
+  _dist_has_line_break "$OPENLLM_API_KEY" && { echo "Error: OPENLLM_API_KEY must not contain a line break" >&2; exit 1; }
+  _dist_is_minted_api_key "$OPENLLM_API_KEY" || { echo "Error: OPENLLM_API_KEY has an invalid format" >&2; exit 1; }
+fi
+export OPENLLM_API_KEY
+
 # --- portable base64 decode (GNU '-d' vs BSD/macOS '-D') --------------------
 if printf '' | base64 -d >/dev/null 2>&1; then _b64d=(base64 -d); else _b64d=(base64 -D); fi
 
@@ -93,23 +122,14 @@ export PATH="$OPENLLMD_DIST_WORK/shim:$PATH"
 #   3. the baked default origin (the key stays empty if nothing supplies it).
 # install.sh always reads/writes $HOME/.openllm/.env, so reuse from there;
 # install.sh itself separately preserves the minted OPENLLM_DEVICE_ID.
-OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/.env"
-_openllmd_dist_reuse() {  # $1=key → its value in the existing env file (or "")
-  [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
-  grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true
-}
 if [ -f "$OPENLLMD_DIST_ENV_FILE" ]; then
   echo "Found existing $OPENLLMD_DIST_ENV_FILE — reusing its OPENLLM_CLOUD_ORIGIN + OPENLLM_API_KEY where not overridden." >&2
 fi
 OPENLLM_CLOUD_ORIGIN="${OPENLLM_CLOUD_ORIGIN:-$(_openllmd_dist_reuse OPENLLM_CLOUD_ORIGIN)}"
-OPENLLM_API_KEY="${OPENLLM_API_KEY:-$(_openllmd_dist_reuse OPENLLM_API_KEY)}"
 OPENLLM_CLOUD_ORIGIN="${OPENLLM_CLOUD_ORIGIN:-__CLOUD_DEFAULT__}"
-
-# Map the OPENLLM_* inputs onto the names the embedded install.sh consumes.
-export GATEWAY_ORIGIN="$OPENLLM_CLOUD_ORIGIN"
-export API_KEY="$OPENLLM_API_KEY"
+export OPENLLM_CLOUD_ORIGIN
 export USAGE_URL="${USAGE_URL:-}"
-if [ -z "$API_KEY" ]; then
+if [ -z "$OPENLLM_API_KEY" ]; then
   echo "No API key is configured; OpenLLM will install without starting the daemon." >&2
 fi
 

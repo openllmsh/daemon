@@ -35,11 +35,25 @@ has_command() { command -v "$1" >/dev/null 2>&1; }
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-has_line_break() { [[ "$1" == *$'\n'* || "$1" == *$'\r'* || "$1" == *$'\0'* ]]; }
+# Bash strings cannot contain NUL bytes: command substitution and shell variables
+# discard them before this script can inspect a value. Do not add `$'\0'` to this
+# glob — Bash expands it to an empty string, turning the glob into `**` and
+# matching every input.
+has_line_break() { [[ "$1" == *$'\n'* || "$1" == *$'\r'* ]]; }
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
 
 is_usable_api_key() {
   local key="$1"
-  [[ "$key" =~ ^sk-llm-[^.[:space:]]+[.][^.[:space:]]+$ ]]
+  # Minted keys are `sk-llm-` + a 10-byte base64url id (14 chars) + `.` +
+  # a 32-byte base64url secret (43 chars). Restricting this shell boundary to
+  # the wire grammar keeps values safe to persist in KEY=value config files.
+  [[ "$key" =~ ^sk-llm-[A-Za-z0-9_-]{14}[.][A-Za-z0-9_-]{43}$ ]]
 }
 
 sha256_of() {
@@ -68,6 +82,26 @@ has_command curl || die "curl is required"
 # bytes.
 if ! has_command shasum && ! has_command sha256sum; then
   die "shasum or sha256sum is required to verify the download"
+fi
+
+# Resolve and validate credentials BEFORE making the install directory or
+# downloading either binary. A bad key must leave an existing installation
+# untouched, and a fresh machine must not gain a partial ~/.openllm tree.
+EXISTING_DEVICE_ID=""
+EXISTING_KEY=""
+EXISTING_PTY_SESSIONS=""
+if [ -f "$ENV_FILE" ]; then
+  EXISTING_DEVICE_ID="$(sed -n 's/^OPENLLM_DEVICE_ID=//p' "$ENV_FILE" | head -1)"
+  EXISTING_KEY="$(sed -n 's/^OPENLLM_API_KEY=//p' "$ENV_FILE" | head -1)"
+  EXISTING_PTY_SESSIONS="$(sed -n 's/^OPENLLM_DAEMON_PTY_SESSIONS=//p' "$ENV_FILE" | head -1)"
+fi
+API_KEY="$(trim_whitespace "${OPENLLM_API_KEY:-}")"
+if [ -z "$API_KEY" ]; then
+  API_KEY="$(trim_whitespace "$EXISTING_KEY")"
+fi
+if [ -n "$API_KEY" ]; then
+  has_line_break "$API_KEY" && die "OPENLLM_API_KEY must not contain a line break"
+  is_usable_api_key "$API_KEY" || die "OPENLLM_API_KEY has an invalid format"
 fi
 
 mkdir -p "$BIN_DIR"
@@ -193,19 +227,6 @@ fi
 # the CLI reads it, so a single pairing covers every tool. Preserve any existing
 # device id (re-running must not re-identify this machine) and any key already
 # present when the caller didn't pass one.
-EXISTING_DEVICE_ID=""
-EXISTING_KEY=""
-EXISTING_PTY_SESSIONS=""
-if [ -f "$ENV_FILE" ]; then
-  EXISTING_DEVICE_ID="$(sed -n 's/^OPENLLM_DEVICE_ID=//p' "$ENV_FILE" | head -1)"
-  EXISTING_KEY="$(sed -n 's/^OPENLLM_API_KEY=//p' "$ENV_FILE" | head -1)"
-  EXISTING_PTY_SESSIONS="$(sed -n 's/^OPENLLM_DAEMON_PTY_SESSIONS=//p' "$ENV_FILE" | head -1)"
-fi
-API_KEY="${OPENLLM_API_KEY:-$EXISTING_KEY}"
-if [ -n "$API_KEY" ]; then
-  has_line_break "$API_KEY" && die "OPENLLM_API_KEY must not contain a line break"
-  is_usable_api_key "$API_KEY" || die "OPENLLM_API_KEY has an invalid format"
-fi
 PTY_SESSIONS_INPUT="${OPENLLM_DAEMON_PTY_SESSIONS:-}"
 case "$PTY_SESSIONS_INPUT" in
   1|true) PTY_SESSIONS="1" ;;
@@ -239,10 +260,31 @@ fi
 # `openllmd start` owns service registration (launchd / systemd user unit,
 # restart-on-crash, boot start, linger). A piped installer never prompts: with no
 # persisted key it deliberately leaves no unpaired service behind.
+reconcile_keyless_service() {
+  # Older installers registered a daemon before the user had a usable key. Do
+  # not merely skip `start` on upgrade: stop, disable, and remove that stale
+  # registration so it cannot respawn later with an unpaired configuration.
+  case "$OS" in
+    darwin)
+      local label="sh.openllm.daemon"
+      local target="gui/${UID}/${label}"
+      launchctl bootout "$target" >/dev/null 2>&1 || true
+      launchctl disable "$target" >/dev/null 2>&1 || true
+      rm -f "$HOME/Library/LaunchAgents/${label}.plist"
+      ;;
+    linux)
+      systemctl --user disable --now openllmd.service >/dev/null 2>&1 || true
+      rm -f "$HOME/.config/systemd/user/openllmd.service"
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
 if [ -n "$API_KEY" ]; then
   echo "Starting the daemon..."
   "$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"
 else
+  reconcile_keyless_service
   echo "OpenLLM is installed but not started."
 fi
 
