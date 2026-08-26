@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
+import type { TCredentialGateResult } from "./credential-gate";
 import { hasCredentialProof, requireServiceApiKey } from "./credential-gate";
 import {
   daemonEnv,
@@ -545,7 +546,7 @@ const rejectSourceServiceRegistration = (): never => {
 };
 
 const startServiceAfterCredentialGate = (
-  gate: ReturnType<typeof requireServiceApiKey>,
+  gate: TCredentialGateResult,
 ): boolean => {
   if (!hasCredentialProof(gate)) return false;
   if (DAEMON_VERSION === "0.0.0-dev") rejectSourceServiceRegistration();
@@ -569,6 +570,11 @@ const startServiceAfterCredentialGate = (
 };
 
 export const serviceStart = (): boolean => {
+  // Refuse a from-source run BEFORE the credential gate can prompt for or
+  // persist a key: a dev run is rejected either way, so it must never solicit
+  // credentials just to exit(2). Mirrors serviceRestart, which runs the same
+  // guard ahead of stopping a healthy service.
+  if (DAEMON_VERSION === "0.0.0-dev") rejectSourceServiceRegistration();
   const gate = requireServiceApiKey("human", undefined, serviceEnvFilePath());
   if (!gate.ok) {
     process.stderr.write(gate.message);

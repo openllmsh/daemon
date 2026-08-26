@@ -53,6 +53,13 @@ _dist_is_minted_api_key() {
   [[ "$1" =~ ^sk-llm-[A-Za-z0-9_-]{14}[.][A-Za-z0-9_-]{43}$ ]]
 }
 OPENLLMD_DIST_ENV_FILE="${OPENLLM_DAEMON_ENV_FILE:-$HOME/.openllm/.env}"
+# A custom env-file override must be absolute — the daemon + CLI only honour an
+# absolute OPENLLM_DAEMON_ENV_FILE, so a relative value would write config the
+# runtime never reads. Validate before the reuse read + staging directory below.
+case "$OPENLLMD_DIST_ENV_FILE" in
+  /*) ;;
+  *) echo "Error: OPENLLM_DAEMON_ENV_FILE must be an absolute path" >&2; exit 1 ;;
+esac
 _openllmd_dist_reuse() {  # $1=key → its value in the existing env file (or "")
   [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
   grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true

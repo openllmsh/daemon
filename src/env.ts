@@ -376,6 +376,13 @@ const updatedEnvLines = (
       continue;
     }
     const key = trimmed.slice(0, eq).trim();
+    // Only treat keys the caller actually supplied as updates. A bare
+    // `updates[key]` read would resolve inherited Object.prototype names
+    // (`constructor`, `toString`, …) to functions and rewrite those lines.
+    if (!Object.hasOwn(updates, key)) {
+      out.push(line);
+      continue;
+    }
     const value = updates[key];
     if (value === undefined) {
       out.push(line);

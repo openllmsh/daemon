@@ -65,6 +65,15 @@ sha256_of() {
 # --- preflight -------------------------------------------------------------
 has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
 [ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
+# A custom env-file override must be absolute: the daemon + CLI only honour
+# OPENLLM_DAEMON_ENV_FILE when it is absolute (see packages/cli/src/env.ts), so a
+# relative value here would write config the runtime never reads.
+if [ -n "${OPENLLM_DAEMON_ENV_FILE:-}" ]; then
+  case "$OPENLLM_DAEMON_ENV_FILE" in
+    /*) ;;
+    *) die "OPENLLM_DAEMON_ENV_FILE must be an absolute path" ;;
+  esac
+fi
 case "$(uname -s)" in
   Darwin) OS="darwin" ;;
   Linux)  OS="linux" ;;
@@ -260,6 +269,11 @@ write_env_file() {
   # Install the RETURN cleanup only after all nested reads have completed: Bash
   # runs a RETURN trap for nested functions too.
   trap 'rm -f "$tmp" "$lock"' RETURN
+  # Tighten umask only for the temp-file creation window (closing the race
+  # before `chmod 0600`), then restore it so later installer steps and child
+  # processes keep the caller's umask.
+  local saved_umask
+  saved_umask="$(umask)"
   umask 077
   : > "$tmp"
   # Keep unrelated lines byte-for-byte, but replace every installer-owned key with
@@ -294,8 +308,12 @@ write_env_file() {
   [ -z "$current_device" ] || [ "$wrote_device" = 1 ] || printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"
   [ -z "$desired_pty" ] || [ "$wrote_pty" = 1 ] || printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"
   chmod 0600 "$tmp"
-  mv -f "$tmp" "$ENV_FILE"
+  # Abort with a clear error if the atomic replace fails — never fall through to
+  # announce success (or set API_KEY) on a config that was not written. The
+  # RETURN trap still cleans up the temp file + lock.
+  mv -f "$tmp" "$ENV_FILE" || die "could not write config file: $ENV_FILE"
   chmod 0600 "$ENV_FILE"
+  umask "$saved_umask"
   rm -f "$lock"
   trap - RETURN
   API_KEY="$desired_key"
