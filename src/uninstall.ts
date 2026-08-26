@@ -10,8 +10,11 @@
  *   2. stop + unregister the background service (launch agent / systemd unit)
  *   3. remove shell completion (rc line + fish file)
  *   4. remove the `openllmd` PATH symlink (only if it's ours)
- *   5. delete the entire state dir `~/.openllm` — binary, paired API key,
- *      subscription CREDENTIALS, the encryption keypair, logs
+ *   5. delete the state dir `~/.openllm` — binary, paired API key, subscription
+ *      CREDENTIALS, the encryption keypair, logs. OPTIONALLY preserve
+ *      `~/.openllm/cli` (the connected vendor-CLI logins) so a later reinstall
+ *      reuses them instead of re-authenticating — a reset-and-reinstall keeps
+ *      the user's subscription logins when they ask to.
  *
  * The running process keeps executing from its already-loaded binary even
  * after its file is unlinked (the inode survives until exit), so deleting the
@@ -20,6 +23,7 @@
 import {
   existsSync,
   lstatSync,
+  readdirSync,
   readlinkSync,
   rmSync,
   unlinkSync,
@@ -36,6 +40,43 @@ const out = (s: string): void => {
 
 /** The `openllmd` binary the installers drop under the state dir. */
 const binPath = (): string => join(stateDir(), "bin", "openllmd");
+
+/**
+ * The subscription logins live under `~/.openllm/cli/<provider>/home` (see
+ * `cli-paths.ts`) — each vendor CLI's authenticated home. Preserving this
+ * subtree across an uninstall lets a later reinstall reuse those logins instead
+ * of re-authenticating.
+ */
+export const loginsDir = (): string => join(stateDir(), "cli");
+
+/** True when there is at least one subscription login worth keeping. */
+const hasLogins = (): boolean => {
+  try {
+    return existsSync(loginsDir()) && readdirSync(loginsDir()).length > 0;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Delete the state dir. With `keepLogins`, preserve `~/.openllm/cli` by removing
+ * every OTHER entry rather than the whole tree; otherwise remove it all.
+ * Returns a one-line summary for the caller to print. Exported for tests.
+ */
+export const pruneState = (keepLogins: boolean): string => {
+  const dir = stateDir();
+  if (!existsSync(dir)) return `state dir already gone (${dir})`;
+  if (!keepLogins) {
+    rmSync(dir, { recursive: true, force: true });
+    return `deleted all state (${dir})`;
+  }
+  const kept = loginsDir();
+  for (const entry of readdirSync(dir)) {
+    if (join(dir, entry) === kept) continue;
+    rmSync(join(dir, entry), { recursive: true, force: true });
+  }
+  return `deleted state except your subscription logins (kept ${kept})`;
+};
 
 /**
  * Remove an `openllmd` PATH symlink ONLY when it's one we own — a symlink
@@ -72,19 +113,34 @@ const removeOwnedLinks = (): string[] => {
   return removed;
 };
 
-const CONFIRM_PROMPT = `⚠️  This will COMPLETELY remove the OpenLLM daemon from this machine:
+/** The destructive-action gate. When CLI logins are `keepable`, the copy notes
+ *  they can be preserved (the follow-up question decides) rather than claiming
+ *  every credential is deleted. */
+const confirmPrompt = (keepable: boolean): string =>
+  `⚠️  This will remove the OpenLLM daemon from this machine:
 
   • stop and UNREGISTER the background service (launch agent / systemd unit),
     so it no longer self-restores on login or reboot
-  • DELETE all local state under ${stateDir()} — including your stored
-    subscription CREDENTIALS, the paired API key, and the daemon's
-    encryption keypair
+  • DELETE local state under ${stateDir()} — the paired API key and the
+    daemon's encryption keypair${
+      keepable ? "" : ", and your stored subscription CREDENTIALS"
+    }
   • remove the openllmd binary, its PATH symlink, and shell completion
+${
+  keepable
+    ? `\nYou'll then be asked whether to KEEP your subscription logins\n(${loginsDir()}) so a future reinstall can reuse them.\n`
+    : ""
+}
+This is IRREVERSIBLE. You'll need to reinstall${
+    keepable ? "" : " and reconnect your\nsubscriptions"
+  } to use the daemon again.
 
-This is IRREVERSIBLE. You'll need to reinstall and reconnect your
-subscriptions to use the daemon again.
+Type 'yes' to continue: `;
 
-Type 'yes' to remove everything: `;
+/** The subscription-logins keep/remove question, shown after the uninstall is
+ *  confirmed. Defaults to KEEP (an empty answer keeps them). */
+const keepLoginsPrompt = (): string =>
+  `Keep your subscription logins under\n${loginsDir()}\nso a future reinstall can reuse them (skip re-authenticating)? [Y/n] `;
 
 /** True when the user passed an explicit non-interactive confirm flag. */
 const hasYesFlag = (args: readonly string[]): boolean =>
@@ -96,7 +152,7 @@ const hasYesFlag = (args: readonly string[]): boolean =>
  * without `--yes`, refuse (rather than read a misleading empty line) and tell
  * them how to proceed.
  */
-const confirm = (args: readonly string[]): boolean => {
+const confirm = (args: readonly string[], keepable: boolean): boolean => {
   if (hasYesFlag(args)) return true;
   if (process.stdin.isTTY !== true) {
     process.stderr.write(
@@ -109,18 +165,35 @@ const confirm = (args: readonly string[]): boolean => {
   // Require the exact word the prompt asks for — no bare `y` shorthand for an
   // irreversible, credential-deleting action (the explicit -y/--yes flag is the
   // intentional non-interactive shorthand).
-  const answer = (prompt(CONFIRM_PROMPT) ?? "").trim().toLowerCase();
+  const answer = (prompt(confirmPrompt(keepable)) ?? "").trim().toLowerCase();
   return answer === "yes";
+};
+
+/**
+ * Decide whether to preserve `~/.openllm/cli`. `--keep-logins` /
+ * `--remove-logins` settle it non-interactively; `--yes`/`-y` (explicit "don't
+ * prompt me") defaults to a full clean; otherwise a TTY is asked, defaulting to
+ * KEEP. Only called when there are subscription logins worth keeping.
+ */
+const keepLoginsDecision = (args: readonly string[]): boolean => {
+  if (args.includes("--keep-logins")) return true;
+  if (args.includes("--remove-logins")) return false;
+  if (hasYesFlag(args)) return false;
+  if (process.stdin.isTTY !== true) return false;
+  const answer = (prompt(keepLoginsPrompt()) ?? "").trim().toLowerCase();
+  return answer === "" || answer === "y" || answer === "yes";
 };
 
 /**
  * Run `openllmd uninstall`. Exits the process (0 on completion, 1 on abort).
  */
 export const runUninstall = (args: readonly string[]): never => {
-  if (!confirm(args)) {
+  const keepable = hasLogins();
+  if (!confirm(args, keepable)) {
     out("\nAborted — nothing was removed.\n");
     process.exit(1);
   }
+  const keepLogins = keepable && keepLoginsDecision(args);
 
   out("\nRemoving the OpenLLM daemon…\n");
 
@@ -148,15 +221,15 @@ export const runUninstall = (args: readonly string[]): never => {
       : "  ✓ PATH symlink (none owned by us)\n",
   );
 
-  // 4. All local state — binary, API key, credentials, tokens, keypair, logs.
-  const dir = stateDir();
-  if (existsSync(dir)) {
-    rmSync(dir, { recursive: true, force: true });
-    out(`  ✓ deleted all state (${dir})\n`);
-  } else {
-    out(`  ✓ state dir already gone (${dir})\n`);
-  }
+  // 4. Local state — binary, API key, credentials, tokens, keypair, logs. When
+  //    the user opted to keep them, the subscription logins under
+  //    `~/.openllm/cli` survive for a future reinstall.
+  out(`  ✓ ${pruneState(keepLogins)}\n`);
 
-  out("\nOpenLLM daemon fully removed. Your machine is clean.\n");
+  out(
+    keepLogins
+      ? `\nOpenLLM daemon removed. Your subscription logins were kept at\n${loginsDir()}\nso a reinstall can reuse them.\n`
+      : "\nOpenLLM daemon fully removed. Your machine is clean.\n",
+  );
   process.exit(0);
 };

@@ -10,7 +10,8 @@
 #   curl -fsSL https://openllm.sh/install | OPENLLM_API_KEY=sk-llm-... bash
 #
 # Env (all optional):
-#   OPENLLM_CLOUD_ORIGIN   gateway origin (default https://openllm.sh)
+#   OPENLLM_CLOUD_ORIGIN   gateway origin (env → existing ~/.openllm/.env →
+#                          default https://openllm.sh; a re-run keeps your origin)
 #   OPENLLM_API_KEY        pair the daemon now; otherwise pair from the dashboard
 #   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
 #   OPENLLM_DAEMON_PTY_SESSIONS  enable remote terminal sessions (1/true; default off)
@@ -24,8 +25,8 @@
 # shell rc that `openllm setup` / `openllmd completion` manage.
 set -euo pipefail
 
-ORIGIN="${OPENLLM_CLOUD_ORIGIN:-https://openllm.sh}"
-ORIGIN="${ORIGIN%/}"
+# ORIGIN is resolved in preflight (env → existing ~/.openllm/.env → default),
+# mirroring the CLI's cliConfig() precedence — see below.
 OPENLLM_DIR="$HOME/.openllm"
 BIN_DIR="$OPENLLM_DIR/bin"
 ENV_FILE="${OPENLLM_DAEMON_ENV_FILE:-$OPENLLM_DIR/.env}"
@@ -36,6 +37,10 @@ DAEMON_PORT="${OPENLLM_DAEMON_PORT:-8787}"
 # shell/PATH/completion edits, and no teardown of an existing healthy service.
 # (Validated in preflight, once `die` is defined.)
 INSTALL_MODE="${OPENLLM_INSTALL_MODE:-install}"
+# Space-delimited list of components whose on-disk bytes were actually replaced
+# this run (see install_component). Update mode reads it to skip a pointless
+# daemon restart when nothing changed.
+INSTALLED_COMPONENTS=""
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
 
@@ -54,6 +59,26 @@ trim_whitespace() {
   printf '%s' "$value"
 }
 
+# Read one KEY's value from the shared env file (first match wins), trimming
+# whitespace and one layer of surrounding quotes so it matches how the CLI and
+# daemon parse the same file (packages/cli/src/env.ts). Used only to seed the
+# effective origin below; empty/absent → empty string.
+env_file_value() {
+  local wanted="$1" line key value
+  [ -f "$ENV_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ""|\#*) continue ;; esac
+    key="${line%%=*}"
+    [ "$key" = "$wanted" ] || continue
+    value="$(trim_whitespace "${line#*=}")"
+    value="${value#[\"\']}"
+    value="${value%[\"\']}"
+    printf '%s' "$value"
+    return 0
+  done < "$ENV_FILE"
+  return 0
+}
+
 is_usable_api_key() {
   local key="$1"
   # Minted keys are `sk-llm-` + a 10-byte base64url id (14 chars) + `.` +
@@ -69,17 +94,29 @@ sha256_of() {
 }
 
 # --- preflight -------------------------------------------------------------
-has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
-[ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
 # A custom env-file override must be absolute: the daemon + CLI only honour
 # OPENLLM_DAEMON_ENV_FILE when it is absolute (see packages/cli/src/env.ts), so a
-# relative value here would write config the runtime never reads.
+# relative value here would write config the runtime never reads. Validate this
+# BEFORE reading the file for the origin fallback, so we never read a relative
+# path resolved against the caller's cwd.
 if [ -n "${OPENLLM_DAEMON_ENV_FILE:-}" ]; then
   case "$OPENLLM_DAEMON_ENV_FILE" in
     /*) ;;
     *) die "OPENLLM_DAEMON_ENV_FILE must be an absolute path" ;;
   esac
 fi
+# Effective origin — process env, else the origin already recorded in the shared
+# env file, else the compiled production default. This mirrors the CLI's
+# cliConfig() precedence (packages/cli/src/env.ts), so re-running the installer
+# (or `openllm update`) from a preview/self-host origin does NOT silently reset a
+# user's persisted OPENLLM_CLOUD_ORIGIN back to production. An explicit
+# OPENLLM_CLOUD_ORIGIN in the environment still wins.
+ORIGIN="${OPENLLM_CLOUD_ORIGIN:-}"
+[ -n "$ORIGIN" ] || ORIGIN="$(env_file_value OPENLLM_CLOUD_ORIGIN)"
+[ -n "$ORIGIN" ] || ORIGIN="https://openllm.sh"
+ORIGIN="${ORIGIN%/}"
+has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
+[ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
 case "$INSTALL_MODE" in
   install|update) ;;
   *) die "OPENLLM_INSTALL_MODE must be 'install' or 'update'" ;;
@@ -221,6 +258,7 @@ install_component() {
     fi
   fi
   echo "  $name installed → $dest"
+  INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
 }
 
 install_component openllmd api/daemon/binary "$DAEMON_VERSION"
@@ -373,11 +411,22 @@ reconcile_keyless_service() {
 
 if [ -n "$API_KEY" ]; then
   if [ "$INSTALL_MODE" = update ]; then
-    # A running daemon is pinned to the binary path we just replaced; restart to
-    # pick up the new bytes. Credentials are already persisted, so this never
-    # prompts. `restart` is idempotent — it registers + starts if not yet running.
-    echo "Restarting the daemon to pick up the new binary..."
-    "$BIN_DIR/openllmd" restart || die "openllmd restart failed — run '$BIN_DIR/openllmd status' to diagnose"
+    # Only bounce the daemon when its binary actually changed. `openllmd
+    # restart` (and even `start`) stop-then-start the running service, so an
+    # unconditional restart would needlessly interrupt an already-current daemon
+    # on every `openllm update` — the common no-op case. A changed CLI binary
+    # alone needs no restart: the running daemon's bytes are unchanged and the
+    # new CLI is picked up on its next invocation. Credentials are already
+    # persisted, so the restart never prompts.
+    case " $INSTALLED_COMPONENTS " in
+      *" openllmd "*)
+        echo "Restarting the daemon to pick up the new binary..."
+        "$BIN_DIR/openllmd" restart || die "openllmd restart failed — run '$BIN_DIR/openllmd status' to diagnose"
+        ;;
+      *)
+        echo "  daemon already current — no restart needed"
+        ;;
+    esac
   else
     echo "Starting the daemon..."
     "$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"

@@ -38,7 +38,7 @@ export const COMMANDS: readonly TCommand[] = [
   },
   {
     name: "uninstall",
-    args: "[--yes]",
+    args: "[--yes] [--keep-logins|--remove-logins]",
     description: "Remove the daemon and ALL state (credentials, service)",
   },
   {
@@ -81,7 +81,7 @@ export const COMMAND_ARGS: Readonly<Record<string, readonly string[]>> = {
   "auto-update": [...AUTO_UPDATE_ACTIONS],
   sessions: [...AUTO_UPDATE_ACTIONS],
   logs: ["-f", "--follow", "-n", "--lines"],
-  uninstall: ["--yes", "-y"],
+  uninstall: ["--yes", "-y", "--keep-logins", "--remove-logins"],
 };
 
 const padRight = (value: string, width: number): string =>

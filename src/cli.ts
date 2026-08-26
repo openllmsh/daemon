@@ -15,7 +15,8 @@
  *   openllmd logs [-f] [-n N]     show or follow daemon logs
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd sessions <on|off|status>  opt in/out of remote terminal sessions (default off)
- *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
+ *   openllmd uninstall [--yes] [--keep-logins|--remove-logins]  remove the daemon
+ *                                 (--keep-logins preserves ~/.openllm/cli logins)
  *   openllmd completion <shell>   emit / install shell completion
  *   openllmd -h | --help          show help
  *   openllmd -v | --version       show version
