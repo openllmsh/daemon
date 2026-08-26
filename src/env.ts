@@ -49,10 +49,8 @@
  *                            minutes (default `60`; `0` disables). Read by
  *                            `session-host.ts` from this same env file.
  *
- * Legacy standalone `device-id` / `auto-update` files are migrated into the env
- * file and then removed — lazily on first read, and `auto-update` proactively
- * at boot via `migrateLegacyAutoUpdate`. Pre-launch standalone API-key files are
- * intentionally ignored; native onboarding is the only credential source.
+ * Pre-launch standalone API-key files are intentionally ignored; native
+ * onboarding is the only credential source.
  */
 import { randomUUID } from "node:crypto";
 import {
@@ -64,7 +62,6 @@ import {
   openSync,
   readFileSync,
   renameSync,
-  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -486,8 +483,6 @@ export const daemonPort = (): number => {
   return parseOpenllmDaemonPort(raw, fallback);
 };
 
-const deviceIdFile = (): string => join(stateDir(), "device-id");
-
 let cachedDeviceId: string | null = null;
 
 /**
@@ -495,8 +490,7 @@ let cachedDeviceId: string | null = null;
  * `OPENLLM_DEVICE_ID`. Opaque (a random uuid) — carries no PII. Used to bind
  * the daemon's presence token to this device
  * (`docs/proposals/daemon-presence-without-heartbeat.md`); survives restarts
- * so the token stays constant. A legacy standalone `device-id` file (older
- * installs) is migrated into the env file and removed.
+ * so the token stays constant.
  */
 export const deviceId = (): string => {
   if (cachedDeviceId !== null) return cachedDeviceId;
@@ -506,25 +500,10 @@ export const deviceId = (): string => {
     cachedDeviceId = fromEnv;
     return fromEnv;
   }
-  // Adopt a legacy standalone file if present, else mint a fresh id. Either
-  // way it lives in the env file afterwards (single source).
-  let id: string | null = null;
-  try {
-    const legacy = readFileSync(deviceIdFile(), "utf-8").trim();
-    if (legacy.length > 0) id = legacy;
-  } catch {
-    // no legacy file — mint below
-  }
-  if (id === null) id = randomUUID();
-  const written = writeEnvFileVars({ OPENLLM_DEVICE_ID: id });
+  // Mint a fresh id and persist it in the env file (single source).
+  const id = randomUUID();
+  writeEnvFileVars({ OPENLLM_DEVICE_ID: id });
   process.env.OPENLLM_DEVICE_ID = id;
-  if (written) {
-    try {
-      rmSync(deviceIdFile(), { force: true });
-    } catch {
-      // best-effort cleanup of the now-migrated legacy file
-    }
-  }
   cachedDeviceId = id;
   return id;
 };

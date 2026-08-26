@@ -13,22 +13,12 @@
  *
  * Precedence: an explicit `OPENLLM_DAEMON_AUTO_UPDATE` (set in the environment,
  * or loaded from the env file by `loadEnvFile`) decides; absent it, ON.
- *
- * Legacy: a pre-single-file standalone `~/.openllm/auto-update` flag file is
- * migrated into the env file and removed — lazily on first read, and proactively
- * at boot via {@link migrateLegacyAutoUpdate}. Mirrors the `api-key` /
- * `device-id` migrations in `env.ts`.
  */
-import { readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { loadEnvFile, stateDir, writeEnvFileVars } from "./env";
+import { loadEnvFile, writeEnvFileVars } from "./env";
 import { logWarn } from "./logger";
 
 /** The env-file key the preference lives under. */
 const AUTO_UPDATE_KEY = "OPENLLM_DAEMON_AUTO_UPDATE";
-
-/** The legacy standalone flag file (pre-single-file installs). */
-const legacyPrefFile = (): string => join(stateDir(), "auto-update");
 
 /** Parse a flag value to bool; null when unrecognized/absent. */
 const parseFlag = (raw: string | undefined): boolean | null => {
@@ -38,40 +28,6 @@ const parseFlag = (raw: string | undefined): boolean | null => {
   return null;
 };
 
-/**
- * Migrate a legacy `~/.openllm/auto-update` flag file INTO the env file
- * (`OPENLLM_DAEMON_AUTO_UPDATE`) and remove it, so the env file stays the single
- * config source. Returns the migrated value, or null when there's no (valid)
- * legacy file. Best-effort + idempotent — safe to call on every boot.
- */
-export const migrateLegacyAutoUpdate = (): boolean | null => {
-  let legacy: boolean | null;
-  try {
-    legacy = parseFlag(readFileSync(legacyPrefFile(), "utf-8"));
-  } catch {
-    return null; // no legacy file — nothing to migrate
-  }
-  // A stray/garbage file: drop it rather than leave it lying around.
-  if (legacy === null) {
-    try {
-      rmSync(legacyPrefFile(), { force: true });
-    } catch {
-      // best-effort cleanup
-    }
-    return null;
-  }
-  const written = writeEnvFileVars({ [AUTO_UPDATE_KEY]: legacy ? "1" : "0" });
-  process.env[AUTO_UPDATE_KEY] = legacy ? "1" : "0";
-  if (written) {
-    try {
-      rmSync(legacyPrefFile(), { force: true });
-    } catch {
-      // best-effort cleanup of the now-migrated legacy file
-    }
-  }
-  return legacy;
-};
-
 /** Whether automatic daemon self-update is enabled. Default TRUE (opt-out). */
 export const autoUpdateEnabled = (): boolean => {
   // In dev, `.dev.env` overrides non-selector process env defaults; in prod, an
@@ -79,17 +35,12 @@ export const autoUpdateEnabled = (): boolean => {
   loadEnvFile();
   const fromEnv = parseFlag(process.env[AUTO_UPDATE_KEY]);
   if (fromEnv !== null) return fromEnv;
-
-  // No value in the env file yet — adopt a legacy standalone file if present.
-  const migrated = migrateLegacyAutoUpdate();
-  if (migrated !== null) return migrated;
   return true; // default ON until explicitly opted out
 };
 
 /**
  * Persist the auto-update opt-in into the env file (`0600`, merge) and update
- * the in-process env so the next check sees it immediately. Drops any legacy
- * standalone flag file so the env file stays the single source.
+ * the in-process env so the next check sees it immediately.
  */
 export const setAutoUpdate = (enabled: boolean): void => {
   const value = enabled ? "1" : "0";
@@ -97,9 +48,4 @@ export const setAutoUpdate = (enabled: boolean): void => {
     logWarn("auto-update", "failed to persist preference to the env file");
   }
   process.env[AUTO_UPDATE_KEY] = value;
-  try {
-    rmSync(legacyPrefFile(), { force: true });
-  } catch {
-    // best-effort cleanup of the now-superseded legacy file
-  }
 };

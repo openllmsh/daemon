@@ -1,12 +1,10 @@
 /**
  * Consolidated daemon-private state — ONE `state.json` under the state dir
  * instead of a scatter of single-purpose files. Holds the self-update attempt
- * cooldowns (daemon + CLI slots, previously `update-state.json` and
- * `cli-update-state.json`) and the crash-loop boot history (previously
- * `boot-history.json`). Legacy files are migrated in on first read and
- * removed. Strictly daemon-private: nothing outside this binary reads or
- * writes `state.json`, so its shape is free to evolve — unlike the shared
- * `.env` or the `installed/` stamps, which are deployed contracts.
+ * cooldowns (daemon + CLI slots) and the crash-loop boot history. Strictly
+ * daemon-private: nothing outside this binary reads or writes `state.json`, so
+ * its shape is free to evolve — unlike the shared `.env` or the `installed/`
+ * stamps, which are deployed contracts.
  *
  * CONCURRENCY INVARIANT: every mutation goes through {@link mutateState},
  * which MUST stay fully synchronous — read-fresh, transform, atomic
@@ -116,73 +114,16 @@ const writeStateAtomic = (state: TDaemonState): void => {
   }
 };
 
-/** A single legacy `{version, ts}` attempt file, or undefined. */
-const readLegacyAttempt = (file: string): TUpdateAttempt | undefined => {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(file, "utf-8"));
-    return isAttempt(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
 /**
- * One-shot hydration from the pre-consolidation files (`update-state.json`,
- * `cli-update-state.json`, `boot-history.json`). Runs only when `state.json`
- * is ABSENT; the legacy files are removed only after the consolidated file
- * was written successfully (mirrors the `written` guard in env.ts's
- * `deviceId` migration). Returns null when no legacy file exists — pure reads
- * must not create a state file.
- */
-const migrateLegacyState = (): TDaemonState | null => {
-  const legacyDaemon = join(stateDir(), "update-state.json");
-  const legacyCli = join(stateDir(), "cli-update-state.json");
-  const legacyBoot = join(stateDir(), "boot-history.json");
-  const daemon = readLegacyAttempt(legacyDaemon);
-  const cli = readLegacyAttempt(legacyCli);
-  let bootHistory: number[] | undefined;
-  try {
-    bootHistory = numberList(JSON.parse(readFileSync(legacyBoot, "utf-8")));
-  } catch {
-    bootHistory = undefined;
-  }
-  if (daemon === undefined && cli === undefined && bootHistory === undefined) {
-    return null; // nothing to migrate
-  }
-  const state: TDaemonState = {
-    updateAttempts: {
-      ...(daemon !== undefined ? { daemon } : {}),
-      ...(cli !== undefined ? { cli } : {}),
-    },
-    bootHistory: bootHistory ?? [],
-  };
-  writeStateAtomic(state);
-  // Remove the legacy files only once the consolidated file actually exists.
-  try {
-    readFileSync(stateFilePath(), "utf-8");
-    for (const f of [legacyDaemon, legacyCli, legacyBoot]) {
-      try {
-        rmSync(f, { force: true });
-      } catch {
-        // best-effort cleanup of the now-migrated legacy file
-      }
-    }
-  } catch {
-    // write failed — leave the legacy files for the next attempt
-  }
-  return state;
-};
-
-/**
- * The current consolidated state. Absent file → one-shot legacy migration,
- * else defaults. Corrupt file → per-field defaults. Never throws.
+ * The current consolidated state. Absent or corrupt file → defaults. Never
+ * throws. A pure read must not create a state file.
  */
 export const readState = (): TDaemonState => {
   let raw: string;
   try {
     raw = readFileSync(stateFilePath(), "utf-8");
   } catch {
-    return migrateLegacyState() ?? DEFAULT_STATE;
+    return DEFAULT_STATE;
   }
   try {
     return coerceState(JSON.parse(raw));

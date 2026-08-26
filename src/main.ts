@@ -20,7 +20,6 @@
  * This file is compiled into a source-free standalone binary with
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
-import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { guardCrashLoop, markHealthyBoot } from "./boot-guard";
 import {
   drainDisposableChildren,
@@ -84,11 +83,6 @@ const main = async (): Promise<void> => {
   // `daemonPort()` loads the env file, so the kill-switch / opt-in vars are
   // resolved before the sandbox decision.
   const port = daemonPort();
-
-  // Fold any pre-single-file legacy config into the shared env file (and
-  // remove the stray files) before anything reads it — the `auto-update` flag
-  // here; `api-key` / `device-id` migrate lazily in env.ts on first read.
-  migrateLegacyAutoUpdate();
 
   // Crash-loop circuit breaker. The supervisor (systemd `Restart=always` /
   // launchd `KeepAlive`) relaunches us on every exit, so a persistent boot

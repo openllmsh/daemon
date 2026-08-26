@@ -69,13 +69,8 @@ const hasLogins = (): boolean => {
  */
 const DAEMON_STATE_ENTRIES: readonly string[] = [
   ".env", // paired API key + origin
-  "state.json", // daemon runtime state
-  "update-state.json", // self-update bookkeeping
-  "cli-update-state.json", // vendor-CLI update bookkeeping
-  "boot-history.json", // crash-loop guard history
-  "device-id", // paired device identity
+  "state.json", // daemon runtime state (update cooldowns, boot history)
   "x25519-priv", // the daemon's encryption private key
-  "auto-update", // auto-update preference
   "sessions", // remote PTY session state
   "debug", // debug artifacts
   "openllmd.log",
