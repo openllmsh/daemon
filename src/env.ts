@@ -55,7 +55,19 @@
  * `migrateLegacyAutoUpdate`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
@@ -279,37 +291,149 @@ const parseEnvLines = (text: string): Map<string, string> => {
  * passes `serviceEnvFilePath()` so it seeds the PROD `.env` even under the dev
  * flag — see `serviceEnvFilePath` / `service.ts writeEnvFileIfNeeded`.
  */
+const lockWait = (): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+};
+
+/** Serialize env-file read/modify/write operations across daemon processes. */
+const withEnvFileLock = (
+  targetPath: string,
+  operation: () => boolean,
+): boolean => {
+  const lockPath = `${targetPath}.lock`;
+  let acquired = false;
+  for (let attempts = 0; attempts < 500; attempts += 1) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      closeSync(fd);
+      acquired = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      // A process killed while holding the lock must not block configuration forever.
+      try {
+        const lock = lstatSync(lockPath);
+        if (lock.isFile() && Date.now() - lock.mtimeMs > 30_000)
+          unlinkSync(lockPath);
+      } catch {
+        // Another writer may have released/replaced it; retry normally.
+      }
+      lockWait();
+    }
+  }
+  if (!acquired) return false;
+  try {
+    return operation();
+  } finally {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // Best effort: stale-lock recovery above prevents a permanent wedge.
+    }
+  }
+};
+
+const isSafeEnvTarget = (targetPath: string): boolean => {
+  try {
+    const target = lstatSync(targetPath);
+    return target.isFile() && !target.isSymbolicLink();
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+};
+
+const updatedEnvLines = (
+  existing: readonly string[],
+  updates: Readonly<Record<string, string>>,
+): string[] => {
+  const pending = new Map(Object.entries(updates));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of existing) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) {
+      out.push(line);
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) {
+      out.push(line);
+      continue;
+    }
+    const key = trimmed.slice(0, eq).trim();
+    const value = updates[key];
+    if (value === undefined) {
+      out.push(line);
+      continue;
+    }
+    // Keep one canonical occurrence at the first position and remove conflicting
+    // duplicates. Unrelated lines retain their original spelling and order.
+    if (!seen.has(key)) {
+      out.push(`${key}=${value}`);
+      seen.add(key);
+      pending.delete(key);
+    }
+  }
+  while (out.length > 0 && out[out.length - 1].trim().length === 0) out.pop();
+  for (const [key, value] of pending) out.push(`${key}=${value}`);
+  return out;
+};
+
+/**
+ * Atomically upsert env values without following links or losing concurrent
+ * updates. Existing targets are required to be regular files and every success
+ * leaves a private `0600` file.
+ */
 export const writeEnvFileVars = (
   updates: Readonly<Record<string, string>>,
   targetPath: string = envFilePath(),
 ): boolean => {
-  let existing: string[] = [];
-  try {
-    existing = readFileSync(targetPath, "utf-8").split("\n");
-  } catch {
-    // no file yet — start fresh
-  }
-  const pending = new Map(Object.entries(updates));
-  const out = existing.map((line) => {
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed.startsWith("#")) return line;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) return line;
-    const key = trimmed.slice(0, eq).trim();
-    const next = pending.get(key);
-    if (next === undefined) return line;
-    pending.delete(key);
-    return `${key}=${next}`;
-  });
-  // Drop trailing blank lines so re-writes don't accumulate them, then append
-  // any keys that weren't already present.
-  while (out.length > 0 && out[out.length - 1].trim().length === 0) out.pop();
-  for (const [key, value] of pending) out.push(`${key}=${value}`);
+  if (Object.values(updates).some((value) => /[\r\n\0]/.test(value)))
+    return false;
   try {
     const parentDir = dirname(targetPath);
-    mkdirSync(parentDir, { recursive: true });
-    writeFileSync(targetPath, `${out.join("\n")}\n`, { mode: 0o600 });
-    return true;
+    mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+    return withEnvFileLock(targetPath, () => {
+      if (!isSafeEnvTarget(targetPath)) return false;
+      let existing: string[] = [];
+      try {
+        existing = readFileSync(targetPath, "utf-8").split("\n");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
+      const content = `${updatedEnvLines(existing, updates).join("\n")}\n`;
+      const temporaryPath = join(
+        parentDir,
+        `.${targetPath.split("/").at(-1) ?? "env"}.${randomUUID()}.tmp`,
+      );
+      let temporaryFd: number | null = null;
+      try {
+        temporaryFd = openSync(temporaryPath, "wx", 0o600);
+        writeFileSync(temporaryFd, content, "utf-8");
+        fsyncSync(temporaryFd);
+        closeSync(temporaryFd);
+        temporaryFd = null;
+        // Re-check immediately before replacement to reject a target swapped for
+        // a symlink by another local process while this writer held the lock.
+        if (!isSafeEnvTarget(targetPath)) return false;
+        renameSync(temporaryPath, targetPath);
+        chmodSync(targetPath, 0o600);
+        const directoryFd = openSync(parentDir, "r");
+        try {
+          fsyncSync(directoryFd);
+        } finally {
+          closeSync(directoryFd);
+        }
+        return true;
+      } finally {
+        if (temporaryFd !== null) closeSync(temporaryFd);
+        try {
+          unlinkSync(temporaryPath);
+        } catch {
+          // The rename consumed it, or creation failed.
+        }
+      }
+    });
   } catch {
     return false;
   }
@@ -331,7 +455,7 @@ export const DEV_DEFAULT_DAEMON_PORT = 8788;
 const parseDaemonPort = (raw: string, fallback: number): number => {
   const trimmed = raw.trim();
   const unquoted =
-    trimmed.startsWith("\"") && trimmed.endsWith("\"") && trimmed.length >= 2
+    trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2
       ? trimmed.slice(1, -1)
       : trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2
         ? trimmed.slice(1, -1)
@@ -484,6 +608,25 @@ export const daemonEnv = (): TDaemonEnv => {
  */
 export const resetDaemonEnvCacheForTest = (): void => {
   cached = null;
+};
+
+/** Apply a credential only after its durable env-file write has succeeded. */
+export const applyPersistedApiKey = (key: string): void => {
+  process.env.OPENLLM_API_KEY = key;
+  const current = daemonEnv();
+  cached = { ...current, apiKey: key };
+};
+
+/** Read one value from an exact env file without merging it into process state. */
+export const envFileValue = (
+  targetPath: string,
+  key: string,
+): string | null => {
+  try {
+    return parseEnvLines(readFileSync(targetPath, "utf-8")).get(key) ?? null;
+  } catch {
+    return null;
+  }
 };
 
 /**

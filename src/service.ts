@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
-import { requireServiceApiKey } from "./credential-gate";
+import { hasCredentialProof, requireServiceApiKey } from "./credential-gate";
 import {
   daemonEnv,
   daemonStderrLogFilePath,
@@ -536,14 +536,10 @@ const probeHealth = async (port: number): Promise<TDaemonHealth | null> => {
  * Register + start the service in full self-restore mode. Idempotent. Refuses
  * to register a from-source run (would point the service at `bun`).
  */
-export const serviceStart = (skipCredentialGate = false): boolean => {
-  if (!skipCredentialGate) {
-    const gate = requireServiceApiKey("human");
-    if (!gate.ok) {
-      process.stderr.write(gate.message);
-      return false;
-    }
-  }
+const startServiceAfterCredentialGate = (
+  gate: ReturnType<typeof requireServiceApiKey>,
+): boolean => {
+  if (!hasCredentialProof(gate)) return false;
   if (DAEMON_VERSION === "0.0.0-dev") {
     process.stderr.write(
       "refusing to register a service from a source run.\n" +
@@ -570,6 +566,15 @@ export const serviceStart = (skipCredentialGate = false): boolean => {
   return true;
 };
 
+export const serviceStart = (): boolean => {
+  const gate = requireServiceApiKey("human", undefined, serviceEnvFilePath());
+  if (!gate.ok) {
+    process.stderr.write(gate.message);
+    return false;
+  }
+  return startServiceAfterCredentialGate(gate);
+};
+
 /** Stop the service and disable all self-restore. Idempotent. */
 export const serviceStop = (): void => {
   if (isMac) stopMac();
@@ -582,13 +587,15 @@ export const serviceStop = (): void => {
  * first, so a failed/cancelled restart leaves an existing service untouched.
  */
 export const serviceRestart = (): boolean => {
-  const gate = requireServiceApiKey("human");
+  const gate = requireServiceApiKey("human", undefined, serviceEnvFilePath());
   if (!gate.ok) {
     process.stderr.write(gate.message);
     return false;
   }
+  // Keep the credential/persistence gate ahead of stop: cancelling or failing
+  // onboarding must leave a currently healthy service running.
   serviceStop();
-  return serviceStart(true);
+  return startServiceAfterCredentialGate(gate);
 };
 
 /**

@@ -1,9 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { closeSync, openSync, readSync } from "node:fs";
+import { isOpenllmApiKeySyntax } from "@openllmsh/protocol";
 import {
+  applyPersistedApiKey,
   daemonEnv,
-  resetDaemonEnvCacheForTest,
-  serviceEnvFilePath,
+  envFilePath,
+  envFileValue,
+  isDevMode,
+  sharedEnvFilePath,
   writeEnvFileVars,
 } from "./env";
 
@@ -13,6 +17,19 @@ export type TCredentialGateResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly message: string };
 
+// A successful gate result is registered by identity, not by a forgeable boolean.
+// Lifecycle internals use this boundary instead of a public skip flag.
+const approvedGates = new WeakSet<object>();
+
+export const hasCredentialProof = (result: TCredentialGateResult): boolean =>
+  result.ok && approvedGates.has(result);
+
+const approved = (): TCredentialGateResult => {
+  const result: TCredentialGateResult = { ok: true };
+  approvedGates.add(result);
+  return result;
+};
+
 export type TCredentialGateTerminal = {
   readonly isInteractive: () => boolean;
   readonly promptForKey: () => string | null;
@@ -20,15 +37,8 @@ export type TCredentialGateTerminal = {
 };
 
 /** A local envelope check only; cloud authentication remains authoritative. */
-export const isUsableApiKey = (value: string | null | undefined): boolean => {
-  if (value === null || value === undefined) return false;
-  const trimmed = value.trim();
-  return (
-    trimmed.length > "sk-llm-".length &&
-    !/[\r\n\0\s]/.test(trimmed) &&
-    /^sk-llm-[^.]+\.[^.]+$/.test(trimmed)
-  );
-};
+export const isUsableApiKey = (value: string | null | undefined): boolean =>
+  value !== null && value !== undefined && isOpenllmApiKeySyntax(value.trim());
 
 const signInUrl = (): string => `${daemonEnv().cloudOrigin}/sign-in`;
 
@@ -76,13 +86,27 @@ const defaultTerminal: TCredentialGateTerminal = {
   },
 };
 
-const persistServiceKey = (key: string): boolean => {
-  if (!writeEnvFileVars({ OPENLLM_API_KEY: key }, serviceEnvFilePath())) {
-    return false;
-  }
-  process.env.OPENLLM_API_KEY = key;
-  resetDaemonEnvCacheForTest();
+const persistServiceKey = (key: string, targetPath: string): boolean => {
+  if (!writeEnvFileVars({ OPENLLM_API_KEY: key }, targetPath)) return false;
+  applyPersistedApiKey(key);
   return true;
+};
+
+const persistedUsableKey = (targetPath: string): string | null => {
+  const value = envFileValue(targetPath, "OPENLLM_API_KEY");
+  return value !== null && isUsableApiKey(value) ? value.trim() : null;
+};
+
+const configuredUsableKey = (): string | null => {
+  const value = daemonEnv().apiKey;
+  return value !== null && isUsableApiKey(value) ? value.trim() : null;
+};
+
+const isReadOnlyDevKey = (key: string): boolean => {
+  if (!isDevMode()) return false;
+  const devKey = persistedUsableKey(envFilePath());
+  const sharedKey = persistedUsableKey(sharedEnvFilePath());
+  return devKey === key || sharedKey === key;
 };
 
 /**
@@ -93,14 +117,29 @@ const persistServiceKey = (key: string): boolean => {
 export const requireServiceApiKey = (
   mode: TCredentialGateMode,
   terminal: TCredentialGateTerminal = defaultTerminal,
+  targetPath: string = envFilePath(),
 ): TCredentialGateResult => {
-  const configured = daemonEnv().apiKey;
-  if (configured !== null && isUsableApiKey(configured)) {
-    if (persistServiceKey(configured.trim())) return { ok: true };
+  // A durable valid key is already authoritative. Never rewrite it just because
+  // the process inherited the same (or another) valid value.
+  if (persistedUsableKey(targetPath) !== null) return approved();
+
+  const configured = configuredUsableKey();
+  // Headless service boots are presence-only: no secret write and no prompt.
+  if (mode === "machine") {
+    return configured === null
+      ? { ok: false, message: missingKeyDiagnostic() }
+      : approved();
+  }
+
+  // A production service may inherit a key from its launching environment. Make
+  // that transient value durable in the precise file its supervisor will read.
+  // Do not copy dev's read-only shared-key fallback into any file.
+  if (configured !== null && !isReadOnlyDevKey(configured)) {
+    if (persistServiceKey(configured, targetPath)) return approved();
     return { ok: false, message: "[openllm] Could not save the API key.\n" };
   }
 
-  if (mode === "machine" || !terminal.isInteractive()) {
+  if (!terminal.isInteractive()) {
     return { ok: false, message: missingKeyDiagnostic() };
   }
 
@@ -116,10 +155,10 @@ export const requireServiceApiKey = (
       terminal.write("The API key format is invalid. Please try again.\n");
       continue;
     }
-    if (!persistServiceKey(pasted.trim())) {
+    if (!persistServiceKey(pasted.trim(), targetPath)) {
       return { ok: false, message: "[openllm] Could not save the API key.\n" };
     }
-    terminal.write(`Saved to ${serviceEnvFilePath()}.\n`);
-    return { ok: true };
+    terminal.write(`Saved to ${targetPath}.\n`);
+    return approved();
   }
 };

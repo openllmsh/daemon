@@ -102,6 +102,14 @@ const main = async (): Promise<void> => {
   // and before the (costly) sandbox/FFI work it's meant to stop repeating.
   guardCrashLoop();
 
+  // A supervised boot is machine-only and never mutates credentials, but it
+  // must count missing/malformed-key exits toward the crash-loop breaker.
+  const gate = requireServiceApiKey("machine");
+  if (!gate.ok) {
+    process.stderr.write(gate.message);
+    process.exit(1);
+  }
+
   // OS sandbox is PER-CHILD, not process-wide (see
   // `docs/audits/daemon-sandbox-scoping.md`): the daemon itself boots
   // UNCONFINED so device-session PTYs can run the user's real CLI over their
@@ -448,11 +456,4 @@ const main = async (): Promise<void> => {
 
 // Dispatch management subcommands (start/stop/status/completion/…); a bare
 // service boot is always machine mode and must never consume terminal input.
-if (!runCli()) {
-  const gate = requireServiceApiKey("machine");
-  if (!gate.ok) {
-    process.stderr.write(gate.message);
-    process.exit(1);
-  }
-  void main();
-}
+if (!runCli()) void main();
