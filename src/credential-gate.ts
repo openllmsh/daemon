@@ -1,6 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { closeSync, openSync, readSync } from "node:fs";
-import { isOpenllmApiKeySyntax } from "@openllmsh/protocol";
+import type {
+  TCredentialGateMode,
+  TCredentialGateTerminal,
+} from "@openllmsh/protocol";
+import { isUsableOpenllmApiKey } from "@openllmsh/protocol";
 import {
   applyPersistedApiKey,
   daemonEnv,
@@ -11,7 +15,10 @@ import {
   writeEnvFileVars,
 } from "./env";
 
-export type TCredentialGateMode = "human" | "machine";
+export type {
+  TCredentialGateMode,
+  TCredentialGateTerminal,
+} from "@openllmsh/protocol";
 
 export type TCredentialGateResult =
   | { readonly ok: true }
@@ -30,20 +37,48 @@ const approved = (): TCredentialGateResult => {
   return result;
 };
 
-export type TCredentialGateTerminal = {
-  readonly isInteractive: () => boolean;
-  readonly promptForKey: () => string | null;
-  readonly write: (message: string) => void;
-};
-
 /** A local envelope check only; cloud authentication remains authoritative. */
-export const isUsableApiKey = (value: string | null | undefined): boolean =>
-  value !== null && value !== undefined && isOpenllmApiKeySyntax(value.trim());
+export const isUsableApiKey = isUsableOpenllmApiKey;
 
 const signInUrl = (): string => `${daemonEnv().cloudOrigin}/sign-in`;
 
 export const missingKeyDiagnostic = (): string =>
   `[openllm] API key required.\nRun \`openllm start\` in an interactive terminal and sign in at ${signInUrl()}. New users receive a key during onboarding; returning users can open Keys after signing in. Paste the key when prompted.\n`;
+
+type THiddenInputSignalProcess = {
+  readonly on: (signal: NodeJS.Signals, listener: () => void) => unknown;
+  readonly off: (signal: NodeJS.Signals, listener: () => void) => unknown;
+  readonly kill: (pid: number, signal: NodeJS.Signals) => boolean;
+};
+
+export const restoreEchoOnSignal = (
+  restore: () => void,
+  signalProcess: THiddenInputSignalProcess = process,
+): (() => void) => {
+  let restored = false;
+  const restoreOnce = (): void => {
+    if (restored) return;
+    restored = true;
+    restore();
+  };
+  const forward = (signal: NodeJS.Signals): void => {
+    cleanup();
+    restoreOnce();
+    signalProcess.kill(process.pid, signal);
+  };
+  const onSigint = (): void => forward("SIGINT");
+  const onSigterm = (): void => forward("SIGTERM");
+  const cleanup = (): void => {
+    signalProcess.off("SIGINT", onSigint);
+    signalProcess.off("SIGTERM", onSigterm);
+  };
+  signalProcess.on("SIGINT", onSigint);
+  signalProcess.on("SIGTERM", onSigterm);
+  return (): void => {
+    cleanup();
+    restoreOnce();
+  };
+};
 
 const readHiddenLine = (): string | null => {
   let fd: number | null = null;
@@ -53,6 +88,10 @@ const readHiddenLine = (): string | null => {
       stdio: [fd, fd, fd],
     });
     if (disabled.status !== 0) return null;
+    const restore = (): void => {
+      spawnSync("stty", ["echo"], { stdio: [fd, fd, fd] });
+    };
+    const cleanupSignals = restoreEchoOnSignal(restore);
     try {
       const bytes: number[] = [];
       const buffer = Buffer.alloc(1);
@@ -64,7 +103,7 @@ const readHiddenLine = (): string | null => {
       }
       return Buffer.from(bytes).toString("utf8");
     } finally {
-      spawnSync("stty", ["echo"], { stdio: [fd, fd, fd] });
+      cleanupSignals();
       process.stderr.write("\n");
     }
   } catch {
@@ -144,7 +183,7 @@ export const requireServiceApiKey = (
   }
 
   terminal.write(
-    `${configured === null ? "OpenLLM needs an API key." : "The configured API key format is invalid."}\nSign in at ${signInUrl()}.\nNew users will receive a key during onboarding. Already have an account? Open Keys after signing in.\n`,
+    `${configured === null ? "OpenLLM needs an API key." : "The available development API key is read-only and cannot be saved for this service."}\nSign in at ${signInUrl()}.\nNew users will receive a key during onboarding. Already have an account? Open Keys after signing in.\n`,
   );
   while (true) {
     const pasted = terminal.promptForKey();
