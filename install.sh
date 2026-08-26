@@ -84,29 +84,16 @@ if ! has_command shasum && ! has_command sha256sum; then
   die "shasum or sha256sum is required to verify the download"
 fi
 
-# Resolve and validate credentials BEFORE making the install directory or
-# downloading either binary. A bad key must leave an existing installation
-# untouched, and a fresh machine must not gain a partial ~/.openllm tree.
-EXISTING_DEVICE_ID=""
-EXISTING_KEY=""
-EXISTING_PTY_SESSIONS=""
-if [ -f "$ENV_FILE" ]; then
-  EXISTING_DEVICE_ID="$(sed -n 's/^OPENLLM_DEVICE_ID=//p' "$ENV_FILE" | head -1)"
-  EXISTING_KEY="$(sed -n 's/^OPENLLM_API_KEY=//p' "$ENV_FILE" | head -1)"
-  EXISTING_PTY_SESSIONS="$(sed -n 's/^OPENLLM_DAEMON_PTY_SESSIONS=//p' "$ENV_FILE" | head -1)"
-fi
+# Validate a supplied key before making the install directory or downloading either
+# binary. Persisted values are deliberately read later, under the daemon's env-file
+# lock: downloads can take long enough for the daemon or another installer to update
+# the file in the meantime.
 SUPPLIED_KEY="$(trim_whitespace "${OPENLLM_API_KEY:-}")"
 if [ -n "$SUPPLIED_KEY" ]; then
   has_line_break "$SUPPLIED_KEY" && die "OPENLLM_API_KEY must not contain a line break"
   is_usable_api_key "$SUPPLIED_KEY" || die "OPENLLM_API_KEY has an invalid format"
-  API_KEY="$SUPPLIED_KEY"
-else
-  API_KEY="$(trim_whitespace "$EXISTING_KEY")"
-  if [ -n "$API_KEY" ] && ! is_usable_api_key "$API_KEY"; then
-    echo "Ignoring the persisted API key because its format is invalid; OpenLLM will install without starting the daemon." >&2
-    API_KEY=""
-  fi
 fi
+API_KEY=""
 
 mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
 
@@ -227,27 +214,95 @@ else
 fi
 
 # --- the shared config file ------------------------------------------------
-# ~/.openllm/.env is the ONE OpenLLM config file: the daemon boots from it and
-# the CLI reads it, so a single pairing covers every tool. Preserve any existing
-# device id (re-running must not re-identify this machine) and any key already
-# present when the caller didn't pass one.
-PTY_SESSIONS_INPUT="${OPENLLM_DAEMON_PTY_SESSIONS:-}"
-case "$PTY_SESSIONS_INPUT" in
-  1|true) PTY_SESSIONS="1" ;;
-  0|false) PTY_SESSIONS="0" ;;
-  *) PTY_SESSIONS="$EXISTING_PTY_SESSIONS" ;;
-esac
+# Re-read under the same exclusive `$ENV_FILE.lock` protocol as the daemon's
+# writeEnvFileVars. Never rebuild this file from a pre-download snapshot: a daemon
+# can mint a device id or update credentials while binaries are downloading.
+read_env_value() {
+  local wanted="$1" line key
+  [ -f "$ENV_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    key="${line%%=*}"
+    [ "$key" = "$wanted" ] && { printf '%s' "${line#*=}"; return 0; }
+  done < "$ENV_FILE"
+}
 
-umask 077
-{
-  echo "OPENLLM_CLOUD_ORIGIN=$ORIGIN"
-  echo "OPENLLM_DAEMON_PORT=$DAEMON_PORT"
-  [ -n "$API_KEY" ] && echo "OPENLLM_API_KEY=$API_KEY"
-  [ -n "$EXISTING_DEVICE_ID" ] && echo "OPENLLM_DEVICE_ID=$EXISTING_DEVICE_ID"
-  [ -n "$PTY_SESSIONS" ] && echo "OPENLLM_DAEMON_PTY_SESSIONS=$PTY_SESSIONS"
-} > "$ENV_FILE"
-chmod 0600 "$ENV_FILE"
-echo "  gateway config written → $ENV_FILE"
+write_env_file() {
+  local lock="$ENV_FILE.lock" attempt=0 acquired=0
+  # `noclobber` opens with O_EXCL. This intentionally uses the daemon's lock-file
+  # shape rather than flock, which is unavailable on some supported fresh installs.
+  while [ "$attempt" -lt 500 ]; do
+    if (set -C; : > "$lock") 2>/dev/null; then acquired=1; break; fi
+    attempt=$((attempt + 1))
+    sleep 0.01
+  done
+  [ "$acquired" = 1 ] || die "could not acquire config lock: $lock"
+
+  local current_key current_device current_pty desired_key desired_pty tmp line key
+  current_key="$(trim_whitespace "$(read_env_value OPENLLM_API_KEY || true)")"
+  current_device="$(read_env_value OPENLLM_DEVICE_ID || true)"
+  current_pty="$(read_env_value OPENLLM_DAEMON_PTY_SESSIONS || true)"
+  if [ -n "$SUPPLIED_KEY" ]; then
+    desired_key="$SUPPLIED_KEY"
+  else
+    desired_key="$current_key"
+    if [ -n "$desired_key" ] && ! is_usable_api_key "$desired_key"; then
+      echo "Ignoring the persisted API key because its format is invalid; OpenLLM will install without starting the daemon." >&2
+      desired_key=""
+    fi
+  fi
+  case "${OPENLLM_DAEMON_PTY_SESSIONS:-}" in
+    1|true) desired_pty="1" ;;
+    0|false) desired_pty="0" ;;
+    *) desired_pty="$current_pty" ;;
+  esac
+
+  tmp="$ENV_FILE.tmp.$$"
+  # Install the RETURN cleanup only after all nested reads have completed: Bash
+  # runs a RETURN trap for nested functions too.
+  trap 'rm -f "$tmp" "$lock"' RETURN
+  umask 077
+  : > "$tmp"
+  # Keep unrelated lines byte-for-byte, but replace every installer-owned key with
+  # one canonical occurrence. An ignored invalid persisted key is therefore removed.
+  local wrote_origin=0 wrote_port=0 wrote_key=0 wrote_device=0 wrote_pty=0
+  if [ -f "$ENV_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      key="${line%%=*}"
+      case "$key" in
+        OPENLLM_CLOUD_ORIGIN)
+          [ "$wrote_origin" = 1 ] || { printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp"; wrote_origin=1; }
+          ;;
+        OPENLLM_DAEMON_PORT)
+          [ "$wrote_port" = 1 ] || { printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp"; wrote_port=1; }
+          ;;
+        OPENLLM_API_KEY)
+          if [ -n "$desired_key" ] && [ "$wrote_key" = 0 ]; then printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp"; wrote_key=1; fi
+          ;;
+        OPENLLM_DEVICE_ID)
+          if [ -n "$current_device" ] && [ "$wrote_device" = 0 ]; then printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"; wrote_device=1; fi
+          ;;
+        OPENLLM_DAEMON_PTY_SESSIONS)
+          if [ -n "$desired_pty" ] && [ "$wrote_pty" = 0 ]; then printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"; wrote_pty=1; fi
+          ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$ENV_FILE"
+  fi
+  [ "$wrote_origin" = 1 ] || printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp"
+  [ "$wrote_port" = 1 ] || printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp"
+  [ -z "$desired_key" ] || [ "$wrote_key" = 1 ] || printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp"
+  [ -z "$current_device" ] || [ "$wrote_device" = 1 ] || printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"
+  [ -z "$desired_pty" ] || [ "$wrote_pty" = 1 ] || printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+  rm -f "$lock"
+  trap - RETURN
+  API_KEY="$desired_key"
+  echo "  gateway config written → $ENV_FILE"
+}
+
+write_env_file
 
 # --- shell wiring ----------------------------------------------------------
 # Delegated to the binaries themselves so the installer and a human run the

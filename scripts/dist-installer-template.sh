@@ -62,14 +62,10 @@ if [ -n "$_dist_supplied_key" ]; then
   _dist_has_line_break "$_dist_supplied_key" && { echo "Error: OPENLLM_API_KEY must not contain a line break" >&2; exit 1; }
   _dist_is_minted_api_key "$_dist_supplied_key" || { echo "Error: OPENLLM_API_KEY has an invalid format" >&2; exit 1; }
   OPENLLM_API_KEY="$_dist_supplied_key"
-else
-  OPENLLM_API_KEY="$(_dist_trim_whitespace "$(_openllmd_dist_reuse OPENLLM_API_KEY)")"
-  if [ -n "$OPENLLM_API_KEY" ] && ! _dist_is_minted_api_key "$OPENLLM_API_KEY"; then
-    echo "Ignoring the persisted API key because its format is invalid; OpenLLM will install without starting the daemon." >&2
-    OPENLLM_API_KEY=""
-  fi
 fi
-export OPENLLM_API_KEY
+# The injected production installer re-reads this file while holding its lock.
+# Do not turn a pre-download persisted key into a supplied key here: that would
+# overwrite a concurrent re-pair with this stale snapshot.
 
 # --- portable base64 decode (GNU '-d' vs BSD/macOS '-D') --------------------
 if printf '' | base64 -d >/dev/null 2>&1; then _b64d=(base64 -d); else _b64d=(base64 -D); fi
@@ -122,10 +118,9 @@ export PATH="$OPENLLMD_DIST_WORK/shim:$PATH"
 # config_var) and the daemon boots from OPENLLM_CLOUD_ORIGIN; accept the SAME
 # names here. Precedence:
 #   1. an explicit OPENLLM_* value in the environment;
-#   2. the value already in ~/.openllm/.env (re-run / re-pair in place);
-#   3. the baked default origin (the key stays empty if nothing supplies it).
-# install.sh always reads/writes $HOME/.openllm/.env, so reuse from there;
-# install.sh itself separately preserves the minted OPENLLM_DEVICE_ID.
+#   2. the value already in ~/.openllm/.env for the wrapper's cloud origin;
+#   3. the baked default origin. The injected installer resolves the API key,
+#      device id, and PTY preference under its lock immediately before writing.
 if [ -f "$OPENLLMD_DIST_ENV_FILE" ]; then
   echo "Found existing $OPENLLMD_DIST_ENV_FILE — reusing its OPENLLM_CLOUD_ORIGIN + OPENLLM_API_KEY where not overridden." >&2
 fi
@@ -133,8 +128,8 @@ OPENLLM_CLOUD_ORIGIN="${OPENLLM_CLOUD_ORIGIN:-$(_openllmd_dist_reuse OPENLLM_CLO
 OPENLLM_CLOUD_ORIGIN="${OPENLLM_CLOUD_ORIGIN:-__CLOUD_DEFAULT__}"
 export OPENLLM_CLOUD_ORIGIN
 export USAGE_URL="${USAGE_URL:-}"
-if [ -z "$OPENLLM_API_KEY" ]; then
-  echo "No API key is configured; OpenLLM will install without starting the daemon." >&2
+if [ -z "${OPENLLM_API_KEY:-}" ]; then
+  echo "No API key was supplied; the installer will check the current config before starting the daemon." >&2
 fi
 
 # --- disable daemon self-update for this dist install (default) --------------
