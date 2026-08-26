@@ -39,7 +39,8 @@ export const COMMANDS: readonly TCommand[] = [
   {
     name: "uninstall",
     args: "[--yes] [--keep-logins|--remove-logins]",
-    description: "Remove the daemon and ALL state (credentials, service)",
+    description:
+      "Remove the daemon + its state (leaves the CLI; see openllm uninstall)",
   },
   {
     name: "completion",

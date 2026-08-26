@@ -1,20 +1,21 @@
 /**
- * `openllmd uninstall` — completely remove the OpenLLM daemon from this
- * machine. The inverse of `packages/registry/setup/daemon/install.sh`: it leaves
- * NOTHING behind.
+ * `openllmd uninstall` — remove the OpenLLM DAEMON from this machine. It owns
+ * only the daemon's own teardown; the CLI owns its own (`openllm uninstall`),
+ * which delegates here first and then removes the CLI surface. So this leaves
+ * CLI-owned state (the client ledgers, the `openllm` binary, run dir) in place.
  *
  * Order matters — we STOP the self-restoring service FIRST (so launchd /
- * systemd can't relaunch the daemon mid-teardown), then delete state:
+ * systemd can't relaunch the daemon mid-teardown), then delete daemon state:
  *
- *   1. confirm (destructive + irreversible — credentials are deleted)
+ *   1. confirm (destructive + irreversible — daemon credentials are deleted)
  *   2. stop + unregister the background service (launch agent / systemd unit)
  *   3. remove shell completion (rc line + fish file)
  *   4. remove the `openllmd` PATH symlink (only if it's ours)
- *   5. delete the state dir `~/.openllm` — binary, paired API key, subscription
- *      CREDENTIALS, the encryption keypair, logs. OPTIONALLY preserve
- *      `~/.openllm/cli` (the connected vendor-CLI logins) so a later reinstall
- *      reuses them instead of re-authenticating — a reset-and-reinstall keeps
- *      the user's subscription logins when they ask to.
+ *   5. delete DAEMON state under `~/.openllm` — the `openllmd` binary, paired
+ *      API key, encryption keypair, sessions, logs — while PRESERVING CLI-owned
+ *      entries (see `CLI_OWNED_ENTRIES`). OPTIONALLY also preserve
+ *      `~/.openllm/cli` (the subscription logins) so a later reinstall reuses
+ *      them instead of re-authenticating.
  *
  * The running process keeps executing from its already-loaded binary even
  * after its file is unlinked (the inode survives until exit), so deleting the
@@ -59,23 +60,46 @@ const hasLogins = (): boolean => {
 };
 
 /**
- * Delete the state dir. With `keepLogins`, preserve `~/.openllm/cli` by removing
- * every OTHER entry rather than the whole tree; otherwise remove it all.
- * Returns a one-line summary for the caller to print. Exported for tests.
+ * The daemon's OWN top-level state under `~/.openllm` — the exact set
+ * `openllmd uninstall` removes. Self-contained: the daemon knows only its own
+ * files and never enumerates the CLI's, so it can never wipe CLI-owned state
+ * (the `clients/` ledgers, `bin/openllm`, `run/`, …). `cli/` (subscription
+ * logins) is handled separately so it can be preserved. The daemon binary
+ * `bin/openllmd` lives in the shared `bin/` and is removed on its own below.
+ */
+const DAEMON_STATE_ENTRIES: readonly string[] = [
+  ".env", // paired API key + origin
+  "state.json", // daemon runtime state
+  "update-state.json", // self-update bookkeeping
+  "cli-update-state.json", // vendor-CLI update bookkeeping
+  "boot-history.json", // crash-loop guard history
+  "device-id", // paired device identity
+  "x25519-priv", // the daemon's encryption private key
+  "auto-update", // auto-update preference
+  "sessions", // remote PTY session state
+  "debug", // debug artifacts
+  "openllmd.log",
+  "openllmd.out.log",
+  "openllmd.err.log",
+];
+
+/**
+ * Remove the daemon's own state, leaving every CLI-owned entry untouched. When
+ * `keepLogins`, `~/.openllm/cli` is preserved too. Returns a one-line summary
+ * for the caller to print. Exported for tests.
  */
 export const pruneState = (keepLogins: boolean): string => {
   const dir = stateDir();
   if (!existsSync(dir)) return `state dir already gone (${dir})`;
-  if (!keepLogins) {
-    rmSync(dir, { recursive: true, force: true });
-    return `deleted all state (${dir})`;
-  }
-  const kept = loginsDir();
-  for (const entry of readdirSync(dir)) {
-    if (join(dir, entry) === kept) continue;
+  // The daemon binary is the daemon's, even though `bin/` is shared.
+  rmSync(join(dir, "bin", "openllmd"), { force: true });
+  for (const entry of DAEMON_STATE_ENTRIES) {
     rmSync(join(dir, entry), { recursive: true, force: true });
   }
-  return `deleted state except your subscription logins (kept ${kept})`;
+  if (!keepLogins) rmSync(loginsDir(), { recursive: true, force: true });
+  return keepLogins
+    ? `removed daemon state, kept your subscription logins (${loginsDir()})`
+    : `removed daemon state (${dir})`;
 };
 
 /**
@@ -221,15 +245,24 @@ export const runUninstall = (args: readonly string[]): never => {
       : "  ✓ PATH symlink (none owned by us)\n",
   );
 
-  // 4. Local state — binary, API key, credentials, tokens, keypair, logs. When
-  //    the user opted to keep them, the subscription logins under
-  //    `~/.openllm/cli` survive for a future reinstall.
+  // 4. Daemon state — binary, API key, keypair, sessions, logs — while leaving
+  //    CLI-owned entries in place. When the user opted to keep them, the
+  //    subscription logins under `~/.openllm/cli` also survive.
   out(`  ✓ ${pruneState(keepLogins)}\n`);
 
-  out(
-    keepLogins
-      ? `\nOpenLLM daemon removed. Your subscription logins were kept at\n${loginsDir()}\nso a reinstall can reuse them.\n`
-      : "\nOpenLLM daemon fully removed. Your machine is clean.\n",
-  );
+  if (keepLogins) {
+    out(
+      `\nOpenLLM daemon removed. Your subscription logins were kept at\n${loginsDir()}\nso a reinstall can reuse them.\n`,
+    );
+  } else {
+    out("\nOpenLLM daemon removed.\n");
+  }
+  // When `openllm uninstall` delegated here it removes the CLI surface next and
+  // prints the authoritative summary, so don't nudge toward it redundantly.
+  if (process.env.OPENLLM_UNINSTALL_DELEGATED !== "1") {
+    out(
+      "The openllm CLI is left installed — run `openllm uninstall` to remove everything.\n",
+    );
+  }
   process.exit(0);
 };
