@@ -49,10 +49,10 @@
  *                            minutes (default `60`; `0` disables). Read by
  *                            `session-host.ts` from this same env file.
  *
- * Legacy standalone `api-key` / `device-id` / `auto-update` files
- * (pre-single-file installs) are migrated INTO the env file and then removed —
- * lazily on first read, and `auto-update` proactively at boot via
- * `migrateLegacyAutoUpdate`.
+ * Legacy standalone `device-id` / `auto-update` files are migrated into the env
+ * file and then removed — lazily on first read, and `auto-update` proactively
+ * at boot via `migrateLegacyAutoUpdate`. Pre-launch standalone API-key files are
+ * intentionally ignored; native onboarding is the only credential source.
  */
 import { randomUUID } from "node:crypto";
 import {
@@ -465,8 +465,6 @@ export const daemonPort = (): number => {
   return parseOpenllmDaemonPort(raw, fallback);
 };
 
-const apiKeyFile = (): string => join(stateDir(), "api-key");
-
 const deviceIdFile = (): string => join(stateDir(), "device-id");
 
 let cachedDeviceId: string | null = null;
@@ -511,12 +509,10 @@ export const deviceId = (): string => {
 };
 
 /**
- * The persisted API key, if any. `OPENLLM_API_KEY` (loaded from the env file by
- * `loadEnvFile`, or set explicitly in the environment) wins; otherwise a
- * legacy standalone `api-key` file (older installs) is migrated into
- * the env file, removed, and used. Returns null when neither is present — the
- * daemon runs keyless until the dashboard sets one. Callers run `loadEnvFile`
- * before this (via `daemonEnv`).
+ * The persisted API key, if any. `OPENLLM_API_KEY` is loaded from the env file
+ * or set explicitly in the environment. Returns null when it is absent — the
+ * daemon remains keyless until native onboarding stores one. Callers run
+ * `loadEnvFile` before this (via `daemonEnv`).
  *
  * DEV mode adds a LIVE, read-only fallback: when `.dev.env` is keyless, the
  * shared `.env`'s `OPENLLM_API_KEY` is used (parsed key-only — never a blanket
@@ -526,23 +522,6 @@ export const deviceId = (): string => {
 const loadApiKey = (): string | null => {
   const fromEnv = process.env.OPENLLM_API_KEY?.trim();
   if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv;
-  try {
-    const legacy = readFileSync(apiKeyFile(), "utf-8").trim();
-    if (legacy.length > 0) {
-      const written = writeEnvFileVars({ OPENLLM_API_KEY: legacy });
-      process.env.OPENLLM_API_KEY = legacy;
-      if (written) {
-        try {
-          rmSync(apiKeyFile(), { force: true });
-        } catch {
-          // best-effort cleanup of the now-migrated legacy file
-        }
-      }
-      return legacy;
-    }
-  } catch {
-    // no legacy key file — keyless
-  }
   if (isDevMode()) {
     try {
       const shared = parseEnvLines(readFileSync(sharedEnvFilePath(), "utf-8"))
@@ -611,18 +590,12 @@ export const envFileValue = (
 /**
  * Persist a new API key (set from the dashboard) into the env file (`0600`) and
  * update the in-memory cache so the next cloud call uses it immediately. Pass
- * `null`/empty to clear it. Removes any legacy standalone `api-key` file so
- * the env file stays the single source.
+ * `null`/empty to clear it. The env file is the single source.
  */
 export const setApiKey = (key: string | null): void => {
   const trimmed = key?.trim() ?? "";
   writeEnvFileVars({ OPENLLM_API_KEY: trimmed });
   process.env.OPENLLM_API_KEY = trimmed;
-  try {
-    rmSync(apiKeyFile(), { force: true });
-  } catch {
-    // best-effort cleanup of the now-migrated legacy file
-  }
   // Refresh the cache in place so callers don't need to re-resolve env.
   const current = daemonEnv();
   cached = { ...current, apiKey: trimmed.length > 0 ? trimmed : null };

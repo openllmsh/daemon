@@ -28,7 +28,7 @@ ORIGIN="${OPENLLM_CLOUD_ORIGIN:-https://openllm.sh}"
 ORIGIN="${ORIGIN%/}"
 OPENLLM_DIR="$HOME/.openllm"
 BIN_DIR="$OPENLLM_DIR/bin"
-ENV_FILE="$OPENLLM_DIR/.env"
+ENV_FILE="${OPENLLM_DAEMON_ENV_FILE:-$OPENLLM_DIR/.env}"
 DAEMON_PORT="${OPENLLM_DAEMON_PORT:-8787}"
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
@@ -95,16 +95,20 @@ if [ -f "$ENV_FILE" ]; then
   EXISTING_KEY="$(sed -n 's/^OPENLLM_API_KEY=//p' "$ENV_FILE" | head -1)"
   EXISTING_PTY_SESSIONS="$(sed -n 's/^OPENLLM_DAEMON_PTY_SESSIONS=//p' "$ENV_FILE" | head -1)"
 fi
-API_KEY="$(trim_whitespace "${OPENLLM_API_KEY:-}")"
-if [ -z "$API_KEY" ]; then
+SUPPLIED_KEY="$(trim_whitespace "${OPENLLM_API_KEY:-}")"
+if [ -n "$SUPPLIED_KEY" ]; then
+  has_line_break "$SUPPLIED_KEY" && die "OPENLLM_API_KEY must not contain a line break"
+  is_usable_api_key "$SUPPLIED_KEY" || die "OPENLLM_API_KEY has an invalid format"
+  API_KEY="$SUPPLIED_KEY"
+else
   API_KEY="$(trim_whitespace "$EXISTING_KEY")"
-fi
-if [ -n "$API_KEY" ]; then
-  has_line_break "$API_KEY" && die "OPENLLM_API_KEY must not contain a line break"
-  is_usable_api_key "$API_KEY" || die "OPENLLM_API_KEY has an invalid format"
+  if [ -n "$API_KEY" ] && ! is_usable_api_key "$API_KEY"; then
+    echo "Ignoring the persisted API key because its format is invalid; OpenLLM will install without starting the daemon." >&2
+    API_KEY=""
+  fi
 fi
 
-mkdir -p "$BIN_DIR"
+mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
 
 # --- the ONE install entry point ------------------------------------------
 # /api/install validates the committed daemon + CLI release pins in TypeScript

@@ -52,18 +52,22 @@ _dist_trim_whitespace() {
 _dist_is_minted_api_key() {
   [[ "$1" =~ ^sk-llm-[A-Za-z0-9_-]{14}[.][A-Za-z0-9_-]{43}$ ]]
 }
-OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/.env"
+OPENLLMD_DIST_ENV_FILE="${OPENLLM_DAEMON_ENV_FILE:-$HOME/.openllm/.env}"
 _openllmd_dist_reuse() {  # $1=key → its value in the existing env file (or "")
   [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
   grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true
 }
-OPENLLM_API_KEY="$(_dist_trim_whitespace "${OPENLLM_API_KEY:-}")"
-if [ -z "$OPENLLM_API_KEY" ]; then
+_dist_supplied_key="$(_dist_trim_whitespace "${OPENLLM_API_KEY:-}")"
+if [ -n "$_dist_supplied_key" ]; then
+  _dist_has_line_break "$_dist_supplied_key" && { echo "Error: OPENLLM_API_KEY must not contain a line break" >&2; exit 1; }
+  _dist_is_minted_api_key "$_dist_supplied_key" || { echo "Error: OPENLLM_API_KEY has an invalid format" >&2; exit 1; }
+  OPENLLM_API_KEY="$_dist_supplied_key"
+else
   OPENLLM_API_KEY="$(_dist_trim_whitespace "$(_openllmd_dist_reuse OPENLLM_API_KEY)")"
-fi
-if [ -n "$OPENLLM_API_KEY" ]; then
-  _dist_has_line_break "$OPENLLM_API_KEY" && { echo "Error: OPENLLM_API_KEY must not contain a line break" >&2; exit 1; }
-  _dist_is_minted_api_key "$OPENLLM_API_KEY" || { echo "Error: OPENLLM_API_KEY has an invalid format" >&2; exit 1; }
+  if [ -n "$OPENLLM_API_KEY" ] && ! _dist_is_minted_api_key "$OPENLLM_API_KEY"; then
+    echo "Ignoring the persisted API key because its format is invalid; OpenLLM will install without starting the daemon." >&2
+    OPENLLM_API_KEY=""
+  fi
 fi
 export OPENLLM_API_KEY
 
