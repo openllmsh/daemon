@@ -2961,7 +2961,9 @@ const walkPlan = async (
         (finalHop && cls.reason === "rate_limit");
       if (!shouldRetryInPlace || retryAttempt === 1) return response;
       await abortableDelay(retryAfterDelayMs(response), args.req.signal);
-      if (args.req.signal.aborted) return response;
+      if (args.req.signal.aborted) {
+        return errorJson(499, "client aborted request");
+      }
     }
     return null;
   };
