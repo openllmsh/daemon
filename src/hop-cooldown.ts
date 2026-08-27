@@ -87,7 +87,7 @@ export const markHopCooldown = (
   now: number = Date.now(),
 ): void => {
   const policy = cooldownPolicyFor(reason);
-  if (!policy.cools || policy.ttlMs <= 0) return;
+  if (policy.action !== "cool_and_advance") return;
   const k = key(provider, modelId);
   const until = now + policy.ttlMs;
   const existing = marks.get(k);
