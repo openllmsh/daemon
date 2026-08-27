@@ -1813,13 +1813,26 @@ const serveKimiBuiltinSearch = async (
         wire,
         args.req.signal.aborted,
       );
-      if (round === 0 && !finalHop && cls.kind === "transient") {
+      if (round === 0 && cls.kind === "transient") {
+        // Round 0 has consumed nothing yet, so hand the decision to the
+        // walker-level handler regardless of hop position: it applies a bounded
+        // in-place retry for retry_in_place reasons (honouring Retry-After), or
+        // surfaces this authentic upstream response for cool/walk policies —
+        // the same unified path every other hop uses. `resp` is already drained
+        // by `.text()`, so pass a reconstructed Response with the real status +
+        // body + recover floor.
+        const upstreamResponse = new Response(raw.length > 0 ? raw : null, {
+          status: resp.status,
+          headers: passthroughHeaders(resp),
+        });
         return hopRetry(
           `HTTP ${resp.status}: ${bodySnippet || "upstream rejected"}`,
           {
             status: resp.status,
             bodySnippet,
             cooldownReason: cls.reason,
+            upstreamResponse,
+            recoverAtMs: retryAfterRecoverAtMs(resp),
           },
         );
       }
