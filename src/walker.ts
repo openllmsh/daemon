@@ -2767,6 +2767,9 @@ const walkPlan = async (
           }
           const reason = `native hop ${hop.modelId} returned ${native.status}`;
           addHopFailure(hop, reason, native.status, cls.reason);
+          if (policy.action === "surface") {
+            return { response: native, servedLocally: true };
+          }
           if (!finalHop) return HOP_CONTINUE;
         }
         if (
@@ -2913,8 +2916,21 @@ const walkPlan = async (
         cooldownReason,
         handrolledRetry.recoverAtMs,
       );
-      if (finalHop && handrolledRetry.upstreamResponse !== undefined) {
+      if (
+        (finalHop || policy?.action === "surface") &&
+        handrolledRetry.upstreamResponse !== undefined
+      ) {
         return { response: handrolledRetry.upstreamResponse, servedLocally: true };
+      }
+      if (policy?.action === "surface") {
+        return {
+          response: errorJson(
+            handrolledRetry.status ?? 502,
+            handrolledRetry.reason,
+            cooldownReason,
+          ),
+          servedLocally: true,
+        };
       }
       return HOP_CONTINUE;
     }
@@ -3109,7 +3125,11 @@ const walkPlan = async (
           hop,
         );
       }
-      if (cls.kind === "transient" && !finalHop) {
+      if (
+        cls.kind === "transient" &&
+        cooldownPolicyFor(cls.reason).action !== "surface" &&
+        !finalHop
+      ) {
         lastError = `cloud hop ${hop.modelId} returned ${resp.status}`;
         const reason =
           hopBodySnippet(raw).length > 0
