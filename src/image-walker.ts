@@ -249,11 +249,9 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
       body: JSON.stringify(upstreamBody),
       signal: args.req.signal,
     },
-    // finalHop=false: image generation is non-idempotent (each call spends
-    // quota / renders a new image), so never auto-retry — a 5xx retry could
-    // double-generate if the first attempt actually succeeded upstream.
-    false,
-    args.req.signal,
+    // `postUpstream` makes exactly one attempt — correct for non-idempotent
+    // image generation (a 5xx retry could double-generate if the first attempt
+    // actually succeeded upstream).
   );
   if (resp === null) {
     return args.req.signal.aborted

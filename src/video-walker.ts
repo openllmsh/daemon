@@ -319,10 +319,8 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       body: JSON.stringify(body),
       signal: args.req.signal,
     },
-    // finalHop=false: creating a video job is non-idempotent (spends quota),
-    // so never auto-retry — a retry could enqueue a second render.
-    false,
-    args.req.signal,
+    // `postUpstream` makes exactly one attempt — correct for a non-idempotent
+    // video job (a retry could enqueue a second render / double-spend quota).
   );
   if (resp === null) {
     return args.req.signal.aborted

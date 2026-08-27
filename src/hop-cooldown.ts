@@ -30,8 +30,6 @@ import { cooldownPolicyFor } from "@openllmsh/protocol";
  */
 export const TRANSIENT_COOLDOWN_REASONS = new Set<TCooldownReason>([
   "rate_limit",
-  "server_error",
-  "timeout",
 ]);
 
 /** A single cooldown table entry with provenance + an optional authoritative

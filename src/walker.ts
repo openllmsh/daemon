@@ -54,6 +54,7 @@ import type {
 import {
   AnthropicResponse,
   ChatCompletionChunk,
+  cooldownPolicyFor,
   daemonPlanSigningPayload,
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
@@ -424,46 +425,29 @@ export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
   return true;
 };
 
-/**
- * Final-hop in-place retry policy. Chain routing does NOT use this status
- * allow-list: every non-abort pre-commit candidate failure walks via the shared
- * `classifyHopError` policy below. The final hop has nowhere to walk, so it gets
- * one bounded retry only for transport/rate/server failures before its original
- * response is surfaced verbatim.
- */
-export const shouldRetryFinalHopInPlace = (status: number): boolean =>
-  status === 429 || status === 408 || (status >= 500 && status <= 599);
+// One bounded, abort-aware pre-commit retry uses these neutral transport bounds.
+const HOP_RETRY_DELAY_MS = 1_000;
+const HOP_RETRY_AFTER_CAP_MS = 10_000;
 
-// Final-hop in-place retry bounds: ONE retry, delay from a bounded
-// `Retry-After` (else 1s). Mid-chain hops never retry in place — the walk IS
-// the retry — but with no next hop a transient 429/5xx would otherwise
-// surface immediately, where partner clients absorb the same blip with SDK
-// backoff (audit 2026-07-14 §F6).
-const FINAL_HOP_RETRY_DELAY_MS = 1_000;
-const FINAL_HOP_RETRY_AFTER_CAP_MS = 10_000;
-
-/** Bounded delay from a 429/5xx response's `Retry-After` (seconds or
- *  HTTP-date), falling back to {@link FINAL_HOP_RETRY_DELAY_MS}. */
+/** Bounded delay from an upstream response's `Retry-After` (seconds or
+ * HTTP-date), falling back to {@link HOP_RETRY_DELAY_MS}. */
 const retryAfterDelayMs = (resp: Response): number => {
   const raw = resp.headers.get("retry-after");
   if (raw !== null) {
     const secs = Number(raw);
     if (!Number.isNaN(secs)) {
-      return Math.max(0, Math.min(secs * 1000, FINAL_HOP_RETRY_AFTER_CAP_MS));
+      return Math.max(0, Math.min(secs * 1000, HOP_RETRY_AFTER_CAP_MS));
     }
     const at = Date.parse(raw);
     if (!Number.isNaN(at)) {
-      return Math.max(
-        0,
-        Math.min(at - Date.now(), FINAL_HOP_RETRY_AFTER_CAP_MS),
-      );
+      return Math.max(0, Math.min(at - Date.now(), HOP_RETRY_AFTER_CAP_MS));
     }
   }
-  return FINAL_HOP_RETRY_DELAY_MS;
+  return HOP_RETRY_DELAY_MS;
 };
 
 /**
- * Absolute recover time from a 429/5xx response's `Retry-After` (seconds or
+ * Absolute recover time from an upstream response's `Retry-After` (seconds or
  * HTTP-date) — the authoritative "provably doomed until" floor threaded into
  * the hop cooldown. Unlike {@link retryAfterDelayMs} this is NOT capped: a
  * vendor that says "retry in 60s" must not be truncated to 10s, or the doom
@@ -483,8 +467,7 @@ const retryAfterRecoverAtMs = (
   return undefined;
 };
 
-/** Resolve after `ms` — or immediately once the client disconnects, so a
- *  final-hop backoff never outlives the request it serves. */
+/** Resolve after `ms` — or immediately once the client disconnects. */
 const abortableDelay = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve) => {
     const done = (): void => {
@@ -496,12 +479,7 @@ const abortableDelay = (ms: number, signal: AbortSignal): Promise<void> =>
     signal.addEventListener("abort", done, { once: true });
   });
 
-/**
- * POST the built request upstream — plus, on the plan's FINAL hop, ONE
- * bounded in-place retry when the failure is pre-stream retryable (a network
- * error or a 429/408/5xx). Returns `null` when every attempt failed at the
- * network layer (no `Response` to surface).
- */
+/** POST one built request upstream. Routing retries belong to the walker loop. */
 type TTransportFailure = { readonly reason: string };
 
 // Fetch's message frequently embeds the upstream URL (and potentially an API
@@ -529,29 +507,13 @@ const transportFailureFrom = (err: unknown): TTransportFailure => {
 export const postUpstream = async (
   url: string,
   init: RequestInit,
-  finalHop: boolean,
-  signal: AbortSignal,
   onTransportFailure?: (failure: TTransportFailure) => void,
 ): Promise<Response | null> => {
-  let first: Response | null = null;
-  try {
-    first = await fetch(url, init);
-  } catch (err) {
-    onTransportFailure?.(transportFailureFrom(err));
-  }
-  const failedRetryable =
-    first === null || (!first.ok && shouldRetryFinalHopInPlace(first.status));
-  if (!failedRetryable || !finalHop || signal.aborted) return first;
-  await abortableDelay(
-    first === null ? FINAL_HOP_RETRY_DELAY_MS : retryAfterDelayMs(first),
-    signal,
-  );
-  if (signal.aborted) return first;
   try {
     return await fetch(url, init);
   } catch (err) {
     onTransportFailure?.(transportFailureFrom(err));
-    return first;
+    return null;
   }
 };
 
@@ -580,7 +542,6 @@ export const postWithReplayStripRetry = async (
   headers: Record<string, string>,
   body: unknown,
   wire: TUpstreamWire,
-  finalHop: boolean,
   signal: AbortSignal,
   onTransportFailure?: (failure: TTransportFailure) => void,
 ): Promise<Response | null> => {
@@ -588,8 +549,6 @@ export const postWithReplayStripRetry = async (
     postUpstream(
       url,
       { method: "POST", headers, body: JSON.stringify(b), signal },
-      finalHop,
-      signal,
       onTransportFailure,
     );
   const first = await send(body);
@@ -1303,7 +1262,6 @@ const serveSubscription = async (
       headers,
       body,
       wire,
-      finalHop,
       args.req.signal,
       (failure) => {
         transport.failure = failure;
@@ -1334,7 +1292,7 @@ const serveSubscription = async (
       wire,
       args.req.signal.aborted,
     );
-    if (!finalHop && cls.kind === "transient") {
+    if (cls.kind === "transient" && !args.req.signal.aborted) {
       // Capture the vendor's Retry-After as an ABSOLUTE recover floor (the
       // generic doom oracle). Never shortens the 180s policy TTL — it's an
       // ADDITIONAL fact a recovery pass consults before bypassing a transient
@@ -1829,7 +1787,6 @@ const serveKimiBuiltinSearch = async (
       acquired.headers,
       body,
       wire,
-      finalHop,
       args.req.signal,
     );
     // Round 0 keeps `serveSubscription`'s walk semantics (nothing consumed
@@ -2545,7 +2502,10 @@ const walkPlan = async (
     // re-dialled on every subsequent request (see hop-cooldown.ts). Stamp the
     // walk's session key + the vendor recover floor as provenance so a recovery
     // pass can tell whose mark this is and whether it's provably doomed.
-    if (cooldownReason !== undefined) {
+    if (
+      cooldownReason !== undefined &&
+      cooldownPolicyFor(cooldownReason).action === "cool_and_advance"
+    ) {
       markHopCooldown(
         hop.provider,
         hop.modelId,
@@ -2643,9 +2603,10 @@ const walkPlan = async (
     finalHop: boolean,
     opts: {
       readonly forceContextAttempt: boolean;
+      readonly retryAttempt: number;
     },
   ): Promise<THopServed | THopContinue> => {
-    const { forceContextAttempt } = opts;
+    const { forceContextAttempt, retryAttempt } = opts;
     // ── Local auth gate (every subscription provider) ─────────────────
     // Install ≠ signed-in. status().status === "connected" is the same signal the cloud
     // uses for fleet_subscriptions. Without a local login, skip every local
@@ -2762,6 +2723,38 @@ const walkPlan = async (
               return HOP_CONTINUE;
             }
           }
+          if (args.req.signal.aborted) {
+            return {
+              response: errorJson(499, "client aborted request"),
+              servedLocally: true,
+            };
+          }
+          if (cls.kind === "abort") {
+            return {
+              response: errorJson(499, "client aborted request"),
+              servedLocally: true,
+            };
+          }
+          const policy = cooldownPolicyFor(cls.reason);
+          const shouldRetryInPlace =
+            policy.action === "retry_in_place" ||
+            (finalHop && cls.reason === "rate_limit");
+          if (shouldRetryInPlace && retryAttempt === 0) {
+            await abortableDelay(retryAfterDelayMs(native), args.req.signal);
+            if (args.req.signal.aborted) {
+              return {
+                response: errorJson(499, "client aborted request"),
+                servedLocally: true,
+              };
+            }
+            return serveSubscriptionHop(hop, finalHop, {
+              forceContextAttempt,
+              retryAttempt: 1,
+            });
+          }
+          const reason = `native hop ${hop.modelId} returned ${native.status}`;
+          addHopFailure(hop, reason, native.status, cls.reason);
+          if (!finalHop) return HOP_CONTINUE;
         }
         if (
           native.status === 408 ||
@@ -2875,13 +2868,41 @@ const walkPlan = async (
           servedLocally: true,
         };
       }
+      const cooldownReason = handrolledRetry.cooldownReason;
+      const policy =
+        cooldownReason === undefined ? undefined : cooldownPolicyFor(cooldownReason);
+      // `rate_limit` remains cooling, but a final vendor hop keeps its historical
+      // bounded Retry-After retry before its authentic response is surfaced.
+      const shouldRetryInPlace =
+        policy?.action === "retry_in_place" ||
+        (finalHop && cooldownReason === "rate_limit");
+      if (shouldRetryInPlace && retryAttempt === 0) {
+        const response = handrolledRetry.upstreamResponse;
+        await abortableDelay(
+          response === undefined ? HOP_RETRY_DELAY_MS : retryAfterDelayMs(response),
+          args.req.signal,
+        );
+        if (args.req.signal.aborted) {
+          return {
+            response: errorJson(499, "client aborted request"),
+            servedLocally: true,
+          };
+        }
+        return serveSubscriptionHop(hop, finalHop, {
+          forceContextAttempt,
+          retryAttempt: 1,
+        });
+      }
       addHopFailure(
         hop,
         handrolledRetry.reason,
         handrolledRetry.status,
-        handrolledRetry.cooldownReason,
+        cooldownReason,
         handrolledRetry.recoverAtMs,
       );
+      if (finalHop && handrolledRetry.upstreamResponse !== undefined) {
+        return { response: handrolledRetry.upstreamResponse, servedLocally: true };
+      }
       return HOP_CONTINUE;
     }
 
@@ -2893,6 +2914,43 @@ const walkPlan = async (
           `${hop.provider} hop ${hop.modelId} could not be served locally`));
     addHopFailure(hop, lastError);
     return HOP_CONTINUE;
+  };
+  const forwardCloudHop = async (
+    hop: THop,
+    finalHop: boolean,
+  ): Promise<Response | null> => {
+    for (let retryAttempt = 0; retryAttempt <= 1; retryAttempt++) {
+      let response: Response;
+      try {
+        response = await forwardToCloud(
+          args.req,
+          args.rawBytes,
+          hop.modelId,
+          args.originParam,
+        );
+      } catch {
+        if (args.req.signal.aborted || retryAttempt === 1) return null;
+        await abortableDelay(HOP_RETRY_DELAY_MS, args.req.signal);
+        continue;
+      }
+      if (response.ok || args.req.signal.aborted) return response;
+      const raw = await response.clone().text().catch(() => "");
+      const cls = classifyRawResponse(
+        response.status,
+        raw,
+        "openai",
+        false,
+      );
+      if (cls.kind === "abort") return response;
+      const action = cooldownPolicyFor(cls.reason).action;
+      const shouldRetryInPlace =
+        action === "retry_in_place" ||
+        (finalHop && cls.reason === "rate_limit");
+      if (!shouldRetryInPlace || retryAttempt === 1) return response;
+      await abortableDelay(retryAfterDelayMs(response), args.req.signal);
+      if (args.req.signal.aborted) return response;
+    }
+    return null;
   };
   let queueIndex = 0;
   while (true) {
@@ -2991,20 +3049,14 @@ const walkPlan = async (
       dialedHops.add(`${hop.provider}|${hop.modelId}`);
       const served = await serveSubscriptionHop(hop, finalHop, {
         forceContextAttempt,
+        retryAttempt: 0,
       });
       if (served === HOP_CONTINUE) continue;
       return commitSubscriptionServe(hop, served);
     }
     // API-key hop: forward to the cloud pinned to this concrete model.
-    let resp: Response;
-    try {
-      resp = await forwardToCloud(
-        args.req,
-        args.rawBytes,
-        hop.modelId,
-        args.originParam,
-      );
-    } catch {
+    const forwarded = await forwardCloudHop(hop, finalHop);
+    if (forwarded === null) {
       lastError = `forward of ${hop.modelId} to cloud failed`;
       // Client hung up while the cloud fetch was in flight. Terminal but NOT
       // an upstream fault: `addHopFailure` would report status "error" and the
@@ -3015,6 +3067,7 @@ const walkPlan = async (
       addHopFailure(hop, lastError);
       continue;
     }
+    const resp = forwarded;
     if (!resp.ok) {
       const raw = await resp
         .clone()
@@ -3163,6 +3216,7 @@ const walkPlan = async (
     recoveryDialed.add(`${hop.provider}|${hop.modelId}`);
     const served = await serveSubscriptionHop(hop, false, {
       forceContextAttempt: false,
+      retryAttempt: 0,
     });
     // A bypass failure re-marks the hop with THIS walk's session key (setter ==
     // mine), so it can never be reconsidered here — at-most-once, no loop. A
