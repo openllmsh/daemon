@@ -53,8 +53,12 @@ import { fetchModelList } from "./fetch-model-list";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
-import { isStaleRefresh, makeRefresher, spawnRefresh } from "./refresh";
-import type { TRefreshOutcome } from "./refresh";
+import {
+  isStaleRefresh,
+  makeRefresher,
+  REFRESH_COOLDOWN_MS,
+  spawnRefresh,
+} from "./refresh";
 import type { TProviderDelegate } from "./types";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
 import type { TStoreRead } from "./util";
@@ -146,50 +150,34 @@ const readAccountHash = async (): Promise<string | null> => {
  * refresher (no race with a daemon-side refresh), which is why claude's URL
  * capture stays disabled (`liveCapture:false`).
  */
-const triggerRefresh = async (signal?: AbortSignal): Promise<void> => {
+const triggerRefresh = async (): Promise<void> => {
   // A locked/unusable isolated keychain must NOT reach `claude -p ping`: the
   // vendor CLI would open it and pop the SecurityAgent dialog (and it can't
   // refresh a credential it can't read). Skip when not ready.
-  if (
-    (await ensureKeychainReady(cliHome(PROVIDER), signal)).kind !== "present"
-  )
-    return;
+  if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") return;
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
   await spawnRefresh([bin(), "-p", "ping"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
-    ...(signal !== undefined ? { signal } : {}),
   });
 };
 
-// Within the leeway window → fire the CLI refresh in the background (still
-// valid, no stall); hard-expired → await it. Single-flight per provider.
-// `makeRefresher` cannot take a signal; status-path callers pass one so the
-// trigger spawn can be cancelled without a module-level clobberable slot.
-const refreshBase = makeRefresher({
+// THE single refresher. Within the leeway window → fire the CLI refresh in the
+// background (still valid, no stall); hard-expired → await it. Single-flight +
+// post-spawn cooldown per provider (`refresh.ts`). There is deliberately NO
+// signal-aware bypass: the old wrapper spawned a second concurrent `claude -p
+// ping` off the status path, racing the single-use refresh token (audit
+// 2026-08-27 §7.3). A refresh spawn is already bounded by its own 10s timeout,
+// so status callers don't need to cancel it — they share this one spawn.
+const refresh = makeRefresher({
   slug: PROVIDER,
   label: "Claude Code",
   leewayMs: REFRESH_LEEWAY_MS,
-  trigger: () => triggerRefresh(),
+  cooldownMs: REFRESH_COOLDOWN_MS,
+  trigger: triggerRefresh,
 });
-
-const refresh = async (
-  expiresAtMs: number | null,
-  signal?: AbortSignal,
-): Promise<TRefreshOutcome> => {
-  if (signal === undefined) return refreshBase(expiresAtMs);
-  if (expiresAtMs === null) return "fresh";
-  const remaining = expiresAtMs - Date.now();
-  if (remaining >= REFRESH_LEEWAY_MS) return "fresh";
-  if (remaining > 0) {
-    void triggerRefresh(signal);
-    return "kicked";
-  }
-  await triggerRefresh(signal);
-  return "awaited";
-};
 
 /**
  * The current access token, triggering the CLI's native refresh if it's within
@@ -209,9 +197,7 @@ const readToken = async (
   const expiresAtMs = toEpochMs(oauth.expiresAt);
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
-  const outcome = oauth.refreshToken
-    ? await refresh(expiresAtMs, signal)
-    : "fresh";
+  const outcome = oauth.refreshToken ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
     logWarn("refresh", "returning stale expired credential", {
       provider: PROVIDER,
@@ -468,9 +454,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
   submitLoginCode: device.submitLoginCode,
   cancelConnect: device.cancelConnect,
 
-  status: async (
-    signal?: AbortSignal,
-  ): Promise<TDaemonProviderConnection> => {
+  status: async (signal?: AbortSignal): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
     if (!installed) {
       return {

@@ -34,13 +34,11 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
-import {
-  QUOTA_REJECT_PERCENT,
-  QUOTA_WARN_PERCENT,
-} from "@openllmsh/protocol";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
+import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import { logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -56,7 +54,12 @@ import { fetchModelList, positiveInt } from "./fetch-model-list";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
-import { makeRefresher, spawnRefresh } from "./refresh";
+import {
+  isStaleRefresh,
+  makeRefresher,
+  REFRESH_COOLDOWN_MS,
+  spawnRefresh,
+} from "./refresh";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -229,6 +232,7 @@ const refresh = makeRefresher({
   slug: PROVIDER,
   label: "Kimi Code",
   leewayMs: REFRESH_LEEWAY_MS,
+  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -259,6 +263,14 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
     tok.refresh_token !== undefined && tok.refresh_token.length > 0
       ? await refresh(expiresAtMs)
       : "fresh";
+  if (isStaleRefresh(outcome)) {
+    logWarn("refresh", "returning stale expired credential", {
+      provider: PROVIDER,
+      phase: "refresh_fallback",
+      error_class: outcome.reason,
+    });
+    return { accessToken: tok.access_token };
+  }
   if (outcome !== "awaited") {
     return { accessToken: tok.access_token };
   }

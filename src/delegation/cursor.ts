@@ -20,7 +20,7 @@ import {
 } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
-import { logError, logInfo } from "../logger";
+import { logError, logInfo, logWarn } from "../logger";
 import { listCursorModelsViaAcp } from "../native-runtime/cursor-acp";
 import {
   clearPendingAuth,
@@ -33,8 +33,12 @@ import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
-import { makeRefresher, spawnRefresh } from "./refresh";
-import type { TRefreshOutcome } from "./refresh";
+import {
+  isStaleRefresh,
+  makeRefresher,
+  REFRESH_COOLDOWN_MS,
+  spawnRefresh,
+} from "./refresh";
 import type { TProviderDelegate } from "./types";
 import type { TStoreRead } from "./util";
 import {
@@ -230,44 +234,28 @@ const readFileTokens = async (): Promise<
   };
 };
 
-const triggerRefresh = async (signal?: AbortSignal): Promise<void> => {
+const triggerRefresh = async (): Promise<void> => {
   // Mirror Claude: a locked/unusable isolated keychain must NOT reach
   // `cursor-agent status` (SecurityAgent dialog + 60s spawn). Skip when not
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
-  if (
-    (await ensureKeychainReady(cliHome(PROVIDER), signal)).kind !== "present"
-  ) {
+  if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
     return;
   }
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
-    ...(signal !== undefined ? { signal } : {}),
   });
 };
 
-const refreshBase = makeRefresher({
+// THE single refresher — single-flight + cooldown, no signal-aware bypass. See
+// the claude-code delegate for why the bypass was removed (rotation race).
+const refresh = makeRefresher({
   slug: PROVIDER,
   label: "Cursor",
   leewayMs: REFRESH_LEEWAY_MS,
-  trigger: () => triggerRefresh(),
+  cooldownMs: REFRESH_COOLDOWN_MS,
+  trigger: triggerRefresh,
 });
-
-const refresh = async (
-  expiresAtMs: number | null,
-  signal?: AbortSignal,
-): Promise<TRefreshOutcome> => {
-  if (signal === undefined) return refreshBase(expiresAtMs);
-  if (expiresAtMs === null) return "fresh";
-  const remaining = expiresAtMs - Date.now();
-  if (remaining >= REFRESH_LEEWAY_MS) return "fresh";
-  if (remaining > 0) {
-    void triggerRefresh(signal);
-    return "kicked";
-  }
-  await triggerRefresh(signal);
-  return "awaited";
-};
 
 const readStoredTokens = async (
   signal?: AbortSignal,
@@ -311,8 +299,16 @@ const readToken = async (
   const stored = storeReadValue(await readStoredTokens(signal));
   if (stored === null) return null;
   const outcome = stored.refreshTokenPresent
-    ? await refresh(jwtExpiryMs(stored.accessToken), signal)
+    ? await refresh(jwtExpiryMs(stored.accessToken))
     : "fresh";
+  if (isStaleRefresh(outcome)) {
+    logWarn("refresh", "returning stale expired credential", {
+      provider: PROVIDER,
+      phase: "refresh_fallback",
+      error_class: outcome.reason,
+    });
+    return stored;
+  }
   if (outcome !== "awaited") return stored;
   // CLI remains the sole token-store owner. Re-read after a hard-expiry refresh.
   return storeReadValue(await readStoredTokens(signal)) ?? stored;
@@ -392,11 +388,12 @@ export const cursorDelegate: TProviderDelegate = {
   connect: connectDirect,
   cancelConnect,
 
-  status: async (
-    signal?: AbortSignal,
-  ): Promise<TDaemonProviderConnection> => {
+  status: async (signal?: AbortSignal): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    if (installed && (await readStoredTokens(signal)).kind === "indeterminate") {
+    if (
+      installed &&
+      (await readStoredTokens(signal)).kind === "indeterminate"
+    ) {
       return {
         provider: PROVIDER,
         status: "disconnected",

@@ -47,7 +47,12 @@ import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
-import { isStaleRefresh, makeRefresher, spawnRefresh } from "./refresh";
+import {
+  isStaleRefresh,
+  makeRefresher,
+  REFRESH_COOLDOWN_MS,
+  spawnRefresh,
+} from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
 import {
   reduceChatgptCredits,
@@ -157,6 +162,7 @@ const refresh = makeRefresher({
   slug: PROVIDER,
   label: "ChatGPT",
   leewayMs: REFRESH_LEEWAY_MS,
+  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 

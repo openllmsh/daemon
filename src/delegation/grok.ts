@@ -59,7 +59,7 @@ import {
 } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
-import { logError, logInfo } from "../logger";
+import { logError, logInfo, logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -76,7 +76,12 @@ import { positiveInt } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
-import { makeRefresher, spawnRefresh } from "./refresh";
+import {
+  isStaleRefresh,
+  makeRefresher,
+  REFRESH_COOLDOWN_MS,
+  spawnRefresh,
+} from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
 import type { TStoreRead } from "./util";
 import {
@@ -225,6 +230,7 @@ const refresh = makeRefresher({
   slug: PROVIDER,
   label: "Grok",
   leewayMs: REFRESH_LEEWAY_MS,
+  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -241,6 +247,14 @@ const readToken = async (): Promise<{
   const expiresAtMs = parseExpiryMs(session.expires_at);
   // Only trigger when the credential CAN be refreshed (a refresh token exists).
   const outcome = session.refresh_token ? await refresh(expiresAtMs) : "fresh";
+  if (isStaleRefresh(outcome)) {
+    logWarn("refresh", "returning stale expired credential", {
+      provider: PROVIDER,
+      phase: "refresh_fallback",
+      error_class: outcome.reason,
+    });
+    return { accessToken: session.key, session };
+  }
   if (outcome !== "awaited") return { accessToken: session.key, session };
   // Hard-expired path: the CLI refresh was awaited — re-read the rotated store.
   const fresh = await newestSession();
