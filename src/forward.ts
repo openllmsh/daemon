@@ -121,7 +121,12 @@ export const passthroughToOrigin = async (
   const resp = await fetch(target, {
     method: inbound.method,
     headers,
-    body: bodyBytes,
+    // GET/HEAD cannot carry a body (a model-listing passthrough has none) —
+    // undici throws if one is supplied, so omit it for those methods.
+    body:
+      inbound.method === "GET" || inbound.method === "HEAD"
+        ? undefined
+        : bodyBytes,
     signal: inbound.signal,
   });
   return stripHopByHopResponseHeaders(resp);

@@ -99,6 +99,16 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // Normalize the optional `/api` prefix once; reused for video routing + the
   // recorded `endpoint`.
   const normalizedPath = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
+
+  // Model listing is not an inference surface — the daemon holds no local
+  // catalog, so a `GET /v1/models[...]` is passed straight through to the
+  // cloud (same local-first passthrough as a pure-BYOK hop; the daemon's
+  // paired key fills in when the caller sends none). Handled before the body
+  // parse below, which assumes an inference request with a JSON body.
+  if (req.method === "GET" && /^\/v1\/models(?:\/|$)/.test(normalizedPath)) {
+    return withCors(req, await passthroughToOrigin(req, new ArrayBuffer(0)));
+  }
+
   const { operation: videoOperation, videoId } = videoOperationFor(
     req.method,
     normalizedPath,
