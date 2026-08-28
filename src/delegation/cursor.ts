@@ -257,14 +257,14 @@ const refresh = makeRefresher({
   trigger: triggerRefresh,
 });
 
+type TCursorStoredTokens = {
+  readonly accessToken: string;
+  readonly refreshTokenPresent: boolean;
+};
+
 const readStoredTokens = async (
   signal?: AbortSignal,
-): Promise<
-  TStoreRead<{
-    readonly accessToken: string;
-    readonly refreshTokenPresent: boolean;
-  }>
-> => {
+): Promise<TStoreRead<TCursorStoredTokens>> => {
   if (platform() !== "darwin") return readFileTokens();
   const accessToken = await readMacKeychainSecret(
     "cursor-access-token",
@@ -292,11 +292,9 @@ const readStoredTokens = async (
 
 const readToken = async (
   signal?: AbortSignal,
-): Promise<{
-  readonly accessToken: string;
-  readonly refreshTokenPresent: boolean;
-} | null> => {
-  const stored = storeReadValue(await readStoredTokens(signal));
+  storedRead?: TStoreRead<TCursorStoredTokens>,
+): Promise<TCursorStoredTokens | null> => {
+  const stored = storeReadValue(storedRead ?? (await readStoredTokens(signal)));
   if (stored === null) return null;
   const outcome = stored.refreshTokenPresent
     ? await refresh(jwtExpiryMs(stored.accessToken))
@@ -390,10 +388,8 @@ export const cursorDelegate: TProviderDelegate = {
 
   status: async (signal?: AbortSignal): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    if (
-      installed &&
-      (await readStoredTokens(signal)).kind === "indeterminate"
-    ) {
+    const storedRead = installed ? await readStoredTokens(signal) : undefined;
+    if (storedRead?.kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -402,7 +398,7 @@ export const cursorDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const token = installed ? await readToken(signal) : null;
+    const token = installed ? await readToken(signal, storedRead) : null;
     if (token !== null) clearPendingAuth(PROVIDER);
     const pending = token === null ? getPendingAuth(PROVIDER) : null;
     return {
