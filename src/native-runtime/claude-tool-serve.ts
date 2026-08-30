@@ -15,6 +15,7 @@ import type { TChatCompletionRequest } from "@openllmsh/protocol";
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { deliverJsonResponse, sseResponseForClient } from "../client-encode";
+import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import type { TClientTool, TIteratorFactory } from "./claude-tool-session";
 import {
   continueToolTurn,
@@ -29,6 +30,20 @@ import type { TNativeTokens } from "./types";
 import { ZERO_TOKENS } from "./types";
 
 export type TToolServeOutcome = Response | { readonly declined: string };
+
+const withContinuationHeader = (
+  response: Response,
+  continuationToken: string | null,
+): Response => {
+  if (continuationToken === null) return response;
+  const headers = new Headers(response.headers);
+  headers.set("x-openllm-tool-session", continuationToken);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+};
 
 /** Does the request carry client function tools (→ the tool path)? */
 export const hasClientTools = (canonical: TChatCompletionRequest): boolean =>
@@ -79,6 +94,9 @@ export type TClaudeToolServeParams = {
   readonly bin: string;
   readonly env: Record<string, string>;
   readonly record: (tokens: TNativeTokens, status: "success" | "error") => void;
+  /** Optional, backward-compatible continuation capability sent by the client. */
+  readonly continuationToken?: string | null;
+  readonly continuationIdentity?: TToolContinuationIdentity;
   /** Test seam: inject a fake SDK query iterator (default = the real SDK). */
   readonly makeIterator?: TIteratorFactory;
 };
@@ -134,7 +152,12 @@ export const tryServeNativeToolTurn = async (
       ? // CONTINUE: feed the client's tool results — and any context the
         // client injected alongside them — into the paused held turn.
         isClaude
-        ? await continueToolTurn(trailingToolResults, injectedContext)
+        ? await continueToolTurn(
+            trailingToolResults,
+            injectedContext,
+            params.continuationToken ?? null,
+            params.continuationIdentity,
+          )
         : await continueCodexToolTurn(trailingToolResults, injectedContext)
       : // START: the last user turn opens a new held turn.
         isClaude
@@ -149,6 +172,7 @@ export const tryServeNativeToolTurn = async (
               userText: seedFromHistory(params.canonical),
             },
             params.makeIterator,
+            params.continuationIdentity,
           )
         : await startCodexToolTurn({
             bin: params.bin,
@@ -170,6 +194,10 @@ export const tryServeNativeToolTurn = async (
   params.record(result.usage ?? ZERO_TOKENS, "success");
 
   const canonicalResp = toolTurnToResponse(result, params.providerModelId);
+  const continuationToken =
+    result.kind === "tool_calls" && "continuationToken" in result
+      ? (result.continuationToken ?? null)
+      : null;
   const clientWire = clientWireOf(params.surface);
 
   // Streaming client: encode the completion (tool_calls or final text) as SSE
@@ -179,21 +207,27 @@ export const tryServeNativeToolTurn = async (
   // streaming a single completion is correct.
   if (params.wantsStream) {
     // Tokens were already recorded above — encode-only, no meter tee.
-    return sseResponseForClient(
-      responseToChunkStream(canonicalResp),
+    return withContinuationHeader(
+      sseResponseForClient(
+        responseToChunkStream(canonicalResp),
+        params.surface,
+        clientWire,
+        undefined,
+        params.stripSubagentIsolation,
+      ),
+      continuationToken,
+    );
+  }
+
+  return withContinuationHeader(
+    deliverJsonResponse(
+      canonicalResp,
       params.surface,
       clientWire,
       undefined,
       params.stripSubagentIsolation,
-    );
-  }
-
-  return deliverJsonResponse(
-    canonicalResp,
-    params.surface,
-    clientWire,
-    undefined,
-    params.stripSubagentIsolation,
+    ),
+    continuationToken,
   );
 };
 

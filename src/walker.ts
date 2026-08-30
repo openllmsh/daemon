@@ -2690,6 +2690,11 @@ const walkPlan = async (
         canonical,
         wantsStream:
           (args.rawBody as { stream?: unknown } | null)?.stream === true,
+        // TODO(docs/audit/2026-08-30-claude-code-bridge-failures.md §4 B1):
+        // route a valid token to its owner daemon before this per-request fleet
+        // fallback. Until a durable owner registry exists, validation below gives
+        // a precise wrong-owner/epoch decline rather than a misleading map miss.
+        continuationToken: args.req.headers.get("x-openllm-tool-session"),
         stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>

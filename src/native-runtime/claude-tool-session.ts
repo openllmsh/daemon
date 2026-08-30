@@ -22,6 +22,7 @@
  * sibling (`codex-tool-session.ts`), routed by `tryServeNativeToolTurn`.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   createSdkMcpServer,
   query,
@@ -33,6 +34,14 @@ import type {
 } from "@openllmsh/protocol";
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
+import type {
+  TToolContinuationIdentity,
+  TValidatedToolContinuation,
+} from "./claude-tool-continuation";
+import {
+  mintToolContinuation,
+  validateToolContinuation,
+} from "./claude-tool-continuation";
 import type { TNativeTokens } from "./types";
 import { cleanNativeSpawnEnv, normalizeNativeTerminalResult } from "./types";
 
@@ -46,6 +55,12 @@ const DRIVE_TIMEOUT_MS = 120_000;
  *  wait out the whole drive deadline. */
 const FIRE_SETTLE_MS = 2_000;
 const MCP_PREFIX = "mcp__openllm__";
+const DEFAULT_CONTINUATION_IDENTITY: TToolContinuationIdentity = {
+  subject: "local",
+  ownerDaemonKey: "local",
+  ownerDaemonEpoch: randomUUID(),
+  secret: randomUUID(),
+};
 
 const sanitize = (name: string): string => name.replace(/[^a-zA-Z0-9_-]/g, "_");
 const nowMs = (): number => Date.now();
@@ -171,6 +186,8 @@ export type TToolTurnResult =
       readonly kind: "tool_calls";
       readonly text: string;
       readonly toolCalls: ReadonlyArray<TToolCallOut>;
+      /** Returned as x-openllm-tool-session; clients send it on continuation. */
+      readonly continuationToken?: string;
       readonly usage?: TNativeTokens;
       readonly serverSearchCalls?: ReadonlyArray<TServerSearchCall>;
     }
@@ -210,6 +227,57 @@ type THeld = {
   lock: Promise<void>;
   sessionId: string | null;
   lastUsed: number;
+  readonly continuationIdentity: TToolContinuationIdentity;
+};
+
+type TCompletedContinuation = {
+  readonly expiresAt: number;
+  readonly result: TToolTurnResult;
+};
+
+/** Finished continuations are retained only for retry idempotency. */
+const completedContinuations = new Map<string, TCompletedContinuation>();
+/** Accepted ids detect conflicting payloads after the live index is removed. */
+const consumedToolIds = new Map<string, number>();
+/** Concurrent byte-identical retries await the original drive, never re-drive it. */
+const inFlightContinuations = new Map<string, Promise<TToolTurnResult>>();
+
+const fingerprintOf = (
+  tokenId: string | null,
+  toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
+  injectedContext: string | null,
+): string =>
+  JSON.stringify({
+    tokenId,
+    results: toolResults
+      .map((result) => ({ id: result.id, content: result.content }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    injectedContext,
+  });
+
+const cleanupCompletedContinuations = (now: number): void => {
+  for (const [fingerprint, completed] of completedContinuations) {
+    if (completed.expiresAt <= now) completedContinuations.delete(fingerprint);
+  }
+  for (const [id, expiresAt] of consumedToolIds) {
+    if (expiresAt <= now) consumedToolIds.delete(id);
+  }
+};
+
+const refreshHeld = (h: THeld): void => {
+  h.lastUsed = nowMs();
+};
+
+const continuationExpiryOf = (h: THeld): number => h.lastUsed + HELD_TTL_MS;
+
+const immutableResultOf = (result: TToolTurnResult): TToolTurnResult => {
+  if (result.kind !== "tool_calls") return Object.freeze({ ...result });
+  return Object.freeze({
+    ...result,
+    toolCalls: Object.freeze(
+      result.toolCalls.map((call) => Object.freeze({ ...call })),
+    ),
+  });
 };
 
 /** Run `fn` after any in-flight `drive()` for this session completes, chaining
@@ -254,7 +322,9 @@ const closeHeld = (h: THeld): void => {
 };
 
 const evictStale = (): void => {
-  const cutoff = nowMs() - HELD_TTL_MS;
+  const now = nowMs();
+  cleanupCompletedContinuations(now);
+  const cutoff = now - HELD_TTL_MS;
   const stale = new Set<THeld>();
   for (const [, h] of held) if (h.lastUsed < cutoff) stale.add(h);
   for (const h of stale) closeHeld(h);
@@ -356,6 +426,7 @@ export type TIteratorFactory = (
 export const startToolTurn = async (
   params: TStartToolTurnParams,
   makeIterator: TIteratorFactory = buildIterator,
+  continuationIdentity: TToolContinuationIdentity = DEFAULT_CONTINUATION_IDENTITY,
 ): Promise<TToolTurnResult> => {
   evictStale();
   const chan: TChannel = { fired: [], wake: null };
@@ -376,6 +447,7 @@ export const startToolTurn = async (
     lock: Promise.resolve(),
     sessionId: params.resumeSessionId,
     lastUsed: nowMs(),
+    continuationIdentity,
   };
   return drive(h);
 };
@@ -389,32 +461,90 @@ export const startToolTurn = async (
 export const continueToolTurn = async (
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
   injectedContext: string | null = null,
+  continuationToken: string | null = null,
+  continuationIdentity: TToolContinuationIdentity = DEFAULT_CONTINUATION_IDENTITY,
 ): Promise<TToolTurnResult> => {
   evictStale();
+  const now = nowMs();
+  let validated: TValidatedToolContinuation | null = null;
+  if (continuationToken !== null) {
+    const validation = validateToolContinuation(
+      continuationToken,
+      continuationIdentity,
+      toolResults.map((result) => result.id),
+      now,
+    );
+    if (validation.kind === "invalid") {
+      return { kind: "declined", reason: validation.reason };
+    }
+    validated = validation.value;
+  }
+  const fingerprint = fingerprintOf(
+    validated?.tokenId ?? null,
+    toolResults,
+    injectedContext,
+  );
+  // A live pending id always wins over a stale completion cache. This preserves
+  // the legacy no-token path even for deterministic test/model ids that recur
+  // in a later, entirely new held query.
   const h = toolResults.map((r) => held.get(r.id)).find((x) => x !== undefined);
   if (h === undefined) {
+    const completed = completedContinuations.get(fingerprint);
+    if (completed !== undefined && completed.expiresAt > now) {
+      return completed.result;
+    }
+    const inFlight = inFlightContinuations.get(fingerprint);
+    if (inFlight !== undefined) return inFlight;
+    if (toolResults.some((result) => consumedToolIds.has(result.id))) {
+      return {
+        kind: "declined",
+        reason:
+          "tool-session continuation conflicts with an already-consumed tool result",
+      };
+    }
     return { kind: "declined", reason: "no held tool session for these ids" };
   }
+  const inFlight = inFlightContinuations.get(fingerprint);
+  if (inFlight !== undefined) return inFlight;
   // Resolve the provided handlers IMMEDIATELY (concurrent-safe: distinct ids),
-  // BEFORE awaiting the drive lock — so a sibling request delivering the other
-  // parallel results can unblock the SDK even while this one waits, instead of
-  // deadlocking (this drive would otherwise stall waiting for a result the
-  // lock-blocked sibling holds).
+  // BEFORE awaiting the drive lock — so a sibling continuation can unblock the SDK.
   const matched = toolResults.filter((r) => h.pending.has(r.id));
-  for (const [index, r] of matched.entries()) {
-    const resolve = h.pending.get(r.id);
-    if (resolve === undefined) continue;
-    h.pending.delete(r.id);
-    held.delete(r.id);
-    const last = index === matched.length - 1;
-    resolve(
-      last && injectedContext !== null
-        ? `${r.content}\n\n${injectedContext}`
-        : r.content,
-    );
+  if (matched.length !== toolResults.length) {
+    return {
+      kind: "declined",
+      reason:
+        "tool-session continuation conflicts with an already-consumed tool result",
+    };
   }
-  h.lastUsed = nowMs();
-  return withSessionLock(h, () => drive(h));
+  refreshHeld(h);
+  const outcome = (async (): Promise<TToolTurnResult> => {
+    for (const [index, r] of matched.entries()) {
+      const resolve = h.pending.get(r.id);
+      if (resolve === undefined) continue;
+      h.pending.delete(r.id);
+      held.delete(r.id);
+      consumedToolIds.set(r.id, continuationExpiryOf(h));
+      const last = index === matched.length - 1;
+      resolve(
+        last && injectedContext !== null
+          ? `${r.content}\n\n${injectedContext}`
+          : r.content,
+      );
+    }
+    refreshHeld(h);
+    const result = immutableResultOf(await withSessionLock(h, () => drive(h)));
+    completedContinuations.set(fingerprint, {
+      expiresAt: continuationExpiryOf(h),
+      result,
+    });
+    return result;
+  })();
+  inFlightContinuations.set(fingerprint, outcome);
+  try {
+    return await outcome;
+  } finally {
+    inFlightContinuations.delete(fingerprint);
+  }
 };
 
 /**
@@ -548,12 +678,22 @@ const pauseAndReturn = (
       argumentsJson: JSON.stringify(b.input ?? {}),
     });
   }
-  h.lastUsed = nowMs();
+  refreshHeld(h);
   if (toolCalls.length === 0) {
     closeHeld(h);
     return { kind: "declined", reason: "tool pause produced no tool calls" };
   }
-  return { kind: "tool_calls", text, toolCalls, usage };
+  return {
+    kind: "tool_calls",
+    text,
+    toolCalls,
+    continuationToken: mintToolContinuation(
+      h.continuationIdentity,
+      toolCalls.map((call) => call.id),
+      continuationExpiryOf(h),
+    ),
+    usage,
+  };
 };
 
 /** Build a canonical response envelope from a completed tool turn. */

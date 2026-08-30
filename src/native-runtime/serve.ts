@@ -15,6 +15,7 @@
  * Post-commit the response is final (commit-on-first-byte).
  */
 
+import { randomUUID } from "node:crypto";
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
@@ -25,9 +26,12 @@ import { partialUsageFrom } from "@openllmsh/wire/lib/streaming/upstream-error";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
 import { deliverChunkStream, deliverJsonResponse } from "../client-encode";
+import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
+import { daemonApiKeyId } from "../env";
 import { logDebug, logWarn } from "../logger";
 import { runClaudeNative } from "./claude-native";
+import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
 import { runCodexNative } from "./codex-app-server";
 import { runCursorNative } from "./cursor-acp";
@@ -60,6 +64,21 @@ const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   // resumable id, so this store stays empty); every prior-history turn takes
   // the renderSeed path. TODO(cursor-resume): ACP `session/load` follow-up.
   cursor: new NativeSessionStore(),
+};
+
+const toolContinuationEpoch = randomUUID();
+const localContinuationSecret = randomUUID();
+
+const toolContinuationIdentity = (): TToolContinuationIdentity => {
+  const ownerDaemonKey = daemonApiKeyId() ?? "unpaired";
+  return {
+    // The bootstrap signing secret is scoped per user. The key id distinguishes
+    // devices/keys within that account without putting a user id on the wire.
+    subject: ownerDaemonKey,
+    ownerDaemonKey,
+    ownerDaemonEpoch: toolContinuationEpoch,
+    secret: planSigningKey() ?? localContinuationSecret,
+  };
 };
 
 /**
@@ -159,6 +178,8 @@ export type TNativeServeParams = {
   readonly rawBody: unknown;
   readonly canonical: TChatCompletionRequest;
   readonly wantsStream: boolean;
+  /** Opaque continuation capability echoed by a client after a tool pause. */
+  readonly continuationToken?: string | null;
   /** Catalog-gated client-output repair, resolved by the walker. */
   readonly stripSubagentIsolation: boolean;
   readonly signal: AbortSignal;
@@ -266,6 +287,8 @@ export const tryServeNativeRuntime = async (
       bin: overrides?.bin ?? cliBin(params.provider),
       env: overrides?.env ?? cliEnv(params.provider),
       record: params.record,
+      continuationToken: params.continuationToken ?? null,
+      continuationIdentity: toolContinuationIdentity(),
     });
   }
   const req = nativeRequestOf(params.canonical);
