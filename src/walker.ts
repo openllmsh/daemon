@@ -129,6 +129,7 @@ import {
   normalizeSchemaRefs,
   stripSchemaKeywords,
 } from "@openllmsh/wire/lib/tool-schema";
+import { buildAnthropicToolNameMap } from "@openllmsh/wire/providers/anthropic/request";
 import { fromAnthropicResponse } from "@openllmsh/wire/providers/anthropic/response";
 import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
 import { buildChatGptToolNameMap } from "@openllmsh/wire/providers/chatgpt/request";
@@ -845,7 +846,7 @@ export const decodeUpstreamStream = (
       : {}),
   };
   if (wire === "anthropic") {
-    return decodeAnthropicEventStream(body, providerModelId);
+    return decodeAnthropicEventStream(body, options);
   }
   if (wire === "chatgpt") {
     return decodeProviderEventStream(
@@ -875,10 +876,16 @@ const decodeUpstreamJson = (
   wire: TUpstreamWire,
   json: unknown,
   providerModelId: string,
+  toolNameMap?: ReadonlyMap<string, string>,
 ): TChatCompletionResponse => {
   if (wire === "anthropic") {
     const anthropic: TAnthropicResponse = decodeAnthropicResponse(json);
-    return fromAnthropicResponse(anthropic, { providerModelId });
+    return fromAnthropicResponse(anthropic, {
+      providerModelId,
+      ...(toolNameMap !== undefined && toolNameMap.size > 0
+        ? { toolNameMap }
+        : {}),
+    });
   }
   // chatgpt Responses + openai/kimi: already ChatCompletion-shaped (mirror
   // the core chatgpt spec's inline `fromBody`, which only pins the model).
@@ -1183,12 +1190,13 @@ const serveSubscription = async (
   const headers = built.headers;
   // Build from the same canonical request that `buildUpstreamRequest` encoded.
   // Empty maps stay absent from decoder state, preserving the normal path.
+  const canonicalForToolNames = canonicalFromInbound(args.surface, args.rawBody);
   const toolNameMap =
     wire === "chatgpt"
-      ? buildChatGptToolNameMap(
-          canonicalFromInbound(args.surface, args.rawBody),
-        )
-      : undefined;
+      ? buildChatGptToolNameMap(canonicalForToolNames)
+      : wire === "anthropic"
+        ? buildAnthropicToolNameMap(canonicalForToolNames)
+        : undefined;
   let body = await applyDelegateModelCompat(
     getDelegate(hop.provider),
     hop.providerModelId,
@@ -1687,7 +1695,12 @@ const serveSubscription = async (
   }
   let canonical: TChatCompletionResponse;
   try {
-    canonical = decodeUpstreamJson(wire, upstreamJson, hop.providerModelId);
+    canonical = decodeUpstreamJson(
+      wire,
+      upstreamJson,
+      hop.providerModelId,
+      toolNameMap,
+    );
   } catch (err) {
     recordUnmetered(
       `response did not decode on the ${wire} wire (${streamFailureDetail(err)})`,
