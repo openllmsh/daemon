@@ -466,11 +466,15 @@ export const continueToolTurn = async (
 ): Promise<TToolTurnResult> => {
   evictStale();
   const now = nowMs();
+  // The held query owns the identity captured when its capability was minted.
+  // Bootstrap refreshes can rotate the live signing key while a tool is paused,
+  // so validating against the request-time identity would reject its own token.
+  const h = toolResults.map((r) => held.get(r.id)).find((x) => x !== undefined);
   let validated: TValidatedToolContinuation | null = null;
   if (continuationToken !== null) {
     const validation = validateToolContinuation(
       continuationToken,
-      continuationIdentity,
+      h?.continuationIdentity ?? continuationIdentity,
       toolResults.map((result) => result.id),
       now,
     );
@@ -487,7 +491,6 @@ export const continueToolTurn = async (
   // A live pending id always wins over a stale completion cache. This preserves
   // the legacy no-token path even for deterministic test/model ids that recur
   // in a later, entirely new held query.
-  const h = toolResults.map((r) => held.get(r.id)).find((x) => x !== undefined);
   if (h === undefined) {
     const completed = completedContinuations.get(fingerprint);
     if (completed !== undefined && completed.expiresAt > now) {
