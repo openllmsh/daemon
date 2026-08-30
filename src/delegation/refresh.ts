@@ -64,28 +64,32 @@ export class RefreshTriggerError extends Error {
   }
 }
 
-const refreshCounters = new Map<
-  string,
-  {
-    attempts: number;
-    ok: number;
-    fail: number;
-    abandoned: number;
-    cooldown_skips: number;
-    fallbacks: number;
-    lost: number;
-  }
->();
+/** Per-provider refresh counters. `cooldown_skips` (post-success 30s window) and
+ *  `backoff_skips` (post-failure escalating window) are kept DISTINCT so a healthy
+ *  cooldown-dominated ratio can be told apart from a broken provider backing off. */
+type TRefreshCounters = {
+  attempts: number;
+  ok: number;
+  fail: number;
+  abandoned: number;
+  cooldown_skips: number;
+  backoff_skips: number;
+  fallbacks: number;
+  lost: number;
+};
 
-const counterFor = (provider: string) => {
+const refreshCounters = new Map<string, TRefreshCounters>();
+
+const counterFor = (provider: string): TRefreshCounters => {
   const current = refreshCounters.get(provider);
   if (current !== undefined) return current;
-  const next = {
+  const next: TRefreshCounters = {
     attempts: 0,
     ok: 0,
     fail: 0,
     abandoned: 0,
     cooldown_skips: 0,
+    backoff_skips: 0,
     fallbacks: 0,
     lost: 0,
   };
@@ -95,31 +99,23 @@ const counterFor = (provider: string) => {
 
 /** Metadata-only refresh telemetry for `openllmd status` consumers. */
 export const refreshTelemetrySnapshot = (): Readonly<
-  Record<
-    string,
-    Readonly<{
-      attempts: number;
-      ok: number;
-      fail: number;
-      abandoned: number;
-      cooldown_skips: number;
-      fallbacks: number;
-      lost: number;
-    }>
-  >
+  Record<string, Readonly<TRefreshCounters>>
 > => Object.fromEntries(refreshCounters.entries());
 
 export const noteRefreshTokenLost = (provider: string): void => {
   counterFor(provider).lost++;
 };
 
-export const noteRefreshFallback = (provider: string): void => {
-  counterFor(provider).fallbacks++;
-};
-
 /** Shared post-refresh credential decision. A new access token without its
  * refresh companion is intentionally not treated as healthy: it can serve only
- * until expiry and must prompt re-auth before that deadline. */
+ * until expiry and must prompt re-auth before that deadline.
+ *
+ * The lost-refresh case is currently OBSERVABLE via the `refresh_token_lost`
+ * warn + counter emitted here. `reauthRequired` is the shared shape ready for
+ * the daemon status/pending-auth surface to render a PRE-expiry re-auth prompt;
+ * wiring it through the status protocol is the tracked follow-up (see the plan's
+ * "telemetry→protocol / reauthRequired→UI" deferral). Delegates use `token`
+ * today and pass the flag through unchanged. */
 export type TResolvedToken<T> = {
   readonly token: T;
   readonly reauthRequired: boolean;
@@ -163,11 +159,21 @@ export const keychainUnusable = (provider: string): never => {
 
 const inspectRefreshResult = (result: TLoginResult): void => {
   const output = result.output.toLowerCase();
+  // `abandoned` is the deadline/abort SIGTERM — the exact mid-rotation kill that
+  // strands a single-use refresh token (the B1 bug). It is the primary failure.
   if (result.abandoned) throw new RefreshTriggerError("abandoned", result);
+  // An explicit OAuth error means the credential is genuinely un-refreshable.
   if (output.includes("invalid_grant") || output.includes("invalid_request")) {
     throw new RefreshTriggerError("invalid_grant", result);
   }
-  if (result.code !== 0) throw new RefreshTriggerError("rejected", result);
+  // A BARE non-zero exit is deliberately NOT a failure: the refresh commands are
+  // diagnostic-style (`codex doctor`, `grok models`, `cursor status`) that can
+  // exit non-zero on a benign warning while still rotating the token as a side
+  // effect. Classifying that as failure would escalate the backoff and serve
+  // stale tokens on every tick. The persistence-aware grace (Stage 8 / T12 —
+  // "store credential is newer than pre-spawn ⇒ success regardless of exit
+  // code") is the tracked follow-up; until then a non-zero exit resolves as
+  // `"awaited"` and the store re-read decides, exactly as before this change.
 };
 
 /**
@@ -349,7 +355,7 @@ export const makeRefresher = (opts: {
       return "fresh";
     }
     if (now < failureBackoffUntil) {
-      counterFor(opts.slug).cooldown_skips++;
+      counterFor(opts.slug).backoff_skips++;
       logDebug("refresh", "native refresh skipped (failure backoff)", {
         provider: opts.slug,
         phase: "refresh_skipped",
@@ -363,6 +369,9 @@ export const makeRefresher = (opts: {
     }
     await fire();
     if (lastErrorClass !== null) {
+      // The caller will serve the stale credential — count it centrally so no
+      // delegate has to remember to (they all log `refresh_fallback` already).
+      counterFor(opts.slug).fallbacks++;
       return { kind: "stale", reason: lastErrorClass };
     }
     return "awaited";

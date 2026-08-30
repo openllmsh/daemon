@@ -243,12 +243,16 @@ const triggerRefresh = async (): Promise<void> => {
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
   if (keychain.kind !== "present") {
+    // A truly UNUSABLE chain is a classified failure that needs re-auth.
     if (
       keychain.kind === "indeterminate" &&
       keychain.cause === "keychain_unusable"
     )
-      keychainUnusable(PROVIDER);
-    throw new Error("keychain unavailable");
+      keychainUnusable(PROVIDER); // throws RefreshTriggerError("keychain_unusable")
+    // Any OTHER non-present state (a transient unlock/create failure) is
+    // RETRYABLE — skip this spawn benignly rather than throwing, so a momentary
+    // keychain hiccup on a slow/loaded Mac can't escalate the failure backoff.
+    return;
   }
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
