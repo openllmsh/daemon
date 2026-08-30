@@ -298,6 +298,12 @@ export const makeRefresher = (opts: {
       // the store simply isn't refreshed and `readToken` falls back to the
       // stale token (surfacing the vendor's own 401 → re-login). Log a
       // REDACTED class only — never the raw error / token.
+      // NOTE (telemetry semantics, tracked follow-up): `attempts`/`ok` count a
+      // trigger INVOCATION that resolved, which includes a benign keychain skip
+      // or a non-zero-but-unverified exit where no rotation is proven. Making
+      // `ok` mean "rotation confirmed" needs the Stage 8 store-newer-than-
+      // pre-spawn predicate; until then `refreshTelemetrySnapshot` (no live
+      // consumer yet) slightly over-counts `ok` on those benign paths.
       const counters = counterFor(opts.slug);
       counters.attempts++;
       inFlight = opts
