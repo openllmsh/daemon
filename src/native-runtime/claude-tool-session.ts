@@ -188,12 +188,16 @@ export type TToolTurnResult =
       readonly toolCalls: ReadonlyArray<TToolCallOut>;
       /** Returned as x-openllm-tool-session; clients send it on continuation. */
       readonly continuationToken?: string;
+      /** This result came from an idempotent continuation retry. */
+      readonly replayed?: true;
       readonly usage?: TNativeTokens;
       readonly serverSearchCalls?: ReadonlyArray<TServerSearchCall>;
     }
   | {
       readonly kind: "final";
       readonly text: string;
+      /** This result came from an idempotent continuation retry. */
+      readonly replayed?: true;
       readonly usage?: TNativeTokens;
       readonly serverSearchCalls?: ReadonlyArray<TServerSearchCall>;
     }
@@ -243,17 +247,28 @@ const consumedToolIds = new Map<string, number>();
 const inFlightContinuations = new Map<string, Promise<TToolTurnResult>>();
 
 const fingerprintOf = (
-  tokenId: string | null,
+  continuationIdentity: TToolContinuationIdentity,
+  validatedToken: TValidatedToolContinuation,
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
   injectedContext: string | null,
 ): string =>
   JSON.stringify({
-    tokenId,
+    identity: {
+      subject: continuationIdentity.subject,
+      ownerDaemonKey: continuationIdentity.ownerDaemonKey,
+      ownerDaemonEpoch: continuationIdentity.ownerDaemonEpoch,
+    },
+    tokenId: validatedToken.tokenId,
     results: toolResults
       .map((result) => ({ id: result.id, content: result.content }))
       .sort((a, b) => a.id.localeCompare(b.id)),
     injectedContext,
   });
+
+const replayedResultOf = (result: TToolTurnResult): TToolTurnResult => {
+  if (result.kind === "declined") return result;
+  return { ...result, replayed: true };
+};
 
 const cleanupCompletedContinuations = (now: number): void => {
   for (const [fingerprint, completed] of completedContinuations) {
@@ -483,21 +498,26 @@ export const continueToolTurn = async (
     }
     validated = validation.value;
   }
-  const fingerprint = fingerprintOf(
-    validated?.tokenId ?? null,
-    toolResults,
-    injectedContext,
-  );
+  // Only a validated capability may address an idempotency entry. Legacy
+  // no-token continuations still resolve a live same-daemon hold below, but
+  // cannot read or create retry state after that hold has been consumed.
+  const cacheIdentity = h?.continuationIdentity ?? continuationIdentity;
+  const fingerprint =
+    validated === null
+      ? null
+      : fingerprintOf(cacheIdentity, validated, toolResults, injectedContext);
   // A live pending id always wins over a stale completion cache. This preserves
   // the legacy no-token path even for deterministic test/model ids that recur
   // in a later, entirely new held query.
   if (h === undefined) {
-    const completed = completedContinuations.get(fingerprint);
-    if (completed !== undefined && completed.expiresAt > now) {
-      return completed.result;
+    if (fingerprint !== null) {
+      const completed = completedContinuations.get(fingerprint);
+      if (completed !== undefined && completed.expiresAt > now) {
+        return replayedResultOf(completed.result);
+      }
+      const inFlight = inFlightContinuations.get(fingerprint);
+      if (inFlight !== undefined) return replayedResultOf(await inFlight);
     }
-    const inFlight = inFlightContinuations.get(fingerprint);
-    if (inFlight !== undefined) return inFlight;
     if (toolResults.some((result) => consumedToolIds.has(result.id))) {
       return {
         kind: "declined",
@@ -507,8 +527,10 @@ export const continueToolTurn = async (
     }
     return { kind: "declined", reason: "no held tool session for these ids" };
   }
-  const inFlight = inFlightContinuations.get(fingerprint);
-  if (inFlight !== undefined) return inFlight;
+  if (fingerprint !== null) {
+    const inFlight = inFlightContinuations.get(fingerprint);
+    if (inFlight !== undefined) return replayedResultOf(await inFlight);
+  }
   // Resolve the provided handlers IMMEDIATELY (concurrent-safe: distinct ids),
   // BEFORE awaiting the drive lock — so a sibling continuation can unblock the SDK.
   const matched = toolResults.filter((r) => h.pending.has(r.id));
@@ -536,12 +558,15 @@ export const continueToolTurn = async (
     }
     refreshHeld(h);
     const result = immutableResultOf(await withSessionLock(h, () => drive(h)));
-    completedContinuations.set(fingerprint, {
-      expiresAt: continuationExpiryOf(h),
-      result,
-    });
+    if (fingerprint !== null) {
+      completedContinuations.set(fingerprint, {
+        expiresAt: continuationExpiryOf(h),
+        result,
+      });
+    }
     return result;
   })();
+  if (fingerprint === null) return outcome;
   inFlightContinuations.set(fingerprint, outcome);
   try {
     return await outcome;

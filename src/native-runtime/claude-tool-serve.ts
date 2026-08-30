@@ -188,10 +188,12 @@ export const tryServeNativeToolTurn = async (
     return { declined: result.reason };
   }
 
-  // Record THIS turn's token row. The Claude SDK path surfaces per-turn usage
-  // (`result.usage`, folded to the same shape as the plain-text native path);
-  // the gated Codex tool path doesn't yet, so it falls back to zero.
-  params.record(result.usage ?? ZERO_TOKENS, "success");
+  // Record THIS fresh turn's token row. The Claude SDK path surfaces per-turn
+  // usage (`result.usage`, folded to the same shape as the plain-text native
+  // path); idempotent continuation replays must not record that usage again.
+  if (result.replayed !== true) {
+    params.record(result.usage ?? ZERO_TOKENS, "success");
+  }
 
   const canonicalResp = toolTurnToResponse(result, params.providerModelId);
   const continuationToken =
