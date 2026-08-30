@@ -85,7 +85,8 @@ const joinChangeKeyParts = (parts: readonly string[]): string =>
 const optionalArrayChangeKey = (
   value: readonly unknown[] | undefined,
   encodedItems: string,
-): string => joinChangeKeyParts([value === undefined ? "0" : "1", encodedItems]);
+): string =>
+  joinChangeKeyParts([value === undefined ? "0" : "1", encodedItems]);
 
 /**
  * Cheap change key: concatenates wire-visible primitives. Nested `usage` /
@@ -110,7 +111,9 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
         c.pending_auth === undefined || c.pending_auth === null
           ? ""
           : JSON.stringify(c.pending_auth),
-        c.usage === undefined || c.usage === null ? "" : JSON.stringify(c.usage),
+        c.usage === undefined || c.usage === null
+          ? ""
+          : JSON.stringify(c.usage),
       ]),
     )
     .join("|");
@@ -180,9 +183,11 @@ export const WATCH_MS = 2_500;
 // than waiting for the relay to terminate the socket (a `1006`). See `heartbeat.ts`
 // and R4 in docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
 export const HEARTBEAT_MS = 20_000;
-// Liveness window: if NO `pong` arrives within this, the link is a silent
-// half-open (no `close` fired) → `reconnect()`. 3.5× the heartbeat, so a single
-// slow round-trip never trips it. partysocket owns connect/backoff, not liveness.
+// Reap only after three consecutive missed relay pongs. The heartbeat checks
+// before incrementing, so at the 20s cadence it preserves the prior ~70s
+// detection budget while tolerating a short pause. partysocket owns dial/backoff.
+export const MAX_MISSED_PONGS = 3;
+/** @deprecated Retained for external cadence assertions; heartbeat no longer uses a deadline. */
 export const LIVENESS_TIMEOUT_MS = 70_000;
 // Reconnect jitter: a relay redeploy closes EVERY daemon's socket at once, and
 // partysocket's backoff is deterministic (no jitter of its own), so without this
@@ -248,13 +253,13 @@ const heartbeat = createHeartbeat({
   onSilent: () => {
     logWarn(
       "control-channel",
-      `no relay pong in ${LIVENESS_TIMEOUT_MS}ms; forcing reconnect`,
+      `no relay pong after ${MAX_MISSED_PONGS} missed heartbeats; forcing reconnect`,
     );
     ws?.reconnect();
   },
   onFirstPong: () => armProbesAfterPong(),
   heartbeatMs: HEARTBEAT_MS,
-  livenessMs: LIVENESS_TIMEOUT_MS,
+  maxMissedPongs: MAX_MISSED_PONGS,
 });
 /** Escalating stand-down when a same-key daemon evicts this connection. */
 const supersedeBackoff = createSupersedeBackoff({

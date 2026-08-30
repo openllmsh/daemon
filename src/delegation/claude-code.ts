@@ -54,9 +54,12 @@ import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import {
+  credentialUnrefreshable,
   isStaleRefresh,
+  keychainUnusable,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
+  resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TProviderDelegate } from "./types";
@@ -154,7 +157,15 @@ const triggerRefresh = async (): Promise<void> => {
   // A locked/unusable isolated keychain must NOT reach `claude -p ping`: the
   // vendor CLI would open it and pop the SecurityAgent dialog (and it can't
   // refresh a credential it can't read). Skip when not ready.
-  if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") return;
+  const keychain = await ensureKeychainReady(cliHome(PROVIDER));
+  if (keychain.kind !== "present") {
+    if (
+      keychain.kind === "indeterminate" &&
+      keychain.cause === "keychain_unusable"
+    )
+      keychainUnusable(PROVIDER);
+    throw new Error("keychain unavailable");
+  }
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
@@ -197,6 +208,7 @@ const readToken = async (
   const expiresAtMs = toEpochMs(oauth.expiresAt);
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
+  if (!oauth.refreshToken) credentialUnrefreshable(PROVIDER);
   const outcome = oauth.refreshToken ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
     logWarn("refresh", "returning stale expired credential", {
@@ -213,13 +225,19 @@ const readToken = async (
   // store. Falls back to the stale token if it failed (the upstream then 401s
   // and the UI says re-sign-in).
   const fresh = storeReadValue(await loadStore(signal))?.claudeAiOauth;
-  if (fresh?.accessToken !== undefined && fresh.accessToken.length > 0) {
-    return {
-      accessToken: fresh.accessToken,
-      expiresAtMs: toEpochMs(fresh.expiresAt),
-    };
-  }
-  return { accessToken: oauth.accessToken, expiresAtMs };
+  const resolved = resolveToken({
+    provider: PROVIDER,
+    prior: oauth,
+    refreshed:
+      fresh?.accessToken !== undefined && fresh.accessToken.length > 0
+        ? fresh
+        : null,
+    hasRefreshToken: (token) => Boolean(token.refreshToken),
+  });
+  return {
+    accessToken: resolved.token.accessToken ?? oauth.accessToken,
+    expiresAtMs: toEpochMs(resolved.token.expiresAt),
+  };
 };
 
 const userAgent = async (): Promise<string> => {
