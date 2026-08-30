@@ -239,12 +239,27 @@ type TCompletedContinuation = {
   readonly result: TToolTurnResult;
 };
 
+type TContinuationIdentityEntry = {
+  readonly expiresAt: number;
+  readonly identity: TToolContinuationIdentity;
+};
+
 /** Finished continuations are retained only for retry idempotency. */
 const completedContinuations = new Map<string, TCompletedContinuation>();
+/** Mint-time identities let retries validate and address a completed turn after a signing-key refresh. */
+const continuationIdentities = new Map<string, TContinuationIdentityEntry>();
 /** Accepted ids detect conflicting payloads after the live index is removed. */
 const consumedToolIds = new Map<string, number>();
 /** Concurrent byte-identical retries await the original drive, never re-drive it. */
 const inFlightContinuations = new Map<string, Promise<TToolTurnResult>>();
+
+const sameContinuationScope = (
+  left: TToolContinuationIdentity,
+  right: TToolContinuationIdentity,
+): boolean =>
+  left.subject === right.subject &&
+  left.ownerDaemonKey === right.ownerDaemonKey &&
+  left.ownerDaemonEpoch === right.ownerDaemonEpoch;
 
 const fingerprintOf = (
   continuationIdentity: TToolContinuationIdentity,
@@ -273,6 +288,9 @@ const replayedResultOf = (result: TToolTurnResult): TToolTurnResult => {
 const cleanupCompletedContinuations = (now: number): void => {
   for (const [fingerprint, completed] of completedContinuations) {
     if (completed.expiresAt <= now) completedContinuations.delete(fingerprint);
+  }
+  for (const [token, entry] of continuationIdentities) {
+    if (entry.expiresAt <= now) continuationIdentities.delete(token);
   }
   for (const [id, expiresAt] of consumedToolIds) {
     if (expiresAt <= now) consumedToolIds.delete(id);
@@ -485,11 +503,21 @@ export const continueToolTurn = async (
   // Bootstrap refreshes can rotate the live signing key while a tool is paused,
   // so validating against the request-time identity would reject its own token.
   const h = toolResults.map((r) => held.get(r.id)).find((x) => x !== undefined);
+  const storedIdentity =
+    h?.continuationIdentity ??
+    (continuationToken === null
+      ? undefined
+      : continuationIdentities.get(continuationToken)?.identity);
+  const validatedIdentity =
+    storedIdentity !== undefined &&
+    sameContinuationScope(storedIdentity, continuationIdentity)
+      ? storedIdentity
+      : continuationIdentity;
   let validated: TValidatedToolContinuation | null = null;
   if (continuationToken !== null) {
     const validation = validateToolContinuation(
       continuationToken,
-      h?.continuationIdentity ?? continuationIdentity,
+      validatedIdentity,
       toolResults.map((result) => result.id),
       now,
     );
@@ -501,7 +529,7 @@ export const continueToolTurn = async (
   // Only a validated capability may address an idempotency entry. Legacy
   // no-token continuations still resolve a live same-daemon hold below, but
   // cannot read or create retry state after that hold has been consumed.
-  const cacheIdentity = h?.continuationIdentity ?? continuationIdentity;
+  const cacheIdentity = validatedIdentity;
   const fingerprint =
     validated === null
       ? null
@@ -711,15 +739,21 @@ const pauseAndReturn = (
     closeHeld(h);
     return { kind: "declined", reason: "tool pause produced no tool calls" };
   }
+  const expiresAt = continuationExpiryOf(h);
+  const continuationToken = mintToolContinuation(
+    h.continuationIdentity,
+    toolCalls.map((call) => call.id),
+    expiresAt,
+  );
+  continuationIdentities.set(continuationToken, {
+    expiresAt,
+    identity: h.continuationIdentity,
+  });
   return {
     kind: "tool_calls",
     text,
     toolCalls,
-    continuationToken: mintToolContinuation(
-      h.continuationIdentity,
-      toolCalls.map((call) => call.id),
-      continuationExpiryOf(h),
-    ),
+    continuationToken,
     usage,
   };
 };
