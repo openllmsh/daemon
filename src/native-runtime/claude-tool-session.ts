@@ -498,6 +498,16 @@ export const continueToolTurn = async (
   continuationIdentity: TToolContinuationIdentity = DEFAULT_CONTINUATION_IDENTITY,
 ): Promise<TToolTurnResult> => {
   evictStale();
+  const resultIds = new Set<string>();
+  for (const { id } of toolResults) {
+    if (resultIds.has(id)) {
+      return {
+        kind: "declined",
+        reason: "tool-session continuation contains duplicate tool result ids",
+      };
+    }
+    resultIds.add(id);
+  }
   const now = nowMs();
   // The held query owns the identity captured when its capability was minted.
   // Bootstrap refreshes can rotate the live signing key while a tool is paused,
@@ -537,6 +547,13 @@ export const continueToolTurn = async (
   // A live pending id always wins over a stale completion cache. This preserves
   // the legacy no-token path even for deterministic test/model ids that recur
   // in a later, entirely new held query.
+  if (
+    continuationToken === null &&
+    h !== undefined &&
+    !sameContinuationScope(h.continuationIdentity, continuationIdentity)
+  ) {
+    return { kind: "declined", reason: "invalid tool-session continuation" };
+  }
   if (h === undefined) {
     if (fingerprint !== null) {
       const completed = completedContinuations.get(fingerprint);

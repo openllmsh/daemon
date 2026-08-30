@@ -168,6 +168,12 @@ const refresh = makeRefresher({
   trigger: triggerRefresh,
 });
 
+/** Preserve the account identity when Codex rotates only the access token. */
+export const resolveChatgptAccountId = (
+  resolved: Pick<TCodexTokens, "account_id">,
+  prior: Pick<TCodexTokens, "account_id">,
+): string | null => resolved.account_id ?? prior.account_id ?? null;
+
 const readToken = async (): Promise<{
   accessToken: string;
   accountId: string | null;
@@ -213,7 +219,7 @@ const readToken = async (): Promise<{
   });
   return {
     accessToken: resolved.token.access_token ?? tokens.access_token,
-    accountId: resolved.token.account_id ?? null,
+    accountId: resolveChatgptAccountId(resolved.token, tokens),
   };
 };
 

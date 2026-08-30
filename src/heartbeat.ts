@@ -119,6 +119,14 @@ export const createHeartbeat = (deps: THeartbeatDeps): THeartbeat => {
     // complete liveness policy.
     if (missedPongs >= maxMissedPongs && isPhiSilent()) {
       reaping = true;
+      awaitingFirstPong = false;
+      if (pingTimer !== null) {
+        clearInterval(pingTimer);
+        pingTimer = null;
+      }
+      // A reconnect starts with a fresh liveness sample window.
+      lastPongAt = null;
+      pongIntervals = [];
       deps.onSilent();
       return;
     }
@@ -133,11 +141,20 @@ export const createHeartbeat = (deps: THeartbeatDeps): THeartbeat => {
     reaping = false;
     lastPongAt = null;
     pongIntervals = [];
+    // Install the timer before the immediate ping, so a synchronous pong is
+    // accepted as belonging to this connection.
+    const timer = setInterval(tick, deps.heartbeatMs);
+    pingTimer = timer;
+    timer.unref?.();
     // Ping now (not only after `heartbeatMs`) so a reconnect/foreground return
     // can confirm its socket with one round-trip rather than waiting 20 seconds.
-    deps.sendPing();
-    pingTimer = setInterval(tick, deps.heartbeatMs);
-    pingTimer.unref?.();
+    try {
+      deps.sendPing();
+    } catch (error) {
+      clearInterval(timer);
+      if (pingTimer === timer) pingTimer = null;
+      throw error;
+    }
   };
 
   const notePong = (): void => {

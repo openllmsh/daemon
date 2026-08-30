@@ -184,10 +184,10 @@ export const WATCH_MS = 2_500;
 // and R4 in docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
 export const HEARTBEAT_MS = 20_000;
 // Reap only after three consecutive missed relay pongs. The heartbeat checks
-// before incrementing, so at the 20s cadence it preserves the prior ~70s
-// detection budget while tolerating a short pause. partysocket owns dial/backoff.
+// before incrementing: after its immediate ping, 20s/40s/60s are grace ticks and
+// the 80s tick reaps. partysocket owns dial/backoff.
 export const MAX_MISSED_PONGS = 3;
-/** @deprecated Retained for external cadence assertions; heartbeat no longer uses a deadline. */
+/** @deprecated Legacy compatibility export; active liveness is miss-counted (~80s), not this deadline. */
 export const LIVENESS_TIMEOUT_MS = 70_000;
 // Reconnect jitter: a relay redeploy closes EVERY daemon's socket at once, and
 // partysocket's backoff is deterministic (no jitter of its own), so without this

@@ -16,7 +16,7 @@
  * hard-expired — exactly "no latency unless the refresh is close".
  */
 import { logDebug, logWarn } from "../logger";
-import type { TLoginResult } from "./util";
+import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin, spawnLoginPty } from "./util";
 
 /** Bound on a refresh spawn — generous for a slow first call, short enough that
@@ -155,6 +155,26 @@ export const keychainUnusable = (provider: string): never => {
     abandoned: false,
     code: -1,
   });
+};
+
+/**
+ * Decide whether a native refresh may spawn after a keychain readiness check.
+ * Only the terminal, explicitly-classified unusable state becomes a refresh
+ * failure. Absent and every other indeterminate result are benign skips: a
+ * refresh CLI must not create, unlock, or probe an uncertain keychain.
+ */
+export const keychainRefreshSpawnAllowed = (
+  provider: string,
+  readiness: TStoreRead<void>,
+): boolean => {
+  if (readiness.kind === "present") return true;
+  if (
+    readiness.kind === "indeterminate" &&
+    readiness.cause === "keychain_unusable"
+  ) {
+    keychainUnusable(provider);
+  }
+  return false;
 };
 
 const inspectRefreshResult = (result: TLoginResult): void => {

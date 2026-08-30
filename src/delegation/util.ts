@@ -35,8 +35,8 @@ export type TStoreRead<T> =
   | { readonly kind: "absent" }
   | { readonly kind: "indeterminate"; readonly cause: string };
 
-/** Sentinel `detail` matching `statusFailure()` in status.ts. */
-export const STATUS_CHECK_FAILED_DETAIL = "status check failed";
+/** Shared daemon-status wire sentinel; preserves existing daemon import paths. */
+export { STATUS_CHECK_FAILED_DETAIL } from "@openllmsh/protocol";
 
 export const storeReadValue = <T>(read: TStoreRead<T>): T | null =>
   read.kind === "present" ? read.value : null;

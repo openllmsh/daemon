@@ -60,7 +60,7 @@ export const classifyLossDetail = (
   if (
     d.includes("timeout") ||
     d.includes("timed out") ||
-    d === "status check failed"
+    d === STATUS_CHECK_FAILED_DETAIL
   ) {
     return "probe_timeout";
   }

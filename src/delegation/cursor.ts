@@ -36,7 +36,7 @@ import { loginSlot, makeCancelConnect } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
-  keychainUnusable,
+  keychainRefreshSpawnAllowed,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
   resolveToken,
@@ -242,18 +242,7 @@ const triggerRefresh = async (): Promise<void> => {
   // `cursor-agent status` (SecurityAgent dialog + 60s spawn). Skip when not
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
-  if (keychain.kind !== "present") {
-    // A truly UNUSABLE chain is a classified failure that needs re-auth.
-    if (
-      keychain.kind === "indeterminate" &&
-      keychain.cause === "keychain_unusable"
-    )
-      keychainUnusable(PROVIDER); // throws RefreshTriggerError("keychain_unusable")
-    // Any OTHER non-present state (a transient unlock/create failure) is
-    // RETRYABLE — skip this spawn benignly rather than throwing, so a momentary
-    // keychain hiccup on a slow/loaded Mac can't escalate the failure backoff.
-    return;
-  }
+  if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,

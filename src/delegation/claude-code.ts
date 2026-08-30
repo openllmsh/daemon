@@ -56,7 +56,7 @@ import { loginSlot } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
-  keychainUnusable,
+  keychainRefreshSpawnAllowed,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
   resolveToken,
@@ -158,18 +158,7 @@ const triggerRefresh = async (): Promise<void> => {
   // vendor CLI would open it and pop the SecurityAgent dialog (and it can't
   // refresh a credential it can't read). Skip when not ready.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
-  if (keychain.kind !== "present") {
-    // A truly UNUSABLE chain is a classified failure that needs re-auth.
-    if (
-      keychain.kind === "indeterminate" &&
-      keychain.cause === "keychain_unusable"
-    )
-      keychainUnusable(PROVIDER); // throws RefreshTriggerError("keychain_unusable")
-    // Any OTHER non-present state (a transient unlock/create failure) is
-    // RETRYABLE — skip this spawn benignly rather than throwing, so a momentary
-    // keychain hiccup on a slow/loaded Mac can't escalate the failure backoff.
-    return;
-  }
+  if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
