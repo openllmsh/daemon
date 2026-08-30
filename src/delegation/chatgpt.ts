@@ -48,9 +48,11 @@ import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import {
+  credentialUnrefreshable,
   isStaleRefresh,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
+  resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
@@ -177,6 +179,7 @@ const readToken = async (): Promise<{
   const expiresAtMs = jwtExpiryMs(tokens.access_token);
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
+  if (!tokens.refresh_token) credentialUnrefreshable(PROVIDER);
   const outcome = tokens.refresh_token ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
     logWarn("refresh", "returning stale expired credential", {
@@ -199,15 +202,18 @@ const readToken = async (): Promise<{
   // store. Falls back to the stale token if it failed (the upstream then 401s
   // and the UI says re-sign-in).
   const fresh = storeReadValue(await loadStore())?.tokens;
-  if (fresh?.access_token !== undefined && fresh.access_token.length > 0) {
-    return {
-      accessToken: fresh.access_token,
-      accountId: fresh.account_id ?? null,
-    };
-  }
+  const resolved = resolveToken({
+    provider: PROVIDER,
+    prior: tokens,
+    refreshed:
+      fresh?.access_token !== undefined && fresh.access_token.length > 0
+        ? fresh
+        : null,
+    hasRefreshToken: (token) => Boolean(token.refresh_token),
+  });
   return {
-    accessToken: tokens.access_token,
-    accountId: tokens.account_id ?? null,
+    accessToken: resolved.token.access_token ?? tokens.access_token,
+    accountId: resolved.token.account_id ?? null,
   };
 };
 

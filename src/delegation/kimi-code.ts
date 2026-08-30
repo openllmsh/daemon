@@ -30,7 +30,7 @@
  *     `X-Msh-Device-Id`.
  *   - Usage: GET https://api.kimi.com/coding/v1/usages.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
@@ -55,9 +55,11 @@ import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
 import {
+  credentialUnrefreshable,
   isStaleRefresh,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
+  resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TProviderDelegate } from "./types";
@@ -259,10 +261,10 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
   }
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
-  const outcome =
-    tok.refresh_token !== undefined && tok.refresh_token.length > 0
-      ? await refresh(expiresAtMs)
-      : "fresh";
+  const refreshable =
+    tok.refresh_token !== undefined && tok.refresh_token.length > 0;
+  if (!refreshable) credentialUnrefreshable(PROVIDER);
+  const outcome = refreshable ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
     logWarn("refresh", "returning stale expired credential", {
       provider: PROVIDER,
@@ -280,12 +282,17 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
   const fresh = storeReadValue(
     await readJsonStore<TKimiToken>(credentialPath()),
   );
-  return {
-    accessToken:
+  const resolved = resolveToken({
+    provider: PROVIDER,
+    prior: tok,
+    refreshed:
       fresh?.access_token !== undefined && fresh.access_token.length > 0
-        ? fresh.access_token
-        : tok.access_token,
-  };
+        ? fresh
+        : null,
+    hasRefreshToken: (token) =>
+      token.refresh_token !== undefined && token.refresh_token.length > 0,
+  });
+  return { accessToken: resolved.token.access_token ?? tok.access_token };
 };
 
 // Read the persisted device id, or mint + persist one (uuid4, mode 0600)
@@ -449,10 +456,12 @@ const writeCredential = (wire: Record<string, unknown>): void => {
   };
   const dir = join(kimiHome(), "credentials");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(dir, "kimi-code.json"), JSON.stringify(blob), {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
+  const path = join(dir, "kimi-code.json");
+  const temp = join(dir, `.kimi-code-${process.pid}-${Date.now()}.tmp`);
+  writeFileSync(temp, JSON.stringify(blob), { encoding: "utf-8", mode: 0o600 });
+  // Same-directory rename is atomic: readers see either the old complete
+  // credential or the new complete credential, never a truncated JSON write.
+  renameSync(temp, path);
 };
 
 // ─── /usages parsing ─────────────────────────────────────────────────────

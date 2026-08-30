@@ -77,9 +77,11 @@ import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import {
+  credentialUnrefreshable,
   isStaleRefresh,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
+  resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
@@ -246,6 +248,7 @@ const readToken = async (): Promise<{
   if (session?.key === undefined || session.key.length === 0) return null;
   const expiresAtMs = parseExpiryMs(session.expires_at);
   // Only trigger when the credential CAN be refreshed (a refresh token exists).
+  if (!session.refresh_token) credentialUnrefreshable(PROVIDER);
   const outcome = session.refresh_token ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
     logWarn("refresh", "returning stale expired credential", {
@@ -258,9 +261,16 @@ const readToken = async (): Promise<{
   if (outcome !== "awaited") return { accessToken: session.key, session };
   // Hard-expired path: the CLI refresh was awaited — re-read the rotated store.
   const fresh = await newestSession();
-  return fresh?.key !== undefined && fresh.key.length > 0
-    ? { accessToken: fresh.key, session: fresh }
-    : { accessToken: session.key, session };
+  const resolved = resolveToken({
+    provider: PROVIDER,
+    prior: session,
+    refreshed: fresh?.key !== undefined && fresh.key.length > 0 ? fresh : null,
+    hasRefreshToken: (token) => Boolean(token.refresh_token),
+  });
+  return {
+    accessToken: resolved.token.key ?? session.key,
+    session: resolved.token,
+  };
 };
 
 /**

@@ -16,6 +16,7 @@
  * hard-expired — exactly "no latency unless the refresh is close".
  */
 import { logDebug, logWarn } from "../logger";
+import type { TLoginResult } from "./util";
 import { spawnLogin, spawnLoginPty } from "./util";
 
 /** Bound on a refresh spawn — generous for a slow first call, short enough that
@@ -32,7 +33,148 @@ export const REFRESH_SPAWN_TIMEOUT_MS = 60_000;
  */
 export const REFRESH_COOLDOWN_MS = 30_000;
 
-export type TRefreshErrorClass = "timeout" | "spawn_failed" | "rejected";
+/** Separate retry schedule for failed refreshes. The first retry remains bounded
+ * by the historical 30s cooldown; subsequent failures exponentially back off. */
+export const REFRESH_FAILURE_BACKOFF_MS = 30_000;
+const MAX_REFRESH_FAILURE_BACKOFF_MS = 5 * 60_000;
+
+export type TRefreshErrorClass =
+  | "timeout"
+  | "spawn_failed"
+  | "abandoned"
+  | "invalid_grant"
+  | "keychain_unusable"
+  | "rejected";
+
+/** A redacted, structured failure from a vendor refresh child. */
+export class RefreshTriggerError extends Error {
+  readonly errorClass: TRefreshErrorClass;
+  readonly abandoned: boolean;
+  readonly exitCode: number;
+
+  constructor(
+    errorClass: TRefreshErrorClass,
+    result: Pick<TLoginResult, "abandoned" | "code">,
+  ) {
+    super(`native refresh ${errorClass}`);
+    this.name = "RefreshTriggerError";
+    this.errorClass = errorClass;
+    this.abandoned = result.abandoned;
+    this.exitCode = result.code;
+  }
+}
+
+/** Per-provider refresh counters. `cooldown_skips` (post-success 30s window) and
+ *  `backoff_skips` (post-failure escalating window) are kept DISTINCT so a healthy
+ *  cooldown-dominated ratio can be told apart from a broken provider backing off. */
+type TRefreshCounters = {
+  attempts: number;
+  ok: number;
+  fail: number;
+  abandoned: number;
+  cooldown_skips: number;
+  backoff_skips: number;
+  fallbacks: number;
+  lost: number;
+};
+
+const refreshCounters = new Map<string, TRefreshCounters>();
+
+const counterFor = (provider: string): TRefreshCounters => {
+  const current = refreshCounters.get(provider);
+  if (current !== undefined) return current;
+  const next: TRefreshCounters = {
+    attempts: 0,
+    ok: 0,
+    fail: 0,
+    abandoned: 0,
+    cooldown_skips: 0,
+    backoff_skips: 0,
+    fallbacks: 0,
+    lost: 0,
+  };
+  refreshCounters.set(provider, next);
+  return next;
+};
+
+/** Metadata-only refresh telemetry for `openllmd status` consumers. */
+export const refreshTelemetrySnapshot = (): Readonly<
+  Record<string, Readonly<TRefreshCounters>>
+> => Object.fromEntries(refreshCounters.entries());
+
+export const noteRefreshTokenLost = (provider: string): void => {
+  counterFor(provider).lost++;
+};
+
+/** Shared post-refresh credential decision. A new access token without its
+ * refresh companion is intentionally not treated as healthy: it can serve only
+ * until expiry and must prompt re-auth before that deadline.
+ *
+ * The lost-refresh case is currently OBSERVABLE via the `refresh_token_lost`
+ * warn + counter emitted here. `reauthRequired` is the shared shape ready for
+ * the daemon status/pending-auth surface to render a PRE-expiry re-auth prompt;
+ * wiring it through the status protocol is the tracked follow-up (see the plan's
+ * "telemetry→protocol / reauthRequired→UI" deferral). Delegates use `token`
+ * today and pass the flag through unchanged. */
+export type TResolvedToken<T> = {
+  readonly token: T;
+  readonly reauthRequired: boolean;
+};
+
+export const resolveToken = <T>(opts: {
+  readonly provider: string;
+  readonly prior: T;
+  readonly refreshed: T | null;
+  readonly hasRefreshToken: (token: T) => boolean;
+}): TResolvedToken<T> => {
+  const token = opts.refreshed ?? opts.prior;
+  if (!opts.hasRefreshToken(token)) {
+    noteRefreshTokenLost(opts.provider);
+    logWarn("refresh", "refresh token lost", {
+      provider: opts.provider,
+      phase: "refresh_token_lost",
+    });
+    return { token, reauthRequired: true };
+  }
+  return { token, reauthRequired: false };
+};
+
+export const credentialUnrefreshable = (provider: string): void => {
+  logWarn("refresh", "credential cannot be refreshed", {
+    provider,
+    phase: "credential_unrefreshable",
+  });
+};
+
+export const keychainUnusable = (provider: string): never => {
+  logWarn("refresh", "keychain is unusable; re-authentication required", {
+    provider,
+    phase: "keychain_unusable",
+  });
+  throw new RefreshTriggerError("keychain_unusable", {
+    abandoned: false,
+    code: -1,
+  });
+};
+
+const inspectRefreshResult = (result: TLoginResult): void => {
+  const output = result.output.toLowerCase();
+  // `abandoned` is the deadline/abort SIGTERM — the exact mid-rotation kill that
+  // strands a single-use refresh token (the B1 bug). It is the primary failure.
+  if (result.abandoned) throw new RefreshTriggerError("abandoned", result);
+  // An explicit OAuth error means the credential is genuinely un-refreshable.
+  if (output.includes("invalid_grant") || output.includes("invalid_request")) {
+    throw new RefreshTriggerError("invalid_grant", result);
+  }
+  // A BARE non-zero exit is deliberately NOT a failure: the refresh commands are
+  // diagnostic-style (`codex doctor`, `grok models`, `cursor status`) that can
+  // exit non-zero on a benign warning while still rotating the token as a side
+  // effect. Classifying that as failure would escalate the backoff and serve
+  // stale tokens on every tick. The persistence-aware grace (Stage 8 / T12 —
+  // "store credential is newer than pre-spawn ⇒ success regardless of exit
+  // code") is the tracked follow-up; until then a non-zero exit resolves as
+  // `"awaited"` and the store re-read decides, exactly as before this change.
+};
 
 /**
  * Run a bounded CLI invocation whose SIDE EFFECT is the CLI refreshing +
@@ -51,11 +193,15 @@ export const spawnRefresh = async (
   },
 ): Promise<void> => {
   const run = opts?.pty === true ? spawnLoginPty : spawnLogin;
-  await run([...argv], env, {
+  const result = await run([...argv], env, {
     timeoutMs: opts?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
     probe: opts?.probe,
     ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
   });
+  // spawnLogin intentionally resolves after its deadline/non-zero child exit.
+  // A refresh must turn those resolved outcomes into a classified rejection so
+  // makeRefresher cannot record a killed rotation as a clean success.
+  inspectRefreshResult(result);
 };
 
 /** What `makeRefresher` did for this read — tells the caller whether the store
@@ -78,7 +224,8 @@ export const isStaleRefresh = (
 ): outcome is { readonly kind: "stale"; readonly reason: TRefreshErrorClass } =>
   typeof outcome === "object" && outcome.kind === "stale";
 
-const classifyRefreshError = (err: unknown): TRefreshErrorClass => {
+export const classifyRefreshError = (err: unknown): TRefreshErrorClass => {
+  if (err instanceof RefreshTriggerError) return err.errorClass;
   const name = err instanceof Error ? err.name : "";
   const message = err instanceof Error ? err.message : "";
   const text = `${name} ${message}`.toLowerCase();
@@ -139,6 +286,8 @@ export const makeRefresher = (opts: {
   let inFlight: Promise<void> | null = null;
   let lastErrorClass: TRefreshErrorClass | null = null;
   let cooldownUntil = 0;
+  let failureBackoffUntil = 0;
+  let consecutiveFailures = 0;
   const cooldownMs = opts.cooldownMs ?? 0;
   const fire = (): Promise<void> => {
     if (inFlight === null) {
@@ -149,13 +298,34 @@ export const makeRefresher = (opts: {
       // the store simply isn't refreshed and `readToken` falls back to the
       // stale token (surfacing the vendor's own 401 → re-login). Log a
       // REDACTED class only — never the raw error / token.
+      // NOTE (telemetry semantics, tracked follow-up): `attempts`/`ok` count a
+      // trigger INVOCATION that resolved, which includes a benign keychain skip
+      // or a non-zero-but-unverified exit where no rotation is proven. Making
+      // `ok` mean "rotation confirmed" needs the Stage 8 store-newer-than-
+      // pre-spawn predicate; until then `refreshTelemetrySnapshot` (no live
+      // consumer yet) slightly over-counts `ok` on those benign paths.
+      const counters = counterFor(opts.slug);
+      counters.attempts++;
       inFlight = opts
         .trigger()
         .then(() => {
           lastErrorClass = null;
+          consecutiveFailures = 0;
+          counters.ok++;
+          if (cooldownMs > 0) cooldownUntil = Date.now() + cooldownMs;
         })
         .catch((err: unknown) => {
           lastErrorClass = classifyRefreshError(err);
+          consecutiveFailures++;
+          counters.fail++;
+          const triggerError =
+            err instanceof RefreshTriggerError ? err : undefined;
+          if (triggerError?.abandoned === true) counters.abandoned++;
+          const failureBackoffMs = Math.min(
+            REFRESH_FAILURE_BACKOFF_MS * 2 ** (consecutiveFailures - 1),
+            MAX_REFRESH_FAILURE_BACKOFF_MS,
+          );
+          failureBackoffUntil = Date.now() + failureBackoffMs;
           logWarn("refresh", "native refresh trigger failed", {
             provider: opts.slug,
             label: opts.label,
@@ -163,13 +333,12 @@ export const makeRefresher = (opts: {
             error_class: lastErrorClass,
             elapsed_ms: Date.now() - started,
             timeout_ms: REFRESH_SPAWN_TIMEOUT_MS,
+            abandoned: triggerError?.abandoned ?? false,
+            exit_code: triggerError?.exitCode ?? null,
           });
         })
         .finally(() => {
           inFlight = null;
-          // Open the cooldown from spawn COMPLETION (success or failure), so the
-          // window can't be out-run by a wedged child or a fast caller.
-          if (cooldownMs > 0) cooldownUntil = Date.now() + cooldownMs;
         });
     }
     return inFlight;
@@ -181,11 +350,22 @@ export const makeRefresher = (opts: {
     // A recent spawn already gathered current info — don't spawn again until the
     // cooldown lapses. Serving the current token for at most `cooldownMs` is the
     // right backoff; it never serves a WORSE token than one spawn ago.
-    if (cooldownMs > 0 && Date.now() < cooldownUntil) {
+    const now = Date.now();
+    if (cooldownMs > 0 && now < cooldownUntil) {
+      counterFor(opts.slug).cooldown_skips++;
       logDebug("refresh", "native refresh skipped (cooldown)", {
         provider: opts.slug,
         phase: "refresh_skipped",
         reason: "cooldown",
+      });
+      return "fresh";
+    }
+    if (now < failureBackoffUntil) {
+      counterFor(opts.slug).backoff_skips++;
+      logDebug("refresh", "native refresh skipped (failure backoff)", {
+        provider: opts.slug,
+        phase: "refresh_skipped",
+        reason: "failure_backoff",
       });
       return "fresh";
     }
@@ -195,6 +375,9 @@ export const makeRefresher = (opts: {
     }
     await fire();
     if (lastErrorClass !== null) {
+      // The caller will serve the stale credential — count it centrally so no
+      // delegate has to remember to (they all log `refresh_fallback` already).
+      counterFor(opts.slug).fallbacks++;
       return { kind: "stale", reason: lastErrorClass };
     }
     return "awaited";

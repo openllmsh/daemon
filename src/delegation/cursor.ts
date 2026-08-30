@@ -34,9 +34,12 @@ import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
 import {
+  credentialUnrefreshable,
   isStaleRefresh,
+  keychainUnusable,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
+  resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TProviderDelegate } from "./types";
@@ -238,7 +241,17 @@ const triggerRefresh = async (): Promise<void> => {
   // Mirror Claude: a locked/unusable isolated keychain must NOT reach
   // `cursor-agent status` (SecurityAgent dialog + 60s spawn). Skip when not
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
-  if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
+  const keychain = await ensureKeychainReady(cliHome(PROVIDER));
+  if (keychain.kind !== "present") {
+    // A truly UNUSABLE chain is a classified failure that needs re-auth.
+    if (
+      keychain.kind === "indeterminate" &&
+      keychain.cause === "keychain_unusable"
+    )
+      keychainUnusable(PROVIDER); // throws RefreshTriggerError("keychain_unusable")
+    // Any OTHER non-present state (a transient unlock/create failure) is
+    // RETRYABLE — skip this spawn benignly rather than throwing, so a momentary
+    // keychain hiccup on a slow/loaded Mac can't escalate the failure backoff.
     return;
   }
   await spawnRefresh([bin(), "status"], env(), {
@@ -296,6 +309,7 @@ const readToken = async (
 ): Promise<TCursorStoredTokens | null> => {
   const stored = storeReadValue(storedRead ?? (await readStoredTokens(signal)));
   if (stored === null) return null;
+  if (!stored.refreshTokenPresent) credentialUnrefreshable(PROVIDER);
   const outcome = stored.refreshTokenPresent
     ? await refresh(jwtExpiryMs(stored.accessToken))
     : "fresh";
@@ -309,7 +323,13 @@ const readToken = async (
   }
   if (outcome !== "awaited") return stored;
   // CLI remains the sole token-store owner. Re-read after a hard-expiry refresh.
-  return storeReadValue(await readStoredTokens(signal)) ?? stored;
+  const resolved = resolveToken({
+    provider: PROVIDER,
+    prior: stored,
+    refreshed: storeReadValue(await readStoredTokens(signal)),
+    hasRefreshToken: (token) => token.refreshTokenPresent,
+  });
+  return resolved.token;
 };
 
 const INSTALL_HINT =
