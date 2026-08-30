@@ -179,9 +179,9 @@ export type TNativeRequest = {
  * request is servable natively. The vendor CLIs / app-server accept only model
  * + system + input (plus codex `reasoning_effort`); there is no mapping for the
  * sampling / penalty / decoding / structured-output controls, so a non-default
- * value must DECLINE to the manual transport (which passes them through) rather
- * than be silently served at the runtime's own defaults. Applies to BOTH the
- * text path and the tool path.
+ * value must DECLINE rather than be silently served at the runtime's own
+ * defaults. The walker decides whether a manual transport is available. Applies
+ * to BOTH the text path and the tool path.
  *
  * Two deliberate carve-outs keep the PRIMARY native path (Claude Code on the
  * Anthropic wire) alive:

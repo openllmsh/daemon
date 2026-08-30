@@ -207,7 +207,7 @@ export const tryServeNativeRuntime = async (
   ) {
     return {
       declined:
-        "Anthropic native server tools use the byte-verbatim manual transport",
+        "Anthropic native server tools need the byte-verbatim transport",
     };
   }
   // Requests with client-defined tools use the native runtime's ordinary
@@ -238,15 +238,16 @@ export const tryServeNativeRuntime = async (
   }
   // Generation controls the native runtimes can't honor (non-default
   // temperature/top_p/penalties, stop, seed, n, logprobs, logit_bias,
-  // response_format, forced tool_choice) → decline so the manual transport
-  // applies them, instead of silently serving at the runtime's defaults. Guards
-  // BOTH the tool and text paths. (max_tokens is a documented carve-out — see
-  // `unsupportedNativeControl`.)
+  // response_format, forced tool_choice) → decline rather than silently serving
+  // at the runtime's defaults. The walker decides whether a handrolled transport
+  // is available for this hop. Guards BOTH the tool and text paths. (max_tokens
+  // is a documented carve-out — see `unsupportedNativeControl`.)
+  // TODO(docs/audit/2026-08-30-claude-code-bridge-failures.md §4 B2): route
+  // bridge-only temperature requests through an approved temperature-honoring
+  // transport rather than rejecting this native capability gap.
   const unsupported = unsupportedNativeControl(params.canonical);
   if (unsupported !== null) {
-    return {
-      declined: `native runtime can't honor ${unsupported} — served by the manual transport`,
-    };
+    return { declined: `native runtime can't honor ${unsupported}` };
   }
   // Tool-bearing requests use completion tool-passthrough. claude_code: the
   // held-open SDK query. chatgpt: the Codex app-server's native dynamic-tool

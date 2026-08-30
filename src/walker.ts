@@ -1733,7 +1733,7 @@ const serveSubscription = async (
 const serveKimiBuiltinSearch = async (
   hop: THop,
   args: TWalkArgs,
-  finalHop: boolean,
+  _finalHop: boolean,
   acquired: {
     readonly url: string;
     readonly headers: Record<string, string>;
@@ -2672,6 +2672,9 @@ const walkPlan = async (
       subMethodOverrides[hop.provider] ?? requestedSubMethod,
       { isClaudeCode: claudeCodeOriginator },
     );
+    const wire = UPSTREAM_WIRE[hop.provider];
+    const hasHandrolledFallback =
+      methods.includes("handrolled") && wire !== undefined;
     let nativeDecline: string | null = null;
     let handrolledRetry: THopRetry | null = null;
 
@@ -2782,11 +2785,13 @@ const walkPlan = async (
         return { response: native, servedLocally: true };
       }
       nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
+      if (hasHandrolledFallback) {
+        nativeDecline += " — served by the manual transport";
+      }
       lastError = nativeDecline;
     }
 
-    const wire = UPSTREAM_WIRE[hop.provider];
-    if (methods.includes("handrolled") && wire !== undefined) {
+    if (hasHandrolledFallback && wire !== undefined) {
       // Manual subscription transport — sole path for kimi/grok; fallback
       // for bridge declines on claude_code + chatgpt when policy allows.
       const served = await serveSubscription(
@@ -2886,7 +2891,9 @@ const walkPlan = async (
       }
       const cooldownReason = handrolledRetry.cooldownReason;
       const policy =
-        cooldownReason === undefined ? undefined : cooldownPolicyFor(cooldownReason);
+        cooldownReason === undefined
+          ? undefined
+          : cooldownPolicyFor(cooldownReason);
       // `rate_limit` remains cooling, but a final vendor hop keeps its historical
       // bounded Retry-After retry before its authentic response is surfaced.
       const shouldRetryInPlace =
@@ -2895,7 +2902,9 @@ const walkPlan = async (
       if (shouldRetryInPlace && retryAttempt === 0) {
         const response = handrolledRetry.upstreamResponse;
         await abortableDelay(
-          response === undefined ? HOP_RETRY_DELAY_MS : retryAfterDelayMs(response),
+          response === undefined
+            ? HOP_RETRY_DELAY_MS
+            : retryAfterDelayMs(response),
           args.req.signal,
         );
         if (args.req.signal.aborted) {
@@ -2920,7 +2929,10 @@ const walkPlan = async (
         (finalHop || policy?.action === "surface") &&
         handrolledRetry.upstreamResponse !== undefined
       ) {
-        return { response: handrolledRetry.upstreamResponse, servedLocally: true };
+        return {
+          response: handrolledRetry.upstreamResponse,
+          servedLocally: true,
+        };
       }
       if (policy?.action === "surface") {
         return {
@@ -2963,13 +2975,11 @@ const walkPlan = async (
         continue;
       }
       if (response.ok || args.req.signal.aborted) return response;
-      const raw = await response.clone().text().catch(() => "");
-      const cls = classifyRawResponse(
-        response.status,
-        raw,
-        "openai",
-        false,
-      );
+      const raw = await response
+        .clone()
+        .text()
+        .catch(() => "");
+      const cls = classifyRawResponse(response.status, raw, "openai", false);
       if (cls.kind === "abort") return response;
       const action = cooldownPolicyFor(cls.reason).action;
       const shouldRetryInPlace =
