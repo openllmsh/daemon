@@ -21,7 +21,6 @@ import type { TTunnelSurface } from "@openllmsh/protocol";
 import { RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
 import { tunnelStream } from "@openllmsh/tunnel/streams";
 import { fleetSubscriptionPubkeyFor } from "./config";
-import { logInfo } from "./logger";
 import { getMuxPeerCaps, muxChannelTo } from "./mux-host";
 import { ensureRtcTo, getRtcMuxChannel, markRtcFailure } from "./rtc-client";
 
@@ -78,12 +77,6 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
 
   const peerCaps = getMuxPeerCaps(args.keyId);
   const peerPubkey = fleetSubscriptionPubkeyFor(args.keyId);
-  logInfo("tunnel-client", "resolving fleet hop transport", {
-    key: args.keyId,
-    surface: args.surface,
-    hasRtc1: peerCaps?.has(RTC_CAP) ?? false,
-    hasSeedgate1: peerCaps?.has(SEEDGATE_CAP) ?? false,
-  });
   // Eager RTC: best-effort, never blocks the hop. If the channel is already
   // open we use it; otherwise ensureRtcTo races setup while we try mux.
   ensureRtcTo(args.keyId, {
@@ -137,11 +130,6 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
       "Device transport unavailable. Peer has neither RTC nor mux — update OpenLLM on the peer.",
     );
   }
-  logInfo("tunnel-client", "tunneling hop to fleet peer", {
-    key: args.keyId,
-    surface: args.surface,
-    path: "mux",
-  });
   try {
     const result = await tunnelStream(mux, {
       surface: args.surface,
