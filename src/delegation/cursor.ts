@@ -54,6 +54,7 @@ import {
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   stripAnsi,
+  withMacosKeychainAccess,
 } from "./util";
 
 const PROVIDER = "cursor" as const;
@@ -243,10 +244,12 @@ const triggerRefresh = async (): Promise<void> => {
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
   if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
-  await spawnRefresh([bin(), "status"], env(), {
-    probe: unwrapKeychainSpawn(PROVIDER),
-    timeoutMs: 10_000,
-  });
+  await withMacosKeychainAccess(() =>
+    spawnRefresh([bin(), "status"], env(), {
+      probe: unwrapKeychainSpawn(PROVIDER),
+      timeoutMs: 10_000,
+    }),
+  );
 };
 
 // THE single refresher — single-flight + cooldown, no signal-aware bypass. See
@@ -262,6 +265,18 @@ const refresh = makeRefresher({
 type TCursorStoredTokens = {
   readonly accessToken: string;
   readonly refreshTokenPresent: boolean;
+};
+
+/** Passive status needs presence only; refresh-token reads stay on request paths. */
+const readStatusAccessToken = async (
+  signal?: AbortSignal,
+): Promise<TStoreRead<string>> => {
+  if (platform() === "darwin") {
+    return readMacKeychainSecret("cursor-access-token", signal);
+  }
+  const stored = await readFileTokens();
+  if (stored.kind !== "present") return stored;
+  return { kind: "present", value: stored.value.accessToken };
 };
 
 const readStoredTokens = async (
@@ -397,8 +412,10 @@ export const cursorDelegate: TProviderDelegate = {
 
   status: async (signal?: AbortSignal): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    const storedRead = installed ? await readStoredTokens(signal) : undefined;
-    if (storedRead?.kind === "indeterminate") {
+    const accessRead = installed
+      ? await readStatusAccessToken(signal)
+      : undefined;
+    if (accessRead?.kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -407,12 +424,13 @@ export const cursorDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const token = installed ? await readToken(signal, storedRead) : null;
-    if (token !== null) clearPendingAuth(PROVIDER);
-    const pending = token === null ? getPendingAuth(PROVIDER) : null;
+    const accessToken =
+      accessRead?.kind === "present" ? accessRead.value : null;
+    if (accessToken !== null) clearPendingAuth(PROVIDER);
+    const pending = accessToken === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
-      status: token !== null ? "connected" : "disconnected",
+      status: accessToken !== null ? "connected" : "disconnected",
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
       ...(pending !== null
@@ -427,7 +445,7 @@ export const cursorDelegate: TProviderDelegate = {
             },
           }
         : {}),
-      ...(token === null
+      ...(accessToken === null
         ? {
             detail:
               pending !== null
@@ -440,7 +458,7 @@ export const cursorDelegate: TProviderDelegate = {
             last_login_at_ms: null,
             ...accountHashField(
               PROVIDER,
-              jwtSubject(token.accessToken)?.split("|").at(-1) ?? undefined,
+              jwtSubject(accessToken)?.split("|").at(-1) ?? undefined,
             ),
           }),
     };
@@ -537,7 +555,7 @@ export const cursorDelegate: TProviderDelegate = {
 
   logout: async () => {
     if ((await cliInstallState(PROVIDER)).installed) {
-      await runCapture([bin(), "logout"], env());
+      await withMacosKeychainAccess(() => runCapture([bin(), "logout"], env()));
     }
     // CLI owns its Keychain/file credentials; never delete them directly.
     const cleared = (await readToken()) === null;

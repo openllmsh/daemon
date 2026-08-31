@@ -176,7 +176,7 @@ export const planWatcherSnapshot = (
   return { key, skipSerialize: false };
 };
 
-export const WATCH_MS = 2_500;
+export const WATCH_MS = 15_000;
 // Heartbeat: the daemon sends its OWN `ping` on this interval and arms the
 // liveness watchdog off the relay's `pong` (not off arbitrary inbound frames),
 // so it detects a dead daemon→relay direction itself and reconnects — rather

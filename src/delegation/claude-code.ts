@@ -76,6 +76,7 @@ import {
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   toEpochMs,
+  withMacosKeychainAccess,
 } from "./util";
 
 const PROVIDER = "claude_code" as const;
@@ -162,10 +163,12 @@ const triggerRefresh = async (): Promise<void> => {
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
-  await spawnRefresh([bin(), "-p", "ping"], env(), {
-    probe: unwrapKeychainSpawn(PROVIDER),
-    timeoutMs: 10_000,
-  });
+  await withMacosKeychainAccess(() =>
+    spawnRefresh([bin(), "-p", "ping"], env(), {
+      probe: unwrapKeychainSpawn(PROVIDER),
+      timeoutMs: 10_000,
+    }),
+  );
 };
 
 // THE single refresher. Within the leeway window → fire the CLI refresh in the
@@ -319,9 +322,11 @@ const authStatusLoggedIn = async (
       // so this shared producer is unconfined on macOS and bounded internally by
       // runCapture. Observer cancellation must not kill another status waiter's
       // probe.
-      const out = await runCapture([bin(), "auth", "status"], env(), {
-        probe: unwrapKeychainSpawn(PROVIDER),
-      });
+      const out = await withMacosKeychainAccess(() =>
+        runCapture([bin(), "auth", "status"], env(), {
+          probe: unwrapKeychainSpawn(PROVIDER),
+        }),
+      );
       if (out === null) return null;
       try {
         const parsed = JSON.parse(out) as {
@@ -530,37 +535,40 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // a still-present store (bad unwrap / confined spawn) is inconclusive —
     // never overwrite last-known with "not signed in".
     const viaAuth = await authStatusLoggedIn(signal);
-    const store = await loadStore(signal);
-    if (viaAuth === null && store.kind === "indeterminate") {
-      return {
-        provider: PROVIDER,
-        status: "disconnected",
-        cli_installed: true,
-        ...(version !== null ? { cli_version: version } : {}),
-        detail: STATUS_CHECK_FAILED_DETAIL,
-      };
+    let connected = viaAuth === true;
+    if (!connected) {
+      // A conclusive positive CLI result is sufficient for the passive watcher.
+      // Only consult the secret store as a null/false fallback; refreshability,
+      // account identity, and token refresh belong to explicit/inference paths.
+      const store = await loadStore(signal);
+      if (store.kind === "indeterminate") {
+        return {
+          provider: PROVIDER,
+          status: "disconnected",
+          cli_installed: true,
+          ...(version !== null ? { cli_version: version } : {}),
+          detail: STATUS_CHECK_FAILED_DETAIL,
+        };
+      }
+      if (viaAuth === false && store.kind !== "absent") {
+        return {
+          provider: PROVIDER,
+          status: "disconnected",
+          cli_installed: true,
+          ...(version !== null ? { cli_version: version } : {}),
+          detail: STATUS_CHECK_FAILED_DETAIL,
+        };
+      }
+      const accessToken = storeReadValue(store)?.claudeAiOauth?.accessToken;
+      connected = viaAuth === null && nonEmpty(accessToken) !== null;
     }
-    if (viaAuth === false && store.kind !== "absent") {
-      return {
-        provider: PROVIDER,
-        status: "disconnected",
-        cli_installed: true,
-        ...(version !== null ? { cli_version: version } : {}),
-        detail: STATUS_CHECK_FAILED_DETAIL,
-      };
-    }
-    const connected =
-      viaAuth !== null ? viaAuth : (await readToken(signal)) !== null;
     // A live headless paste-back login (remote box) awaiting the user's code:
     // surface the authorize URL + paste mode so the dashboard renders the
     // paste panel; drop it the moment the credential lands.
     if (connected) clearPendingAuth(PROVIDER);
     const pending = connected ? null : getPendingAuth(PROVIDER);
-    // When connected, flag a credential that can't auto-refresh (no refresh
-    // token) so the dashboard shows a persistent "re-sign in" hint instead of a
-    // green card that silently dies at access-token expiry.
-    const unrefreshable =
-      connected && (await credentialRefreshable(signal)) === false;
+    // Stable identity is file-backed (`.claude.json`), so retaining it does not
+    // add securityd pressure and keeps usage snapshots on the account series.
     const acct = connected ? await readAccountHash() : null;
     return {
       provider: PROVIDER,
@@ -571,12 +579,6 @@ export const claudeCodeDelegate: TProviderDelegate = {
         ? {
             last_login_at_ms: null,
             ...(acct !== null ? { account_hash: acct } : {}),
-            ...(unrefreshable
-              ? {
-                  detail:
-                    "signed in, but this credential can't auto-refresh — re-sign in to restore automatic renewal",
-                }
-              : {}),
           }
         : pending !== null
           ? {
@@ -731,7 +733,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
           detail: "could not reach the credential store to sign out",
         };
       }
-      await runCapture([bin(), "auth", "logout"], env());
+      await withMacosKeychainAccess(() =>
+        runCapture([bin(), "auth", "logout"], env()),
+      );
     }
     // Belt-and-braces on Linux: drop the credentials file if it lingers.
     if (platform() !== "darwin") {

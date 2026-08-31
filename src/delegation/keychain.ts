@@ -131,7 +131,75 @@ const awaitSharedStoreRead = async <T>(
   }
 };
 
-const spawnSecurity = async (
+let macosKeychainLane: Promise<void> = Promise.resolve();
+
+/**
+ * One FIFO lane for every daemon operation that can contact macOS securityd.
+ * Future noninteractive vendor commands that touch an isolated keychain must
+ * use this helper too; per-provider flights alone do not prevent contention.
+ */
+export const withMacosKeychainAccess = async <T>(
+  operation: () => Promise<T>,
+): Promise<T> => {
+  if (!MAC) return operation();
+  const previous = macosKeychainLane;
+  let release = (): void => {};
+  const occupied = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  macosKeychainLane = previous.then(
+    () => occupied,
+    () => occupied,
+  );
+  await previous.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+};
+
+const SECURITY_REAP_GRACE_MS = 250;
+
+const waitForSecurityExit = async (
+  proc: ReturnType<typeof Bun.spawn>,
+  timeoutMs: number,
+): Promise<boolean> => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      proc.exited.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+};
+
+/** TERM → short grace → KILL, with a bounded final reap wait. */
+const reapSecurityProcess = async (
+  proc: ReturnType<typeof Bun.spawn>,
+): Promise<boolean> => {
+  try {
+    proc.kill();
+  } catch {
+    return true;
+  }
+  if (await waitForSecurityExit(proc, SECURITY_REAP_GRACE_MS)) return true;
+  try {
+    proc.kill(9);
+  } catch {
+    return true;
+  }
+  return waitForSecurityExit(proc, SECURITY_REAP_GRACE_MS);
+};
+
+const spawnSecurityNow = async (
   argv: ReadonlyArray<string>,
   home: string,
   opts: TSecuritySpawnOpts,
@@ -198,16 +266,22 @@ const spawnSecurity = async (
           ? [complete, timeout]
           : [complete, timeout, abortWait],
       );
-      if (outcome.kind === "aborted") {
-        proc.kill();
+      if (outcome.kind === "aborted" || outcome.kind === "timeout") {
+        // Keep the global securityd lane occupied through TERM + escalation, but
+        // never wedge every provider forever if Bun cannot observe the final reap.
+        const reaped = await reapSecurityProcess(proc);
+        if (!reaped) {
+          logError("keychain", "security command did not reap after SIGKILL", {
+            argv: redactSecurityArgv(["security", ...argv]),
+          });
+        }
+        if (outcome.kind === "timeout") {
+          logError("keychain", "security command timed out", {
+            argv: redactSecurityArgv(["security", ...argv]),
+          });
+          return { ...FAILED_SPAWN, timedOut: true, aborted: false };
+        }
         return { ...FAILED_SPAWN, timedOut: false, aborted: true };
-      }
-      if (outcome.kind === "timeout") {
-        proc.kill();
-        logError("keychain", "security command timed out", {
-          argv: redactSecurityArgv(["security", ...argv]),
-        });
-        return { ...FAILED_SPAWN, timedOut: true, aborted: false };
       }
       // Through the `--sandbox-exec` shim the daemon sees `128 + signal` as an
       // exit CODE, not a signalCode, so this only fires for a kill of the shim
@@ -234,6 +308,13 @@ const spawnSecurity = async (
     return { ...FAILED_SPAWN, timedOut: false, aborted: false };
   }
 };
+
+const spawnSecurity = async (
+  argv: ReadonlyArray<string>,
+  home: string,
+  opts: TSecuritySpawnOpts,
+): Promise<TSecurityResult> =>
+  withMacosKeychainAccess(() => spawnSecurityNow(argv, home, opts));
 
 /** Boolean convenience over `spawnSecurity` for the fire-and-check callers. */
 const runSecurity = async (
@@ -530,6 +611,7 @@ export const resetKeychainStateForTests = (): void => {
   transientTimeouts.clear();
   dumpCache.clear();
   inFlightKeychainReads.clear();
+  macosKeychainLane = Promise.resolve();
 };
 
 /**
