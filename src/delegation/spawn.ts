@@ -232,7 +232,9 @@ export const runCapture = async (
               bindAbort(opts.signal, () => resolve({ kind: "timeout" }));
             });
       const outcome = await Promise.race(
-        abortWait === null ? [complete, timeout] : [complete, timeout, abortWait],
+        abortWait === null
+          ? [complete, timeout]
+          : [complete, timeout, abortWait],
       );
       if (outcome.kind === "timeout" || aborted) {
         await child.terminate();
@@ -254,14 +256,19 @@ export const runCapture = async (
 };
 
 /** Run a binary's `--version` (best-effort). Returns null on failure.
- *  CONFINED (no `probe`): callers gate this behind a stat-signature cache
- *  (`bin-signature.ts`) so it spawns only when the binary changed, keeping the
- *  ~300ms shim cost off the hot status path without leaving it unconfined. */
+ *  UNWRAPPED (`probe: true`): a fixed-argv, read-only `<bin> --version` is the
+ *  canonical skip-the-shim probe (see {@link TSandboxSpawnOpts.probe}). Leaving
+ *  it confined was a latent bug — harmless while `--version` was a pure print,
+ *  but the `openllm` CLI's `--version` now spawns a nested `openllmd --version`
+ *  child, and a confined caller spawning that child can be Seatbelt/Landlock
+ *  denied (→ null → the CLI converger's "did not report a version" skip).
+ *  Callers still gate this behind a stat-signature cache (`bin-signature.ts`)
+ *  so it spawns only when the binary changed. */
 export const cliVersion = (
   bin: string,
   env?: Record<string, string>,
 ): Promise<string | null> =>
-  runCapture([bin, "--version"], env, { kind: "probe" });
+  runCapture([bin, "--version"], env, { kind: "probe", probe: true });
 
 export type TLoginResult = {
   readonly code: number;
