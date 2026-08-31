@@ -254,6 +254,11 @@ const AUTH_STATUS_TTL_MS = 30_000;
 let authStatusCache: { result: boolean | null; expiresAt: number } | null =
   null;
 
+let authStatusInFlight: {
+  readonly generation: number;
+  readonly work: Promise<boolean | null>;
+} | null = null;
+
 /**
  * Generation token guarding against stale writes: a probe that started before
  * an invalidation must not install its now-outdated result.
@@ -280,6 +285,25 @@ export const clearAuthStatusCache = (): void => {
  *
  * Result cached for `AUTH_STATUS_TTL_MS` (see above).
  */
+const awaitAuthStatus = async (
+  work: Promise<boolean | null>,
+  signal?: AbortSignal,
+): Promise<boolean | null> => {
+  if (signal === undefined) return work;
+  if (signal.aborted) return null;
+
+  let onAbort = (): void => {};
+  const aborted = new Promise<null>((resolve) => {
+    onAbort = () => resolve(null);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+};
+
 const authStatusLoggedIn = async (
   signal?: AbortSignal,
 ): Promise<boolean | null> => {
@@ -287,29 +311,38 @@ const authStatusLoggedIn = async (
   if (cached !== null && cached.expiresAt > Date.now()) return cached.result;
 
   const generation = authStatusGeneration;
-  const probe = async (): Promise<boolean | null> => {
-    // macOS securityd refuses keychain reads for a Seatbelt-confined caller, so
-    // a sandbox-wrapped `auth status` reports a definite `loggedIn: false` on a
-    // signed-in box (verified empirically). Unconfined on macOS, confined on
-    // Linux (`sandbox/policy.ts`).
-    const out = await runCapture([bin(), "auth", "status"], env(), {
-      probe: unwrapKeychainSpawn(PROVIDER),
-      ...(signal !== undefined ? { signal } : {}),
-    });
-    if (out === null) return null;
-    try {
-      const parsed = JSON.parse(out) as {
-        loggedIn?: boolean;
-        authMethod?: string;
-      };
-      if (parsed.loggedIn !== true) return false;
-      return parsed.authMethod !== "api_key";
-    } catch {
-      return null;
-    }
-  };
+  let flight = authStatusInFlight;
+  if (flight === null || flight.generation !== generation) {
+    if (signal?.aborted === true) return null;
+    const work = (async (): Promise<boolean | null> => {
+      // macOS securityd refuses keychain reads for a Seatbelt-confined caller,
+      // so this shared producer is unconfined on macOS and bounded internally by
+      // runCapture. Observer cancellation must not kill another status waiter's
+      // probe.
+      const out = await runCapture([bin(), "auth", "status"], env(), {
+        probe: unwrapKeychainSpawn(PROVIDER),
+      });
+      if (out === null) return null;
+      try {
+        const parsed = JSON.parse(out) as {
+          loggedIn?: boolean;
+          authMethod?: string;
+        };
+        if (parsed.loggedIn !== true) return false;
+        return parsed.authMethod !== "api_key";
+      } catch {
+        return null;
+      }
+    })();
+    flight = { generation, work };
+    authStatusInFlight = flight;
+    const clearFlight = (): void => {
+      if (authStatusInFlight?.work === work) authStatusInFlight = null;
+    };
+    void work.then(clearFlight, clearFlight);
+  }
 
-  const result = await probe();
+  const result = await awaitAuthStatus(flight.work, signal);
   // A `null` is an INCONCLUSIVE probe (CLI absent / unparseable JSON), not a
   // known state — caching it would pin the caller to the fragile store-read
   // fallback for the whole TTL. Only cache a definite answer.

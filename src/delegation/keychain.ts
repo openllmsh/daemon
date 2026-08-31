@@ -56,7 +56,8 @@ const loginKeychainPath = (home: string): string =>
  *  reach `openllmd.err.log`. */
 const redactSecurityArgv = (argv: ReadonlyArray<string>): string[] =>
   argv.map((arg, i) =>
-    i > 0 && (argv[i - 1] === "-w" || argv[i - 1] === "-p" || argv[i - 1] === "-k")
+    i > 0 &&
+    (argv[i - 1] === "-w" || argv[i - 1] === "-p" || argv[i - 1] === "-k")
       ? "<redacted>"
       : arg,
   );
@@ -76,7 +77,12 @@ const securitySpawnTimeoutMs = (): number => {
 };
 
 type TSecurityOutcome =
-  | { readonly kind: "complete"; readonly code: number; readonly stdout: string; readonly stderr: string }
+  | {
+      readonly kind: "complete";
+      readonly code: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }
   | { readonly kind: "timeout" }
   | { readonly kind: "aborted" };
 
@@ -101,6 +107,28 @@ type TSecurityResult = {
   readonly stderr: string;
   readonly timedOut: boolean;
   readonly aborted: boolean;
+};
+
+/** Wait for shared producer work without giving one observer ownership of it. */
+const awaitSharedStoreRead = async <T>(
+  work: Promise<TStoreRead<T>>,
+  signal: AbortSignal | undefined,
+  cause: string,
+): Promise<TStoreRead<T>> => {
+  if (signal === undefined) return work;
+  if (signal.aborted) return { kind: "indeterminate", cause };
+
+  let unbind = (): void => {};
+  const aborted = new Promise<TStoreRead<T>>((resolve) => {
+    unbind = bindAbort(signal, () => {
+      resolve({ kind: "indeterminate", cause });
+    });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    unbind();
+  }
 };
 
 const spawnSecurity = async (
@@ -166,7 +194,9 @@ const spawnSecurity = async (
               bindAbort(opts.signal, () => resolve({ kind: "aborted" }));
             });
       const outcome = await Promise.race(
-        abortWait === null ? [complete, timeout] : [complete, timeout, abortWait],
+        abortWait === null
+          ? [complete, timeout]
+          : [complete, timeout, abortWait],
       );
       if (outcome.kind === "aborted") {
         proc.kill();
@@ -245,6 +275,17 @@ const dumpCache = new Map<
     readonly atMs: number;
     readonly value: TStoreRead<ReadonlyArray<string>>;
   }
+>();
+
+type TKeychainPayloads = {
+  readonly values: ReadonlyArray<string>;
+  readonly secretUnreadable: boolean;
+};
+
+/** Complete credential reads, keyed by isolated keychain + service prefix. */
+const inFlightKeychainReads = new Map<
+  string,
+  Promise<TStoreRead<TKeychainPayloads>>
 >();
 
 // A chain we recreated once this process (bounds self-heal to one attempt per
@@ -464,13 +505,19 @@ export const ensureKeychainReady = async (
   }
   const until = unlockedUntilMs.get(kc) ?? 0;
   if (until > Date.now()) return READY;
-  const pending = inFlightKeychains.get(kc);
-  if (pending !== undefined) return pending;
-  const op = ensureKeychainNow(home, kc, signal).finally(() => {
-    inFlightKeychains.delete(kc);
-  });
-  inFlightKeychains.set(kc, op);
-  return op;
+  let op = inFlightKeychains.get(kc);
+  if (op === undefined) {
+    if (signal?.aborted === true) {
+      return { kind: "indeterminate", cause: "keychain_wait_aborted" };
+    }
+    // The producer owns its command deadline. A status observer's cancellation
+    // must not kill readiness work an inference waiter still needs.
+    op = ensureKeychainNow(home, kc).finally(() => {
+      if (inFlightKeychains.get(kc) === op) inFlightKeychains.delete(kc);
+    });
+    inFlightKeychains.set(kc, op);
+  }
+  return awaitSharedStoreRead(op, signal, "keychain_wait_aborted");
 };
 
 /** Test-only: process-global keychain caches leak across suites. */
@@ -482,6 +529,7 @@ export const resetKeychainStateForTests = (): void => {
   unlockedUntilMs.clear();
   transientTimeouts.clear();
   dumpCache.clear();
+  inFlightKeychainReads.clear();
 };
 
 /**
@@ -554,15 +602,11 @@ export const findKeychainServices = async (
   ) {
     return cached.value;
   }
-  const { code, stdout } = await spawnSecurity(
-    ["dump-keychain", kc],
-    home,
-    {
-      stdout: "pipe",
-      stderr: "ignore",
-      ...(signal !== undefined ? { signal } : {}),
-    },
-  );
+  const { code, stdout } = await spawnSecurity(["dump-keychain", kc], home, {
+    stdout: "pipe",
+    stderr: "ignore",
+    ...(signal !== undefined ? { signal } : {}),
+  });
   if (code !== 0) {
     return { kind: "indeterminate", cause: `dump-keychain_exit_${code}` };
   }
@@ -610,6 +654,35 @@ const readKeychainSecret = async (
  * dump-keychain / secret read fails. NEVER dumps a not-ready chain (that is
  * the GUI-prompt path).
  */
+const readIsolatedKeychainNow = async (
+  home: string,
+  servicePrefix: string,
+): Promise<TStoreRead<TKeychainPayloads>> => {
+  const ready = await ensureKeychainReady(home);
+  if (ready.kind !== "present") return ready;
+  const services = await findKeychainServices(home, servicePrefix);
+  if (services.kind !== "present") return services;
+
+  const values: string[] = [];
+  let secretUnreadable = false;
+  try {
+    for (const service of services.value) {
+      const secret = await readKeychainSecret(home, service);
+      if (secret === null) {
+        secretUnreadable = true;
+      } else {
+        values.push(secret);
+      }
+    }
+    return { kind: "present", value: { values, secretUnreadable } };
+  } catch (err) {
+    return {
+      kind: "indeterminate",
+      cause: err instanceof Error ? err.name : "keychain_read_failed",
+    };
+  }
+};
+
 export const readIsolatedKeychain = async (
   home: string,
   servicePrefix: string,
@@ -617,30 +690,33 @@ export const readIsolatedKeychain = async (
   signal?: AbortSignal,
 ): Promise<TStoreRead<string>> => {
   if (!MAC) return { kind: "absent" };
-  const ready = await ensureKeychainReady(home, signal);
-  if (ready.kind !== "present") return ready; // locked / unusable — no dump
-  const services = await findKeychainServices(home, servicePrefix, signal);
-  if (services.kind !== "present") return services;
-  if (services.value.length === 0) return { kind: "absent" };
-  let secretUnreadable = false;
-  try {
-    for (const service of services.value) {
-      const secret = await readKeychainSecret(home, service, signal);
-      if (secret === null) {
-        secretUnreadable = true;
-        continue;
+  const key = `${loginKeychainPath(home)}\0${servicePrefix}`;
+  let op = inFlightKeychainReads.get(key);
+  if (op === undefined) {
+    if (signal?.aborted === true) {
+      return { kind: "indeterminate", cause: "keychain_read_aborted" };
+    }
+    op = readIsolatedKeychainNow(home, servicePrefix).finally(() => {
+      if (inFlightKeychainReads.get(key) === op) {
+        inFlightKeychainReads.delete(key);
       }
-      if (validate !== undefined && !validate(secret)) continue;
-      return { kind: "present", value: secret };
-    }
-    if (secretUnreadable) {
-      return { kind: "indeterminate", cause: "keychain_secret_unreadable" };
-    }
-    return { kind: "absent" };
-  } catch (err) {
-    return {
-      kind: "indeterminate",
-      cause: err instanceof Error ? err.name : "keychain_read_failed",
-    };
+    });
+    inFlightKeychainReads.set(key, op);
   }
+
+  const payloads = await awaitSharedStoreRead(
+    op,
+    signal,
+    "keychain_read_aborted",
+  );
+  if (payloads.kind !== "present") return payloads;
+  for (const payload of payloads.value.values) {
+    if (validate === undefined || validate(payload)) {
+      return { kind: "present", value: payload };
+    }
+  }
+  if (payloads.value.secretUnreadable) {
+    return { kind: "indeterminate", cause: "keychain_secret_unreadable" };
+  }
+  return { kind: "absent" };
 };
