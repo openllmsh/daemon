@@ -2,10 +2,12 @@
  * Daemon logs. ONE structured destination, plus native-only stream capture —
  * no duplication between files:
  *
- *   1. `~/.openllm/openllmd.log` — the SINGLE structured log: every level, one
- *      timestamped JSON line per event, rotated past a size cap. The canonical
+ *   1. `~/.openllm/openllmd.log` — the SINGLE structured log: one timestamped
+ *      JSON line per event, rotated past a size cap. The canonical
  *      `tail -f` / `openllmd logs` target. Find faults by grepping
- *      `"level":"error"` (or `"warn"`); every scope is tagged.
+ *      `"level":"error"` (or `"warn"`); every scope is tagged. Which levels
+ *      land here is gated by `OPENLLM_LOG_LEVEL` (default `info` — so `debug`
+ *      is OFF unless explicitly enabled); see {@link thresholdRank}.
  *   2. `openllmd.out.log` / `openllmd.err.log` — the OS supervisor's capture of
  *      the daemon's raw stdout / stderr (launchd `StandardOut/ErrorPath`,
  *      systemd `append:` — see `service.ts`). These are reserved for NATIVE
@@ -36,6 +38,33 @@ const MAX_BYTES = 5 * 1024 * 1024;
 
 type TLevel = "error" | "warn" | "info" | "debug";
 
+/** Severity ordering: a lower rank is more severe and always survives the gate. */
+const LEVEL_RANK: Record<TLevel, number> = {
+  error: 0,
+  warn: 1,
+  info: 2,
+  debug: 3,
+};
+
+/**
+ * The most-verbose level written to the combined log, from `OPENLLM_LOG_LEVEL`
+ * (`error` | `warn` | `info` | `debug`, case-insensitive; default `info`).
+ * Anything more verbose than this is dropped — so `debug` is OFF by default and
+ * turns on only when the env explicitly sets it.
+ *
+ * Resolved LAZILY per call (not a module constant) so the value the env file
+ * loads at boot — and any later change — takes effect regardless of import
+ * order; logging is best-effort and infrequent, so the `process.env` read is
+ * cheap. An unset or unrecognized value falls back to `info`.
+ */
+const thresholdRank = (): number => {
+  const raw = process.env.OPENLLM_LOG_LEVEL?.trim().toLowerCase();
+  if (raw !== undefined && Object.hasOwn(LEVEL_RANK, raw)) {
+    return LEVEL_RANK[raw as TLevel];
+  }
+  return LEVEL_RANK.info;
+};
+
 const serializeErr = (err: unknown): string => {
   // `||`, not `??`: a DOMException (e.g. Bun's `AbortSignal.timeout`
   // TimeoutError) carries an EMPTY-STRING stack, which is not nullish — `??`
@@ -63,6 +92,11 @@ const write = (
   message: string,
   meta?: Record<string, unknown>,
 ): void => {
+  // The boot readiness line is a plain stdout signal for the install-time
+  // launcher, so it is emitted regardless of the level gate. Everything else
+  // more verbose than `OPENLLM_LOG_LEVEL` is dropped before any write.
+  const isBootReadiness = scope === "boot" && level === "info";
+  if (LEVEL_RANK[level] > thresholdRank() && !isBootReadiness) return;
   let line: string;
   try {
     // Serialize INSIDE the guard: a circular / BigInt `meta` would otherwise
@@ -101,7 +135,7 @@ const write = (
     // stdout line (→ out.log) for humans + the install-time launcher. Readiness
     // GATING is the HTTP `/status` probe (`service.ts probeHealth`), not a
     // stdout parse, so this line is informational only.
-    if (scope === "boot" && level === "info") {
+    if (isBootReadiness) {
       process.stdout.write(`${message}\n`);
     } else if (!wroteCombinedLog) {
       // Failure-only fallback: when the combined-log file write failed (disk

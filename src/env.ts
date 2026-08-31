@@ -48,6 +48,10 @@
  * - `OPENLLM_SESSION_IDLE_TIMEOUT_MIN` — detached PTY idle-reap window in
  *                            minutes (default `60`; `0` disables). Read by
  *                            `session-host.ts` from this same env file.
+ * - `OPENLLM_LOG_LEVEL`   — most-verbose level written to `openllmd.log`
+ *                            (`error` | `warn` | `info` | `debug`, default
+ *                            `info` — so `debug` is OFF unless set). Read by
+ *                            `logger.ts` from this same env file.
  *
  * Pre-launch standalone API-key files are intentionally ignored; native
  * onboarding is the only credential source.
