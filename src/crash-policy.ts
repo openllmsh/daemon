@@ -19,6 +19,7 @@
  * Such an error says nothing about the health of this process. It is logged and
  * survived. Everything else still exits.
  */
+import { isStreamResetError } from "@openllmsh/tunnel";
 
 /**
  * Errno codes that describe the state of a REMOTE peer or the network path,
@@ -65,3 +66,22 @@ export const isTransientNetworkError = (err: unknown): boolean => {
   const errno = leadingErrno(message);
   return errno !== null && TRANSIENT_NETWORK_CODES.has(errno);
 };
+
+/**
+ * A tunnel/mux stream reset (`StreamResetError`) is transport lifecycle data —
+ * a peer's channel went away, a session open was refused, an open timed out, a
+ * frame violated the protocol. Like a dead-socket errno (above), it says
+ * NOTHING about the health of THIS process, yet its `code` (`protocol_error`,
+ * `peer_gone`, `timeout`, session NACK codes, …) is NOT one of the network
+ * errnos, so the bare `isTransientNetworkError` gate would let a leaked reset
+ * take the fatal branch in `main.ts` and kill the daemon over a remote peer's
+ * behaviour. That is exactly the crash-loop shape `crash-policy` exists to
+ * prevent.
+ *
+ * We classify by `instanceof` (`isStreamResetError`), NEVER by string-matching
+ * `"protocol_error"`: an arbitrary application error must keep exiting, since
+ * the whole value of the last-resort handler is not limping on after a real
+ * fault. Only a genuine `StreamResetError` instance is survived.
+ */
+export const isSurvivableTransportError = (err: unknown): boolean =>
+  isTransientNetworkError(err) || isStreamResetError(err);

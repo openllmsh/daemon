@@ -77,6 +77,39 @@ export const processStartTime = (pid: number): string | null => {
   }
 };
 
+/**
+ * Async twin of {@link processStartTime}, for the spawn HOT PATH.
+ *
+ * `Bun.spawnSync(["ps", …])` is a synchronous fork/exec/wait that BLOCKS the
+ * single JS thread. `superviseSpawn` used to call it inline on every spawn, and
+ * a status sweep fans out five `--version` probes at once — so a slow process
+ * table stalled the event loop and starved unrelated async work (the all-provider
+ * status-timeout symptom). This variant reads the same `lstart` via a
+ * non-blocking `Bun.spawn`, so the identity read no longer pauses the loop.
+ *
+ * The synchronous {@link processStartTime} stays for the ONE-TIME boot identity
+ * and the boot-sweep `childProcessMatchesRecord`, neither of which is hot.
+ */
+export const readProcessStartTime = async (
+  pid: number,
+): Promise<string | null> => {
+  try {
+    const proc = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const [out, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]);
+    if (exitCode !== 0) return null;
+    const value = out.trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+};
+
 // The boot process must be distinguishable even on a platform where its
 // creation timestamp cannot be read. The random-like startup timestamp is
 // intentionally process-local rather than durable state.

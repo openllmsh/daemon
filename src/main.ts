@@ -20,7 +20,13 @@
  * This file is compiled into a source-free standalone binary with
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
-import { guardCrashLoop, markHealthyBoot } from "./boot-guard";
+
+import { isStreamResetError } from "@openllmsh/tunnel";
+import {
+  guardCrashLoop,
+  guardRtcCircuitBreaker,
+  markHealthyBoot,
+} from "./boot-guard";
 import {
   drainDisposableChildren,
   sweepStaleChildrenOnBoot,
@@ -39,7 +45,7 @@ import {
   stopControlChannel,
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
-import { isTransientNetworkError } from "./crash-policy";
+import { isSurvivableTransportError } from "./crash-policy";
 import { requireServiceApiKey } from "./credential-gate";
 import { refreshCliState } from "./device-state";
 import {
@@ -96,6 +102,13 @@ const main = async (): Promise<void> => {
   // and before the (costly) sandbox/FFI work it's meant to stop repeating.
   guardCrashLoop();
 
+  // RTC native-crash breaker (right after the crash-loop guard, before the
+  // costly sandbox/FFI work). If this host has died to a Bun/werift native fault
+  // with RTC live too many times recently, withdraw RTC for this run so the
+  // daemon falls back to relay-mux instead of crash-looping. Sets
+  // `OPENLLM_RTC_DISABLE=1` before `mux-host`'s capability list is read.
+  guardRtcCircuitBreaker();
+
   // A supervised boot is machine-only and never mutates credentials, but it
   // must count missing/malformed-key exits toward the crash-loop breaker.
   const gate = requireServiceApiKey("machine");
@@ -132,12 +145,18 @@ const main = async (): Promise<void> => {
   const exitAfterDisposableDrain = (code: number): void => {
     void drainDisposableChildren().finally(() => process.exit(code));
   };
+  // A remote peer's dead socket — or a leaked tunnel/mux stream reset — is not
+  // this process's problem (see `crash-policy.ts`). Exiting over one turned an
+  // unreachable WebRTC ICE candidate into a permanent crash loop; a leaked
+  // `StreamResetError` (code `protocol_error` / `peer_gone` / …) was doing the
+  // same. Log it (naming a reset by its code) and survive.
+  const survivedTransportLabel = (err: unknown): string =>
+    isStreamResetError(err)
+      ? `streamReset:${err.code}`
+      : "transientNetworkError";
   process.on("uncaughtException", (err) => {
-    // A remote peer's dead socket is not this process's problem — see
-    // `crash-policy.ts`. Exiting over one turned an unreachable WebRTC ICE
-    // candidate into a permanent crash loop.
-    if (isTransientNetworkError(err)) {
-      logError("transientNetworkError", err);
+    if (isSurvivableTransportError(err)) {
+      logError(survivedTransportLabel(err), err);
       return;
     }
     logError("uncaughtException", err);
@@ -147,8 +166,8 @@ const main = async (): Promise<void> => {
     exitAfterDisposableDrain(1);
   });
   process.on("unhandledRejection", (reason) => {
-    if (isTransientNetworkError(reason)) {
-      logError("transientNetworkError", reason);
+    if (isSurvivableTransportError(reason)) {
+      logError(survivedTransportLabel(reason), reason);
       return;
     }
     logError("unhandledRejection", reason);
@@ -206,8 +225,15 @@ const main = async (): Promise<void> => {
             .catch((err) => logError("main", err));
         }
         // Periodic version check — picks up a release published while running.
-        void maybeSelfUpdate(latestVersion());
-        void maybeUpdateCli(latestCliVersion());
+        // `.catch` each: a rejected converge here is fire-and-forget, so without
+        // it a non-transient throw becomes an unhandledRejection and (pre-C1)
+        // took the daemon down.
+        void maybeSelfUpdate(latestVersion()).catch((err) =>
+          logError("main", err),
+        );
+        void maybeUpdateCli(latestCliVersion()).catch((err) =>
+          logError("main", err),
+        );
         // Report connected delegates' live model lists to the cloud's
         // model cache (throttled internally to the cache TTL, so this
         // 5-min tick costs at most one vendor list call per provider
@@ -232,12 +258,17 @@ const main = async (): Promise<void> => {
         // Converge to the cloud's published daemon version (no-op from source /
         // when already current). Fire-and-forget: it self-guards and, when it
         // updates, swaps the binary + exits once `/v1` is idle so the supervisor
-        // relaunches.
-        void maybeSelfUpdate(latestVersion());
+        // relaunches. `.catch` so a rejected converge can't escape this `.then`
+        // as an unhandledRejection.
+        void maybeSelfUpdate(latestVersion()).catch((err) =>
+          logError("main", err),
+        );
         // Converge the installed openllm CLI too — same toggle, same tick. Daemon
         // first: if the daemon swaps + exits mid-flight, the relaunch's boot call
         // finishes the CLI converge within seconds.
-        void maybeUpdateCli(latestCliVersion());
+        void maybeUpdateCli(latestCliVersion()).catch((err) =>
+          logError("main", err),
+        );
         runCloudReadyWork();
       })
       .catch((err) => logError("main", err))

@@ -12,7 +12,7 @@ import {
   childProcessMatchesRecord,
   currentChildSupervisorInstanceId,
   listChildRegistryRecords,
-  processStartTime,
+  readProcessStartTime,
   removeChildRegistryRecord,
 } from "./registry";
 import { daemonSelfInvocation } from "./self-exec";
@@ -135,15 +135,6 @@ export const superviseSpawn = (
   });
   const pid = subprocess.pid;
   const pgid = pid;
-  // A short probe (`--version`) can exit within milliseconds — before
-  // `ps -o lstart=` can read its start time. A null identity therefore means
-  // "already exiting", NOT a spawn failure: DON'T kill it (its stdout is still
-  // the valid capture) and DON'T throw. We still return a working handle and
-  // track it in-memory so terminate()/terminateAllDisposable() can group-kill a
-  // descendant that outlived it this session; we just skip the PERSISTENT
-  // registry record, because a boot sweep needs a verifiable identity and an
-  // already-exited process is never a cross-restart orphan.
-  const startTime = processStartTime(pid);
   let handle: TSupervisedChild;
   let tracked: TTrackedChild;
   const beginTask = (): (() => void) => {
@@ -160,7 +151,37 @@ export const superviseSpawn = (
   };
   tracked = { handle, terminating: null, activeTasks: 0 };
   trackedChildren.set(pid, tracked);
-  if (startTime !== null)
+  // Persist the cross-restart identity record OFF the spawn hot path. Reading
+  // the start time is a `ps` subprocess; doing it synchronously here blocked the
+  // event loop on every spawn (a status sweep fans out 5 `--version` probes at
+  // once), starving unrelated async work. Defer it: resolve the identity via the
+  // non-blocking reader, then write the record once it lands.
+  //
+  // A short probe (`--version`) can exit within milliseconds — before
+  // `ps -o lstart=` can read its start time (null identity), or before this
+  // deferred write runs (the child already reaped, dropped from
+  // `trackedChildren`). Either way we skip the PERSISTENT registry record: a
+  // boot sweep needs a verifiable identity, and an already-exited process is
+  // never a cross-restart orphan. The in-memory tracking above is unaffected, so
+  // terminate()/terminateAllDisposable() can still group-kill a live descendant.
+  //
+  // ACCEPTED macOS window: between spawn and this deferred write landing (the
+  // async `ps` read, ms–tens of ms), the child has no persistent record. Linux
+  // is still covered — `linuxPdeathsigArgv` SIGKILLs the child with the parent —
+  // but Darwin has no PDEATHSIG and the boot sweep keys on the registry, so a
+  // HARD daemon death (SIGKILL/native crash, no graceful drain) inside that
+  // window can orphan a still-detached macOS child that the next boot's sweep
+  // won't see. This is the deliberate trade for taking the synchronous `ps` off
+  // the spawn hot path (it stalled the event loop on every spawn); the window is
+  // orders of magnitude shorter than a child's lifetime, graceful drain still
+  // reaps via in-memory tracking, and most probes are sub-second regardless.
+  void (async () => {
+    const startTime = await readProcessStartTime(pid);
+    // Re-check membership AFTER the await: if the child exited during the read,
+    // `finishTrackedChild` has already deleted it (and removed any record), so
+    // writing now would leave a stale one. No `await` between this guard and the
+    // write, so single-threaded JS keeps them atomic against that deletion.
+    if (startTime === null || !trackedChildren.has(pid)) return;
     addChildRegistryRecord({
       instanceId: currentChildSupervisorInstanceId(),
       kind: opts.kind,
@@ -170,6 +191,9 @@ export const superviseSpawn = (
       argvDigest: argvDigest(argv),
       startedAtMs: Date.now(),
     });
+  })().catch((error) =>
+    logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
+  );
   void finishTrackedChild(handle).catch((error) =>
     logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
   );

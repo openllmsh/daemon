@@ -30,6 +30,7 @@
  * down the daemon), depends only on `stateDir`, rotates past a size cap.
  */
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { logFilePath, stateDir } from "./env";
 
 // Rotate past 5MB → `<log file>.1` (one generation; the daemon is chatty only
@@ -78,13 +79,87 @@ const serializeErr = (err: unknown): string => {
   }
 };
 
+// Rotation is decided against an in-memory byte tally, NOT a per-line
+// `statSync` — that stat was itself synchronous hot-path work that a burst of
+// timeout warnings multiplied. The tally is seeded once from the file's real
+// size (re-seeded if the log path changes, e.g. between tests) and reset on
+// rotation, so it can't drift unboundedly.
+let approxBytes = 0;
+let seededFor: string | null = null;
+
 const rotateIfBig = (file: string): void => {
+  if (seededFor !== file) {
+    try {
+      approxBytes = statSync(file).size;
+    } catch {
+      approxBytes = 0; // no file yet
+    }
+    seededFor = file;
+  }
+  if (approxBytes <= MAX_BYTES) return;
   try {
-    if (statSync(file).size > MAX_BYTES) renameSync(file, `${file}.1`);
+    renameSync(file, `${file}.1`);
   } catch {
     // No file yet, or rotate failed — either way, keep appending.
   }
+  // Reset the tally regardless: on success the live file is empty; on failure,
+  // resetting avoids re-attempting the rename on every subsequent line.
+  approxBytes = 0;
 };
+
+/**
+ * Combined-log append. `error` writes SYNCHRONOUSLY: the last-resort crash
+ * handlers in `main.ts` call `process.exit` right after `logError`, so the fatal
+ * line must reach disk first. `warn`/`info`/`debug` take a serialized async tail
+ * ({@link appendTail}) — a burst (e.g. five per-slug status-timeout warnings) no
+ * longer performs N synchronous `appendFileSync` calls inline on the event loop.
+ * The two share one file, so a sync error line can land physically between queued
+ * lines; each line's `ts` preserves the true order. Returns whether a SYNC write
+ * succeeded (async writes report `true` optimistically — their fallback is their
+ * own `.catch`).
+ */
+let appendTail: Promise<void> = Promise.resolve();
+
+const appendCombined = (line: string, sync: boolean): boolean => {
+  // Resolve the destination SYNCHRONOUSLY (at log time), then close over it: a
+  // deferred write must land in the state dir that was active when the line was
+  // logged, not whatever `logFilePath()` resolves to when the tail later drains
+  // (which, under a state-dir change, would misfile the line).
+  const dir = stateDir();
+  const file = logFilePath();
+  // Grow the rotation tally only AFTER a successful write: a failed append that
+  // still bumped the counter would inflate it unboundedly under sustained
+  // failure and force spurious rotation attempts.
+  if (sync) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      rotateIfBig(file);
+      appendFileSync(file, line, { mode: 0o600 });
+      approxBytes += Buffer.byteLength(line);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  appendTail = appendTail.then(async () => {
+    try {
+      mkdirSync(dir, { recursive: true });
+      rotateIfBig(file);
+      await appendFile(file, line, { mode: 0o600 });
+      approxBytes += Buffer.byteLength(line);
+    } catch {
+      // Logging is best-effort — never surface a failed append.
+    }
+  });
+  return true;
+};
+
+/**
+ * Await any queued async log appends. TEST-ONLY: production never needs to
+ * block on the log tail, but a test that asserts a `logWarn`/`logInfo` landed
+ * must first drain the serialized queue.
+ */
+export const flushLogs = (): Promise<void> => appendTail;
 
 const write = (
   level: TLevel,
@@ -112,16 +187,9 @@ const write = (
     // Unserializable meta — drop it rather than throw; keep the message.
     line = `${JSON.stringify({ ts: new Date().toISOString(), level, scope, message })}\n`;
   }
-  let wroteCombinedLog = false;
-  try {
-    mkdirSync(stateDir(), { recursive: true });
-    const file = logFilePath();
-    rotateIfBig(file);
-    appendFileSync(file, line, { mode: 0o600 });
-    wroteCombinedLog = true;
-  } catch {
-    // Logging is best-effort — never let it throw into the caller.
-  }
+  // Only `error` needs the synchronous flush-before-exit guarantee; everything
+  // else is queued so it never blocks the event loop.
+  const wroteCombinedLog = appendCombined(line, level === "error");
   try {
     // App structured logs go ONLY to the combined `openllmd.log` (the
     // appendFileSync above). They are deliberately NOT echoed to stdout/stderr:

@@ -21,6 +21,7 @@ import { runWithLoginCommand } from "./delegation/login-flow";
 import { daemonApiKeyId } from "./env";
 import { openSealed } from "./keypair";
 import { clampLimit, readLocalSessions } from "./local-sessions";
+import { logError } from "./logger";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
@@ -325,7 +326,7 @@ export const runCommandInner = async (
           // with auto-update toggled off, the relaunched boot wouldn't force it).
           await maybeUpdateCli(latestCliVersion(), { force: true });
           await maybeSelfUpdate(latestVersion(), { force: true });
-        })();
+        })().catch((err) => logError("control-relay", err));
         return { id: cmd.id, status: "done", result: { checking: true } };
       // Toggle the auto-update opt-in from the dashboard. Persisted locally so it
       // survives restarts; the post-command status push carries the new value
@@ -359,7 +360,7 @@ export const runCommandInner = async (
             // converging both now avoids the extra tick).
             await maybeUpdateCli(latestCliVersion());
             await maybeSelfUpdate(latestVersion());
-          })();
+          })().catch((err) => logError("control-relay", err));
         }
         return {
           id: cmd.id,

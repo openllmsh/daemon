@@ -37,7 +37,7 @@ import {
 } from "./device-limit-backoff";
 import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
-import { logDebug, logInfo, logWarn } from "./logger";
+import { logDebug, logError, logInfo, logWarn } from "./logger";
 import {
   acceptChannel,
   closeChannelFromRelay,
@@ -538,11 +538,11 @@ const scheduleMigrationCheck = (): void => {
       if (migrationInFlight === null) {
         // Fence the check to the generation it starts under — a reconnect while
         // its channel fetch is in flight must not bounce the newer session.
-        migrationInFlight = migrateIfRelayMoved(connectionGeneration).finally(
-          () => {
+        migrationInFlight = migrateIfRelayMoved(connectionGeneration)
+          .catch((err) => logError("control-channel", err))
+          .finally(() => {
             migrationInFlight = null;
-          },
-        );
+          });
       }
       void migrationInFlight.finally(scheduleMigrationCheck);
     },
