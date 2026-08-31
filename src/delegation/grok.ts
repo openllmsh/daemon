@@ -169,6 +169,14 @@ type TGrokSession = {
 };
 type TGrokStore = Readonly<Record<string, TGrokSession>>;
 
+export const resolveGrokSession = (
+  prior: TGrokSession,
+  refreshed: TGrokSession,
+): TGrokSession => ({
+  ...refreshed,
+  user_id: refreshed.user_id ?? prior.user_id,
+});
+
 const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
 
 const loadStore = (): Promise<TStoreRead<TGrokStore>> =>
@@ -267,9 +275,10 @@ const readToken = async (): Promise<{
     refreshed: fresh?.key !== undefined && fresh.key.length > 0 ? fresh : null,
     hasRefreshToken: (token) => Boolean(token.refresh_token),
   });
+  const resolvedSession = resolveGrokSession(session, resolved.token);
   return {
-    accessToken: resolved.token.key ?? session.key,
-    session: resolved.token,
+    accessToken: resolvedSession.key ?? session.key,
+    session: resolvedSession,
   };
 };
 

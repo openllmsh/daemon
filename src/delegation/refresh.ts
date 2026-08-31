@@ -51,16 +51,19 @@ export class RefreshTriggerError extends Error {
   readonly errorClass: TRefreshErrorClass;
   readonly abandoned: boolean;
   readonly exitCode: number;
+  readonly timeoutMs: number;
 
   constructor(
     errorClass: TRefreshErrorClass,
     result: Pick<TLoginResult, "abandoned" | "code">,
+    timeoutMs = REFRESH_SPAWN_TIMEOUT_MS,
   ) {
     super(`native refresh ${errorClass}`);
     this.name = "RefreshTriggerError";
     this.errorClass = errorClass;
     this.abandoned = result.abandoned;
     this.exitCode = result.code;
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -139,7 +142,11 @@ export const resolveToken = <T>(opts: {
   return { token, reauthRequired: false };
 };
 
+const unrefreshableCredentialProviders = new Set<string>();
+
 export const credentialUnrefreshable = (provider: string): void => {
+  if (unrefreshableCredentialProviders.has(provider)) return;
+  unrefreshableCredentialProviders.add(provider);
   logWarn("refresh", "credential cannot be refreshed", {
     provider,
     phase: "credential_unrefreshable",
@@ -177,14 +184,19 @@ export const keychainRefreshSpawnAllowed = (
   return false;
 };
 
-const inspectRefreshResult = (result: TLoginResult): void => {
+const inspectRefreshResult = (
+  result: TLoginResult,
+  timeoutMs: number,
+): void => {
   const output = result.output.toLowerCase();
   // `abandoned` is the deadline/abort SIGTERM — the exact mid-rotation kill that
   // strands a single-use refresh token (the B1 bug). It is the primary failure.
-  if (result.abandoned) throw new RefreshTriggerError("abandoned", result);
+  if (result.abandoned) {
+    throw new RefreshTriggerError("abandoned", result, timeoutMs);
+  }
   // An explicit OAuth error means the credential is genuinely un-refreshable.
   if (output.includes("invalid_grant") || output.includes("invalid_request")) {
-    throw new RefreshTriggerError("invalid_grant", result);
+    throw new RefreshTriggerError("invalid_grant", result, timeoutMs);
   }
   // A BARE non-zero exit is deliberately NOT a failure: the refresh commands are
   // diagnostic-style (`codex doctor`, `grok models`, `cursor status`) that can
@@ -213,15 +225,16 @@ export const spawnRefresh = async (
   },
 ): Promise<void> => {
   const run = opts?.pty === true ? spawnLoginPty : spawnLogin;
+  const timeoutMs = opts?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS;
   const result = await run([...argv], env, {
-    timeoutMs: opts?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+    timeoutMs,
     probe: opts?.probe,
     ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
   });
   // spawnLogin intentionally resolves after its deadline/non-zero child exit.
   // A refresh must turn those resolved outcomes into a classified rejection so
   // makeRefresher cannot record a killed rotation as a clean success.
-  inspectRefreshResult(result);
+  inspectRefreshResult(result, timeoutMs);
 };
 
 /** What `makeRefresher` did for this read — tells the caller whether the store
@@ -352,7 +365,7 @@ export const makeRefresher = (opts: {
             phase: "refresh_trigger",
             error_class: lastErrorClass,
             elapsed_ms: Date.now() - started,
-            timeout_ms: REFRESH_SPAWN_TIMEOUT_MS,
+            timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
             abandoned: triggerError?.abandoned ?? false,
             exit_code: triggerError?.exitCode ?? null,
           });
@@ -387,6 +400,13 @@ export const makeRefresher = (opts: {
         phase: "refresh_skipped",
         reason: "failure_backoff",
       });
+      // NOTE: an expired credential inside the failure-backoff window returns
+      // "fresh" (serve the current token, don't re-spawn) rather than a stale
+      // outcome. This is deliberate — see `refresh-cooldown.test.ts` "cooldown
+      // holds after a FAILED trigger too": re-spawning every ~2.5s status tick
+      // would hammer a broken refresh. A CodeRabbit nitpick suggested returning
+      // stale here; not adopted, as it changes tested backoff behavior and
+      // borders the deferred Stage-8 persistence-aware predicate.
       return "fresh";
     }
     if (remaining > 0) {

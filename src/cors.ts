@@ -7,7 +7,7 @@
  * + reflect an allowed origin. Access control stays the localhost bind +
  * this origin lock — no control token.
  */
-import { NO_DAEMON_HEADER } from "@openllmsh/protocol";
+import { NO_DAEMON_HEADER, TOOL_SESSION_HEADER } from "@openllmsh/protocol";
 import { daemonEnv, isDevMode } from "./env";
 
 /**
@@ -104,9 +104,8 @@ const allowOrigin = (req: Request): string => {
 export const corsHeaders = (req: Request): Record<string, string> => ({
   "access-control-allow-origin": allowOrigin(req),
   "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers": `content-type, authorization, x-openllm-tool-session, ${NO_DAEMON_HEADER}`,
-  "access-control-expose-headers":
-    "x-openllm-media-id, x-openllm-media-url, x-openllm-tool-session",
+  "access-control-allow-headers": `content-type, authorization, ${TOOL_SESSION_HEADER}, ${NO_DAEMON_HEADER}`,
+  "access-control-expose-headers": `x-openllm-media-id, x-openllm-media-url, ${TOOL_SESSION_HEADER}`,
   "access-control-allow-private-network": "true",
   vary: "origin",
 });

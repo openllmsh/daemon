@@ -56,6 +56,7 @@ import {
   ChatCompletionChunk,
   cooldownPolicyFor,
   daemonPlanSigningPayload,
+  TOOL_SESSION_HEADER,
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
 } from "@openllmsh/protocol";
@@ -1190,7 +1191,10 @@ const serveSubscription = async (
   const headers = built.headers;
   // Build from the same canonical request that `buildUpstreamRequest` encoded.
   // Empty maps stay absent from decoder state, preserving the normal path.
-  const canonicalForToolNames = canonicalFromInbound(args.surface, args.rawBody);
+  const canonicalForToolNames = canonicalFromInbound(
+    args.surface,
+    args.rawBody,
+  );
   const toolNameMap =
     wire === "chatgpt"
       ? buildChatGptToolNameMap(canonicalForToolNames)
@@ -2707,7 +2711,7 @@ const walkPlan = async (
         // route a valid token to its owner daemon before this per-request fleet
         // fallback. Until a durable owner registry exists, validation below gives
         // a precise wrong-owner/epoch decline rather than a misleading map miss.
-        continuationToken: args.req.headers.get("x-openllm-tool-session"),
+        continuationToken: args.req.headers.get(TOOL_SESSION_HEADER),
         stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>

@@ -30,7 +30,7 @@
  *     `X-Msh-Device-Id`.
  *   - Usage: GET https://api.kimi.com/coding/v1/usages.
  */
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
@@ -461,7 +461,16 @@ const writeCredential = (wire: Record<string, unknown>): void => {
   writeFileSync(temp, JSON.stringify(blob), { encoding: "utf-8", mode: 0o600 });
   // Same-directory rename is atomic: readers see either the old complete
   // credential or the new complete credential, never a truncated JSON write.
-  renameSync(temp, path);
+  try {
+    renameSync(temp, path);
+  } catch (error) {
+    try {
+      unlinkSync(temp);
+    } catch {
+      // Cleanup cannot replace the original write failure.
+    }
+    throw error;
+  }
 };
 
 // ─── /usages parsing ─────────────────────────────────────────────────────

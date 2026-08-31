@@ -12,6 +12,7 @@
  */
 
 import type { TChatCompletionRequest } from "@openllmsh/protocol";
+import { TOOL_SESSION_HEADER } from "@openllmsh/protocol";
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { deliverJsonResponse, sseResponseForClient } from "../client-encode";
@@ -37,7 +38,7 @@ const withContinuationHeader = (
 ): Response => {
   if (continuationToken === null) return response;
   const headers = new Headers(response.headers);
-  headers.set("x-openllm-tool-session", continuationToken);
+  headers.set(TOOL_SESSION_HEADER, continuationToken);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
