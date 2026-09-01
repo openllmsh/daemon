@@ -33,6 +33,7 @@ import type {
   TDaemonProviderConnection,
   TProviderUsageSnapshot,
 } from "@openllmsh/protocol";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logWarn } from "../logger";
@@ -101,7 +102,11 @@ const readClaudePlan = async (
   try {
     const response = await fetch(
       await resolveProviderUrl(PROVIDER, PROFILE_PATH),
-      { method: "GET", headers },
+      {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+      },
     );
     if (!response.ok) return null;
     const profile = (await response.json()) as TClaudeProfile;

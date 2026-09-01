@@ -35,7 +35,11 @@ import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
-import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
+import {
+  MODEL_LIST_FETCH_TIMEOUT_MS,
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import { logWarn } from "../logger";
@@ -95,6 +99,7 @@ const readKimiPlan = async (accessToken: string): Promise<string | null> => {
           ...(await identityHeaders()),
           accept: "application/json",
         },
+        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
       },
     );
     if (!response.ok) return null;
