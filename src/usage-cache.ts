@@ -36,7 +36,9 @@
  *     last-known figures under a "cached · updated Xm ago" badge instead of
  *     silently presenting old numbers as live (or a bare error);
  *   - the last good snapshot is PERSISTED to disk
- *     (`<stateDir>/usage-cache.json`) once the daemon opts in via
+ *     (`<stateDir>/usage-cache.json`, or `usage-cache.dev.json` in dev mode so
+ *     a source-run dev daemon never shares a cache with the installed prod one)
+ *     once the daemon opts in via
  *     {@link enableUsagePersistence}, so a daemon RESTART doesn't lose it —
  *     before this, a restart wiped the in-memory good snapshot and, if the
  *     first post-restart read 429'd, the card showed a rate-limit error with
@@ -59,6 +61,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
+import { isDevMode } from "./env";
 
 // Hit the vendor at most once per this window — applies to BOTH a successful
 // read (the figures are reused) and a failed one (we back off instead of
@@ -143,7 +146,19 @@ type TPersistedEntry = {
 // (the default — keeps this module hermetic for unit tests that import it
 // directly). The daemon sets it once via enableUsagePersistence().
 let persistDir: string | null = null;
-const cacheFile = (): string => join(persistDir as string, "usage-cache.json");
+// The cache FILE is dev-namespaced, exactly like `openllmd.dev.log` — a
+// source-run dev daemon shares the state dir (`~/.openllm`) with the installed
+// prod daemon most developers also run, and an undifferentiated
+// `usage-cache.json` would let the two fight over one file: prod (an older
+// binary that never read the subscription tier) writes a tier-less snapshot,
+// dev hydrates it and serves it back for the freshness window, so a tier the
+// dev build DOES compute never appears. Separate files keep dev and prod
+// caches fully independent.
+const cacheFile = (): string =>
+  join(
+    persistDir as string,
+    isDevMode() ? "usage-cache.dev.json" : "usage-cache.json",
+  );
 
 /**
  * Opt this process into disk-backed survival of the last good usage snapshot
