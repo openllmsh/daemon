@@ -88,11 +88,15 @@ const OAUTH_BETA = "oauth-2025-04-20";
 const USAGE_PATH = "/api/oauth/usage";
 const PROFILE_PATH = "/api/oauth/profile";
 
+// `/api/oauth/profile` nests the tier under `organization` — NOT at the top
+// level. The Claude Code CLI reads `organization.rate_limit_tier` (e.g.
+// "default_claude_max_20x") and `organization.organization_type` (e.g.
+// "claude_max"); see ref/claude oauth client.ts + upgrade.tsx.
 type TClaudeProfile = {
-  readonly rate_limit_tier?: unknown;
-  readonly has_claude_pro?: unknown;
-  readonly has_claude_max?: unknown;
-  readonly organization_type?: unknown;
+  readonly organization?: {
+    readonly rate_limit_tier?: unknown;
+    readonly organization_type?: unknown;
+  };
 };
 
 /** Best-effort private-client tier read. It must never affect quota availability. */
@@ -110,13 +114,10 @@ const readClaudePlan = async (
     );
     if (!response.ok) return null;
     const profile = (await response.json()) as TClaudeProfile;
-    if (typeof profile.rate_limit_tier === "string") {
-      return profile.rate_limit_tier;
-    }
-    if (profile.has_claude_max === true) return "has_claude_max";
-    if (profile.has_claude_pro === true) return "has_claude_pro";
-    return typeof profile.organization_type === "string"
-      ? profile.organization_type
+    const org = profile.organization;
+    if (typeof org?.rate_limit_tier === "string") return org.rate_limit_tier;
+    return typeof org?.organization_type === "string"
+      ? org.organization_type
       : null;
   } catch {
     return null;

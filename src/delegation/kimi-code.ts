@@ -90,18 +90,19 @@ type TKimiUserInfo = {
 /** Best-effort documented-experimental tier read; usage remains independent. */
 const readKimiPlan = async (accessToken: string): Promise<string | null> => {
   try {
-    const response = await fetch(
-      await resolveProviderUrl(PROVIDER, USERINFO_PATH),
-      {
-        method: "GET",
-        headers: {
-          authorization: `Bearer ${accessToken}`,
-          ...(await identityHeaders()),
-          accept: "application/json",
-        },
-        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+    // Userinfo is an OAUTH-host endpoint (auth.kimi.com), like the
+    // device_authorization / token calls — NOT the inference host
+    // (api.kimi.com) that `resolveProviderUrl` derives from the captured
+    // endpoint. Using the inference host 404s and the tier never resolves.
+    const response = await fetch(`${OAUTH_HOST}${USERINFO_PATH}`, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        ...(await identityHeaders()),
+        accept: "application/json",
       },
-    );
+      signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+    });
     if (!response.ok) return null;
     const userInfo = (await response.json()) as TKimiUserInfo;
     const tier = userInfo.userInfo?.userLevelName;
