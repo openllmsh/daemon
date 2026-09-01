@@ -35,14 +35,10 @@ import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
-import {
-  MODEL_LIST_FETCH_TIMEOUT_MS,
-  QUOTA_REJECT_PERCENT,
-  QUOTA_WARN_PERCENT,
-} from "@openllmsh/protocol";
+import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
-import { logWarn } from "../logger";
+import { logDebug, logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -78,42 +74,46 @@ const PROVIDER = "kimi_code" as const;
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
 const USAGE_PATH = "/coding/v1/usages";
-const USERINFO_PATH = "/api/v1/oauth/userinfo";
 
-type TKimiUserInfo = {
-  readonly userInfo?: {
-    readonly userLevelName?: unknown;
-    readonly userLevel?: unknown;
-  };
-};
+// Claim names a kimi access-token JWT might carry a membership/level under. The
+// token is known to carry `user_id`; whether it also carries a level — and
+// under what spelling — is undocumented, so try the plausible ones.
+const KIMI_CLAIM_TIER_KEYS = [
+  "user_level_name",
+  "userLevelName",
+  "level_name",
+  "user_level",
+  "userLevel",
+  "membership",
+  "plan",
+  "tier",
+] as const;
 
-/** Best-effort documented-experimental tier read; usage remains independent. */
-const readKimiPlan = async (accessToken: string): Promise<string | null> => {
-  try {
-    // Userinfo is an OAUTH-host endpoint (auth.kimi.com), like the
-    // device_authorization / token calls — NOT the inference host
-    // (api.kimi.com) that `resolveProviderUrl` derives from the captured
-    // endpoint. Using the inference host 404s and the tier never resolves.
-    const response = await fetch(`${OAUTH_HOST}${USERINFO_PATH}`, {
-      method: "GET",
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        ...(await identityHeaders()),
-        accept: "application/json",
-      },
-      signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-    });
-    if (!response.ok) return null;
-    const userInfo = (await response.json()) as TKimiUserInfo;
-    const tier = userInfo.userInfo?.userLevelName;
-    if (typeof tier === "string") return tier;
-    const level = userInfo.userInfo?.userLevel;
-    return typeof level === "string" || typeof level === "number"
-      ? String(level)
-      : null;
-  } catch {
-    return null;
+/**
+ * Best-effort tier read. Kimi Code exposes NO subscription tier through any
+ * surface its own CLI uses: the `/usages` payload is limits + a credit balance,
+ * the OAuth token wire shape carries no level, and the vendor reference has no
+ * userinfo / account / profile endpoint (see ref/kimi-code). The one in-band
+ * possibility is a claim on the access-token JWT — which we already decode for
+ * `user_id` — since a token can carry claims the CLI's wire type doesn't
+ * declare. Try that and nothing else (no fabricated network call). If it's
+ * absent the tier is simply unknown and the row omits it; the claim KEYS
+ * (never values) are logged at debug so a level claim under some other name can
+ * be identified from `openllmd.dev.log`.
+ */
+const readKimiPlan = (accessToken: string): string | null => {
+  const claims = jwtClaims(accessToken);
+  if (claims === null) return null;
+  for (const key of KIMI_CLAIM_TIER_KEYS) {
+    const value = claims[key];
+    if (typeof value === "string" && value.trim().length > 0)
+      return value.trim();
+    if (typeof value === "number") return String(value);
   }
+  logDebug("kimi-tier", "no known level claim on access token", {
+    claimKeys: Object.keys(claims),
+  });
+  return null;
 };
 
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
@@ -798,7 +798,7 @@ export const kimiCodeDelegate: TProviderDelegate = {
       // (+ the rolled-up summary), skipping incomplete quota rows.
       const snapshot = parseKimiUsage(await resp.json());
       if (snapshot.kind !== "quota") return snapshot;
-      const plan = await readKimiPlan(token.accessToken);
+      const plan = readKimiPlan(token.accessToken);
       return plan === null
         ? snapshot
         : { ...snapshot, plan, plan_source: "documented-experimental" };
