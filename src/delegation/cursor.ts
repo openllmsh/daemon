@@ -66,7 +66,10 @@ const PLAN_PATH = "/aiserver.v1.DashboardService/GetPlanInfo";
 const REFRESH_LEEWAY_MS = 5 * 60_000;
 
 const bin = (): string => cliBin(PROVIDER);
-const env = (): Record<string, string> => cliEnv(PROVIDER);
+const env = (): Record<string, string> => ({
+  ...cliEnv(PROVIDER),
+  NO_OPEN_BROWSER: "1",
+});
 
 // ─── Live model rows via the ACP bridge (cursor/list_available_models) ─────
 const CURSOR_MODELS_TTL_MS = 5 * 60_000;
@@ -521,6 +524,14 @@ export const cursorDelegate: TProviderDelegate = {
     if (cursorModelsInflight === null) {
       cursorModelsInflight =
         (async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
+          // `readToken` refreshes a refreshable credential. A failed hard-expiry
+          // refresh deliberately returns the stale token for request-path
+          // diagnostics, so model discovery must validate the resolved JWT again
+          // before it can spawn the auth-capable ACP CLI.
+          const token = await readToken();
+          const expiryMs =
+            token === null ? null : jwtExpiryMs(token.accessToken);
+          if (expiryMs === null || expiryMs <= Date.now()) return null;
           const rows = await listCursorModelsViaAcp({ bin: bin(), env: env() });
           if (rows === null) return null;
           const entries: TProviderModelEntry[] = rows.map((row) => ({
