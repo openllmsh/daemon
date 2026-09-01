@@ -671,9 +671,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       return {
         kind: "quota",
         status: reduceQuotaStatus(undefined, windows),
-        ...(plan !== null
-          ? { plan, plan_source: "private-client" }
-          : {}),
+        ...(plan !== null ? { plan, plan_source: "private-client" } : {}),
         windows,
         ...(extra_pools.length > 0 ? { extra_pools } : {}),
         note: "Pro/Max subscription — read locally via Claude Code",

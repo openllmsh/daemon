@@ -84,9 +84,7 @@ type TKimiUserInfo = {
 };
 
 /** Best-effort documented-experimental tier read; usage remains independent. */
-const readKimiPlan = async (
-  accessToken: string,
-): Promise<string | null> => {
+const readKimiPlan = async (accessToken: string): Promise<string | null> => {
   try {
     const response = await fetch(
       await resolveProviderUrl(PROVIDER, USERINFO_PATH),
