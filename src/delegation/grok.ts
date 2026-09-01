@@ -109,6 +109,7 @@ const GROK_IMAGE_URL = "https://api.x.ai/v1/images/generations";
 // the CLI's `billing.rs` reads to render "View credit usage" — verified live
 // against a SuperGrok / X Premium+ session (see the header block above).
 const USAGE_PATH = "/v1/billing";
+const SETTINGS_PATH = "/v1/settings";
 
 // Grok Imagine video generation uses the xAI API base, not the CLI chat proxy.
 const GROK_VIDEO_BASE = "https://api.x.ai/v1";
@@ -451,6 +452,32 @@ type TGrokCreditsConfig = {
 type TGrokCredits = { readonly config?: TGrokCreditsConfig };
 
 const GROK_NOTE = "Grok — read locally via Grok CLI";
+
+type TGrokSettings = { readonly subscription_tier_display?: unknown };
+
+/** Best-effort private-client tier read; quota availability never depends on it. */
+const readGrokPlan = async (
+  headers: Readonly<Record<string, string>>,
+): Promise<string | null> => {
+  try {
+    const response = await fetch(
+      await resolveProviderUrl(PROVIDER, SETTINGS_PATH),
+      {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+      },
+    );
+    if (!response.ok) return null;
+    const settings = (await response.json()) as TGrokSettings;
+    return typeof settings.subscription_tier_display === "string"
+      ? settings.subscription_tier_display
+      : null;
+  } catch {
+    return null;
+  }
+};
+
 const clampPercent = (n: number): number => Math.max(0, Math.min(100, n));
 const parseIsoMs = (iso: string | undefined): number | null => {
   if (typeof iso !== "string") return null;
@@ -773,10 +800,15 @@ export const grokDelegate: TProviderDelegate = {
       return grokWeeklyUsageUnavailable(credits.error);
     }
 
-    return parseGrokUsage(
+    const snapshot = parseGrokUsage(
       "body" in monthly ? monthly.body : null,
       "body" in credits ? credits.body : null,
     );
+    if (snapshot.kind !== "quota") return snapshot;
+    const plan = await readGrokPlan(headers);
+    return plan === null
+      ? snapshot
+      : { ...snapshot, plan, plan_source: "private-client" };
   },
 
   listModels: async () => {

@@ -74,6 +74,43 @@ const PROVIDER = "kimi_code" as const;
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
 const USAGE_PATH = "/coding/v1/usages";
+const USERINFO_PATH = "/api/v1/oauth/userinfo";
+
+type TKimiUserInfo = {
+  readonly userInfo?: {
+    readonly userLevelName?: unknown;
+    readonly userLevel?: unknown;
+  };
+};
+
+/** Best-effort documented-experimental tier read; usage remains independent. */
+const readKimiPlan = async (
+  accessToken: string,
+): Promise<string | null> => {
+  try {
+    const response = await fetch(
+      await resolveProviderUrl(PROVIDER, USERINFO_PATH),
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          ...(await identityHeaders()),
+          accept: "application/json",
+        },
+      },
+    );
+    if (!response.ok) return null;
+    const userInfo = (await response.json()) as TKimiUserInfo;
+    const tier = userInfo.userInfo?.userLevelName;
+    if (typeof tier === "string") return tier;
+    const level = userInfo.userInfo?.userLevel;
+    return typeof level === "string" || typeof level === "number"
+      ? String(level)
+      : null;
+  } catch {
+    return null;
+  }
+};
 
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
 // (constants.ts + oauth.ts). Same host + public client id the CLI uses,
@@ -755,7 +792,12 @@ export const kimiCodeDelegate: TProviderDelegate = {
       }
       // Parse the `{ usage, limits[] }` payload into one window per limit
       // (+ the rolled-up summary), skipping incomplete quota rows.
-      return parseKimiUsage(await resp.json());
+      const snapshot = parseKimiUsage(await resp.json());
+      if (snapshot.kind !== "quota") return snapshot;
+      const plan = await readKimiPlan(token.accessToken);
+      return plan === null
+        ? snapshot
+        : { ...snapshot, plan, plan_source: "documented-experimental" };
     } catch (err) {
       return {
         kind: "unavailable",

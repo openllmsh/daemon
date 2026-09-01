@@ -85,6 +85,38 @@ const OAUTH_BETA = "oauth-2025-04-20";
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
 const USAGE_PATH = "/api/oauth/usage";
+const PROFILE_PATH = "/api/oauth/profile";
+
+type TClaudeProfile = {
+  readonly rate_limit_tier?: unknown;
+  readonly has_claude_pro?: unknown;
+  readonly has_claude_max?: unknown;
+  readonly organization_type?: unknown;
+};
+
+/** Best-effort private-client tier read. It must never affect quota availability. */
+const readClaudePlan = async (
+  headers: Readonly<Record<string, string>>,
+): Promise<string | null> => {
+  try {
+    const response = await fetch(
+      await resolveProviderUrl(PROVIDER, PROFILE_PATH),
+      { method: "GET", headers },
+    );
+    if (!response.ok) return null;
+    const profile = (await response.json()) as TClaudeProfile;
+    if (typeof profile.rate_limit_tier === "string") {
+      return profile.rate_limit_tier;
+    }
+    if (profile.has_claude_max === true) return "has_claude_max";
+    if (profile.has_claude_pro === true) return "has_claude_pro";
+    return typeof profile.organization_type === "string"
+      ? profile.organization_type
+      : null;
+  } catch {
+    return null;
+  }
+};
 
 // The daemon does NOT refresh the token itself. When the access token is within
 // this window of expiry, `readToken` TRIGGERS the `claude` CLI's OWN native
@@ -603,15 +635,16 @@ export const claudeCodeDelegate: TProviderDelegate = {
       return { kind: "unavailable", reason: "not signed in to Claude Code" };
     }
     try {
+      const headers = {
+        authorization: `Bearer ${token.accessToken}`,
+        "user-agent": await userAgent(),
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": OAUTH_BETA,
+        accept: "application/json",
+      };
       const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
         method: "GET",
-        headers: {
-          authorization: `Bearer ${token.accessToken}`,
-          "user-agent": await userAgent(),
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": OAUTH_BETA,
-          accept: "application/json",
-        },
+        headers,
       });
       if (!resp.ok) {
         const reason =
@@ -634,9 +667,13 @@ export const claudeCodeDelegate: TProviderDelegate = {
       // `extra_pools`, same contract as Codex Spark: display-only, never
       // flip overall status when only a single model family is exhausted.
       const { windows, extra_pools } = reduceClaudeUsage(data);
+      const plan = await readClaudePlan(headers);
       return {
         kind: "quota",
         status: reduceQuotaStatus(undefined, windows),
+        ...(plan !== null
+          ? { plan, plan_source: "private-client" }
+          : {}),
         windows,
         ...(extra_pools.length > 0 ? { extra_pools } : {}),
         note: "Pro/Max subscription — read locally via Claude Code",
