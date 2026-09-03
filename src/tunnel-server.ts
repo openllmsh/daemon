@@ -20,7 +20,10 @@
  * `docs/proposals/browser-selected-device-tunnel-contract.md`.
  */
 
-import type { TTunnelSurface } from "@openllmsh/protocol";
+import type {
+  TTunnelForwardHeaders,
+  TTunnelSurface,
+} from "@openllmsh/protocol";
 import {
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
@@ -54,12 +57,7 @@ let muxServedCount = 0;
 
 const forwardedHeaders = (open: {
   readonly consumer?: "browser" | "daemon";
-  readonly headers?: {
-    readonly content_type?: "application/json";
-    readonly accept?: "application/json" | "text/event-stream";
-    readonly anthropic_version?: string;
-    readonly anthropic_beta?: string;
-  };
+  readonly headers?: TTunnelForwardHeaders;
 }): Headers => {
   const headers = new Headers();
   headers.set("content-type", open.headers?.content_type ?? "application/json");
@@ -69,6 +67,8 @@ const forwardedHeaders = (open: {
     headers.set("anthropic-version", open.headers.anthropic_version);
   if (open.headers?.anthropic_beta !== undefined)
     headers.set("anthropic-beta", open.headers.anthropic_beta);
+  if (open.headers?.user_agent !== undefined)
+    headers.set("user-agent", open.headers.user_agent);
   // Only fleet-daemon hops are tunnel-borne for the walker loop-guard.
   // Browser (or omitted consumer) leaves the header off so the selected
   // device may still tryFleetTunnel once.
@@ -81,12 +81,7 @@ const forwardedHeaders = (open: {
 type TTunneledOpen = {
   readonly surface: TTunnelSurface;
   readonly consumer?: "browser" | "daemon";
-  readonly headers?: {
-    readonly content_type?: "application/json";
-    readonly accept?: "application/json" | "text/event-stream";
-    readonly anthropic_version?: string;
-    readonly anthropic_beta?: string;
-  };
+  readonly headers?: TTunnelForwardHeaders;
 };
 
 function tunneledRequest(

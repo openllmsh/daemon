@@ -2181,6 +2181,7 @@ const tryFleetTunnel = async (
         args.surface === "messages"
           ? args.req.headers.get("anthropic-beta")
           : null,
+      userAgent: args.req.headers.get("user-agent"),
       signal: args.req.signal,
     });
     // Any peer response head (success or terminal failure) ends this
@@ -2847,14 +2848,10 @@ const walkPlan = async (
       preserveTerminalResponse(served.upstreamResponse, forceContextAttempt);
     }
 
-    // Local serve exhausted (auth-gated, method-gated, or both declined) —
-    // a fleet peer may still hold the login. ONE tunnel site for every
-    // subscription provider; loop guard lives inside tryFleetTunnel.
-    const tunneled = await tryFleetTunnel(hop, args);
-    if (tunneled !== null) {
-      return { response: tunneled, servedLocally: false };
-    }
-
+    // Once local authentication is confirmed, this daemon owns the outcome.
+    // A bridge decline or handrolled failure follows the local retry/cooldown/
+    // plan policy below; another account on a fleet peer must not mask it.
+    // Generic fleet fallback is reserved for the auth-unavailable gate above.
     if (handrolledRetry !== null) {
       if (handrolledRetry.cooldownReason === "context_overflow") {
         if (!shouldDemoteOnContextOverflow(contextOverflowStrategy)) {

@@ -44,6 +44,7 @@ export type TTunnelToPeerArgs = {
   accept: "application/json" | "text/event-stream";
   anthropicVersion?: string | null;
   anthropicBeta?: string | null;
+  userAgent?: string | null;
   signal: AbortSignal;
 };
 
@@ -72,6 +73,9 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
       : {}),
     ...(args.anthropicBeta != null
       ? { anthropic_beta: args.anthropicBeta.slice(0, 256) }
+      : {}),
+    ...(args.userAgent != null
+      ? { user_agent: args.userAgent.slice(0, 512) }
       : {}),
   };
 
