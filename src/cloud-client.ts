@@ -27,6 +27,7 @@ import {
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
+import { setIdentityConflict } from "./identity-state";
 import { logWarn } from "./logger";
 
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
@@ -251,11 +252,40 @@ export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
  */
 export const publishIdentity = async (pubkey: string): Promise<void> => {
   try {
-    await cloudFetch(cloudUrl("/api/daemon/identity"), {
+    const response = await cloudFetch(cloudUrl("/api/daemon/identity"), {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ pubkey }),
     });
+    if (response.status === 409) {
+      let code: string | null = null;
+      try {
+        const body: unknown = await response.json();
+        if (
+          body !== null &&
+          typeof body === "object" &&
+          "error" in body &&
+          body.error !== null &&
+          typeof body.error === "object" &&
+          "type" in body.error &&
+          body.error.type === "identity_conflict"
+        ) {
+          code = "identity_conflict";
+        }
+      } catch {
+        // A malformed conflict envelope remains non-fatal and unreported.
+      }
+      if (code === "identity_conflict") {
+        setIdentityConflict(true);
+        logWarn(
+          "identity",
+          "cloud pin conflicts with local X25519 key — RTC will fail until the pin is reset",
+          {},
+        );
+      }
+      return;
+    }
+    if (response.ok) setIdentityConflict(false);
   } catch {
     // swallow — identity pin is best-effort hardening
   }

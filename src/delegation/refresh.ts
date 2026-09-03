@@ -40,6 +40,7 @@ const MAX_REFRESH_FAILURE_BACKOFF_MS = 5 * 60_000;
 
 export type TRefreshErrorClass =
   | "timeout"
+  | "network"
   | "spawn_failed"
   | "abandoned"
   | "invalid_grant"
@@ -52,6 +53,7 @@ export class RefreshTriggerError extends Error {
   readonly abandoned: boolean;
   readonly exitCode: number;
   readonly timeoutMs: number;
+  readonly errno: string | null;
 
   constructor(
     errorClass: TRefreshErrorClass,
@@ -64,6 +66,16 @@ export class RefreshTriggerError extends Error {
     this.abandoned = result.abandoned;
     this.exitCode = result.code;
     this.timeoutMs = timeoutMs;
+    const output =
+      "output" in result && typeof result.output === "string"
+        ? result.output
+        : "";
+    this.errno =
+      output
+        .match(
+          /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET)\b/i,
+        )?.[1]
+        ?.toUpperCase() ?? null;
   }
 }
 
@@ -184,6 +196,24 @@ export const keychainRefreshSpawnAllowed = (
   return false;
 };
 
+const networkErrorPattern =
+  /\b(?:ehostunreach|enetunreach|econnrefused|enotfound|eai_again|etimedout|econnreset)\b|fetch failed|\b(?:getaddrinfo|dns|network error|socket hang up)\b|\b(?:tls|ssl)\b|certificate verify failed|self[- ]signed certificate|unable to verify/i;
+
+const errorText = (err: unknown): string => {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    parts.push(current.name, current.message);
+    current = current.cause;
+  }
+  return parts.join(" ");
+};
+
+const isNetworkErrorText = (text: string): boolean =>
+  networkErrorPattern.test(text);
+
 const inspectRefreshResult = (
   result: TLoginResult,
   timeoutMs: number,
@@ -197,6 +227,12 @@ const inspectRefreshResult = (
   // An explicit OAuth error means the credential is genuinely un-refreshable.
   if (output.includes("invalid_grant") || output.includes("invalid_request")) {
     throw new RefreshTriggerError("invalid_grant", result, timeoutMs);
+  }
+  // Codex doctor reports its reachability failure on stderr but intentionally
+  // returns a non-zero code for other harmless diagnostics. Preserve that bare
+  // non-zero behavior while recognizing its explicit network vocabulary.
+  if (result.code !== 0 && isNetworkErrorText(result.output)) {
+    throw new RefreshTriggerError("network", result, timeoutMs);
   }
   // A BARE non-zero exit is deliberately NOT a failure: the refresh commands are
   // diagnostic-style (`codex doctor`, `grok models`, `cursor status`) that can
@@ -259,27 +295,43 @@ export const isStaleRefresh = (
 
 export const classifyRefreshError = (err: unknown): TRefreshErrorClass => {
   if (err instanceof RefreshTriggerError) return err.errorClass;
-  const name = err instanceof Error ? err.name : "";
-  const message = err instanceof Error ? err.message : "";
-  const text = `${name} ${message}`.toLowerCase();
+  const text = errorText(err);
+  if (isNetworkErrorText(text)) return "network";
   if (
-    name === "TimeoutError" ||
-    name === "AbortError" ||
-    text.includes("timeout") ||
-    text.includes("timed out")
+    err instanceof Error &&
+    (err.name === "TimeoutError" ||
+      err.name === "AbortError" ||
+      text.toLowerCase().includes("timeout") ||
+      text.toLowerCase().includes("timed out"))
   ) {
     return "timeout";
   }
+  const normalized = text.toLowerCase();
   if (
-    text.includes("spawn") ||
-    text.includes("enoent") ||
-    text.includes("eacces") ||
-    text.includes("eperm") ||
-    text.includes("eagain")
+    normalized.includes("spawn") ||
+    normalized.includes("enoent") ||
+    normalized.includes("eacces") ||
+    normalized.includes("eperm") ||
+    normalized.includes("eagain")
   ) {
     return "spawn_failed";
   }
   return "rejected";
+};
+
+const lastRefreshErrorClasses = new Map<string, TRefreshErrorClass | null>();
+
+/** In-memory result of the most recently settled refresh for one provider. */
+export const lastRefreshErrorClass = (
+  provider: string,
+): TRefreshErrorClass | null => lastRefreshErrorClasses.get(provider) ?? null;
+
+const networkErrnoPattern =
+  /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET)\b/i;
+
+const networkErrno = (err: unknown): string | null => {
+  const match = errorText(err).match(networkErrnoPattern);
+  return match?.[1]?.toUpperCase() ?? null;
 };
 
 /**
@@ -343,12 +395,14 @@ export const makeRefresher = (opts: {
         .trigger()
         .then(() => {
           lastErrorClass = null;
+          lastRefreshErrorClasses.set(opts.slug, null);
           consecutiveFailures = 0;
           counters.ok++;
           if (cooldownMs > 0) cooldownUntil = Date.now() + cooldownMs;
         })
         .catch((err: unknown) => {
           lastErrorClass = classifyRefreshError(err);
+          lastRefreshErrorClasses.set(opts.slug, lastErrorClass);
           consecutiveFailures++;
           counters.fail++;
           const triggerError =
@@ -359,6 +413,14 @@ export const makeRefresher = (opts: {
             MAX_REFRESH_FAILURE_BACKOFF_MS,
           );
           failureBackoffUntil = Date.now() + failureBackoffMs;
+          if (lastErrorClass === "network") {
+            logWarn("refresh", "codex token refresh failed: network", {
+              provider: opts.slug,
+              errno: triggerError?.errno ?? networkErrno(err),
+              retry_in_ms: failureBackoffMs,
+            });
+            return;
+          }
           logWarn("refresh", "native refresh trigger failed", {
             provider: opts.slug,
             label: opts.label,

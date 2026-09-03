@@ -294,6 +294,9 @@ export const handleRtcOffer = async (frame: {
     logWarn("rtc-host", "bad fingerprint_proof (open failed)", {
       channelId: frame.channel_id,
     });
+    // The sealed proof cannot reveal which key was used. Its failure does tell
+    // the offerer to refresh a possibly stale cloud identity pin, so fail fast.
+    sendNack(frame.channel_id, "proof_open_failed");
     return;
   }
   const inner = decodeOfferInner(opened);

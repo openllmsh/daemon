@@ -22,6 +22,7 @@ import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { getCliState } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
+import { hasIdentityConflict } from "./identity-state";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
@@ -83,8 +84,7 @@ const applyAuthLiteral = (
   conn: TDaemonProviderConnection,
 ): TDaemonProviderConnection => {
   const last = lastKnownConnections.get(slug);
-  const inFlight =
-    isSubscriptionSlug(slug) && loginSlot(slug).inFlight();
+  const inFlight = isSubscriptionSlug(slug) && loginSlot(slug).inFlight();
   const indeterminate = conn.detail === STATUS_CHECK_FAILED_DETAIL;
   // Determinate = this tick's vendor read, not last-known overlay.
   const determinate = !inFlight && !indeterminate;
@@ -188,9 +188,9 @@ const boundedDelegateStatus = async (
     ]);
     if (!timedOut) {
       timedOutSlugs.delete(slug);
-      if (result.detail === STATUS_CHECK_FAILED_DETAIL) {
-        return statusFailure(slug);
-      }
+      // A determinate delegate can establish CLI presence even when its
+      // credential/store check failed. Keep its fields intact; only timeout,
+      // throw, and single-flight collision use the field-omitting fallback.
     }
     return result;
   } finally {
@@ -302,6 +302,7 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     pty_sessions: ptySessionsEnabled(),
     cloud_state: getCloudState(),
     pubkey: daemonPublicKey(),
+    identity_conflict: hasIdentityConflict() || undefined,
     port: daemonPort(),
     sandbox: sandboxState(),
     caps: currentDaemonCaps(),

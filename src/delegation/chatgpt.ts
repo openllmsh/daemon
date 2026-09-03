@@ -50,6 +50,7 @@ import { loginSlot } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
+  lastRefreshErrorClass,
   makeRefresher,
   REFRESH_COOLDOWN_MS,
   resolveToken,
@@ -260,6 +261,20 @@ const IN_PROGRESS_DETAIL =
 const isInstalled = async (): Promise<boolean> =>
   (await cliInstallState(PROVIDER)).installed;
 const isConnected = async (): Promise<boolean> => (await readToken()) !== null;
+
+/** Explain a transient near-expiry refresh failure without treating its token as a logout. */
+export const chatgptRefreshDetail = (accessToken: string): string | null => {
+  const expiresAtMs = jwtExpiryMs(accessToken);
+  if (expiresAtMs === null || expiresAtMs - Date.now() > REFRESH_LEEWAY_MS) {
+    return null;
+  }
+  const errorClass = lastRefreshErrorClass(PROVIDER);
+  if (errorClass === "network" || errorClass === "timeout") {
+    return `signed in; token refresh failing (${errorClass}) — retrying`;
+  }
+  return null;
+};
+
 // Device-code lands the credential on THIS box; refresh the auth config (a CLI
 // update can rotate the upstream URL / token endpoint / client id), exactly as
 // the browser flow does. Best-effort + non-blocking.
@@ -363,6 +378,8 @@ export const chatgptDelegate: TProviderDelegate = {
     }
     const token = installed ? await readToken() : null;
     if (token !== null) clearPendingAuth(PROVIDER);
+    const connectedDetail =
+      token !== null ? chatgptRefreshDetail(token.accessToken) : null;
     const pending = token === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
@@ -392,6 +409,7 @@ export const chatgptDelegate: TProviderDelegate = {
           }
         : {
             last_login_at_ms: null,
+            ...(connectedDetail !== null ? { detail: connectedDetail } : {}),
             // Stable ChatGPT account identity, hashed (`account-id.ts`) —
             // `tokens.account_id` in auth.json (the same uuid as the
             // id_token's `chatgpt_account_id` claim; survives refresh).

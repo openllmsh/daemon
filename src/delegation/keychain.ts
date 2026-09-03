@@ -33,8 +33,8 @@
 import { existsSync, statSync } from "node:fs";
 import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
-import { dirname, join } from "node:path";
-import { logError } from "../logger";
+import { basename, dirname, join } from "node:path";
+import { logError, logInfo, logWarn } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { bindAbort, logIfKilled, spawnCwd } from "./spawn";
@@ -373,6 +373,10 @@ const inFlightKeychainReads = new Map<
 // path per process — launchd KeepAlive resets it on restart).
 const healedKeychains = new Set<string>();
 
+// First existing-chain unlock logged once per path per process. This is the
+// boot breadcrumb that distinguishes a healthy unlock from a self-heal.
+const initialExistingKeychainUnlocks = new Set<string>();
+
 // A chain whose empty-password unlock is auth-failed AND whose recreate also
 // failed: give up until restart. `ensureKeychainReady` short-circuits on these
 // with ZERO spawns, so a hopeless chain stops re-prompting every 2.5s.
@@ -405,22 +409,82 @@ const logSelfHeal = (kc: string): void =>
     { keychain: kc },
   );
 
+/** The positive classifier token, preserving the established matching order. */
+export const matchUnlockFailureToken = (stderr: string): string | null => {
+  const s = stderr.toLowerCase();
+  if (s.includes("-25293")) return "-25293";
+  if (s.includes("-25295")) return "-25295";
+  if (s.includes("passphrase you entered")) return "passphrase you entered";
+  if (s.includes("username or passphrase")) return "username or passphrase";
+  return null;
+};
+
+/** Keep stderr evidence useful without retaining passwords or directory paths. */
+export const redactSecurityStderr = (stderr: string): string => {
+  const withoutPasswords = stderr
+    // Quoted values may carry escaped quotes (`-p "a\"b"`): consume `\.`
+    // pairs inside the quotes so the whole value is replaced, never a tail.
+    .replace(
+      /(^|\s)(-p|--password)=(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S*)/g,
+      "$1$2=[redacted]",
+    )
+    .replace(
+      /(^|\s)(-p|--password)\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/g,
+      "$1$2 [redacted]",
+    )
+    .replace(/(^|\s)(?:-p|--password)(?=\s*$)/g, "$1")
+    // Keep the established excerpt for the common trailing `-p value` form.
+    .replace(/\s+-p \[redacted\]$/, "");
+  const pathBasename = (path: string): string => {
+    const value = path.trim();
+    const name = basename(value);
+    return name.length > 0 ? name : "<path>";
+  };
+  const knownHomePath =
+    /(?:\/Users\/|\/home\/|\/var\/|\/private\/|\/tmp\/|~\/)[\s\S]*?(?=\s+(?=-{1,2}[A-Za-z])|\s+(?=(?:\/Users\/|\/home\/|\/var\/|\/private\/|\/tmp\/|~\/))|$)/g;
+
+  return withoutPasswords
+    .replace(/(["'])((?:\/|~\/)[\s\S]*?)\1/g, (_match, _quote, path) =>
+      pathBasename(path),
+    )
+    .replace(knownHomePath, pathBasename)
+    .replace(/(?:\/|~\/)[^\s"'`]+/g, pathBasename)
+    .trim()
+    .slice(0, 200);
+};
+
 /** errSecAuthFailed (-25293) / errSecInvalidKeychain (-25295) / the passphrase
  *  message ⇒ the empty password genuinely no longer works (recreate).
  *  Everything else — incl. an empty stderr the sandbox shim may swallow, a
  *  user-canceled (-128), or interaction-not-allowed (-25308) — is treated as
  *  TRANSIENT: do NOT recreate (fail-safe; the readiness gate already prevents
  *  any prompt), so a transient securityd hiccup never nukes a good credential. */
-const classifyUnlockFailure = (stderr: string): "auth" | "transient" => {
-  const s = stderr.toLowerCase();
-  if (
-    s.includes("-25293") ||
-    s.includes("-25295") ||
-    s.includes("passphrase you entered") ||
-    s.includes("username or passphrase")
-  )
-    return "auth";
-  return "transient";
+const classifyUnlockFailure = (stderr: string): "auth" | "transient" =>
+  matchUnlockFailureToken(stderr) === null ? "transient" : "auth";
+
+type TKeychainMetadata = {
+  readonly mtimeMs: number | null;
+  readonly size: number | null;
+};
+
+const keychainMetadata = (kc: string): TKeychainMetadata => {
+  try {
+    const { mtimeMs, size } = statSync(kc);
+    return { mtimeMs, size };
+  } catch {
+    return { mtimeMs: null, size: null };
+  }
+};
+
+const brokenKeychainCount = async (kc: string): Promise<number> => {
+  try {
+    const prefix = `${basename(kc)}.broken-`;
+    return (await readdir(dirname(kc))).filter((name) =>
+      name.startsWith(prefix),
+    ).length;
+  } catch {
+    return 0;
+  }
 };
 
 /** Create + configure the isolated login keychain at `kc`. macOS `securityd`
@@ -471,13 +535,18 @@ const createIsolatedKeychain = async (
   return existsSync(kc);
 };
 
+type TRecreateOutcome = {
+  readonly created: boolean;
+  readonly unlocked: boolean;
+};
+
 /** Rename the drifted chain aside (reversible, forensic), recreate fresh, and
- *  unlock. Returns whether the fresh chain unlocked with the empty password. */
+ *  unlock. Reports each outcome so recurring self-heals can be diagnosed. */
 const recreateIsolatedKeychain = async (
   home: string,
   kc: string,
   signal?: AbortSignal,
-): Promise<boolean> => {
+): Promise<TRecreateOutcome> => {
   const aside = `${kc}.broken-${process.pid}-${Date.now()}`;
   try {
     await rename(kc, aside);
@@ -490,8 +559,12 @@ const recreateIsolatedKeychain = async (
     }
   }
   logSelfHeal(kc);
-  if (!(await createIsolatedKeychain(home, kc, signal))) return false;
-  return runSecurity(["unlock-keychain", "-p", "", kc], home, signal);
+  const created = await createIsolatedKeychain(home, kc, signal);
+  const unlocked =
+    created &&
+    (await runSecurity(["unlock-keychain", "-p", "", kc], home, signal));
+  logWarn("keychain", "keychain self-heal outcome", { created, unlocked });
+  return { created, unlocked };
 };
 
 /** Ensure the isolated login keychain exists and is UNLOCKED for this call,
@@ -525,7 +598,11 @@ const ensureKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
-  if (!existsSync(kc)) {
+  const existedAtStart = existsSync(kc);
+  const isInitialExistingUnlock =
+    existedAtStart && !initialExistingKeychainUnlocks.has(kc);
+  if (isInitialExistingUnlock) initialExistingKeychainUnlocks.add(kc);
+  if (!existedAtStart) {
     if (!(await createIsolatedKeychain(home, kc, signal))) {
       // A later `claude auth login` would pop "Keychain Not Found" and wedge.
       logKeychainFailure(kc);
@@ -540,6 +617,11 @@ const ensureKeychainNow = async (
     stderr: "pipe",
     ...(signal !== undefined ? { signal } : {}),
   });
+  if (isInitialExistingUnlock) {
+    logInfo("keychain", "keychain initial empty-password unlock", {
+      unlocked: res.code === 0,
+    });
+  }
   if (res.code === 0) return noteUnlockSuccess(kc);
 
   // Caller abort (status-race cancel) is not a keychain fault — skip timeout
@@ -549,11 +631,22 @@ const ensureKeychainNow = async (
   }
   if (res.timedOut) return noteUnlockTimeout(kc);
 
+  const failureToken = matchUnlockFailureToken(res.stderr);
   if (classifyUnlockFailure(res.stderr) === "auth") {
     if (!healedKeychains.has(kc)) {
+      const metadata = keychainMetadata(kc);
+      logWarn("keychain", "keychain auth-drift evidence", {
+        classifier_token: failureToken,
+        exit_code: res.code,
+        stderr_length: res.stderr.length,
+        stderr_excerpt: redactSecurityStderr(res.stderr),
+        keychain_mtime_ms: metadata.mtimeMs,
+        keychain_size: metadata.size,
+        broken_count: await brokenKeychainCount(kc),
+      });
       healedKeychains.add(kc);
-      if (await recreateIsolatedKeychain(home, kc, signal))
-        return noteUnlockSuccess(kc);
+      const outcome = await recreateIsolatedKeychain(home, kc, signal);
+      if (outcome.unlocked) return noteUnlockSuccess(kc);
     }
     // Auth-drift and (already healed OR recreate failed) → terminal.
     unusableKeychains.add(kc);
@@ -605,6 +698,7 @@ export const ensureKeychainReady = async (
 export const resetKeychainStateForTests = (): void => {
   inFlightKeychains.clear();
   healedKeychains.clear();
+  initialExistingKeychainUnlocks.clear();
   unusableKeychains.clear();
   lastKeychainFailureLogMs.clear();
   unlockedUntilMs.clear();
