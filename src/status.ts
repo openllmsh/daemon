@@ -25,6 +25,7 @@ import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { getCliState } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
+import { authCooldownForProvider } from "./hop-cooldown";
 import { hasIdentityConflict } from "./identity-state";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
@@ -350,6 +351,21 @@ const rememberConnection = (
 };
 
 /**
+ * Visibility-only overlay: a live `auth` hop cooldown on a subscription
+ * slug. Attached AFTER {@link rememberConnection} so last-known never
+ * persists a transient cooldown. Does not rewrite status/observation.
+ */
+const attachUpstreamAuthCooldown = (
+  slug: string,
+  conn: TDaemonProviderConnection,
+): TDaemonProviderConnection => {
+  if (!isSubscriptionSlug(slug)) return conn;
+  const cooldown = authCooldownForProvider(slug);
+  if (cooldown === null) return conn;
+  return { ...conn, upstream_auth_cooldown: cooldown };
+};
+
+/**
  * Join the one per-slug status producer. Walkers and other local callers must
  * use this instead of `delegate.status()` so last-known and in-flight sharing
  * stay in one place.
@@ -374,10 +390,11 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
         );
         const conn = applyAuthLiteral(d.slug, raw);
         rememberConnection(d.slug, raw, conn);
+        const published = attachUpstreamAuthCooldown(d.slug, conn);
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
-        if (normalizeProviderConnection(conn).observation !== "connected")
-          return conn;
+        if (normalizeProviderConnection(published).observation !== "connected")
+          return published;
         // PEEK only — never hit the vendor here. `computeStatus` runs on every
         // status push (hello/reconnect, the periodic observer, post-command),
         // and the vendor usage endpoint rate-limits independently of inference;
@@ -386,8 +403,8 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
         // on demand — the `refresh` command → `refreshUsage` (the manual button
         // or the providers page mounting). Here we just attach whatever that last
         // on-demand read cached. See `usage-cache.ts`.
-        const usage = peekUsage(d.slug, conn.account_hash);
-        return usage === null ? conn : { ...conn, usage };
+        const usage = peekUsage(d.slug, published.account_hash);
+        return usage === null ? published : { ...published, usage };
       } catch (err) {
         // One provider's status read must NOT sink the whole snapshot (every
         // card would vanish + the push would fail). Surface a safe placeholder;
@@ -395,7 +412,7 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
         logWarn("status", `status() failed for ${d.slug}`, {
           err: err instanceof Error ? err.message : String(err),
         });
-        return statusFailure(d.slug);
+        return attachUpstreamAuthCooldown(d.slug, statusFailure(d.slug));
       }
     }),
   );

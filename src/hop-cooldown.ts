@@ -186,3 +186,35 @@ export const clearHopCooldown = (provider: string, modelId: string): void => {
 export const clearHopCooldowns = (): void => {
   marks.clear();
 };
+
+/** Soonest-expiring live `auth` cooldown for any model of `provider`. */
+export type TAuthCooldownForProvider = {
+  readonly until_ms: number;
+  readonly model_id: string;
+};
+
+/**
+ * Read-only: the soonest-expiring ACTIVE cooldown with reason `auth` for
+ * this provider (any model). Expired marks are dropped on read. Other
+ * reasons (`rate_limit`, `quota_exhausted`, …) are ignored.
+ */
+export const authCooldownForProvider = (
+  provider: string,
+  now: number = Date.now(),
+): TAuthCooldownForProvider | null => {
+  const prefix = `${provider}|`;
+  let soonest: TAuthCooldownForProvider | null = null;
+  for (const [k, entry] of marks) {
+    if (!k.startsWith(prefix)) continue;
+    if (entry.untilMs <= now) {
+      marks.delete(k);
+      continue;
+    }
+    if (entry.reason !== "auth") continue;
+    const model_id = k.slice(prefix.length);
+    if (soonest === null || entry.untilMs < soonest.until_ms) {
+      soonest = { until_ms: entry.untilMs, model_id };
+    }
+  }
+  return soonest;
+};
