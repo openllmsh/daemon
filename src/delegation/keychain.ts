@@ -77,6 +77,12 @@ type TSpawnMode = "ignore" | "pipe";
 /** Per-command ceiling; the caller's monotonic budget includes FIFO queue wait. */
 const DEFAULT_SECURITY_SPAWN_TIMEOUT_MS = 4_000;
 
+/** Do not start a `security` child with less than this remaining — a sliver
+ *  spawn just times out and logs. Capped by `securitySpawnTimeoutMs()` so
+ *  tests that inject a 20–30ms timeout still spawn at the head of an empty
+ *  lane. */
+export const KEYCHAIN_LANE_SPAWN_FLOOR_MS = 400;
+
 /** Per-call so tests can drive `OPENLLM_SECURITY_TIMEOUT_MS`. Finite + positive
  *  or the default. Dump/unlock on a one-cred isolated chain is fast. */
 const securitySpawnTimeoutMs = (): number => {
@@ -84,6 +90,20 @@ const securitySpawnTimeoutMs = (): number => {
   if (raw === undefined) return DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
+};
+
+const laneSpawnFloorMs = (): number =>
+  Math.min(KEYCHAIN_LANE_SPAWN_FLOOR_MS, securitySpawnTimeoutMs());
+
+/** Skip a spawn when remaining is below the floor, except when the floor
+ *  *is* the whole configured timeout (`min(400, 20) === 20`). In that case
+ *  1ms of scheduling would skip the empty-lane head — tests inject 20–30ms
+ *  and T14/T15 count those spawns. Full expiry still skips. */
+const remainingBelowSpawnFloor = (remainingMs: number): boolean => {
+  const configured = securitySpawnTimeoutMs();
+  const floor = laneSpawnFloorMs();
+  if (floor >= configured) return false;
+  return remainingMs < floor;
 };
 
 type TSecurityOutcome =
@@ -238,10 +258,14 @@ let macosKeychainLane: Promise<void> = Promise.resolve();
  * One FIFO lane for OpenLLM-issued `security` commands only. Vendor CLI
  * auth-status / refresh / login / logout talk to securityd themselves and must
  * not occupy this lane. Queue waiters that abort before spawn never start.
+ * `onSkip` is the typed skip: expiry or remaining below the spawn floor
+ * returns it instead of `operation()`, still releasing the slot after the
+ * predecessor settles so the lane cannot leak.
  */
 export const withMacosKeychainAccess = async <T>(
   operation: () => Promise<T>,
   budget?: TDeadlineBudget,
+  onSkip?: () => T,
 ): Promise<T> => {
   if (!MAC) return operation();
   const previous = macosKeychainLane;
@@ -256,10 +280,12 @@ export const withMacosKeychainAccess = async <T>(
   const waitPrev = previous.catch(() => {});
   if (budget !== undefined) {
     await Promise.race([waitPrev, waitUntilExpired(budget)]);
-    if (budget.expired()) {
+    const remaining = budget.remainingMs();
+    if (budget.expired() || remainingBelowSpawnFloor(remaining)) {
       void waitPrev.finally(() => {
         release();
       });
+      if (onSkip !== undefined) return onSkip();
       return operation();
     }
   }
@@ -412,18 +438,24 @@ const spawnSecurity = async (
     parentBudget?.child(securitySpawnTimeoutMs()) ??
     createDeadlineBudget(securitySpawnTimeoutMs(), opts.signal);
   const queuedAtMs = Date.now();
-  return withMacosKeychainAccess(async () => {
-    if (budget.expired()) {
-      if (opts.signal?.aborted === true) keychainCounters.aborted++;
-      else keychainCounters.skipped_expired++;
-      return {
-        ...FAILED_SPAWN,
-        timedOut: opts.signal?.aborted !== true,
-        aborted: opts.signal?.aborted === true,
-      };
+  const skippedSpawn = (): TSecurityResult => {
+    if (opts.signal?.aborted === true) {
+      keychainCounters.aborted++;
+      return { ...FAILED_SPAWN, timedOut: false, aborted: true };
     }
-    return spawnSecurityNow(argv, home, opts, budget, queuedAtMs);
-  }, budget);
+    keychainCounters.skipped_expired++;
+    return { ...FAILED_SPAWN, timedOut: true, aborted: false };
+  };
+  return withMacosKeychainAccess(
+    async () => {
+      if (budget.expired() || remainingBelowSpawnFloor(budget.remainingMs())) {
+        return skippedSpawn();
+      }
+      return spawnSecurityNow(argv, home, opts, budget, queuedAtMs);
+    },
+    budget,
+    skippedSpawn,
+  );
 };
 
 /** Boolean convenience over `spawnSecurity` for the fire-and-check callers. */
