@@ -171,7 +171,19 @@ export const bindAbort = (
 
 type TCaptureOutcome =
   | { readonly kind: "complete"; readonly out: string; readonly code: number }
-  | { readonly kind: "timeout" };
+  | { readonly kind: "timeout" }
+  | { readonly kind: "aborted" };
+
+type TCaptureCompleteHook = () => void;
+
+let captureCompleteHookForTests: TCaptureCompleteHook | null = null;
+
+/** Test-only: run after `complete` settles, before `Promise.race` reactions. */
+export const setCaptureCompleteHookForTests = (
+  hook: TCaptureCompleteHook | null,
+): void => {
+  captureCompleteHookForTests = hook;
+};
 
 /**
  * Run a command and capture trimmed stdout (best-effort). Returns null on
@@ -221,9 +233,7 @@ export const runCapture = async (
       createDeadlineBudget(configuredTimeoutMs, opts?.signal);
     const remainingAtSpawn = budget.remainingMs();
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let aborted = false;
     const unbind = bindAbort(opts?.signal, () => {
-      aborted = true;
       void child.terminate(splitReapBudget(budget.remainingMs()));
     });
     let unbindAbortWait = (): void => {};
@@ -245,34 +255,51 @@ export const runCapture = async (
           ? null
           : new Promise<TCaptureOutcome>((resolve) => {
               unbindAbortWait = bindAbort(opts.signal, () =>
-                resolve({ kind: "timeout" }),
+                resolve({ kind: "aborted" }),
               );
             });
+      if (captureCompleteHookForTests !== null) {
+        const hook = captureCompleteHookForTests;
+        void complete.then(() => {
+          hook();
+        });
+      }
       const outcome = await Promise.race(
         abortWait === null
           ? [complete, timeout]
           : [complete, timeout, abortWait],
       );
-      if (outcome.kind === "timeout" || aborted) {
-        // Abort is the caller's choice, not a ceiling — log only a real timeout.
-        if (outcome.kind === "timeout" && !aborted) {
-          logWarn("spawn", "capture timed out", {
-            configured_timeout_ms: configuredTimeoutMs,
-            spawn_elapsed_ms: performance.now() - spawnedAtMs,
-            budget_remaining_ms_at_spawn: remainingAtSpawn,
-            child_pid: typeof proc.pid === "number" ? proc.pid : null,
-            tick_id: currentTickId(),
-            kind: spawnOptions.kind,
-            probe: opts?.probe === true,
-            argv: redactSensitiveArgv(argv),
-          });
-        }
+      // Race winner is authoritative. Unbind before branching so a late abort
+      // cannot flip the shared flag and discard a completed stdout.
+      unbind();
+      unbindAbortWait();
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (outcome.kind === "timeout") {
+        logWarn("spawn", "capture timed out", {
+          configured_timeout_ms: configuredTimeoutMs,
+          spawn_elapsed_ms: performance.now() - spawnedAtMs,
+          budget_remaining_ms_at_spawn: remainingAtSpawn,
+          child_pid: typeof proc.pid === "number" ? proc.pid : null,
+          tick_id: currentTickId(),
+          kind: spawnOptions.kind,
+          probe: opts?.probe === true,
+          argv: redactSensitiveArgv(argv),
+        });
+        await child.terminate(splitReapBudget(budget.remainingMs()));
+        return null;
+      }
+      if (outcome.kind === "aborted") {
         await child.terminate(splitReapBudget(budget.remainingMs()));
         return null;
       }
       // `probe:true` runs UNWRAPPED — a signal death there is not a sandbox
       // denial (this was the mislabeled `--version` status-probe drain).
-      logIfKilled(argv, proc, { confined: opts?.probe !== true });
+      logIfKilled(redactSensitiveArgv(argv), proc, {
+        confined: opts?.probe !== true,
+      });
       if (outcome.code !== 0) return null;
       const trimmed = outcome.out.trim();
       return trimmed.length > 0 ? trimmed : null;
