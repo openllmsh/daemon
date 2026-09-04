@@ -19,7 +19,8 @@ import {
   createDeadlineBudget,
   splitReapBudget,
 } from "../deadline-budget";
-import { logError } from "../logger";
+import { logError, logWarn } from "../logger";
+import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
 
@@ -140,6 +141,17 @@ const MIN_CAPTURE_TIMEOUT_MS = 250;
 const captureTimeoutMs = (timeoutMs: number | undefined): number =>
   Math.max(MIN_CAPTURE_TIMEOUT_MS, timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS);
 
+/** Secret-bearing option VALUES (`-p`/`-w`/`-k`) redacted for logs. No
+ *  `runCapture` caller currently passes tokens, but the same flags that
+ *  `keychain.ts` redacts are stripped here so a future argv cannot leak. */
+const redactCaptureArgv = (argv: ReadonlyArray<string>): string[] =>
+  argv.map((arg, i) =>
+    i > 0 &&
+    (argv[i - 1] === "-w" || argv[i - 1] === "-p" || argv[i - 1] === "-k")
+      ? "<redacted>"
+      : arg,
+  );
+
 export type TRunCaptureOpts = {
   /** Skip the sandbox shim for a read-only probe that needs direct execution. */
   readonly probe?: boolean;
@@ -206,15 +218,18 @@ export const runCapture = async (
       spawnOptions,
     );
     const proc = child.subprocess;
+    const spawnedAtMs = Date.now();
     const stdout = proc.stdout;
     if (stdout === undefined || typeof stdout === "number") {
       await child.terminate();
       return null;
     }
+    const configuredTimeoutMs = captureTimeoutMs(opts?.timeoutMs);
     const parentBudget = budgetFromSignal(opts?.signal);
     const budget =
-      parentBudget?.child(captureTimeoutMs(opts?.timeoutMs)) ??
-      createDeadlineBudget(captureTimeoutMs(opts?.timeoutMs), opts?.signal);
+      parentBudget?.child(configuredTimeoutMs) ??
+      createDeadlineBudget(configuredTimeoutMs, opts?.signal);
+    const remainingAtSpawn = budget.remainingMs();
     let timer: ReturnType<typeof setTimeout> | null = null;
     let aborted = false;
     const unbind = bindAbort(opts?.signal, () => {
@@ -246,6 +261,19 @@ export const runCapture = async (
           : [complete, timeout, abortWait],
       );
       if (outcome.kind === "timeout" || aborted) {
+        // Abort is the caller's choice, not a ceiling — log only a real timeout.
+        if (outcome.kind === "timeout" && !aborted) {
+          logWarn("spawn", "capture timed out", {
+            configured_timeout_ms: configuredTimeoutMs,
+            spawn_elapsed_ms: Date.now() - spawnedAtMs,
+            budget_remaining_ms_at_spawn: remainingAtSpawn,
+            child_pid: typeof proc.pid === "number" ? proc.pid : null,
+            tick_id: currentTickId(),
+            kind: spawnOptions.kind,
+            probe: opts?.probe === true,
+            argv: redactCaptureArgv(argv),
+          });
+        }
         await child.terminate(splitReapBudget(budget.remainingMs()));
         return null;
       }
