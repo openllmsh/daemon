@@ -21,6 +21,17 @@
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
 
+// MUST be the entrypoint's FIRST import. `@peculiar/x509` (pulled in by
+// `werift`, our RTC stack) constructs a `tsyringe` DI container at module load,
+// and tsyringe THROWS unless `Reflect.getMetadata` already exists. x509's own
+// ESM build imports this polyfill, but `bun build --compile` drops that
+// side-effect-only import, so the compiled binary died on boot with "tsyringe
+// requires a reflect polyfill" while `bun run` from source was fine. Importing
+// it here — from the entry, ahead of the RTC import chain — is the fix the
+// tsyringe error message itself prescribes. `tests/daemon/compiled-boot.test.ts`
+// guards it.
+import "reflect-metadata";
+
 import { isStreamResetError } from "@openllmsh/tunnel";
 import {
   guardCrashLoop,
