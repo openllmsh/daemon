@@ -489,18 +489,30 @@ const noteKeychainIoResult = (kc: string, res: TSecurityResult): void => {
   }
 };
 
-const parseAutoLockOff = (stdout: string): boolean | null => {
-  const lower = stdout.toLowerCase();
-  if (
-    !lower.includes("lock-on-sleep") ||
-    !lower.includes("lock-after-timeout")
-  ) {
-    return null;
-  }
-  const flagOff = (name: string): boolean =>
-    new RegExp(`${name}\\s*[:=]\\s*(off|false|no|0)\\b`).test(lower);
-  if (flagOff("lock-on-sleep") && flagOff("lock-after-timeout")) return true;
-  return false;
+/** Parse `security show-keychain-info`. The grammar is POSITIONAL, not
+ *  `name: value` — verified against macOS 15 (`security` writes this line to
+ *  **stderr**, so pass both streams):
+ *
+ *      Keychain "x.keychain-db" no-timeout                 → auto-lock OFF
+ *      Keychain "x.keychain-db" lock-on-sleep no-timeout   → locks on sleep
+ *      Keychain "x.keychain-db" timeout=900s               → idle auto-lock
+ *      Keychain "x.keychain-db" lock-on-sleep timeout=300s → both (the default)
+ *
+ *  Auto-lock is off IFF `no-timeout` is present AND `lock-on-sleep` is not.
+ *  Our own chains are created with a bare `set-keychain-settings`, which yields
+ *  the first form. Returns `null` when the output is not recognisable at all,
+ *  so an inconclusive probe is never cached as a verdict. */
+export const parseAutoLockOffForTests = (out: string): boolean | null =>
+  parseAutoLockOff(out);
+
+const parseAutoLockOff = (out: string): boolean | null => {
+  const lower = out.toLowerCase();
+  const noTimeout = lower.includes("no-timeout");
+  const hasTimeout = /timeout=\d+s/.test(lower);
+  // Neither token ⇒ this is not show-keychain-info output (empty, an error, a
+  // future format). Unknown is NOT "auto-lock on".
+  if (!noTimeout && !hasTimeout) return null;
+  return noTimeout && !lower.includes("lock-on-sleep");
 };
 
 const confirmAutoLockOff = async (
@@ -518,11 +530,18 @@ const confirmAutoLockOff = async (
   noteKeychainIoResult(kc, res);
   const parsed =
     res.code === 0 && !res.timedOut && !res.aborted
-      ? parseAutoLockOff(res.stdout)
+      ? // `security` prints this line on STDERR; stdout is empty. Read both so
+        // the parse does not depend on which stream macOS chooses.
+        parseAutoLockOff(`${res.stderr}\n${res.stdout}`)
       : null;
-  const off = parsed === true;
-  autoLockOffByKc.set(kc, off);
-  return off;
+  // Cache only a CONCLUSIVE verdict. A timeout, abort, non-zero exit or
+  // unrecognised output must not poison the cache with `false`: that is
+  // process-lifetime state, so one transient failure would disable the skip for
+  // this chain until the daemon restarts — and the caller already treats
+  // "not confirmed" as "do not skip" for this call.
+  if (parsed === null) return false;
+  autoLockOffByKc.set(kc, parsed);
+  return parsed;
 };
 
 const recordUnlockSuccessForSkip = (kc: string): void => {
