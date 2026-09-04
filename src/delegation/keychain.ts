@@ -760,16 +760,29 @@ export const ensureIsolatedKeychain = async (
 ): Promise<TStoreRead<void>> => ensureKeychainReady(home);
 
 /**
+ * `security set-key-partition-list` matched no item. `-s` selects symmetric
+ * KEYS, but every vendor CLI we host stores its credential as a generic
+ * PASSWORD (`class: "genp"`) — a keychain holding only those has no key to
+ * partition, so `security` exits 1 with this. That is "nothing to grant", NOT a
+ * refusal: the credential is still readable prompt-free. Reporting it as a
+ * failure false-fails an otherwise healthy login.
+ */
+const noKeyToPartition = (stderr: string): boolean =>
+  /SecItemCopyMatching/i.test(stderr) &&
+  /could not be found in the keychain/i.test(stderr);
+
+/**
  * macOS only: grant command-line tools prompt-free access to the items in
  * the isolated keychain. Run AFTER a login writes them. Gated on readiness.
- * Returns whether the partition-list grant succeeded (true off macOS).
+ * Returns whether the keychain ended up in the granted state (true off macOS,
+ * and true when there was no key to partition — see {@link noKeyToPartition}).
  */
 export const grantKeychainToolAccess = async (
   home: string,
 ): Promise<boolean> => {
   if (!MAC) return true;
   if ((await ensureKeychainReady(home)).kind !== "present") return false;
-  return runSecurity(
+  const res = await spawnSecurity(
     [
       "set-key-partition-list",
       "-S",
@@ -780,7 +793,20 @@ export const grantKeychainToolAccess = async (
       loginKeychainPath(home),
     ],
     home,
+    { stdout: "ignore", stderr: "pipe" },
   );
+  if (res.code === 0) return true;
+  if (noKeyToPartition(res.stderr)) {
+    logInfo("keychain", "no key to partition — grant not needed", {
+      keychain_path: loginKeychainPath(home),
+    });
+    return true;
+  }
+  logWarn("keychain", "partition-list grant failed", {
+    exit_code: res.code,
+    stderr_excerpt: redactSecurityStderr(res.stderr),
+  });
+  return false;
 };
 
 /**
