@@ -8,6 +8,11 @@
  * without rewriting the last-known literal.
  *
  * Cold start (`disconnected` with no prior `connected`) is not a loss.
+ *
+ * Consecutive `observation === "unknown"` ticks after a last-known
+ * `connected` emit `auth.liveness.degraded` once at
+ * {@link UNKNOWN_ESCALATION_TICKS}. That event is local-only: it never
+ * drives the cloud session-lost POST.
  */
 import type {
   TAuthSessionLostDiagnosticCode,
@@ -36,8 +41,14 @@ export type TAuthLossEdge = {
   readonly next: TAuthStatusBaseline;
 };
 
+/** Consecutive unknown ticks that escalate to `auth.liveness.degraded`. */
+export const UNKNOWN_ESCALATION_TICKS = 3;
+
 /** Last observed auth-status literal per subscription slug. */
 const lastStatus = new Map<string, TAuthStatusBaseline>();
+
+/** Consecutive `observation === "unknown"` ticks per slug. */
+const unknownStreak = new Map<string, number>();
 
 /**
  * Map free-form `conn.detail` to a bounded diagnostic code. Never returns
@@ -124,10 +135,38 @@ export const detectAuthLossEdge = (
  * `connected → disconnected` with no in-flight login. Best-effort: `emitAuth`
  * is a no-op when the control channel is not running.
  */
+const wasLastKnownConnected = (slug: string): boolean =>
+  lastStatus.get(slug)?.status === "connected";
+
+const noteUnknownLiveness = (conn: TDaemonProviderConnection): void => {
+  const slug = conn.provider;
+  if (!isSubscriptionSlug(slug)) return;
+  const normalized = normalizeProviderConnection(conn);
+  if (normalized.observation === "unknown") {
+    if (!wasLastKnownConnected(slug)) return;
+    const consecutive = (unknownStreak.get(slug) ?? 0) + 1;
+    unknownStreak.set(slug, consecutive);
+    if (consecutive !== UNKNOWN_ESCALATION_TICKS) return;
+    emitAuth({
+      event: "auth.liveness.degraded",
+      key_id: daemonApiKeyId() ?? "local",
+      slug,
+      consecutive_unknown: consecutive,
+      ...(normalized.reason_code !== undefined
+        ? { reason_code: normalized.reason_code }
+        : {}),
+    });
+    return;
+  }
+  if (normalized.pending) return;
+  unknownStreak.delete(slug);
+};
+
 export const noteConnectionsForSessionLost = (
   connections: ReadonlyArray<TDaemonProviderConnection>,
 ): void => {
   for (const conn of connections) {
+    noteUnknownLiveness(conn);
     const edge = detectAuthLossEdge(lastStatus.get(conn.provider), conn);
     if (edge === null) continue;
     if (edge.lost) {
@@ -156,4 +195,5 @@ export const noteConnectionsForSessionLost = (
 /** Test-only: the trackers are process-global and leak across suites. */
 export const resetSessionLostTrackerForTests = (): void => {
   lastStatus.clear();
+  unknownStreak.clear();
 };
