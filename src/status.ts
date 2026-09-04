@@ -247,7 +247,6 @@ const awaitProducer = async (
         phase: "delegate_status",
         timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
         elapsed_ms: Date.now() - observerStarted,
-        producer_still_running: !settled,
         joined,
         cancellable: !SIGNAL_LESS_STATUS_SLUGS.has(slug),
         tick_id: currentTickId(),

@@ -315,7 +315,6 @@ const spawnSecurityNow = async (
   const verb = securityVerb(argv);
   const laneWaitMs = Math.max(0, Date.now() - queuedAtMs);
   const remainingAtSpawn = budget.remainingMs();
-  const spawnedAfterExpired = budget.expired();
   const configuredTimeoutMs = securitySpawnTimeoutMs();
   try {
     const child = superviseSpawn(
@@ -398,7 +397,6 @@ const spawnSecurityNow = async (
             lane_wait_ms: laneWaitMs,
             budget_remaining_ms_at_spawn: remainingAtSpawn,
             spawn_elapsed_ms: Date.now() - spawnedAtMs,
-            spawned_after_expired: spawnedAfterExpired,
             verb,
             child_pid: child.pid,
             tick_id: currentTickId(),
@@ -750,15 +748,11 @@ export const redactSecurityStderr = (stderr: string): string => {
     .slice(0, 200);
 };
 
-/** errSecAuthFailed (-25293) / errSecInvalidKeychain (-25295) / the passphrase
- *  message ⇒ the empty password genuinely no longer works (recreate).
- *  Everything else — incl. an empty stderr the sandbox shim may swallow, a
- *  user-canceled (-128), or interaction-not-allowed (-25308) — is treated as
- *  TRANSIENT: do NOT recreate (fail-safe; the readiness gate already prevents
- *  any prompt), so a transient securityd hiccup never nukes a good credential. */
-const classifyUnlockFailure = (stderr: string): "auth" | "transient" =>
-  matchUnlockFailureToken(stderr) === null ? "transient" : "auth";
-
+/** A non-null `matchUnlockFailureToken` is auth-drift (recreate). Everything
+ *  else — empty stderr the sandbox shim may swallow, user-canceled (-128), or
+ *  interaction-not-allowed (-25308) — is TRANSIENT: do NOT recreate (fail-safe;
+ *  the readiness gate already prevents any prompt), so a transient securityd
+ *  hiccup never nukes a good credential. */
 type TKeychainMetadata = {
   readonly mtimeMs: number | null;
   readonly size: number | null;
@@ -1012,7 +1006,7 @@ const ensureKeychainNow = async (
   }
 
   const failureToken = matchUnlockFailureToken(res.stderr);
-  if (classifyUnlockFailure(res.stderr) === "auth") {
+  if (failureToken !== null) {
     invalidateUnlockSkip(kc);
     if (!healedKeychains.has(kc)) {
       const metadata = keychainMetadata(kc);
