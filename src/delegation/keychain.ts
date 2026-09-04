@@ -47,6 +47,7 @@ import { logError, logInfo, logWarn } from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { redactSensitiveArgv } from "./redact-sensitive-argv";
 import { bindAbort, logIfKilled, spawnCwd } from "./spawn";
 import type { TStoreRead } from "./util";
 
@@ -59,18 +60,6 @@ const READY: TStoreRead<void> = { kind: "present", value: undefined };
 
 const loginKeychainPath = (home: string): string =>
   join(home, "Library", "Keychains", "login.keychain-db");
-
-/** The argv with secret-bearing option VALUES redacted for logging: `-w`
- *  carries the OAuth credential payload (`add-generic-password`), `-p` a
- *  keychain password, `-k` the partition-list unlock password — none may
- *  reach `openllmd.err.log`. */
-const redactSecurityArgv = (argv: ReadonlyArray<string>): string[] =>
-  argv.map((arg, i) =>
-    i > 0 &&
-    (argv[i - 1] === "-w" || argv[i - 1] === "-p" || argv[i - 1] === "-k")
-      ? "<redacted>"
-      : arg,
-  );
 
 type TSpawnMode = "ignore" | "pipe";
 
@@ -328,11 +317,12 @@ const spawnSecurityNow = async (
         env: { ...process.env, HOME: home },
       },
     );
+    const spawnedAtMs = performance.now();
     keychainCounters.attempts++;
     noteKeychainVerb(verb);
-    const spawnedAtMs = Date.now();
     const proc = child.subprocess;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let unbindAbortWait = (): void => {};
     const readPiped = async (
       stream: unknown,
       mode: TSpawnMode,
@@ -368,7 +358,9 @@ const spawnSecurityNow = async (
         opts.signal === undefined
           ? null
           : new Promise<TSecurityOutcome>((resolve) => {
-              bindAbort(opts.signal, () => resolve({ kind: "aborted" }));
+              unbindAbortWait = bindAbort(opts.signal, () =>
+                resolve({ kind: "aborted" }),
+              );
             });
       const outcome = await Promise.race(
         abortWait === null
@@ -386,17 +378,17 @@ const spawnSecurityNow = async (
         }
         if (reap === "reap_unconfirmed") {
           logError("keychain", "security command did not reap after SIGKILL", {
-            argv: redactSecurityArgv(["security", ...argv]),
+            argv: redactSensitiveArgv(["security", ...argv]),
           });
         }
         if (outcome.kind === "timeout") {
           keychainCounters.timeouts++;
           logError("keychain", "security command timed out", {
-            argv: redactSecurityArgv(["security", ...argv]),
+            argv: redactSensitiveArgv(["security", ...argv]),
             configured_timeout_ms: configuredTimeoutMs,
             lane_wait_ms: laneWaitMs,
             budget_remaining_ms_at_spawn: remainingAtSpawn,
-            spawn_elapsed_ms: Date.now() - spawnedAtMs,
+            spawn_elapsed_ms: performance.now() - spawnedAtMs,
             verb,
             child_pid: child.pid,
             tick_id: currentTickId(),
@@ -406,7 +398,7 @@ const spawnSecurityNow = async (
         keychainCounters.aborted++;
         return { ...FAILED_SPAWN, timedOut: false, aborted: true };
       }
-      logIfKilled(redactSecurityArgv(["security", ...argv]), proc, {
+      logIfKilled(redactSensitiveArgv(["security", ...argv]), proc, {
         confined: unwrapKeychainSpawn() !== true,
       });
       if (outcome.code === 0) keychainCounters.complete_ok++;
@@ -419,6 +411,7 @@ const spawnSecurityNow = async (
         aborted: false,
       };
     } finally {
+      unbindAbortWait();
       if (timer !== null) clearTimeout(timer);
     }
   } catch {
