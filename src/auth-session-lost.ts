@@ -15,6 +15,7 @@ import type {
   TDaemonProviderConnection,
   TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
+import { normalizeProviderConnection } from "@openllmsh/protocol";
 import { emitAuth } from "./auth-events";
 import { isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
@@ -96,8 +97,13 @@ export const detectAuthLossEdge = (
   const slug = conn.provider;
   if (!isSubscriptionSlug(slug)) return null;
   if (loginSlot(slug).inFlight()) return null;
-  if (conn.detail === STATUS_CHECK_FAILED_DETAIL) return null;
-  const nextStatus = conn.status;
+  const normalized = normalizeProviderConnection(conn);
+  if (normalized.observation === "unknown" || normalized.pending) return null;
+  const nextStatus = normalized.signed_out
+    ? "signed_out"
+    : normalized.observation === "connected"
+      ? "connected"
+      : "disconnected";
   const lost = prev?.status === "connected" && nextStatus === "disconnected";
   const accountHash = conn.account_hash ?? prev?.accountHash;
   return {

@@ -439,7 +439,7 @@ const sleep = (ms: number): Promise<void> =>
  * Samples `isConnected` once, then ONE bounded re-read if false. Emits
  * `auth.login.succeeded` or `auth.login.failed` and triggers a status push —
  * the connect command has already acked, so without this the card waits for
- * the 2.5s watcher.
+ * the next periodic status observation.
  */
 export const finishInBackground = async (opts: {
   readonly provider: string;

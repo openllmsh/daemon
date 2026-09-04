@@ -1,6 +1,8 @@
-import { logError } from "../logger";
+import { logError, logWarn } from "../logger";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
+import type { TReapOutcome } from "./posix";
 import {
+  DEFAULT_FINAL_REAP_MS,
   DEFAULT_TERMINATE_GRACE_MS,
   signalGroup,
   terminateProcessGroup,
@@ -30,23 +32,33 @@ export type TSuperviseSpawnOptions = Omit<
 
 export type TTerminateOptions = {
   readonly graceMs?: number;
+  readonly finalReapMs?: number;
 };
 
 export type TSupervisedChild = {
   readonly subprocess: ReturnType<typeof Bun.spawn>;
   readonly pid: number;
   readonly pgid: number;
-  readonly terminate: (opts?: TTerminateOptions) => Promise<void>;
+  readonly terminate: (opts?: TTerminateOptions) => Promise<TReapOutcome>;
   readonly beginTask: () => () => void;
 };
 
 type TTrackedChild = {
   readonly handle: TSupervisedChild;
-  terminating: Promise<void> | null;
+  terminating: Promise<TReapOutcome> | null;
   activeTasks: number;
 };
 
 const trackedChildren = new Map<number, TTrackedChild>();
+
+type TExitWait = (child: TSupervisedChild) => Promise<void>;
+
+let exitWaitOverride: TExitWait | null = null;
+
+/** Test-only: replace the Bun `proc.exited` wait (never-settling exit cases). */
+export const setSupervisedExitWaitForTests = (wait: TExitWait | null): void => {
+  exitWaitOverride = wait;
+};
 
 const exited = async (child: TSupervisedChild): Promise<void> => {
   try {
@@ -56,45 +68,85 @@ const exited = async (child: TSupervisedChild): Promise<void> => {
   }
 };
 
-const finishTrackedChild = async (child: TSupervisedChild): Promise<void> => {
-  await exited(child);
-  // A disposable root can exit while a forked descendant still owns stdout or
-  // stderr. Its subprocess has exited, but its detached process group remains
-  // alive and would otherwise evade a later timeout reaper after this handle is
-  // removed. Reap the remaining group before forgetting its ownership record.
-  await terminateProcessGroup(child.pgid, 0);
+const waitChildExited = (child: TSupervisedChild): Promise<void> =>
+  exitWaitOverride !== null ? exitWaitOverride(child) : exited(child);
+
+const raceExitOrBudget = async (
+  child: TSupervisedChild,
+  budgetMs: number,
+): Promise<"exited" | "budget"> => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      waitChildExited(child).then(() => "exited" as const),
+      new Promise<"budget">((resolve) => {
+        timer = setTimeout(() => resolve("budget"), Math.max(0, budgetMs));
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+};
+
+const forgetChild = (child: TSupervisedChild, outcome: TReapOutcome): void => {
+  if (outcome === "reap_unconfirmed") {
+    logWarn(
+      "child-supervisor",
+      "process group unreaped after bounded TERM/KILL",
+      {
+        pid: child.pid,
+        pgid: child.pgid,
+      },
+    );
+  }
   removeChildRegistryRecord(child.pid);
   trackedChildren.delete(child.pid);
 };
 
-const waitForTrackedExit = async (
+const finishTrackedChild = async (
   tracked: TTrackedChild,
-  graceMs: number,
-): Promise<void> => {
-  const outcome = await Promise.race([
-    exited(tracked.handle).then(() => "exited" as const),
-    new Promise<"grace">((resolve) =>
-      setTimeout(() => resolve("grace"), graceMs),
-    ),
-  ]);
-  if (outcome === "exited") return;
-  await terminateProcessGroup(tracked.handle.pgid, 0);
-  await exited(tracked.handle);
+): Promise<TReapOutcome> => {
+  try {
+    await waitChildExited(tracked.handle);
+  } catch {
+    // Natural-exit waiter; terminate() owns cleanup if it already started.
+  }
+  if (tracked.terminating !== null) return tracked.terminating;
+  return terminateTrackedChild(tracked, {
+    graceMs: 0,
+    finalReapMs: DEFAULT_FINAL_REAP_MS,
+  });
 };
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const terminateTrackedChild = (
   tracked: TTrackedChild,
   opts: TTerminateOptions,
-): Promise<void> => {
+): Promise<TReapOutcome> => {
   if (tracked.terminating !== null) return tracked.terminating;
   const graceMs = opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS;
-  tracked.terminating = (async (): Promise<void> => {
+  const finalReapMs = opts.finalReapMs ?? DEFAULT_FINAL_REAP_MS;
+  tracked.terminating = (async (): Promise<TReapOutcome> => {
     signalGroup(tracked.handle.pgid, "SIGTERM");
-    await waitForTrackedExit(tracked, Math.max(0, graceMs));
-    await finishTrackedChild(tracked.handle);
+    const first = await raceExitOrBudget(tracked.handle, Math.max(0, graceMs));
+    let outcome: TReapOutcome;
+    if (first === "exited") {
+      outcome = await terminateProcessGroup(
+        tracked.handle.pgid,
+        0,
+        undefined,
+        0,
+      );
+    } else {
+      outcome = await terminateProcessGroup(
+        tracked.handle.pgid,
+        0,
+        undefined,
+        Math.max(0, finalReapMs),
+      );
+      if (outcome === "exited") outcome = "terminated";
+    }
+    forgetChild(tracked.handle, outcome);
+    return outcome;
   })();
   return tracked.terminating;
 };
@@ -145,7 +197,7 @@ export const superviseSpawn = (
     subprocess,
     pid,
     pgid,
-    terminate: (terminateOptions?: TTerminateOptions): Promise<void> =>
+    terminate: (terminateOptions?: TTerminateOptions): Promise<TReapOutcome> =>
       terminate(handle, terminateOptions),
     beginTask,
   };
@@ -194,7 +246,7 @@ export const superviseSpawn = (
   })().catch((error) =>
     logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
   );
-  void finishTrackedChild(handle).catch((error) =>
+  void finishTrackedChild(tracked).catch((error) =>
     logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
   );
   return handle;
@@ -207,13 +259,13 @@ const isIdleTrackedChild = (tracked: TTrackedChild): boolean =>
 export const terminate = async (
   handle: TSupervisedChild,
   opts: TTerminateOptions = {},
-): Promise<void> => {
+): Promise<TReapOutcome> => {
   const tracked = trackedChildren.get(handle.pid);
   if (tracked === undefined) {
     removeChildRegistryRecord(handle.pid);
-    return;
+    return "exited";
   }
-  await terminateTrackedChild(tracked, opts);
+  return terminateTrackedChild(tracked, opts);
 };
 
 /**
@@ -243,9 +295,22 @@ const terminateStaleRecord = async (
     removeChildRegistryRecord(record.pid);
     return;
   }
-  signalGroup(record.pgid, "SIGTERM");
-  await sleep(Math.max(0, opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS));
-  if (childProcessMatchesRecord(record)) signalGroup(record.pgid, "SIGKILL");
+  const outcome = await terminateProcessGroup(
+    record.pgid,
+    Math.max(0, opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS),
+    () => childProcessMatchesRecord(record),
+    Math.max(0, opts.finalReapMs ?? DEFAULT_FINAL_REAP_MS),
+  );
+  if (outcome === "reap_unconfirmed") {
+    logWarn(
+      "child-supervisor",
+      "stale process group unreaped after boot sweep",
+      {
+        pid: record.pid,
+        pgid: record.pgid,
+      },
+    );
+  }
   removeChildRegistryRecord(record.pid);
 };
 

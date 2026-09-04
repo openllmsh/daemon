@@ -45,6 +45,8 @@ import {
 import type { TProviderDelegate } from "./types";
 import type { TStoreRead } from "./util";
 import {
+  connectedObservation,
+  disconnectedObservation,
   ensureIsolatedKeychain,
   ensureKeychainReady,
   grantKeychainToolAccess,
@@ -54,7 +56,7 @@ import {
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   stripAnsi,
-  withMacosKeychainAccess,
+  unknownObservation,
 } from "./util";
 
 const PROVIDER = "cursor" as const;
@@ -247,12 +249,10 @@ const triggerRefresh = async (): Promise<void> => {
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
   if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
-  await withMacosKeychainAccess(() =>
-    spawnRefresh([bin(), "status"], env(), {
-      probe: unwrapKeychainSpawn(PROVIDER),
-      timeoutMs: 10_000,
-    }),
-  );
+  await spawnRefresh([bin(), "status"], env(), {
+    probe: unwrapKeychainSpawn(PROVIDER),
+    timeoutMs: 10_000,
+  });
 };
 
 // THE single refresher — single-flight + cooldown, no signal-aware bypass. See
@@ -360,6 +360,7 @@ const connectDirect = makeStreamConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
   env: () => ({ ...cliEnv(PROVIDER), NO_OPEN_BROWSER: "1" }),
+  beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
   stream: "stdout",
   parse: (buffer) => {
     const url = parseAuthUrl(buffer);
@@ -368,14 +369,10 @@ const connectDirect = makeStreamConnect({
   // After a successful login lands the tokens, grant command-line tools
   // prompt-free access to the isolated keychain items (claude_code parity) so
   // the daemon's later `security` reads never pop a GUI prompt.
-  onConnected: () => grantKeychainToolAccess(cliHome(PROVIDER)),
+  onConnected: async () => {
+    await grantKeychainToolAccess(cliHome(PROVIDER));
+  },
   onStart: () => {
-    // Ensure the ISOLATED login keychain exists before the CLI spawns — a CLI
-    // run under the isolated HOME with no keychain there wedges on macOS's
-    // "Keychain Not Found" dialog (same failure claude_code guards against).
-    // Best-effort + non-blocking; the pre-spawn `connected()` probe usually
-    // has already ensured it (readIsolatedKeychain ensures on every read).
-    void ensureIsolatedKeychain(cliHome(PROVIDER)).catch(() => {});
     logInfo("cursor-connect", "spawning `cursor-agent login`");
   },
   onParsed: (url) =>
@@ -422,6 +419,7 @@ export const cursorDelegate: TProviderDelegate = {
       return {
         provider: PROVIDER,
         status: "disconnected",
+        ...unknownObservation("store_unreadable"),
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -434,6 +432,13 @@ export const cursorDelegate: TProviderDelegate = {
     return {
       provider: PROVIDER,
       status: accessToken !== null ? "connected" : "disconnected",
+      ...(accessToken !== null
+        ? connectedObservation()
+        : pending !== null
+          ? {}
+          : installed
+            ? disconnectedObservation()
+            : unknownObservation("cli_unavailable")),
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
       ...(pending !== null
@@ -566,7 +571,9 @@ export const cursorDelegate: TProviderDelegate = {
 
   logout: async () => {
     if ((await cliInstallState(PROVIDER)).installed) {
-      await withMacosKeychainAccess(() => runCapture([bin(), "logout"], env()));
+      await runCapture([bin(), "logout"], env(), {
+        probe: unwrapKeychainSpawn(PROVIDER),
+      });
     }
     // CLI owns its Keychain/file credentials; never delete them directly.
     const cleared = (await readToken()) === null;

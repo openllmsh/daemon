@@ -31,7 +31,8 @@ import {
   spawnStreamLogin,
   streamLoginFail,
 } from "./login-flow";
-import type { THeadlessLogin } from "./util";
+import { KEYCHAIN_NOT_READY_DETAIL, loginReady } from "./login-readiness";
+import type { THeadlessLogin, TStoreRead } from "./util";
 import { spawnHeadlessLogin } from "./util";
 
 type TCancelConnect = () => Promise<{
@@ -52,14 +53,14 @@ export type TPasteBackConfig = {
   /** Re-surface detail when a login is already in flight. */
   readonly inProgressDetail: string;
   /** Runs before the login spawn (claude: ensure the isolated keychain). */
-  readonly beforeLogin?: () => Promise<void>;
+  readonly beforeLogin?: () => Promise<TStoreRead<void> | void>;
   readonly argv: () => ReadonlyArray<string>;
   readonly env: () => Record<string, string>;
   /** Background side effect once the credential lands (warn-if-unrefreshable +
    *  refresh the auth config). Invoked only when connected. */
   readonly onConnected?: () => void | Promise<void>;
   /** Runs after a code is accepted (claude: grant keychain tool access). */
-  readonly onCodeAccepted?: () => Promise<void>;
+  readonly onCodeAccepted?: () => Promise<boolean | undefined>;
   /** Authoritative connection check after a submitted code. */
   readonly verifyAfterSubmit: () => Promise<boolean>;
   /** The submit success `detail` (refreshable-aware). */
@@ -109,7 +110,15 @@ export const makePasteBackDevice = (
       },
       async () => {
         const flow = resolveLoginFlow(cfg.provider, "paste_code");
-        await cfg.beforeLogin?.();
+        const ready = await cfg.beforeLogin?.();
+        if (!loginReady(ready)) {
+          emitLoginFailed(flow, {
+            code: "spawn_denied",
+            message: KEYCHAIN_NOT_READY_DETAIL,
+            retryable: true,
+          });
+          return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
+        }
         // Keychain-dependent paste-back login (claude) is unconfined on macOS
         // (`sandbox/policy.ts`).
         const login = await spawnHeadlessLogin([...cfg.argv()], cfg.env(), {
@@ -171,7 +180,10 @@ export const makePasteBackDevice = (
     }> => {
       const r = await current.submitCode(code);
       if (!r.ok) return { ok: false, detail: r.detail };
-      await cfg.onCodeAccepted?.();
+      const granted = await cfg.onCodeAccepted?.();
+      if (granted === false) {
+        return { ok: false, detail: KEYCHAIN_NOT_READY_DETAIL };
+      }
       if (!(await cfg.verifyAfterSubmit())) {
         return {
           ok: false,

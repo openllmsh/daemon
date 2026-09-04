@@ -68,6 +68,8 @@ import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
   cliVersion,
+  connectedObservation,
+  disconnectedObservation,
   ensureIsolatedKeychain,
   ensureKeychainReady,
   grantKeychainToolAccess,
@@ -77,7 +79,7 @@ import {
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   toEpochMs,
-  withMacosKeychainAccess,
+  unknownObservation,
 } from "./util";
 
 const PROVIDER = "claude_code" as const;
@@ -201,12 +203,10 @@ const triggerRefresh = async (): Promise<void> => {
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
-  await withMacosKeychainAccess(() =>
-    spawnRefresh([bin(), "-p", "ping"], env(), {
-      probe: unwrapKeychainSpawn(PROVIDER),
-      timeoutMs: 10_000,
-    }),
-  );
+  await spawnRefresh([bin(), "-p", "ping"], env(), {
+    probe: unwrapKeychainSpawn(PROVIDER),
+    timeoutMs: 10_000,
+  });
 };
 
 // THE single refresher. Within the leeway window → fire the CLI refresh in the
@@ -360,11 +360,9 @@ const authStatusLoggedIn = async (
       // so this shared producer is unconfined on macOS and bounded internally by
       // runCapture. Observer cancellation must not kill another status waiter's
       // probe.
-      const out = await withMacosKeychainAccess(() =>
-        runCapture([bin(), "auth", "status"], env(), {
-          probe: unwrapKeychainSpawn(PROVIDER),
-        }),
-      );
+      const out = await runCapture([bin(), "auth", "status"], env(), {
+        probe: unwrapKeychainSpawn(PROVIDER),
+      });
       if (out === null) return null;
       try {
         const parsed = JSON.parse(out) as {
@@ -475,7 +473,7 @@ const connectDirect = makeBlockingConnect({
   // Drop the cached status BEFORE `verifyConnected` runs: the pre-login
   // `installed`/status reads may have cached a signed-OUT answer that would
   // otherwise make the post-login verification falsely fail.
-  afterLogin: () => {
+  afterLogin: async () => {
     clearAuthStatusCache();
     return grantKeychainToolAccess(cliHome(PROVIDER));
   },
@@ -547,6 +545,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       return {
         provider: PROVIDER,
         status: "disconnected",
+        ...unknownObservation("cli_unavailable"),
         cli_installed: false,
         detail: "claude CLI not installed",
       };
@@ -554,7 +553,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // macOS: the isolated login keychain must be unlocked so `claude auth
     // status` can read the credential it stored there. If it is NOT ready
     // (locked / drifted / unusable), the vendor CLI would open a locked chain
-    // and pop the SecurityAgent dialog on every ~2.5s tick — so stop here and
+    // and pop the SecurityAgent dialog on every periodic observation — so stop here and
     // report a status-check failure (NOT signed-out). No-op `present`
     // elsewhere.
     if (
@@ -563,6 +562,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       return {
         provider: PROVIDER,
         status: "disconnected",
+        ...unknownObservation("keychain_unavailable"),
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -583,6 +583,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
         return {
           provider: PROVIDER,
           status: "disconnected",
+          ...unknownObservation("store_unreadable"),
           cli_installed: true,
           ...(version !== null ? { cli_version: version } : {}),
           detail: STATUS_CHECK_FAILED_DETAIL,
@@ -592,6 +593,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
         return {
           provider: PROVIDER,
           status: "disconnected",
+          ...unknownObservation("probe_failed"),
           cli_installed: true,
           ...(version !== null ? { cli_version: version } : {}),
           detail: STATUS_CHECK_FAILED_DETAIL,
@@ -611,6 +613,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
     return {
       provider: PROVIDER,
       status: connected ? "connected" : "disconnected",
+      ...(connected
+        ? connectedObservation()
+        : pending !== null
+          ? {}
+          : disconnectedObservation()),
       cli_installed: true,
       ...(version !== null ? { cli_version: version } : {}),
       ...(connected
@@ -774,9 +781,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
           detail: "could not reach the credential store to sign out",
         };
       }
-      await withMacosKeychainAccess(() =>
-        runCapture([bin(), "auth", "logout"], env()),
-      );
+      await runCapture([bin(), "auth", "logout"], env(), {
+        probe: unwrapKeychainSpawn(PROVIDER),
+      });
     }
     // Belt-and-braces on Linux: drop the credentials file if it lingers.
     if (platform() !== "darwin") {

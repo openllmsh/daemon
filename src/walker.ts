@@ -1975,35 +1975,6 @@ export type TLocalSubscriptionAuth = {
   readonly detail: string | null;
 };
 
-/** Bound on the auth-gate `status()` probe — a hung keychain/CLI read must
- * not stall the hop. */
-const LOCAL_STATUS_TIMEOUT_MS = 5_000;
-let localStatusTimeoutMs = LOCAL_STATUS_TIMEOUT_MS;
-
-/** Test-only timeout override for deterministic local subscription auth probe coverage. */
-export const setLocalStatusTimeoutForTest = (
-  timeoutMs: number | null,
-): void => {
-  localStatusTimeoutMs = timeoutMs ?? LOCAL_STATUS_TIMEOUT_MS;
-};
-
-// A recent successful local status check remains trustworthy through one slow
-// keychain/CLI probe. This process-local grace window avoids dropping a signed-in
-// provider from a request chain on older Macs, while quickly requiring a fresh
-// status result after the daemon's local state may have changed.
-const LOCAL_STATUS_LAST_KNOWN_GOOD_TTL_MS = 5 * 60_000;
-
-type TLastKnownGoodLocalSubscription = {
-  readonly auth: TLocalSubscriptionAuth;
-  readonly accountHash: string | null;
-  readonly observedAtMs: number;
-};
-
-const lastKnownGoodLocalSubscriptionByProvider = new Map<
-  string,
-  TLastKnownGoodLocalSubscription
->();
-
 export const ensureLocalSubscription = async (
   provider: string,
   connectedByProvider: Map<string, TLocalSubscriptionAuth>,
@@ -2012,8 +1983,10 @@ export const ensureLocalSubscription = async (
   const cached = connectedByProvider.get(provider);
   if (cached !== undefined) return cached;
 
-  const delegate = getDelegate(provider);
-  if (delegate === null) {
+  const { readProviderStatus } = await import("./status");
+  const { normalizeProviderConnection } = await import("@openllmsh/protocol");
+  const status = await readProviderStatus(provider);
+  if (status === null) {
     const miss: TLocalSubscriptionAuth = {
       connected: false,
       detail: `${provider} is not a local subscription provider`,
@@ -2022,65 +1995,19 @@ export const ensureLocalSubscription = async (
     accountHashByProvider.set(provider, null);
     return miss;
   }
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const status = await Promise.race([
-      delegate.status(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error(`${provider} status timed out`));
-        }, localStatusTimeoutMs);
-      }),
-    ]);
-    const result: TLocalSubscriptionAuth = {
-      connected: status.status === "connected",
-      detail:
-        status.status === "connected"
-          ? null
-          : (status.detail ?? `${provider} not signed in on this device`),
-    };
-    connectedByProvider.set(provider, result);
-    const accountHash =
-      status.status === "connected" ? (status.account_hash ?? null) : null;
-    accountHashByProvider.set(provider, accountHash);
-    if (result.connected) {
-      lastKnownGoodLocalSubscriptionByProvider.set(provider, {
-        auth: result,
-        accountHash,
-        observedAtMs: Date.now(),
-      });
-    } else {
-      lastKnownGoodLocalSubscriptionByProvider.delete(provider);
-    }
-    return result;
-  } catch (error) {
-    const lastKnownGood =
-      lastKnownGoodLocalSubscriptionByProvider.get(provider);
-    if (
-      lastKnownGood !== undefined &&
-      Date.now() - lastKnownGood.observedAtMs <=
-        LOCAL_STATUS_LAST_KNOWN_GOOD_TTL_MS
-    ) {
-      connectedByProvider.set(provider, lastKnownGood.auth);
-      accountHashByProvider.set(provider, lastKnownGood.accountHash);
-      return lastKnownGood.auth;
-    }
-    // Timeout, throw, or hung CLI without a recent connected observation means
-    // this box cannot serve; fleet (or hop fail) is the right next step.
-    const result: TLocalSubscriptionAuth = {
-      connected: false,
-      detail:
-        error instanceof Error
-          ? error.message
-          : `${provider} status check failed`,
-    };
-    connectedByProvider.set(provider, result);
-    accountHashByProvider.set(provider, null);
-    return result;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+  const normalized = normalizeProviderConnection(status);
+  const result: TLocalSubscriptionAuth = {
+    connected: normalized.serviceable,
+    detail: normalized.serviceable
+      ? null
+      : (status.detail ?? `${provider} not signed in on this device`),
+  };
+  connectedByProvider.set(provider, result);
+  accountHashByProvider.set(
+    provider,
+    normalized.serviceable ? (status.account_hash ?? null) : null,
+  );
+  return result;
 };
 
 export const usageForActiveAccount = async (

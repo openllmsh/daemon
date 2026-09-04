@@ -14,6 +14,11 @@ import { join } from "node:path";
 import type { TSuperviseSpawnOptions } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
 import { spawnCommand } from "../command";
+import {
+  budgetFromSignal,
+  createDeadlineBudget,
+  splitReapBudget,
+} from "../deadline-budget";
 import { logError } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -206,11 +211,15 @@ export const runCapture = async (
       await child.terminate();
       return null;
     }
+    const parentBudget = budgetFromSignal(opts?.signal);
+    const budget =
+      parentBudget?.child(captureTimeoutMs(opts?.timeoutMs)) ??
+      createDeadlineBudget(captureTimeoutMs(opts?.timeoutMs), opts?.signal);
     let timer: ReturnType<typeof setTimeout> | null = null;
     let aborted = false;
     const unbind = bindAbort(opts?.signal, () => {
       aborted = true;
-      void child.terminate();
+      void child.terminate(splitReapBudget(budget.remainingMs()));
     });
     try {
       const complete = Promise.all([
@@ -222,7 +231,7 @@ export const runCapture = async (
       const timeout = new Promise<TCaptureOutcome>((resolve) => {
         timer = setTimeout(
           () => resolve({ kind: "timeout" }),
-          captureTimeoutMs(opts?.timeoutMs),
+          budget.remainingMs(),
         );
       });
       const abortWait =
@@ -237,7 +246,7 @@ export const runCapture = async (
           : [complete, timeout, abortWait],
       );
       if (outcome.kind === "timeout" || aborted) {
-        await child.terminate();
+        await child.terminate(splitReapBudget(budget.remainingMs()));
         return null;
       }
       // `probe:true` runs UNWRAPPED — a signal death there is not a sandbox
@@ -331,30 +340,53 @@ export const spawnLogin = async (
   if (opts?.signal?.aborted === true) {
     return { code: -1, output: "", abandoned: true };
   }
-  const proc = Bun.spawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
+  const parentBudget = budgetFromSignal(opts?.signal);
+  const budget =
+    parentBudget?.child(timeoutMs) ??
+    createDeadlineBudget(timeoutMs, opts?.signal);
+  const child = superviseSpawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
+    kind: "login",
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     cwd: spawnCwd(env),
     ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
   });
+  const proc = child.subprocess;
+  const stdout = proc.stdout;
+  const stderr = proc.stderr;
+  if (
+    stdout === undefined ||
+    typeof stdout === "number" ||
+    stderr === undefined ||
+    typeof stderr === "number"
+  ) {
+    await child.terminate(splitReapBudget(budget.remainingMs()));
+    return { code: -1, output: "", abandoned: true };
+  }
   const dec = new TextDecoder();
   let out = "";
   let err = "";
   let abandoned = false;
   let killTimer: ReturnType<typeof setTimeout> | null = null;
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
+  let markAbandoned!: () => void;
+  const abandonedGate = new Promise<void>((resolve) => {
+    markAbandoned = resolve;
+  });
+  const readers: Array<ReadableStreamDefaultReader<Uint8Array>> = [];
   const kill = (): void => {
     if (abandoned) return;
     abandoned = true;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // already gone
+    markAbandoned();
+    for (const reader of readers) {
+      void reader.cancel().catch(() => {});
     }
+    void child.terminate(splitReapBudget(budget.remainingMs()));
   };
 
-  killTimer = setTimeout(kill, opts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+  killTimer = setTimeout(kill, budget.remainingMs());
   const unbindAbort = bindAbort(opts?.signal, kill);
 
   const pump = async (
@@ -362,10 +394,12 @@ export const spawnLogin = async (
     onChunk: (s: string) => void,
   ): Promise<void> => {
     const reader = stream.getReader();
+    readers.push(reader);
     try {
       for (;;) {
+        if (abandoned) break;
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done || abandoned) break;
         if (value !== undefined) onChunk(dec.decode(value));
         // Early-return once the awaited output appears (the child may never exit
         // cleanly — it can WEDGE after printing the token). Match the COMBINED
@@ -382,23 +416,35 @@ export const spawnLogin = async (
           settleTimer = setTimeout(kill, UNTIL_SETTLE_MS);
         }
       }
+    } catch {
+      // Cancelled reader after abandon — captured output is still valid.
     } finally {
-      reader.releaseLock();
+      try {
+        reader.releaseLock();
+      } catch {
+        // Already cancelled.
+      }
     }
   };
 
-  await Promise.all([
-    pump(proc.stdout, (s) => {
-      out += s;
-    }),
-    pump(proc.stderr, (s) => {
-      err += s;
-    }),
-    proc.exited,
+  await Promise.race([
+    Promise.all([
+      pump(stdout, (s) => {
+        out += s;
+      }),
+      pump(stderr, (s) => {
+        err += s;
+      }),
+      proc.exited,
+    ]),
+    abandonedGate,
   ]);
   unbindAbort();
   if (killTimer !== null) clearTimeout(killTimer);
   if (settleTimer !== null) clearTimeout(settleTimer);
+  if (abandoned) {
+    await child.terminate(splitReapBudget(budget.remainingMs()));
+  }
 
   // Only surface a SIGNAL kill we did NOT cause (a sandbox/OS kill) — our own
   // `until`/timeout kill is expected and its output is valid.
@@ -511,15 +557,24 @@ export const spawnLoginPty = async (
 
   // Wrap the WHOLE `script(1)` argv — the PTY wrapper and the vendor CLI it
   // runs are one confined tree.
-  const proc = Bun.spawn(sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }), {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-    cwd: spawnCwd(env),
-    ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
-  });
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
+  const parentBudget = budgetFromSignal(opts?.signal);
+  const budget =
+    parentBudget?.child(timeoutMs) ??
+    createDeadlineBudget(timeoutMs, opts?.signal);
+  const child = superviseSpawn(
+    sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }),
+    {
+      kind: "login",
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      cwd: spawnCwd(env),
+      ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
+    },
+  );
+  const proc = child.subprocess;
 
-  const deadline = Date.now() + (opts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
   const readFile = (): Promise<string> =>
     Bun.file(tsFile)
       .text()
@@ -529,11 +584,7 @@ export const spawnLoginPty = async (
   const kill = (): void => {
     if (abandoned) return;
     abandoned = true;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // already gone
-    }
+    void child.terminate(splitReapBudget(budget.remainingMs()));
   };
   const unbindAbort = bindAbort(opts?.signal, kill);
   try {
@@ -548,13 +599,34 @@ export const spawnLoginPty = async (
         break;
       }
       if (proc.exitCode !== null || proc.signalCode !== null) break; // exited
-      if (Date.now() >= deadline) {
+      if (budget.expired()) {
         kill();
         break;
       }
-      await new Promise((r) => setTimeout(r, 400));
+      await new Promise((r) =>
+        setTimeout(r, Math.min(400, budget.remainingMs())),
+      );
     }
-    await proc.exited;
+    if (abandoned) {
+      await child.terminate(splitReapBudget(budget.remainingMs()));
+    } else {
+      const leftover = budget.remainingMs();
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        await Promise.race([
+          proc.exited,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, leftover);
+          }),
+        ]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+      if (proc.exitCode === null && proc.signalCode === null) {
+        await child.terminate(splitReapBudget(0));
+        abandoned = true;
+      }
+    }
   } finally {
     unbindAbort();
   }

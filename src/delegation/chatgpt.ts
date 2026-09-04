@@ -65,11 +65,14 @@ import {
 } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
+  connectedObservation,
+  disconnectedObservation,
   readJsonStore,
   runCapture,
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   stripAnsi,
+  unknownObservation,
 } from "./util";
 
 const PROVIDER = "chatgpt" as const;
@@ -371,6 +374,7 @@ export const chatgptDelegate: TProviderDelegate = {
       return {
         provider: PROVIDER,
         status: "disconnected",
+        ...unknownObservation("store_unreadable"),
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -384,6 +388,13 @@ export const chatgptDelegate: TProviderDelegate = {
     return {
       provider: PROVIDER,
       status: token !== null ? "connected" : "disconnected",
+      ...(token !== null
+        ? connectedObservation()
+        : pending !== null
+          ? {}
+          : installed
+            ? disconnectedObservation()
+            : unknownObservation("cli_unavailable")),
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
       ...(pending !== null

@@ -21,6 +21,11 @@
  * only.
  */
 
+import type {
+  TDaemonProviderObservationResult,
+  TDaemonProviderReasonCode,
+} from "@openllmsh/protocol";
+
 export * from "./headless-login";
 export * from "./keychain";
 export * from "./spawn";
@@ -35,8 +40,30 @@ export type TStoreRead<T> =
   | { readonly kind: "absent" }
   | { readonly kind: "indeterminate"; readonly cause: string };
 
+export type {
+  TDaemonProviderObservation,
+  TDaemonProviderObservationResult,
+  TDaemonProviderReasonCode,
+} from "@openllmsh/protocol";
 /** Shared daemon-status wire sentinel; preserves existing daemon import paths. */
 export { STATUS_CHECK_FAILED_DETAIL } from "@openllmsh/protocol";
+
+export const unknownObservation = (
+  reason: TDaemonProviderReasonCode = "probe_failed",
+): TDaemonProviderObservationResult => ({
+  observation: "unknown",
+  reason_code: reason,
+});
+
+export const disconnectedObservation =
+  (): TDaemonProviderObservationResult => ({
+    observation: "disconnected",
+    reason_code: "credential_absent",
+  });
+
+export const connectedObservation = (): TDaemonProviderObservationResult => ({
+  observation: "connected",
+});
 
 export const storeReadValue = <T>(read: TStoreRead<T>): T | null =>
   read.kind === "present" ? read.value : null;

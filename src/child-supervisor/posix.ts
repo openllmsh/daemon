@@ -1,4 +1,7 @@
 export const DEFAULT_TERMINATE_GRACE_MS = 2_000;
+export const DEFAULT_FINAL_REAP_MS = 1_000;
+
+export type TReapOutcome = "exited" | "terminated" | "reap_unconfirmed";
 
 const pause = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -41,13 +44,38 @@ export const signalGroup = (
 export const processGroupExists = (pgid: number): boolean =>
   signalGroup(pgid, 0);
 
+const waitUntilGone = async (
+  stillPresent: () => boolean,
+  budgetMs: number,
+): Promise<boolean> => {
+  const budget = Math.max(0, budgetMs);
+  if (!stillPresent()) return true;
+  if (budget === 0) return !stillPresent();
+  const started = performance.now();
+  while (performance.now() - started < budget) {
+    await pause(Math.min(25, budget));
+    if (!stillPresent()) return true;
+  }
+  return !stillPresent();
+};
+
+/**
+ * Process-group SIGTERM, finite grace, SIGKILL, finite final reap. Settles
+ * even when the group never disappears (caller logs `reap_unconfirmed`).
+ */
 export const terminateProcessGroup = async (
   pgid: number,
   graceMs: number = DEFAULT_TERMINATE_GRACE_MS,
   isStillOwned?: () => boolean,
-): Promise<void> => {
-  if (!signalGroup(pgid, "SIGTERM")) return;
-  await pause(Math.max(0, graceMs));
-  if (isStillOwned !== undefined && !isStillOwned()) return;
+  finalReapMs: number = DEFAULT_FINAL_REAP_MS,
+): Promise<TReapOutcome> => {
+  const stillPresent = (): boolean =>
+    (isStillOwned === undefined || isStillOwned()) && processGroupExists(pgid);
+  if (!stillPresent()) return "exited";
+  const termDelivered = signalGroup(pgid, "SIGTERM");
+  if (termDelivered && (await waitUntilGone(stillPresent, graceMs)))
+    return "exited";
   signalGroup(pgid, "SIGKILL");
+  if (await waitUntilGone(stillPresent, finalReapMs)) return "terminated";
+  return "reap_unconfirmed";
 };

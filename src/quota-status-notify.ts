@@ -3,19 +3,17 @@
  *
  * The cloud is authoritative for de-escalation suppression and reset-flap
  * filtering. This Map only skips an identical `(status, resetEpoch)` repeat
- * so the ~2.5s status watcher does not POST the same transition over and
+ * so periodic status observers do not POST the same transition over and
  * over. It has no delivery policy: callers decide how and where to send
  * returned transitions.
  */
-import {
-  QUOTA_REJECT_PERCENT,
-  QUOTA_WARN_PERCENT,
-} from "@openllmsh/protocol";
+
 import type {
   TDaemonProviderConnection,
   TDaemonQuotaStatusReached,
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
+import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 
 type TQuotaStatus = "allowed" | "allowed_warning" | "rejected";
 

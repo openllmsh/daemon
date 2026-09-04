@@ -65,9 +65,12 @@ import {
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
+  connectedObservation,
+  disconnectedObservation,
   readJsonStore,
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
+  unknownObservation,
 } from "./util";
 
 const PROVIDER = "kimi_code" as const;
@@ -676,6 +679,7 @@ export const kimiCodeDelegate: TProviderDelegate = {
       return {
         provider: PROVIDER,
         status: "disconnected",
+        ...unknownObservation("store_unreadable"),
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,
@@ -687,6 +691,13 @@ export const kimiCodeDelegate: TProviderDelegate = {
     return {
       provider: PROVIDER,
       status: token !== null ? "connected" : "disconnected",
+      ...(token !== null
+        ? connectedObservation()
+        : pending !== null
+          ? {}
+          : installed
+            ? disconnectedObservation()
+            : unknownObservation("cli_unavailable")),
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
       ...(pending !== null

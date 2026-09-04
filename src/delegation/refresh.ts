@@ -25,9 +25,9 @@ import { spawnLogin, spawnLoginPty } from "./util";
 export const REFRESH_SPAWN_TIMEOUT_MS = 60_000;
 
 /**
- * Post-spawn refresh cooldown shared by every delegate. Larger than the 2.5s
- * status-watch tick (so the watcher can't drive repeat spawns) and smaller than
- * the shortest refresh leeway (60s, claude) so a genuinely near-expiry token
+ * Post-spawn refresh cooldown shared by every delegate. It prevents periodic
+ * status observers from driving repeat spawns and remains smaller than the
+ * shortest refresh leeway (60s, claude), so a genuinely near-expiry token
  * still gets a second attempt before it hard-expires. This is the knob that
  * makes "no redundant refresh ever" true across status + request + usage.
  */
@@ -178,23 +178,14 @@ export const keychainUnusable = (provider: string): never => {
 
 /**
  * Decide whether a native refresh may spawn after a keychain readiness check.
- * Only the terminal, explicitly-classified unusable state becomes a refresh
- * failure. Absent and every other indeterminate result are benign skips: a
- * refresh CLI must not create, unlock, or probe an uncertain keychain.
+ * Only `present` may spawn. Every other result is a benign skip: a refresh
+ * CLI must not create, unlock, or probe an uncertain keychain. Recoverable
+ * backoff is owned by keychain readiness, not a permanent refresh failure.
  */
 export const keychainRefreshSpawnAllowed = (
-  provider: string,
+  _provider: string,
   readiness: TStoreRead<void>,
-): boolean => {
-  if (readiness.kind === "present") return true;
-  if (
-    readiness.kind === "indeterminate" &&
-    readiness.cause === "keychain_unusable"
-  ) {
-    keychainUnusable(provider);
-  }
-  return false;
-};
+): boolean => readiness.kind === "present";
 
 const networkErrorPattern =
   /\b(?:ehostunreach|enetunreach|econnrefused|enotfound|eai_again|etimedout|econnreset)\b|fetch failed|\b(?:getaddrinfo|dns|network error|socket hang up)\b|\b(?:tls|ssl)\b|certificate verify failed|self[- ]signed certificate|unable to verify/i;
@@ -338,7 +329,7 @@ const networkErrno = (err: unknown): string | null => {
  * Build a per-provider refresher around its `trigger` (the CLI-refresh spawn).
  *
  * Two invariants make "correct token, no redundant refresh" hold for EVERY
- * caller (the 2.5s status watcher, the request hot path, usage reads) because
+ * caller (a periodic status observer, the request hot path, usage reads) because
  * all of them funnel through this one function:
  *   - **Single-flight:** concurrent callers that all see a stale token share
  *     ONE spawn (refresh-token rotation means parallel refreshes would
@@ -349,7 +340,7 @@ const networkErrno = (err: unknown): string | null => {
  *     COMPLETED (success OR failure), no new spawn fires for `cooldownMs`. A
  *     success rotates the token so its new expiry is far out and `"fresh"`
  *     suppresses re-fires on its own; the cooldown additionally bounds the
- *     near-expiry window and, on failure, stops a per-2.5s hammer on a broken
+ *     near-expiry window and, on failure, stops a per-observer hammer on a broken
  *     refresh. Net: ≤1 spawn per `cooldownMs` per provider.
  *
  * Returns a function the delegate's `readToken` calls with the token's
@@ -465,7 +456,7 @@ export const makeRefresher = (opts: {
       // NOTE: an expired credential inside the failure-backoff window returns
       // "fresh" (serve the current token, don't re-spawn) rather than a stale
       // outcome. This is deliberate — see `refresh-cooldown.test.ts` "cooldown
-      // holds after a FAILED trigger too": re-spawning every ~2.5s status tick
+      // holds after a FAILED trigger too": re-spawning on every periodic status observation
       // would hammer a broken refresh. A CodeRabbit nitpick suggested returning
       // stale here; not adopted, as it changes tested backoff behavior and
       // borders the deferred Stage-8 persistence-aware predicate.

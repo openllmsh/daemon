@@ -168,8 +168,8 @@ const reconcileIsolatedLink = async (
  *   2. A real `--version` re-runs when the resolved binary's stat signature
  *      changes OR the cached version is older than `CLI_VERSION_HARD_MAX_MS`
  *      (catches a stable launcher/wrapper whose own stat never moves).
- * The short TTL only throttles how often we re-stat / re-reconcile on the hot
- * 2.5 s status path; it never pins a version past a detected binary change.
+ * The short TTL only throttles how often periodic status observations re-stat /
+ * re-reconcile; it never pins a version past a detected binary change.
  */
 
 /** Numeric env override (tests only) — returns `fallback` unless the var parses
@@ -273,7 +273,7 @@ export const cliInstallState = async (
     // not a cold start): RE-RECONCILE it against the preferred host candidate so
     // an out-of-band update that moved the binary re-points the link. Gated to
     // the refresh path — a cold daemon trusts its existing link (whatever the
-    // user last linked), and a `realpath` compare per 2.5s tick would be needless
+    // user last linked), and a `realpath` compare per observation would be needless
     // churn. A re-point changes the resolved target, forcing a `--version` probe.
     await reconcileIsolatedLink(provider, bin);
   }

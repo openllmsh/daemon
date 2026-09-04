@@ -14,9 +14,12 @@ import type {
   TDaemonProviderConnection,
   TDaemonStatus,
 } from "@openllmsh/protocol";
+import { normalizeProviderConnection } from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
-import { DELEGATES, isSubscriptionSlug } from "./delegation";
+import type { TDeadlineBudget } from "./deadline-budget";
+import { createDeadlineBudget, waitUntilExpired } from "./deadline-budget";
+import { DELEGATES, getDelegate, isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
 import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
@@ -85,23 +88,30 @@ const applyAuthLiteral = (
 ): TDaemonProviderConnection => {
   const last = lastKnownConnections.get(slug);
   const inFlight = isSubscriptionSlug(slug) && loginSlot(slug).inFlight();
-  const indeterminate = conn.detail === STATUS_CHECK_FAILED_DETAIL;
+  const normalized = normalizeProviderConnection(conn);
+  const indeterminate =
+    normalized.observation === "unknown" ||
+    conn.detail === STATUS_CHECK_FAILED_DETAIL;
   // Determinate = this tick's vendor read, not last-known overlay.
-  const determinate = !inFlight && !indeterminate;
+  const determinate = !inFlight && !indeterminate && !normalized.pending;
 
-  if (determinate && conn.status === "connected") {
+  if (determinate && normalized.observation === "connected") {
     // Logout receipt sets the sticky flag while the vendor may still
     // read connected until `delegate.logout()` finishes. Only a rising
     // edge (fresh connected, last-known was not connected) is a login
     // by any path and clears the flag.
     if (signedOutByUser.has(slug) && last?.status === "connected") {
-      return { ...conn, status: "signed_out" };
+      return {
+        ...conn,
+        status: "signed_out",
+        observation: "signed_out",
+      };
     }
     signedOutByUser.delete(slug);
-    return { ...conn, status: "connected" };
+    return { ...conn, status: "connected", observation: "connected" };
   }
-  if (signedOutByUser.has(slug)) {
-    return { ...conn, status: "signed_out" };
+  if (signedOutByUser.has(slug) || normalized.signed_out) {
+    return { ...conn, status: "signed_out", observation: "signed_out" };
   }
   if (!determinate) {
     const preserved: TDaemonProviderAuthStatus = last?.status ?? conn.status;
@@ -109,23 +119,33 @@ const applyAuthLiteral = (
       ...(last !== undefined ? last : conn),
       detail: conn.detail,
       status: preserved,
+      observation: "unknown",
+      reason_code: normalized.reason_code ?? "probe_failed",
       ...(conn.pending_auth !== undefined
         ? { pending_auth: conn.pending_auth }
         : {}),
     };
   }
-  return { ...conn, status: "disconnected" };
+  return {
+    ...conn,
+    status: "disconnected",
+    observation: "disconnected",
+    reason_code: normalized.reason_code ?? "credential_absent",
+  };
 };
 
-const timedOutSlugs = new Set<string>();
-const inFlightSlugProbes = new Map<string, Promise<unknown>>();
+const inFlightSlugProbes = new Map<
+  string,
+  Promise<TDaemonProviderConnection>
+>();
+let inFlightStatus: Promise<TDaemonStatus> | null = null;
 
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
-  timedOutSlugs.clear();
   signedOutByUser.clear();
   inFlightSlugProbes.clear();
+  inFlightStatus = null;
 };
 
 const statusFailure = (slug: string): TDaemonProviderConnection => {
@@ -134,68 +154,74 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
     return {
       ...lastKnown,
       detail: STATUS_CHECK_FAILED_DETAIL,
+      observation: "unknown",
+      reason_code: "probe_timeout",
     };
   }
   return {
     provider: slug,
-    // Probe failure is not a logout assertion. Protocol has no `unknown`
-    // literal; cold-start keeps `disconnected` + the sentinel detail and
-    // does not write last-known (so it cannot emit credential_gone).
+    // Probe failure is not a logout assertion. Cold-start keeps legacy
+    // `disconnected` plus typed `unknown` and does not write last-known
+    // (so it cannot emit credential_gone).
     status: "disconnected",
+    observation: "unknown",
+    reason_code: "probe_timeout",
     detail: STATUS_CHECK_FAILED_DETAIL,
   };
+};
+
+const awaitProducer = async (
+  slug: string,
+  producer: Promise<TDaemonProviderConnection>,
+  ownerBudget?: TDeadlineBudget,
+): Promise<TDaemonProviderConnection> => {
+  const observerBudget =
+    ownerBudget ?? createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
+  let settled = false;
+  return Promise.race([
+    producer.then((conn) => {
+      settled = true;
+      return conn;
+    }),
+    waitUntilExpired(observerBudget).then((): TDaemonProviderConnection => {
+      if (settled) return statusFailure(slug);
+      logWarn("status", "delegate status probe timed out", {
+        slug,
+        phase: "delegate_status",
+        timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
+      });
+      return statusFailure(slug);
+    }),
+  ]);
 };
 
 const boundedDelegateStatus = async (
   slug: string,
   status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>,
 ): Promise<TDaemonProviderConnection> => {
-  if (inFlightSlugProbes.has(slug)) {
-    return statusFailure(slug);
+  const existing = inFlightSlugProbes.get(slug);
+  if (existing !== undefined) {
+    return awaitProducer(slug, existing);
   }
-  const ac = new AbortController();
-  const work = status(ac.signal);
-  const tracked = work.then(
-    () => undefined,
-    () => undefined,
+  const ownerBudget = createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
+  const producer: Promise<TDaemonProviderConnection> = status(
+    ownerBudget.signal,
+  ).then(
+    (conn) => conn,
+    (err: unknown) => {
+      logWarn("status", `status() failed for ${slug}`, {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return statusFailure(slug);
+    },
   );
-  inFlightSlugProbes.set(slug, tracked);
-  void tracked.finally(() => {
-    if (inFlightSlugProbes.get(slug) === tracked) {
+  inFlightSlugProbes.set(slug, producer);
+  void producer.finally(() => {
+    if (inFlightSlugProbes.get(slug) === producer) {
       inFlightSlugProbes.delete(slug);
     }
   });
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let timedOut = false;
-  try {
-    const result = await Promise.race([
-      work,
-      new Promise<TDaemonProviderConnection>((resolve) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          ac.abort();
-          if (!timedOutSlugs.has(slug)) {
-            timedOutSlugs.add(slug);
-            logWarn("status", "delegate status probe timed out", {
-              slug,
-              phase: "delegate_status",
-              timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
-            });
-          }
-          resolve(statusFailure(slug));
-        }, DELEGATE_STATUS_TIMEOUT_MS);
-      }),
-    ]);
-    if (!timedOut) {
-      timedOutSlugs.delete(slug);
-      // A determinate delegate can establish CLI presence even when its
-      // credential/store check failed. Keep its fields intact; only timeout,
-      // throw, and single-flight collision use the field-omitting fallback.
-    }
-    return result;
-  } finally {
-    if (timer !== null) clearTimeout(timer);
-  }
+  return awaitProducer(slug, producer, ownerBudget);
 };
 
 /** OpenCode is a device-session client (not a subscription delegate). Surface
@@ -237,6 +263,40 @@ const hermesInstalled = (): boolean => {
   return found;
 };
 
+const rememberConnection = (
+  slug: string,
+  raw: TDaemonProviderConnection,
+  conn: TDaemonProviderConnection,
+): void => {
+  if (
+    conn.observation !== "unknown" &&
+    conn.detail !== STATUS_CHECK_FAILED_DETAIL &&
+    !(isSubscriptionSlug(slug) && loginSlot(slug).inFlight()) &&
+    // Overlaying signed_out on a still-connected vendor read (logout
+    // in flight) must not rewrite last-known to signed_out, or the
+    // next connected tick would look like a login rising edge.
+    !(conn.status === "signed_out" && raw.status === "connected")
+  ) {
+    lastKnownConnections.set(slug, conn);
+  }
+};
+
+/**
+ * Join the one per-slug status producer. Walkers and other local callers must
+ * use this instead of `delegate.status()` so last-known and in-flight sharing
+ * stay in one place.
+ */
+export const readProviderStatus = async (
+  slug: string,
+): Promise<TDaemonProviderConnection | null> => {
+  const d = getDelegate(slug);
+  if (d === null) return null;
+  const raw = await boundedDelegateStatus(d.slug, (signal) => d.status(signal));
+  const conn = applyAuthLiteral(d.slug, raw);
+  rememberConnection(d.slug, raw, conn);
+  return conn;
+};
+
 const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
@@ -245,21 +305,13 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
           d.status(signal),
         );
         const conn = applyAuthLiteral(d.slug, raw);
-        if (
-          conn.detail !== STATUS_CHECK_FAILED_DETAIL &&
-          !(isSubscriptionSlug(d.slug) && loginSlot(d.slug).inFlight()) &&
-          // Overlaying signed_out on a still-connected vendor read (logout
-          // in flight) must not rewrite last-known to signed_out, or the
-          // next connected tick would look like a login rising edge.
-          !(conn.status === "signed_out" && raw.status === "connected")
-        ) {
-          lastKnownConnections.set(d.slug, conn);
-        }
+        rememberConnection(d.slug, raw, conn);
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
-        if (conn.status !== "connected") return conn;
+        if (normalizeProviderConnection(conn).observation !== "connected")
+          return conn;
         // PEEK only — never hit the vendor here. `computeStatus` runs on every
-        // status push (hello/reconnect, the ~2.5s flow watcher, post-command),
+        // status push (hello/reconnect, the periodic observer, post-command),
         // and the vendor usage endpoint rate-limits independently of inference;
         // reading it on that cadence 429'd it ("Claude usage is rate-limited
         // right now") on a daemon nobody was even looking at. Usage is read ONLY
@@ -318,13 +370,14 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   };
 };
 
-let inFlightStatus: Promise<TDaemonStatus> | null = null;
-
 export const computeStatus = async (): Promise<TDaemonStatus> => {
   if (inFlightStatus === null) {
-    inFlightStatus = computeStatusFresh().finally(() => {
-      inFlightStatus = null;
+    const flight = computeStatusFresh().finally(() => {
+      if (inFlightStatus === flight) {
+        inFlightStatus = null;
+      }
     });
+    inFlightStatus = flight;
   }
   return inFlightStatus;
 };
@@ -342,21 +395,30 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
  * failures into an `unavailable` snapshot.
  */
 export const refreshUsage = async (slug?: string): Promise<void> => {
-  // `allSettled`, NOT `all`: ONE provider throwing (e.g. a failing status/refresh
-  // read) must not reject the whole refresh — that would error the `refresh`
-  // command ack, so the dashboard's "Refresh usage" button would fail and every
-  // card stay stale just because a single provider is broken. Each provider's
-  // read is independent + best-effort (`cachedUsage` already swallows fetch
-  // failures into an `unavailable` snapshot).
+  // Join the canonical snapshot — never a raw `d.status()` bypass that would
+  // start a second producer beside `computeStatus`. `allSettled`, NOT `all`:
+  // ONE provider throwing (e.g. a failing usage read) must not reject the whole
+  // refresh — that would error the `refresh` command ack, so the dashboard's
+  // "Refresh usage" button would fail and every card stay stale just because a
+  // single provider is broken. Each provider's read is independent +
+  // best-effort (`cachedUsage` already swallows fetch failures into an
+  // `unavailable` snapshot).
+  const snapshot = await computeStatus();
   await Promise.allSettled(
     Object.values(DELEGATES)
       .filter((d) => slug === undefined || d.slug === slug)
       .map(async (d) => {
-        // Only connected providers have a usage endpoint to read.
-        const status = await d.status();
-        if (status.status !== "connected") return;
+        const conn = snapshot.connections.find(
+          (entry) => entry.provider === d.slug,
+        );
+        // Only definitively connected providers have a usage endpoint to read.
+        if (
+          conn === undefined ||
+          !normalizeProviderConnection(conn).serviceable
+        )
+          return;
         await cachedUsage(d.slug, () => d.usage(), {
-          accountHash: status.account_hash,
+          accountHash: conn.account_hash,
         });
       }),
   );

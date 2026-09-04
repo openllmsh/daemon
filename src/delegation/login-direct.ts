@@ -35,7 +35,8 @@ import {
   spawnStreamLogin,
   streamLoginFail,
 } from "./login-flow";
-import type { TLoginResult } from "./util";
+import { KEYCHAIN_NOT_READY_DETAIL, loginReady } from "./login-readiness";
+import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin } from "./util";
 
 // ─── claude: blocking native login ───────────────────────────────────────
@@ -45,11 +46,11 @@ export type TBlockingConnectConfig = {
   readonly installed: () => Promise<boolean>;
   readonly installHint: string;
   /** Runs before the login spawn (claude: ensure the isolated keychain). */
-  readonly beforeLogin?: () => Promise<void>;
+  readonly beforeLogin?: () => Promise<TStoreRead<void> | void>;
   readonly argv: () => ReadonlyArray<string>;
   readonly env: () => Record<string, string>;
   /** Runs after the login spawn (claude: grant keychain tool access). */
-  readonly afterLogin?: () => Promise<void>;
+  readonly afterLogin?: () => Promise<boolean | undefined>;
   /** Authoritative connection check after the login completes. */
   readonly verifyConnected: () => Promise<boolean>;
   /** Fire-and-forget side effect on success (claude: refresh the auth config). */
@@ -80,15 +81,31 @@ export const makeBlockingConnect = (
       },
       async () => {
         const flow = resolveLoginFlow(cfg.provider, "browser");
-        await cfg.beforeLogin?.();
+        const ready = await cfg.beforeLogin?.();
+        if (!loginReady(ready)) {
+          emitLoginFailed(flow, {
+            code: "spawn_denied",
+            message: KEYCHAIN_NOT_READY_DETAIL,
+            retryable: true,
+          });
+          return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
+        }
         emitLoginStarted(flow);
         // Keychain-dependent login (claude) runs unconfined on macOS — see
         // `sandbox/policy.ts`; codex/kimi/grok stay confined on both platforms.
         const result = await spawnLogin([...cfg.argv()], cfg.env(), {
           probe: unwrapKeychainSpawn(cfg.provider),
         });
-        await cfg.afterLogin?.();
+        const granted = await cfg.afterLogin?.();
         if (await cfg.verifyConnected()) {
+          if (granted === false) {
+            emitLoginFailed(flow, {
+              code: "spawn_denied",
+              message: KEYCHAIN_NOT_READY_DETAIL,
+              retryable: true,
+            });
+            return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
+          }
           await cfg.onConnected?.();
           emitLoginSucceeded(flow);
           return { connected: true, detail: await cfg.successDetail() };
@@ -123,6 +140,8 @@ export type TStreamConnectConfig = {
   /** Parse the authorize URL off the chosen fd → `{ url, code }` (code: ""). */
   readonly parse: (buf: string) => { url: string; code: string } | null;
   readonly onConnected?: () => void | Promise<void>;
+  /** Cursor: isolated keychain must be `present` before a prompt-capable spawn. */
+  readonly beforeLogin?: () => Promise<TStoreRead<void> | void>;
   /** Diagnostics: before spawn, after a successful parse, on a parse miss
    *  (the captured output is passed so the caller can redact + log it). */
   readonly onStart?: () => void;
@@ -159,6 +178,16 @@ export const makeStreamConnect = (
         mode: "browser",
       },
       async () => {
+        const ready = await cfg.beforeLogin?.();
+        if (!loginReady(ready)) {
+          const flow = resolveLoginFlow(cfg.provider, "browser");
+          emitLoginFailed(flow, {
+            code: "spawn_denied",
+            message: KEYCHAIN_NOT_READY_DETAIL,
+            retryable: true,
+          });
+          return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
+        }
         cfg.onStart?.();
         const res = await spawnStreamLogin({
           provider: cfg.provider,

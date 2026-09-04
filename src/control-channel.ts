@@ -101,6 +101,8 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
       joinChangeKeyParts([
         c.provider,
         c.status,
+        c.observation ?? "",
+        c.reason_code ?? "",
         c.cli_installed === undefined ? "" : String(c.cli_installed),
         c.cli_version ?? "",
         c.detail ?? "",
@@ -299,7 +301,7 @@ let binaryFrameTail: Promise<void> = Promise.resolve();
  *  own snapshot resolving — putting a `status` frame on the wire first and
  *  killing the handshake. So `send` drops every non-hello frame until the
  *  hello is out; the dropped status is lossless (the hello carries a fresh
- *  snapshot, and the 2.5s watcher re-pushes on change). */
+ *  snapshot, and the periodic observer re-pushes on change). */
 let helloSent = false;
 /** Monotonic connection counter. The hello continuation awaits
  *  `computeStatus()`, and the socket can close + reopen while that's pending —
