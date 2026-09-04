@@ -403,7 +403,12 @@ export const makeRefresher = (opts: {
   readonly label: string;
   readonly leewayMs: number;
   readonly cooldownMs?: number;
-  readonly trigger: () => Promise<undefined | TRefreshSpawnMeta>;
+  /** Every provider's trigger is `async () => { … }`, i.e. `Promise<void>`, so
+   *  `void` here means "may return nothing" — exactly the contract. Narrowing
+   *  it to `undefined` makes all five providers unassignable (TS2322) for no
+   *  gain; that swap was tried and reverted. */
+  // biome-ignore lint/suspicious/noConfusingVoidType: providers return Promise<void>
+  readonly trigger: () => Promise<void | TRefreshSpawnMeta>;
 }): ((expiresAtMs: number | null) => Promise<TRefreshOutcome>) => {
   let inFlight: Promise<void> | null = null;
   let lastErrorClass: TRefreshErrorClass | null = null;
