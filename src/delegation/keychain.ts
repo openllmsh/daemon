@@ -124,6 +124,7 @@ type TKeychainCounters = {
   timeouts: number;
   aborted: number;
   skipped_expired: number;
+  skipped: number;
   complete_ok: number;
   complete_fail: number;
   by_verb: Record<string, number>;
@@ -134,6 +135,7 @@ const emptyKeychainCounters = (): TKeychainCounters => ({
   timeouts: 0,
   aborted: 0,
   skipped_expired: 0,
+  skipped: 0,
   complete_ok: 0,
   complete_fail: 0,
   by_verb: {},
@@ -159,6 +161,7 @@ const hasKeychainActivity = (d: TKeychainCounters): boolean =>
   d.timeouts !== 0 ||
   d.aborted !== 0 ||
   d.skipped_expired !== 0 ||
+  d.skipped !== 0 ||
   d.complete_ok !== 0 ||
   d.complete_fail !== 0;
 
@@ -179,6 +182,7 @@ const deltaKeychainCounters = (
     timeouts: now.timeouts - prev.timeouts,
     aborted: now.aborted - prev.aborted,
     skipped_expired: now.skipped_expired - prev.skipped_expired,
+    skipped: now.skipped - prev.skipped,
     complete_ok: now.complete_ok - prev.complete_ok,
     complete_fail: now.complete_fail - prev.complete_fail,
     by_verb,
@@ -304,14 +308,21 @@ const spawnSecurityNow = async (
     const spawnedAtMs = Date.now();
     const proc = child.subprocess;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const readPiped = async (
+      stream: unknown,
+      mode: TSpawnMode,
+    ): Promise<string> => {
+      if (mode !== "pipe" || !(stream instanceof ReadableStream)) return "";
+      try {
+        return await new Response(stream).text();
+      } catch {
+        return "";
+      }
+    };
     try {
       const complete = Promise.all([
-        opts.stdout === "pipe" && proc.stdout instanceof ReadableStream
-          ? new Response(proc.stdout).text()
-          : Promise.resolve(""),
-        opts.stderr === "pipe" && proc.stderr instanceof ReadableStream
-          ? new Response(proc.stderr).text()
-          : Promise.resolve(""),
+        readPiped(proc.stdout, opts.stdout),
+        readPiped(proc.stderr, opts.stderr),
         proc.exited,
       ]).then(
         ([stdout, stderr, code]): TSecurityOutcome => ({
@@ -441,6 +452,144 @@ const transientTimeouts = new Map<
   string,
   { readonly count: number; readonly nextAtMs: number }
 >();
+
+/** Process-local positive unlock skip. Empty at start so the first unlock
+ *  after boot is always real. No clock — mtime/size are content-replacement
+ *  only; `show-keychain-info` confirms auto-lock is off, not lock state. */
+type TUnlockSkip = {
+  readonly unlockedByUs: true;
+  readonly mtimeMs: number;
+  readonly size: number;
+  readonly autoLockOff: true;
+};
+
+const unlockSkip = new Map<string, TUnlockSkip>();
+const pendingUnlockSkip = new Map<
+  string,
+  { readonly mtimeMs: number; readonly size: number }
+>();
+const autoLockOffByKc = new Map<string, boolean>();
+
+/** Second classifier beside `matchUnlockFailureToken`. `-25308` stays
+ *  TRANSIENT for recreate (must not nuke a good credential); it DOES
+ *  invalidate a skip because the chain may have relocked under us. */
+const isInteractionNotAllowed = (stderr: string): boolean => {
+  const s = stderr.toLowerCase();
+  return s.includes("-25308") || s.includes("interaction not allowed");
+};
+
+const invalidateUnlockSkip = (kc: string): void => {
+  unlockSkip.delete(kc);
+  pendingUnlockSkip.delete(kc);
+};
+
+const noteKeychainIoResult = (kc: string, res: TSecurityResult): void => {
+  if (res.timedOut || isInteractionNotAllowed(res.stderr)) {
+    invalidateUnlockSkip(kc);
+  }
+};
+
+const parseAutoLockOff = (stdout: string): boolean | null => {
+  const lower = stdout.toLowerCase();
+  if (
+    !lower.includes("lock-on-sleep") ||
+    !lower.includes("lock-after-timeout")
+  ) {
+    return null;
+  }
+  const flagOff = (name: string): boolean =>
+    new RegExp(`${name}\\s*[:=]\\s*(off|false|no|0)\\b`).test(lower);
+  if (flagOff("lock-on-sleep") && flagOff("lock-after-timeout")) return true;
+  return false;
+};
+
+const confirmAutoLockOff = async (
+  home: string,
+  kc: string,
+  signal?: AbortSignal,
+): Promise<boolean> => {
+  const cached = autoLockOffByKc.get(kc);
+  if (cached !== undefined) return cached;
+  const res = await spawnSecurity(["show-keychain-info", kc], home, {
+    stdout: "pipe",
+    stderr: "pipe",
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  noteKeychainIoResult(kc, res);
+  const parsed =
+    res.code === 0 && !res.timedOut && !res.aborted
+      ? parseAutoLockOff(res.stdout)
+      : null;
+  const off = parsed === true;
+  autoLockOffByKc.set(kc, off);
+  return off;
+};
+
+const recordUnlockSuccessForSkip = (kc: string): void => {
+  const meta = keychainMetadata(kc);
+  if (meta.mtimeMs === null || meta.size === null) {
+    invalidateUnlockSkip(kc);
+    return;
+  }
+  pendingUnlockSkip.set(kc, { mtimeMs: meta.mtimeMs, size: meta.size });
+};
+
+const skipEligible = (kc: string): boolean => {
+  const skip = unlockSkip.get(kc);
+  if (skip === undefined) return false;
+  if (!existsSync(kc)) {
+    invalidateUnlockSkip(kc);
+    return false;
+  }
+  const meta = keychainMetadata(kc);
+  if (
+    meta.mtimeMs === null ||
+    meta.size === null ||
+    meta.mtimeMs !== skip.mtimeMs ||
+    meta.size !== skip.size
+  ) {
+    invalidateUnlockSkip(kc);
+    return false;
+  }
+  return skip.unlockedByUs && skip.autoLockOff;
+};
+
+const tryPromoteUnlockSkip = async (
+  home: string,
+  kc: string,
+  signal?: AbortSignal,
+): Promise<boolean> => {
+  if (skipEligible(kc)) return true;
+  const pending = pendingUnlockSkip.get(kc);
+  if (pending === undefined) return false;
+  if (!existsSync(kc)) {
+    invalidateUnlockSkip(kc);
+    return false;
+  }
+  const meta = keychainMetadata(kc);
+  if (
+    meta.mtimeMs === null ||
+    meta.size === null ||
+    meta.mtimeMs !== pending.mtimeMs ||
+    meta.size !== pending.size
+  ) {
+    invalidateUnlockSkip(kc);
+    return false;
+  }
+  const autoLockOff = await confirmAutoLockOff(home, kc, signal);
+  if (!autoLockOff) {
+    pendingUnlockSkip.delete(kc);
+    return false;
+  }
+  unlockSkip.set(kc, {
+    unlockedByUs: true,
+    mtimeMs: pending.mtimeMs,
+    size: pending.size,
+    autoLockOff: true,
+  });
+  pendingUnlockSkip.delete(kc);
+  return true;
+};
 
 const dumpCache = new Map<
   string,
@@ -687,6 +836,8 @@ const recreateIsolatedKeychain = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TRecreateOutcome> => {
+  invalidateUnlockSkip(kc);
+  autoLockOffByKc.delete(kc);
   const dir = dirname(kc);
   const prepared = await prepareStagingKeychain(home, dir, signal);
   if (prepared === null) {
@@ -746,6 +897,7 @@ const recreateIsolatedKeychain = async (
  *  macOS. */
 const noteUnlockSuccess = (kc: string): TStoreRead<void> => {
   transientTimeouts.delete(kc);
+  recordUnlockSuccessForSkip(kc);
   return READY;
 };
 
@@ -787,16 +939,20 @@ const ensureKeychainNow = async (
   }
   if (res.code === 0) return noteUnlockSuccess(kc);
 
+  noteKeychainIoResult(kc, res);
   // Caller abort (status-race cancel) is not a keychain fault — skip timeout
   // accounting so a healthy chain is never marked unusable.
   if (res.aborted) {
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
   }
-  if (res.timedOut)
+  if (res.timedOut) {
+    invalidateUnlockSkip(kc);
     return noteTransientFailure(kc, "keychain_unlock_transient");
+  }
 
   const failureToken = matchUnlockFailureToken(res.stderr);
   if (classifyUnlockFailure(res.stderr) === "auth") {
+    invalidateUnlockSkip(kc);
     if (!healedKeychains.has(kc)) {
       const metadata = keychainMetadata(kc);
       logWarn("keychain", "keychain auth-drift evidence", {
@@ -840,9 +996,21 @@ export const ensureKeychainReady = async (
     if (signal?.aborted === true) {
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
+    if (skipEligible(kc)) {
+      keychainCounters.skipped++;
+      return READY;
+    }
     // The producer owns its command deadline. A status observer's cancellation
     // must not kill readiness work an inference waiter still needs.
-    op = ensureKeychainNow(home, kc).finally(() => {
+    // Promote (one-shot show-keychain-info) is part of this owner so a
+    // mid-unlock joiner cannot skip and two first-callers cannot double-spawn.
+    op = (async (): Promise<TStoreRead<void>> => {
+      if (await tryPromoteUnlockSkip(home, kc)) {
+        keychainCounters.skipped++;
+        return READY;
+      }
+      return ensureKeychainNow(home, kc);
+    })().finally(() => {
       if (inFlightKeychains.get(kc) === op) inFlightKeychains.delete(kc);
     });
     inFlightKeychains.set(kc, op);
@@ -857,6 +1025,9 @@ export const resetKeychainStateForTests = (): void => {
   initialExistingKeychainUnlocks.clear();
   lastKeychainFailureLogMs.clear();
   transientTimeouts.clear();
+  unlockSkip.clear();
+  pendingUnlockSkip.clear();
+  autoLockOffByKc.clear();
   dumpCache.clear();
   inFlightKeychainReads.clear();
   macosKeychainLane = Promise.resolve();
@@ -898,19 +1069,13 @@ export const grantKeychainToolAccess = async (
 ): Promise<boolean> => {
   if (!MAC) return true;
   if ((await ensureKeychainReady(home)).kind !== "present") return false;
+  const kc = loginKeychainPath(home);
   const res = await spawnSecurity(
-    [
-      "set-key-partition-list",
-      "-S",
-      "apple-tool:,apple:",
-      "-s",
-      "-k",
-      "",
-      loginKeychainPath(home),
-    ],
+    ["set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", "", kc],
     home,
     { stdout: "ignore", stderr: "pipe" },
   );
+  noteKeychainIoResult(kc, res);
   if (res.code === 0) return true;
   if (noKeyToPartition(res.stderr)) {
     logInfo("keychain", "no key to partition — grant not needed", {
@@ -954,14 +1119,16 @@ export const findKeychainServices = async (
   if (cached !== undefined && cached.mtimeMs === mtimeMs) {
     return cached.value;
   }
-  const { code, stdout } = await spawnSecurity(["dump-keychain", kc], home, {
+  const dump = await spawnSecurity(["dump-keychain", kc], home, {
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: "pipe",
     ...(signal !== undefined ? { signal } : {}),
   });
-  if (code !== 0) {
-    return { kind: "indeterminate", cause: `dump-keychain_exit_${code}` };
+  noteKeychainIoResult(kc, dump);
+  if (dump.code !== 0) {
+    return { kind: "indeterminate", cause: `dump-keychain_exit_${dump.code}` };
   }
+  const { stdout } = dump;
   const names = new Set<string>();
   for (const line of stdout.split("\n")) {
     const m = line.match(/"svce"<blob>="([^"]*)"/);
@@ -982,16 +1149,19 @@ const readKeychainSecret = async (
   service: string,
   signal?: AbortSignal,
 ): Promise<string | null> => {
-  const { code, stdout } = await spawnSecurity(
-    ["find-generic-password", "-s", service, "-w", loginKeychainPath(home)],
+  const kc = loginKeychainPath(home);
+  const found = await spawnSecurity(
+    ["find-generic-password", "-s", service, "-w", kc],
     home,
     {
       stdout: "pipe",
-      stderr: "ignore",
+      stderr: "pipe",
       ...(signal !== undefined ? { signal } : {}),
     },
   );
-  if (code !== 0) return null;
+  noteKeychainIoResult(kc, found);
+  if (found.code !== 0) return null;
+  const { stdout } = found;
   const trimmed = stdout.trim();
   return trimmed.length > 0 ? trimmed : null;
 };
