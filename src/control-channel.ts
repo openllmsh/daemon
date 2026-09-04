@@ -19,6 +19,7 @@ import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { setAuthSink } from "./auth-events";
+import { clearAuthGap, drainAuthGap, enqueueAuthGap } from "./auth-gap-buffer";
 import type { TAuthStatusBaseline } from "./auth-session-lost";
 import {
   detectAuthLossEdge,
@@ -114,6 +115,9 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
         c.pending_auth === undefined || c.pending_auth === null
           ? ""
           : JSON.stringify(c.pending_auth),
+        c.upstream_auth_cooldown === undefined
+          ? ""
+          : JSON.stringify(c.upstream_auth_cooldown),
         c.usage === undefined || c.usage === null
           ? ""
           : JSON.stringify(c.usage),
@@ -334,14 +338,24 @@ const sendBytes = (bytes: Uint8Array): void => {
   }
 };
 
+const authTransportReady = (): boolean =>
+  ws !== null && ws.readyState === ws.OPEN && helloSent;
+
 const send = (frame: TRelayFrame): void => {
-  if (ws === null || ws.readyState !== ws.OPEN) return;
+  if (ws === null || ws.readyState !== ws.OPEN) {
+    if (frame.type === "auth") enqueueAuthGap(frame.auth);
+    return;
+  }
   // Nothing may precede the hello on a fresh connection (see `helloSent`).
-  if (!helloSent && frame.type !== "hello") return;
+  if (!helloSent && frame.type !== "hello") {
+    if (frame.type === "auth") enqueueAuthGap(frame.auth);
+    return;
+  }
   try {
     ws.send(JSON.stringify(frame));
   } catch {
     // best-effort: a failed send means the socket is closing; partysocket reconnects
+    if (frame.type === "auth") enqueueAuthGap(frame.auth);
   }
 };
 
@@ -349,6 +363,21 @@ const emitAuthFrame = (auth: TAuthEvent): void => {
   const key_id = daemonApiKeyId();
   if (key_id === null) return;
   send({ type: "auth", key_id, auth });
+};
+
+/** Replay auth events that landed while the socket was down, after hello. */
+const flushAuthGap = (): void => {
+  const pending = drainAuthGap();
+  if (pending.length === 0) return;
+  const key_id = daemonApiKeyId();
+  if (key_id === null) return;
+  for (const auth of pending) {
+    if (!authTransportReady()) {
+      enqueueAuthGap(auth);
+      continue;
+    }
+    send({ type: "auth", key_id, auth });
+  }
 };
 
 const lastPostedAuthStatus = new Map<string, TAuthStatusBaseline>();
@@ -1048,6 +1077,7 @@ export const startControlChannel = (): void => {
         protocol_version: RELAY_PROTOCOL_VERSION,
         caps: currentDaemonCaps(),
       });
+      flushAuthGap();
       heartbeat.start();
     }
   };
@@ -1112,6 +1142,7 @@ export const startControlChannel = (): void => {
 /** Graceful-exit beacon: flip the key offline, then close. Best-effort. */
 export const stopControlChannel = async (): Promise<void> => {
   lastPostedAuthStatus.clear();
+  clearAuthGap();
   if (ws === null) return;
   stopWatcher();
   stopMigrationCheck();
