@@ -30,6 +30,7 @@ import {
   setPendingAuth,
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
+import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
 import { DEFAULT_LOGIN_TIMEOUT_MS, redactUrls, spawnCwd } from "./spawn";
 import { openUrl } from "./util";
 
@@ -445,7 +446,13 @@ export const finishInBackground = async (opts: {
   readonly provider: string;
   readonly slot: TLoginSlot;
   readonly isConnected: () => Promise<boolean>;
-  readonly onConnected?: () => void | Promise<void>;
+  /** Runs after a credential lands. Returning `false` marks the login FAILED
+   *  (e.g. the keychain partition-list grant was refused) — see below. */
+  readonly onConnected?: () =>
+    | boolean
+    | void
+    | Promise<boolean>
+    | Promise<void>;
   readonly alwaysClearPending?: boolean;
   /** Child exit code when known. Non-zero + not-connected → `cli_crash`;
    *  zero + not-connected → `poll_expired`. */
@@ -473,9 +480,15 @@ export const finishInBackground = async (opts: {
       // still treat as not-connected
     }
   }
+  // An `onConnected` that returns `false` is an OBSERVED refusal (the keychain
+  // partition-list grant), not a best-effort miss: the credential landed but the
+  // daemon can't read it prompt-free, so the login is failed + retryable rather
+  // than reported as succeeded. A THROW stays best-effort (swallowed) so cleanup
+  // still runs and `clearPendingAuth` is never skipped.
+  let grantDenied = false;
   if (connected && opts.onConnected !== undefined) {
     try {
-      await opts.onConnected();
+      grantDenied = (await opts.onConnected()) === false;
     } catch {
       // best-effort — a failed onConnected must not reject the cleanup
     }
@@ -488,21 +501,28 @@ export const finishInBackground = async (opts: {
   const event: TLoginTerminalEvent =
     cancelled || flow === null
       ? { kind: "none" }
-      : connected
-        ? { kind: "succeeded" }
-        : {
+      : connected && grantDenied
+        ? {
             kind: "failed",
-            code: crashed ? "cli_crash" : "poll_expired",
-            message: crashed
-              ? "sign-in process exited before a credential landed"
-              : "sign-in ended without a stored credential",
-            retryable: !crashed,
-          };
+            code: "spawn_denied",
+            message: KEYCHAIN_NOT_READY_DETAIL,
+            retryable: true,
+          }
+        : connected
+          ? { kind: "succeeded" }
+          : {
+              kind: "failed",
+              code: crashed ? "cli_crash" : "poll_expired",
+              message: crashed
+                ? "sign-in process exited before a credential landed"
+                : "sign-in ended without a stored credential",
+              retryable: !crashed,
+            };
   finalizeLoginTerminal({
     flow,
     event,
     provider: opts.provider,
-    clearPending: opts.alwaysClearPending === true || !connected,
+    clearPending: opts.alwaysClearPending === true || !connected || grantDenied,
   });
 };
 
@@ -533,8 +553,13 @@ export type TStreamLoginOpts<T> = {
   readonly warnMs?: number;
   /** Already-signed-in check for the background-exit cleanup. */
   readonly isConnected: () => Promise<boolean>;
-  /** Runs in the background-exit cleanup when a credential landed. */
-  readonly onConnected?: () => void | Promise<void>;
+  /** Runs in the background-exit cleanup when a credential landed. Returning
+   *  `false` fails the login (see {@link finishInBackground}). */
+  readonly onConnected?: () =>
+    | boolean
+    | void
+    | Promise<boolean>
+    | Promise<void>;
   /** Skip the sandbox wrap (macOS keychain-dependent login — see
    *  `sandbox/policy.ts`). Set from `unwrapKeychainSpawn(provider)`. */
   readonly probe?: boolean;

@@ -369,9 +369,10 @@ const connectDirect = makeStreamConnect({
   // After a successful login lands the tokens, grant command-line tools
   // prompt-free access to the isolated keychain items (claude_code parity) so
   // the daemon's later `security` reads never pop a GUI prompt.
-  onConnected: async () => {
-    await grantKeychainToolAccess(cliHome(PROVIDER));
-  },
+  // A refused grant FAILS the login (retryable) rather than reporting success
+  // the daemon can't act on — a later `security` read would pop a GUI prompt.
+  onConnected: (): Promise<boolean> =>
+    grantKeychainToolAccess(cliHome(PROVIDER)),
   onStart: () => {
     logInfo("cursor-connect", "spawning `cursor-agent login`");
   },

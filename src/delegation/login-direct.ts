@@ -139,7 +139,13 @@ export type TStreamConnectConfig = {
   readonly stream?: "stdout" | "stderr";
   /** Parse the authorize URL off the chosen fd → `{ url, code }` (code: ""). */
   readonly parse: (buf: string) => { url: string; code: string } | null;
-  readonly onConnected?: () => void | Promise<void>;
+  /** Runs once a credential lands. Returning `false` FAILS the login — the
+   *  keychain partition-list grant is observed, not best-effort. */
+  readonly onConnected?: () =>
+    | boolean
+    | void
+    | Promise<boolean>
+    | Promise<void>;
   /** Cursor: isolated keychain must be `present` before a prompt-capable spawn. */
   readonly beforeLogin?: () => Promise<TStoreRead<void> | void>;
   /** Diagnostics: before spawn, after a successful parse, on a parse miss
