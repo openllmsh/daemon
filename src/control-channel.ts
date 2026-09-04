@@ -19,7 +19,11 @@ import { RELAY_PROTOCOL_VERSION, RelayFrame } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { setAuthSink } from "./auth-events";
-import { clearAuthGap, drainAuthGap, enqueueAuthGap } from "./auth-gap-buffer";
+import {
+  clearAuthGap,
+  enqueueAuthGap,
+  flushAuthGap as flushAuthGapBuffer,
+} from "./auth-gap-buffer";
 import type { TAuthStatusBaseline } from "./auth-session-lost";
 import {
   detectAuthLossEdge,
@@ -365,19 +369,55 @@ const emitAuthFrame = (auth: TAuthEvent): void => {
   send({ type: "auth", key_id, auth });
 };
 
-/** Replay auth events that landed while the socket was down, after hello. */
+type TAuthFlushTransportForTests = {
+  readonly keyId: string | null;
+  readonly ready: () => boolean;
+  readonly send: (payload: string) => void;
+};
+
+let authFlushTransportForTests: TAuthFlushTransportForTests | null = null;
+
+/** Test seam: stub key id + send readiness without dialing a real socket. */
+export const installAuthFlushTransportForTests = (
+  transport: TAuthFlushTransportForTests,
+): (() => void) => {
+  authFlushTransportForTests = transport;
+  return () => {
+    authFlushTransportForTests = null;
+  };
+};
+
+/**
+ * Replay auth events that landed while the socket was down, after hello.
+ * Never drains until a usable key id and OPEN+helloSent hold; a mid-flush
+ * socket close retains the unsent tail (send is best-effort, not exactly-once).
+ */
 const flushAuthGap = (): void => {
-  const pending = drainAuthGap();
-  if (pending.length === 0) return;
-  const key_id = daemonApiKeyId();
-  if (key_id === null) return;
-  for (const auth of pending) {
-    if (!authTransportReady()) {
-      enqueueAuthGap(auth);
-      continue;
+  const key_id = authFlushTransportForTests?.keyId ?? daemonApiKeyId();
+  flushAuthGapBuffer(key_id, (auth) => {
+    const ready =
+      authFlushTransportForTests !== null
+        ? authFlushTransportForTests.ready()
+        : authTransportReady();
+    if (key_id === null || !ready) return false;
+    try {
+      const payload = JSON.stringify({ type: "auth", key_id, auth });
+      if (authFlushTransportForTests !== null) {
+        authFlushTransportForTests.send(payload);
+        return true;
+      }
+      if (ws === null) return false;
+      ws.send(payload);
+      return true;
+    } catch {
+      return false;
     }
-    send({ type: "auth", key_id, auth });
-  }
+  });
+};
+
+/** Test seam: run the same flush used after hello. */
+export const flushAuthGapForTests = (): void => {
+  flushAuthGap();
 };
 
 const lastPostedAuthStatus = new Map<string, TAuthStatusBaseline>();

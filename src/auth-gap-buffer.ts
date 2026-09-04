@@ -88,8 +88,8 @@ export const enqueueAuthGap = (event: TAuthEvent): void => {
   touchSlug(`${event.event}:${event.slug}`, event);
 };
 
-/** Drain in enqueue order: per login flow started → prompt → terminal, then slug events. */
-export const drainAuthGap = (): TAuthEvent[] => {
+/** Snapshot in enqueue order without mutating the buffer. */
+export const peekAuthGap = (): TAuthEvent[] => {
   const out: TAuthEvent[] = [];
   for (const flowId of loginOrder) {
     const gap = loginGaps.get(flowId);
@@ -102,6 +102,81 @@ export const drainAuthGap = (): TAuthEvent[] => {
     const gap = slugGaps.get(key);
     if (gap !== undefined) out.push(gap.last);
   }
+  return out;
+};
+
+/**
+ * Drop the first `count` peeked events. Call only after those events were
+ * eligible to send (`key_id` present and transport ready).
+ */
+export const commitAuthGap = (count: number): void => {
+  if (count <= 0) return;
+  if (count >= authGapSize()) {
+    clearAuthGap();
+    return;
+  }
+  let left = count;
+  const remainingLogin: string[] = [];
+  for (const flowId of loginOrder) {
+    const gap = loginGaps.get(flowId);
+    if (gap === undefined) continue;
+    if (left > 0 && gap.started !== null) {
+      gap.started = null;
+      left -= 1;
+    }
+    if (left > 0 && gap.prompt !== null) {
+      gap.prompt = null;
+      left -= 1;
+    }
+    if (left > 0 && gap.terminal !== null) {
+      gap.terminal = null;
+      left -= 1;
+    }
+    if (gap.started !== null || gap.prompt !== null || gap.terminal !== null) {
+      remainingLogin.push(flowId);
+    } else {
+      loginGaps.delete(flowId);
+    }
+  }
+  loginOrder.length = 0;
+  loginOrder.push(...remainingLogin);
+
+  const remainingSlug: string[] = [];
+  for (const key of slugOrder) {
+    if (left > 0) {
+      slugGaps.delete(key);
+      left -= 1;
+      continue;
+    }
+    remainingSlug.push(key);
+  }
+  slugOrder.length = 0;
+  slugOrder.push(...remainingSlug);
+};
+
+/**
+ * Attempt to send buffered events. Does not remove anything until `trySend`
+ * returns true. Stops (and retains the tail) on the first false — typically
+ * a missing key id, a closed socket, or hello not yet sent.
+ */
+export const flushAuthGap = (
+  keyId: string | null,
+  trySend: (event: TAuthEvent) => boolean,
+): number => {
+  if (keyId === null) return 0;
+  const pending = peekAuthGap();
+  let sent = 0;
+  for (const event of pending) {
+    if (!trySend(event)) break;
+    sent += 1;
+  }
+  commitAuthGap(sent);
+  return sent;
+};
+
+/** Drain in enqueue order: per login flow started → prompt → terminal, then slug events. */
+export const drainAuthGap = (): TAuthEvent[] => {
+  const out = peekAuthGap();
   clearAuthGap();
   return out;
 };
