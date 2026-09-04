@@ -287,7 +287,26 @@ export type TLoginResult = {
    *  than it exiting on its own — its OUTPUT is still valid (the token/cred was
    *  produced first), it just never cleanly exited. */
   readonly abandoned: boolean;
+  /** Wall clock immediately after `superviseSpawn`. Null when no child ran. */
+  readonly spawned_at_ms: number | null;
+  /** Child pid immediately after `superviseSpawn`. Null when no child ran. */
+  readonly child_pid: number | null;
 };
+
+const noChildResult = (abandoned: boolean): TLoginResult => ({
+  code: -1,
+  output: "",
+  abandoned,
+  spawned_at_ms: null,
+  child_pid: null,
+});
+
+const spawnStamp = (proc: {
+  readonly pid?: number;
+}): Pick<TLoginResult, "spawned_at_ms" | "child_pid"> => ({
+  spawned_at_ms: Date.now(),
+  child_pid: typeof proc.pid === "number" ? proc.pid : null,
+});
 
 export type TSpawnLoginOpts = {
   /** Hard ceiling: kill the child after this and return what was captured.
@@ -338,7 +357,7 @@ export const spawnLogin = async (
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
   if (opts?.signal?.aborted === true) {
-    return { code: -1, output: "", abandoned: true };
+    return noChildResult(true);
   }
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
   const parentBudget = budgetFromSignal(opts?.signal);
@@ -354,6 +373,7 @@ export const spawnLogin = async (
     ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
   });
   const proc = child.subprocess;
+  const stamp = spawnStamp(proc);
   const stdout = proc.stdout;
   const stderr = proc.stderr;
   if (
@@ -363,7 +383,7 @@ export const spawnLogin = async (
     typeof stderr === "number"
   ) {
     await child.terminate(splitReapBudget(budget.remainingMs()));
-    return { code: -1, output: "", abandoned: true };
+    return { code: -1, output: "", abandoned: true, ...stamp };
   }
   const dec = new TextDecoder();
   let out = "";
@@ -456,6 +476,7 @@ export const spawnLogin = async (
     code: proc.exitCode ?? -1,
     output: `${out}\n${err}`.trim(),
     abandoned,
+    ...stamp,
   };
 };
 
@@ -543,7 +564,7 @@ export const spawnLoginPty = async (
   const os = platform();
   if (os !== "darwin" && os !== "linux") return spawnLogin(argv, env, opts);
   if (opts?.signal?.aborted === true) {
-    return { code: -1, output: "", abandoned: true };
+    return noChildResult(true);
   }
 
   const tsFile = join(
@@ -574,6 +595,7 @@ export const spawnLoginPty = async (
     },
   );
   const proc = child.subprocess;
+  const stamp = spawnStamp(proc);
 
   const readFile = (): Promise<string> =>
     Bun.file(tsFile)
@@ -634,7 +656,12 @@ export const spawnLoginPty = async (
   await rm(tsFile, { force: true }).catch(() => {});
   if (!abandoned)
     logIfKilled(scriptArgv, proc, { confined: opts?.probe !== true });
-  return { code: proc.exitCode ?? -1, output: stripAnsi(captured), abandoned };
+  return {
+    code: proc.exitCode ?? -1,
+    output: stripAnsi(captured),
+    abandoned,
+    ...stamp,
+  };
 };
 
 /**

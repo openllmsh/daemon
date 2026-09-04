@@ -15,7 +15,8 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
-import { logDebug, logWarn } from "../logger";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { logDebug, logInfo, logWarn } from "../logger";
 import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin, spawnLoginPty } from "./util";
 
@@ -48,16 +49,24 @@ export type TRefreshErrorClass =
   | "rejected";
 
 /** A redacted, structured failure from a vendor refresh child. */
+export type TRefreshSpawnMeta = {
+  readonly spawned_at_ms: number | null;
+  readonly child_pid: number | null;
+};
+
 export class RefreshTriggerError extends Error {
   readonly errorClass: TRefreshErrorClass;
   readonly abandoned: boolean;
   readonly exitCode: number;
   readonly timeoutMs: number;
   readonly errno: string | null;
+  readonly spawnedAtMs: number | null;
+  readonly childPid: number | null;
 
   constructor(
     errorClass: TRefreshErrorClass,
-    result: Pick<TLoginResult, "abandoned" | "code">,
+    result: Pick<TLoginResult, "abandoned" | "code"> &
+      Partial<Pick<TLoginResult, "spawned_at_ms" | "child_pid" | "output">>,
     timeoutMs = REFRESH_SPAWN_TIMEOUT_MS,
   ) {
     super(`native refresh ${errorClass}`);
@@ -66,6 +75,8 @@ export class RefreshTriggerError extends Error {
     this.abandoned = result.abandoned;
     this.exitCode = result.code;
     this.timeoutMs = timeoutMs;
+    this.spawnedAtMs = result.spawned_at_ms ?? null;
+    this.childPid = result.child_pid ?? null;
     const output =
       "output" in result && typeof result.output === "string"
         ? result.output
@@ -78,6 +89,34 @@ export class RefreshTriggerError extends Error {
         ?.toUpperCase() ?? null;
   }
 }
+
+const refreshSpawnBag = new AsyncLocalStorage<{
+  meta: TRefreshSpawnMeta | undefined;
+  timeoutMs: number | undefined;
+}>();
+
+const refreshClocks = (
+  started: number,
+  spawn: TRefreshSpawnMeta | undefined,
+): {
+  readonly elapsed_ms: number;
+  readonly queued_ms: number;
+  readonly spawn_elapsed_ms: number | null;
+  readonly spawned: boolean;
+  readonly child_pid: number | null;
+} => {
+  const settled = Date.now();
+  const elapsed_ms = settled - started;
+  const spawnedAt = spawn?.spawned_at_ms ?? null;
+  const spawned = spawnedAt !== null;
+  return {
+    elapsed_ms,
+    queued_ms: spawned ? spawnedAt - started : elapsed_ms,
+    spawn_elapsed_ms: spawned ? settled - spawnedAt : null,
+    spawned,
+    child_pid: spawn?.child_pid ?? null,
+  };
+};
 
 /** Per-provider refresh counters. `cooldown_skips` (post-success 30s window) and
  *  `backoff_skips` (post-failure escalating window) are kept DISTINCT so a healthy
@@ -173,6 +212,8 @@ export const keychainUnusable = (provider: string): never => {
   throw new RefreshTriggerError("keychain_unusable", {
     abandoned: false,
     code: -1,
+    spawned_at_ms: null,
+    child_pid: null,
   });
 };
 
@@ -262,6 +303,16 @@ export const spawnRefresh = async (
   // A refresh must turn those resolved outcomes into a classified rejection so
   // makeRefresher cannot record a killed rotation as a clean success.
   inspectRefreshResult(result, timeoutMs);
+  // T4 pins spawnRefresh resolving to `undefined`. Stamp clocks onto the
+  // in-flight fire() bag so the success path still carries them.
+  const bag = refreshSpawnBag.getStore();
+  if (bag !== undefined) {
+    bag.meta = {
+      spawned_at_ms: result.spawned_at_ms,
+      child_pid: result.child_pid,
+    };
+    bag.timeoutMs = timeoutMs;
+  }
 };
 
 /** What `makeRefresher` did for this read — tells the caller whether the store
@@ -357,7 +408,7 @@ export const makeRefresher = (opts: {
   readonly label: string;
   readonly leewayMs: number;
   readonly cooldownMs?: number;
-  readonly trigger: () => Promise<void>;
+  readonly trigger: () => Promise<undefined | TRefreshSpawnMeta>;
 }): ((expiresAtMs: number | null) => Promise<TRefreshOutcome>) => {
   let inFlight: Promise<void> | null = null;
   let lastErrorClass: TRefreshErrorClass | null = null;
@@ -368,12 +419,17 @@ export const makeRefresher = (opts: {
   const fire = (): Promise<void> => {
     if (inFlight === null) {
       const started = Date.now();
-      // A failed trigger is still best-effort: rejecting would (a) leak an
-      // unhandled rejection from the background `void fire()` path and (b)
-      // throw out of the awaited hard-expired path — both wrong. On failure
-      // the store simply isn't refreshed and `readToken` falls back to the
-      // stale token (surfacing the vendor's own 401 → re-login). Log a
-      // REDACTED class only — never the raw error / token.
+      // Three clocks, not one: `elapsed_ms` is the whole trigger() wall from
+      // this first waiter's `started` (queue + spawn). `queued_ms` is
+      // spawned_at − started, or the wall-to-failure when no child ran.
+      // `spawn_elapsed_ms` is settled − spawned_at and is the ONLY number
+      // comparable to `timeout_ms`; it is null when no child ran. A failed
+      // trigger is still best-effort: rejecting would (a) leak an unhandled
+      // rejection from the background `void fire()` path and (b) throw out of
+      // the awaited hard-expired path — both wrong. On failure the store
+      // simply isn't refreshed and `readToken` falls back to the stale token
+      // (surfacing the vendor's own 401 → re-login). Log a REDACTED class
+      // only — never the raw error / token.
       // NOTE (telemetry semantics, tracked follow-up): `attempts`/`ok` count a
       // trigger INVOCATION that resolved, which includes a benign keychain skip
       // or a non-zero-but-unverified exit where no rotation is proven. Making
@@ -382,14 +438,32 @@ export const makeRefresher = (opts: {
       // consumer yet) slightly over-counts `ok` on those benign paths.
       const counters = counterFor(opts.slug);
       counters.attempts++;
-      inFlight = opts
-        .trigger()
-        .then(() => {
+      const bag: {
+        meta: TRefreshSpawnMeta | undefined;
+        timeoutMs: number | undefined;
+      } = { meta: undefined, timeoutMs: undefined };
+      inFlight = refreshSpawnBag
+        .run(bag, () => opts.trigger())
+        .then((meta) => {
           lastErrorClass = null;
           lastRefreshErrorClasses.set(opts.slug, null);
           consecutiveFailures = 0;
           counters.ok++;
           if (cooldownMs > 0) cooldownUntil = Date.now() + cooldownMs;
+          const spawn =
+            meta !== undefined && meta !== null
+              ? {
+                  spawned_at_ms: meta.spawned_at_ms,
+                  child_pid: meta.child_pid,
+                }
+              : bag.meta;
+          logInfo("refresh", "native refresh trigger settled", {
+            provider: opts.slug,
+            label: opts.label,
+            phase: "refresh_trigger",
+            ...refreshClocks(started, spawn),
+            timeout_ms: bag.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+          });
         })
         .catch((err: unknown) => {
           lastErrorClass = classifyRefreshError(err);
@@ -404,11 +478,21 @@ export const makeRefresher = (opts: {
             MAX_REFRESH_FAILURE_BACKOFF_MS,
           );
           failureBackoffUntil = Date.now() + failureBackoffMs;
+          const spawn: TRefreshSpawnMeta | undefined =
+            triggerError === undefined
+              ? undefined
+              : {
+                  spawned_at_ms: triggerError.spawnedAtMs,
+                  child_pid: triggerError.childPid,
+                };
+          const clocks = refreshClocks(started, spawn);
           if (lastErrorClass === "network") {
             logWarn("refresh", "codex token refresh failed: network", {
               provider: opts.slug,
               errno: triggerError?.errno ?? networkErrno(err),
               retry_in_ms: failureBackoffMs,
+              ...clocks,
+              timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
             });
             return;
           }
@@ -417,7 +501,7 @@ export const makeRefresher = (opts: {
             label: opts.label,
             phase: "refresh_trigger",
             error_class: lastErrorClass,
-            elapsed_ms: Date.now() - started,
+            ...clocks,
             timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
             abandoned: triggerError?.abandoned ?? false,
             exit_code: triggerError?.exitCode ?? null,
