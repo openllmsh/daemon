@@ -36,17 +36,41 @@ let cachedPriv: KeyObject | null = null;
 let cachedPersisted = false;
 let cachedPubB64: string | null = null;
 
-const nodeErrno = (
+const isErrnoException = (err: unknown): err is NodeJS.ErrnoException => {
+  if (!(err instanceof Error)) return false;
+  return (
+    ("code" in err && typeof err.code === "string") ||
+    ("errno" in err && typeof err.errno === "number")
+  );
+};
+
+const errnoFields = (
   err: unknown,
 ): { readonly errno: number | null; readonly code: string | null } => {
-  if (typeof err !== "object" || err === null) {
-    return { errno: null, code: null };
-  }
-  const rec = err as { errno?: unknown; code?: unknown };
+  if (!isErrnoException(err)) return { errno: null, code: null };
   return {
-    errno: typeof rec.errno === "number" ? rec.errno : null,
-    code: typeof rec.code === "string" ? rec.code : null,
+    errno: typeof err.errno === "number" ? err.errno : null,
+    code: typeof err.code === "string" ? err.code : null,
   };
+};
+
+const isAbsentIdentityFile = (err: unknown): boolean =>
+  isErrnoException(err) && err.code === "ENOENT";
+
+const logIdentityFailure = (
+  message: string,
+  operation: "read" | "parse" | "write",
+  err: unknown,
+  path: string,
+): void => {
+  const { errno, code } = errnoFields(err);
+  logError("keypair", message, {
+    operation,
+    class: err instanceof Error ? err.constructor.name : typeof err,
+    errno,
+    code,
+    path,
+  });
 };
 
 /**
@@ -75,17 +99,43 @@ const publicKeyB64Of = (privateKey: KeyObject): string => {
   return cachedPubB64;
 };
 
+const cacheEphemeral = (privateKey: KeyObject): KeyObject => {
+  cachedPriv = privateKey;
+  cachedPersisted = false;
+  return privateKey;
+};
+
 /** The daemon's own X25519 private key, generated + persisted on first use. */
 const ownPrivate = (): KeyObject => {
   if (cachedPriv !== null) return cachedPriv;
   const path = privFile();
   try {
     const der = readFileSync(path);
-    cachedPriv = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    try {
+      cachedPriv = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    } catch (err) {
+      // File exists but is not a usable PKCS#8 key — never overwrite it.
+      logIdentityFailure(
+        "identity private key exists but is unreadable — using ephemeral key, skip publishIdentity this run",
+        "parse",
+        err,
+        path,
+      );
+      return cacheEphemeral(generateKeyPairSync("x25519").privateKey);
+    }
     cachedPersisted = true;
     return cachedPriv;
-  } catch {
-    // none yet — generate + persist below
+  } catch (err) {
+    if (!isAbsentIdentityFile(err)) {
+      // Existing file we cannot read (EACCES, EISDIR, …) — never overwrite.
+      logIdentityFailure(
+        "identity private key exists but is unreadable — using ephemeral key, skip publishIdentity this run",
+        "read",
+        err,
+        path,
+      );
+      return cacheEphemeral(generateKeyPairSync("x25519").privateKey);
+    }
   }
   const { privateKey } = generateKeyPairSync("x25519");
   try {
@@ -96,16 +146,11 @@ const ownPrivate = (): KeyObject => {
     cachedPersisted = true;
   } catch (err) {
     cachedPersisted = false;
-    const { errno, code } = nodeErrno(err);
-    logError(
-      "keypair",
+    logIdentityFailure(
       "identity private key was not persisted — skip publishIdentity this run",
-      {
-        errno,
-        code,
-        path,
-        err: err instanceof Error ? err.message : String(err),
-      },
+      "write",
+      err,
+      path,
     );
   }
   cachedPriv = privateKey;

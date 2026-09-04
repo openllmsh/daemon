@@ -93,8 +93,12 @@ export const refreshBootstrap = async (): Promise<boolean> => {
       // the next boot generates a different key and 409s forever — a transient
       // full disk becomes a permanent wedge. Skipping leaves no pin, and the
       // next boot pins cleanly. `keypair.ts` already logged the errno.
+      // Fire-and-forget: a slow POST must not hold bootstrap. Sync throws from
+      // loadIdentityKey still land in this catch (must not flip cloudState).
       const identity = loadIdentityKey();
-      if (identity.persisted) await publishIdentity(identity.publicKeyB64);
+      if (identity.persisted) {
+        void publishIdentity(identity.publicKeyB64).catch(() => {});
+      }
     } catch {
       // swallow — identity pin is non-critical hardening
     }
