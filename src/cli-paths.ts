@@ -26,31 +26,142 @@ import { daemonTempDir } from "./sandbox/working-set";
  *  that reaches a CLI path provably came through the typed command union. */
 export type TCliProvider = TSubscriptionProviderSlug;
 
+type TCliEnvCtx = {
+  readonly home: string;
+  readonly root: string;
+  readonly config: string;
+  readonly tmp: string;
+};
+
 // Where the vendor installer drops the binary, RELATIVE to the provider
 // root, plus the CLI's command name as invoked from a shell (what a PATH
-// scan looks for). (Run/install env knobs live in `cliEnv` below, not here.)
+// scan looks for). Host drop-points, isolated config dir, and run/install
+// env knobs live on the same record so adding a provider is one entry.
 type TCliSpec = {
   readonly binRel: string;
   readonly cmd: string;
+  /** Official-installer drop points, relative to the real user home. Lazy. */
+  readonly hostCandidates: (home: string) => string[];
+  /** Isolated config/credential dir as the CLI itself sees it. Lazy. */
+  readonly configDir: (isolatedHome: string) => string;
+  /** Isolated spawn env (HOME + TMPDIR + provider knobs). Lazy. */
+  readonly env: (ctx: TCliEnvCtx) => Record<string, string>;
 };
 
 const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   // `claude install` (run by claude.ai/install.sh under our HOME) places
   // the launcher at $HOME/.local/bin/claude.
-  claude_code: { binRel: "home/.local/bin/claude", cmd: "claude" },
+  claude_code: {
+    binRel: "home/.local/bin/claude",
+    cmd: "claude",
+    // The official installer's launcher → resolves to
+    // ~/.local/share/claude/versions/<v> (the self-contained binary).
+    hostCandidates: (home) => [join(home, ".local", "bin", "claude")],
+    configDir: (home) => join(home, ".claude"),
+    env: ({ home, config, tmp }) => ({
+      HOME: home,
+      TMPDIR: tmp,
+      // Claude reads its config/credentials from CLAUDE_CONFIG_DIR
+      // (defaults to $HOME/.claude); pin it to the isolated home so
+      // login/status/usage all use it, never the user's.
+      CLAUDE_CONFIG_DIR: config,
+    }),
+  },
   // codex install.sh with CODEX_INSTALL_DIR=<root>/bin → <root>/bin/codex.
-  chatgpt: { binRel: "bin/codex", cmd: "codex" },
+  chatgpt: {
+    binRel: "bin/codex",
+    cmd: "codex",
+    hostCandidates: (home) => [
+      join(home, ".local", "bin", "codex"),
+      join(home, ".codex", "bin", "codex"),
+    ],
+    configDir: (home) => join(home, ".codex"),
+    env: ({ home, root, config, tmp }) => ({
+      HOME: home,
+      TMPDIR: tmp,
+      CODEX_HOME: config,
+      CODEX_INSTALL_DIR: join(root, "bin"),
+      // Skip interactive prompts during the scripted install.
+      CODEX_NON_INTERACTIVE: "1",
+    }),
+  },
   // kimi install.sh with KIMI_INSTALL_DIR=<root> → <root>/bin/kimi.
-  kimi_code: { binRel: "bin/kimi", cmd: "kimi" },
+  kimi_code: {
+    binRel: "bin/kimi",
+    cmd: "kimi",
+    hostCandidates: (home) => [
+      join(home, ".kimi-code", "bin", "kimi"),
+      join(home, ".local", "bin", "kimi"),
+    ],
+    configDir: (home) => join(home, ".kimi-code"),
+    env: ({ home, root, config, tmp }) => ({
+      HOME: home,
+      TMPDIR: tmp,
+      KIMI_CODE_HOME: config,
+      KIMI_INSTALL_DIR: root,
+      // Don't edit the user's shell rc files.
+      KIMI_NO_MODIFY_PATH: "1",
+    }),
+  },
   // grok (Grok Build, x.ai/cli) is HOME-rooted like claude, so its isolated
   // symlink lives under the isolated HOME's bin, paralleling claude's launcher.
   // NB: this is only where the ISOLATED SYMLINK is created — the real installer
-  // drops the host launcher at ~/.grok/bin/grok (see `hostCliCandidates`), and
+  // drops the host launcher at ~/.grok/bin/grok (see `hostCandidates`), and
   // that is what gets symlinked here.
-  grok: { binRel: "home/.local/bin/grok", cmd: "grok" },
+  grok: {
+    binRel: "home/.local/bin/grok",
+    cmd: "grok",
+    // The official x.ai/cli installer's default BIN_DIR is ~/.grok/bin
+    // (`BIN_DIR="${GROK_BIN_DIR:-$HOME/.grok/bin}"`), and it only adds a
+    // ~/.local/bin/grok symlink WHEN ~/.grok/bin isn't already on PATH — so
+    // the primary location must come first, with ~/.local/bin/grok as the
+    // conditional fallback. (Verified against the live installer 2026-06-30.)
+    hostCandidates: (home) => [
+      join(home, ".grok", "bin", "grok"),
+      join(home, ".local", "bin", "grok"),
+    ],
+    // grok caches its OAuth token at <home>/.grok/auth.json.
+    configDir: (home) => join(home, ".grok"),
+    // grok is HOME-rooted (like claude): it reads/writes its config +
+    // `auth.json` under <home>/.grok, so pinning HOME isolates it from the
+    // user's real ~/.grok. The host binary lives at its DEFAULT location
+    // (~/.grok/bin, installed out of band by the user-run installer) and the
+    // isolated path is a symlink to it — the daemon only runs it, never installs.
+    env: ({ home, tmp }) => ({
+      HOME: home,
+      TMPDIR: tmp,
+    }),
+  },
   // ⚠️ RESEARCH-UNVERIFIED: Cursor's official installer is reported to place
   // this launcher at ~/.local/bin/cursor-agent.
-  cursor: { binRel: "home/.local/bin/cursor-agent", cmd: "cursor-agent" },
+  cursor: {
+    binRel: "home/.local/bin/cursor-agent",
+    cmd: "cursor-agent",
+    // ⚠️ RESEARCH-UNVERIFIED: best-known Cursor installer launcher path;
+    // `resolveOnPath` below covers other installation layouts.
+    hostCandidates: (home) => [join(home, ".local", "bin", "cursor-agent")],
+    // Live-verified (Linux, cursor-agent 2026.07.23): the credential store is
+    // the XDG path `$XDG_CONFIG_HOME/cursor/auth.json`, i.e. `<home>/.config/
+    // cursor/auth.json` once HOME is isolated (the CLI's own app data —
+    // cli-config, acp-sessions, skills — is HOME-rooted under `<home>/.cursor`
+    // and is NOT the credential dir). `cliEnv` pins `XDG_CONFIG_HOME` at
+    // `<home>/.config` so this is where the token lands regardless of any
+    // ambient `XDG_CONFIG_HOME`, keeping write + read on the same isolated path
+    // (Codex parity via `CODEX_HOME`).
+    configDir: (home) => join(home, ".config", "cursor"),
+    // cursor-agent resolves its credential store as
+    // `($XDG_CONFIG_HOME || $HOME/.config)/cursor/auth.json`. Pin
+    // `XDG_CONFIG_HOME` at the isolated `<home>/.config` so the token can never
+    // land in the user's real `~/.config/cursor` even when the host exports an
+    // ambient `XDG_CONFIG_HOME` (Codex parity via `CODEX_HOME`). `config` here
+    // is `<home>/.config/cursor` (see `configDir`), so its parent is the
+    // XDG config root. macOS Keychain credentials remain host-managed.
+    env: ({ home, tmp }) => ({
+      HOME: home,
+      TMPDIR: tmp,
+      XDG_CONFIG_HOME: join(home, ".config"),
+    }),
+  },
 };
 
 /** The closed runtime list of CLI providers — derived from `SPECS` keys so it
@@ -110,38 +221,7 @@ export const hostCliCandidates = (
   // production; unset there, so host discovery is unchanged.
   if (process.env.OPENLLM_NO_HOST_CLI_DISCOVERY === "1") return [];
   const home = homeOverride ?? homedir();
-  const vendorDefaults = ((): string[] => {
-    switch (provider) {
-      case "claude_code":
-        // The official installer's launcher → resolves to
-        // ~/.local/share/claude/versions/<v> (the self-contained binary).
-        return [join(home, ".local", "bin", "claude")];
-      case "chatgpt":
-        return [
-          join(home, ".local", "bin", "codex"),
-          join(home, ".codex", "bin", "codex"),
-        ];
-      case "kimi_code":
-        return [
-          join(home, ".kimi-code", "bin", "kimi"),
-          join(home, ".local", "bin", "kimi"),
-        ];
-      // The official x.ai/cli installer's default BIN_DIR is ~/.grok/bin
-      // (`BIN_DIR="${GROK_BIN_DIR:-$HOME/.grok/bin}"`), and it only adds a
-      // ~/.local/bin/grok symlink WHEN ~/.grok/bin isn't already on PATH — so
-      // the primary location must come first, with ~/.local/bin/grok as the
-      // conditional fallback. (Verified against the live installer 2026-06-30.)
-      case "grok":
-        return [
-          join(home, ".grok", "bin", "grok"),
-          join(home, ".local", "bin", "grok"),
-        ];
-      // ⚠️ RESEARCH-UNVERIFIED: best-known Cursor installer launcher path;
-      // `resolveOnPath` below covers other installation layouts.
-      case "cursor":
-        return [join(home, ".local", "bin", "cursor-agent")];
-    }
-  })();
+  const vendorDefaults = SPECS[provider].hostCandidates(home);
   const out: string[] = [];
   const seen = new Set<string>();
   for (const p of [...vendorDefaults, ...resolveOnPath(SPECS[provider].cmd)]) {
@@ -210,30 +290,8 @@ export const sessionEnv = (): Record<string, string> => {
  * so the read location and the `cliEnv` run location never drift.
  *   claude → <home>/.claude   codex → <home>/.codex   kimi → <home>/.kimi-code
  */
-export const cliConfigDir = (provider: TCliProvider): string => {
-  const home = cliHome(provider);
-  switch (provider) {
-    case "claude_code":
-      return join(home, ".claude");
-    case "chatgpt":
-      return join(home, ".codex");
-    case "kimi_code":
-      return join(home, ".kimi-code");
-    // grok caches its OAuth token at <home>/.grok/auth.json.
-    case "grok":
-      return join(home, ".grok");
-    // Live-verified (Linux, cursor-agent 2026.07.23): the credential store is
-    // the XDG path `$XDG_CONFIG_HOME/cursor/auth.json`, i.e. `<home>/.config/
-    // cursor/auth.json` once HOME is isolated (the CLI's own app data —
-    // cli-config, acp-sessions, skills — is HOME-rooted under `<home>/.cursor`
-    // and is NOT the credential dir). `cliEnv` pins `XDG_CONFIG_HOME` at
-    // `<home>/.config` so this is where the token lands regardless of any
-    // ambient `XDG_CONFIG_HOME`, keeping write + read on the same isolated path
-    // (Codex parity via `CODEX_HOME`).
-    case "cursor":
-      return join(home, ".config", "cursor");
-  }
-};
+export const cliConfigDir = (provider: TCliProvider): string =>
+  SPECS[provider].configDir(cliHome(provider));
 
 /**
  * Environment overrides that (1) isolate the CLI's runtime home and
@@ -261,56 +319,5 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
   const config = cliConfigDir(provider);
   // The daemon-owned, sandbox-granted staging dir for `mktemp -d` (see above).
   const tmp = verifiedDaemonTempDir();
-  switch (provider) {
-    case "claude_code":
-      return {
-        HOME: home,
-        TMPDIR: tmp,
-        // Claude reads its config/credentials from CLAUDE_CONFIG_DIR
-        // (defaults to $HOME/.claude); pin it to the isolated home so
-        // login/status/usage all use it, never the user's.
-        CLAUDE_CONFIG_DIR: config,
-      };
-    case "chatgpt":
-      return {
-        HOME: home,
-        TMPDIR: tmp,
-        CODEX_HOME: config,
-        CODEX_INSTALL_DIR: join(root, "bin"),
-        // Skip interactive prompts during the scripted install.
-        CODEX_NON_INTERACTIVE: "1",
-      };
-    case "kimi_code":
-      return {
-        HOME: home,
-        TMPDIR: tmp,
-        KIMI_CODE_HOME: config,
-        KIMI_INSTALL_DIR: root,
-        // Don't edit the user's shell rc files.
-        KIMI_NO_MODIFY_PATH: "1",
-      };
-    // grok is HOME-rooted (like claude): it reads/writes its config +
-    // `auth.json` under <home>/.grok, so pinning HOME isolates it from the
-    // user's real ~/.grok. The host binary lives at its DEFAULT location
-    // (~/.grok/bin, installed out of band by the user-run installer) and the
-    // isolated path is a symlink to it — the daemon only runs it, never installs.
-    case "grok":
-      return {
-        HOME: home,
-        TMPDIR: tmp,
-      };
-    // cursor-agent resolves its credential store as
-    // `($XDG_CONFIG_HOME || $HOME/.config)/cursor/auth.json`. Pin
-    // `XDG_CONFIG_HOME` at the isolated `<home>/.config` so the token can never
-    // land in the user's real `~/.config/cursor` even when the host exports an
-    // ambient `XDG_CONFIG_HOME` (Codex parity via `CODEX_HOME`). `config` here
-    // is `<home>/.config/cursor` (see `cliConfigDir`), so its parent is the
-    // XDG config root. macOS Keychain credentials remain host-managed.
-    case "cursor":
-      return {
-        HOME: home,
-        TMPDIR: tmp,
-        XDG_CONFIG_HOME: join(home, ".config"),
-      };
-  }
+  return SPECS[provider].env({ home, root, config, tmp });
 };
