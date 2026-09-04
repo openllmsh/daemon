@@ -475,7 +475,14 @@ const autoLockOffByKc = new Map<string, boolean>();
  *  invalidate a skip because the chain may have relocked under us. */
 const isInteractionNotAllowed = (stderr: string): boolean => {
   const s = stderr.toLowerCase();
-  return s.includes("-25308") || s.includes("interaction not allowed");
+  // The literal message, verified with `security error -25308`, is "User
+  // interaction is not allowed." — note the "is". `security` reports the text
+  // WITHOUT the numeric code (e.g. "security: SecKeychainSearchCopyNext: User
+  // interaction is not allowed."), so a numeric-only match never fires on a
+  // real host; the `-25308` arm is kept only for callers that do surface codes.
+  return (
+    s.includes("-25308") || /interaction\s+(?:is\s+)?not\s+allowed/.test(s)
+  );
 };
 
 const invalidateUnlockSkip = (kc: string): void => {
@@ -504,6 +511,9 @@ const noteKeychainIoResult = (kc: string, res: TSecurityResult): void => {
  *  so an inconclusive probe is never cached as a verdict. */
 export const parseAutoLockOffForTests = (out: string): boolean | null =>
   parseAutoLockOff(out);
+
+export const isInteractionNotAllowedForTests = (stderr: string): boolean =>
+  isInteractionNotAllowed(stderr);
 
 const parseAutoLockOff = (out: string): boolean | null => {
   const lower = out.toLowerCase();
