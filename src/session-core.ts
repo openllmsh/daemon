@@ -24,6 +24,10 @@ import { sessionEnv } from "./cli-paths";
 import { resolveOpenllmCli } from "./cli-self-update";
 import { spawnEnv } from "./delegation/spawn";
 import { loadEnvFile } from "./env";
+import {
+  openllmClientIdOf,
+  pushDeviceCliResumeArgs,
+} from "./local-sessions/types";
 import { logInfo, logWarn } from "./logger";
 import { serializeScreenBytes } from "./session-screen";
 
@@ -476,22 +480,14 @@ const liveCount = (): number =>
 /**
  * Device CLI → `openllm <client>` id. Only clients the openllm CLI hosts
  * are mappable; others fall back to the host vendor binary.
+ *
+ * Precondition guard: only reached after `argvFor` early-returns for `shell`.
+ * The throw is the unreachable-shell contract; `openllmClientIdOf` is total.
  */
 const openllmClientId = (cli: TDeviceSessionCli): string => {
-  switch (cli) {
-    case "claude_code":
-      return "claude";
-    case "chatgpt":
-      return "codex";
-    case "grok":
-      return "grok";
-    case "opencode":
-      return "opencode";
-    case "hermes":
-      return "hermes";
-    case "shell":
-      throw new Error("shell is not an openllm client");
-  }
+  const id = openllmClientIdOf(cli);
+  if (id === null) throw new Error("shell is not an openllm client");
+  return id;
 };
 
 /**
@@ -511,25 +507,7 @@ const pushResumeArgs = (
   cli: TDeviceSessionCli,
   vendorSessionId: string,
 ): void => {
-  switch (cli) {
-    case "claude_code":
-    case "grok":
-      args.push("--resume", vendorSessionId);
-      break;
-    case "chatgpt":
-      args.push("resume", vendorSessionId);
-      break;
-    case "opencode":
-      args.push("--session", vendorSessionId);
-      break;
-    case "hermes":
-      args.push("--resume", vendorSessionId);
-      break;
-    case "shell":
-      break;
-    default:
-      break;
-  }
+  pushDeviceCliResumeArgs(args, cli, vendorSessionId);
 };
 
 /**

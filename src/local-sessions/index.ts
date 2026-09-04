@@ -11,8 +11,9 @@ import { readGrokHistory } from "./grok";
 import { readLiveRuns } from "./live-run";
 import { readOpencodeHistory } from "./opencode";
 import { TITLE_MAX } from "./title";
-import type { THistorySession, TLiveRun } from "./types";
+import type { TDeviceCliHistoryId, THistorySession, TLiveRun } from "./types";
 import {
+  DEVICE_CLI_RECORD,
   deviceCliOfClientId,
   isListableDeviceCli,
   openllmClientIdOf,
@@ -42,22 +43,24 @@ export type TLocalSessionsDeps = {
   }>;
 };
 
+const HISTORY_READERS: Record<
+  TDeviceCliHistoryId,
+  (limit: number) => THistorySession[] | Promise<THistorySession[]>
+> = {
+  claude: readClaudeHistory,
+  codex: readCodexHistory,
+  grok: readGrokHistory,
+  opencode: readOpencodeHistory,
+};
+
 const defaultHistory = async (
   cli: TDeviceSessionCli,
   limit: number,
 ): Promise<THistorySession[]> => {
-  switch (cli) {
-    case "claude_code":
-      return readClaudeHistory(limit);
-    case "chatgpt":
-      return readCodexHistory(limit);
-    case "grok":
-      return readGrokHistory(limit);
-    case "opencode":
-      return readOpencodeHistory(limit);
-    default:
-      return [];
-  }
+  const spec = DEVICE_CLI_RECORD[cli];
+  const historyId = "history" in spec ? spec.history : undefined;
+  if (historyId === undefined) return [];
+  return HISTORY_READERS[historyId](limit);
 };
 
 const defaultLive = async (cli: TDeviceSessionCli): Promise<TLiveRun[]> => {
