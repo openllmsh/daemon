@@ -37,7 +37,7 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
-import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import { cliConfigDir } from "../cli-paths";
 import { logWarn } from "../logger";
 import {
   clearPendingAuth,
@@ -45,20 +45,15 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { accountHashField, jwtClaims } from "./account-id";
-import {
-  ensureAuthConfig,
-  resolveProviderUrl,
-  resolveUpstreamUrl,
-} from "./auth-config";
+import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
+import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { fetchModelList, positiveInt } from "./fetch-model-list";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
-import { loginSlot, makeCancelConnect } from "./login-flow";
+import { makeCancelConnect } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
-  makeRefresher,
-  REFRESH_COOLDOWN_MS,
   resolveToken,
   spawnRefresh,
 } from "./refresh";
@@ -95,8 +90,7 @@ const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 // which the daemon must drive itself (kimi's only sign-in is the in-TUI /login).
 const REFRESH_LEEWAY_MS = 60_000;
 
-const bin = (): string => cliBin(PROVIDER);
-const env = (): Record<string, string> => cliEnv(PROVIDER);
+const { bin, env } = cliLaunch(PROVIDER);
 const kimiHome = (): string => cliConfigDir(PROVIDER);
 const credentialPath = (): string =>
   join(kimiHome(), "credentials", "kimi-code.json");
@@ -233,11 +227,10 @@ const triggerRefresh = async (): Promise<void> => {
 
 // Within the leeway window → fire the CLI refresh in the background (still
 // valid, no stall); hard-expired → await it. Single-flight per provider.
-const refresh = makeRefresher({
+const refresh = nativeRefresher({
   slug: PROVIDER,
   label: "Kimi Code",
   leewayMs: REFRESH_LEEWAY_MS,
-  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -620,7 +613,23 @@ export const parseKimiUsage = (payload: unknown): TProviderUsageSnapshot => {
 // kimi's only sign-in is the device-code flow, driven via the direct-login
 // adaptor; `cancelConnect` aborts the background poll through the shared slot.
 
-const slot = loginSlot(PROVIDER);
+const {
+  installHint,
+  connectedDetail,
+  inProgressDetail,
+  isInstalled,
+  isConnected,
+  refreshConfig,
+  slot,
+} = loginWiring({
+  provider: PROVIDER,
+  installHint:
+    "Kimi CLI not found — re-run the OpenLLM daemon installer to add it.",
+  connectedDetail: "signed in via Kimi Code",
+  inProgressDetail:
+    "Kimi sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  readToken,
+});
 // Identity headers (UA + device id) computed ONCE per login (single-flight
 // guarantees no overlap) and reused by the device-code request + every poll,
 // matching the pre-refactor flow which captured `headers` once in `connect`.
@@ -629,13 +638,11 @@ let loginHeaders: Record<string, string> = {};
 const connectDevice = makeDeviceCodeConnect({
   provider: PROVIDER,
   slot,
-  installed: async () => (await cliInstallState(PROVIDER)).installed,
-  installHint:
-    "Kimi CLI not found — re-run the OpenLLM daemon installer to add it.",
-  connected: async () => (await readToken()) !== null,
-  connectedDetail: "signed in via Kimi Code",
-  inProgressDetail:
-    "Kimi sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  installed: isInstalled,
+  installHint,
+  connected: isConnected,
+  connectedDetail,
+  inProgressDetail,
   requestDeviceAuth: async () => {
     loginHeaders = await identityHeaders();
     return requestDeviceCode(loginHeaders);
@@ -643,9 +650,7 @@ const connectDevice = makeDeviceCodeConnect({
   pollToken: (deviceCode) => pollDeviceToken(deviceCode, loginHeaders),
   onCredential: (wire) => writeCredential(wire),
   // Refresh the auth config (upstream URL) now the identity is established.
-  onConnected: () => {
-    void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-  },
+  onConnected: refreshConfig,
   pendingDetail: (auth) =>
     `Authorize Kimi in the browser window that just opened (code ${auth.userCode}). This page updates automatically when you're done — or open ${auth.verificationUriComplete}`,
   startFailDetail:

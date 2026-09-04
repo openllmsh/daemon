@@ -9,11 +9,9 @@
  * (relay persistence, the calibration estimator, the UI all consume only
  * the canonical struct).
  */
-import {
-  QUOTA_REJECT_PERCENT,
-  QUOTA_WARN_PERCENT,
-} from "@openllmsh/protocol";
+
 import type { TProviderUsageWindow } from "@openllmsh/protocol";
+import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 
 /**
  * Duration label for a vendor-stated quota window — "5-hour", "7-day",
@@ -310,6 +308,21 @@ export const reduceQuotaStatus = (
   return rejected
     ? "rejected"
     : maxPct >= QUOTA_WARN_PERCENT
+      ? "allowed_warning"
+      : "allowed";
+};
+
+/** Peak `percent_used` across windows → overall status (no vendor verdict). */
+export const statusForWindows = (
+  windows: ReadonlyArray<TProviderUsageWindow>,
+): "allowed" | "allowed_warning" | "rejected" => {
+  const peak = windows.reduce(
+    (max, window) => Math.max(max, window.percent_used),
+    0,
+  );
+  return peak >= QUOTA_REJECT_PERCENT
+    ? "rejected"
+    : peak >= QUOTA_WARN_PERCENT
       ? "allowed_warning"
       : "allowed";
 };

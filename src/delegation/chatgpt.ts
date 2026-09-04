@@ -28,7 +28,7 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
-import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import { cliConfigDir } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
 import {
   clearPendingAuth,
@@ -37,22 +37,16 @@ import {
 } from "../pending-auth";
 import { DAEMON_VERSION } from "../version";
 import { accountHash } from "./account-id";
-import {
-  ensureAuthConfig,
-  resolveProviderUrl,
-  resolveUpstreamUrl,
-} from "./auth-config";
+import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
+import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { fetchModelList, positiveInt } from "./fetch-model-list";
 import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
-import { loginSlot } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
   lastRefreshErrorClass,
-  makeRefresher,
-  REFRESH_COOLDOWN_MS,
   resolveToken,
   spawnRefresh,
 } from "./refresh";
@@ -89,8 +83,7 @@ const USAGE_PATH = "/backend-api/wham/usage";
 // or client id lives here. See `triggerRefresh`.
 const REFRESH_LEEWAY_MS = 5 * 60_000;
 
-const bin = (): string => cliBin(PROVIDER);
-const env = (): Record<string, string> => cliEnv(PROVIDER);
+const { bin, env } = cliLaunch(PROVIDER);
 
 /**
  * Strip query strings from any URL in a diagnostic string, so OAuth authorize
@@ -164,11 +157,10 @@ const triggerRefresh = async (): Promise<void> => {
 
 // Within the leeway window → fire the CLI refresh in the background (still
 // valid, no stall); hard-expired → await it. Single-flight per provider.
-const refresh = makeRefresher({
+const refresh = nativeRefresher({
   slug: PROVIDER,
   label: "ChatGPT",
   leewayMs: REFRESH_LEEWAY_MS,
-  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -255,15 +247,23 @@ const hasCodexUserAgent = (inbound?: Headers): boolean =>
 // `loginSlot` so only one `codex login` runs at a time (each binds a localhost
 // callback / polls), and `cancelConnect` kills whichever is live.
 
-const INSTALL_HINT =
-  "Codex CLI not found — re-run the OpenLLM daemon installer to add it.";
-const CONNECTED_DETAIL = "signed in via Codex";
-const IN_PROGRESS_DETAIL =
-  "Codex sign-in already in progress — finish authorizing in your browser; this updates automatically.";
-
-const isInstalled = async (): Promise<boolean> =>
-  (await cliInstallState(PROVIDER)).installed;
-const isConnected = async (): Promise<boolean> => (await readToken()) !== null;
+const {
+  installHint: INSTALL_HINT,
+  connectedDetail: CONNECTED_DETAIL,
+  inProgressDetail: IN_PROGRESS_DETAIL,
+  isInstalled,
+  isConnected,
+  refreshConfig,
+  slot,
+} = loginWiring({
+  provider: PROVIDER,
+  installHint:
+    "Codex CLI not found — re-run the OpenLLM daemon installer to add it.",
+  connectedDetail: "signed in via Codex",
+  inProgressDetail:
+    "Codex sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  readToken,
+});
 
 /** Explain a transient near-expiry refresh failure without treating its token as a logout. */
 export const chatgptRefreshDetail = (accessToken: string): string | null => {
@@ -277,15 +277,6 @@ export const chatgptRefreshDetail = (accessToken: string): string | null => {
   }
   return null;
 };
-
-// Device-code lands the credential on THIS box; refresh the auth config (a CLI
-// update can rotate the upstream URL / token endpoint / client id), exactly as
-// the browser flow does. Best-effort + non-blocking.
-const refreshConfig = (): void => {
-  void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-};
-
-const slot = loginSlot(PROVIDER);
 
 // Browser flow: `codex login` prints the authorize URL to STDERR. Its OWN
 // browser-open reaches the user, so we do NOT open a second tab — only surface

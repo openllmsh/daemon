@@ -35,7 +35,7 @@ import type {
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
-import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
+import { cliConfigDir, cliHome } from "../cli-paths";
 import { logWarn } from "../logger";
 import {
   clearPendingAuth,
@@ -45,21 +45,18 @@ import {
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { accountHash, nonEmpty } from "./account-id";
 import {
-  ensureAuthConfig,
   resolveIdentityHeaders,
   resolveProviderUrl,
   resolveUpstreamUrl,
 } from "./auth-config";
+import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { fetchModelList } from "./fetch-model-list";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
-import { loginSlot } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
   keychainRefreshSpawnAllowed,
-  makeRefresher,
-  REFRESH_COOLDOWN_MS,
   resolveToken,
   spawnRefresh,
 } from "./refresh";
@@ -134,8 +131,7 @@ const readClaudePlan = async (
 const REFRESH_LEEWAY_MS = 60_000;
 
 // Run the isolated `claude` binary with its isolated home/config env.
-const bin = (): string => cliBin(PROVIDER);
-const env = (): Record<string, string> => cliEnv(PROVIDER);
+const { bin, env } = cliLaunch(PROVIDER);
 
 type TClaudeOAuth = {
   readonly accessToken?: string;
@@ -216,11 +212,10 @@ const triggerRefresh = async (): Promise<void> => {
 // ping` off the status path, racing the single-use refresh token (audit
 // 2026-08-27 §7.3). A refresh spawn is already bounded by its own 10s timeout,
 // so status callers don't need to cancel it — they share this one spawn.
-const refresh = makeRefresher({
+const refresh = nativeRefresher({
   slug: PROVIDER,
   label: "Claude Code",
   leewayMs: REFRESH_LEEWAY_MS,
-  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -425,10 +420,6 @@ const NO_REFRESH_HINT =
 // `cancelConnect`. All paths flag a credential that can't auto-refresh (no
 // refresh token) at sign-in, so the card doesn't silently die ~8h later.
 
-const slot = loginSlot(PROVIDER);
-const INSTALL_HINT =
-  "Claude Code CLI not found — re-run the OpenLLM daemon installer to add it.";
-const CONNECTED_DETAIL = "signed in via Claude Code";
 const LOGIN_ARGV = (): ReadonlyArray<string> => [
   bin(),
   "auth",
@@ -436,19 +427,26 @@ const LOGIN_ARGV = (): ReadonlyArray<string> => [
   "--claudeai",
 ];
 
-const isInstalled = async (): Promise<boolean> =>
-  (await cliInstallState(PROVIDER)).installed;
 // Authoritative connection check: prefer `claude auth status`, fall back to the
 // store read when it's unavailable (the store read is fragile on macOS).
-const isConnected = async (): Promise<boolean> => {
-  const viaAuth = await authStatusLoggedIn();
-  return viaAuth !== null ? viaAuth : (await readToken()) !== null;
-};
-// Refresh the auth config now the identity / CLI may have changed (a CLI update
-// can rotate the upstream URL / token endpoint / client id). Best-effort.
-const refreshConfig = (): void => {
-  void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-};
+const {
+  installHint: INSTALL_HINT,
+  connectedDetail: CONNECTED_DETAIL,
+  isInstalled,
+  isConnected,
+  refreshConfig,
+  slot,
+} = loginWiring({
+  provider: PROVIDER,
+  installHint:
+    "Claude Code CLI not found — re-run the OpenLLM daemon installer to add it.",
+  connectedDetail: "signed in via Claude Code",
+  readToken,
+  isConnected: async (): Promise<boolean> => {
+    const viaAuth = await authStatusLoggedIn();
+    return viaAuth !== null ? viaAuth : (await readToken()) !== null;
+  },
+});
 // The success `detail`: a credential with no refresh token works now but can't
 // be renewed — log `warning` + return the persistent NO_REFRESH_HINT so the
 // dashboard shows a "re-sign in" hint instead of a card that dies at expiry.

@@ -13,13 +13,9 @@ import type {
   TProviderUsageSnapshot,
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
-import {
-  MODEL_LIST_FETCH_TIMEOUT_MS,
-  QUOTA_REJECT_PERCENT,
-  QUOTA_WARN_PERCENT,
-} from "@openllmsh/protocol";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
-import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
+import { cliConfigDir, cliHome } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
 import { listCursorModelsViaAcp } from "../native-runtime/cursor-acp";
 import {
@@ -30,19 +26,19 @@ import {
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { accountHashField } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
+import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
-import { loginSlot, makeCancelConnect } from "./login-flow";
+import { makeCancelConnect } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
   keychainRefreshSpawnAllowed,
-  makeRefresher,
-  REFRESH_COOLDOWN_MS,
   resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TProviderDelegate } from "./types";
+import { statusForWindows } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
   connectedObservation,
@@ -67,11 +63,7 @@ const USAGE_PATH = "/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const PLAN_PATH = "/aiserver.v1.DashboardService/GetPlanInfo";
 const REFRESH_LEEWAY_MS = 5 * 60_000;
 
-const bin = (): string => cliBin(PROVIDER);
-const env = (): Record<string, string> => ({
-  ...cliEnv(PROVIDER),
-  NO_OPEN_BROWSER: "1",
-});
+const { bin, env } = cliLaunch(PROVIDER, { NO_OPEN_BROWSER: "1" });
 
 // ─── Live model rows via the ACP bridge (cursor/list_available_models) ─────
 const CURSOR_MODELS_TTL_MS = 5 * 60_000;
@@ -93,20 +85,6 @@ const parseAuthUrl = (raw: string): string | null => {
     clean.match(/https?:\/\/\S*\/(?:oauth\/)?authorize\S*/)?.[0] ??
     null
   );
-};
-
-const statusForWindows = (
-  windows: ReadonlyArray<TProviderUsageWindow>,
-): "allowed" | "allowed_warning" | "rejected" => {
-  const peak = windows.reduce(
-    (max, window) => Math.max(max, window.percent_used),
-    0,
-  );
-  return peak >= QUOTA_REJECT_PERCENT
-    ? "rejected"
-    : peak >= QUOTA_WARN_PERCENT
-      ? "allowed_warning"
-      : "allowed";
 };
 
 const numberOf = (value: unknown): number | null => {
@@ -257,11 +235,10 @@ const triggerRefresh = async (): Promise<void> => {
 
 // THE single refresher — single-flight + cooldown, no signal-aware bypass. See
 // the claude-code delegate for why the bypass was removed (rotation race).
-const refresh = makeRefresher({
+const refresh = nativeRefresher({
   slug: PROVIDER,
   label: "Cursor",
   leewayMs: REFRESH_LEEWAY_MS,
-  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -339,16 +316,22 @@ const readToken = async (
   return resolved.token;
 };
 
-const INSTALL_HINT =
-  "Cursor Agent not found — re-run the OpenLLM daemon installer to add it.";
-const CONNECTED_DETAIL = "signed in via Cursor Agent";
-const IN_PROGRESS_DETAIL =
-  "Cursor sign-in already in progress — finish authorizing in your browser; this updates automatically.";
-
-const isInstalled = async (): Promise<boolean> =>
-  (await cliInstallState(PROVIDER)).installed;
-const isConnected = async (): Promise<boolean> => (await readToken()) !== null;
-const slot = loginSlot(PROVIDER);
+const {
+  installHint: INSTALL_HINT,
+  connectedDetail: CONNECTED_DETAIL,
+  inProgressDetail: IN_PROGRESS_DETAIL,
+  isInstalled,
+  isConnected,
+  slot,
+} = loginWiring({
+  provider: PROVIDER,
+  installHint:
+    "Cursor Agent not found — re-run the OpenLLM daemon installer to add it.",
+  connectedDetail: "signed in via Cursor Agent",
+  inProgressDetail:
+    "Cursor sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  readToken,
+});
 
 const connectDirect = makeStreamConnect({
   provider: PROVIDER,
@@ -359,7 +342,7 @@ const connectDirect = makeStreamConnect({
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
-  env: () => ({ ...cliEnv(PROVIDER), NO_OPEN_BROWSER: "1" }),
+  env,
   beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
   stream: "stdout",
   parse: (buffer) => {

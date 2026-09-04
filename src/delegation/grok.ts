@@ -52,13 +52,9 @@ import type {
   TProviderUsageSnapshot,
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
-import {
-  MODEL_LIST_FETCH_TIMEOUT_MS,
-  QUOTA_REJECT_PERCENT,
-  QUOTA_WARN_PERCENT,
-} from "@openllmsh/protocol";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
-import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import { cliConfigDir } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
 import {
   clearPendingAuth,
@@ -67,24 +63,19 @@ import {
 } from "../pending-auth";
 import { DAEMON_VERSION } from "../version";
 import { accountHashField } from "./account-id";
-import {
-  ensureAuthConfig,
-  resolveProviderUrl,
-  resolveUpstreamUrl,
-} from "./auth-config";
+import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
+import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { positiveInt } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
-import { loginSlot } from "./login-flow";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
-  makeRefresher,
-  REFRESH_COOLDOWN_MS,
   resolveToken,
   spawnRefresh,
 } from "./refresh";
 import type { TImageCredential, TProviderDelegate } from "./types";
+import { statusForWindows } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
   cliVersion,
@@ -121,8 +112,7 @@ const GROK_VIDEO_BASE = "https://api.x.ai/v1";
 // `expires_at`. Mirrors codex's leeway.
 const REFRESH_LEEWAY_MS = 5 * 60_000;
 
-const bin = (): string => cliBin(PROVIDER);
-const env = (): Record<string, string> => cliEnv(PROVIDER);
+const { bin, env } = cliLaunch(PROVIDER);
 
 /**
  * Parse the browser authorize URL `grok login` prints. The user clicks an
@@ -240,11 +230,10 @@ const triggerRefresh = async (): Promise<void> => {
 
 // Within leeway → refresh in the background (token still valid, no stall);
 // hard-expired → await it. Single-flight per provider.
-const refresh = makeRefresher({
+const refresh = nativeRefresher({
   slug: PROVIDER,
   label: "Grok",
   leewayMs: REFRESH_LEEWAY_MS,
-  cooldownMs: REFRESH_COOLDOWN_MS,
   trigger: triggerRefresh,
 });
 
@@ -322,22 +311,23 @@ const grokClientCredential = async (): Promise<{
 //   - connect            → `grok login` (browser, this machine);
 //   - connectDeviceCode  → `grok login --device-auth` (headless/remote).
 
-const INSTALL_HINT =
-  "Grok CLI not found — re-run the OpenLLM daemon installer to add it.";
-const CONNECTED_DETAIL = "signed in via Grok";
-const IN_PROGRESS_DETAIL =
-  "Grok sign-in already in progress — finish authorizing in your browser; this updates automatically.";
-
-const isInstalled = async (): Promise<boolean> =>
-  (await cliInstallState(PROVIDER)).installed;
-const isConnected = async (): Promise<boolean> => (await readToken()) !== null;
-// A fresh login may rotate the captured upstream URL — refresh the auth config,
-// best-effort + non-blocking, exactly as codex's flows do.
-const refreshConfig = (): void => {
-  void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-};
-
-const slot = loginSlot(PROVIDER);
+const {
+  installHint: INSTALL_HINT,
+  connectedDetail: CONNECTED_DETAIL,
+  inProgressDetail: IN_PROGRESS_DETAIL,
+  isInstalled,
+  isConnected,
+  refreshConfig,
+  slot,
+} = loginWiring({
+  provider: PROVIDER,
+  installHint:
+    "Grok CLI not found — re-run the OpenLLM daemon installer to add it.",
+  connectedDetail: "signed in via Grok",
+  inProgressDetail:
+    "Grok sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  readToken,
+});
 
 // Browser flow: `grok login` prints the authorize URL to stderr; it opens its
 // OWN browser, so we only surface the URL (so a remote box can click it).
@@ -486,20 +476,6 @@ const parseIsoMs = (iso: string | undefined): number | null => {
   if (typeof iso !== "string") return null;
   const t = Date.parse(iso);
   return Number.isNaN(t) ? null : t;
-};
-
-// One usage window plus the escalated status a set of windows implies (the
-// MOST-used window drives the overall status — an exhausted weekly pool must
-// `reject` even when monthly has headroom).
-const statusForWindows = (
-  windows: ReadonlyArray<TProviderUsageWindow>,
-): "allowed" | "allowed_warning" | "rejected" => {
-  const peak = windows.reduce((m, w) => Math.max(m, w.percent_used), 0);
-  return peak >= QUOTA_REJECT_PERCENT
-    ? "rejected"
-    : peak >= QUOTA_WARN_PERCENT
-      ? "allowed_warning"
-      : "allowed";
 };
 
 /** The MONTHLY included-credit window from a plain `/v1/billing` body, or null
