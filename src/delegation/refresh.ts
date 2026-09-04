@@ -15,8 +15,8 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { logDebug, logInfo, logWarn } from "../logger";
+import { currentTickId, refreshSpawnBag } from "../op-context";
 import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin, spawnLoginPty } from "./util";
 
@@ -89,11 +89,6 @@ export class RefreshTriggerError extends Error {
         ?.toUpperCase() ?? null;
   }
 }
-
-const refreshSpawnBag = new AsyncLocalStorage<{
-  meta: TRefreshSpawnMeta | undefined;
-  timeoutMs: number | undefined;
-}>();
 
 const refreshClocks = (
   started: number,
@@ -434,8 +429,9 @@ export const makeRefresher = (opts: {
       // trigger INVOCATION that resolved, which includes a benign keychain skip
       // or a non-zero-but-unverified exit where no rotation is proven. Making
       // `ok` mean "rotation confirmed" needs the Stage 8 store-newer-than-
-      // pre-spawn predicate; until then `refreshTelemetrySnapshot` (no live
-      // consumer yet) slightly over-counts `ok` on those benign paths.
+      // pre-spawn predicate; until then `refreshTelemetrySnapshot` (now
+      // surfaced on GET /status as `refresh_spawns`) slightly over-counts
+      // `ok` on those benign paths.
       const counters = counterFor(opts.slug);
       counters.attempts++;
       const bag: {
@@ -463,6 +459,7 @@ export const makeRefresher = (opts: {
             phase: "refresh_trigger",
             ...refreshClocks(started, spawn),
             timeout_ms: bag.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+            tick_id: currentTickId(),
           });
         })
         .catch((err: unknown) => {
@@ -493,6 +490,7 @@ export const makeRefresher = (opts: {
               retry_in_ms: failureBackoffMs,
               ...clocks,
               timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+              tick_id: currentTickId(),
             });
             return;
           }
@@ -505,6 +503,7 @@ export const makeRefresher = (opts: {
             timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
             abandoned: triggerError?.abandoned ?? false,
             exit_code: triggerError?.exitCode ?? null,
+            tick_id: currentTickId(),
           });
         })
         .finally(() => {

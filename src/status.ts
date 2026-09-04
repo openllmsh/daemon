@@ -29,6 +29,7 @@ import { hasIdentityConflict } from "./identity-state";
 import { daemonPublicKey } from "./keypair";
 import { logWarn } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
+import { currentTickId, nextStatusTickId, opTickContext } from "./op-context";
 import { resolveOnPath } from "./path-utils";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
@@ -174,9 +175,11 @@ const awaitProducer = async (
   slug: string,
   producer: Promise<TDaemonProviderConnection>,
   ownerBudget?: TDeadlineBudget,
+  joined = false,
 ): Promise<TDaemonProviderConnection> => {
   const observerBudget =
     ownerBudget ?? createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
+  const observerStarted = Date.now();
   let settled = false;
   return Promise.race([
     producer.then((conn) => {
@@ -189,6 +192,10 @@ const awaitProducer = async (
         slug,
         phase: "delegate_status",
         timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
+        elapsed_ms: Date.now() - observerStarted,
+        producer_still_running: !settled,
+        joined,
+        tick_id: currentTickId(),
       });
       return statusFailure(slug);
     }),
@@ -199,29 +206,34 @@ const boundedDelegateStatus = async (
   slug: string,
   status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>,
 ): Promise<TDaemonProviderConnection> => {
-  const existing = inFlightSlugProbes.get(slug);
-  if (existing !== undefined) {
-    return awaitProducer(slug, existing);
-  }
-  const ownerBudget = createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
-  const producer: Promise<TDaemonProviderConnection> = status(
-    ownerBudget.signal,
-  ).then(
-    (conn) => conn,
-    (err: unknown) => {
-      logWarn("status", `status() failed for ${slug}`, {
-        err: err instanceof Error ? err.message : String(err),
-      });
-      return statusFailure(slug);
-    },
-  );
-  inFlightSlugProbes.set(slug, producer);
-  void producer.finally(() => {
-    if (inFlightSlugProbes.get(slug) === producer) {
-      inFlightSlugProbes.delete(slug);
+  const parentTick = opTickContext.getStore();
+  const run = async (): Promise<TDaemonProviderConnection> => {
+    const existing = inFlightSlugProbes.get(slug);
+    if (existing !== undefined) {
+      return awaitProducer(slug, existing, undefined, true);
     }
-  });
-  return awaitProducer(slug, producer, ownerBudget);
+    const ownerBudget = createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
+    const producer: Promise<TDaemonProviderConnection> = status(
+      ownerBudget.signal,
+    ).then(
+      (conn) => conn,
+      (err: unknown) => {
+        logWarn("status", `status() failed for ${slug}`, {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        return statusFailure(slug);
+      },
+    );
+    inFlightSlugProbes.set(slug, producer);
+    void producer.finally(() => {
+      if (inFlightSlugProbes.get(slug) === producer) {
+        inFlightSlugProbes.delete(slug);
+      }
+    });
+    return awaitProducer(slug, producer, ownerBudget, false);
+  };
+  if (parentTick === undefined) return run();
+  return opTickContext.run({ tick_id: parentTick.tick_id, slug }, run);
 };
 
 /** OpenCode is a device-session client (not a subscription delegate). Surface
@@ -297,7 +309,7 @@ export const readProviderStatus = async (
   return conn;
 };
 
-const computeStatusFresh = async (): Promise<TDaemonStatus> => {
+const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
@@ -368,6 +380,11 @@ const computeStatusFresh = async (): Promise<TDaemonStatus> => {
     pty_supported: ptySupported(),
     sessions: sessionStatusReport(),
   };
+};
+
+const computeStatusFresh = (): Promise<TDaemonStatus> => {
+  const tick_id = nextStatusTickId();
+  return opTickContext.run({ tick_id }, computeStatusFreshInner);
 };
 
 export const computeStatus = async (): Promise<TDaemonStatus> => {

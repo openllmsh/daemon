@@ -44,6 +44,7 @@ import {
   waitUntilExpired,
 } from "../deadline-budget";
 import { logError, logInfo, logWarn } from "../logger";
+import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { bindAbort, logIfKilled, spawnCwd } from "./spawn";
@@ -118,6 +119,93 @@ type TSecurityResult = {
   readonly aborted: boolean;
 };
 
+type TKeychainCounters = {
+  attempts: number;
+  timeouts: number;
+  aborted: number;
+  skipped_expired: number;
+  complete_ok: number;
+  complete_fail: number;
+  by_verb: Record<string, number>;
+};
+
+const emptyKeychainCounters = (): TKeychainCounters => ({
+  attempts: 0,
+  timeouts: 0,
+  aborted: 0,
+  skipped_expired: 0,
+  complete_ok: 0,
+  complete_fail: 0,
+  by_verb: {},
+});
+
+let keychainCounters = emptyKeychainCounters();
+let lastWatcherSnapshot = emptyKeychainCounters();
+
+const cloneKeychainCounters = (
+  counters: TKeychainCounters,
+): TKeychainCounters => ({
+  ...counters,
+  by_verb: { ...counters.by_verb },
+});
+
+export const keychainTelemetrySnapshot = (): Readonly<TKeychainCounters> =>
+  cloneKeychainCounters(keychainCounters);
+
+/** Did anything at all happen in this window? `by_verb` is derived from the
+ *  scalars, so the scalars alone decide. */
+const hasKeychainActivity = (d: TKeychainCounters): boolean =>
+  d.attempts !== 0 ||
+  d.timeouts !== 0 ||
+  d.aborted !== 0 ||
+  d.skipped_expired !== 0 ||
+  d.complete_ok !== 0 ||
+  d.complete_fail !== 0;
+
+const deltaKeychainCounters = (
+  now: TKeychainCounters,
+  prev: TKeychainCounters,
+): TKeychainCounters => {
+  const by_verb: Record<string, number> = {};
+  for (const verb of new Set([
+    ...Object.keys(now.by_verb),
+    ...Object.keys(prev.by_verb),
+  ])) {
+    const d = (now.by_verb[verb] ?? 0) - (prev.by_verb[verb] ?? 0);
+    if (d !== 0) by_verb[verb] = d;
+  }
+  return {
+    attempts: now.attempts - prev.attempts,
+    timeouts: now.timeouts - prev.timeouts,
+    aborted: now.aborted - prev.aborted,
+    skipped_expired: now.skipped_expired - prev.skipped_expired,
+    complete_ok: now.complete_ok - prev.complete_ok,
+    complete_fail: now.complete_fail - prev.complete_fail,
+    by_verb,
+  };
+};
+
+/** One info line per watcher tick: totals + deltas since the last tick. */
+export const logKeychainWatcherTick = (): void => {
+  const snapshot = keychainTelemetrySnapshot();
+  const deltas = deltaKeychainCounters(keychainCounters, lastWatcherSnapshot);
+  lastWatcherSnapshot = cloneKeychainCounters(keychainCounters);
+  // A quiet tick logs NOTHING. The unconditional version wrote ~5.7k all-zero
+  // lines a day on an idle host, which buys no history and costs log budget
+  // that a wedged machine needs for the ticks that DID spawn. Live counters
+  // stay readable at any moment on `GET /status` (`keychain_spawns`); this line
+  // exists only to reconstruct *when* activity happened, after the fact.
+  if (!hasKeychainActivity(deltas)) return;
+  logInfo("keychain", "keychain spawn snapshot", { snapshot, deltas });
+};
+
+const noteKeychainVerb = (verb: string): void => {
+  keychainCounters.by_verb[verb] = (keychainCounters.by_verb[verb] ?? 0) + 1;
+};
+
+const securityVerb = (argv: ReadonlyArray<string>): string =>
+  argv[0] ?? "unknown";
+
 /** Wait for shared producer work without giving one observer ownership of it. */
 const awaitSharedStoreRead = async <T>(
   work: Promise<TStoreRead<T>>,
@@ -184,13 +272,21 @@ const spawnSecurityNow = async (
   home: string,
   opts: TSecuritySpawnOpts,
   budget: TDeadlineBudget,
+  queuedAtMs: number,
 ): Promise<TSecurityResult> => {
   if (opts.signal?.aborted === true) {
+    keychainCounters.aborted++;
     return { ...FAILED_SPAWN, timedOut: false, aborted: true };
   }
   if (budget.expired()) {
+    keychainCounters.skipped_expired++;
     return { ...FAILED_SPAWN, timedOut: true, aborted: false };
   }
+  const verb = securityVerb(argv);
+  const laneWaitMs = Math.max(0, Date.now() - queuedAtMs);
+  const remainingAtSpawn = budget.remainingMs();
+  const spawnedAfterExpired = budget.expired();
+  const configuredTimeoutMs = securitySpawnTimeoutMs();
   try {
     const child = superviseSpawn(
       sandboxSpawnArgs(["security", ...argv], { probe: unwrapKeychainSpawn() }),
@@ -203,6 +299,9 @@ const spawnSecurityNow = async (
         env: { ...process.env, HOME: home },
       },
     );
+    keychainCounters.attempts++;
+    noteKeychainVerb(verb);
+    const spawnedAtMs = Date.now();
     const proc = child.subprocess;
     let timer: ReturnType<typeof setTimeout> | null = null;
     try {
@@ -255,16 +354,28 @@ const spawnSecurityNow = async (
           });
         }
         if (outcome.kind === "timeout") {
+          keychainCounters.timeouts++;
           logError("keychain", "security command timed out", {
             argv: redactSecurityArgv(["security", ...argv]),
+            configured_timeout_ms: configuredTimeoutMs,
+            lane_wait_ms: laneWaitMs,
+            budget_remaining_ms_at_spawn: remainingAtSpawn,
+            spawn_elapsed_ms: Date.now() - spawnedAtMs,
+            spawned_after_expired: spawnedAfterExpired,
+            verb,
+            child_pid: child.pid,
+            tick_id: currentTickId(),
           });
           return { ...FAILED_SPAWN, timedOut: true, aborted: false };
         }
+        keychainCounters.aborted++;
         return { ...FAILED_SPAWN, timedOut: false, aborted: true };
       }
       logIfKilled(redactSecurityArgv(["security", ...argv]), proc, {
         confined: unwrapKeychainSpawn() !== true,
       });
+      if (outcome.code === 0) keychainCounters.complete_ok++;
+      else keychainCounters.complete_fail++;
       return {
         code: outcome.code,
         stdout: outcome.stdout,
@@ -289,15 +400,18 @@ const spawnSecurity = async (
   const budget =
     parentBudget?.child(securitySpawnTimeoutMs()) ??
     createDeadlineBudget(securitySpawnTimeoutMs(), opts.signal);
+  const queuedAtMs = Date.now();
   return withMacosKeychainAccess(async () => {
     if (budget.expired()) {
+      if (opts.signal?.aborted === true) keychainCounters.aborted++;
+      else keychainCounters.skipped_expired++;
       return {
         ...FAILED_SPAWN,
         timedOut: opts.signal?.aborted !== true,
         aborted: opts.signal?.aborted === true,
       };
     }
-    return spawnSecurityNow(argv, home, opts, budget);
+    return spawnSecurityNow(argv, home, opts, budget, queuedAtMs);
   }, budget);
 };
 
@@ -746,6 +860,8 @@ export const resetKeychainStateForTests = (): void => {
   dumpCache.clear();
   inFlightKeychainReads.clear();
   macosKeychainLane = Promise.resolve();
+  keychainCounters = emptyKeychainCounters();
+  lastWatcherSnapshot = emptyKeychainCounters();
 };
 
 /**

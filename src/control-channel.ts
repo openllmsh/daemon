@@ -31,6 +31,7 @@ import {
   notifySessionLost,
 } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
+import { logKeychainWatcherTick } from "./delegation/keychain";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
@@ -508,6 +509,7 @@ export const pushStatusIfChanged = async (): Promise<void> =>
 const startWatcher = (): void => {
   if (watchTimer !== null) return;
   watchTimer = setInterval(() => {
+    logKeychainWatcherTick();
     pushStatusIfChanged().catch(() => {
       // best-effort: a failed snapshot push retries on the next tick
     });

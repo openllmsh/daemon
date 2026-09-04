@@ -20,6 +20,8 @@
  * compute the posture itself — it never ran the probe).
  */
 import type { TCloudState } from "./config";
+import { keychainTelemetrySnapshot } from "./delegation/keychain";
+import { refreshTelemetrySnapshot } from "./delegation/refresh";
 import type { TSandboxState } from "./sandbox/landlock";
 
 export type TDaemonHealth = {
@@ -41,6 +43,10 @@ export type TDaemonHealth = {
   readonly cloud_origin: string;
   /** Seconds since this process booted (whole seconds). */
   readonly uptime_s: number;
+  /** Attempt-level `security` spawn counters — no subprocess probe. */
+  readonly keychain_spawns: ReturnType<typeof keychainTelemetrySnapshot>;
+  /** Per-provider refresh counters — no subprocess probe. */
+  readonly refresh_spawns: ReturnType<typeof refreshTelemetrySnapshot>;
 };
 
 /**
@@ -67,4 +73,6 @@ export const buildHealth = (deps: {
   pty_sessions: deps.ptySessions,
   cloud_origin: deps.cloudOrigin,
   uptime_s: Math.max(0, Math.floor((deps.now - deps.bootAt) / 1000)),
+  keychain_spawns: keychainTelemetrySnapshot(),
+  refresh_spawns: refreshTelemetrySnapshot(),
 });
