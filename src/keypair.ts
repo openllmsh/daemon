@@ -26,18 +26,63 @@ import {
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { stateDir } from "./env";
+import { logError } from "./logger";
 
 const privFile = (): string => join(stateDir(), "x25519-priv");
 const HKDF_INFO = Buffer.from("openllm-cred-seal-v1");
 
 let cachedPriv: KeyObject | null = null;
+/** True iff `cachedPriv` was loaded from disk or written this run. */
+let cachedPersisted = false;
+let cachedPubB64: string | null = null;
+
+const nodeErrno = (
+  err: unknown,
+): { readonly errno: number | null; readonly code: string | null } => {
+  if (typeof err !== "object" || err === null) {
+    return { errno: null, code: null };
+  }
+  const rec = err as { errno?: unknown; code?: unknown };
+  return {
+    errno: typeof rec.errno === "number" ? rec.errno : null,
+    code: typeof rec.code === "string" ? rec.code : null,
+  };
+};
+
+/**
+ * Load (or mint) the daemon's long-lived X25519 identity.
+ *
+ * Caller contract (publishIdentity / bootstrap):
+ * - Always returns a usable in-memory key for THIS run — mux, chat, seals, and
+ *   subscriptions keep working even when the disk is full. Never process.exit.
+ * - `persisted` is true iff the PKCS#8 private key is on disk under the state
+ *   dir (loaded or written). When false, the caller MUST skip publishIdentity.
+ *   The cloud pin is write-once; publishing an unpersisted pubkey plants a pin
+ *   this process cannot reproduce, and the next boot 409s forever.
+ * - Never auto-rotate the pin via the API key. A stolen `sk-llm-…` must not be
+ *   able to rotate a device identity.
+ */
+export type TIdentityKey = {
+  readonly publicKeyB64: string;
+  readonly persisted: boolean;
+};
+
+const publicKeyB64Of = (privateKey: KeyObject): string => {
+  if (cachedPubB64 !== null) return cachedPubB64;
+  cachedPubB64 = Buffer.from(
+    createPublicKey(privateKey).export({ format: "der", type: "spki" }),
+  ).toString("base64");
+  return cachedPubB64;
+};
 
 /** The daemon's own X25519 private key, generated + persisted on first use. */
 const ownPrivate = (): KeyObject => {
   if (cachedPriv !== null) return cachedPriv;
+  const path = privFile();
   try {
-    const der = readFileSync(privFile());
+    const der = readFileSync(path);
     cachedPriv = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    cachedPersisted = true;
     return cachedPriv;
   } catch {
     // none yet — generate + persist below
@@ -45,28 +90,50 @@ const ownPrivate = (): KeyObject => {
   const { privateKey } = generateKeyPairSync("x25519");
   try {
     mkdirSync(stateDir(), { recursive: true });
-    writeFileSync(
-      privFile(),
-      privateKey.export({ format: "der", type: "pkcs8" }),
-      { mode: 0o600 },
+    writeFileSync(path, privateKey.export({ format: "der", type: "pkcs8" }), {
+      mode: 0o600,
+    });
+    cachedPersisted = true;
+  } catch (err) {
+    cachedPersisted = false;
+    const { errno, code } = nodeErrno(err);
+    logError(
+      "keypair",
+      "identity private key was not persisted — skip publishIdentity this run",
+      {
+        errno,
+        code,
+        path,
+        err: err instanceof Error ? err.message : String(err),
+      },
     );
-  } catch {
-    // best-effort persistence — an in-memory key still works this run
   }
   cachedPriv = privateKey;
   return privateKey;
 };
 
-/** Memoized SPKI DER base64 of {@link ownPrivate}'s public half. */
-let cachedPubB64: string | null = null;
+export const loadIdentityKey = (): TIdentityKey => {
+  const privateKey = ownPrivate();
+  return {
+    publicKeyB64: publicKeyB64Of(privateKey),
+    persisted: cachedPersisted,
+  };
+};
 
-/** This daemon's public key (SPKI DER, base64) — published on the status. */
-export const daemonPublicKey = (): string => {
-  if (cachedPubB64 !== null) return cachedPubB64;
-  cachedPubB64 = Buffer.from(
-    createPublicKey(ownPrivate()).export({ format: "der", type: "spki" }),
-  ).toString("base64");
-  return cachedPubB64;
+/**
+ * Whether the long-lived private key is on disk. False means skip
+ * publishIdentity (see {@link loadIdentityKey}).
+ */
+export const identityKeyPersisted = (): boolean => loadIdentityKey().persisted;
+
+/** This daemon's public key (SPKI DER, base64) — in-memory even if not persisted. */
+export const daemonPublicKey = (): string => loadIdentityKey().publicKeyB64;
+
+/** Drop memoized identity so a test can switch `OPENLLM_DAEMON_STATE_DIR`. */
+export const resetIdentityKeyCacheForTests = (): void => {
+  cachedPriv = null;
+  cachedPersisted = false;
+  cachedPubB64 = null;
 };
 
 const deriveKey = (shared: Buffer): Buffer =>

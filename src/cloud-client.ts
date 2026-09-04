@@ -27,7 +27,7 @@ import {
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
-import { setIdentityConflict } from "./identity-state";
+import { hasIdentityConflict, setIdentityConflict } from "./identity-state";
 import { logWarn } from "./logger";
 
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
@@ -246,6 +246,15 @@ export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
 };
 
 /**
+ * Lazy import: control-channel already imports this module. Push only on a
+ * conflict *transition* so the dashboard sees the flag without an extra backoff.
+ */
+const pushIdentityConflictIfChanged = async (): Promise<void> => {
+  const { pushStatusIfChanged } = await import("./control-channel");
+  await pushStatusIfChanged();
+};
+
+/**
  * Publish this daemon's long-lived X25519 SPKI to the cloud so browser/fleet
  * peers pin against a cloud-attested identity (not solely relay status_push).
  * Best-effort: identity pin lag is non-fatal (RTC falls back to status_push).
@@ -276,16 +285,24 @@ export const publishIdentity = async (pubkey: string): Promise<void> => {
         // A malformed conflict envelope remains non-fatal and unreported.
       }
       if (code === "identity_conflict") {
+        const wasConflict = hasIdentityConflict();
         setIdentityConflict(true);
         logWarn(
           "identity",
           "cloud pin conflicts with local X25519 key — RTC will fail until the pin is reset",
           {},
         );
+        // Push once per false→true; repeated 409s (bootstrap ~5min) stay silent.
+        if (!wasConflict) await pushIdentityConflictIfChanged();
       }
       return;
     }
-    if (response.ok) setIdentityConflict(false);
+    if (response.ok) {
+      const wasConflict = hasIdentityConflict();
+      setIdentityConflict(false);
+      // Push the true→false recovery so a reset is visible without an unrelated flip.
+      if (wasConflict) await pushIdentityConflictIfChanged();
+    }
   } catch {
     // swallow — identity pin is best-effort hardening
   }

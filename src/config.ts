@@ -30,7 +30,7 @@ import {
 } from "./cloud-client";
 import { setDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
-import { daemonPublicKey } from "./keypair";
+import { loadIdentityKey } from "./keypair";
 import { clearPlanCache } from "./plan-cache";
 
 const EMPTY: TDaemonBootstrap = {
@@ -88,7 +88,13 @@ export const refreshBootstrap = async (): Promise<boolean> => {
     // keypair/construction failure must not flip a successful bootstrap
     // to "unreachable".
     try {
-      void publishIdentity(daemonPublicKey());
+      // R5: publish ONLY a key that reached disk. The cloud pin is write-once,
+      // so pinning an in-memory key that a failed write never persisted means
+      // the next boot generates a different key and 409s forever — a transient
+      // full disk becomes a permanent wedge. Skipping leaves no pin, and the
+      // next boot pins cleanly. `keypair.ts` already logged the errno.
+      const identity = loadIdentityKey();
+      if (identity.persisted) await publishIdentity(identity.publicKeyB64);
     } catch {
       // swallow — identity pin is non-critical hardening
     }

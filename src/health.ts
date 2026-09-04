@@ -22,6 +22,7 @@
 import type { TCloudState } from "./config";
 import { keychainTelemetrySnapshot } from "./delegation/keychain";
 import { refreshTelemetrySnapshot } from "./delegation/refresh";
+import { hasIdentityConflict } from "./identity-state";
 import type { TSandboxState } from "./sandbox/landlock";
 
 export type TDaemonHealth = {
@@ -47,6 +48,11 @@ export type TDaemonHealth = {
   readonly keychain_spawns: ReturnType<typeof keychainTelemetrySnapshot>;
   /** Per-provider refresh counters — no subprocess probe. */
   readonly refresh_spawns: ReturnType<typeof refreshTelemetrySnapshot>;
+  /**
+   * Cloud write-once X25519 pin disagrees with this process's key.
+   * Secret-free; recovery is a session-gated dashboard reset, not API-key rotate.
+   */
+  readonly identity_conflict: boolean;
 };
 
 /**
@@ -75,4 +81,5 @@ export const buildHealth = (deps: {
   uptime_s: Math.max(0, Math.floor((deps.now - deps.bootAt) / 1000)),
   keychain_spawns: keychainTelemetrySnapshot(),
   refresh_spawns: refreshTelemetrySnapshot(),
+  identity_conflict: hasIdentityConflict(),
 });

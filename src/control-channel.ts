@@ -144,6 +144,8 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
     status.auto_update === undefined ? "" : String(status.auto_update),
     status.pty_sessions === undefined ? "" : String(status.pty_sessions),
     status.cloud_state,
+    // Omitted/undefined is "0" so a false→true flip is a real key change.
+    status.identity_conflict ? "1" : "0",
     status.pubkey ?? "",
     status.port === undefined ? "" : String(status.port),
     status.sandbox ?? "",
