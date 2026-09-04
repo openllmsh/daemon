@@ -157,6 +157,7 @@ import {
   UnsupportedContentError,
 } from "@openllmsh/wire/providers/upstream-request";
 import { Schema } from "effect";
+import { requestStatusPush } from "./auth-events";
 import type { TCacheProbe } from "./cache-probe";
 import {
   cacheProbeEnabled,
@@ -206,6 +207,15 @@ import {
   sampleUsageAfterRequest,
   sampleUsageOnExhaustion,
 } from "./usage-cache";
+
+/** Test seam: how many immediate status pushes auth-cooldown marks requested. */
+let authCooldownStatusPushesForTests = 0;
+
+export const takeAuthCooldownStatusPushesForTests = (): number => {
+  const n = authCooldownStatusPushesForTests;
+  authCooldownStatusPushesForTests = 0;
+  return n;
+};
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
 // the one constant that stays in the walker. The upstream URL is no longer
@@ -2464,13 +2474,24 @@ const walkPlan = async (
       cooldownReason !== undefined &&
       cooldownPolicyFor(cooldownReason).action === "cool_and_advance"
     ) {
-      markHopCooldown(
+      const changed = markHopCooldown(
         hop.provider,
         hop.modelId,
         cooldownReason,
         walkSessionKey,
         recoverAtMs,
       );
+      // A NEW/changed `auth` mark on a subscription hop: push status now so
+      // the dashboard overlay does not wait for the 15s watcher. Repeated
+      // identical marks (in-place retry) do not re-arm. Never refresh.
+      if (
+        changed &&
+        cooldownReason === "auth" &&
+        isSubscriptionSlug(hop.provider)
+      ) {
+        authCooldownStatusPushesForTests += 1;
+        requestStatusPush();
+      }
     }
     // The vendor just TOLD us this account is out of quota. Sample its usage
     // IMMEDIATELY (no debounce) so the quota gate gets a rejected snapshot to

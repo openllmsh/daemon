@@ -78,6 +78,11 @@ const mergeRecoverAt = (
   return later !== undefined && later > now ? later : undefined;
 };
 
+/**
+ * Record a hop failure. Returns `true` when the table actually changed
+ * (new mark, later expiry, or a reason upgrade) so callers can fire a
+ * one-shot side effect without re-arming on a repeated identical mark.
+ */
 export const markHopCooldown = (
   provider: string,
   modelId: string,
@@ -85,9 +90,9 @@ export const markHopCooldown = (
   setterSessionKey?: string,
   recoverAtMs?: number,
   now: number = Date.now(),
-): void => {
+): boolean => {
   const policy = cooldownPolicyFor(reason);
-  if (policy.action !== "cool_and_advance") return;
+  if (policy.action !== "cool_and_advance") return false;
   const k = key(provider, modelId);
   const until = now + policy.ttlMs;
   const existing = marks.get(k);
@@ -106,8 +111,9 @@ export const markHopCooldown = (
         setAtMs: now,
         recoverAtMs: mergeRecoverAt(existing.recoverAtMs, recoverAtMs, now),
       });
+      return true;
     }
-    return;
+    return false;
   }
   if (
     existing !== undefined &&
@@ -117,6 +123,7 @@ export const markHopCooldown = (
     // The incoming expiry is equal-or-greater, but the incoming reason is
     // transient while the stored one is non-transient (stricter). Extend the
     // expiry to the later of the two but preserve the stricter provenance.
+    const changed = until !== existing.untilMs;
     marks.set(k, {
       untilMs: until,
       reason: existing.reason,
@@ -124,8 +131,12 @@ export const markHopCooldown = (
       setAtMs: existing.setAtMs,
       recoverAtMs: mergeRecoverAt(existing.recoverAtMs, recoverAtMs, now),
     });
-    return;
+    return changed;
   }
+  const unchanged =
+    existing !== undefined &&
+    existing.untilMs === until &&
+    existing.reason === reason;
   marks.set(k, {
     untilMs: until,
     reason,
@@ -133,6 +144,7 @@ export const markHopCooldown = (
     setAtMs: now,
     recoverAtMs: mergeRecoverAt(existing?.recoverAtMs, recoverAtMs, now),
   });
+  return !unchanged;
 };
 
 /** Is this (provider, model) still cooling on THIS box? Expired marks are
@@ -187,23 +199,25 @@ export const clearHopCooldowns = (): void => {
   marks.clear();
 };
 
-/** Soonest-expiring live `auth` cooldown for any model of `provider`. */
+/** Latest-expiring live `auth` cooldown for any model of `provider`. */
 export type TAuthCooldownForProvider = {
   readonly until_ms: number;
   readonly model_id: string;
 };
 
 /**
- * Read-only: the soonest-expiring ACTIVE cooldown with reason `auth` for
- * this provider (any model). Expired marks are dropped on read. Other
- * reasons (`rate_limit`, `quota_exhausted`, …) are ignored.
+ * Read-only: the latest-expiring ACTIVE cooldown with reason `auth` for
+ * this provider (any model). The provider-level overlay must persist while
+ * ANY model still has an auth cooldown. Equal `until_ms` ties break on
+ * `model_id` (lexicographically smaller wins). Expired marks are dropped
+ * on read. Other reasons (`rate_limit`, `quota_exhausted`, …) are ignored.
  */
 export const authCooldownForProvider = (
   provider: string,
   now: number = Date.now(),
 ): TAuthCooldownForProvider | null => {
   const prefix = `${provider}|`;
-  let soonest: TAuthCooldownForProvider | null = null;
+  let latest: TAuthCooldownForProvider | null = null;
   for (const [k, entry] of marks) {
     if (!k.startsWith(prefix)) continue;
     if (entry.untilMs <= now) {
@@ -212,9 +226,13 @@ export const authCooldownForProvider = (
     }
     if (entry.reason !== "auth") continue;
     const model_id = k.slice(prefix.length);
-    if (soonest === null || entry.untilMs < soonest.until_ms) {
-      soonest = { until_ms: entry.untilMs, model_id };
+    if (
+      latest === null ||
+      entry.untilMs > latest.until_ms ||
+      (entry.untilMs === latest.until_ms && model_id < latest.model_id)
+    ) {
+      latest = { until_ms: entry.untilMs, model_id };
     }
   }
-  return soonest;
+  return latest;
 };
