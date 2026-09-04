@@ -141,12 +141,64 @@ const inFlightSlugProbes = new Map<
 >();
 let inFlightStatus: Promise<TDaemonStatus> | null = null;
 
+/**
+ * chatgpt / grok / kimi-code `status()` ignore AbortSignal. Timing out an
+ * observer is "we stopped waiting", not "they were slow / we cancelled them".
+ */
+const SIGNAL_LESS_STATUS_SLUGS: ReadonlySet<string> = new Set([
+  "chatgpt",
+  "grok",
+  "kimi_code",
+]);
+
+const connectionFingerprint = (conn: TDaemonProviderConnection): string =>
+  JSON.stringify(conn);
+
+const defaultLateProbePush = (): void => {
+  void import("./control-channel")
+    .then((mod) => mod.pushStatusIfChanged())
+    .catch(() => {});
+};
+
+let requestLateProbePush: () => void = defaultLateProbePush;
+
+/** Test-only: intercept the late-probe status push. Pass `null` to restore. */
+export const setLateProbeStatusPushForTests = (
+  fn: (() => void) | null,
+): void => {
+  requestLateProbePush = fn ?? defaultLateProbePush;
+};
+
+/** Test-only: last-known is process-global and otherwise unreadable. */
+export const lastKnownConnectionForTests = (
+  slug: string,
+): TDaemonProviderConnection | undefined => lastKnownConnections.get(slug);
+
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
   signedOutByUser.clear();
   inFlightSlugProbes.clear();
   inFlightStatus = null;
+  requestLateProbePush = defaultLateProbePush;
+};
+
+const recordLateProbeOutcome = (
+  slug: string,
+  raw: TDaemonProviderConnection,
+): void => {
+  const previous = lastKnownConnections.get(slug);
+  const conn = applyAuthLiteral(slug, raw);
+  rememberConnection(slug, raw, conn);
+  const next = lastKnownConnections.get(slug);
+  if (next === undefined) return;
+  if (
+    previous !== undefined &&
+    connectionFingerprint(previous) === connectionFingerprint(next)
+  ) {
+    return;
+  }
+  requestLateProbePush();
 };
 
 const statusFailure = (slug: string): TDaemonProviderConnection => {
@@ -174,6 +226,7 @@ const statusFailure = (slug: string): TDaemonProviderConnection => {
 const awaitProducer = async (
   slug: string,
   producer: Promise<TDaemonProviderConnection>,
+  markAbandoned: () => void,
   ownerBudget?: TDeadlineBudget,
   joined = false,
 ): Promise<TDaemonProviderConnection> => {
@@ -188,6 +241,7 @@ const awaitProducer = async (
     }),
     waitUntilExpired(observerBudget).then((): TDaemonProviderConnection => {
       if (settled) return statusFailure(slug);
+      markAbandoned();
       logWarn("status", "delegate status probe timed out", {
         slug,
         phase: "delegate_status",
@@ -195,6 +249,7 @@ const awaitProducer = async (
         elapsed_ms: Date.now() - observerStarted,
         producer_still_running: !settled,
         joined,
+        cancellable: !SIGNAL_LESS_STATUS_SLUGS.has(slug),
         tick_id: currentTickId(),
       });
       return statusFailure(slug);
@@ -210,9 +265,10 @@ const boundedDelegateStatus = async (
   const run = async (): Promise<TDaemonProviderConnection> => {
     const existing = inFlightSlugProbes.get(slug);
     if (existing !== undefined) {
-      return awaitProducer(slug, existing, undefined, true);
+      return awaitProducer(slug, existing, () => {}, undefined, true);
     }
     const ownerBudget = createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
+    let abandoned = false;
     const producer: Promise<TDaemonProviderConnection> = status(
       ownerBudget.signal,
     ).then(
@@ -230,7 +286,18 @@ const boundedDelegateStatus = async (
         inFlightSlugProbes.delete(slug);
       }
     });
-    return awaitProducer(slug, producer, ownerBudget, false);
+    void producer.then((conn) => {
+      if (abandoned) recordLateProbeOutcome(slug, conn);
+    });
+    return awaitProducer(
+      slug,
+      producer,
+      () => {
+        abandoned = true;
+      },
+      ownerBudget,
+      false,
+    );
   };
   if (parentTick === undefined) return run();
   return opTickContext.run({ tick_id: parentTick.tick_id, slug }, run);
