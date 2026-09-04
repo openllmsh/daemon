@@ -34,6 +34,17 @@ export type TProviderDelegate = {
   status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>;
 
   /**
+   * Whether this delegate's `status()` honours the optional `AbortSignal`.
+   * Required so a new provider cannot silently land in the wrong timeout
+   * bucket. `true` means aborting the observer actually cancels the probe;
+   * `false` means the probe ignores the signal (timing out is "we stopped
+   * waiting", not "we cancelled them"). Do not thread a signal into a
+   * `false` implementation without the observer-sharing invariant: aborting
+   * one waiter must not kill another waiter's in-flight probe.
+   */
+  readonly statusCancellable: boolean;
+
+  /**
    * Trigger the official CLI's NATIVE login locally (no OpenLLM OAuth).
    * Returns once the CLI reports a terminal state — EXCEPT Kimi's
    * device-code flow, which returns `pending: true` (browser opened,

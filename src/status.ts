@@ -141,16 +141,6 @@ const inFlightSlugProbes = new Map<
 >();
 let inFlightStatus: Promise<TDaemonStatus> | null = null;
 
-/**
- * chatgpt / grok / kimi-code `status()` ignore AbortSignal. Timing out an
- * observer is "we stopped waiting", not "they were slow / we cancelled them".
- */
-const SIGNAL_LESS_STATUS_SLUGS: ReadonlySet<string> = new Set([
-  "chatgpt",
-  "grok",
-  "kimi_code",
-]);
-
 const connectionFingerprint = (conn: TDaemonProviderConnection): string =>
   JSON.stringify(conn);
 
@@ -248,7 +238,7 @@ const awaitProducer = async (
         timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
         elapsed_ms: Date.now() - observerStarted,
         joined,
-        cancellable: !SIGNAL_LESS_STATUS_SLUGS.has(slug),
+        cancellable: getDelegate(slug)?.statusCancellable === true,
         tick_id: currentTickId(),
       });
       return statusFailure(slug);

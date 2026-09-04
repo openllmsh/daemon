@@ -354,6 +354,7 @@ const deviceLogin = makeStreamDeviceConnect({
 
 export const chatgptDelegate: TProviderDelegate = {
   slug: PROVIDER,
+  statusCancellable: false,
 
   connect: connectDirect,
   connectDeviceCode: deviceLogin.connectDeviceCode,

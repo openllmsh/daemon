@@ -391,6 +391,7 @@ const dashboardHeaders = (accessToken: string): Record<string, string> => ({
 
 export const cursorDelegate: TProviderDelegate = {
   slug: PROVIDER,
+  statusCancellable: true,
   connect: connectDirect,
   cancelConnect,
 

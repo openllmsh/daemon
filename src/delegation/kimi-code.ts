@@ -664,6 +664,7 @@ const cancelConnect = makeCancelConnect(PROVIDER, slot, {
 
 export const kimiCodeDelegate: TProviderDelegate = {
   slug: PROVIDER,
+  statusCancellable: false,
 
   // Moonshot's endpoint rejects tool-schema `$ref`s not based at `#/$defs/`
   // ("not a valid moonshot flavored json schema … references must start with

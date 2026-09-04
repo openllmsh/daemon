@@ -677,6 +677,7 @@ export const reasoningEffortFromRows = (
 
 export const grokDelegate: TProviderDelegate = {
   slug: PROVIDER,
+  statusCancellable: false,
 
   connect: connectDirect,
   connectDeviceCode: deviceLogin.connectDeviceCode,

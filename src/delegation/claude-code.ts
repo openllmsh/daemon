@@ -531,6 +531,7 @@ const device = makePasteBackDevice({
 
 export const claudeCodeDelegate: TProviderDelegate = {
   slug: "claude_code",
+  statusCancellable: true,
 
   connect: connectDirect,
   connectDeviceCode: device.connectDeviceCode,
