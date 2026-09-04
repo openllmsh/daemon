@@ -142,6 +142,14 @@ const noteUnknownLiveness = (conn: TDaemonProviderConnection): void => {
   const slug = conn.provider;
   if (!isSubscriptionSlug(slug)) return;
   const normalized = normalizeProviderConnection(conn);
+  // Login overlays `unknown` + preserved `connected`. Counting those ticks
+  // would fire `auth.liveness.degraded` mid-login. Drop the streak (not the
+  // last-known connected baseline) so a long pending cannot inherit 1–2
+  // pre-login unknowns and emit on the first tick after the slot clears.
+  if (loginSlot(slug).inFlight() || normalized.pending) {
+    unknownStreak.delete(slug);
+    return;
+  }
   if (normalized.observation === "unknown") {
     if (!wasLastKnownConnected(slug)) return;
     const consecutive = (unknownStreak.get(slug) ?? 0) + 1;
@@ -158,7 +166,6 @@ const noteUnknownLiveness = (conn: TDaemonProviderConnection): void => {
     });
     return;
   }
-  if (normalized.pending) return;
   unknownStreak.delete(slug);
 };
 
