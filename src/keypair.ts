@@ -24,9 +24,9 @@ import {
   randomBytes,
 } from "node:crypto";
 import {
+  linkSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -152,14 +152,33 @@ const ownPrivate = (): KeyObject => {
       privateKey.export({ format: "der", type: "pkcs8" }),
       { mode: 0o600 },
     );
-    renameSync(tmpPath, path);
+    // link(2) fails with EEXIST instead of replacing — never clobber a
+    // dest that appeared after the ENOENT read (first-boot race) or an
+    // unreadable existing identity.
+    linkSync(tmpPath, path);
     cachedPersisted = true;
   } catch (err) {
     cachedPersisted = false;
-    try {
-      unlinkSync(tmpPath);
-    } catch {
-      // Best-effort: the tmp file may never have been created.
+    if (isErrnoException(err) && err.code === "EEXIST") {
+      try {
+        const der = readFileSync(path);
+        cachedPriv = createPrivateKey({
+          key: der,
+          format: "der",
+          type: "pkcs8",
+        });
+        cachedPersisted = true;
+        cachedPubB64 = null;
+        return cachedPriv;
+      } catch (readErr) {
+        logIdentityFailure(
+          "identity private key exists but is unreadable — using ephemeral key, skip publishIdentity this run",
+          "read",
+          readErr,
+          path,
+        );
+        return cacheEphemeral(privateKey);
+      }
     }
     logIdentityFailure(
       "identity private key was not persisted — skip publishIdentity this run",
@@ -167,6 +186,12 @@ const ownPrivate = (): KeyObject => {
       err,
       path,
     );
+  } finally {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Best-effort: the tmp file may never have been created.
+    }
   }
   cachedPriv = privateKey;
   return privateKey;
