@@ -133,6 +133,7 @@ type TKeychainCounters = {
   timeouts: number;
   aborted: number;
   skipped_expired: number;
+  skipped_floor: number;
   skipped: number;
   complete_ok: number;
   complete_fail: number;
@@ -144,6 +145,7 @@ const emptyKeychainCounters = (): TKeychainCounters => ({
   timeouts: 0,
   aborted: 0,
   skipped_expired: 0,
+  skipped_floor: 0,
   skipped: 0,
   complete_ok: 0,
   complete_fail: 0,
@@ -170,6 +172,7 @@ const hasKeychainActivity = (d: TKeychainCounters): boolean =>
   d.timeouts !== 0 ||
   d.aborted !== 0 ||
   d.skipped_expired !== 0 ||
+  d.skipped_floor !== 0 ||
   d.skipped !== 0 ||
   d.complete_ok !== 0 ||
   d.complete_fail !== 0;
@@ -191,6 +194,7 @@ const deltaKeychainCounters = (
     timeouts: now.timeouts - prev.timeouts,
     aborted: now.aborted - prev.aborted,
     skipped_expired: now.skipped_expired - prev.skipped_expired,
+    skipped_floor: now.skipped_floor - prev.skipped_floor,
     skipped: now.skipped - prev.skipped,
     complete_ok: now.complete_ok - prev.complete_ok,
     complete_fail: now.complete_fail - prev.complete_fail,
@@ -432,23 +436,25 @@ const spawnSecurity = async (
     parentBudget?.child(securitySpawnTimeoutMs()) ??
     createDeadlineBudget(securitySpawnTimeoutMs(), opts.signal);
   const queuedAtMs = Date.now();
-  const skippedSpawn = (): TSecurityResult => {
+  const skippedSpawn = (reason: "expired" | "floor"): TSecurityResult => {
     if (opts.signal?.aborted === true) {
       keychainCounters.aborted++;
       return { ...FAILED_SPAWN, timedOut: false, aborted: true };
     }
-    keychainCounters.skipped_expired++;
+    if (reason === "floor") keychainCounters.skipped_floor++;
+    else keychainCounters.skipped_expired++;
     return { ...FAILED_SPAWN, timedOut: true, aborted: false };
   };
   return withMacosKeychainAccess(
     async () => {
-      if (budget.expired() || remainingBelowSpawnFloor(budget.remainingMs())) {
-        return skippedSpawn();
+      if (budget.expired()) return skippedSpawn("expired");
+      if (remainingBelowSpawnFloor(budget.remainingMs())) {
+        return skippedSpawn("floor");
       }
       return spawnSecurityNow(argv, home, opts, budget, queuedAtMs);
     },
     budget,
-    skippedSpawn,
+    () => skippedSpawn(budget.expired() ? "expired" : "floor"),
   );
 };
 

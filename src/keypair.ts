@@ -23,7 +23,13 @@ import {
   type KeyObject,
   randomBytes,
 } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { stateDir } from "./env";
 import { logError } from "./logger";
@@ -138,14 +144,23 @@ const ownPrivate = (): KeyObject => {
     }
   }
   const { privateKey } = generateKeyPairSync("x25519");
+  const tmpPath = `${path}.${process.pid}.tmp`;
   try {
     mkdirSync(stateDir(), { recursive: true });
-    writeFileSync(path, privateKey.export({ format: "der", type: "pkcs8" }), {
-      mode: 0o600,
-    });
+    writeFileSync(
+      tmpPath,
+      privateKey.export({ format: "der", type: "pkcs8" }),
+      { mode: 0o600 },
+    );
+    renameSync(tmpPath, path);
     cachedPersisted = true;
   } catch (err) {
     cachedPersisted = false;
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Best-effort: the tmp file may never have been created.
+    }
     logIdentityFailure(
       "identity private key was not persisted — skip publishIdentity this run",
       "write",
