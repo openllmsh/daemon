@@ -19,6 +19,7 @@ import { randomUUID } from "node:crypto";
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
+  TCooldownReason,
 } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
@@ -169,7 +170,18 @@ const recordResumeOutcome = (
  * failure); the walker then falls back to the MANUAL transport on the SAME hop
  * (`UPSTREAM_WIRE`) so no workflow is blocked.
  */
-export type TNativeServeOutcome = Response | { readonly declined: string };
+export type TNativeServeOutcome =
+  | Response
+  | {
+      readonly declined: string;
+      readonly cooldownReason?: TCooldownReason;
+    };
+
+const declinedOutcome = (
+  declined: string,
+  cooldownReason?: TCooldownReason,
+): { readonly declined: string; readonly cooldownReason?: TCooldownReason } =>
+  cooldownReason === undefined ? { declined } : { declined, cooldownReason };
 
 export type TNativeServeParams = {
   readonly provider: string;
@@ -366,7 +378,7 @@ export const tryServeNativeRuntime = async (
   }
   if (run.kind === "declined") {
     lease.abandon();
-    return { declined: run.reason };
+    return declinedOutcome(run.reason, run.cooldownReason);
   }
 
   const committed = run;
@@ -468,7 +480,9 @@ const serveCursorHop = async (
         : null,
     signal: params.signal,
   });
-  if (run.kind === "declined") return { declined: run.reason };
+  if (run.kind === "declined") {
+    return declinedOutcome(run.reason, run.cooldownReason);
+  }
 
   const settle = (
     resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,

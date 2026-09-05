@@ -66,6 +66,40 @@ import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 /** Handshake RPC budget (initialize / authenticate / session/new). */
 const RPC_TIMEOUT_MS = 30_000;
 
+type TAcpErrorKind = "rpc" | "timeout" | "transport";
+
+/** Typed ACP request failure so setup declines can tell an explicit
+ *  authenticate rejection from a timeout/crash/transport drop. */
+class AcpRpcError extends Error {
+  readonly method: string;
+  readonly kind: TAcpErrorKind;
+  readonly rpcCode: number | undefined;
+
+  constructor(opts: {
+    readonly method: string;
+    readonly kind: TAcpErrorKind;
+    readonly message: string;
+    readonly rpcCode?: number;
+  }) {
+    super(opts.message);
+    this.name = "AcpRpcError";
+    this.method = opts.method;
+    this.kind = opts.kind;
+    this.rpcCode = opts.rpcCode;
+  }
+}
+
+/** Vendor JSON-RPC authenticate errors that mean the stored login was
+ *  rejected — not a timeout, child exit, or generic protocol failure. */
+const AUTHENTICATE_REJECTION_RE =
+  /not logged in|not signed in|unauthorized|unauthenticated|authentication (?:failed|rejected)|auth(?:entication)? rejected|please (?:log|sign)[\s-]?in/i;
+
+const isExplicitAuthenticateRejection = (error: unknown): boolean =>
+  error instanceof AcpRpcError &&
+  error.method === "authenticate" &&
+  error.kind === "rpc" &&
+  AUTHENTICATE_REJECTION_RE.test(error.message);
+
 /** Cap on the retained stderr tail (bytes) used for failure diagnostics. */
 const STDERR_TAIL_MAX = 4_096;
 /** Hard per-turn budget — the prompt is abandoned (child killed) past this. */
@@ -276,7 +310,11 @@ class AcpClient {
   private nextId: TJsonRpcId = 1;
   private readonly pending = new Map<
     TJsonRpcId,
-    { resolve: (result: unknown) => void; reject: (err: Error) => void }
+    {
+      readonly method: string;
+      resolve: (result: unknown) => void;
+      reject: (err: Error) => void;
+    }
   >();
   private readonly proc: ReturnType<typeof Bun.spawn>;
   private readonly stdin: { write: (s: string) => void; flush?: () => void };
@@ -336,10 +374,17 @@ class AcpClient {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pending.delete(id)) {
-          reject(new Error(`cursor-agent acp ${method} timed out`));
+          reject(
+            new AcpRpcError({
+              method,
+              kind: "timeout",
+              message: `cursor-agent acp ${method} timed out`,
+            }),
+          );
         }
       }, timeoutMs);
       this.pending.set(id, {
+        method,
         resolve: (result) => {
           clearTimeout(timer);
           resolve(result);
@@ -354,7 +399,13 @@ class AcpClient {
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        reject(
+          new AcpRpcError({
+            method,
+            kind: "transport",
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
       }
     });
   }
@@ -379,7 +430,15 @@ class AcpClient {
   }
 
   private failAllPending(reason: string): void {
-    for (const [, entry] of this.pending) entry.reject(new Error(reason));
+    for (const [, entry] of this.pending) {
+      entry.reject(
+        new AcpRpcError({
+          method: entry.method,
+          kind: "transport",
+          message: reason,
+        }),
+      );
+    }
     this.pending.clear();
   }
 
@@ -432,7 +491,14 @@ class AcpClient {
       this.pending.delete(message.id);
       if (message.error !== undefined) {
         entry.reject(
-          new Error(message.error.message ?? "cursor-agent acp error"),
+          new AcpRpcError({
+            method: entry.method,
+            kind: "rpc",
+            message: message.error.message ?? "cursor-agent acp error",
+            ...(typeof message.error.code === "number"
+              ? { rpcCode: message.error.code }
+              : {}),
+          }),
         );
         return;
       }
@@ -484,9 +550,29 @@ const INIT_PARAMS = {
  *  (2026-07-29): composer-2.5 reads image blocks correctly (blue→"blue",
  *  green→"green"); the models accept `{ type:"image", data, mimeType }` blocks
  *  as-is. So we send images unconditionally and let the model handle them. */
-const handshake = async (client: AcpClient): Promise<void> => {
-  await client.request("initialize", INIT_PARAMS);
-  await client.request("authenticate", { methodId: "cursor_login" });
+const handshake = async (
+  client: AcpClient,
+  timeoutMs: number = RPC_TIMEOUT_MS,
+): Promise<void> => {
+  await client.request("initialize", INIT_PARAMS, timeoutMs);
+  await client.request("authenticate", { methodId: "cursor_login" }, timeoutMs);
+};
+
+const setupDecline = (
+  error: unknown,
+  signal: AbortSignal,
+): TNativeRunResult => {
+  if (signal.aborted) {
+    return { kind: "declined", reason: "client aborted" };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    kind: "declined",
+    reason: `cursor ACP handshake failed: ${message}`,
+    ...(isExplicitAuthenticateRejection(error)
+      ? { cooldownReason: "auth" as const }
+      : {}),
+  };
 };
 
 /**
@@ -613,6 +699,8 @@ export type TCursorNativeParams = {
   readonly precommitMs?: number;
   readonly idleMs?: number;
   readonly turnTimeoutMs?: number;
+  /** Test override for handshake RPC timeout. */
+  readonly rpcTimeoutMs?: number;
 };
 
 /**
@@ -729,35 +817,8 @@ export const runCursorNative = async (
   params.signal.addEventListener("abort", abort, { once: true });
 
   // ── Handshake + session ────────────────────────────────────────────
-  try {
-    await handshake(client);
-    const opened = await client.request("session/new", {
-      // A daemon-owned, empty cwd — the isolated cursor home (spawnCwd already
-      // pins the child's process cwd there too), never the user's project.
-      // Empty also bounds what Cursor's NATIVE fs tools can see.
-      cwd: spawnCwd(params.env),
-      // Client tools ride the ephemeral loopback MCP server (see above).
-      mcpServers:
-        mcp !== null
-          ? [
-              {
-                type: "http",
-                name: "openllm-client-tools",
-                url: mcp.url,
-                headers: mcp.headers,
-              },
-            ]
-          : [],
-    });
-    const sid = (opened as { readonly sessionId?: unknown }).sessionId;
-    if (typeof sid !== "string" || sid.length === 0) {
-      client.dispose();
-      stopMcp();
-      return { kind: "declined", reason: "session/new returned no sessionId" };
-    }
-    sessionId = sid;
-    await trySetModel(client, sid, params.providerModelId, opened);
-  } catch (error) {
+  const rpcTimeoutMs = params.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
+  const failSetup = (error: unknown): TNativeRunResult => {
     const stderrTail = client.stderr();
     client.dispose();
     stopMcp();
@@ -766,11 +827,48 @@ export const runCursorNative = async (
         stderrTail: stderrTail.slice(-400),
       });
     }
-    return {
-      kind: "declined",
-      reason: `cursor ACP handshake failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
+    return setupDecline(error, params.signal);
+  };
+  try {
+    await handshake(client, rpcTimeoutMs);
+  } catch (error) {
+    return failSetup(error);
   }
+  let opened: unknown;
+  try {
+    opened = await client.request(
+      "session/new",
+      {
+        // A daemon-owned, empty cwd — the isolated cursor home (spawnCwd already
+        // pins the child's process cwd there too), never the user's project.
+        // Empty also bounds what Cursor's NATIVE fs tools can see.
+        cwd: spawnCwd(params.env),
+        // Client tools ride the ephemeral loopback MCP server (see above).
+        mcpServers:
+          mcp !== null
+            ? [
+                {
+                  type: "http",
+                  name: "openllm-client-tools",
+                  url: mcp.url,
+                  headers: mcp.headers,
+                },
+              ]
+            : [],
+      },
+      rpcTimeoutMs,
+    );
+  } catch (error) {
+    return failSetup(error);
+  }
+  const sid = (opened as { readonly sessionId?: unknown }).sessionId;
+  if (typeof sid !== "string" || sid.length === 0) {
+    client.dispose();
+    stopMcp();
+    return { kind: "declined", reason: "session/new returned no sessionId" };
+  }
+  sessionId = sid;
+  await trySetModel(client, sid, params.providerModelId, opened);
 
   // ── The prompt turn ────────────────────────────────────────────────
   const turnBudget = params.turnTimeoutMs ?? CURSOR_TURN_TIMEOUT_MS;

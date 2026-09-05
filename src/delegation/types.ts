@@ -30,8 +30,16 @@ export type TImageCredential = {
 export type TProviderDelegate = {
   readonly slug: string;
 
-  /** Current connection state for `GET /status` (includes `cli_installed`). */
+  /** Current connection state for the status snapshot (`cli_installed`).
+   *  HTTP `GET /status` is `buildHealth` and does not call this. */
   status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>;
+
+  /**
+   * Drop a TTL'd NONSECRET status observation (presence/account hint, never
+   * credentials). Inference auth failures and login/logout/refresh call this
+   * so the next status tick re-reads the store. Absent = no observation cache.
+   */
+  invalidateStatusObservation?: () => void;
 
   /**
    * Whether this delegate's `status()` honours the optional `AbortSignal`.

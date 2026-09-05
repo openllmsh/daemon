@@ -227,10 +227,12 @@ const triggerRefresh = async (): Promise<void> => {
   // ready. Bound the spawn to the status budget so it cannot outlive the race.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
   if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
+  clearCursorStatusObservationCache();
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
   });
+  clearCursorStatusObservationCache();
 };
 
 // THE single refresher — single-flight + cooldown, no signal-aware bypass. See
@@ -257,6 +259,120 @@ const readStatusAccessToken = async (
   const stored = await readFileTokens();
   if (stored.kind !== "present") return stored;
   return { kind: "present", value: stored.value.accessToken };
+};
+
+/** Modest TTL for NONSECRET status presence — not credentials. Mirrors
+ *  Claude `AUTH_STATUS_TTL_MS` / `CLI_INSTALL_STATE_TTL_MS` (30s). The 15s
+ *  watcher otherwise re-reads the access-token item every tick. */
+const STATUS_ACCESS_TTL_MS = 30_000;
+
+type TStatusAccessObservation =
+  | { readonly kind: "absent" }
+  | { readonly kind: "present"; readonly accountHint: string | undefined };
+
+let statusAccessCache: {
+  readonly observation: TStatusAccessObservation;
+  readonly expiresAt: number;
+} | null = null;
+
+let statusAccessGeneration = 0;
+
+let statusAccessInFlight: {
+  readonly generation: number;
+  readonly work: Promise<TStoreRead<string>>;
+} | null = null;
+
+/** Drop cached Cursor status presence. Login/logout/native refresh/auth
+ *  mutations call this so the next status tick re-reads the store. */
+export const clearCursorStatusObservationCache = (): void => {
+  statusAccessCache = null;
+  statusAccessGeneration++;
+};
+
+const awaitStatusAccessRead = async (
+  work: Promise<TStoreRead<string>>,
+  signal?: AbortSignal,
+): Promise<TStoreRead<string>> => {
+  if (signal === undefined) return work;
+  if (signal.aborted) {
+    return { kind: "indeterminate", cause: "keychain_read_aborted" };
+  }
+  let onAbort = (): void => {};
+  const aborted = new Promise<TStoreRead<string>>((resolve) => {
+    onAbort = () =>
+      resolve({ kind: "indeterminate", cause: "keychain_read_aborted" });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+};
+
+const observationFromAccessRead = (
+  read: TStoreRead<string>,
+): TStoreRead<{ readonly accountHint: string | undefined }> => {
+  if (read.kind !== "present") return read;
+  return {
+    kind: "present",
+    value: {
+      accountHint: jwtSubject(read.value)?.split("|").at(-1),
+    },
+  };
+};
+
+const readCachedStatusAccess = async (
+  signal?: AbortSignal,
+): Promise<TStoreRead<{ readonly accountHint: string | undefined }>> => {
+  const cached = statusAccessCache;
+  if (cached !== null && cached.expiresAt > Date.now()) {
+    return cached.observation.kind === "present"
+      ? {
+          kind: "present",
+          value: { accountHint: cached.observation.accountHint },
+        }
+      : { kind: "absent" };
+  }
+
+  const generation = statusAccessGeneration;
+  let flight = statusAccessInFlight;
+  if (flight === null || flight.generation !== generation) {
+    if (signal?.aborted === true) {
+      return { kind: "indeterminate", cause: "keychain_read_aborted" };
+    }
+    // Shared producer is not observer-signal-bound — one aborted status
+    // waiter must not cancel another tick's in-flight store read.
+    const work = readStatusAccessToken();
+    flight = { generation, work };
+    statusAccessInFlight = flight;
+    const clearFlight = (): void => {
+      if (statusAccessInFlight?.work === work) statusAccessInFlight = null;
+    };
+    void work.then(clearFlight, clearFlight);
+  }
+
+  const read = await awaitStatusAccessRead(flight.work, signal);
+  if (read.kind === "indeterminate") return read;
+  // Logout/refresh bumped generation while this producer was in flight —
+  // do not hand a stale determinate presence to the waiter. Last-known
+  // overlay treats unknown as probe failure until the next tick re-reads.
+  if (generation !== statusAccessGeneration) {
+    return {
+      kind: "indeterminate",
+      cause: "status_observation_invalidated",
+    };
+  }
+  const mapped = observationFromAccessRead(read);
+  if (mapped.kind === "indeterminate") return mapped;
+  statusAccessCache = {
+    observation:
+      mapped.kind === "present"
+        ? { kind: "present", accountHint: mapped.value.accountHint }
+        : { kind: "absent" },
+    expiresAt: Date.now() + STATUS_ACCESS_TTL_MS,
+  };
+  return mapped;
 };
 
 const readStoredTokens = async (
@@ -354,8 +470,10 @@ const connectDirect = makeStreamConnect({
   // the daemon's later `security` reads never pop a GUI prompt.
   // A refused grant FAILS the login (retryable) rather than reporting success
   // the daemon can't act on — a later `security` read would pop a GUI prompt.
-  onConnected: (): Promise<boolean> =>
-    grantKeychainToolAccess(cliHome(PROVIDER)),
+  onConnected: (): Promise<boolean> => {
+    clearCursorStatusObservationCache();
+    return grantKeychainToolAccess(cliHome(PROVIDER));
+  },
   onStart: () => {
     logInfo("cursor-connect", "spawning `cursor-agent login`");
   },
@@ -392,13 +510,14 @@ const dashboardHeaders = (accessToken: string): Record<string, string> => ({
 export const cursorDelegate: TProviderDelegate = {
   slug: PROVIDER,
   statusCancellable: true,
+  invalidateStatusObservation: clearCursorStatusObservationCache,
   connect: connectDirect,
   cancelConnect,
 
   status: async (signal?: AbortSignal): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
     const accessRead = installed
-      ? await readStatusAccessToken(signal)
+      ? await readCachedStatusAccess(signal)
       : undefined;
     if (accessRead?.kind === "indeterminate") {
       return {
@@ -410,14 +529,15 @@ export const cursorDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const accessToken =
-      accessRead?.kind === "present" ? accessRead.value : null;
-    if (accessToken !== null) clearPendingAuth(PROVIDER);
-    const pending = accessToken === null ? getPendingAuth(PROVIDER) : null;
+    const accountHint =
+      accessRead?.kind === "present" ? accessRead.value.accountHint : null;
+    const connected = accessRead?.kind === "present";
+    if (connected) clearPendingAuth(PROVIDER);
+    const pending = connected ? null : getPendingAuth(PROVIDER);
     return {
       provider: PROVIDER,
-      status: accessToken !== null ? "connected" : "disconnected",
-      ...(accessToken !== null
+      status: connected ? "connected" : "disconnected",
+      ...(connected
         ? connectedObservation()
         : pending !== null
           ? {}
@@ -438,7 +558,7 @@ export const cursorDelegate: TProviderDelegate = {
             },
           }
         : {}),
-      ...(accessToken === null
+      ...(!connected
         ? {
             detail:
               pending !== null
@@ -449,10 +569,7 @@ export const cursorDelegate: TProviderDelegate = {
           }
         : {
             last_login_at_ms: null,
-            ...accountHashField(
-              PROVIDER,
-              jwtSubject(accessToken)?.split("|").at(-1) ?? undefined,
-            ),
+            ...accountHashField(PROVIDER, accountHint ?? undefined),
           }),
     };
   },
@@ -478,6 +595,7 @@ export const cursorDelegate: TProviderDelegate = {
       ]);
       if (!usage.ok || !plan.ok) {
         const failed = !usage.ok ? usage : plan;
+        if (failed.status === 401) clearCursorStatusObservationCache();
         return {
           kind: "unavailable",
           reason:
@@ -555,6 +673,7 @@ export const cursorDelegate: TProviderDelegate = {
   },
 
   logout: async () => {
+    clearCursorStatusObservationCache();
     if ((await cliInstallState(PROVIDER)).installed) {
       await runCapture([bin(), "logout"], env(), {
         probe: unwrapKeychainSpawn(PROVIDER),
@@ -562,6 +681,7 @@ export const cursorDelegate: TProviderDelegate = {
     }
     // CLI owns its Keychain/file credentials; never delete them directly.
     const cleared = (await readToken()) === null;
+    clearCursorStatusObservationCache();
     return cleared
       ? { ok: true, detail: "signed out of Cursor" }
       : { ok: false, detail: "credential still present after logout" };

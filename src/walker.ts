@@ -2489,6 +2489,7 @@ const walkPlan = async (
         cooldownReason === "auth" &&
         isSubscriptionSlug(hop.provider)
       ) {
+        getDelegate(hop.provider)?.invalidateStatusObservation?.();
         authCooldownStatusPushesForTests += 1;
         requestStatusPush();
       }
@@ -2642,6 +2643,7 @@ const walkPlan = async (
     const hasHandrolledFallback =
       methods.includes("handrolled") && wire !== undefined;
     let nativeDecline: string | null = null;
+    let nativeCooldownReason: TCooldownReason | undefined;
     let handrolledRetry: THopRetry | null = null;
 
     if (methods.includes("bridge") && isNativeRuntimeProvider(hop.provider)) {
@@ -2756,6 +2758,7 @@ const walkPlan = async (
         return { response: native, servedLocally: true };
       }
       nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
+      nativeCooldownReason = native.cooldownReason;
       if (hasHandrolledFallback) {
         nativeDecline += " — served by the manual transport";
       }
@@ -2914,13 +2917,19 @@ const walkPlan = async (
       return HOP_CONTINUE;
     }
 
+    if (args.req.signal.aborted) {
+      return {
+        response: errorJson(499, "client aborted request"),
+        servedLocally: true,
+      };
+    }
     lastError =
       nativeDecline ??
       (methods.length === 0
         ? `${hop.provider} hop ${hop.modelId} has no local transport on this box`
         : (lastError ??
           `${hop.provider} hop ${hop.modelId} could not be served locally`));
-    addHopFailure(hop, lastError);
+    addHopFailure(hop, lastError, undefined, nativeCooldownReason);
     return HOP_CONTINUE;
   };
   const forwardCloudHop = async (

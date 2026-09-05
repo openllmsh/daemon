@@ -43,7 +43,7 @@ import {
   splitReapBudget,
   waitUntilExpired,
 } from "../deadline-budget";
-import { logError, logInfo, logWarn } from "../logger";
+import { logDebug, logError, logInfo, logWarn } from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
@@ -198,7 +198,7 @@ const deltaKeychainCounters = (
   };
 };
 
-/** One info line per watcher tick: totals + deltas since the last tick. */
+/** One debug line per watcher tick: totals + deltas since the last tick. */
 export const logKeychainWatcherTick = (): void => {
   const snapshot = keychainTelemetrySnapshot();
   const deltas = deltaKeychainCounters(keychainCounters, lastWatcherSnapshot);
@@ -208,8 +208,11 @@ export const logKeychainWatcherTick = (): void => {
   // that a wedged machine needs for the ticks that DID spawn. Live counters
   // stay readable at any moment on `GET /status` (`keychain_spawns`); this line
   // exists only to reconstruct *when* activity happened, after the fact.
+  // Routine summaries stay DEBUG (default log gate is `info`) so a benign
+  // partition/`complete_fail` delta does not flood the combined log. Actionable
+  // timeout/error lines keep their levels; counter names stay on the wire.
   if (!hasKeychainActivity(deltas)) return;
-  logInfo("keychain", "keychain spawn snapshot", { snapshot, deltas });
+  logDebug("keychain", "keychain spawn snapshot", { snapshot, deltas });
 };
 
 const noteKeychainVerb = (verb: string): void => {

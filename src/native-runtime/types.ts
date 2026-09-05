@@ -24,6 +24,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
+  TCooldownReason,
 } from "@openllmsh/protocol";
 import { stateDir } from "../env";
 
@@ -304,7 +305,11 @@ export type TNativeRunResult =
        *  the runtime produced none (→ the session isn't recorded). */
       readonly sessionId: () => string | null;
     }
-  | { readonly kind: "declined"; readonly reason: string };
+  | {
+      readonly kind: "declined";
+      readonly reason: string;
+      readonly cooldownReason?: TCooldownReason;
+    };
 
 export type TNativeTerminalResult =
   | { readonly kind: "success" }
