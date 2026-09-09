@@ -66,7 +66,11 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
+import type {
+  TProviderUsageRefreshFailure,
+  TProviderUsageSnapshot,
+} from "@openllmsh/protocol";
+import { classifyUsageRefreshFailureReason } from "@openllmsh/protocol";
 import { isDevMode } from "./env";
 
 // Hit the vendor at most once per this window — applies to BOTH a successful
@@ -138,6 +142,47 @@ const requestSamples = new Map<string, TRequestSample>();
 
 const isUsable = (s: TProviderUsageSnapshot): boolean =>
   s.kind !== "unavailable";
+
+const GENERIC_FETCH_FAILURE = "usage fetch failed";
+
+const refreshFailureMeta = (
+  failure: TProviderUsageSnapshot | null,
+  atMs: number,
+): TProviderUsageRefreshFailure | undefined => {
+  if (failure === null || failure.kind !== "unavailable") return undefined;
+  const reason = classifyUsageRefreshFailureReason(failure.reason);
+  if (reason === null) return undefined;
+  return { reason, at_ms: atMs };
+};
+
+type TQuotaSnapshot = Extract<TProviderUsageSnapshot, { kind: "quota" }>;
+
+const stripRefreshFailure = (
+  snapshot: TProviderUsageSnapshot,
+): TProviderUsageSnapshot => {
+  if (snapshot.kind !== "quota") return snapshot;
+  return stripQuotaRefreshFailure(snapshot);
+};
+
+const stripQuotaRefreshFailure = (snapshot: TQuotaSnapshot): TQuotaSnapshot => {
+  if (snapshot.refresh_failure === undefined) return snapshot;
+  const { refresh_failure: _drop, ...rest } = snapshot;
+  return rest;
+};
+
+const withRefreshFailure = (
+  snapshot: TProviderUsageSnapshot,
+  failure: TProviderUsageSnapshot | null,
+  failureAtMs: number,
+): TProviderUsageSnapshot => {
+  if (snapshot.kind !== "quota") return snapshot;
+  const cleaned = stripQuotaRefreshFailure(snapshot);
+  const meta = refreshFailureMeta(failure, failureAtMs);
+  if (meta === undefined) return cleaned;
+  // A failed live read is stale even inside FRESH_TTL — otherwise a manual
+  // refresh that 429s in the first five minutes would still look live.
+  return { ...cleaned, refresh_failure: meta, stale: true };
+};
 
 type TCachedUsageOptions = {
   readonly force?: boolean;
@@ -285,7 +330,13 @@ const persist = (): void => {
   const out: Record<string, TPersistedEntry> = {};
   for (const [slug, e] of cache.entries()) {
     if (e.good !== null) {
-      out[slug] = { good: e.good, lastAttemptAtMs: e.lastAttemptAtMs };
+      out[slug] = {
+        good: {
+          snapshot: stripRefreshFailure(e.good.snapshot),
+          atMs: e.good.atMs,
+        },
+        lastAttemptAtMs: e.lastAttemptAtMs,
+      };
     }
   }
   try {
@@ -316,7 +367,11 @@ const stampStale = (
 // attempt completes).
 const servable = (entry: TUsageEntry, now: number): TProviderUsageSnapshot => {
   if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
-    return stampStale(entry.good.snapshot, entry.good.atMs, now);
+    return withRefreshFailure(
+      stampStale(entry.good.snapshot, entry.good.atMs, now),
+      entry.failure,
+      entry.lastAttemptAtMs,
+    );
   }
   return entry.failure ?? { kind: "unavailable", reason: "loading" };
 };
@@ -357,7 +412,11 @@ export const cachedUsage = async (
       now - entry.good.atMs < FRESH_TTL_MS &&
       isUsable(entry.good.snapshot)
     ) {
-      return entry.good.snapshot;
+      return withRefreshFailure(
+        entry.good.snapshot,
+        entry.failure,
+        entry.lastAttemptAtMs,
+      );
     }
     // A refresh is already running — share it (refresh-token rotation and rate
     // limits make parallel fetches actively harmful).
@@ -389,10 +448,10 @@ export const cachedUsage = async (
     let next: TProviderUsageSnapshot;
     try {
       next = await fetcher();
-    } catch (err) {
+    } catch {
       next = {
         kind: "unavailable",
-        reason: err instanceof Error ? err.message : "usage fetch failed",
+        reason: GENERIC_FETCH_FAILURE,
       };
     }
     const at = Date.now();
@@ -400,7 +459,9 @@ export const cachedUsage = async (
       return { kind: "unavailable", reason: "usage cache invalidated" };
     }
     const prev = cache.get(key);
-    const observed = isUsable(next) ? stampLiveFetch(next, at) : next;
+    const observed = isUsable(next)
+      ? stampLiveFetch(stripRefreshFailure(next), at)
+      : next;
     const updated: TUsageEntry = {
       good: isUsable(observed)
         ? { snapshot: observed, atMs: at }
@@ -446,7 +507,11 @@ export const peekUsage = (
   if (entry === undefined) return null;
   const now = Date.now();
   if (entry.good !== null) {
-    return stampStale(entry.good.snapshot, entry.good.atMs, now);
+    return withRefreshFailure(
+      stampStale(entry.good.snapshot, entry.good.atMs, now),
+      entry.failure,
+      entry.lastAttemptAtMs,
+    );
   }
   return entry.failure;
 };
@@ -498,7 +563,11 @@ export const peekUsageForQuotaGate = (
     }).catch(() => {});
   }
   if (now - entry.good.atMs < STALE_TTL_MS) {
-    return stampStale(snapshot, entry.good.atMs, now);
+    return withRefreshFailure(
+      stampStale(snapshot, entry.good.atMs, now),
+      entry.failure,
+      entry.lastAttemptAtMs,
+    );
   }
   if (
     pools.some(
@@ -508,7 +577,11 @@ export const peekUsageForQuotaGate = (
         now < pool.reset_at_ms,
     )
   ) {
-    return stampStale(snapshot, entry.good.atMs, now);
+    return withRefreshFailure(
+      stampStale(snapshot, entry.good.atMs, now),
+      entry.failure,
+      entry.lastAttemptAtMs,
+    );
   }
   return entry.failure;
 };

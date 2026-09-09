@@ -215,17 +215,13 @@ export const runCommandInner = async (
       // push only PEEKS the cache; see `status.ts`). `slug` scopes it to one
       // provider; the dashboard's whole-daemon refresh sends none → all.
       case "refresh":
-        // Fetch the connected providers' usage into the cache, RESPECTING each
-        // provider's TTL: `refreshUsage` → `cachedUsage` serves a still-fresh
-        // snapshot from cache (no vendor hit) and only re-fetches a STALE or
-        // never-fetched one. We deliberately do NOT bust the cache first —
-        // invalidating would (a) re-hit EVERY provider when only one was just
-        // connected (the whole-daemon refresh the dashboard fires on login), (b)
-        // ignore a provider's freshness window, and (c) clear the served snapshot
-        // so the card blanks mid-refresh. Leaving the cache intact means the last
-        // figures keep being served (`peekUsage`) while a re-fetch runs. The
-        // post-command status push then carries whatever the cache now holds.
-        await refreshUsage(cmd.payload?.slug);
+        // Automatic reads respect the usage TTL and only use stored credentials.
+        // The explicit manual button bypasses that TTL and permits native token
+        // renewal. Neither path clears last-good figures: keep them visible while
+        // fetching, then push fresh data or a sanitized per-provider failure.
+        await refreshUsage(cmd.payload?.slug, {
+          manual: cmd.payload?.manual === true,
+        });
         // NB: a bare `refresh` does NOT re-walk device state — the `-s` walk is
         // heavy (a fetch + bash per registry item) and the dashboard fires
         // `refresh` often, which would flood. Device state refreshes on connect

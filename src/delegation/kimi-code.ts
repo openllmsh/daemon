@@ -45,7 +45,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { accountHashField, jwtClaims } from "./account-id";
+import { accountHashField, jwtClaims, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import {
@@ -73,6 +73,7 @@ import type {
   TModelDiscoveryResult,
   TProviderDelegate,
 } from "./types";
+import { resolveUsageCredential } from "./usage-credential";
 import {
   cliVersion,
   connectedObservation,
@@ -299,7 +300,8 @@ const readStoredToken = async (): Promise<TStoredKimiToken> => {
  * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
  * refresh when it's within the leeway of `expires_at`. Used by
  * `credentialForUpstream` so inference carries a live token. Passive `status()`
- * and `usage()` must not call this — they would refresh and provision model config.
+ * and default `usage()` must not call this — they would refresh and provision
+ * model config. Manual Refresh-usage may call it under `usageNativeRefreshAllowed`.
  */
 const readToken = async (): Promise<{
   accessToken: string;
@@ -822,20 +824,37 @@ export const kimiCodeDelegate: TProviderDelegate = {
 
   usage: (): Promise<TProviderUsageSnapshot> =>
     withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
-      const token = await readStoredToken();
-      if (token.kind === "missing") {
-        return { kind: "unavailable", reason: "not signed in to Kimi CLI" };
-      }
-      if (token.kind === "expired") {
-        return { kind: "unavailable", reason: "credential_expired" };
-      }
+      const stored = await readStoredToken();
+      const cred = await resolveUsageCredential({
+        provider: PROVIDER,
+        stored:
+          stored.kind === "live" ? { kind: "live", value: stored } : stored,
+        missingReason: "not signed in to Kimi CLI",
+        accountIdOf: (value) => nonEmpty(jwtClaims(value.accessToken)?.user_id),
+        priorAccountIdWhenExpired: async () =>
+          nonEmpty(
+            jwtClaims(
+              storeReadValue(await readJsonStore<TKimiToken>(credentialPath()))
+                ?.access_token ?? "",
+            )?.user_id,
+          ),
+        readNative: async () => {
+          await readToken();
+          // Native inference readers may return a stale fallback on failure.
+          // Usage must verify the persisted token is now live before fetching.
+          const fresh = await readStoredToken();
+          return fresh.kind === "live" ? fresh : null;
+        },
+      });
+      if (cred.kind === "unavailable") return cred;
+      const { accessToken, tok } = cred.value;
       try {
         const resp = await fetch(
           await resolveProviderUrl(PROVIDER, USAGE_PATH),
           {
             method: "GET",
             headers: {
-              authorization: `Bearer ${token.accessToken}`,
+              authorization: `Bearer ${accessToken}`,
               ...(await identityHeaders()),
               accept: "application/json",
             },
@@ -848,8 +867,7 @@ export const kimiCodeDelegate: TProviderDelegate = {
           // 403 = the coding feature isn't available to this account.
           // 404 = the usage endpoint isn't enabled for this plan.
           const hasRefreshToken =
-            token.tok.refresh_token !== undefined &&
-            token.tok.refresh_token.length > 0;
+            tok.refresh_token !== undefined && tok.refresh_token.length > 0;
           const reason =
             resp.status === 401
               ? hasRefreshToken

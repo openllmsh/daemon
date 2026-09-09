@@ -25,6 +25,33 @@ export const refreshCallerBag = new AsyncLocalStorage<TRefreshCaller>();
 export const currentRefreshCaller = (): TRefreshCaller | null =>
   refreshCallerBag.getStore() ?? null;
 
+/**
+ * Manual "Refresh usage" may call the existing native `readToken` path.
+ * Default usage reads stay stored-only. The bag is scoped per provider
+ * fetch so a sibling/later usage() cannot inherit permission, and so the
+ * quota write can be tied to the status snapshot's `account_hash`.
+ */
+export type TUsageNativeRefreshBag = {
+  readonly expectedAccountHash?: string;
+};
+
+const usageNativeRefreshBag = new AsyncLocalStorage<TUsageNativeRefreshBag>();
+
+export const usageNativeRefreshAllowed = (): boolean =>
+  usageNativeRefreshBag.getStore() !== undefined;
+
+export const expectedUsageAccountHash = (): string | undefined =>
+  usageNativeRefreshBag.getStore()?.expectedAccountHash;
+
+export const withUsageNativeRefresh = <T>(
+  fn: () => Promise<T>,
+  expectedAccountHash?: string,
+): Promise<T> =>
+  usageNativeRefreshBag.run(
+    expectedAccountHash === undefined ? {} : { expectedAccountHash },
+    fn,
+  );
+
 export type TOpTick = {
   readonly tick_id: number;
   readonly slug?: string;

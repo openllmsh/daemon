@@ -84,6 +84,7 @@ import type {
   TModelDiscoveryResult,
   TProviderDelegate,
 } from "./types";
+import { resolveUsageCredential } from "./usage-credential";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
 import type { TRunCaptureResult, TStoreRead } from "./util";
 import {
@@ -213,13 +214,17 @@ const loadStore = async (
  * (`<CLAUDE_CONFIG_DIR>/.claude.json` → `oauthAccount.accountUuid`), which
  * survives token refresh. NOT `machineID`/`userID` — those are per-device.
  */
-const readAccountHash = async (): Promise<string | null> => {
+const readAccountId = async (): Promise<string | null> => {
   const cfg = storeReadValue(
     await readJsonStore<{
       readonly oauthAccount?: { readonly accountUuid?: string };
     }>(join(cliConfigDir(PROVIDER), ".claude.json")),
   );
-  const id = nonEmpty(cfg?.oauthAccount?.accountUuid);
+  return nonEmpty(cfg?.oauthAccount?.accountUuid);
+};
+
+const readAccountHash = async (): Promise<string | null> => {
+  const id = await readAccountId();
   return id === null ? null : accountHash(PROVIDER, id);
 };
 
@@ -1033,16 +1038,27 @@ export const claudeCodeDelegate: TProviderDelegate = {
 
   usage: (): Promise<TProviderUsageSnapshot> =>
     withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
-      const token = await readStoredToken();
-      if (token.kind === "missing") {
-        return { kind: "unavailable", reason: "not signed in to Claude Code" };
-      }
-      if (token.kind === "expired") {
-        return { kind: "unavailable", reason: "credential_expired" };
-      }
+      const stored = await readStoredToken();
+      const cred = await resolveUsageCredential({
+        provider: PROVIDER,
+        stored:
+          stored.kind === "live"
+            ? { kind: "live", value: stored.accessToken }
+            : stored,
+        missingReason: "not signed in to Claude Code",
+        accountIdOf: readAccountId,
+        priorAccountIdWhenExpired: readAccountId,
+        readNative: async () => {
+          await readToken();
+          const fresh = await readStoredToken();
+          return fresh.kind === "live" ? fresh.accessToken : null;
+        },
+      });
+      if (cred.kind === "unavailable") return cred;
+      const accessToken = cred.value;
       try {
         const headers = {
-          authorization: `Bearer ${token.accessToken}`,
+          authorization: `Bearer ${accessToken}`,
           "user-agent": await userAgent(),
           "anthropic-version": "2023-06-01",
           "anthropic-beta": OAUTH_BETA,

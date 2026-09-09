@@ -719,7 +719,10 @@ persistence so repeated status frames retain the original observation time.
 Legacy disk entries use their persisted observation time, never restart time.
 The live cache remains provider/account-scoped: a successful tier change
 replaces its snapshot, and routing never resurrects a historical tier bucket
-as current quota. Failed refreshes preserve last-good figures stamped `stale`.
+as current quota. Failed refreshes preserve last-good figures stamped `stale`,
+with sanitized `refresh_failure` metadata so the dashboard can explain why its
+figures remain cached. A successful read clears that metadata without ever
+re-dating a failed read as a fresh observation.
 
 **Passive status does not refresh tokens or provision vendor config.** File-backed
 delegates (`chatgpt`, `kimi_code`, `grok`) derive `status()` from **one** typed
@@ -729,11 +732,14 @@ store snapshot (`present` / `absent` / `indeterminate`). They never call
 managed `config.toml`. Expired-but-stored credentials stay `connected`; a
 read error stays `unknown` (`store_unreadable`) and is not collapsed to
 `credential_absent`. `readToken()` remains the demand path for inference and requested
-(refresh-capable) `listModels()`. `usage()` is a stored-credential read
+(refresh-capable) `listModels()`. Ordinary `usage()` is a stored-credential read
 (`readStoredToken`) — an expired token yields `unavailable` /
-`credential_expired` and does not spawn a native refresh; the next real
-request refreshes. Automatic catalog observation uses `discoverModels`
-instead and must not call `readToken()`.
+`credential_expired` and does not spawn a native refresh. The explicit dashboard
+Refresh button sends `refresh { manual: true }`: only this scoped operation
+permits usage to call the existing native `readToken()` path and bypasses the
+usage-cache TTL without discarding last-good figures. Automatic refresh and old
+payloads omit the flag and remain non-renewing. Automatic catalog observation
+uses `discoverModels` instead and must not call `readToken()`.
 
 **Claude / Cursor idle observations are reused while store identity is stable
 (`delegation/observation-cache.ts`).** Reuse is keyed by path + inode + mtime +
@@ -845,12 +851,14 @@ ORIGIN + default path per provider.
 **Token refresh is the CLI's own job (`delegation/refresh.ts`), on demand.** The
 daemon never refreshes a subscription token itself — no `grant_type=refresh_token`
 calls, no extracted or hardcoded token endpoint / client id. When a demand path
-(`credentialForUpstream`, requested `listModels`, login) calls `readToken`, it
+(`credentialForUpstream`, requested `listModels`, explicit manual usage refresh,
+login) calls `readToken`, it
 checks the stored access token's expiry and, when it's within the leeway window,
 TRIGGERS the official CLI's OWN native refresh: a bounded spawn whose side
 effect is the CLI refreshing + persisting its token to its own store. Passive
-`status()` and on-demand `usage()` must not take this path — usage reads the
-stored token only. Shared refresh producers are not cancelled
+`status()` and automatic `usage()` must not take this path — usage reads the
+stored token only unless the explicit manual-refresh permit is present.
+Shared refresh producers are not cancelled
 because a status observer timed out.
 claude → a minimal `claude -p` query (the CLI refreshes mid-request); codex →
 `codex doctor` (its websocket-reachability check forces the proactive refresh —

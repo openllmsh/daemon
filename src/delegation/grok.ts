@@ -53,6 +53,7 @@ import type {
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
+import { Option, Schema as S } from "effect";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
@@ -63,7 +64,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { DAEMON_VERSION } from "../version";
-import { accountHashField } from "./account-id";
+import { accountHashField, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import {
@@ -93,6 +94,7 @@ import type {
   TModelDiscoveryResult,
   TProviderDelegate,
 } from "./types";
+import { resolveUsageCredential } from "./usage-credential";
 import { statusForWindows } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
@@ -485,13 +487,14 @@ const deviceLogin = makeStreamDeviceConnect({
 // — the primary limit `grok /usage` + grok.com show and the one that gates
 // inference. We surface BOTH (weekly first); see {@link parseGrokUsage}.
 
-type TGrokBillingVal = { readonly val?: number };
-type TGrokBillingConfig = {
-  readonly monthlyLimit?: TGrokBillingVal;
-  readonly used?: TGrokBillingVal;
-  readonly billingPeriodEnd?: string;
-};
-type TGrokBilling = { readonly config?: TGrokBillingConfig };
+const GrokBillingVal = S.Struct({ val: S.optional(S.Finite) });
+const GrokBillingConfig = S.Struct({
+  monthlyLimit: S.optional(GrokBillingVal),
+  used: S.optional(GrokBillingVal),
+  billingPeriodEnd: S.optional(S.String),
+});
+const GrokBilling = S.Struct({ config: GrokBillingConfig });
+const decodeGrokBilling = S.decodeUnknownOption(GrokBilling);
 
 // The `?format=credits` view — the WEEKLY unified-billing pool the Grok CLI's
 // own `/usage` and the grok.com dashboard show, and the one that actually gates
@@ -499,20 +502,28 @@ type TGrokBilling = { readonly config?: TGrokBillingConfig };
 // 100% weekly and 402 "Grok Build usage balance exhausted"). `creditUsagePercent`
 // is the overall figure; `productUsage[GrokBuild].usagePercent` is the same pool
 // per-product. `currentPeriod.end` is the weekly reset.
-type TGrokCreditsPeriod = {
-  readonly type?: string;
-  readonly end?: string;
-};
-type TGrokCreditsProductUsage = {
-  readonly product?: string;
-  readonly usagePercent?: number;
-};
-type TGrokCreditsConfig = {
-  readonly creditUsagePercent?: number;
-  readonly currentPeriod?: TGrokCreditsPeriod;
-  readonly productUsage?: ReadonlyArray<TGrokCreditsProductUsage>;
-};
-type TGrokCredits = { readonly config?: TGrokCreditsConfig };
+const GrokCredits = S.Struct({
+  config: S.Struct({
+    ...GrokBillingConfig.fields,
+    creditUsagePercent: S.optional(S.Finite),
+    currentPeriod: S.optional(
+      S.Struct({
+        type: S.optional(S.String),
+        start: S.optional(S.String),
+        end: S.optional(S.String),
+      }),
+    ),
+    productUsage: S.optional(
+      S.Array(
+        S.Struct({
+          product: S.optional(S.String),
+          usagePercent: S.optional(S.Finite),
+        }),
+      ),
+    ),
+  }),
+});
+const decodeGrokCredits = S.decodeUnknownOption(GrokCredits);
 
 const GROK_NOTE = "Grok — read locally via Grok CLI";
 
@@ -553,14 +564,12 @@ const parseIsoMs = (iso: string | undefined): number | null => {
 export const parseGrokMonthlyWindow = (
   body: unknown,
 ): TProviderUsageWindow | null => {
-  const config =
-    body !== null && typeof body === "object" && "config" in body
-      ? ((body as TGrokBilling).config ?? {})
-      : {};
-  const limit =
-    typeof config.monthlyLimit?.val === "number" ? config.monthlyLimit.val : 0;
+  const decoded = decodeGrokBilling(body);
+  if (Option.isNone(decoded)) return null;
+  const { config } = decoded.value;
+  const limit = config.monthlyLimit?.val ?? 0;
   if (limit <= 0) return null;
-  const used = typeof config.used?.val === "number" ? config.used.val : 0;
+  const used = config.used?.val ?? 0;
   return {
     label: "Monthly",
     percent_used: clampPercent((used / limit) * 100),
@@ -574,22 +583,32 @@ export const parseGrokMonthlyWindow = (
 export const parseGrokWeeklyWindow = (
   body: unknown,
 ): TProviderUsageWindow | null => {
-  const config =
-    body !== null && typeof body === "object" && "config" in body
-      ? ((body as TGrokCredits).config ?? {})
-      : {};
+  const decoded = decodeGrokCredits(body);
+  if (Option.isNone(decoded)) return null;
+  const { config } = decoded.value;
   const product = config.productUsage?.find((p) => p.product === "GrokBuild");
-  const pct =
-    typeof product?.usagePercent === "number"
-      ? product.usagePercent
-      : typeof config.creditUsagePercent === "number"
-        ? config.creditUsagePercent
-        : null;
-  if (pct === null) return null;
+  let pct = product?.usagePercent ?? config.creditUsagePercent;
+  const resetAt = parseIsoMs(config.currentPeriod?.end);
+  if (pct === undefined) {
+    const startAt = parseIsoMs(config.currentPeriod?.start);
+    if (
+      config.currentPeriod?.type !== "USAGE_PERIOD_TYPE_WEEKLY" ||
+      startAt === null ||
+      resetAt === null ||
+      resetAt <= startAt
+    )
+      return null;
+    // Grok omits zero-valued counters after reset. Its native
+    // credit_balance_from_config uses the legacy budget, else 0. Require a
+    // real weekly period here so an empty/malformed response isn't a quota.
+    const limit = config.monthlyLimit?.val ?? 0;
+    const used = config.used?.val ?? 0;
+    pct = limit > 0 ? (used / limit) * 100 : 0;
+  }
   return {
     label: "Weekly",
     percent_used: clampPercent(pct),
-    reset_at_ms: parseIsoMs(config.currentPeriod?.end),
+    reset_at_ms: resetAt,
   };
 };
 
@@ -819,19 +838,29 @@ export const grokDelegate: TProviderDelegate = {
 
   usage: (): Promise<TProviderUsageSnapshot> =>
     withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
-      const token = await readStoredToken();
-      if (token.kind === "missing") {
-        return { kind: "unavailable", reason: "not signed in to Grok" };
-      }
-      if (token.kind === "expired") {
-        return { kind: "unavailable", reason: "credential_expired" };
-      }
+      const stored = await readStoredToken();
+      const cred = await resolveUsageCredential({
+        provider: PROVIDER,
+        stored:
+          stored.kind === "live" ? { kind: "live", value: stored } : stored,
+        missingReason: "not signed in to Grok",
+        accountIdOf: (value) => nonEmpty(value.session.user_id),
+        priorAccountIdWhenExpired: async () =>
+          nonEmpty((await newestSession())?.user_id),
+        readNative: async () => {
+          await readToken();
+          const fresh = await readStoredToken();
+          return fresh.kind === "live" ? fresh : null;
+        },
+      });
+      if (cred.kind === "unavailable") return cred;
+      const { accessToken } = cred.value;
       // Same host as inference (`resolveProviderUrl` derives it from the captured
       // upstream, never spawning the CLI). The plain OAuth bearer is accepted; we
       // send our own `openllm/<ver>` identity (+ the gate version header),
       // mirroring `credentialForUpstream`.
       const headers = {
-        authorization: `Bearer ${token.accessToken}`,
+        authorization: `Bearer ${accessToken}`,
         "user-agent": OPENLLM_USER_AGENT,
         "x-grok-client-version": await clientVersion(),
         accept: "application/json",

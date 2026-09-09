@@ -23,6 +23,7 @@ import {
   currentTickId,
   refreshCallerBag,
   refreshSpawnBag,
+  usageNativeRefreshAllowed,
 } from "../op-context";
 import type { TNativeAuthProducer } from "./spawn";
 import { DEADLINE_CHECK_CAP_MS, spawnLogin, spawnLoginPty } from "./spawn";
@@ -781,6 +782,15 @@ export const makeRefresher = (opts: {
   return async (expiresAtMs) => {
     if (expiresAtMs === null) return "fresh";
     const remaining = expiresAtMs - Date.now();
+    // Usage is stored-only unless the manual Refresh-usage ALS is set.
+    // Honour that here so a nested `readToken` cannot spawn on a passive
+    // usage() even if a caller forgets the stored-token branch.
+    if (currentRefreshCaller() === "usage" && !usageNativeRefreshAllowed()) {
+      if (remaining > 0) return "fresh";
+      if (lastErrorClass === null) return "fresh";
+      counterFor(opts.slug).fallbacks++;
+      return { kind: "stale", reason: lastErrorClass };
+    }
     if (remaining >= opts.leewayMs) return "fresh";
     // A recent spawn already gathered current info — don't spawn again until the
     // cooldown lapses. Serving the current token for at most `cooldownMs` is the

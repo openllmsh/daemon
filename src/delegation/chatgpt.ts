@@ -37,7 +37,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { DAEMON_VERSION } from "../version";
-import { accountHash } from "./account-id";
+import { accountHash, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import {
@@ -68,6 +68,7 @@ import type {
   TModelDiscoveryResult,
   TProviderDelegate,
 } from "./types";
+import { resolveUsageCredential } from "./usage-credential";
 import {
   reduceChatgptCredits,
   reduceChatgptPools,
@@ -500,22 +501,34 @@ export const chatgptDelegate: TProviderDelegate = {
 
   usage: (): Promise<TProviderUsageSnapshot> =>
     withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
-      const token = await readStoredToken();
-      if (token.kind === "missing") {
-        return { kind: "unavailable", reason: "not signed in to Codex" };
-      }
-      if (token.kind === "expired") {
-        return { kind: "unavailable", reason: "credential_expired" };
-      }
+      const stored = await readStoredToken();
+      const cred = await resolveUsageCredential({
+        provider: PROVIDER,
+        stored:
+          stored.kind === "live" ? { kind: "live", value: stored } : stored,
+        missingReason: "not signed in to Codex",
+        accountIdOf: (value) => nonEmpty(value.accountId),
+        priorAccountIdWhenExpired: async () =>
+          nonEmpty(
+            storeReadValue(await loadStore())?.tokens?.account_id ?? null,
+          ),
+        readNative: async () => {
+          await readToken();
+          const fresh = await readStoredToken();
+          return fresh.kind === "live" ? fresh : null;
+        },
+      });
+      if (cred.kind === "unavailable") return cred;
+      const { accessToken, accountId } = cred.value;
       try {
         const resp = await fetch(
           await resolveProviderUrl(PROVIDER, USAGE_PATH),
           {
             method: "GET",
             headers: {
-              authorization: `Bearer ${token.accessToken}`,
-              ...(token.accountId !== null
-                ? { "chatgpt-account-id": token.accountId }
+              authorization: `Bearer ${accessToken}`,
+              ...(accountId !== null
+                ? { "chatgpt-account-id": accountId }
                 : {}),
               "user-agent": OPENLLM_USER_AGENT,
               originator: OPENLLM_ORIGINATOR,

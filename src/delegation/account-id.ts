@@ -59,3 +59,17 @@ export const accountHashField = (
   const id = nonEmpty(rawId);
   return id === null ? {} : { account_hash: accountHash(provider, id) };
 };
+
+/**
+ * After a manual native usage refresh, reject a store that rotated onto a
+ * different account. A known prior that becomes missing is also a change
+ * (do not treat unverifiable identity as the previous account).
+ */
+export const usageAccountChanged = (
+  prior: string | null,
+  next: string | null,
+): boolean => {
+  if (prior === null) return false;
+  if (next === null) return true;
+  return prior !== next;
+};

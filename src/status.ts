@@ -14,6 +14,7 @@ import type {
   TDaemonProviderAuthStatus,
   TDaemonProviderConnection,
   TDaemonStatus,
+  TProviderUsageSnapshot,
 } from "@openllmsh/protocol";
 import { normalizeProviderConnection } from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
@@ -42,7 +43,12 @@ import { hasIdentityConflict } from "./identity-state";
 import { daemonPublicKey } from "./keypair";
 import { logWarn, safeDiagnosticMessage } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
-import { currentTickId, nextStatusTickId, opTickContext } from "./op-context";
+import {
+  currentTickId,
+  nextStatusTickId,
+  opTickContext,
+  withUsageNativeRefresh,
+} from "./op-context";
 import { resolveOnPath } from "./path-utils";
 import { getPendingAuth } from "./pending-auth";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
@@ -725,19 +731,17 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
 };
 
 /**
- * On-demand usage read — the ONLY path that hits the vendor usage endpoint.
- * Driven by the `refresh` command (the manual "Refresh usage" button or a
- * one-shot providers-page mount when usage is still missing, via
- * `control-relay.ts`). Fetches
- * figures for every CONNECTED provider (or just `slug` when scoped) into the
- * usage cache; the status push that follows the command then carries them back
- * via `peekUsage`. RESPECTS each provider's TTL — `cachedUsage` serves a
- * still-fresh snapshot from cache (no vendor hit) and only re-fetches a stale or
- * never-fetched one, so a whole-daemon refresh after one login doesn't re-hit
- * every vendor. Best-effort per provider — `cachedUsage` already swallows fetch
- * failures into an `unavailable` snapshot.
+ * Command-driven usage read for connected providers (or just `slug`). The
+ * subsequent status push serves the result through `peekUsage`. Automatic
+ * callers respect cache TTLs and never renew tokens. Explicit manual refresh
+ * bypasses the usage TTL and permits existing native renewal, scoped per
+ * provider/account. Each provider is best-effort: a failed read preserves its
+ * last-good figures plus failure metadata without blocking other providers.
  */
-export const refreshUsage = async (slug?: string): Promise<void> => {
+export const refreshUsage = async (
+  slug?: string,
+  options?: { readonly manual?: boolean },
+): Promise<void> => {
   // Join the canonical snapshot — never a raw `d.status()` bypass that would
   // start a second producer beside `computeStatus`. `allSettled`, NOT `all`:
   // ONE provider throwing (e.g. a failing usage read) must not reject the whole
@@ -746,7 +750,11 @@ export const refreshUsage = async (slug?: string): Promise<void> => {
   // single provider is broken. Each provider's read is independent +
   // best-effort (`cachedUsage` already swallows fetch failures into an
   // `unavailable` snapshot).
+  const manual = options?.manual === true;
   const snapshot = await computeStatus();
+  // ALS is per-provider AFTER computeStatus so a status probe cannot inherit
+  // native-refresh permission, and so the write is keyed to this snapshot's
+  // `account_hash`. Cache `force` is internal TTL bypass, not the wire grant.
   await Promise.allSettled(
     Object.values(DELEGATES)
       .filter((d) => slug === undefined || d.slug === slug)
@@ -760,8 +768,13 @@ export const refreshUsage = async (slug?: string): Promise<void> => {
           !normalizeProviderConnection(conn).serviceable
         )
           return;
-        await cachedUsage(d.slug, () => d.usage(), {
+        const fetchUsage = (): Promise<TProviderUsageSnapshot> =>
+          manual
+            ? withUsageNativeRefresh(() => d.usage(), conn.account_hash)
+            : d.usage();
+        await cachedUsage(d.slug, fetchUsage, {
           accountHash: conn.account_hash,
+          ...(manual ? { force: true } : {}),
         });
       }),
   );

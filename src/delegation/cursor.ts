@@ -63,6 +63,7 @@ import type {
   TModelDiscoveryResult,
   TProviderDelegate,
 } from "./types";
+import { resolveUsageCredential } from "./usage-credential";
 import { statusForWindows } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
@@ -692,12 +693,27 @@ export const cursorDelegate: TProviderDelegate = {
 
   usage: (): Promise<TProviderUsageSnapshot> =>
     withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
-      const token = await readStoredToken();
-      if (token.kind === "missing")
-        return { kind: "unavailable", reason: "not signed in to Cursor" };
-      if (token.kind === "expired")
-        return { kind: "unavailable", reason: "credential_expired" };
-      const stored = token.stored;
+      const storedToken = await readStoredToken();
+      const cred = await resolveUsageCredential({
+        provider: PROVIDER,
+        stored:
+          storedToken.kind === "live"
+            ? { kind: "live", value: storedToken.stored }
+            : storedToken,
+        missingReason: "not signed in to Cursor",
+        accountIdOf: (value) => jwtSubject(value.accessToken),
+        priorAccountIdWhenExpired: async () =>
+          jwtSubject(
+            storeReadValue(await readStoredTokens())?.accessToken ?? "",
+          ),
+        readNative: async () => {
+          await readToken();
+          const fresh = await readStoredToken();
+          return fresh.kind === "live" ? fresh.stored : null;
+        },
+      });
+      if (cred.kind === "unavailable") return cred;
+      const stored = cred.value;
       try {
         const [usage, plan] = await Promise.all([
           fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
