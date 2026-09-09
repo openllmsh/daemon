@@ -474,10 +474,9 @@ export const runCaptureResult = async (
               configured_timeout_ms: configuredTimeoutMs,
               spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
               budget_remaining_ms_at_spawn: remainingAtSpawn,
-              timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-                armed,
-                fired,
-                timerDelayMs,
+              timeout_callback_lateness_ms: Math.max(
+                0,
+                timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
               ),
               cleanup_ms: cleanupMs,
               stdout_closed: stdoutClosedAtRace,
@@ -795,10 +794,9 @@ export const spawnLogin = async (
           configured_timeout_ms: timeoutMs,
           spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
           budget_remaining_ms_at_spawn: remainingAtSpawn,
-          timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-            armed,
-            fired,
-            timerDelayMs,
+          timeout_callback_lateness_ms: Math.max(
+            0,
+            timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
           ),
           cleanup_ms: opts.cleanupMs,
           stdout_closed: opts.stdoutClosed,
