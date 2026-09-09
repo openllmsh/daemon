@@ -15,11 +15,8 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
-import {
-  matchRefreshNetworkErrno,
-  noteRefreshFailure,
-} from "../doctor-report/hooks";
-import { logDebug, logInfo, logWarn } from "../logger";
+import { matchRefreshNetworkErrno } from "../doctor-report/hooks";
+import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import type { TRefreshCaller } from "../op-context";
 import {
   currentRefreshCaller,
@@ -329,7 +326,7 @@ export const resolveToken = <T>(opts: {
   const token = opts.refreshed ?? opts.prior;
   if (!opts.hasRefreshToken(token)) {
     noteRefreshTokenLost(opts.provider);
-    logWarn("refresh", "refresh token lost", {
+    logWarn("refresh", safeDiagnosticMessage`refresh token lost`, {
       provider: opts.provider,
       phase: "refresh_token_lost",
     });
@@ -343,17 +340,21 @@ const unrefreshableCredentialProviders = new Set<string>();
 export const credentialUnrefreshable = (provider: string): void => {
   if (unrefreshableCredentialProviders.has(provider)) return;
   unrefreshableCredentialProviders.add(provider);
-  logWarn("refresh", "credential cannot be refreshed", {
+  logWarn("refresh", safeDiagnosticMessage`credential cannot be refreshed`, {
     provider,
     phase: "credential_unrefreshable",
   });
 };
 
 export const keychainUnusable = (provider: string): never => {
-  logWarn("refresh", "keychain is unusable; re-authentication required", {
-    provider,
-    phase: "keychain_unusable",
-  });
+  logWarn(
+    "refresh",
+    safeDiagnosticMessage`keychain is unusable; re-authentication required`,
+    {
+      provider,
+      phase: "keychain_unusable",
+    },
+  );
   throw new RefreshTriggerError("keychain_unusable", {
     abandoned: false,
     code: -1,
@@ -714,44 +715,61 @@ export const makeRefresher = (opts: {
             in_flight: false,
           });
           if (lastErrorClass === "network") {
-            logWarn("refresh", "codex token refresh failed: network", {
-              provider: opts.slug,
-              errno: triggerError?.errno ?? networkErrno(err),
-              retry_in_ms: failureBackoffMs,
-              ...clocks,
-              timeout_ms,
-              tick_id: currentTickId(),
-              caller,
-            });
-            noteRefreshFailure({
-              provider: opts.slug,
-              errorClass: "network",
-              spawnElapsedMs: clocks.spawn_elapsed_ms,
-              timeoutMs: timeout_ms,
-              exitCode: triggerError?.exitCode,
-              errno: triggerError?.errno ?? networkErrno(err),
-            });
+            logWarn(
+              "refresh",
+              safeDiagnosticMessage`codex token refresh failed: network`,
+              {
+                provider: opts.slug,
+                errno: triggerError?.errno ?? networkErrno(err),
+                retry_in_ms: failureBackoffMs,
+                ...clocks,
+                timeout_ms,
+                tick_id: currentTickId(),
+                caller,
+              },
+              {
+                message: safeDiagnosticMessage`Credential refresh failed.`,
+                timings: {
+                  ...(clocks.spawn_elapsed_ms !== null
+                    ? { spawn_elapsed_ms: clocks.spawn_elapsed_ms }
+                    : {}),
+                  configured_timeout_ms: timeout_ms,
+                  ...(triggerError?.exitCode !== undefined
+                    ? { root_exit_code: triggerError.exitCode }
+                    : {}),
+                },
+              },
+            );
+
             return;
           }
-          logWarn("refresh", "native refresh trigger failed", {
-            provider: opts.slug,
-            label: opts.label,
-            phase: "refresh_trigger",
-            error_class: lastErrorClass,
-            ...clocks,
-            timeout_ms,
-            abandoned: triggerError?.abandoned ?? false,
-            exit_code: triggerError?.exitCode ?? null,
-            tick_id: currentTickId(),
-            caller,
-          });
-          noteRefreshFailure({
-            provider: opts.slug,
-            errorClass: lastErrorClass,
-            spawnElapsedMs: clocks.spawn_elapsed_ms,
-            timeoutMs: timeout_ms,
-            exitCode: triggerError?.exitCode,
-          });
+          logWarn(
+            "refresh",
+            safeDiagnosticMessage`native refresh trigger failed`,
+            {
+              provider: opts.slug,
+              label: opts.label,
+              phase: "refresh_trigger",
+              error_class: lastErrorClass,
+              ...clocks,
+              timeout_ms,
+              abandoned: triggerError?.abandoned ?? false,
+              exit_code: triggerError?.exitCode ?? null,
+              tick_id: currentTickId(),
+              caller,
+            },
+            {
+              timings: {
+                ...(clocks.spawn_elapsed_ms !== null
+                  ? { spawn_elapsed_ms: clocks.spawn_elapsed_ms }
+                  : {}),
+                configured_timeout_ms: timeout_ms,
+                ...(triggerError?.exitCode !== undefined
+                  ? { root_exit_code: triggerError.exitCode }
+                  : {}),
+              },
+            },
+          );
         })
         .finally(() => {
           inFlight = null;

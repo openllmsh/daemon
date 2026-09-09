@@ -19,7 +19,7 @@ import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir, cliHome } from "../cli-paths";
-import { logError, logInfo, logWarn } from "../logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { listCursorModelsViaAcp } from "../native-runtime/cursor-acp";
 import {
   clearCursorNativeModels,
@@ -521,11 +521,15 @@ const readToken = async (
     ? await refresh(jwtExpiryMs(stored.accessToken))
     : "fresh";
   if (isStaleRefresh(outcome)) {
-    logWarn("refresh", "returning stale expired credential", {
-      provider: PROVIDER,
-      phase: "refresh_fallback",
-      error_class: outcome.reason,
-    });
+    logWarn(
+      "refresh",
+      safeDiagnosticMessage`returning stale expired credential`,
+      {
+        provider: PROVIDER,
+        phase: "refresh_fallback",
+        error_class: outcome.reason,
+      },
+    );
     return { ...stored, staleRefresh: outcome.reason };
   }
   if (outcome !== "awaited") return stored;
@@ -596,7 +600,7 @@ const connectDirect = makeStreamConnect({
   onParseFail: (captured) =>
     logError(
       "cursor-connect",
-      "no authorize URL parsed from cursor-agent login",
+      safeDiagnosticMessage`no authorize URL parsed from cursor-agent login`,
       {
         stderrLen: captured.length,
         stderrSample: redactUrls(captured.slice(0, 400)),

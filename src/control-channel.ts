@@ -49,7 +49,14 @@ import {
 } from "./doctor-report/hooks";
 import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
-import { logDebug, logError, logInfo, logWarn } from "./logger";
+import {
+  logDebug,
+  logError,
+  logInfo,
+  logWarn,
+  logWarnAlreadyObserved,
+  safeDiagnosticMessage,
+} from "./logger";
 import {
   acceptChannel,
   closeChannelFromRelay,
@@ -396,7 +403,10 @@ export const handleControlChannelSocketError = (
     "unknown";
   if (reason !== lastErrorReason) {
     lastErrorReason = reason;
-    logWarn("control-channel", `socket error: ${reason} (reconnecting)`);
+    logWarnAlreadyObserved(
+      "control-channel",
+      `socket error: ${reason} (reconnecting)`,
+    );
   }
   noteControlChannelSocketError(ev);
 };
@@ -404,7 +414,7 @@ export const handleControlChannelSocketError = (
 /** Heartbeat silence is a control-channel timeout, never provider-auth
  *  `liveness_degraded`. */
 export const handleControlChannelHeartbeatSilent = (): void => {
-  logWarn(
+  logWarnAlreadyObserved(
     "control-channel",
     `no relay pong after ${MAX_MISSED_PONGS} missed heartbeats; forcing reconnect`,
   );
@@ -825,7 +835,7 @@ const onFrame = (frame: TRelayFrame): void => {
   try {
     dispatchFrame(frame);
   } catch (err: unknown) {
-    logWarn("control-channel", "frame dispatch failed", {
+    logWarnAlreadyObserved("control-channel", "frame dispatch failed", {
       frameType: frame.type,
       err: err instanceof Error ? err.message : String(err),
     });
@@ -877,32 +887,48 @@ const dispatchFrame = (frame: TRelayFrame): void => {
       // Daemon is the responder: open seal, answer, trickle ICE.
       // Log async failures (parity with serveTunnel) — never crash the process.
       void handleRtcOffer(frame).catch((err: unknown) => {
-        logWarn("control-channel", "rtc_offer handler failed", {
-          channelId: frame.channel_id,
-          err: err instanceof Error ? err.message : String(err),
-        });
+        logWarn(
+          "control-channel",
+          safeDiagnosticMessage`rtc_offer handler failed`,
+          {
+            channelId: frame.channel_id,
+            err: err instanceof Error ? err.message : String(err),
+          },
+        );
       });
       return;
     case "rtc_ice":
       void handleRtcIce(frame).catch((err: unknown) => {
-        logWarn("control-channel", "rtc host ICE handler failed", {
-          channelId: frame.channel_id,
-          err: err instanceof Error ? err.message : String(err),
-        });
+        logWarn(
+          "control-channel",
+          safeDiagnosticMessage`rtc host ICE handler failed`,
+          {
+            channelId: frame.channel_id,
+            err: err instanceof Error ? err.message : String(err),
+          },
+        );
       });
       void handleRtcClientIce(frame).catch((err: unknown) => {
-        logWarn("control-channel", "rtc client ICE handler failed", {
-          channelId: frame.channel_id,
-          err: err instanceof Error ? err.message : String(err),
-        });
+        logWarn(
+          "control-channel",
+          safeDiagnosticMessage`rtc client ICE handler failed`,
+          {
+            channelId: frame.channel_id,
+            err: err instanceof Error ? err.message : String(err),
+          },
+        );
       });
       return;
     case "rtc_answer":
       void handleRtcAnswer(frame).catch((err: unknown) => {
-        logWarn("control-channel", "rtc answer handler failed", {
-          channelId: frame.channel_id,
-          err: err instanceof Error ? err.message : String(err),
-        });
+        logWarn(
+          "control-channel",
+          safeDiagnosticMessage`rtc answer handler failed`,
+          {
+            channelId: frame.channel_id,
+            err: err instanceof Error ? err.message : String(err),
+          },
+        );
       });
       return;
     case "rtc_nack":
@@ -937,9 +963,13 @@ const enqueueBinaryFrame = (
       muxHostOnBytes(bytes);
     })
     .catch((err: unknown) => {
-      logWarn("control-channel", "blob binary frame read failed", {
-        err: err instanceof Error ? err.message : String(err),
-      });
+      logWarn(
+        "control-channel",
+        safeDiagnosticMessage`blob binary frame read failed`,
+        {
+          err: err instanceof Error ? err.message : String(err),
+        },
+      );
     });
 };
 
@@ -1215,7 +1245,8 @@ export const startControlChannel = (): void => {
       logDebug("control-channel", line);
     } else if (line !== lastCloseLine) {
       lastCloseLine = line;
-      logWarn("control-channel", line);
+
+      logWarnAlreadyObserved("control-channel", line);
       noteControlChannelClose({
         code: ev.code,
         superseded: false,

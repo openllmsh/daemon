@@ -30,7 +30,7 @@ import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
-import { logError, logInfo, logWarn } from "../logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -240,11 +240,15 @@ const readToken = async (): Promise<{
   if (!tokens.refresh_token) credentialUnrefreshable(PROVIDER);
   const outcome = tokens.refresh_token ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
-    logWarn("refresh", "returning stale expired credential", {
-      provider: PROVIDER,
-      phase: "refresh_fallback",
-      error_class: outcome.reason,
-    });
+    logWarn(
+      "refresh",
+      safeDiagnosticMessage`returning stale expired credential`,
+      {
+        provider: PROVIDER,
+        phase: "refresh_fallback",
+        error_class: outcome.reason,
+      },
+    );
     return {
       accessToken: tokens.access_token,
       accountId: tokens.account_id ?? null,
@@ -361,12 +365,16 @@ const connectDirect = makeStreamConnect({
       urlLen: url.length,
     }),
   onParseFail: (captured) =>
-    logError("chatgpt-connect", "no authorize URL parsed from codex login", {
-      stderrLen: captured.length,
-      // Redact URL query strings so OAuth params can't land in the local log,
-      // while keeping the sample useful for diagnosing a parse miss.
-      stderrSample: redactUrls(captured.slice(0, 400)),
-    }),
+    logError(
+      "chatgpt-connect",
+      safeDiagnosticMessage`no authorize URL parsed from codex login`,
+      {
+        stderrLen: captured.length,
+        // Redact URL query strings so OAuth params can't land in the local log,
+        // while keeping the sample useful for diagnosing a parse miss.
+        stderrSample: redactUrls(captured.slice(0, 400)),
+      },
+    ),
   pendingDetail: (url) =>
     `Authorize Codex in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
   failDetail:

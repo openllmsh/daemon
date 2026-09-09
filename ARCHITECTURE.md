@@ -270,13 +270,23 @@ in-scope `pending_report_upload`, and process-local last attempt time/outcome â€
 older daemons omit those fields (unknown, not false). Last attempt is in-memory
 and cleared on identity/window discard; status never includes raw HTTP bodies,
 exception text, keys, URLs, or paths.
-Warning coverage (no extra probes): unclean control-channel closes, socket
-DNS/connect/timeouts, and missed relay heartbeats coalesce into
-`control_channel_unexpected_disconnect` (heartbeat silence is not provider
-`liveness_degraded`); login first-prompt wait emits nonterminal
-`login_prompt_delayed` without changing auth timing; native refresh records
-the existing network-failure branch before its early return using only
-available errno evidence.
+Capture is severity-first, with no diagnostic category/producer/trigger
+registry: logger warnings and errors enter the existing reporting path before
+the local log-level filter; info/debug remain local by default. Safe messages,
+actual binary version, occurrence time, opaque IDs, and bounded factual
+measurements form the report. Raw scope, arbitrary metadata, CLI output, stacks,
+login material, and credentials are not report fields. Unsafe message details
+fall back to a minimal report rather than removing the observation; an invalid
+optional measurement removes only that measurement. Hook-only observations
+use the same ingress, and paired logger/hook sites have one reporting owner.
+No additional status, authentication, or provider probes are started.
+
+New events use report schema v2 exclusively. There is no legacy decoder,
+normalizer, downgrade, or special old-server retry path. Old-format journal
+records and reports are unsupported; cloud and daemon must use matching report
+contracts. Bootstrap consent policy remains separately versioned. Existing
+spool/TTL limits, suppression counters, retry/acknowledgment semantics, and
+consent/account/origin purges still apply.
 
 **Validated live** (`RUN_DAEMON_LIVE=1`, `tests/server/daemon-walker-live
 .e2e.test.ts`) against the real authenticated CLIs, through the full

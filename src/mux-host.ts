@@ -11,7 +11,7 @@ import { serveStream } from "@openllmsh/tunnel/streams";
 import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
-import { logInfo, logWarn } from "./logger";
+import { logInfo, logWarn, safeDiagnosticMessage } from "./logger";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import type { TSessionStream } from "./session-core";
 import {
@@ -110,7 +110,7 @@ const logDemuxWarning = (
   const last = lastDemuxWarningAt.get(reason) ?? 0;
   if (now - last < DEMUX_WARNING_THROTTLE_MS) return;
   lastDemuxWarningAt.set(reason, now);
-  logWarn("mux-host", "relay mux frame dropped", {
+  logWarn("mux-host", safeDiagnosticMessage`relay mux frame dropped`, {
     reason,
     channelCount: channels.size,
     ...meta,
@@ -523,7 +523,7 @@ const admitBySeedGate = (
     aud: daemonPublicKey(),
   });
   if (gate.mode !== "reject") return true;
-  logWarn("mux-host", "channel_open rejected: seedgate", {
+  logWarn("mux-host", safeDiagnosticMessage`channel_open rejected: seedgate`, {
     channelId: frame.channel_id,
     reason: gate.reason,
   });
@@ -550,9 +550,13 @@ export const acceptChannel = (frame: {
     // the daemon and indistinguishable, from the browser, from a device that
     // never answered — which is exactly the shape of the hardest transport
     // bugs to diagnose.
-    logWarn("mux-host", "channel_open rejected: mux disabled", {
-      channelId: frame.channel_id,
-    });
+    logWarn(
+      "mux-host",
+      safeDiagnosticMessage`channel_open rejected: mux disabled`,
+      {
+        channelId: frame.channel_id,
+      },
+    );
     send({
       type: "channel_open_ack",
       channel_id: frame.channel_id,
@@ -566,9 +570,13 @@ export const acceptChannel = (frame: {
     if (existing.keyId !== null) {
       // A consumer-side channel id is OURS — a peer re-opening it is a
       // protocol bug, not a reconnect. Keep the refusal for that narrow case.
-      logWarn("mux-host", "channel_open rejected: duplicate id", {
-        channelId: frame.channel_id,
-      });
+      logWarn(
+        "mux-host",
+        safeDiagnosticMessage`channel_open rejected: duplicate id`,
+        {
+          channelId: frame.channel_id,
+        },
+      );
       send({
         type: "channel_open_ack",
         channel_id: frame.channel_id,

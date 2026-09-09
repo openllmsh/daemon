@@ -40,7 +40,7 @@ import { daemonPort, hasApiKey } from "./env";
 import { authCooldownForProvider } from "./hop-cooldown";
 import { hasIdentityConflict } from "./identity-state";
 import { daemonPublicKey } from "./keypair";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
 import { currentTickId, nextStatusTickId, opTickContext } from "./op-context";
 import { resolveOnPath } from "./path-utils";
@@ -396,26 +396,30 @@ const awaitProducer = async (
       const timerFiredAtMs = performance.now();
       if (settled) return statusFailure(slug);
       markAbandoned();
-      logWarn("status", "delegate status probe timed out", {
-        slug,
-        phase: "delegate_status",
-        timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
-        elapsed_ms: Date.now() - observerStartedWall,
-        observer_started_at_ms: timerArmedAtMs,
-        timer_armed_at_ms: timerArmedAtMs,
-        timer_fired_at_ms: timerFiredAtMs,
-        timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-          timerArmedAtMs,
-          timerFiredAtMs,
-          observerDelayMs,
-        ),
-        clock_elapsed: "Date.now",
-        clock_timer: "performance.now",
-        joined,
-        cancellable: getDelegate(slug)?.statusCancellable === true,
-        tick_id: currentTickId(),
-        ...readPublishQueueSnapshot(),
-      });
+      logWarn(
+        "status",
+        safeDiagnosticMessage`delegate status probe timed out`,
+        {
+          slug,
+          phase: "delegate_status",
+          timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
+          elapsed_ms: Date.now() - observerStartedWall,
+          observer_started_at_ms: timerArmedAtMs,
+          timer_armed_at_ms: timerArmedAtMs,
+          timer_fired_at_ms: timerFiredAtMs,
+          timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+            timerArmedAtMs,
+            timerFiredAtMs,
+            observerDelayMs,
+          ),
+          clock_elapsed: "Date.now",
+          clock_timer: "performance.now",
+          joined,
+          cancellable: getDelegate(slug)?.statusCancellable === true,
+          tick_id: currentTickId(),
+          ...readPublishQueueSnapshot(),
+        },
+      );
       return statusFailure(slug);
     }),
   ]);

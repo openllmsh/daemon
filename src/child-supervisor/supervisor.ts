@@ -1,4 +1,4 @@
-import { logError, logWarn } from "../logger";
+import { logError, logWarn, safeDiagnosticMessage } from "../logger";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
 import type { TReapOutcome } from "./posix";
 import {
@@ -92,7 +92,7 @@ const forgetChild = (child: TSupervisedChild, outcome: TReapOutcome): void => {
   if (outcome === "reap_unconfirmed") {
     logWarn(
       "child-supervisor",
-      "process group unreaped after bounded TERM/KILL",
+      safeDiagnosticMessage`process group unreaped after bounded TERM/KILL`,
       {
         pid: child.pid,
         pgid: child.pgid,
@@ -304,7 +304,7 @@ const terminateStaleRecord = async (
   if (outcome === "reap_unconfirmed") {
     logWarn(
       "child-supervisor",
-      "stale process group unreaped after boot sweep",
+      safeDiagnosticMessage`stale process group unreaped after boot sweep`,
       {
         pid: record.pid,
         pgid: record.pgid,

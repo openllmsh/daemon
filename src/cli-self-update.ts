@@ -35,7 +35,7 @@ import { autoUpdateEnabled } from "./auto-update-pref";
 import { cliVersion } from "./delegation/util";
 import { daemonEnv, stateDir } from "./env";
 import { hardenMacBinary } from "./harden-binary";
-import { logError, logInfo, logWarn } from "./logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
 import { currentTarget, fetchBinary, fetchDigest } from "./self-update";
 import { recentlyAttempted, recordAttempt } from "./state-file";
 
@@ -120,7 +120,7 @@ export const maybeUpdateCli = async (
   if (current === null) {
     logWarn(
       "cli-update",
-      "installed openllm CLI did not report a version — skipping",
+      safeDiagnosticMessage`installed openllm CLI did not report a version — skipping`,
     );
     return;
   }
@@ -151,12 +151,16 @@ export const maybeUpdateCli = async (
     ]);
     const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== expected) {
-      logError("cli-update", "checksum mismatch — refusing update", {
-        target,
-        latest,
-        expected,
-        actual,
-      });
+      logError(
+        "cli-update",
+        safeDiagnosticMessage`checksum mismatch — refusing update`,
+        {
+          target,
+          latest,
+          expected,
+          actual,
+        },
+      );
       return;
     }
     writeFileSync(tmp, bytes, { mode: 0o755 });

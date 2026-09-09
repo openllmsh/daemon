@@ -27,7 +27,7 @@ import { loginSlot } from "./delegation/login-flow";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { observeDoctorEvent } from "./doctor-report";
 import { daemonApiKeyId } from "./env";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 
 export type TAuthStatusBaseline = {
   readonly status: TDaemonProviderAuthStatus;
@@ -157,12 +157,8 @@ const noteUnknownLiveness = (conn: TDaemonProviderConnection): void => {
     unknownStreak.set(slug, consecutive);
     if (consecutive !== UNKNOWN_ESCALATION_TICKS) return;
     observeDoctorEvent({
-      code: "liveness_degraded",
-      producer: "auth_session_lost",
-      trigger: "session_lost",
-      outcome: "degraded",
-      operation: "probe",
-      provider: slug,
+      severity: "warn",
+      message: safeDiagnosticMessage`Provider liveness degraded.`,
       timings: { unknown_probe_streak: consecutive },
     });
     emitAuth({
@@ -188,21 +184,18 @@ export const noteConnectionsForSessionLost = (
     if (edge === null) continue;
     if (edge.lost) {
       const diagnostic_code = edge.diagnostic_code ?? "unclassified";
-      observeDoctorEvent({
-        code: "session_lost",
-        producer: "auth_session_lost",
-        trigger: "session_lost",
-        outcome: "disconnect",
-        operation: "probe",
-        provider: edge.slug,
-      });
-      logWarn("auth-session-lost", "subscription session lost", {
-        slug: edge.slug,
-        diagnostic_code,
-        ...(edge.account_hash !== undefined
-          ? { account_hash: edge.account_hash }
-          : {}),
-      });
+
+      logWarn(
+        "auth-session-lost",
+        safeDiagnosticMessage`subscription session lost`,
+        {
+          slug: edge.slug,
+          diagnostic_code,
+          ...(edge.account_hash !== undefined
+            ? { account_hash: edge.account_hash }
+            : {}),
+        },
+      );
       emitAuth({
         event: "auth.session.lost",
         key_id: daemonApiKeyId() ?? "local",

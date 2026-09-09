@@ -23,7 +23,7 @@
  */
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { logWarn } from "../logger";
+import { logWarn, safeDiagnosticMessage } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import type { TSandboxState } from "./landlock";
 import {
@@ -257,7 +257,10 @@ const signalNumber = (signal: string): number | null => {
  */
 export const probeSandboxCapability = async (): Promise<TSandboxState> => {
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {
-    logWarn("sandbox", "OPENLLM_DAEMON_NO_SANDBOX=1 — children run unconfined");
+    logWarn(
+      "sandbox",
+      safeDiagnosticMessage`OPENLLM_DAEMON_NO_SANDBOX=1 — children run unconfined`,
+    );
     return "off";
   }
   if (isDevSourceRun() && process.env.OPENLLM_DAEMON_SANDBOX !== "1") {

@@ -56,7 +56,7 @@ import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
-import { logError, logInfo, logWarn } from "../logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -308,11 +308,15 @@ const readToken = async (): Promise<{
   if (!session.refresh_token) credentialUnrefreshable(PROVIDER);
   const outcome = session.refresh_token ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
-    logWarn("refresh", "returning stale expired credential", {
-      provider: PROVIDER,
-      phase: "refresh_fallback",
-      error_class: outcome.reason,
-    });
+    logWarn(
+      "refresh",
+      safeDiagnosticMessage`returning stale expired credential`,
+      {
+        provider: PROVIDER,
+        phase: "refresh_fallback",
+        error_class: outcome.reason,
+      },
+    );
     return { accessToken: session.key, session, staleRefresh: outcome.reason };
   }
   if (outcome !== "awaited") return { accessToken: session.key, session };
@@ -414,10 +418,14 @@ const connectDirect = makeStreamConnect({
       urlLen: url.length,
     }),
   onParseFail: (captured) =>
-    logError("grok-connect", "no authorize URL parsed from grok login", {
-      stderrLen: captured.length,
-      stderrSample: redactUrls(captured.slice(0, 400)),
-    }),
+    logError(
+      "grok-connect",
+      safeDiagnosticMessage`no authorize URL parsed from grok login`,
+      {
+        stderrLen: captured.length,
+        stderrSample: redactUrls(captured.slice(0, 400)),
+      },
+    ),
   pendingDetail: (url) =>
     `Authorize Grok in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
   failDetail:

@@ -5,32 +5,25 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import type {
-  TDoctorDiagnosticCode,
-  TDoctorErrorClass,
   TDoctorEventTimings,
-  TDoctorOperation,
-  TDoctorOutcome,
-  TDoctorProducer,
-  TDoctorProvider,
   TDoctorReportEvent,
-  TDoctorTrigger,
 } from "@openllmsh/protocol";
-import { parseDoctorReportEvent } from "@openllmsh/protocol";
+import {
+  DOCTOR_OPAQUE_ID_PATTERN,
+  parseDoctorReportEvent,
+  projectDoctorTimings,
+} from "@openllmsh/protocol";
 import { DAEMON_VERSION } from "../version";
 import { doctorStateDir, doctorStatePath } from "./files";
+import { diagnosticMessageText } from "./message";
 import { doctorArchitecture, doctorPlatform } from "./platform";
 
 const DIAGNOSTICS_BASENAME = "openllmd.diagnostics.jsonl";
 const MAX_DIAGNOSTICS_BYTES = 5 * 1024 * 1024;
 
 export type TDoctorObservationInput = {
-  readonly code: TDoctorDiagnosticCode;
-  readonly producer: TDoctorProducer;
-  readonly trigger: TDoctorTrigger;
-  readonly outcome: TDoctorOutcome;
-  readonly operation?: TDoctorOperation;
-  readonly provider?: TDoctorProvider;
-  readonly error_class?: TDoctorErrorClass;
+  readonly severity: "warn" | "error";
+  readonly message: unknown;
   readonly correlation_id?: string;
   readonly timings?: TDoctorEventTimings;
   readonly observed_at_ms?: number;
@@ -86,19 +79,15 @@ export const recordDoctorObservation = (
     daemon_version: DAEMON_VERSION,
     platform,
     architecture,
-    code: input.code,
-    producer: input.producer,
-    trigger: input.trigger,
-    outcome: input.outcome,
-    ...(input.operation !== undefined ? { operation: input.operation } : {}),
-    ...(input.provider !== undefined ? { provider: input.provider } : {}),
-    ...(input.error_class !== undefined
-      ? { error_class: input.error_class }
-      : {}),
-    ...(input.correlation_id !== undefined
+    severity: input.severity,
+    message: diagnosticMessageText(input.message, input.severity),
+    ...(input.correlation_id !== undefined &&
+    DOCTOR_OPAQUE_ID_PATTERN.test(input.correlation_id)
       ? { correlation_id: input.correlation_id }
       : {}),
-    ...(input.timings !== undefined ? { timings: input.timings } : {}),
+    ...(input.timings !== undefined
+      ? { timings: projectDoctorTimings(input.timings) }
+      : {}),
   };
   let parsed: TDoctorReportEvent;
   try {

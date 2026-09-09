@@ -30,7 +30,7 @@ import type {
   TUsage,
 } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
-import { logError } from "../logger";
+import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
@@ -148,7 +148,7 @@ class CodexAppServerClient {
     if (this.sinks.size > 0) {
       logError(
         "native-runtime",
-        "codex app-server teardown failed live turns",
+        safeDiagnosticMessage`codex app-server teardown failed live turns`,
         {
           reason,
           turns: this.sinks.size,
@@ -664,7 +664,11 @@ export const runCodexNative = async (
         ? "codex app-server produced no output before the pre-commit deadline"
         : ((terminal as { error: string | null } | null)?.error ??
           "codex turn ended before producing output");
-    logError("native-runtime", "codex hop declined pre-commit", { reason });
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`codex hop declined pre-commit`,
+      { reason },
+    );
     return { kind: "declined", reason };
   }
 

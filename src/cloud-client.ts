@@ -28,7 +28,7 @@ import {
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
 import { hasIdentityConflict, setIdentityConflict } from "./identity-state";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
 const decodePlan = Schema.decodeUnknownSync(DaemonPlanResponse);
@@ -292,7 +292,7 @@ export const publishIdentity = async (pubkey: string): Promise<void> => {
         setIdentityConflict(true);
         logWarn(
           "identity",
-          "cloud pin conflicts with local X25519 key — RTC will fail until the pin is reset",
+          safeDiagnosticMessage`cloud pin conflicts with local X25519 key — RTC will fail until the pin is reset`,
           {},
         );
         // Push once per false→true; repeated 409s (bootstrap ~5min) stay silent.

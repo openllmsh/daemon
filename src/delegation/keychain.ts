@@ -43,7 +43,13 @@ import {
   splitReapBudget,
   waitUntilExpired,
 } from "../deadline-budget";
-import { logDebug, logError, logInfo, logWarn } from "../logger";
+import {
+  logDebug,
+  logError,
+  logInfo,
+  logWarn,
+  safeDiagnosticMessage,
+} from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
@@ -412,23 +418,31 @@ const spawnSecurityNow = async (
           // mock / already gone
         }
         if (reap === "reap_unconfirmed") {
-          logError("keychain", "security command did not reap after SIGKILL", {
-            argv: redactSensitiveArgv(["security", ...argv]),
-          });
+          logError(
+            "keychain",
+            safeDiagnosticMessage`security command did not reap after SIGKILL`,
+            {
+              argv: redactSensitiveArgv(["security", ...argv]),
+            },
+          );
         }
         if (outcome.kind === "timeout") {
           keychainCounters.timeouts++;
-          logError("keychain", "security command timed out", {
-            argv: redactSensitiveArgv(["security", ...argv]),
-            configured_timeout_ms: configuredTimeoutMs,
-            lane_wait_ms: laneWaitMs,
-            budget_remaining_ms_at_spawn: remainingAtSpawn,
-            spawn_setup_ms: spawnSetupMs,
-            spawn_elapsed_ms: performance.now() - spawnedAtMs,
-            verb,
-            child_pid: child.pid,
-            tick_id: currentTickId(),
-          });
+          logError(
+            "keychain",
+            safeDiagnosticMessage`security command timed out`,
+            {
+              argv: redactSensitiveArgv(["security", ...argv]),
+              configured_timeout_ms: configuredTimeoutMs,
+              lane_wait_ms: laneWaitMs,
+              budget_remaining_ms_at_spawn: remainingAtSpawn,
+              spawn_setup_ms: spawnSetupMs,
+              spawn_elapsed_ms: performance.now() - spawnedAtMs,
+              verb,
+              child_pid: child.pid,
+              tick_id: currentTickId(),
+            },
+          );
           return { ...FAILED_SPAWN, timedOut: true, aborted: false };
         }
         keychainCounters.aborted++;
@@ -732,7 +746,7 @@ const logKeychainFailure = (kc: string): void => {
   lastKeychainFailureLogMs.set(kc, now);
   logError(
     "keychain",
-    "failed to create the isolated login keychain — claude login will pop the 'Keychain Not Found' dialog and hang",
+    safeDiagnosticMessage`failed to create the isolated login keychain — claude login will pop the 'Keychain Not Found' dialog and hang`,
     { keychain: kc },
   );
 };
@@ -740,7 +754,7 @@ const logKeychainFailure = (kc: string): void => {
 const logSelfHeal = (kc: string): void =>
   logError(
     "keychain",
-    "recreated a drifted isolated login keychain (empty-password unlock failed); the provider will require re-login",
+    safeDiagnosticMessage`recreated a drifted isolated login keychain (empty-password unlock failed); the provider will require re-login`,
     { keychain: kc },
   );
 
@@ -990,7 +1004,7 @@ const recreateIsolatedKeychain = async (
   const dir = dirname(kc);
   const prepared = await prepareStagingKeychain(home, dir, signal);
   if (prepared === null) {
-    logWarn("keychain", "keychain self-heal outcome", {
+    logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
       created: false,
       unlocked: false,
     });
@@ -1009,7 +1023,7 @@ const recreateIsolatedKeychain = async (
     if (originalMoved && !existsSync(kc)) {
       await rename(aside, kc).catch(() => {});
     }
-    logWarn("keychain", "keychain self-heal outcome", {
+    logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
       created: true,
       unlocked: false,
     });
@@ -1023,14 +1037,14 @@ const recreateIsolatedKeychain = async (
   if (!unlocked && originalMoved) {
     await rm(kc, { force: true }).catch(() => {});
     await rename(aside, kc).catch(() => {});
-    logWarn("keychain", "keychain self-heal outcome", {
+    logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
       created: true,
       unlocked: false,
     });
     return { created: true, unlocked: false, replaced: false };
   }
   logSelfHeal(kc);
-  logWarn("keychain", "keychain self-heal outcome", {
+  logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
     created: true,
     unlocked,
   });
@@ -1118,7 +1132,7 @@ const ensureKeychainNow = async (
     invalidateUnlockSkip(kc);
     if (!healedKeychains.has(kc)) {
       const metadata = keychainMetadata(kc);
-      logWarn("keychain", "keychain auth-drift evidence", {
+      logWarn("keychain", safeDiagnosticMessage`keychain auth-drift evidence`, {
         classifier_token: failureToken,
         exit_code: res.code,
         stderr_length: res.stderr.length,
@@ -1315,7 +1329,7 @@ export const grantKeychainToolAccess = async (
     });
     return true;
   }
-  logWarn("keychain", "partition-list grant failed", {
+  logWarn("keychain", safeDiagnosticMessage`partition-list grant failed`, {
     exit_code: res.code,
     stderr_excerpt: redactSecurityStderr(res.stderr),
   });

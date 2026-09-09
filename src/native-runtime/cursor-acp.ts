@@ -52,7 +52,7 @@ import { existsSync } from "node:fs";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { spawnCwd } from "../delegation/util";
-import { logError, logInfo, logWarn } from "../logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
@@ -671,7 +671,7 @@ const trySetModel = async (
   } catch (error) {
     logWarn(
       "native-runtime",
-      "cursor session/set_model failed — auto routing",
+      safeDiagnosticMessage`cursor session/set_model failed — auto routing`,
       {
         providerModelId,
         modelId,
@@ -833,9 +833,13 @@ export const runCursorNative = async (
     client.dispose();
     stopMcp();
     if (stderrTail.length > 0) {
-      logError("native-runtime", "cursor ACP handshake failed", {
-        stderrTail: stderrTail.slice(-400),
-      });
+      logError(
+        "native-runtime",
+        safeDiagnosticMessage`cursor ACP handshake failed`,
+        {
+          stderrTail: stderrTail.slice(-400),
+        },
+      );
     }
     return setupDecline(error, params.signal);
   };
@@ -912,9 +916,13 @@ export const runCursorNative = async (
         push("end");
         return;
       }
-      logError("native-runtime", "cursor prompt failed after output began", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      logError(
+        "native-runtime",
+        safeDiagnosticMessage`cursor prompt failed after output began`,
+        {
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
       endTurn(null);
     });
   void promptDone;
@@ -929,9 +937,13 @@ export const runCursorNative = async (
     }
     if (Date.now() - lastActivityAt > idleBudget) {
       clearInterval(idleTimer);
-      logError("native-runtime", "cursor turn idle timeout — killing child", {
-        idleMs: idleBudget,
-      });
+      logError(
+        "native-runtime",
+        safeDiagnosticMessage`cursor turn idle timeout — killing child`,
+        {
+          idleMs: idleBudget,
+        },
+      );
       cancelAndDispose();
       if (turn.sawOutput()) endTurn(null);
       else push("end");
@@ -976,7 +988,11 @@ export const runCursorNative = async (
       first === "timeout"
         ? "cursor ACP produced no output before the pre-commit deadline"
         : "cursor turn ended before producing output";
-    logError("native-runtime", "cursor hop declined pre-commit", { reason });
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`cursor hop declined pre-commit`,
+      { reason },
+    );
     return { kind: "declined", reason };
   }
 

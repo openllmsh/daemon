@@ -22,8 +22,7 @@ import {
   splitReapBudget,
   timeoutCallbackLatenessMs,
 } from "../deadline-budget";
-import { noteNativeAuthTimeout } from "../doctor-report/hooks";
-import { logDebug, logError, logWarn } from "../logger";
+import { logDebug, logError, logWarn, safeDiagnosticMessage } from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -426,73 +425,70 @@ export const runCaptureResult = async (
         const cleanupMs = performance.now() - cleanupStartedAtMs;
         const armed = timerArmedAtMs ?? spawnedAtMs;
         const fired = timerFiredAtMs ?? raceObservedAtMs;
-        logWarn("spawn", "capture timed out", {
-          configured_timeout_ms: configuredTimeoutMs,
-          deadline_ms: remainingAtSpawn,
-          remaining_at_spawn_ms: remainingAtSpawn,
-          budget_remaining_ms_at_spawn: remainingAtSpawn,
-          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-          spawn_setup_ms: spawnSetupMs,
-          timer_armed_at_ms: armed,
-          timer_fired_at_ms: fired,
-          race_observed_at_ms: raceObservedAtMs,
-          timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-            armed,
-            fired,
-            timerDelayMs,
-          ),
-          stdout_closed: stdoutClosedAtRace,
-          root_exited: rootExitedAtRace,
-          root_exit_code: rootExitCodeAtRace,
-          cleanup_ms: cleanupMs,
-          clock: "performance.now",
-          child_pid: typeof proc.pid === "number" ? proc.pid : null,
-          tick_id: currentTickId(),
-          kind: spawnOptions.kind,
-          probe: opts?.probe === true,
-          reason_code: "timeout",
-          ...(opts?.producer !== undefined ? { producer: opts.producer } : {}),
-          ...(opts?.operationId !== undefined
-            ? { operation_id: opts.operationId }
-            : {}),
-          ...(opts?.producer === undefined
-            ? { argv: redactSensitiveArgv(argv) }
-            : {}),
-        });
-        noteNativeAuthTimeout({
-          trigger:
-            opts?.producer === "claude-refresh"
-              ? "refresh"
-              : opts?.producer === "claude-auth-status"
-                ? "status_poll"
-                : opts?.producer !== undefined
-                  ? "native_login"
-                  : "capture",
-          operation:
-            opts?.producer === "claude-refresh"
-              ? "refresh"
-              : opts?.producer === "claude-auth-status"
-                ? "probe"
-                : opts?.producer !== undefined
-                  ? "native_auth"
-                  : "capture",
-          timings: {
+        logWarn(
+          "spawn",
+          "capture timed out",
+          {
             configured_timeout_ms: configuredTimeoutMs,
-            spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+            deadline_ms: remainingAtSpawn,
+            remaining_at_spawn_ms: remainingAtSpawn,
             budget_remaining_ms_at_spawn: remainingAtSpawn,
+            spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+            spawn_setup_ms: spawnSetupMs,
+            timer_armed_at_ms: armed,
+            timer_fired_at_ms: fired,
+            race_observed_at_ms: raceObservedAtMs,
             timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
               armed,
               fired,
               timerDelayMs,
             ),
-            cleanup_ms: cleanupMs,
             stdout_closed: stdoutClosedAtRace,
             root_exited: rootExitedAtRace,
-            ...(typeof rootExitCodeAtRace === "number"
-              ? { root_exit_code: rootExitCodeAtRace }
+            root_exit_code: rootExitCodeAtRace,
+            cleanup_ms: cleanupMs,
+            clock: "performance.now",
+            child_pid: typeof proc.pid === "number" ? proc.pid : null,
+            tick_id: currentTickId(),
+            kind: spawnOptions.kind,
+            probe: opts?.probe === true,
+            reason_code: "timeout",
+            ...(opts?.producer !== undefined
+              ? { producer: opts.producer }
+              : {}),
+            ...(opts?.operationId !== undefined
+              ? { operation_id: opts.operationId }
+              : {}),
+            ...(opts?.producer === undefined
+              ? { argv: redactSensitiveArgv(argv) }
               : {}),
           },
-        });
+          {
+            message:
+              opts?.producer === "claude-auth-status"
+                ? safeDiagnosticMessage`Authentication status probe exceeded its time budget.`
+                : opts?.producer === "claude-refresh"
+                  ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
+                  : safeDiagnosticMessage`Native capture exceeded its time budget.`,
+            timings: {
+              configured_timeout_ms: configuredTimeoutMs,
+              spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+              budget_remaining_ms_at_spawn: remainingAtSpawn,
+              timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+                armed,
+                fired,
+                timerDelayMs,
+              ),
+              cleanup_ms: cleanupMs,
+              stdout_closed: stdoutClosedAtRace,
+              root_exited: rootExitedAtRace,
+              ...(typeof rootExitCodeAtRace === "number"
+                ? { root_exit_code: rootExitCodeAtRace }
+                : {}),
+            },
+          },
+        );
+
         return { kind: "timeout" };
       }
       if (outcome.kind === "aborted") {
@@ -753,61 +749,67 @@ export const spawnLogin = async (
     const raceObservedAtMs = performance.now();
     const armed = timerArmedAtMs ?? spawnedAtMs;
     const fired = timerFiredAtMs ?? raceObservedAtMs;
-    logWarn("spawn", "login timed out", {
-      configured_timeout_ms: timeoutMs,
-      deadline_ms: remainingAtSpawn,
-      remaining_at_spawn_ms: remainingAtSpawn,
-      budget_remaining_ms_at_spawn: remainingAtSpawn,
-      spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-      spawn_setup_ms: spawnSetupMs,
-      timer_armed_at_ms: armed,
-      timer_fired_at_ms: fired,
-      race_observed_at_ms: raceObservedAtMs,
-      timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-        armed,
-        fired,
-        timerDelayMs,
-      ),
-      stdout_closed: opts.stdoutClosed,
-      stderr_closed: opts.stderrClosed,
-      root_exited: opts.rootExited,
-      root_exit_code: opts.rootExitCode,
-      cleanup_ms: opts.cleanupMs,
-      clock: "performance.now",
-      child_pid: stamp.child_pid,
-      tick_id: currentTickId(),
-      kind: "login",
-      probe: loginOpts?.probe === true,
-      reason_code: "timeout",
-      abandoned: true,
-      ...(loginOpts?.producer !== undefined
-        ? { producer: loginOpts.producer }
-        : {}),
-      ...(loginOpts?.operationId !== undefined
-        ? { operation_id: loginOpts.operationId }
-        : {}),
-    });
-    noteNativeAuthTimeout({
-      trigger: "native_login",
-      operation: "native_auth",
-      timings: {
+    logWarn(
+      "spawn",
+      "login timed out",
+      {
         configured_timeout_ms: timeoutMs,
-        spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+        deadline_ms: remainingAtSpawn,
+        remaining_at_spawn_ms: remainingAtSpawn,
         budget_remaining_ms_at_spawn: remainingAtSpawn,
+        spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+        spawn_setup_ms: spawnSetupMs,
+        timer_armed_at_ms: armed,
+        timer_fired_at_ms: fired,
+        race_observed_at_ms: raceObservedAtMs,
         timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
           armed,
           fired,
           timerDelayMs,
         ),
-        cleanup_ms: opts.cleanupMs,
         stdout_closed: opts.stdoutClosed,
         stderr_closed: opts.stderrClosed,
         root_exited: opts.rootExited,
-        ...(typeof opts.rootExitCode === "number"
-          ? { root_exit_code: opts.rootExitCode }
+        root_exit_code: opts.rootExitCode,
+        cleanup_ms: opts.cleanupMs,
+        clock: "performance.now",
+        child_pid: stamp.child_pid,
+        tick_id: currentTickId(),
+        kind: "login",
+        probe: loginOpts?.probe === true,
+        reason_code: "timeout",
+        abandoned: true,
+        ...(loginOpts?.producer !== undefined
+          ? { producer: loginOpts.producer }
+          : {}),
+        ...(loginOpts?.operationId !== undefined
+          ? { operation_id: loginOpts.operationId }
           : {}),
       },
-    });
+      {
+        message:
+          loginOpts?.producer === "claude-refresh"
+            ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
+            : safeDiagnosticMessage`Login exceeded its time budget.`,
+        timings: {
+          configured_timeout_ms: timeoutMs,
+          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+          budget_remaining_ms_at_spawn: remainingAtSpawn,
+          timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+            armed,
+            fired,
+            timerDelayMs,
+          ),
+          cleanup_ms: opts.cleanupMs,
+          stdout_closed: opts.stdoutClosed,
+          stderr_closed: opts.stderrClosed,
+          root_exited: opts.rootExited,
+          ...(typeof opts.rootExitCode === "number"
+            ? { root_exit_code: opts.rootExitCode }
+            : {}),
+        },
+      },
+    );
   };
 
   const onTimeout = (): void => {

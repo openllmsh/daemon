@@ -12,7 +12,7 @@ import {
   DEVICE_GRANT_TS_WINDOW_MS,
   decodeDeviceGrant,
 } from "@openllmsh/tunnel";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 import { mutateState, readState } from "./state-file";
 
 /**
@@ -53,10 +53,14 @@ export const setDeviceAccessPubkey = (pubkey: string | null): void => {
   if (prev === pubkey) return;
   pinnedPubkey = pubkey;
   mutateState((s) => ({ ...s, deviceAccessPubkey: pubkey }));
-  logWarn("device-access", "device_access_pubkey pin changed", {
-    previous: prev === null ? "null" : "set",
-    next: pubkey === null ? "null" : "set",
-  });
+  logWarn(
+    "device-access",
+    safeDiagnosticMessage`device_access_pubkey pin changed`,
+    {
+      previous: prev === null ? "null" : "set",
+      next: pubkey === null ? "null" : "set",
+    },
+  );
 };
 
 /** Test-only: set the pin without state-file I/O or log noise. */
@@ -137,9 +141,13 @@ const rememberNonce = (
 ): boolean => {
   if (nonceSeen.has(n)) return false;
   if (nonceOrder.length >= nonceLruCap) {
-    logWarn("device-access", "nonce map full; rejecting new grant", {
-      cap: nonceLruCap,
-    });
+    logWarn(
+      "device-access",
+      safeDiagnosticMessage`nonce map full; rejecting new grant`,
+      {
+        cap: nonceLruCap,
+      },
+    );
     return false;
   }
   nonceSeen.set(n, envelopeTs + DEVICE_GRANT_TS_WINDOW_MS);

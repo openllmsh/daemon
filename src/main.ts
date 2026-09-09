@@ -64,7 +64,6 @@ import {
   initDoctorCursorAtTail,
   isDoctorLocalPath,
   onDoctorListenAttempt,
-  recordDoctorObservation,
 } from "./doctor-report";
 import {
   daemonEnv,
@@ -76,7 +75,7 @@ import {
 } from "./env";
 import { buildHealth } from "./health";
 import { handleInference } from "./listener";
-import { logError, logInfo } from "./logger";
+import { logError, logInfo, safeDiagnosticMessage } from "./logger";
 import { observeLoginModelReports } from "./model-report";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { probeSandboxCapability } from "./sandbox/exec";
@@ -178,14 +177,10 @@ const main = async (): Promise<void> => {
       logError(survivedTransportLabel(err), err);
       return;
     }
-    logError("uncaughtException", err);
-    recordDoctorObservation({
-      code: "fatal_process",
-      producer: "process",
-      trigger: "fatal",
-      outcome: "failure",
-      error_class: "unclassified",
+    logError("uncaughtException", err, undefined, {
+      message: safeDiagnosticMessage`The daemon encountered an uncaught exception.`,
     });
+
     // Durable local session hosts are detached sibling processes. A daemon
     // fatal exit must never terminate their vendor PTYs; attached browser
     // clients simply lose their transport until Phase 2 reconnects them.
@@ -197,14 +192,10 @@ const main = async (): Promise<void> => {
       logError(survivedTransportLabel(reason), reason);
       return;
     }
-    logError("unhandledRejection", reason);
-    recordDoctorObservation({
-      code: "fatal_process",
-      producer: "process",
-      trigger: "fatal",
-      outcome: "failure",
-      error_class: "unclassified",
+    logError("unhandledRejection", reason, undefined, {
+      message: safeDiagnosticMessage`The daemon encountered an unhandled rejection.`,
     });
+
     exitAfterDisposableDrain(1);
   });
 

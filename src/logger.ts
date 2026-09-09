@@ -31,6 +31,16 @@
  */
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
+import { observeDoctorEvent } from "./doctor-report/engine";
+import type { TSafeDiagnosticMessage } from "./doctor-report/message";
+import {
+  isSafeDiagnosticMessage,
+  localDiagnosticMessage,
+} from "./doctor-report/message";
+import type { TDoctorObservationInput } from "./doctor-report/record";
+
+export { safeDiagnosticMessage } from "./doctor-report/message";
+
 import { logFilePath, stateDir } from "./env";
 
 // Rotate past 5MB → `<log file>.1` (one generation; the daemon is chatty only
@@ -67,15 +77,13 @@ const thresholdRank = (): number => {
 };
 
 const serializeErr = (err: unknown): string => {
-  // `||`, not `??`: a DOMException (e.g. Bun's `AbortSignal.timeout`
-  // TimeoutError) carries an EMPTY-STRING stack, which is not nullish — `??`
-  // logged those errors as `"message":""`, hiding the failure entirely.
-  if (err instanceof Error) return err.stack || `${err.name}: ${err.message}`;
-  if (typeof err === "string") return err;
   try {
-    return JSON.stringify(err);
+    if (err instanceof Error) return err.stack || `${err.name}: ${err.message}`;
+    if (typeof err === "string") return err;
+    return JSON.stringify(err) ?? "Unknown daemon error";
   } catch {
-    return String(err);
+    // Getters, toJSON and coercion can all throw; never invoke them again.
+    return "Unknown daemon error";
   }
 };
 
@@ -161,12 +169,32 @@ const appendCombined = (line: string, sync: boolean): boolean => {
  */
 export const flushLogs = (): Promise<void> => appendTail;
 
+type TLogObservation = Pick<
+  TDoctorObservationInput,
+  "timings" | "correlation_id"
+> & { readonly message?: TSafeDiagnosticMessage };
+
 const write = (
   level: TLevel,
   scope: string,
-  message: string,
+  message: string | TSafeDiagnosticMessage,
   meta?: Record<string, unknown>,
+  observation?: TLogObservation,
+  alreadyObserved = false,
 ): void => {
+  if (!alreadyObserved && (level === "warn" || level === "error")) {
+    try {
+      observeDoctorEvent({
+        severity: level,
+        message: observation?.message ?? message,
+        timings: observation?.timings,
+        correlation_id: observation?.correlation_id,
+      });
+    } catch {
+      // Reporting must never throw or log recursively.
+    }
+  }
+  message = localDiagnosticMessage(message);
   // The boot readiness line is a plain stdout signal for the install-time
   // launcher, so it is emitted regardless of the level gate. Everything else
   // more verbose than `OPENLLM_LOG_LEVEL` is dropped before any write.
@@ -222,13 +250,29 @@ export const logError = (
   scope: string,
   err: unknown,
   meta?: Record<string, unknown>,
-): void => write("error", scope, serializeErr(err), meta);
+  observation?: TLogObservation,
+): void =>
+  write(
+    "error",
+    scope,
+    isSafeDiagnosticMessage(err) ? err : serializeErr(err),
+    meta,
+    observation,
+  );
 
 export const logWarn = (
   scope: string,
-  message: string,
+  message: string | TSafeDiagnosticMessage,
   meta?: Record<string, unknown>,
-): void => write("warn", scope, message, meta);
+  observation?: TLogObservation,
+): void => write("warn", scope, message, meta, observation);
+
+/** Only paired hook-owned incidents: preserve local forensics without a second report. */
+export const logWarnAlreadyObserved = (
+  scope: string,
+  message: string | TSafeDiagnosticMessage,
+  meta?: Record<string, unknown>,
+): void => write("warn", scope, message, meta, undefined, true);
 
 export const logInfo = (
   scope: string,

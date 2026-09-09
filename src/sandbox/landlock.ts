@@ -32,7 +32,7 @@
  * drain-and-exit + supervisor relaunch, never by widening a live ruleset.
  */
 import { fstatSync } from "node:fs";
-import { logDebug, logInfo, logWarn } from "../logger";
+import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { daemonWorkingSet } from "./working-set";
 
@@ -306,7 +306,10 @@ export const sandboxAppliedInProcess = (): boolean => inProcessApplied;
 
 const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {
-    logWarn("sandbox", "OPENLLM_DAEMON_NO_SANDBOX=1 — running unconfined");
+    logWarn(
+      "sandbox",
+      safeDiagnosticMessage`OPENLLM_DAEMON_NO_SANDBOX=1 — running unconfined`,
+    );
     return "off";
   }
   // Source runs opt in (§3.5); the shim (`force`) and the compiled binary
@@ -331,7 +334,10 @@ const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
   try {
     const probed = await probeLandlockAbi();
     if (probed === null) {
-      logWarn("sandbox", "could not bind libc — running unconfined");
+      logWarn(
+        "sandbox",
+        safeDiagnosticMessage`could not bind libc — running unconfined`,
+      );
       return "error";
     }
     const { libc, abi } = probed;
@@ -410,7 +416,10 @@ const applyInner = async (opts?: TApplySandboxOpts): Promise<TSandboxState> => {
     // restrict_self requires no_new_privs (we're an unprivileged process).
     if (libc.prctl(PR_SET_NO_NEW_PRIVS, 1n, 0n, 0n, 0n) !== 0) {
       libc.close(rulesetFd);
-      logWarn("sandbox", "prctl(NO_NEW_PRIVS) failed — running unconfined");
+      logWarn(
+        "sandbox",
+        safeDiagnosticMessage`prctl(NO_NEW_PRIVS) failed — running unconfined`,
+      );
       return "error";
     }
     const rc = Number(

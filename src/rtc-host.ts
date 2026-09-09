@@ -36,7 +36,7 @@ import { RTCPeerConnection } from "werift";
 import { enforceRtcSeedGate } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey, openSealed, sealTo } from "./keypair";
-import { logDebug, logWarn } from "./logger";
+import { logDebug, logWarn, safeDiagnosticMessage } from "./logger";
 import { serveMuxOnStream } from "./mux-host";
 
 /** Bound concurrent RTC sessions per daemon process. */
@@ -283,7 +283,7 @@ export const handleRtcOffer = async (frame: {
   if (sessions.has(frame.channel_id)) {
     // A retransmit of an in-flight offer, not a reject — stay silent (a nack
     // would tear the caller's healthy pending attempt).
-    logWarn("rtc-host", "duplicate rtc_offer", {
+    logWarn("rtc-host", safeDiagnosticMessage`duplicate rtc_offer`, {
       channelId: frame.channel_id,
     });
     return;
@@ -291,9 +291,13 @@ export const handleRtcOffer = async (frame: {
 
   const opened = openSealed(frame.fingerprint_proof);
   if (opened === null) {
-    logWarn("rtc-host", "bad fingerprint_proof (open failed)", {
-      channelId: frame.channel_id,
-    });
+    logWarn(
+      "rtc-host",
+      safeDiagnosticMessage`bad fingerprint_proof (open failed)`,
+      {
+        channelId: frame.channel_id,
+      },
+    );
     // The sealed proof cannot reveal which key was used. Its failure does tell
     // the offerer to refresh a possibly stale cloud identity pin, so fail fast.
     sendNack(frame.channel_id, "proof_open_failed");
@@ -301,7 +305,7 @@ export const handleRtcOffer = async (frame: {
   }
   const inner = decodeOfferInner(opened);
   if (inner === null) {
-    logWarn("rtc-host", "bad fingerprint_proof (shape)", {
+    logWarn("rtc-host", safeDiagnosticMessage`bad fingerprint_proof (shape)`, {
       channelId: frame.channel_id,
     });
     return;
@@ -310,7 +314,7 @@ export const handleRtcOffer = async (frame: {
   // Bind the sealed browser fingerprint to EVERY effective offer SDP
   // fingerprint. Reject an absent or conflicting set before setting it remote.
   if (!sdpFingerprintsMatch(frame.sdp, inner.fb)) {
-    logWarn("rtc-host", "offer fingerprint mismatch", {
+    logWarn("rtc-host", safeDiagnosticMessage`offer fingerprint mismatch`, {
       channelId: frame.channel_id,
     });
     return;
@@ -318,14 +322,18 @@ export const handleRtcOffer = async (frame: {
   // `rtc1` withdrawn (see `mux-host.ts`): an authenticated stale offer gets a
   // nack so its peer caches the durable posture without exposing it to probes.
   if (process.env.OPENLLM_RTC_DISABLE === "1") {
-    logWarn("rtc-host", "rtc_offer refused: rtc disabled", {
-      channelId: frame.channel_id,
-    });
+    logWarn(
+      "rtc-host",
+      safeDiagnosticMessage`rtc_offer refused: rtc disabled`,
+      {
+        channelId: frame.channel_id,
+      },
+    );
     sendNack(frame.channel_id, "disabled");
     return;
   }
   if (sessions.size >= MAX_CONCURRENT_RTC) {
-    logWarn("rtc-host", "rtc session cap reached", {
+    logWarn("rtc-host", safeDiagnosticMessage`rtc session cap reached`, {
       channelId: frame.channel_id,
       cap: MAX_CONCURRENT_RTC,
     });
@@ -348,7 +356,7 @@ export const handleRtcOffer = async (frame: {
       },
     );
     if (gate.mode === "reject") {
-      logWarn("rtc-host", "seedgate rejected", {
+      logWarn("rtc-host", safeDiagnosticMessage`seedgate rejected`, {
         channelId: frame.channel_id,
         reason: gate.reason,
       });
@@ -366,7 +374,7 @@ export const handleRtcOffer = async (frame: {
     MAX_PAYLOAD_BYTES,
   );
   if (maxPayloadBytes === null) {
-    logWarn("rtc-host", "sctp max-message-size unusable", {
+    logWarn("rtc-host", safeDiagnosticMessage`sctp max-message-size unusable`, {
       channelId: frame.channel_id,
       sdpMax: offerSdpMax,
     });
@@ -380,9 +388,13 @@ export const handleRtcOffer = async (frame: {
   try {
     pc = new RTCPeerConnection({ iceServers: [...iceServers()] });
   } catch (err) {
-    logWarn("rtc-host", "RTCPeerConnection construct failed", {
-      err: err instanceof Error ? err.message : String(err),
-    });
+    logWarn(
+      "rtc-host",
+      safeDiagnosticMessage`RTCPeerConnection construct failed`,
+      {
+        err: err instanceof Error ? err.message : String(err),
+      },
+    );
     sendNack(frame.channel_id, "not_capable");
     return;
   }
@@ -461,7 +473,7 @@ export const handleRtcOffer = async (frame: {
         }),
       );
     } catch (err) {
-      logWarn("rtc-host", "seal answer failed", {
+      logWarn("rtc-host", safeDiagnosticMessage`seal answer failed`, {
         err: err instanceof Error ? err.message : String(err),
       });
       failUnmountedHandshake(session, "seal_failed");
@@ -478,7 +490,7 @@ export const handleRtcOffer = async (frame: {
       fingerprint_proof: fingerprintProof,
     });
   } catch (err) {
-    logWarn("rtc-host", "offer handling failed", {
+    logWarn("rtc-host", safeDiagnosticMessage`offer handling failed`, {
       channelId: frame.channel_id,
       err: err instanceof Error ? err.message : String(err),
     });

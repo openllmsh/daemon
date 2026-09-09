@@ -1,3 +1,4 @@
+import { logWarnAlreadyObserved } from "../logger";
 /**
  * Shared, provider-agnostic login-flow scaffolding for the subscription
  * delegates.
@@ -25,7 +26,6 @@ import {
   noteLoginPromptDelayed,
   noteLoginTerminal,
 } from "../doctor-report/hooks";
-import { logWarn } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -857,7 +857,7 @@ export const spawnStreamLogin = async <T>(
       ceilingMs > warnMs
         ? setTimeout(() => {
             if (!settled) {
-              logWarn(
+              logWarnAlreadyObserved(
                 "login-flow",
                 "vendor login has not printed an authorize prompt yet; waiting until the login ceiling",
                 { provider: opts.provider },

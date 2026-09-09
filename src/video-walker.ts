@@ -16,7 +16,7 @@ import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 import type { TWalkArgs } from "./walker";
 import {
   coolHopAfterStaleRefresh,
@@ -491,10 +491,14 @@ export const runVideoContent = async (
       args.originParam,
     );
   })().catch((err) => {
-    logWarn("video-walker", "Failed to persist generated video", {
-      error: err instanceof Error ? err.message : String(err),
-      videoId,
-    });
+    logWarn(
+      "video-walker",
+      safeDiagnosticMessage`Failed to persist generated video`,
+      {
+        error: err instanceof Error ? err.message : String(err),
+        videoId,
+      },
+    );
   });
 
   const durable = args.originParam

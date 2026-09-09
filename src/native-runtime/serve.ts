@@ -34,7 +34,7 @@ import {
 import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
-import { logDebug, logWarn } from "../logger";
+import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
 import { runClaudeNative } from "./claude-native";
 import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
@@ -159,7 +159,7 @@ const recordResumeOutcome = (
   if (outcome === "resumeMiss") {
     logWarn(
       "native-runtime",
-      "resume MISS — prior history did not correlate; re-seeding a fresh session with the rendered transcript",
+      safeDiagnosticMessage`resume MISS — prior history did not correlate; re-seeding a fresh session with the rendered transcript`,
       { ...meta, seedChars },
     );
     return;

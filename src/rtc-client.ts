@@ -35,7 +35,7 @@ import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
 import type { TEphKeypair } from "./keypair";
 import { generateEphKeypair, openSealedWith, sealTo } from "./keypair";
-import { logDebug, logWarn } from "./logger";
+import { logDebug, logWarn, safeDiagnosticMessage } from "./logger";
 
 const RTC_SIGNALING_TIMEOUT_MS = 10_000;
 const RTC_ICE_TIMEOUT_MS = 20_000;
@@ -243,7 +243,7 @@ export const ensureRtcTo = (
     return;
   }
   void beginConnect(keyId, options.pubkey).catch((error: unknown) => {
-    logWarn("rtc-client", "beginConnect rejected", {
+    logWarn("rtc-client", safeDiagnosticMessage`beginConnect rejected`, {
       keyId,
       err: error instanceof Error ? error.message : String(error),
     });
@@ -388,7 +388,7 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
     session.offerSent = true;
     flushPendingIce(session);
   } catch (error) {
-    logWarn("rtc-client", "offer setup failed", {
+    logWarn("rtc-client", safeDiagnosticMessage`offer setup failed`, {
       keyId,
       err: error instanceof Error ? error.message : String(error),
     });
@@ -473,7 +473,7 @@ export const handleRtcNack = (frame: {
   const session = sessionsByChannel.get(frame.channel_id);
   if (session === undefined || session.closed) return;
   const keyId = session.keyId;
-  logWarn("rtc-client", "rtc offer nacked", {
+  logWarn("rtc-client", safeDiagnosticMessage`rtc offer nacked`, {
     keyId,
     channelId: frame.channel_id,
     reason,

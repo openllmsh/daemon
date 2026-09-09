@@ -37,7 +37,7 @@ import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir, cliHome } from "../cli-paths";
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
-import { logWarn } from "../logger";
+import { logWarn, safeDiagnosticMessage } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -327,11 +327,15 @@ const readToken = async (
   if (!oauth.refreshToken) credentialUnrefreshable(PROVIDER);
   const outcome = oauth.refreshToken ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
-    logWarn("refresh", "returning stale expired credential", {
-      provider: PROVIDER,
-      phase: "refresh_fallback",
-      error_class: outcome.reason,
-    });
+    logWarn(
+      "refresh",
+      safeDiagnosticMessage`returning stale expired credential`,
+      {
+        provider: PROVIDER,
+        phase: "refresh_fallback",
+        error_class: outcome.reason,
+      },
+    );
     return {
       accessToken: oauth.accessToken,
       expiresAtMs,
@@ -873,7 +877,7 @@ const device = makePasteBackDevice({
     if ((await credentialRefreshable()) === false) {
       logWarn(
         "claude-code",
-        "headless login landed a credential with NO refresh token — it cannot auto-refresh (re-login will be needed at access-token expiry)",
+        safeDiagnosticMessage`headless login landed a credential with NO refresh token — it cannot auto-refresh (re-login will be needed at access-token expiry)`,
       );
     }
     refreshConfig();

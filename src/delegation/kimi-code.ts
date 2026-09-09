@@ -39,7 +39,7 @@ import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
-import { logWarn } from "../logger";
+import { logWarn, safeDiagnosticMessage } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -333,11 +333,15 @@ const readToken = async (): Promise<{
   if (!refreshable) credentialUnrefreshable(PROVIDER);
   const outcome = refreshable ? await refresh(expiresAtMs) : "fresh";
   if (isStaleRefresh(outcome)) {
-    logWarn("refresh", "returning stale expired credential", {
-      provider: PROVIDER,
-      phase: "refresh_fallback",
-      error_class: outcome.reason,
-    });
+    logWarn(
+      "refresh",
+      safeDiagnosticMessage`returning stale expired credential`,
+      {
+        provider: PROVIDER,
+        phase: "refresh_fallback",
+        error_class: outcome.reason,
+      },
+    );
     return { accessToken: tok.access_token, staleRefresh: outcome.reason };
   }
   if (outcome !== "awaited") {

@@ -14,7 +14,7 @@
  * or loaded from the env file by `loadEnvFile`) decides; absent it, OFF.
  */
 import { loadEnvFile, writeEnvFileVars } from "./env";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 
 /** The env-file key the preference lives under. */
 const PTY_SESSIONS_KEY = "OPENLLM_DAEMON_PTY_SESSIONS";
@@ -48,7 +48,7 @@ export const setPtySessions = (enabled: boolean): boolean => {
   if (!written) {
     logWarn(
       "session",
-      "failed to persist remote PTY session preference to the env file",
+      safeDiagnosticMessage`failed to persist remote PTY session preference to the env file`,
     );
   }
   process.env[PTY_SESSIONS_KEY] = value;

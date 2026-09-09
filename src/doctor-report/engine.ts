@@ -195,8 +195,7 @@ const readPending = (): TPending | null => {
   if (raw === null) return null;
   try {
     const parsed = JSON.parse(raw) as TPending;
-    parseDoctorReport(parsed.report);
-    return parsed;
+    return { ...parsed, report: parseDoctorReport(parsed.report) };
   } catch {
     return null;
   }

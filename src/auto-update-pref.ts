@@ -15,7 +15,7 @@
  * or loaded from the env file by `loadEnvFile`) decides; absent it, ON.
  */
 import { loadEnvFile, writeEnvFileVars } from "./env";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 
 /** The env-file key the preference lives under. */
 const AUTO_UPDATE_KEY = "OPENLLM_DAEMON_AUTO_UPDATE";
@@ -45,7 +45,10 @@ export const autoUpdateEnabled = (): boolean => {
 export const setAutoUpdate = (enabled: boolean): void => {
   const value = enabled ? "1" : "0";
   if (!writeEnvFileVars({ [AUTO_UPDATE_KEY]: value })) {
-    logWarn("auto-update", "failed to persist preference to the env file");
+    logWarn(
+      "auto-update",
+      safeDiagnosticMessage`failed to persist preference to the env file`,
+    );
   }
   process.env[AUTO_UPDATE_KEY] = value;
 };

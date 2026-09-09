@@ -41,7 +41,7 @@ import {
 } from "@openllmsh/wire/providers/anthropic/streaming";
 import { Schema } from "effect";
 import { spawnCwd } from "../delegation/util";
-import { logError } from "../logger";
+import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TNativeRunResult } from "./types";
@@ -397,14 +397,22 @@ export const runClaudeNative = async (
       first === "timeout"
         ? "claude runtime produced no output before the pre-commit deadline"
         : `claude runtime exited before producing output${stderr.length > 0 ? `: ${stderr.slice(0, 300)}` : ""}`;
-    logError("native-runtime", "claude hop declined pre-commit", { reason });
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`claude hop declined pre-commit`,
+      { reason },
+    );
     return { kind: "declined", reason };
   }
   if (first.kind === "error") {
     kill();
-    logError("native-runtime", "claude hop declined pre-commit", {
-      reason: first.reason,
-    });
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`claude hop declined pre-commit`,
+      {
+        reason: first.reason,
+      },
+    );
     return { kind: "declined", reason: first.reason };
   }
   const firstMeaningful = first.chunk;
@@ -421,9 +429,13 @@ export const runClaudeNative = async (
         // Post-commit failure can't re-route (commit-on-first-byte): end the
         // stream; the accumulated usage/finish state is whatever arrived.
         if (typeof next === "object" && "error" in next) {
-          logError("native-runtime", "claude stream failed post-commit", {
-            reason: next.error,
-          });
+          logError(
+            "native-runtime",
+            safeDiagnosticMessage`claude stream failed post-commit`,
+            {
+              reason: next.error,
+            },
+          );
         }
         controller.close();
         kill();

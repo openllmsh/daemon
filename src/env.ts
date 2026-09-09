@@ -74,7 +74,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
 // both sides only dereference the other's exports lazily inside functions.
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 
 export type TDaemonEnv = {
   /** The user's `sk-llm-...` key, or null until the dashboard sets it. */
@@ -623,7 +623,10 @@ export const setCloudOrigin = (origin: string): void => {
   // non-fatal — the in-memory update below still applies for this process; only
   // restart durability is lost.
   if (!writeEnvFileVars({ OPENLLM_CLOUD_ORIGIN: trimmed })) {
-    logWarn("env", "failed to persist OPENLLM_CLOUD_ORIGIN to the env file");
+    logWarn(
+      "env",
+      safeDiagnosticMessage`failed to persist OPENLLM_CLOUD_ORIGIN to the env file`,
+    );
   }
   process.env.OPENLLM_CLOUD_ORIGIN = trimmed;
   const current = daemonEnv();

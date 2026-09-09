@@ -32,7 +32,7 @@ import { autoUpdateEnabled } from "./auto-update-pref";
 import { drainDisposableChildren } from "./child-supervisor";
 import { daemonEnv } from "./env";
 import { hardenMacBinary } from "./harden-binary";
-import { logError, logInfo, logWarn } from "./logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
 import { recentlyAttempted, recordAttempt } from "./state-file";
 import { DAEMON_VERSION } from "./version";
 
@@ -210,12 +210,16 @@ export const maybeSelfUpdate = async (
     ]);
     const actual = createHash("sha256").update(bin).digest("hex");
     if (actual !== expected) {
-      logError("self-update", "checksum mismatch — refusing update", {
-        target,
-        latest,
-        expected,
-        actual,
-      });
+      logError(
+        "self-update",
+        safeDiagnosticMessage`checksum mismatch — refusing update`,
+        {
+          target,
+          latest,
+          expected,
+          actual,
+        },
+      );
       updating = false;
       return;
     }
