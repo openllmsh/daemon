@@ -184,21 +184,44 @@ export const noteCliInstallProbeResult = (opts: {
   });
 };
 
+/** POSIX network errnos refresh logging extracts. Doctor scan is a superset. */
+export const REFRESH_NETWORK_ERRNOS = [
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "ECONNRESET",
+] as const;
+
+const BUN_CONNECT_CODES = ["CONNECTIONREFUSED", "FAILEDTOOPENSOCKET"] as const;
+const DOCTOR_TIMEOUT_ERRNOS = ["UND_ERR_CONNECT_TIMEOUT", "ABORT_ERR"] as const;
+
+const tokenBoundaryRe = (tokens: readonly string[]): RegExp =>
+  new RegExp(`\\b(${tokens.join("|")})\\b`, "i");
+
+const REFRESH_NETWORK_ERRNO_RE = tokenBoundaryRe(REFRESH_NETWORK_ERRNOS);
+const ALLOWLISTED_ERRNO_RE = tokenBoundaryRe([
+  ...REFRESH_NETWORK_ERRNOS,
+  ...DOCTOR_TIMEOUT_ERRNOS,
+  ...BUN_CONNECT_CODES,
+]);
+
+export const matchRefreshNetworkErrno = (text: string): string | null => {
+  const matched = text.match(REFRESH_NETWORK_ERRNO_RE)?.[1];
+  return matched !== undefined ? matched.toUpperCase() : null;
+};
+
 const DNS_ERRNOS = new Set(["ENOTFOUND", "EAI_AGAIN"]);
 const CONNECT_ERRNOS = new Set([
   "ECONNREFUSED",
   "ECONNRESET",
   "EHOSTUNREACH",
   "ENETUNREACH",
+  ...BUN_CONNECT_CODES,
 ]);
-const TIMEOUT_ERRNOS = new Set([
-  "ETIMEDOUT",
-  "UND_ERR_CONNECT_TIMEOUT",
-  "ABORT_ERR",
-]);
-/** Same closed errno list refresh logging already extracts. */
-const ALLOWLISTED_ERRNO_RE =
-  /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|UND_ERR_CONNECT_TIMEOUT|ABORT_ERR)\b/i;
+const TIMEOUT_ERRNOS = new Set(["ETIMEDOUT", ...DOCTOR_TIMEOUT_ERRNOS]);
 const TIMEOUT_TOKEN_RE = /\bTIMEOUT\b/;
 const TIMED_OUT_RE = /\btimed out\b/i;
 
@@ -216,12 +239,14 @@ const evidenceStrings = (err: unknown): string[] => {
     const rec = current as {
       code?: unknown;
       errno?: unknown;
+      name?: unknown;
       message?: unknown;
       error?: unknown;
       cause?: unknown;
     };
     if (typeof rec.code === "string") out.push(rec.code);
     if (typeof rec.errno === "string") out.push(rec.errno);
+    if (typeof rec.name === "string") out.push(rec.name);
     if (typeof rec.message === "string") out.push(rec.message);
     current = rec.cause ?? rec.error;
   }

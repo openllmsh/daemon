@@ -15,7 +15,10 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
-import { noteRefreshFailure } from "../doctor-report/hooks";
+import {
+  matchRefreshNetworkErrno,
+  noteRefreshFailure,
+} from "../doctor-report/hooks";
 import { logDebug, logInfo, logWarn } from "../logger";
 import type { TRefreshCaller } from "../op-context";
 import {
@@ -183,12 +186,7 @@ export class RefreshTriggerError extends Error {
       "output" in result && typeof result.output === "string"
         ? result.output
         : "";
-    this.errno =
-      output
-        .match(
-          /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET)\b/i,
-        )?.[1]
-        ?.toUpperCase() ?? null;
+    this.errno = matchRefreshNetworkErrno(output);
   }
 }
 
@@ -562,13 +560,8 @@ export const authReasonCodeForRefreshError = (
     ? "refresh_abandoned"
     : "refresh_failed";
 
-const networkErrnoPattern =
-  /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET)\b/i;
-
-const networkErrno = (err: unknown): string | null => {
-  const match = errorText(err).match(networkErrnoPattern);
-  return match?.[1]?.toUpperCase() ?? null;
-};
+const networkErrno = (err: unknown): string | null =>
+  matchRefreshNetworkErrno(errorText(err));
 
 /**
  * Build a per-provider refresher around its `trigger` (the CLI-refresh spawn).

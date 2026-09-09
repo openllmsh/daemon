@@ -306,8 +306,9 @@ const inScopePending = (): TPending | null => {
 
 const hasEligibleUnconsumedWork = (): boolean => {
   if (!uploadAllowed()) return false;
-  if (inScopePending() !== null) return true;
   const scope = reportingScope();
+  const pending = readPending();
+  if (pending !== null && pendingMatchesScope(pending, scope)) return true;
   const cursor = readCursor();
   if (cursor === null || !cursorMatchesScope(cursor, scope)) return false;
   return collectWindow(cursor).events.length > 0;
