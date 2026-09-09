@@ -730,6 +730,14 @@ export const makeRefresher = (opts: {
               tick_id: currentTickId(),
               caller,
             });
+            noteRefreshFailure({
+              provider: opts.slug,
+              errorClass: "network",
+              spawnElapsedMs: clocks.spawn_elapsed_ms,
+              timeoutMs: timeout_ms,
+              exitCode: triggerError?.exitCode,
+              errno: triggerError?.errno ?? networkErrno(err),
+            });
             return;
           }
           logWarn("refresh", "native refresh trigger failed", {

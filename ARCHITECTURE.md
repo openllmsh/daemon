@@ -258,6 +258,25 @@ and transition revisions fence stale upload completions. Suspension and recovery
 purge pending reports and move the cursor to the current tail, so disabled-period
 history is not replayed; ordinary same-generation refreshes retain pending retries.
 Historical local opt-outs and malformed existing preference files remain disabled.
+Delivery uses one active timer: observation debounce (`DOCTOR_REPORT_DEBOUNCE_MS`)
+or upload backoff (bounded by `DOCTOR_REPORT_MAX_BACKOFF_MS`), never both.
+`scheduleRetry` replaces debounce; `scheduleDoctorFlush` and observation are
+no-ops while backoff is armed. Eligible same-scope journal backlog (not only a
+pending spool file) is armed on bootstrap, after an in-flight completion, and
+after a thrown upload via backoff. Local `reportingStatus` exposes optional
+`upload_eligible` / `upload_blocker` (closed literals: missing key, development
+environment, inactive/expired policy, local opt-out, cloud suspended/revoked),
+in-scope `pending_report_upload`, and process-local last attempt time/outcome —
+older daemons omit those fields (unknown, not false). Last attempt is in-memory
+and cleared on identity/window discard; status never includes raw HTTP bodies,
+exception text, keys, URLs, or paths.
+Warning coverage (no extra probes): unclean control-channel closes, socket
+DNS/connect/timeouts, and missed relay heartbeats coalesce into
+`control_channel_unexpected_disconnect` (heartbeat silence is not provider
+`liveness_degraded`); login first-prompt wait emits nonterminal
+`login_prompt_delayed` without changing auth timing; native refresh records
+the existing network-failure branch before its early return using only
+available errno evidence.
 
 **Validated live** (`RUN_DAEMON_LIVE=1`, `tests/server/daemon-walker-live
 .e2e.test.ts`) against the real authenticated CLIs, through the full

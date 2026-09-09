@@ -11,6 +11,8 @@ import type {
   TDoctorReportAck,
   TDoctorReportEvent,
   TDoctorReportingStatus,
+  TDoctorUploadAttemptOutcome,
+  TDoctorUploadBlocker,
 } from "@openllmsh/protocol";
 import {
   DAEMON_DOCTOR_REPORTS_PATH,
@@ -101,6 +103,11 @@ let clearTimer: (t: ReturnType<typeof setTimeout>) => void = clearTimeout;
 let uploadImpl: ((report: TDoctorReport) => Promise<TUploadResult>) | null =
   null;
 let notifyObservation: ((event: TDoctorReportEvent) => void) | null = null;
+let lastAttemptAtMs: number | null = null;
+let lastAttemptOutcome: TDoctorUploadAttemptOutcome | null = null;
+let lastAttemptOriginScope: string | null = null;
+let lastAttemptAccountScope: string | null = null;
+let lastAttemptGeneration: string | null = null;
 
 const cursorPath = (): string => doctorStatePath("doctor-report.cursor.json");
 const pendingPath = (): string => doctorStatePath("doctor-report.pending.json");
@@ -252,14 +259,81 @@ const cursorMatchesScope = (
   cursor.account_scope === scope.accountScope &&
   cursor.generation === scope.generation;
 
-const uploadAllowed = (): boolean => {
-  if (process.env.NODE_ENV === "development") return false;
+type TUploadEligibility =
+  | { readonly allowed: true }
+  | { readonly allowed: false; readonly blocker: TDoctorUploadBlocker };
+
+const resolveUploadEligibility = (): TUploadEligibility => {
+  if (process.env.NODE_ENV === "development") {
+    return { allowed: false, blocker: "development_environment" };
+  }
+  if (!hasApiKey()) return { allowed: false, blocker: "missing_key" };
   const scope = reportingScope();
-  if (!hasApiKey()) return false;
-  if (!reportingPolicyAllowsUpload(scope.policy, clock())) return false;
-  if (localDisableSticky()) return false;
-  if (cloudSuspended || revokedAtPolicyRevision !== null) return false;
-  return true;
+  if (scope.policy === null || scope.policy.enabled === false) {
+    return { allowed: false, blocker: "inactive_policy" };
+  }
+  if (!reportingPolicyAllowsUpload(scope.policy, clock())) {
+    return { allowed: false, blocker: "expired_policy" };
+  }
+  if (localDisableSticky()) return { allowed: false, blocker: "local_opt_out" };
+  if (revokedAtPolicyRevision !== null) {
+    return { allowed: false, blocker: "cloud_revoked" };
+  }
+  if (cloudSuspended) return { allowed: false, blocker: "cloud_suspended" };
+  return { allowed: true };
+};
+
+const uploadAllowed = (): boolean => resolveUploadEligibility().allowed;
+
+const pendingMatchesScope = (
+  pending: TPending,
+  scope: {
+    originScope: string;
+    accountScope: string;
+    generation: string | null;
+  },
+): boolean =>
+  pending.origin_scope === scope.originScope &&
+  pending.account_scope === scope.accountScope &&
+  pending.generation === scope.generation;
+
+const inScopePending = (): TPending | null => {
+  const scope = reportingScope();
+  const pending = readPending();
+  if (pending === null || !pendingMatchesScope(pending, scope)) return null;
+  return pending;
+};
+
+const hasEligibleUnconsumedWork = (): boolean => {
+  if (!uploadAllowed()) return false;
+  if (inScopePending() !== null) return true;
+  const scope = reportingScope();
+  const cursor = readCursor();
+  if (cursor === null || !cursorMatchesScope(cursor, scope)) return false;
+  return collectWindow(cursor).events.length > 0;
+};
+
+const scheduleEligibleWorkIfNeeded = (): void => {
+  if (debounceTimer !== null || backoffTimer !== null) return;
+  if (!hasEligibleUnconsumedWork()) return;
+  scheduleDoctorFlush();
+};
+
+const rememberAttempt = (outcome: TDoctorUploadAttemptOutcome): void => {
+  const scope = reportingScope();
+  lastAttemptAtMs = clock();
+  lastAttemptOutcome = outcome;
+  lastAttemptOriginScope = scope.originScope;
+  lastAttemptAccountScope = scope.accountScope;
+  lastAttemptGeneration = scope.generation;
+};
+
+const clearAttemptMemory = (): void => {
+  lastAttemptAtMs = null;
+  lastAttemptOutcome = null;
+  lastAttemptOriginScope = null;
+  lastAttemptAccountScope = null;
+  lastAttemptGeneration = null;
 };
 
 const readSlice = (
@@ -615,6 +689,7 @@ const flushLocked = async (
   });
 
   if (inFlight) {
+    scheduleEligibleWorkIfNeeded();
     return {
       nothing_new: false,
       dry_run: false,
@@ -643,6 +718,7 @@ const flushLocked = async (
       return emptyResult({ dry_run: false, report_id: report.report_id });
     }
     if (result.kind === "ack" && !ackMatchesBatch(report, result.ack)) {
+      rememberAttempt("retry");
       scheduleRetry(backoffMs);
       return {
         nothing_new: false,
@@ -657,6 +733,7 @@ const flushLocked = async (
       };
     }
     if (result.kind === "ack") {
+      rememberAttempt("uploaded");
       writeCursor({
         ...cursorAfter,
         last_ack_report_id: result.ack.report_id,
@@ -681,6 +758,7 @@ const flushLocked = async (
     ) {
       revokedAtPolicyRevision = getReportingPolicyRevision();
       discardReportingWindow();
+      rememberAttempt("stopped");
       return emptyResult({
         dry_run: false,
         report_id: report.report_id,
@@ -689,6 +767,7 @@ const flushLocked = async (
       });
     }
     if (result.kind === "reject") {
+      rememberAttempt("rejected");
       purgePendingReports();
       writeCursor(cursorAfter);
       return emptyResult({
@@ -705,6 +784,7 @@ const flushLocked = async (
       result.retryAfterMs ?? backoffMs,
       DOCTOR_REPORT_MAX_BACKOFF_MS,
     );
+    rememberAttempt("retry");
     backoffMs = Math.min(backoffMs * 2, DOCTOR_REPORT_MAX_BACKOFF_MS);
     scheduleRetry(wait);
     return {
@@ -718,8 +798,21 @@ const flushLocked = async (
       daemon_versions: versionsOf(report.events),
       pending: pendingWritten,
     };
+  } catch (error) {
+    const sameWindow =
+      uploadRevision === transitionRevision &&
+      cursorMatchesScope(cursorAfter, reportingScope());
+    if (sameWindow) {
+      rememberAttempt("error");
+      if (uploadAllowed()) {
+        scheduleRetry(backoffMs);
+        backoffMs = Math.min(backoffMs * 2, DOCTOR_REPORT_MAX_BACKOFF_MS);
+      }
+    }
+    throw error;
   } finally {
     if (activeUploadId === uploadId) inFlight = false;
+    scheduleEligibleWorkIfNeeded();
   }
 };
 
@@ -737,6 +830,10 @@ export const flushDoctorReport = (
 ): Promise<TDoctorLocalReportResult> => withLock(() => flushLocked(opts));
 
 const scheduleRetry = (delayMs: number): void => {
+  if (debounceTimer !== null) {
+    clearTimer(debounceTimer);
+    debounceTimer = null;
+  }
   if (backoffTimer !== null) return;
   backoffTimer = scheduleTimer(() => {
     backoffTimer = null;
@@ -748,6 +845,7 @@ const scheduleRetry = (delayMs: number): void => {
 
 export const scheduleDoctorFlush = (): void => {
   if (!uploadAllowed()) return;
+  if (backoffTimer !== null) return;
   if (debounceTimer !== null) return;
   debounceTimer = scheduleTimer(() => {
     debounceTimer = null;
@@ -784,15 +882,34 @@ export const reportingStatus = (): TDoctorReportingStatus => {
   const pref = readLocalPreference();
   const cursor = readCursor();
   const policyOn = reportingPolicyAllowsUpload(scope.policy, clock());
+  const eligibility = resolveUploadEligibility();
+  const cursorInScope =
+    cursor !== null && cursorMatchesScope(cursor, scope) ? cursor : null;
+  const attemptInScope =
+    lastAttemptOutcome !== null &&
+    lastAttemptOriginScope === scope.originScope &&
+    lastAttemptAccountScope === scope.accountScope &&
+    lastAttemptGeneration === scope.generation;
   return {
     local_enabled: !localDisableSticky(),
     account_enabled:
       policyOn && !cloudSuspended && revokedAtPolicyRevision === null,
     pending_account_sync: pref?.pending_account_sync === true,
-    ...(cursor?.last_ack_report_id !== undefined
-      ? { last_acknowledged_report_id: cursor.last_ack_report_id }
+    ...(cursorInScope?.last_ack_report_id !== undefined
+      ? { last_acknowledged_report_id: cursorInScope.last_ack_report_id }
       : {}),
     daemon_version: DAEMON_VERSION,
+    upload_eligible: eligibility.allowed,
+    ...(eligibility.allowed ? {} : { upload_blocker: eligibility.blocker }),
+    pending_report_upload: inScopePending() !== null,
+    ...(attemptInScope &&
+    lastAttemptAtMs !== null &&
+    lastAttemptOutcome !== null
+      ? {
+          last_attempt_at_ms: lastAttemptAtMs,
+          last_attempt_outcome: lastAttemptOutcome,
+        }
+      : {}),
   };
 };
 
@@ -805,6 +922,7 @@ const discardReportingWindow = (): void => {
   backoffTimer = null;
   backoffMs = 1_000;
   writeCursor(tailCursorForScope(reportingScope()));
+  clearAttemptMemory();
 };
 
 export const applyLocalPreferenceAndMaybePurge = (_enabled: boolean): void => {
@@ -835,9 +953,7 @@ export const onBootstrapReportingPolicy = (
     discardReportingWindow();
     return;
   }
-  if (readPending() !== null && uploadAllowed()) {
-    scheduleDoctorFlush();
-  }
+  if (hasEligibleUnconsumedWork()) scheduleDoctorFlush();
 };
 
 export const resetDoctorEngineForTests = (): void => {
@@ -857,4 +973,5 @@ export const resetDoctorEngineForTests = (): void => {
   uploadImpl = null;
   notifyObservation = null;
   clock = (): number => Date.now();
+  clearAttemptMemory();
 };

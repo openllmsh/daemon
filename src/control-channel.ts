@@ -43,7 +43,9 @@ import {
 } from "./device-limit-backoff";
 import {
   noteControlChannelClose,
+  noteControlChannelHeartbeatMiss,
   noteControlChannelProtocolFailure,
+  noteControlChannelSocketError,
 } from "./doctor-report/hooks";
 import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
@@ -274,11 +276,7 @@ let migrationEnabled = false;
 const heartbeat = createHeartbeat({
   sendPing: () => send({ type: "ping" }),
   onSilent: () => {
-    logWarn(
-      "control-channel",
-      `no relay pong after ${MAX_MISSED_PONGS} missed heartbeats; forcing reconnect`,
-    );
-    ws?.reconnect();
+    handleControlChannelHeartbeatSilent();
   },
   onFirstPong: () => armProbesAfterPong(),
   heartbeatMs: HEARTBEAT_MS,
@@ -383,6 +381,36 @@ let hasConnected = false;
  *  fresh (paired with the `reconnected` line). */
 let lastErrorReason = "";
 let lastCloseLine = "";
+
+/** Socket error path used by `socket.onerror`. Logs once per reason; doctor
+ *  observations use closed error classes only — never the free-form reason. */
+export const handleControlChannelSocketError = (
+  ev: {
+    readonly message?: unknown;
+    readonly error?: unknown;
+  } | null,
+): void => {
+  const reason =
+    (typeof ev?.message === "string" && ev.message) ||
+    (ev?.error instanceof Error && ev.error.message) ||
+    "unknown";
+  if (reason !== lastErrorReason) {
+    lastErrorReason = reason;
+    logWarn("control-channel", `socket error: ${reason} (reconnecting)`);
+  }
+  noteControlChannelSocketError(ev);
+};
+
+/** Heartbeat silence is a control-channel timeout, never provider-auth
+ *  `liveness_degraded`. */
+export const handleControlChannelHeartbeatSilent = (): void => {
+  logWarn(
+    "control-channel",
+    `no relay pong after ${MAX_MISSED_PONGS} missed heartbeats; forcing reconnect`,
+  );
+  noteControlChannelHeartbeatMiss();
+  ws?.reconnect();
+};
 
 const sendBytes = (bytes: Uint8Array): void => {
   if (ws === null || ws.readyState !== ws.OPEN || !helloSent) return;
@@ -1151,16 +1179,9 @@ export const startControlChannel = (): void => {
     // off + retries; the matching `reconnected` line lands on recovery. The real
     // reason lives on `.message` (partysocket wraps the thrown error) but native
     // ws error events carry only `.error`, so read both.
-    const e = ev as { message?: unknown; error?: unknown } | null;
-    const reason =
-      (typeof e?.message === "string" && e.message) ||
-      (e?.error instanceof Error && e.error.message) ||
-      "unknown";
-    // Suppress the per-dial repeat of an UNCHANGED reason (sustained outage).
-    if (reason !== lastErrorReason) {
-      lastErrorReason = reason;
-      logWarn("control-channel", `socket error: ${reason} (reconnecting)`);
-    }
+    handleControlChannelSocketError(
+      ev as { message?: unknown; error?: unknown } | null,
+    );
   };
   socket.onclose = (ev): void => {
     stopWatcher();

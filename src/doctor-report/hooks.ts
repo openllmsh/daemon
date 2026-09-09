@@ -26,6 +26,10 @@ const PROTOCOL_FAILURE_COOLDOWN_MS = 60_000;
 let lastProtocolFailureAtMs = 0;
 let protocolFailureStreak = 0;
 
+const CHANNEL_TRANSPORT_COOLDOWN_MS = 60_000;
+let lastChannelTransportAtMs = 0;
+let channelTransportStreak = 0;
+
 const noteProtocolFailure = (): void => {
   const now = Date.now();
   protocolFailureStreak += 1;
@@ -49,6 +53,33 @@ const noteProtocolFailure = (): void => {
   });
 };
 
+const noteChannelTransport = (errorClass: TDoctorErrorClass): void => {
+  try {
+    const now = Date.now();
+    channelTransportStreak += 1;
+    if (
+      lastChannelTransportAtMs !== 0 &&
+      now - lastChannelTransportAtMs < CHANNEL_TRANSPORT_COOLDOWN_MS
+    ) {
+      return;
+    }
+    lastChannelTransportAtMs = now;
+    const n = channelTransportStreak;
+    channelTransportStreak = 0;
+    observeDoctorEvent({
+      code: "control_channel_unexpected_disconnect",
+      producer: "control_channel",
+      trigger: "reconnect",
+      outcome: errorClass === "timeout" ? "timeout" : "disconnect",
+      operation: "reconnect",
+      error_class: errorClass,
+      ...(n > 1 ? { timings: { repeat_count: n } } : {}),
+    });
+  } catch {
+    // Diagnostics must not affect the control channel.
+  }
+};
+
 export const noteControlChannelClose = (opts: {
   readonly code: number;
   readonly superseded: boolean;
@@ -59,18 +90,37 @@ export const noteControlChannelClose = (opts: {
     noteProtocolFailure();
     return;
   }
-  observeDoctorEvent({
-    code: "control_channel_unexpected_disconnect",
-    producer: "control_channel",
-    trigger: "reconnect",
-    outcome: "disconnect",
-    operation: "reconnect",
-    error_class: "transport_connect",
-  });
+  noteChannelTransport("transport_connect");
+};
+
+export const noteControlChannelSocketError = (err: unknown): void => {
+  noteChannelTransport(classifyControlTransport(err));
+};
+
+export const noteControlChannelHeartbeatMiss = (): void => {
+  noteChannelTransport("timeout");
 };
 
 export const noteControlChannelProtocolFailure = (): void => {
   noteProtocolFailure();
+};
+
+export const noteLoginPromptDelayed = (opts: {
+  readonly provider: string;
+}): void => {
+  try {
+    const provider = asDoctorProvider(opts.provider);
+    observeDoctorEvent({
+      code: "login_prompt_delayed",
+      producer: "login_flow",
+      trigger: "login",
+      outcome: "delayed",
+      operation: "login",
+      ...(provider !== undefined ? { provider } : {}),
+    });
+  } catch {
+    // Diagnostics must not affect login.
+  }
 };
 
 export const noteLoginTerminal = (opts: {
@@ -105,6 +155,8 @@ export const resetCliInstallDoctorStreakForTests = (): void => {
   cliFailStreak.clear();
   lastProtocolFailureAtMs = 0;
   protocolFailureStreak = 0;
+  lastChannelTransportAtMs = 0;
+  channelTransportStreak = 0;
 };
 
 export const noteCliInstallProbeResult = (opts: {
@@ -132,45 +184,95 @@ export const noteCliInstallProbeResult = (opts: {
   });
 };
 
-const nodeCode = (err: unknown): string => {
-  if (typeof err === "object" && err !== null && "code" in err) {
-    const c = (err as { code?: unknown }).code;
-    if (typeof c === "string") return c;
+const DNS_ERRNOS = new Set(["ENOTFOUND", "EAI_AGAIN"]);
+const CONNECT_ERRNOS = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+]);
+const TIMEOUT_ERRNOS = new Set([
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "ABORT_ERR",
+]);
+/** Same closed errno list refresh logging already extracts. */
+const ALLOWLISTED_ERRNO_RE =
+  /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|UND_ERR_CONNECT_TIMEOUT|ABORT_ERR)\b/i;
+const TIMEOUT_TOKEN_RE = /\bTIMEOUT\b/;
+const TIMED_OUT_RE = /\btimed out\b/i;
+
+const evidenceStrings = (err: unknown): string[] => {
+  const out: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if (typeof current === "string") {
+      out.push(current);
+      break;
+    }
+    if (typeof current !== "object") break;
+    const rec = current as {
+      code?: unknown;
+      errno?: unknown;
+      message?: unknown;
+      error?: unknown;
+      cause?: unknown;
+    };
+    if (typeof rec.code === "string") out.push(rec.code);
+    if (typeof rec.errno === "string") out.push(rec.errno);
+    if (typeof rec.message === "string") out.push(rec.message);
+    current = rec.cause ?? rec.error;
   }
-  const cause =
-    err instanceof Error && "cause" in err
-      ? (err as { cause: unknown }).cause
-      : null;
-  if (typeof cause === "object" && cause !== null && "code" in cause) {
-    const c = (cause as { code?: unknown }).code;
-    if (typeof c === "string") return c;
-  }
-  return "";
+  return out;
 };
 
-export const classifyWalkerTransport = (err: unknown): TDoctorErrorClass => {
-  const code = nodeCode(err).toUpperCase();
-  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "transport_dns";
+const classFromErrno = (token: string): TDoctorErrorClass | undefined => {
+  const code = token.toUpperCase();
+  if (DNS_ERRNOS.has(code)) return "transport_dns";
+  if (CONNECT_ERRNOS.has(code)) return "transport_connect";
+  if (TIMEOUT_ERRNOS.has(code)) return "timeout";
   if (
-    code === "ECONNREFUSED" ||
-    code === "ECONNRESET" ||
-    code === "EHOSTUNREACH" ||
-    code === "ENETUNREACH"
+    !/\s/.test(code) &&
+    (code.includes("CERT") || code === "ERR_TLS_CERT_ALTNAME_INVALID")
   ) {
-    return "transport_connect";
-  }
-  if (code.includes("CERT") || code === "ERR_TLS_CERT_ALTNAME_INVALID") {
     return "transport_tls";
   }
-  if (
-    code === "ABORT_ERR" ||
-    code === "ETIMEDOUT" ||
-    code === "UND_ERR_CONNECT_TIMEOUT"
-  ) {
-    return "timeout";
-  }
-  return "upstream_http";
+  return undefined;
 };
+
+/** Closed errno/token mapping. Never copies free-form messages onto events. */
+export const classifyTransportErrno = (
+  err: unknown,
+): TDoctorErrorClass | undefined => {
+  if (typeof err === "string") {
+    const fromToken = classFromErrno(err);
+    if (fromToken !== undefined) return fromToken;
+  }
+  for (const part of evidenceStrings(err)) {
+    const fromCode = classFromErrno(part);
+    if (fromCode !== undefined) return fromCode;
+    const matched = part.match(ALLOWLISTED_ERRNO_RE)?.[1];
+    if (matched !== undefined) {
+      const fromScan = classFromErrno(matched);
+      if (fromScan !== undefined) return fromScan;
+    }
+    if (TIMEOUT_TOKEN_RE.test(part) || TIMED_OUT_RE.test(part)) {
+      return "timeout";
+    }
+  }
+  return undefined;
+};
+
+export const classifyWalkerTransport = (err: unknown): TDoctorErrorClass =>
+  classifyTransportErrno(err) ?? "upstream_http";
+
+export const classifyControlTransport = (err: unknown): TDoctorErrorClass =>
+  classifyTransportErrno(err) ?? "transport_connect";
+
+export const classifyRefreshNetwork = (err: unknown): TDoctorErrorClass =>
+  classifyTransportErrno(err) ?? "transport_connect";
 
 export const noteWalkerStreamTerminal = (opts: {
   readonly aborted: boolean;
@@ -246,22 +348,26 @@ export const noteRefreshFailure = (opts: {
   readonly spawnElapsedMs: number | null;
   readonly timeoutMs: number;
   readonly exitCode: number | undefined;
+  readonly errno?: string | null;
 }): void => {
   if (opts.errorClass === "abandoned") return;
   const provider = asDoctorProvider(opts.provider);
   try {
+    const errorClass: TDoctorErrorClass =
+      opts.errorClass === "timeout"
+        ? "timeout"
+        : opts.errorClass === "spawn_failed"
+          ? "spawn_denied"
+          : opts.errorClass === "network"
+            ? classifyRefreshNetwork(opts.errno)
+            : "unclassified";
     observeDoctorEvent({
       code: "refresh_failure",
       producer: "refresh",
       trigger: "refresh",
       outcome: opts.errorClass === "timeout" ? "timeout" : "failure",
       operation: "refresh",
-      error_class:
-        opts.errorClass === "timeout"
-          ? "timeout"
-          : opts.errorClass === "spawn_failed"
-            ? "spawn_denied"
-            : "unclassified",
+      error_class: errorClass,
       ...(provider !== undefined ? { provider } : {}),
       timings: {
         ...(opts.spawnElapsedMs !== null

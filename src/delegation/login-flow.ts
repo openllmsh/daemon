@@ -21,7 +21,10 @@
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { emitAuth, requestStatusPush } from "../auth-events";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
-import { noteLoginTerminal } from "../doctor-report/hooks";
+import {
+  noteLoginPromptDelayed,
+  noteLoginTerminal,
+} from "../doctor-report/hooks";
 import { logWarn } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
@@ -859,6 +862,7 @@ export const spawnStreamLogin = async <T>(
                 "vendor login has not printed an authorize prompt yet; waiting until the login ceiling",
                 { provider: opts.provider },
               );
+              noteLoginPromptDelayed({ provider: opts.provider });
             }
           }, warnMs)
         : null;
