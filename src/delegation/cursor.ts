@@ -35,7 +35,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import { accountHashField } from "./account-id";
+import { accountHashField, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
@@ -83,6 +83,11 @@ import {
 } from "./util";
 
 const PROVIDER = "cursor" as const;
+
+/** Cursor subjects can be `issuer|account-id`; every consumer uses the account part. */
+export const cursorAccountId = (token: string): string | null =>
+  nonEmpty(jwtSubject(token)?.split("|").at(-1));
+
 // Usage endpoint LEAF paths — the host comes from `resolveProviderUrl` (the
 // auth-config CAPTURE default / captured origin), so the dashboard host lives
 // in ONE place (`auth-config.ts`) like every other delegate.
@@ -386,7 +391,7 @@ const observationFromAccessRead = (
   return {
     kind: "present",
     value: {
-      accountHint: jwtSubject(read.value)?.split("|").at(-1),
+      accountHint: cursorAccountId(read.value) ?? undefined,
     },
   };
 };
@@ -701,9 +706,9 @@ export const cursorDelegate: TProviderDelegate = {
             ? { kind: "live", value: storedToken.stored }
             : storedToken,
         missingReason: "not signed in to Cursor",
-        accountIdOf: (value) => jwtSubject(value.accessToken),
+        accountIdOf: (value) => cursorAccountId(value.accessToken),
         priorAccountIdWhenExpired: async () =>
-          jwtSubject(
+          cursorAccountId(
             storeReadValue(await readStoredTokens())?.accessToken ?? "",
           ),
         readNative: async () => {
@@ -768,7 +773,7 @@ export const cursorDelegate: TProviderDelegate = {
     if (expiryMs === null || expiryMs <= Date.now()) {
       return { kind: "skipped" };
     }
-    const accountHint = jwtSubject(accessRead.value)?.split("|").at(-1) ?? null;
+    const accountHint = cursorAccountId(accessRead.value);
     const provenance = cursorModelProvenance(accountHint);
     if (provenance === null) return { kind: "skipped" };
     const cached = readCursorNativeModels(provenance);
@@ -785,9 +790,7 @@ export const cursorDelegate: TProviderDelegate = {
         const token = await readToken();
         const expiryMs = token === null ? null : jwtExpiryMs(token.accessToken);
         const accountHint =
-          token === null
-            ? null
-            : (jwtSubject(token.accessToken)?.split("|").at(-1) ?? null);
+          token === null ? null : cursorAccountId(token.accessToken);
         const provenance = cursorModelProvenance(accountHint);
         if (provenance !== null) {
           const cached = readCursorNativeModels(provenance);
