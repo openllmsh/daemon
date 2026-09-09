@@ -51,7 +51,7 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 ```
 daemon/
   index.ts                  re-exports
-  scripts/compile.ts        bun build --compile --minify --bytecode (4 targets)
+  scripts/compile.ts        bun build --compile --minify --bytecode (4 targets; NODE_ENV bake)
   scripts/verify.ts         download each published binary → sha256 → assert == manifest.ts pin (bun run verify)
   scripts/dist.ts           compile + emit a self-contained installer per target (daemon:dist)
   scripts/dist-install.ts   run an emitted installer by target on this host (daemon:dist:install)
@@ -945,8 +945,13 @@ auto-links its isolated run-view to whatever the user-run installer lands.
 `scripts/compile.ts` → `bun build --compile --minify --bytecode
 --target=bun-<os>-<arch>` for darwin-{arm64,x64} + linux-{x64,arm64} (no
 Windows). Compile-time defaults are injected via `--define` GLOBALS
-(`__OPENLLM_CLOUD_ORIGIN_DEFAULT__`, `__OPENLLM_DAEMON_VERSION__`) — NOT
-`process.env.*`, which would clobber the runtime env read. Distribution is
+(`__OPENLLM_CLOUD_ORIGIN_DEFAULT__`, `__OPENLLM_DAEMON_VERSION__`) — those
+are NOT `process.env.*`, so the runtime env read still wins for cloud origin.
+`process.env.NODE_ENV` is the exception: Bun inlines it from the compile
+host unless `--define` bakes it. A release/`daemon:dist` version bakes
+`"production"`; the `0.0.0-dev` sentinel (`compile:host`, `dev:dist`) bakes
+`"development"` so local compiled binaries keep the source `NODE_ENV ===
+"development"` gate. Distribution is
 the `packages/setup/daemon` install target (`includeBundle:false`,
 `requires_key:false` so the installer runs with a plain `curl … | bash` —
 no key piped in): `install.sh` downloads the binary from

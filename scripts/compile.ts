@@ -40,6 +40,45 @@ const OUT_DIR = join(PKG_ROOT, "dist");
 
 const DEFAULT_CLOUD_ORIGIN = "https://www.openllm.sh";
 
+/** Sentinel baked when compile is invoked with no `--version` (`compile:host`,
+ *  `dev:dist`). Release + `daemon:dist` always pass a real version. */
+export const DEV_VERSION_SENTINEL = "0.0.0-dev";
+
+/**
+ * Bun inlines `process.env.NODE_ENV` at compile time from the *compile host*
+ * unless `--define` overrides it. CI/dev hosts are `development`, so a
+ * published binary without this define ships the development gate as true
+ * (doctor-report uploads blocked, localhost CORS open). Release versions
+ * therefore bake `"production"`; the `0.0.0-dev` sentinel keeps
+ * `"development"` so `dev:dist` / `compile:host` retain the documented
+ * local-dev distinction. Runtime `NODE_ENV` cannot override the bake — same
+ * as Bun's default inline. Source runs still read the live env.
+ */
+export const compileNodeEnv = (
+  version: string,
+): "development" | "production" =>
+  version === DEV_VERSION_SENTINEL ? "development" : "production";
+
+/** `--define` tokens shared by `buildOne` and compiled-binary tests. */
+export const compileDefineArgs = (
+  cloudOrigin: string,
+  version: string,
+): readonly string[] => [
+  "--define",
+  `__OPENLLM_CLOUD_ORIGIN_DEFAULT__=${JSON.stringify(cloudOrigin)}`,
+  "--define",
+  `__OPENLLM_DAEMON_VERSION__=${JSON.stringify(version)}`,
+  "--define",
+  `process.env.NODE_ENV=${JSON.stringify(compileNodeEnv(version))}`,
+];
+
+export const COMPILE_BUN_FLAGS = [
+  "--compile",
+  "--minify",
+  "--sourcemap=none",
+  "--bytecode",
+] as const;
+
 /**
  * Validate the cloud origin BEFORE baking it into every shipped binary via
  * `--define`. An unvalidated value (audit §3 / §4b N1) lets a poisoned build
@@ -122,7 +161,9 @@ const versionIdx = argv.indexOf("--version");
 // production behaviour. The vestigial `package.json` version was overwritten at
 // build and only ever disagreed with the pin, so it is no longer read here.
 const version =
-  versionIdx >= 0 ? (argv[versionIdx + 1] ?? "0.0.0-dev") : "0.0.0-dev";
+  versionIdx >= 0
+    ? (argv[versionIdx + 1] ?? DEV_VERSION_SENTINEL)
+    : DEV_VERSION_SENTINEL;
 
 const outfileFor = (target: string): string => {
   const suffix = target.replace(/^bun-/, "");
@@ -135,13 +176,10 @@ const buildOne = async (
 ): Promise<string> => {
   const outfile = target === null ? `${OUT_DIR}/openllmd` : outfileFor(target);
   const targetArgs = target === null ? [] : ["--target", target];
+  const defines = compileDefineArgs(cloudOrigin, version);
   await $`bun build ${ENTRY} \
-    --compile \
-    --minify \
-    --sourcemap=none \
-    --bytecode \
-    --define ${`__OPENLLM_CLOUD_ORIGIN_DEFAULT__=${JSON.stringify(cloudOrigin)}`} \
-    --define ${`__OPENLLM_DAEMON_VERSION__=${JSON.stringify(version)}`} \
+    ${COMPILE_BUN_FLAGS} \
+    ${defines} \
     ${targetArgs} \
     --outfile ${outfile}`;
   // Emit a gzip sidecar for DISTRIBUTION. The embedded Bun runtime is most of
