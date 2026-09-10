@@ -181,7 +181,10 @@ export const makeBlockingConnect = (
             });
             return { connected: false, detail };
           }
-          const crashed = typeof result.code === "number" && result.code !== 0;
+          const crashed =
+            result.abandoned !== true &&
+            typeof result.code === "number" &&
+            result.code !== 0;
           emitLoginFailed(flow, {
             code: crashed ? "cli_crash" : "poll_expired",
             message: detail,
