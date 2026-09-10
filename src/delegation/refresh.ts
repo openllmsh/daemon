@@ -16,7 +16,9 @@
  * hard-expired — exactly "no latency unless the refresh is close".
  */
 
-import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
+import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
+import type { TSafeDiagnosticMessage } from "../doctor-report/message";
+import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import type { TRefreshCaller } from "../op-context";
 import {
   currentRefreshCaller,
@@ -204,6 +206,70 @@ export class RefreshTriggerError extends Error {
     this.errno = matchRefreshNetworkErrno(output);
   }
 }
+
+const SETTLED_FALLBACK = safeDiagnosticMessage`Credential refresh settled.`;
+
+/** Closed-enum doctor text only — no interpolation, no extra provider list. */
+const SETTLED_BY_PROVIDER: Record<
+  TSubscriptionProviderSlug,
+  TSafeDiagnosticMessage
+> = {
+  claude_code: safeDiagnosticMessage`Credential refresh settled for claude_code.`,
+  chatgpt: safeDiagnosticMessage`Credential refresh settled for chatgpt.`,
+  kimi_code: safeDiagnosticMessage`Credential refresh settled for kimi_code.`,
+  grok: safeDiagnosticMessage`Credential refresh settled for grok.`,
+  cursor: safeDiagnosticMessage`Credential refresh settled for cursor.`,
+};
+
+const SETTLED_BY_PROVIDER_CALLER: Record<
+  TSubscriptionProviderSlug,
+  Record<TRefreshCaller, TSafeDiagnosticMessage>
+> = {
+  claude_code: {
+    upstream: safeDiagnosticMessage`Credential refresh settled for claude_code (upstream).`,
+    usage: safeDiagnosticMessage`Credential refresh settled for claude_code (usage).`,
+    models: safeDiagnosticMessage`Credential refresh settled for claude_code (models).`,
+    login: safeDiagnosticMessage`Credential refresh settled for claude_code (login).`,
+  },
+  chatgpt: {
+    upstream: safeDiagnosticMessage`Credential refresh settled for chatgpt (upstream).`,
+    usage: safeDiagnosticMessage`Credential refresh settled for chatgpt (usage).`,
+    models: safeDiagnosticMessage`Credential refresh settled for chatgpt (models).`,
+    login: safeDiagnosticMessage`Credential refresh settled for chatgpt (login).`,
+  },
+  kimi_code: {
+    upstream: safeDiagnosticMessage`Credential refresh settled for kimi_code (upstream).`,
+    usage: safeDiagnosticMessage`Credential refresh settled for kimi_code (usage).`,
+    models: safeDiagnosticMessage`Credential refresh settled for kimi_code (models).`,
+    login: safeDiagnosticMessage`Credential refresh settled for kimi_code (login).`,
+  },
+  grok: {
+    upstream: safeDiagnosticMessage`Credential refresh settled for grok (upstream).`,
+    usage: safeDiagnosticMessage`Credential refresh settled for grok (usage).`,
+    models: safeDiagnosticMessage`Credential refresh settled for grok (models).`,
+    login: safeDiagnosticMessage`Credential refresh settled for grok (login).`,
+  },
+  cursor: {
+    upstream: safeDiagnosticMessage`Credential refresh settled for cursor (upstream).`,
+    usage: safeDiagnosticMessage`Credential refresh settled for cursor (usage).`,
+    models: safeDiagnosticMessage`Credential refresh settled for cursor (models).`,
+    login: safeDiagnosticMessage`Credential refresh settled for cursor (login).`,
+  },
+};
+
+const isSubscriptionProviderSlug = (
+  slug: string,
+): slug is TSubscriptionProviderSlug =>
+  Object.hasOwn(SETTLED_BY_PROVIDER, slug);
+
+const settledDoctorMessage = (
+  slug: string,
+  caller: TRefreshCaller | null,
+): TSafeDiagnosticMessage => {
+  if (!isSubscriptionProviderSlug(slug)) return SETTLED_FALLBACK;
+  if (caller === null) return SETTLED_BY_PROVIDER[slug];
+  return SETTLED_BY_PROVIDER_CALLER[slug][caller];
+};
 
 const refreshClocks = (
   started: number,
@@ -690,15 +756,29 @@ export const makeRefresher = (opts: {
             timeout_ms,
             in_flight: false,
           });
-          logDebug("refresh", "native refresh trigger settled", {
-            provider: opts.slug,
-            label: opts.label,
-            phase: "refresh_trigger",
-            ...clocks,
-            timeout_ms,
-            tick_id: currentTickId(),
-            caller,
-          });
+          logInfo(
+            "refresh",
+            settledDoctorMessage(opts.slug, caller),
+            {
+              provider: opts.slug,
+              phase: "refresh_trigger",
+              caller,
+              elapsed_ms: clocks.elapsed_ms,
+              queued_ms: clocks.queued_ms,
+              spawn_elapsed_ms: clocks.spawn_elapsed_ms,
+              spawned: clocks.spawned,
+              timeout_ms,
+            },
+            {
+              timings: {
+                elapsed_ms: clocks.elapsed_ms,
+                configured_timeout_ms: timeout_ms,
+                ...(clocks.spawn_elapsed_ms !== null
+                  ? { spawn_elapsed_ms: clocks.spawn_elapsed_ms }
+                  : {}),
+              },
+            },
+          );
         })
         .catch((err: unknown) => {
           lastErrorClass = classifyRefreshError(err);
