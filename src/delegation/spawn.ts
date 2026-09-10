@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
+import type { TDoctorEventTimings } from "@openllmsh/protocol";
 import type { TSuperviseSpawnOptions } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
 import type { TCliVersionOpts } from "../cli-version-cache";
@@ -22,6 +23,7 @@ import {
   splitReapBudget,
   timeoutCallbackLatenessMs,
 } from "../deadline-budget";
+import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { logDebug, logError, logWarn, safeDiagnosticMessage } from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
@@ -207,7 +209,32 @@ type TCaptureTimeoutScheduler = (
 let captureTimeoutSchedulerForTests: TCaptureTimeoutScheduler | null = null;
 let loginTimeoutSchedulerForTests: TCaptureTimeoutScheduler | null = null;
 
-export type TNativeAuthProducer = "claude-refresh" | "claude-auth-status";
+export type TNativeAuthProducer =
+  | "claude-refresh"
+  | "claude-auth-status"
+  | "claude-login"
+  | "claude-logout";
+
+const nativeAuthOperationMeta = (
+  operationId: string | undefined,
+): { readonly operation_id: string } | Record<string, never> => {
+  const id = opaqueDoctorCorrelation(operationId);
+  return id !== undefined ? { operation_id: id } : {};
+};
+
+const nativeAuthDoctorObservation = (
+  operationId: string | undefined,
+  timings: TDoctorEventTimings,
+): {
+  readonly timings: TDoctorEventTimings;
+  readonly correlation_id?: string;
+} => {
+  const correlation_id = opaqueDoctorCorrelation(operationId);
+  return {
+    timings,
+    ...(correlation_id !== undefined ? { correlation_id } : {}),
+  };
+};
 
 let nativeAuthOperationSeq = 0;
 
@@ -284,9 +311,7 @@ export const runCaptureResult = async (
     if (opts?.producer !== undefined) {
       logDebug("spawn", "native auth child started", {
         producer: opts.producer,
-        ...(opts.operationId !== undefined
-          ? { operation_id: opts.operationId }
-          : {}),
+        ...nativeAuthOperationMeta(opts.operationId),
         phase: "start",
         child_pid: typeof proc.pid === "number" ? proc.pid : null,
         tick_id: currentTickId(),
@@ -431,7 +456,9 @@ export const runCaptureResult = async (
             ? safeDiagnosticMessage`Authentication status probe exceeded its time budget.`
             : opts?.producer === "claude-refresh"
               ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
-              : safeDiagnosticMessage`Native capture exceeded its time budget.`,
+              : opts?.producer === "claude-logout"
+                ? safeDiagnosticMessage`Logout exceeded its time budget.`
+                : safeDiagnosticMessage`Native capture exceeded its time budget.`,
           {
             configured_timeout_ms: configuredTimeoutMs,
             deadline_ms: remainingAtSpawn,
@@ -460,30 +487,26 @@ export const runCaptureResult = async (
             ...(opts?.producer !== undefined
               ? { producer: opts.producer }
               : {}),
-            ...(opts?.operationId !== undefined
-              ? { operation_id: opts.operationId }
-              : {}),
+            ...nativeAuthOperationMeta(opts?.operationId),
             ...(opts?.producer === undefined
               ? { argv: redactSensitiveArgv(argv) }
               : {}),
           },
-          {
-            timings: {
-              configured_timeout_ms: configuredTimeoutMs,
-              spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-              budget_remaining_ms_at_spawn: remainingAtSpawn,
-              timeout_callback_lateness_ms: Math.max(
-                0,
-                timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
-              ),
-              cleanup_ms: cleanupMs,
-              stdout_closed: stdoutClosedAtRace,
-              root_exited: rootExitedAtRace,
-              ...(typeof rootExitCodeAtRace === "number"
-                ? { root_exit_code: rootExitCodeAtRace }
-                : {}),
-            },
-          },
+          nativeAuthDoctorObservation(opts?.operationId, {
+            configured_timeout_ms: configuredTimeoutMs,
+            spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+            budget_remaining_ms_at_spawn: remainingAtSpawn,
+            timeout_callback_lateness_ms: Math.max(
+              0,
+              timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
+            ),
+            cleanup_ms: cleanupMs,
+            stdout_closed: stdoutClosedAtRace,
+            root_exited: rootExitedAtRace,
+            ...(typeof rootExitCodeAtRace === "number"
+              ? { root_exit_code: rootExitCodeAtRace }
+              : {}),
+          }),
         );
 
         return { kind: "timeout" };
@@ -682,9 +705,7 @@ export const spawnLogin = async (
   if (loginOpts?.producer !== undefined) {
     logDebug("spawn", "native auth child started", {
       producer: loginOpts.producer,
-      ...(loginOpts.operationId !== undefined
-        ? { operation_id: loginOpts.operationId }
-        : {}),
+      ...nativeAuthOperationMeta(loginOpts.operationId),
       phase: "start",
       child_pid: stamp.child_pid,
       tick_id: currentTickId(),
@@ -781,28 +802,24 @@ export const spawnLogin = async (
         ...(loginOpts?.producer !== undefined
           ? { producer: loginOpts.producer }
           : {}),
-        ...(loginOpts?.operationId !== undefined
-          ? { operation_id: loginOpts.operationId }
+        ...nativeAuthOperationMeta(loginOpts?.operationId),
+      },
+      nativeAuthDoctorObservation(loginOpts?.operationId, {
+        configured_timeout_ms: timeoutMs,
+        spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+        budget_remaining_ms_at_spawn: remainingAtSpawn,
+        timeout_callback_lateness_ms: Math.max(
+          0,
+          timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
+        ),
+        cleanup_ms: opts.cleanupMs,
+        stdout_closed: opts.stdoutClosed,
+        stderr_closed: opts.stderrClosed,
+        root_exited: opts.rootExited,
+        ...(typeof opts.rootExitCode === "number"
+          ? { root_exit_code: opts.rootExitCode }
           : {}),
-      },
-      {
-        timings: {
-          configured_timeout_ms: timeoutMs,
-          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-          budget_remaining_ms_at_spawn: remainingAtSpawn,
-          timeout_callback_lateness_ms: Math.max(
-            0,
-            timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
-          ),
-          cleanup_ms: opts.cleanupMs,
-          stdout_closed: opts.stdoutClosed,
-          stderr_closed: opts.stderrClosed,
-          root_exited: opts.rootExited,
-          ...(typeof opts.rootExitCode === "number"
-            ? { root_exit_code: opts.rootExitCode }
-            : {}),
-        },
-      },
+      }),
     );
   };
 
@@ -936,9 +953,7 @@ export const spawnLogin = async (
   if (loginOpts?.producer !== undefined) {
     logDebug("spawn", "native auth child finished", {
       producer: loginOpts.producer,
-      ...(loginOpts.operationId !== undefined
-        ? { operation_id: loginOpts.operationId }
-        : {}),
+      ...nativeAuthOperationMeta(loginOpts.operationId),
       phase: "result",
       reason_code: abandoned ? "abandoned" : "complete",
       abandoned,

@@ -10,15 +10,17 @@ import type {
   TDoctorSeverity,
 } from "@openllmsh/protocol";
 import {
-  DOCTOR_OPAQUE_ID_PATTERN,
   parseDoctorReportEvent,
   projectDoctorTimings,
   sanitizeDoctorScope,
 } from "@openllmsh/protocol";
 import { DAEMON_VERSION } from "../version";
+import { opaqueDoctorCorrelation } from "./correlation";
 import { doctorStateDir, doctorStatePath } from "./files";
 import { diagnosticMessageText } from "./message";
 import { doctorArchitecture, doctorPlatform } from "./platform";
+
+export { opaqueDoctorCorrelation } from "./correlation";
 
 const DIAGNOSTICS_BASENAME = "openllmd.diagnostics.jsonl";
 const MAX_DIAGNOSTICS_BYTES = 5 * 1024 * 1024;
@@ -85,8 +87,7 @@ export const recordDoctorObservation = (
     severity: input.severity,
     scope: sanitizeDoctorScope(input.scope),
     message: diagnosticMessageText(input.message, input.severity),
-    ...(input.correlation_id !== undefined &&
-    DOCTOR_OPAQUE_ID_PATTERN.test(input.correlation_id)
+    ...(opaqueDoctorCorrelation(input.correlation_id) !== undefined
       ? { correlation_id: input.correlation_id }
       : {}),
     ...(input.timings !== undefined

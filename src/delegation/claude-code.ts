@@ -62,6 +62,8 @@ import {
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import type { TLoginVerify } from "./login-flow";
+import { currentLoginCommandCorrelation } from "./login-flow";
+import { createNativeAuthLifecycle } from "./native-auth-lifecycle";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -829,6 +831,7 @@ const connectDirect = makeBlockingConnect({
   provider: PROVIDER,
   installed: isInstalled,
   installHint: INSTALL_HINT,
+  nativeAuth: { producer: "claude-login" },
   beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
   argv: LOGIN_ARGV,
   env,
@@ -1202,6 +1205,12 @@ export const claudeCodeDelegate: TProviderDelegate = {
 
   logout: async () => {
     const budget = createDeadlineBudget(logoutTimeoutMs());
+    const correlation = currentLoginCommandCorrelation();
+    const lifecycle = createNativeAuthLifecycle({
+      scope: "logout",
+      producer: "claude-logout",
+      ...(correlation !== undefined ? { operationId: correlation } : {}),
+    });
     // The credential is about to disappear — drop the cached status so no
     // caller can read a stale "connected" for up to the TTL.
     clearAuthStatusCache();
@@ -1214,40 +1223,65 @@ export const claudeCodeDelegate: TProviderDelegate = {
         capture: { kind: "timeout" },
         store: await loadStore(budget.signal),
       });
-    // `claude auth logout` clears the isolated login credential. Do not
-    // spawn it after the operation deadline, and do not delete the store
-    // as a fallback if the CLI times out or fails.
-    const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
-    if (installed.kind === "expired") return timedOut();
-    if (installed.value.installed) {
-      const ready = await firstOfBudget(
-        budget,
-        ensureKeychainReady(cliHome(PROVIDER), budget.signal),
-      );
-      if (ready.kind === "expired") return timedOut();
-      if (ready.value.kind !== "present") {
-        return {
-          ok: false,
-          detail: "could not reach the credential store to sign out",
-        };
+    try {
+      // `claude auth logout` clears the isolated login credential. Do not
+      // spawn it after the operation deadline, and do not delete the store
+      // as a fallback if the CLI times out or fails.
+      const readyMark = lifecycle.mark();
+      lifecycle.record("readiness_wait", readyMark);
+      const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
+      if (installed.kind === "expired") {
+        lifecycle.record("readiness", readyMark);
+        return await timedOut();
       }
-      if (budget.expired()) return timedOut();
-      capture = await runCaptureResult([bin(), "auth", "logout"], env(), {
-        probe: unwrapKeychainSpawn(PROVIDER),
-        timeoutMs: budget.remainingMs(),
-        signal: budget.signal,
-        allowEmpty: true,
-      });
+      if (installed.value.installed) {
+        const ready = await firstOfBudget(
+          budget,
+          ensureKeychainReady(cliHome(PROVIDER), budget.signal),
+        );
+        lifecycle.record("readiness", readyMark);
+        if (ready.kind === "expired") {
+          return await timedOut();
+        }
+        if (ready.value.kind !== "present") {
+          return {
+            ok: false,
+            detail: "could not reach the credential store to sign out",
+          };
+        }
+        if (budget.expired()) {
+          return await timedOut();
+        }
+        lifecycle.record("start");
+        const childMark = lifecycle.mark();
+        lifecycle.record("child_wait", childMark);
+        capture = await runCaptureResult([bin(), "auth", "logout"], env(), {
+          probe: unwrapKeychainSpawn(PROVIDER),
+          timeoutMs: budget.remainingMs(),
+          signal: budget.signal,
+          allowEmpty: true,
+          producer: "claude-logout",
+          ...(correlation !== undefined ? { operationId: correlation } : {}),
+        });
+        lifecycle.record("child", childMark);
+      } else {
+        lifecycle.record("readiness", readyMark);
+      }
+      if (budget.expired() && capture.kind !== "timeout") {
+        capture = { kind: "timeout" };
+      }
+      // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
+      // clear could have completed mid-logout and installed a "connected"
+      // result under the new generation. The post-clear leaves the cache empty
+      // so the next read re-probes against the now-cleared credential.
+      clearAuthStatusCache();
+      const verifyMark = lifecycle.mark();
+      lifecycle.record("verify_wait", verifyMark);
+      const store = await loadStore(budget.signal);
+      lifecycle.record("verify", verifyMark);
+      return classifyClaudeLogout({ capture, store });
+    } finally {
+      lifecycle.record("terminal");
     }
-    if (budget.expired() && capture.kind !== "timeout") {
-      capture = { kind: "timeout" };
-    }
-    // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
-    // clear could have completed mid-logout and installed a "connected"
-    // result under the new generation. The post-clear leaves the cache empty
-    // so the next read re-probes against the now-cleared credential.
-    clearAuthStatusCache();
-    const store = await loadStore(budget.signal);
-    return classifyClaudeLogout({ capture, store });
   },
 };

@@ -21,6 +21,7 @@
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { emitAuth, requestStatusPush } from "../auth-events";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
+import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { logWarn, safeDiagnosticMessage } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
@@ -81,6 +82,10 @@ export const resolveLoginFlow = (
   slug,
   mode,
 });
+
+/** Opaque doctor correlation for logout; omit when unbound or untrusted. */
+export const currentLoginCommandCorrelation = (): string | undefined =>
+  opaqueDoctorCorrelation(commandCtx?.flowId);
 
 // ─── Per-provider single-flight slot ─────────────────────────────────────
 

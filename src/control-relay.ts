@@ -166,8 +166,10 @@ export const runCommandInner = async (
         markProviderSignedOut(cmd.payload.slug);
         let r: Awaited<ReturnType<typeof delegate.logout>>;
         try {
-          r = await runWithAuthOperation(cmd.payload.slug, () =>
-            delegate.logout(),
+          r = await runWithLoginCommand(
+            { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+            () =>
+              runWithAuthOperation(cmd.payload.slug, () => delegate.logout()),
           );
         } catch (err) {
           clearProviderSignedOut(cmd.payload.slug);

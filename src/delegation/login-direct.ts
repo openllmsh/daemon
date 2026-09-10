@@ -15,6 +15,7 @@
  * there is no cycle.
  */
 
+import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { clearPendingAuth } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type {
@@ -40,6 +41,8 @@ import {
   waitLoginVerifyHint,
 } from "./login-flow";
 import { KEYCHAIN_NOT_READY_DETAIL, loginReady } from "./login-readiness";
+import { createNativeAuthLifecycle } from "./native-auth-lifecycle";
+import type { TNativeAuthProducer } from "./spawn";
 import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin } from "./util";
 
@@ -66,6 +69,10 @@ export type TBlockingConnectConfig = {
   readonly successDetail: () => Promise<string>;
   /** The failure `detail`, from the (abandoned-or-exited) login output. */
   readonly failDetail: (result: TLoginResult) => string;
+  /** Native-child producer. Callers supply the label; this helper stays generic. */
+  readonly nativeAuth?: {
+    readonly producer: TNativeAuthProducer;
+  };
 };
 
 /**
@@ -87,39 +94,23 @@ export const makeBlockingConnect = (
       },
       async () => {
         const flow = resolveLoginFlow(cfg.provider, "browser");
-        const ready = await cfg.beforeLogin?.();
-        if (!loginReady(ready)) {
-          emitLoginFailed(flow, {
-            code: "spawn_denied",
-            message: KEYCHAIN_NOT_READY_DETAIL,
-            retryable: true,
-          });
-          return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
-        }
-        emitLoginStarted(flow);
-        // Keychain-dependent login (claude) runs unconfined on macOS — see
-        // `sandbox/policy.ts`; codex/kimi/grok stay confined on both platforms.
-        const result = await spawnLogin([...cfg.argv()], cfg.env(), {
-          probe: unwrapKeychainSpawn(cfg.provider),
-        });
-        const granted = await cfg.afterLogin?.();
-        const sample = async (): Promise<TLoginVerify> => {
-          try {
-            return await cfg.verifyConnected();
-          } catch {
-            return { state: "unavailable" };
-          }
-        };
-        let verified = await sample();
-        if (verified.state === "unavailable") {
-          await waitLoginVerifyHint({
-            waitStoreHint: cfg.waitStoreHint,
-            verifyWatchdogMs: cfg.verifyWatchdogMs ?? LOGIN_VERIFY_WATCHDOG_MS,
-          });
-          verified = await sample();
-        }
-        if (verified.state === "connected") {
-          if (granted === false) {
+        const correlation = opaqueDoctorCorrelation(flow.flowId);
+        const lifecycle =
+          cfg.nativeAuth === undefined
+            ? null
+            : createNativeAuthLifecycle({
+                scope: "login",
+                producer: cfg.nativeAuth.producer,
+                ...(correlation !== undefined
+                  ? { operationId: correlation }
+                  : {}),
+              });
+        try {
+          const readyMark = lifecycle?.mark();
+          lifecycle?.record("readiness_wait", readyMark);
+          const ready = await cfg.beforeLogin?.();
+          lifecycle?.record("readiness", readyMark);
+          if (!loginReady(ready)) {
             emitLoginFailed(flow, {
               code: "spawn_denied",
               message: KEYCHAIN_NOT_READY_DETAIL,
@@ -127,26 +118,79 @@ export const makeBlockingConnect = (
             });
             return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
           }
-          await cfg.onConnected?.();
-          emitLoginSucceeded(flow);
-          return { connected: true, detail: await cfg.successDetail() };
-        }
-        const detail = cfg.failDetail(result);
-        if (verified.state === "unavailable") {
+          emitLoginStarted(flow);
+          lifecycle?.record("start");
+          // Keychain-dependent login (claude) runs unconfined on macOS — see
+          // `sandbox/policy.ts`; codex/kimi/grok stay confined on both platforms.
+          const childMark = lifecycle?.mark();
+          lifecycle?.record("child_wait", childMark);
+          const result = await spawnLogin([...cfg.argv()], cfg.env(), {
+            probe: unwrapKeychainSpawn(cfg.provider),
+            ...(cfg.nativeAuth !== undefined
+              ? {
+                  producer: cfg.nativeAuth.producer,
+                  ...(correlation !== undefined
+                    ? { operationId: correlation }
+                    : {}),
+                }
+              : {}),
+          });
+          lifecycle?.record("child", childMark);
+          const prepMark = lifecycle?.mark();
+          lifecycle?.record("prep_wait", prepMark);
+          const granted = await cfg.afterLogin?.();
+          lifecycle?.record("prep", prepMark);
+          const sample = async (): Promise<TLoginVerify> => {
+            try {
+              return await cfg.verifyConnected();
+            } catch {
+              return { state: "unavailable" };
+            }
+          };
+          const verifyMark = lifecycle?.mark();
+          lifecycle?.record("verify_wait", verifyMark);
+          let verified = await sample();
+          if (verified.state === "unavailable") {
+            await waitLoginVerifyHint({
+              waitStoreHint: cfg.waitStoreHint,
+              verifyWatchdogMs:
+                cfg.verifyWatchdogMs ?? LOGIN_VERIFY_WATCHDOG_MS,
+            });
+            verified = await sample();
+          }
+          lifecycle?.record("verify", verifyMark);
+          if (verified.state === "connected") {
+            if (granted === false) {
+              emitLoginFailed(flow, {
+                code: "spawn_denied",
+                message: KEYCHAIN_NOT_READY_DETAIL,
+                retryable: true,
+              });
+              return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
+            }
+            await cfg.onConnected?.();
+            emitLoginSucceeded(flow);
+            return { connected: true, detail: await cfg.successDetail() };
+          }
+          const detail = cfg.failDetail(result);
+          if (verified.state === "unavailable") {
+            emitLoginFailed(flow, {
+              code: "poll_expired",
+              message: detail,
+              retryable: true,
+            });
+            return { connected: false, detail };
+          }
+          const crashed = typeof result.code === "number" && result.code !== 0;
           emitLoginFailed(flow, {
-            code: "poll_expired",
+            code: crashed ? "cli_crash" : "poll_expired",
             message: detail,
-            retryable: true,
+            retryable: !crashed,
           });
           return { connected: false, detail };
+        } finally {
+          lifecycle?.record("terminal");
         }
-        const crashed = typeof result.code === "number" && result.code !== 0;
-        emitLoginFailed(flow, {
-          code: crashed ? "cli_crash" : "poll_expired",
-          message: detail,
-          retryable: !crashed,
-        });
-        return { connected: false, detail };
       },
     );
 };

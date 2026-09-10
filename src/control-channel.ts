@@ -41,6 +41,7 @@ import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
 } from "./device-limit-backoff";
+import { opaqueDoctorCorrelation } from "./doctor-report/correlation";
 import { takeRepeatWindow } from "./doctor-report/repeat";
 import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
@@ -730,6 +731,44 @@ const PROCESSED_CAP = 500;
  *  full transcript dump. */
 const ERROR_DETAIL_MAX = 600;
 
+/** Explicit auth commands only — never poll/status/refresh. */
+const EXPLICIT_AUTH_COMMAND_KINDS = new Set<string>([
+  "connect",
+  "connect_device_code",
+  "cancel_connect",
+  "logout",
+  "submit_login_code",
+]);
+
+const authCommandElapsedMs = (startedAt: number): number => {
+  const ms = performance.now() - startedAt;
+  return Number.isFinite(ms) && ms >= 0 ? ms : 0;
+};
+
+const logAuthCommandStage = (
+  message: ReturnType<typeof safeDiagnosticMessage>,
+  kind: string,
+  commandId: string,
+  elapsedMs: number,
+  level: "info" | "warn" = "info",
+): void => {
+  const correlation_id = opaqueDoctorCorrelation(commandId);
+  const meta = {
+    kind,
+    elapsed_ms: elapsedMs,
+    ...(correlation_id !== undefined ? { correlation_id } : {}),
+  };
+  const observation = {
+    timings: { elapsed_ms: elapsedMs },
+    ...(correlation_id !== undefined ? { correlation_id } : {}),
+  };
+  if (level === "warn") {
+    logWarn("control-channel", message, meta, observation);
+    return;
+  }
+  logInfo("control-channel", message, meta, observation);
+};
+
 /** Extract a loggable diagnostic from an error ack's `result`: prefer its
  *  `error` field, else the TAIL of its `output` (integration failures put the
  *  failing step last), else a compact JSON of the result. Never used for
@@ -782,6 +821,17 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
     return;
   }
   commandResults.set(id, null); // mark in-flight
+  const kind = command.command.kind;
+  const isAuthCommand = EXPLICIT_AUTH_COMMAND_KINDS.has(kind);
+  const receivedAt = performance.now();
+  if (isAuthCommand) {
+    logAuthCommandStage(
+      safeDiagnosticMessage`auth command received`,
+      kind,
+      id,
+      0,
+    );
+  }
   if (commandResults.size > PROCESSED_CAP) {
     // Evict the oldest COMPLETED entry. Skipping in-flight (`null`) entries is
     // load-bearing: evicting one would let a duplicate delivery of a still-
@@ -797,6 +847,14 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
     }
   }
   const run = async (): Promise<void> => {
+    if (isAuthCommand) {
+      logAuthCommandStage(
+        safeDiagnosticMessage`auth command queue wait ended`,
+        kind,
+        id,
+        authCommandElapsedMs(receivedAt),
+      );
+    }
     // Queued under a replaced session — skip, and drop the in-flight dedup
     // marker so the relay's redelivery of this id can run on the CURRENT
     // session (a retained `null` entry would suppress that valid redelivery).
@@ -817,8 +875,25 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
     });
     // This daemon, not the relay's socket send, confirms execution has started.
     send({ type: "ack", ack: { id, status: "ack" } });
+    if (isAuthCommand) {
+      logAuthCommandStage(
+        safeDiagnosticMessage`auth command execution started`,
+        kind,
+        id,
+        0,
+      );
+    }
+    const executionStartedAt = performance.now();
     const ack = await runCommandInner(command.command);
     commandResults.set(id, ack);
+    if (isAuthCommand) {
+      logAuthCommandStage(
+        safeDiagnosticMessage`auth command terminal`,
+        kind,
+        id,
+        authCommandElapsedMs(executionStartedAt),
+      );
+    }
     // On SUCCESS the result stays out of the log (it can carry control-plane
     // secrets — see the received-side note above). On ERROR, surface the
     // diagnostic fields (`error` / the tail of `output`) — without them a
@@ -831,8 +906,39 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
       ...(ack.status === "error" ? { error: ackErrorDetail(ack.result) } : {}),
     });
     send({ type: "ack", ack });
-    // Carry a fresh snapshot back so the dashboard reflects the result.
-    await pushStatus(undefined, "command");
+    // `pushStatus` returning is the publish *request* settling (compute /
+    // enqueue / local send attempt). It is not browser receipt or relay persistence.
+    if (isAuthCommand) {
+      logAuthCommandStage(
+        safeDiagnosticMessage`auth command status publish request attempted`,
+        kind,
+        id,
+        0,
+      );
+    }
+    const publishStartedAt = performance.now();
+    try {
+      await pushStatus(undefined, "command");
+      if (isAuthCommand) {
+        logAuthCommandStage(
+          safeDiagnosticMessage`auth command status publish request completed`,
+          kind,
+          id,
+          authCommandElapsedMs(publishStartedAt),
+        );
+      }
+    } catch (err) {
+      if (isAuthCommand) {
+        logAuthCommandStage(
+          safeDiagnosticMessage`auth command status publish request error`,
+          kind,
+          id,
+          authCommandElapsedMs(publishStartedAt),
+          "warn",
+        );
+      }
+      throw err;
+    }
   };
   commandTail = commandTail.catch(() => {}).then(run);
   await commandTail;
