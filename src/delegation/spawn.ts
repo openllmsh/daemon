@@ -427,7 +427,11 @@ export const runCaptureResult = async (
         const fired = timerFiredAtMs ?? raceObservedAtMs;
         logWarn(
           "spawn",
-          "capture timed out",
+          opts?.producer === "claude-auth-status"
+            ? safeDiagnosticMessage`Authentication status probe exceeded its time budget.`
+            : opts?.producer === "claude-refresh"
+              ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
+              : safeDiagnosticMessage`Native capture exceeded its time budget.`,
           {
             configured_timeout_ms: configuredTimeoutMs,
             deadline_ms: remainingAtSpawn,
@@ -464,12 +468,6 @@ export const runCaptureResult = async (
               : {}),
           },
           {
-            message:
-              opts?.producer === "claude-auth-status"
-                ? safeDiagnosticMessage`Authentication status probe exceeded its time budget.`
-                : opts?.producer === "claude-refresh"
-                  ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
-                  : safeDiagnosticMessage`Native capture exceeded its time budget.`,
             timings: {
               configured_timeout_ms: configuredTimeoutMs,
               spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
@@ -750,7 +748,9 @@ export const spawnLogin = async (
     const fired = timerFiredAtMs ?? raceObservedAtMs;
     logWarn(
       "spawn",
-      "login timed out",
+      loginOpts?.producer === "claude-refresh"
+        ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
+        : safeDiagnosticMessage`Login exceeded its time budget.`,
       {
         configured_timeout_ms: timeoutMs,
         deadline_ms: remainingAtSpawn,
@@ -786,10 +786,6 @@ export const spawnLogin = async (
           : {}),
       },
       {
-        message:
-          loginOpts?.producer === "claude-refresh"
-            ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
-            : safeDiagnosticMessage`Login exceeded its time budget.`,
         timings: {
           configured_timeout_ms: timeoutMs,
           spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,

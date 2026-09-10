@@ -34,11 +34,37 @@ import {
   hostCliCandidates,
 } from "./cli-paths";
 import { cliVersion } from "./delegation/util";
-import { noteCliInstallProbeResult } from "./doctor-report/hooks";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 
 export type TCliInstallState = {
   readonly installed: boolean;
   readonly version: string | null;
+};
+
+const cliFailStreak = new Map<string, number>();
+
+export const resetCliInstallDoctorStreakForTests = (): void => {
+  cliFailStreak.clear();
+};
+
+export const noteCliInstallProbeResult = (opts: {
+  readonly provider: string;
+  readonly version: string | null;
+  readonly installed: boolean;
+}): void => {
+  if (!opts.installed || opts.version !== null) {
+    cliFailStreak.delete(opts.provider);
+    return;
+  }
+  const n = (cliFailStreak.get(opts.provider) ?? 0) + 1;
+  cliFailStreak.set(opts.provider, n);
+  if (n !== 3) return;
+  logWarn(
+    "cli-install",
+    safeDiagnosticMessage`The installed client version could not be read repeatedly.`,
+    undefined,
+    { timings: { repeat_count: n } },
+  );
 };
 
 /** Create the isolated provider dirs (root + home + config) before a write. */

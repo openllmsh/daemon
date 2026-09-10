@@ -1,4 +1,3 @@
-import { logWarnAlreadyObserved } from "../logger";
 /**
  * Shared, provider-agnostic login-flow scaffolding for the subscription
  * delegates.
@@ -22,10 +21,7 @@ import { logWarnAlreadyObserved } from "../logger";
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { emitAuth, requestStatusPush } from "../auth-events";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
-import {
-  noteLoginPromptDelayed,
-  noteLoginTerminal,
-} from "../doctor-report/hooks";
+import { logWarn, safeDiagnosticMessage } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -314,11 +310,13 @@ export const finalizeLoginTerminal = (opts: {
   readonly provider: string;
   readonly clearPending: boolean;
 }): void => {
-  if (opts.event.kind === "failed") {
-    noteLoginTerminal({
-      code: opts.event.code,
-      provider: opts.provider,
-    });
+  if (opts.event.kind === "failed" && opts.event.code !== "user_cancelled") {
+    logWarn(
+      "login-flow",
+      opts.event.code === "poll_expired" || opts.event.code === "prompt_timeout"
+        ? safeDiagnosticMessage`The login time budget expired.`
+        : safeDiagnosticMessage`Login ended in an unexpected failure.`,
+    );
   }
   if (opts.flow !== null) {
     if (opts.event.kind === "succeeded") {
@@ -857,12 +855,11 @@ export const spawnStreamLogin = async <T>(
       ceilingMs > warnMs
         ? setTimeout(() => {
             if (!settled) {
-              logWarnAlreadyObserved(
+              logWarn(
                 "login-flow",
-                "vendor login has not printed an authorize prompt yet; waiting until the login ceiling",
+                safeDiagnosticMessage`Login is still waiting for an authorize prompt.`,
                 { provider: opts.provider },
               );
-              noteLoginPromptDelayed({ provider: opts.provider });
             }
           }, warnMs)
         : null;

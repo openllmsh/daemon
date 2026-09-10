@@ -28,7 +28,7 @@ import {
   openllmClientIdOf,
   pushDeviceCliResumeArgs,
 } from "./local-sessions/types";
-import { logInfo, logWarn } from "./logger";
+import { logDebug, logInfo, logWarn } from "./logger";
 import { serializeScreenBytes } from "./session-screen";
 
 /** Max concurrently-LIVE PTYs in one session-host process. */
@@ -364,7 +364,7 @@ const reapIdleSession = (session: TSession): void => {
     // A raced exit will be reconciled by its onExit callback.
   }
   scheduleReapKill(session, pty);
-  logInfo("session", "session reaped after detached idle timeout", {
+  logDebug("session", "session reaped after detached idle timeout", {
     id: session.id,
   });
 };
@@ -619,7 +619,7 @@ const detachConsumer = (
   if (session.primaryConsumer === consumer) promoteSuccessorPrimary(session);
   if (!isAttached(session)) {
     session.detachedAtMs = Date.now();
-    logInfo("session", "session detached", { id: session.id });
+    logDebug("session", "session detached", { id: session.id });
   }
 };
 
@@ -990,7 +990,7 @@ export const killSession = (id: string): boolean => {
   const session = sessions.get(id);
   if (session === undefined || session.pty === null) return false;
   endPty(session, "killed");
-  logInfo("session", "session closed", { id, reason: "kill" });
+  logDebug("session", "session closed", { id, reason: "kill" });
   return true;
 };
 
@@ -1039,7 +1039,7 @@ export const closeSession = (id: string): boolean => {
   if (session === undefined) return false;
   endPty(session, "killed");
   terminalClose(session);
-  logInfo("session", "session closed", { id, reason: "close" });
+  logDebug("session", "session closed", { id, reason: "close" });
   return true;
 };
 
@@ -1214,7 +1214,7 @@ export const openSession = (
           for (const chunk of existing.scrollback) sendOut(existing, chunk);
         }
       }
-      logInfo("session", "session re-attached", { id: existing.id });
+      logDebug("session", "session re-attached", { id: existing.id });
       return;
     }
 
@@ -1288,7 +1288,7 @@ export const openSession = (
         vendorSessionId,
         vendorArgs,
       );
-      logInfo("session", "session open started", {
+      logDebug("session", "session open started", {
         id: s.id,
         cli,
         mode: frame.mode,
@@ -1333,7 +1333,7 @@ export const openSession = (
           const reason = s.lastExitReason ?? "done";
           endPty(s, reason, false);
           terminalClose(s);
-          logInfo("session", "session CLI exited", { id: s.id });
+          logDebug("session", "session CLI exited", { id: s.id });
         },
       });
       s.pty = pty;
@@ -1355,7 +1355,7 @@ export const openSession = (
       ptyReady = true;
       for (const chunk of pendingOutput) sendOut(s, chunk);
       pendingOutput.length = 0;
-      logInfo("session", "session started", {
+      logDebug("session", "session started", {
         id: s.id,
         cli,
         mode: frame.mode,

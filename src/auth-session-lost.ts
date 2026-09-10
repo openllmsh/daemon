@@ -25,7 +25,6 @@ import { emitAuth } from "./auth-events";
 import { isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
-import { observeDoctorEvent } from "./doctor-report";
 import { daemonApiKeyId } from "./env";
 import { logWarn, safeDiagnosticMessage } from "./logger";
 
@@ -156,11 +155,12 @@ const noteUnknownLiveness = (conn: TDaemonProviderConnection): void => {
     const consecutive = (unknownStreak.get(slug) ?? 0) + 1;
     unknownStreak.set(slug, consecutive);
     if (consecutive !== UNKNOWN_ESCALATION_TICKS) return;
-    observeDoctorEvent({
-      severity: "warn",
-      message: safeDiagnosticMessage`Provider liveness degraded.`,
-      timings: { unknown_probe_streak: consecutive },
-    });
+    logWarn(
+      "auth-session-lost",
+      safeDiagnosticMessage`Provider liveness degraded.`,
+      undefined,
+      { timings: { unknown_probe_streak: consecutive } },
+    );
     emitAuth({
       event: "auth.liveness.degraded",
       key_id: daemonApiKeyId() ?? "local",

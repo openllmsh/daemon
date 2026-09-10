@@ -172,7 +172,7 @@ export const flushLogs = (): Promise<void> => appendTail;
 type TLogObservation = Pick<
   TDoctorObservationInput,
   "timings" | "correlation_id"
-> & { readonly message?: TSafeDiagnosticMessage };
+>;
 
 const write = (
   level: TLevel,
@@ -180,13 +180,13 @@ const write = (
   message: string | TSafeDiagnosticMessage,
   meta?: Record<string, unknown>,
   observation?: TLogObservation,
-  alreadyObserved = false,
 ): void => {
-  if (!alreadyObserved && (level === "warn" || level === "error")) {
+  if (level === "info" || level === "warn" || level === "error") {
     try {
       observeDoctorEvent({
         severity: level,
-        message: observation?.message ?? message,
+        scope,
+        message,
         timings: observation?.timings,
         correlation_id: observation?.correlation_id,
       });
@@ -267,18 +267,12 @@ export const logWarn = (
   observation?: TLogObservation,
 ): void => write("warn", scope, message, meta, observation);
 
-/** Only paired hook-owned incidents: preserve local forensics without a second report. */
-export const logWarnAlreadyObserved = (
+export const logInfo = (
   scope: string,
   message: string | TSafeDiagnosticMessage,
   meta?: Record<string, unknown>,
-): void => write("warn", scope, message, meta, undefined, true);
-
-export const logInfo = (
-  scope: string,
-  message: string,
-  meta?: Record<string, unknown>,
-): void => write("info", scope, message, meta);
+  observation?: TLogObservation,
+): void => write("info", scope, message, meta, observation);
 
 /**
  * Low-severity backoff/weather (a transient cloud hiccup, an abort/timeout on

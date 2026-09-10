@@ -204,7 +204,7 @@ import {
   peekHopCooldown,
   TRANSIENT_COOLDOWN_REASONS,
 } from "./hop-cooldown";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 import { maybeReportModels } from "./model-report";
 import {
   isNativeRuntimeProvider,
@@ -223,6 +223,19 @@ import {
 
 /** Test seam: how many immediate status pushes auth-cooldown marks requested. */
 let authCooldownStatusPushesForTests = 0;
+
+export const noteWalkerStreamTerminal = (opts: {
+  readonly aborted: boolean;
+  readonly hang: boolean;
+}): void => {
+  if (opts.aborted) return;
+  logWarn(
+    "walker",
+    opts.hang
+      ? safeDiagnosticMessage`The stream stopped making progress.`
+      : safeDiagnosticMessage`The stream ended in an unexpected failure.`,
+  );
+};
 
 export const takeAuthCooldownStatusPushesForTests = (): number => {
   const n = authCooldownStatusPushesForTests;
@@ -1473,15 +1486,7 @@ const serveSubscription = async (
   const recordStreamFailure = (err: unknown): void => {
     if (args.req.signal.aborted) return;
     if (isClientHangUp(err)) return;
-    void import("./doctor-report/hooks")
-      .then((m) =>
-        m.noteWalkerStreamTerminal({
-          aborted: false,
-          hang: false,
-          err,
-        }),
-      )
-      .catch(() => {});
+    noteWalkerStreamTerminal({ aborted: false, hang: false });
     report(
       {
         ...baseRow,

@@ -7,11 +7,13 @@ import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import type {
   TDoctorEventTimings,
   TDoctorReportEvent,
+  TDoctorSeverity,
 } from "@openllmsh/protocol";
 import {
   DOCTOR_OPAQUE_ID_PATTERN,
   parseDoctorReportEvent,
   projectDoctorTimings,
+  sanitizeDoctorScope,
 } from "@openllmsh/protocol";
 import { DAEMON_VERSION } from "../version";
 import { doctorStateDir, doctorStatePath } from "./files";
@@ -22,7 +24,8 @@ const DIAGNOSTICS_BASENAME = "openllmd.diagnostics.jsonl";
 const MAX_DIAGNOSTICS_BYTES = 5 * 1024 * 1024;
 
 export type TDoctorObservationInput = {
-  readonly severity: "warn" | "error";
+  readonly severity: TDoctorSeverity;
+  readonly scope: unknown;
   readonly message: unknown;
   readonly correlation_id?: string;
   readonly timings?: TDoctorEventTimings;
@@ -80,6 +83,7 @@ export const recordDoctorObservation = (
     platform,
     architecture,
     severity: input.severity,
+    scope: sanitizeDoctorScope(input.scope),
     message: diagnosticMessageText(input.message, input.severity),
     ...(input.correlation_id !== undefined &&
     DOCTOR_OPAQUE_ID_PATTERN.test(input.correlation_id)

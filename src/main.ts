@@ -174,12 +174,24 @@ const main = async (): Promise<void> => {
       : "transientNetworkError";
   process.on("uncaughtException", (err) => {
     if (isSurvivableTransportError(err)) {
-      logError(survivedTransportLabel(err), err);
+      logError(
+        "process",
+        safeDiagnosticMessage`A transient transport error was ignored.`,
+        {
+          label: survivedTransportLabel(err),
+          error:
+            err instanceof Error ? (err.stack ?? err.message) : String(err),
+        },
+      );
       return;
     }
-    logError("uncaughtException", err, undefined, {
-      message: safeDiagnosticMessage`The daemon encountered an uncaught exception.`,
-    });
+    logError(
+      "process",
+      safeDiagnosticMessage`The daemon encountered an uncaught exception.`,
+      {
+        error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+      },
+    );
 
     // Durable local session hosts are detached sibling processes. A daemon
     // fatal exit must never terminate their vendor PTYs; attached browser
@@ -189,12 +201,29 @@ const main = async (): Promise<void> => {
   });
   process.on("unhandledRejection", (reason) => {
     if (isSurvivableTransportError(reason)) {
-      logError(survivedTransportLabel(reason), reason);
+      logError(
+        "process",
+        safeDiagnosticMessage`A transient transport error was ignored.`,
+        {
+          label: survivedTransportLabel(reason),
+          error:
+            reason instanceof Error
+              ? (reason.stack ?? reason.message)
+              : String(reason),
+        },
+      );
       return;
     }
-    logError("unhandledRejection", reason, undefined, {
-      message: safeDiagnosticMessage`The daemon encountered an unhandled rejection.`,
-    });
+    logError(
+      "process",
+      safeDiagnosticMessage`The daemon encountered an unhandled rejection.`,
+      {
+        error:
+          reason instanceof Error
+            ? (reason.stack ?? reason.message)
+            : String(reason),
+      },
+    );
 
     exitAfterDisposableDrain(1);
   });

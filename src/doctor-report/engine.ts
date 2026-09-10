@@ -47,6 +47,7 @@ import {
   diagnosticsRotatedPath,
   recordDoctorObservation,
 } from "./record";
+import { resetDoctorRepeatForTests } from "./repeat";
 
 type TFileId = {
   readonly dev: number;
@@ -974,4 +975,5 @@ export const resetDoctorEngineForTests = (): void => {
   notifyObservation = null;
   clock = (): number => Date.now();
   clearAttemptMemory();
+  resetDoctorRepeatForTests();
 };

@@ -271,17 +271,20 @@ older daemons omit those fields (unknown, not false). Last attempt is in-memory
 and cleared on identity/window discard; status never includes raw HTTP bodies,
 exception text, keys, URLs, or paths.
 Capture is severity-first, with no diagnostic category/producer/trigger
-registry: logger warnings and errors enter the existing reporting path before
-the local log-level filter; info/debug remain local by default. Safe messages,
+registry: `logInfo`, `logWarn`, and `logError` are the only application
+reporting ingress and submit before the local log-level filter. Debug stays
+local and never submits. Safe interpolation-free message tags, a generically
+validated log scope (invalid values fall back; there is no scope catalog),
 actual binary version, occurrence time, opaque IDs, and bounded factual
-measurements form the report. Raw scope, arbitrary metadata, CLI output, stacks,
-login material, and credentials are not report fields. Unsafe message details
-fall back to a minimal report rather than removing the observation; an invalid
-optional measurement removes only that measurement. Hook-only observations
-use the same ingress, and paired logger/hook sites have one reporting owner.
+measurements form the report. Arbitrary metadata, CLI output, stacks, argv,
+paths, login material, credentials, and model content are not report fields.
+Unsafe message details fall back to a severity-appropriate notice rather than
+removing the observation; an invalid optional measurement removes only that
+measurement. There is no parallel `note*` reporting surface. Repeat
+cooldowns and CLI version-probe streaks stay as local domain counters.
 No additional status, authentication, or provider probes are started.
 
-New events use report schema v2 exclusively. There is no legacy decoder,
+New events use report schema v3 exclusively. There is no legacy decoder,
 normalizer, downgrade, or special old-server retry path. Old-format journal
 records and reports are unsupported; cloud and daemon must use matching report
 contracts. Bootstrap consent policy remains separately versioned. Existing

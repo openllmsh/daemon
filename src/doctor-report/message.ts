@@ -1,3 +1,4 @@
+import type { TDoctorSeverity } from "@openllmsh/protocol";
 import { sanitizeDoctorMessage } from "@openllmsh/protocol";
 
 /** Objects are trusted by identity, never by a forgeable property or raw prose. */
@@ -21,13 +22,11 @@ export const safeDiagnosticMessage = (
 
 export const diagnosticMessageText = (
   value: unknown,
-  severity: "warn" | "error",
+  severity: TDoctorSeverity,
 ): string =>
   typeof value === "object" && value !== null && trustedMessages.has(value)
     ? sanitizeDoctorMessage((value as TSafeDiagnosticMessage).text, severity)
-    : severity === "error"
-      ? "Daemon error."
-      : "Daemon warning.";
+    : sanitizeDoctorMessage("", severity);
 
 export const localDiagnosticMessage = (
   value: string | TSafeDiagnosticMessage,

@@ -41,12 +41,7 @@ import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
 } from "./device-limit-backoff";
-import {
-  noteControlChannelClose,
-  noteControlChannelHeartbeatMiss,
-  noteControlChannelProtocolFailure,
-  noteControlChannelSocketError,
-} from "./doctor-report/hooks";
+import { takeRepeatWindow } from "./doctor-report/repeat";
 import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import {
@@ -54,7 +49,6 @@ import {
   logError,
   logInfo,
   logWarn,
-  logWarnAlreadyObserved,
   safeDiagnosticMessage,
 } from "./logger";
 import {
@@ -389,8 +383,7 @@ let hasConnected = false;
 let lastErrorReason = "";
 let lastCloseLine = "";
 
-/** Socket error path used by `socket.onerror`. Logs once per reason; doctor
- *  observations use closed error classes only — never the free-form reason. */
+/** Retryable socket errors stay local at debug, once per reason. */
 export const handleControlChannelSocketError = (
   ev: {
     readonly message?: unknown;
@@ -403,22 +396,39 @@ export const handleControlChannelSocketError = (
     "unknown";
   if (reason !== lastErrorReason) {
     lastErrorReason = reason;
-    logWarnAlreadyObserved(
-      "control-channel",
-      `socket error: ${reason} (reconnecting)`,
-    );
+    logDebug("control-channel", `socket error: ${reason} (reconnecting)`);
   }
-  noteControlChannelSocketError(ev);
+};
+
+const reportControlChannelRepeat = (
+  key: string,
+  message: ReturnType<typeof safeDiagnosticMessage>,
+): void => {
+  const repeatCount = takeRepeatWindow(key);
+  if (repeatCount === null) return;
+  logWarn("control-channel", message, undefined, {
+    timings: { repeat_count: repeatCount },
+  });
+};
+
+export const handleControlChannelProtocolFailure = (): void => {
+  reportControlChannelRepeat(
+    "control-channel:protocol",
+    safeDiagnosticMessage`The control channel received an invalid frame.`,
+  );
 };
 
 /** Heartbeat silence is a control-channel timeout, never provider-auth
  *  `liveness_degraded`. */
 export const handleControlChannelHeartbeatSilent = (): void => {
-  logWarnAlreadyObserved(
+  reportControlChannelRepeat(
+    "control-channel:transport",
+    safeDiagnosticMessage`The control connection failed unexpectedly.`,
+  );
+  logDebug(
     "control-channel",
     `no relay pong after ${MAX_MISSED_PONGS} missed heartbeats; forcing reconnect`,
   );
-  noteControlChannelHeartbeatMiss();
   ws?.reconnect();
 };
 
@@ -835,11 +845,11 @@ const onFrame = (frame: TRelayFrame): void => {
   try {
     dispatchFrame(frame);
   } catch (err: unknown) {
-    logWarnAlreadyObserved("control-channel", "frame dispatch failed", {
+    logDebug("control-channel", "frame dispatch failed", {
       frameType: frame.type,
       err: err instanceof Error ? err.message : String(err),
     });
-    noteControlChannelProtocolFailure();
+    handleControlChannelProtocolFailure();
   }
 };
 
@@ -1121,7 +1131,7 @@ export const migrateIfRelayMoved = async (
   const fresh = wssOrigin(freshUrl);
   if (fresh === null || fresh === current) return;
   if (generation !== undefined && generation !== connectionGeneration) return;
-  logInfo("control-channel", "relay moved to a new box; reconnecting", {
+  logDebug("control-channel", "relay moved to a new box; reconnecting", {
     from: current,
     to: fresh,
   });
@@ -1138,7 +1148,7 @@ export const startControlChannel = (): void => {
     },
   });
   if (ws !== null) return;
-  logInfo("control-channel", "connecting over websocket");
+  logDebug("control-channel", "connecting over websocket");
   configureMuxHost({ send, sendBytes });
   configureRtcHost({ send });
   configureRtcClient({ send });
@@ -1155,7 +1165,7 @@ export const startControlChannel = (): void => {
   // store in lib/stores/daemon-store.ts).
   socket.binaryType = "arraybuffer";
   socket.onopen = (): void => {
-    logInfo(
+    logDebug(
       "control-channel",
       hasConnected ? "reconnected over websocket" : "connected over websocket",
     );
@@ -1203,12 +1213,8 @@ export const startControlChannel = (): void => {
     onMessage(ev.data);
   };
   socket.onerror = (ev): void => {
-    // Surface connect failures (a timed-out channel fetch — message `TIMEOUT` —,
-    // a thrown channel URL provider, a refused dial) at WARN so "I don't know
-    // why it keeps dropping" is answerable from the log. partysocket still backs
-    // off + retries; the matching `reconnected` line lands on recovery. The real
-    // reason lives on `.message` (partysocket wraps the thrown error) but native
-    // ws error events carry only `.error`, so read both.
+    // Retryable dial failures are debug-only; partysocket backs off and retries.
+    // Read both partysocket's `.message` and native websocket `.error`.
     handleControlChannelSocketError(
       ev as { message?: unknown; error?: unknown } | null,
     );
@@ -1237,21 +1243,15 @@ export const startControlChannel = (): void => {
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
     // reconnects automatically in all cases.
     const line = `socket closed code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}${clean ? "" : " (reconnecting)"}`;
-    // A clean close (relay cycling its box, or our own graceful stop) is routine
-    // → debug. An abnormal close (1006 unreachable, 4003 rejected ticket) is a
-    // real drop the user needs to see → warn, paired with the `reconnected` line
-    // — but only ONCE per sustained outage (suppress the unchanged per-dial repeat).
+    // Automatic reconnects are debug-only, including transient 1006 closes.
+    // Rejected tickets remain actionable warnings. Suppress unchanged retries.
     if (clean) {
       logDebug("control-channel", line);
     } else if (line !== lastCloseLine) {
       lastCloseLine = line;
 
-      logWarnAlreadyObserved("control-channel", line);
-      noteControlChannelClose({
-        code: ev.code,
-        superseded: false,
-        clean: false,
-      });
+      logDebug("control-channel", line);
+      if (ev.code === 4003) handleControlChannelProtocolFailure();
     }
   };
 };

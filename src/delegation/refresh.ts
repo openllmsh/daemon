@@ -15,8 +15,8 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
-import { matchRefreshNetworkErrno } from "../doctor-report/hooks";
-import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
+
+import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
 import type { TRefreshCaller } from "../op-context";
 import {
   currentRefreshCaller,
@@ -30,6 +30,23 @@ import { DEADLINE_CHECK_CAP_MS, spawnLogin, spawnLoginPty } from "./spawn";
 import type { TLoginResult, TStoreRead } from "./util";
 
 export type { TRefreshCaller } from "../op-context";
+
+/** Local refresh behavior consumes these errnos; they are not report labels. */
+export const REFRESH_NETWORK_ERRNOS = [
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "ECONNRESET",
+] as const;
+const REFRESH_NETWORK_ERRNO_RE = new RegExp(
+  `\\b(${REFRESH_NETWORK_ERRNOS.join("|")})\\b`,
+  "i",
+);
+export const matchRefreshNetworkErrno = (text: string): string | null =>
+  text.match(REFRESH_NETWORK_ERRNO_RE)?.[1]?.toUpperCase() ?? null;
 
 /** Stamp the demand-path caller onto any nested `makeRefresher` fire. */
 export const withRefreshCaller = <T>(
@@ -673,7 +690,7 @@ export const makeRefresher = (opts: {
             timeout_ms,
             in_flight: false,
           });
-          logInfo("refresh", "native refresh trigger settled", {
+          logDebug("refresh", "native refresh trigger settled", {
             provider: opts.slug,
             label: opts.label,
             phase: "refresh_trigger",
@@ -718,7 +735,7 @@ export const makeRefresher = (opts: {
           if (lastErrorClass === "network") {
             logWarn(
               "refresh",
-              safeDiagnosticMessage`codex token refresh failed: network`,
+              safeDiagnosticMessage`Credential refresh failed.`,
               {
                 provider: opts.slug,
                 errno: triggerError?.errno ?? networkErrno(err),
@@ -729,7 +746,6 @@ export const makeRefresher = (opts: {
                 caller,
               },
               {
-                message: safeDiagnosticMessage`Credential refresh failed.`,
                 timings: {
                   ...(clocks.spawn_elapsed_ms !== null
                     ? { spawn_elapsed_ms: clocks.spawn_elapsed_ms }
@@ -746,7 +762,7 @@ export const makeRefresher = (opts: {
           }
           logWarn(
             "refresh",
-            safeDiagnosticMessage`native refresh trigger failed`,
+            safeDiagnosticMessage`Credential refresh failed.`,
             {
               provider: opts.slug,
               label: opts.label,
