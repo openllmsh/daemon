@@ -2,10 +2,10 @@
  * Stamp-keyed `--version` cache.
  *
  * One probe per resolved-binary identity until that identity changes.
- * Successful stdout AND completed failure/timeout are cached. No TTL, no
- * autonomous retry timer, no filesystem watcher. Missing/unstatable
- * binaries return `null` without spawning and are re-statted on the next
- * demand.
+ * Successful stdout is durable. Completed failure/timeout is process-local
+ * only (not written as `output: null`). No TTL, no autonomous retry timer,
+ * no filesystem watcher. Missing/unstatable binaries return `null` without
+ * spawning and are re-statted on the next demand.
  *
  * Timeout policy (first caller wins): the in-flight probe uses the first
  * waiter's `timeoutMs`. Joiners cannot shorten or lengthen it. When the
@@ -18,6 +18,10 @@
  * child or persist a failure. A stamp change during a probe is not
  * published under the replacement identity. Env is passed to the child
  * only — never persisted.
+ *
+ * Cache file schema v2: durable successes only. v1 files are accepted;
+ * persisted nulls are discarded so a poisoned identity can recover without
+ * replacing the CLI.
  */
 import {
   mkdirSync,
@@ -35,9 +39,15 @@ export type TCliVersionOpts = {
   readonly timeoutMs?: number;
   /** Observer-only. Does not abort the shared probe. */
   readonly signal?: AbortSignal;
+  /**
+   * Explicit demand: bypass a process-local miss, still join in-flight work
+   * and reuse a successful stamp hit. Distinct from updater `force`.
+   */
+  readonly reprobe?: boolean;
 };
 
-const SCHEMA_V = 1;
+const SCHEMA_V1 = 1;
+const SCHEMA_V = 2;
 export const CLI_VERSION_CACHE_MAX_RECORDS = 64;
 /** Version stdout is a short banner; anything larger is treated as failure. */
 export const CLI_VERSION_OUTPUT_MAX_BYTES = 4_096;
@@ -119,8 +129,16 @@ const isRecord = (v: unknown): v is TPersistRecord => {
 const coerceFile = (v: unknown): TPersistRecord[] => {
   if (typeof v !== "object" || v === null) return [];
   const raw = v as { v?: unknown; records?: unknown };
-  if (raw.v !== SCHEMA_V || !Array.isArray(raw.records)) return [];
-  return raw.records.filter(isRecord).slice(-CLI_VERSION_CACHE_MAX_RECORDS);
+  if (
+    (raw.v !== SCHEMA_V && raw.v !== SCHEMA_V1) ||
+    !Array.isArray(raw.records)
+  ) {
+    return [];
+  }
+  return raw.records
+    .filter(isRecord)
+    .filter((rec) => rec.output !== null)
+    .slice(-CLI_VERSION_CACHE_MAX_RECORDS);
 };
 
 const loadPersist = (): void => {
@@ -151,8 +169,10 @@ const loadPersist = (): void => {
   }
 };
 
-const recordsFromMemory = (): TPersistRecord[] =>
-  [...memory.values()].slice(-CLI_VERSION_CACHE_MAX_RECORDS);
+const durableRecordsFromMemory = (): TPersistRecord[] =>
+  [...memory.values()]
+    .filter((rec) => rec.output !== null)
+    .slice(-CLI_VERSION_CACHE_MAX_RECORDS);
 
 const writePersistAtomic = (records: readonly TPersistRecord[]): void => {
   persistTmpSeq += 1;
@@ -184,21 +204,29 @@ const flushPersist = (): void => {
   try {
     do {
       persistQueued = false;
-      writePersistAtomic(recordsFromMemory());
+      writePersistAtomic(durableRecordsFromMemory());
     } while (persistQueued);
   } finally {
     persistLocked = false;
   }
 };
 
-const persistEntry = (entry: TMemoryEntry): void => {
+const rememberEntry = (entry: TMemoryEntry, persist: boolean): void => {
   const key = identityKey(entry.path, entry.stamp);
+  const existing = memory.get(key);
+  if (
+    entry.output === null &&
+    existing !== undefined &&
+    existing.output !== null
+  ) {
+    return;
+  }
   memory.set(key, entry);
   if (memory.size > CLI_VERSION_CACHE_MAX_RECORDS) {
     const first = memory.keys().next().value;
     if (first !== undefined && first !== key) memory.delete(first);
   }
-  flushPersist();
+  if (persist) flushPersist();
 };
 
 const settleShared = (shared: Promise<string | null>): Promise<string | null> =>
@@ -257,18 +285,28 @@ const runProbe = async (
   env: Record<string, string> | undefined,
   timeoutMs: number | undefined,
 ): Promise<string | null> => {
-  const output = boundOutput(await probeRaw(bin, env, timeoutMs));
+  let output: string | null;
+  try {
+    output = boundOutput(await probeRaw(bin, env, timeoutMs));
+  } catch {
+    // Completed unexpected failure: process-local miss, not a retry storm.
+    // Observer abort never reaches here (joinObserver only).
+    output = null;
+  }
   const stampAfter = versionBinaryStamp(bin);
   const resolvedAfter = resolveVersionBinary(bin);
   if (stampAfter !== stamp || resolvedAfter !== resolved) {
     return output;
   }
-  persistEntry({
-    path: resolved,
-    stamp,
-    output,
-    probedAt: Date.now(),
-  });
+  rememberEntry(
+    {
+      path: resolved,
+      stamp,
+      output,
+      probedAt: Date.now(),
+    },
+    output !== null,
+  );
   return output;
 };
 
@@ -290,7 +328,12 @@ export const cachedCliVersion = (
   const key = identityKey(resolved, stamp);
   const hit = memory.get(key);
   if (hit !== undefined) {
-    return Promise.resolve(hit.output);
+    if (hit.output !== null) {
+      return Promise.resolve(hit.output);
+    }
+    if (opts?.reprobe !== true) {
+      return Promise.resolve(null);
+    }
   }
   const existing = inflight.get(key);
   if (existing !== undefined) {
@@ -307,6 +350,27 @@ export const cachedCliVersion = (
   });
   inflight.set(key, shared);
   return joinObserver(shared, opts?.signal);
+};
+
+/**
+ * Compare-and-invalidate one durable (or in-memory) observation. Returns true
+ * only when the current entry's path/stamp/output all match. A newer concurrent
+ * result or a different vendor identity is left untouched.
+ */
+export const invalidateMatchingCliVersionOutput = (
+  bin: string,
+  output: string,
+): boolean => {
+  loadPersist();
+  const resolved = resolveVersionBinary(bin);
+  const stamp = versionBinaryStamp(bin);
+  if (resolved === null || stamp === null) return false;
+  const key = identityKey(resolved, stamp);
+  const hit = memory.get(key);
+  if (hit === undefined || hit.output !== output) return false;
+  memory.delete(key);
+  if (hit.output !== null) flushPersist();
+  return true;
 };
 
 /** Drop memory + inflight and re-read persist on the next lookup. */

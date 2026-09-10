@@ -27,6 +27,8 @@ import {
 } from "./deadline-budget";
 import { DELEGATES, getDelegate, isSubscriptionSlug } from "./delegation";
 import {
+  loginOwnershipPending,
+  loginSlot,
   providerAuthOperationActive,
   resetProviderAuthOperationsForTests,
 } from "./delegation/login-flow";
@@ -50,7 +52,7 @@ import {
   withUsageNativeRefresh,
 } from "./op-context";
 import { resolveOnPath } from "./path-utils";
-import { getPendingAuth } from "./pending-auth";
+import { getPendingAuth, pendingAuthWire } from "./pending-auth";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
@@ -219,17 +221,16 @@ const applyAuthLiteral = (
   if (!determinate) {
     const preserved: TDaemonProviderAuthStatus = last?.status ?? conn.status;
     const stored = getPendingAuth(slug);
+    const owner = loginOwnershipPending(slug);
     const livePending =
       conn.pending_auth ??
-      (stored === null
-        ? undefined
-        : {
-            url: stored.url,
-            code: stored.code,
-            ...(stored.mode !== undefined ? { mode: stored.mode } : {}),
-            started_at_ms: stored.startedAt,
-            ...(stored.flowId !== undefined ? { flow_id: stored.flowId } : {}),
-          });
+      (stored !== null
+        ? pendingAuthWire(stored, {
+            cancel_requested: owner?.cancel_requested === true,
+          })
+        : owner !== null
+          ? owner
+          : undefined);
     const base = last !== undefined ? last : conn;
     return {
       ...base,
@@ -741,7 +742,7 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
 export const refreshUsage = async (
   slug?: string,
   options?: { readonly manual?: boolean },
-): Promise<void> => {
+): Promise<{ readonly deferred: readonly string[] }> => {
   // Join the canonical snapshot — never a raw `d.status()` bypass that would
   // start a second producer beside `computeStatus`. `allSettled`, NOT `all`:
   // ONE provider throwing (e.g. a failing usage read) must not reject the whole
@@ -751,31 +752,34 @@ export const refreshUsage = async (
   // best-effort (`cachedUsage` already swallows fetch failures into an
   // `unavailable` snapshot).
   const manual = options?.manual === true;
-  const snapshot = await computeStatus();
-  // ALS is per-provider AFTER computeStatus so a status probe cannot inherit
-  // native-refresh permission, and so the write is keyed to this snapshot's
-  // `account_hash`. Cache `force` is internal TTL bypass, not the wire grant.
-  await Promise.allSettled(
-    Object.values(DELEGATES)
-      .filter((d) => slug === undefined || d.slug === slug)
-      .map(async (d) => {
-        const conn = snapshot.connections.find(
-          (entry) => entry.provider === d.slug,
-        );
-        // Only definitively connected providers have a usage endpoint to read.
-        if (
-          conn === undefined ||
-          !normalizeProviderConnection(conn).serviceable
-        )
-          return;
-        const fetchUsage = (): Promise<TProviderUsageSnapshot> =>
-          manual
-            ? withUsageNativeRefresh(() => d.usage(), conn.account_hash)
-            : d.usage();
-        await cachedUsage(d.slug, fetchUsage, {
-          accountHash: conn.account_hash,
-          ...(manual ? { force: true } : {}),
-        });
+  if (slug === undefined) {
+    const deferred: string[] = [];
+    await Promise.allSettled(
+      Object.values(DELEGATES).map(async (d) => {
+        const one = await refreshUsage(d.slug, options);
+        deferred.push(...one.deferred);
       }),
-  );
+    );
+    return { deferred };
+  }
+  if (providerAuthOperationActive(slug) || loginSlot(slug).inFlight()) {
+    return { deferred: [slug] };
+  }
+  const d = DELEGATES[slug];
+  if (d === undefined) return { deferred: [] };
+  const conn = await boundedDelegateStatus(slug, (signal) => d.status(signal), {
+    force: manual,
+  });
+  if (conn === undefined || !normalizeProviderConnection(conn).serviceable) {
+    return { deferred: [] };
+  }
+  const fetchUsage = (): Promise<TProviderUsageSnapshot> =>
+    manual
+      ? withUsageNativeRefresh(() => d.usage(), conn.account_hash)
+      : d.usage();
+  await cachedUsage(slug, fetchUsage, {
+    accountHash: conn.account_hash,
+    ...(manual ? { force: true } : {}),
+  });
+  return { deferred: [] };
 };

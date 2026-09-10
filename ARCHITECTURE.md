@@ -59,6 +59,8 @@ daemon/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
     cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
     auto-update-pref.ts     self-update opt-out flag in the shared .env (`OPENLLM_DAEMON_AUTO_UPDATE`, default ON; legacy `~/.openllm/auto-update` file migrated in); gates self-update.ts + reported on DaemonStatus.auto_update
+    cli-version-cache.ts    stamp-keyed `--version` cache: durable successes (schema v2), process-local misses, optional `reprobe` (not `force`); v1 persisted nulls dropped on load
+    cli-self-update.ts      converge installed `openllm`; `reprobeUnknown` is explicit-update only (one recovery probe)
     integrations.ts         shared executor: fetch a gateway install.sh (mode=install|uninstall|state) → verify SHA-256 (fail-closed) → bash. Behind the CLI verbs + the relay's install/uninstall_integration kinds
     device-state.ts         manifest-driven probe: run each integration's `install.sh?mode=state` (`{"installed":bool,…}`) → cached DaemonStatus.integrations (stateful dashboard buttons)
     service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable; serviceUninstall = stop + delete registration)
@@ -70,6 +72,7 @@ daemon/
       landlock.ts           cross-platform applyDaemonSandbox() dispatcher + the Linux Landlock backend (bun:ffi, inherited by children)
       seatbelt.ts           macOS Seatbelt backend — in-process sandbox_init() deny-by-default profile (bun:ffi, inherited by children)
       exec.ts               per-child sandboxing — sandboxSpawnArgs() wrap + the --sandbox-exec shim verb + the boot capability probe
+    command-scheduler.ts    bounded admission: per-provider mutation lanes, usage worker cap, cancel/continuation fast path, update apply drain
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
     sub-method.ts           per-provider execution-method table (bridge|handrolled) + per-hop selection

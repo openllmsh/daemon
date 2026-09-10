@@ -15,11 +15,18 @@ import type {
 } from "@openllmsh/protocol";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
+import {
+  daemonCommandScheduler,
+  schedulerProviderSlugs,
+} from "./command-scheduler";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import {
+  endDaemonApply,
+  loginSlot,
   runWithAuthOperation,
   runWithLoginCommand,
+  tryBeginDaemonApply,
 } from "./delegation/login-flow";
 import { daemonApiKeyId } from "./env";
 import { openSealed } from "./keypair";
@@ -123,19 +130,25 @@ export const runCommandInner = async (
         };
       }
       case "cancel_connect": {
-        // Abort an in-flight device-code / browser login: the delegate kills
-        // its spawned process / stops its background poll and clears the
-        // pending code. Fall back to clearing the daemon's in-memory
-        // `pending_auth` directly for a provider whose `connect` is synchronous
-        // (no `cancelConnect`) — there's no live flow, so dropping a stale code
-        // is the whole job. The post-command status push (with the cleared
-        // `pending_auth`) flips the card back to Not signed in.
         const delegate = getDelegate(cmd.payload.slug);
         if (delegate === null) {
           return {
             id: cmd.id,
             status: "error",
             result: { error: "unknown provider" },
+          };
+        }
+        const requestedFlow = cmd.payload.flow_id;
+        const liveFlow = loginSlot(cmd.payload.slug).flow();
+        if (
+          requestedFlow !== undefined &&
+          liveFlow !== null &&
+          requestedFlow !== liveFlow.flowId
+        ) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "flow_id does not match the active login" },
           };
         }
         const cancelConnect = delegate.cancelConnect;
@@ -145,6 +158,13 @@ export const runCommandInner = async (
             () => cancelConnect(),
           );
           return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
+        }
+        if (loginSlot(cmd.payload.slug).inFlight()) {
+          return {
+            id: cmd.id,
+            status: "done",
+            result: { ok: true, detail: "cancel requested" },
+          };
         }
         clearPendingAuth(cmd.payload.slug);
         return { id: cmd.id, status: "done", result: { ok: true } };
@@ -160,9 +180,15 @@ export const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
-        // Sticky signed_out at command receipt — before the (possibly slow)
-        // `delegate.logout()` — so interleaved status ticks never produce a
-        // `connected → disconnected` edge.
+        if (loginSlot(cmd.payload.slug).inFlight()) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: {
+              error: "login in progress — cancel it before signing out",
+            },
+          };
+        }
         markProviderSignedOut(cmd.payload.slug);
         let r: Awaited<ReturnType<typeof delegate.logout>>;
         try {
@@ -192,6 +218,13 @@ export const runCommandInner = async (
             result: { error: "submit_login_code: unsupported provider" },
           };
         }
+        if (loginSlot(cmd.payload.slug).inFlight() !== true) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "no in-flight login to receive a code" },
+          };
+        }
         const code = openSealed(cmd.payload.sealed);
         if (code === null) {
           return {
@@ -216,20 +249,50 @@ export const runCommandInner = async (
       // ONLY path that hits the vendor usage endpoint (the background status
       // push only PEEKS the cache; see `status.ts`). `slug` scopes it to one
       // provider; the dashboard's whole-daemon refresh sends none → all.
-      case "refresh":
-        // Automatic reads respect the usage TTL and only use stored credentials.
-        // The explicit manual button bypasses that TTL and permits native token
-        // renewal. Neither path clears last-good figures: keep them visible while
-        // fetching, then push fresh data or a sanitized per-provider failure.
-        await refreshUsage(cmd.payload?.slug, {
-          manual: cmd.payload?.manual === true,
-        });
-        // NB: a bare `refresh` does NOT re-walk device state — the `-s` walk is
-        // heavy (a fetch + bash per registry item) and the dashboard fires
-        // `refresh` often, which would flood. Device state refreshes on connect
-        // (eager) and after each install/uninstall (single-item probe); a
-        // dedicated on-demand re-walk is future work (proposal §9 cadence).
+      case "refresh": {
+        const manual = cmd.payload?.manual === true;
+        const slug = cmd.payload?.slug;
+        if (slug === undefined) {
+          const usage = await daemonCommandScheduler.schedulePerProviderUsage(
+            async (one) => {
+              const result = await refreshUsage(one, { manual });
+              if (result.deferred.length > 0) return { deferred: true };
+              return undefined;
+            },
+          );
+          if (usage.deferred.length === schedulerProviderSlugs().length) {
+            return {
+              id: cmd.id,
+              status: "error",
+              result: {
+                error: "login_conflict",
+                retryable: true,
+                deferred: usage.deferred,
+              },
+            };
+          }
+          return {
+            id: cmd.id,
+            status: "done",
+            ...(usage.deferred.length > 0
+              ? { result: { deferred: usage.deferred } }
+              : {}),
+          };
+        }
+        const one = await refreshUsage(slug, { manual });
+        if (one.deferred.length > 0) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: {
+              error: "login_conflict",
+              retryable: true,
+              slug,
+            },
+          };
+        }
         return { id: cmd.id, status: "done" };
+      }
       case "status":
         return { id: cmd.id, status: "done" };
       // Drop every cached signed plan tuple. Enqueued by the dashboard after
@@ -345,16 +408,15 @@ export const runCommandInner = async (
       // seen — otherwise a forced check would read a stale `latestVersion()`.
       // Fire-and-forget: it self-guards and, if it updates, swaps the binary +
       // exits once idle so the supervisor relaunches it.
-      case "update":
-        void (async () => {
-          await refreshBootstrap();
-          // CLI first: converging openllm is a plain file swap, while a daemon
-          // update EXITS the process — anything after it would never run (and
-          // with auto-update toggled off, the relaunched boot wouldn't force it).
-          await maybeUpdateCli(latestCliVersion(), { force: true });
-          await maybeSelfUpdate(latestVersion(), { force: true });
-        })().catch((err) => logError("control-relay", err));
+      case "update": {
+        await refreshBootstrap();
+        await maybeUpdateCli(latestCliVersion(), {
+          force: true,
+          reprobeUnknown: true,
+        });
+        await maybeSelfUpdate(latestVersion(), { force: true });
         return { id: cmd.id, status: "done", result: { checking: true } };
+      }
       // Toggle the auto-update opt-in from the dashboard. Persisted locally so it
       // survives restarts; the post-command status push carries the new value
       // back so the switch reflects it. Enabling kicks off an immediate
@@ -381,12 +443,14 @@ export const runCommandInner = async (
         // Only converge now if it actually stuck on.
         if (enabled) {
           void (async () => {
-            await refreshBootstrap();
-            // CLI first — a daemon update exits the process (see "update" above;
-            // here the toggle is on, so the relaunched boot would catch up, but
-            // converging both now avoids the extra tick).
-            await maybeUpdateCli(latestCliVersion());
-            await maybeSelfUpdate(latestVersion());
+            const apply = tryBeginDaemonApply();
+            try {
+              await refreshBootstrap();
+              await maybeUpdateCli(latestCliVersion());
+              if (apply) await maybeSelfUpdate(latestVersion());
+            } finally {
+              if (apply) endDaemonApply();
+            }
           })().catch((err) => logError("control-relay", err));
         }
         return {

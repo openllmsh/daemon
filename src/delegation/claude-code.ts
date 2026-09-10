@@ -42,6 +42,7 @@ import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
+  pendingAuthWire,
 } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { accountHash, nonEmpty } from "./account-id";
@@ -59,10 +60,21 @@ import {
   parseClaudeModelList,
   skippedModelDiscovery,
 } from "./fetch-model-list";
+import {
+  ensureIsolatedKeychain,
+  ensureKeychainReady,
+  grantKeychainToolAccess,
+  keychainStoreIdentity,
+  observeKeychainReady,
+  readIsolatedKeychain,
+} from "./keychain";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import type { TLoginVerify } from "./login-flow";
-import { currentLoginCommandCorrelation } from "./login-flow";
+import {
+  currentLoginCommandCorrelation,
+  loginOwnershipPending,
+} from "./login-flow";
 import { createNativeAuthLifecycle } from "./native-auth-lifecycle";
 import {
   createPassiveObservationCache,
@@ -81,6 +93,8 @@ import {
   spawnRefresh,
   withRefreshCaller,
 } from "./refresh";
+import type { TRunCaptureResult } from "./spawn";
+import { runCaptureResult } from "./spawn";
 import type {
   TModelDiscoveryOptions,
   TModelDiscoveryResult,
@@ -88,20 +102,13 @@ import type {
 } from "./types";
 import { resolveUsageCredential } from "./usage-credential";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
-import type { TRunCaptureResult, TStoreRead } from "./util";
+import type { TStoreRead } from "./util";
 import {
   cliVersion,
   connectedObservation,
   disconnectedObservation,
-  ensureIsolatedKeychain,
-  ensureKeychainReady,
-  grantKeychainToolAccess,
-  keychainStoreIdentity,
   newNativeAuthOperationId,
-  observeKeychainReady,
-  readIsolatedKeychain,
   readJsonStore,
-  runCaptureResult,
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   toEpochMs,
@@ -733,15 +740,10 @@ const claudeStatusPayload = async (
         }
       : pending !== null
         ? {
-            pending_auth: {
-              url: pending.url,
-              code: pending.code,
-              ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
-              started_at_ms: pending.startedAt,
-              ...(pending.flowId !== undefined
-                ? { flow_id: pending.flowId }
-                : {}),
-            },
+            pending_auth: pendingAuthWire(pending, {
+              cancel_requested:
+                loginOwnershipPending(PROVIDER)?.cancel_requested === true,
+            }),
             detail: pendingAuthDetail(pending),
           }
         : { detail: "claude CLI installed but not signed in" }),
@@ -774,11 +776,8 @@ const NO_REFRESH_HINT =
 
 // ─── Login wiring ────────────────────────────────────────────────────────
 //
-// `connect` is a SYNCHRONOUS browser login (it blocks in `claude auth login`),
-// so it carries no single-flight slot. `connectDeviceCode` is the headless
-// paste-back (remote box) and shares the `slot` with `submitLoginCode` +
-// `cancelConnect`. All paths flag a credential that can't auto-refresh (no
-// refresh token) at sign-in, so the card doesn't silently die ~8h later.
+// Direct and paste-back share one slot. All paths flag a credential that
+// can't auto-refresh (no refresh token) at sign-in.
 
 const LOGIN_ARGV = (): ReadonlyArray<string> => [
   bin(),
@@ -829,6 +828,7 @@ const signedInDetail = async (warning: string): Promise<string> => {
 // the isolated CLI's store. (macOS keychain ensured before / granted after.)
 const connectDirect = makeBlockingConnect({
   provider: PROVIDER,
+  slot,
   installed: isInstalled,
   installHint: INSTALL_HINT,
   nativeAuth: { producer: "claude-login" },

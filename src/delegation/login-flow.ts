@@ -27,8 +27,10 @@ import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
   getPendingAuth,
+  isPromptPending,
   pendingAuthDetail,
   setPendingAuth,
+  setPendingAuthOwnerLive,
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
@@ -97,20 +99,26 @@ export const currentLoginCommandCorrelation = (): string | undefined =>
  * `cancelConnect` runs them all.
  */
 export type TLoginSlot = {
-  /** True while a background login is in flight for this provider. */
+  /** True while a login operation owns this provider. */
   readonly inFlight: () => boolean;
   /** The live flow's identity, or null when nothing is in flight. */
   readonly flow: () => TLoginFlowCtx | null;
-  /** True after {@link TLoginSlot.cancelAll} until the next {@link TLoginSlot.start}. */
+  /** Immutable start time for the current owner; 0 when idle. */
+  readonly startedAtMs: () => number;
+  /** True after {@link TLoginSlot.cancelAll} until matching {@link TLoginSlot.end}. */
   readonly wasCancelled: () => boolean;
-  /** Mark in-flight + register the live flow's canceler. Call only AFTER the
-   *  spawn/handle exists — an early mark wedges the slot if the spawn throws. */
-  readonly start: (canceler: () => void, flow?: TLoginFlowCtx) => void;
-  /** Clear in-flight + drop all cancelers (the background-exit cleanup). */
-  readonly end: () => void;
-  /** Run every registered canceler and clear them. Returns how many ran (>0 ⇔
-   *  a login was in flight) — `inFlight` itself is left for the flow's own exit
-   *  handler to clear via `end()`, mirroring the pre-refactor kill→exit order. */
+  /** Unconfirmed child cleanup — retain containment. */
+  readonly cleanupUnknown: () => boolean;
+  readonly markCleanupUnknown: () => void;
+  /**
+   * Reserve ownership and register a canceler. Safe before spawn. Does not
+   * clear an earlier cancellation flag (a second start must not revive a
+   * cancelled flow).
+   */
+  readonly start: (canceler: () => void, flow?: TLoginFlowCtx) => boolean;
+  /** Release ownership for this flow only. */
+  readonly end: (flowId?: string) => void;
+  /** Signal cancelers; leave ownership until matching {@link TLoginSlot.end}. */
   readonly cancelAll: () => number;
 };
 
@@ -122,23 +130,52 @@ export const loginSlot = (provider: string): TLoginSlot => {
   if (existing !== undefined) return existing;
   let inFlight = false;
   let cancelled = false;
+  let cleanupUnknown = false;
+  let startedAtMs = 0;
   let flow: TLoginFlowCtx | null = null;
   const cancelers = new Set<() => void>();
   const slot: TLoginSlot = {
     inFlight: () => inFlight,
     flow: () => flow,
+    startedAtMs: () => startedAtMs,
     wasCancelled: () => cancelled,
-    start: (canceler, nextFlow) => {
-      inFlight = true;
-      cancelled = false;
-      if (nextFlow !== undefined) flow = nextFlow;
-      cancelers.add(canceler);
+    cleanupUnknown: () => cleanupUnknown,
+    markCleanupUnknown: () => {
+      cleanupUnknown = true;
     },
-    end: () => {
+    start: (canceler, nextFlow) => {
+      if (applyHeld) {
+        try {
+          canceler();
+        } catch {
+          // apply in progress — do not take ownership
+        }
+        return false;
+      }
+      inFlight = true;
+      if (nextFlow !== undefined) flow = nextFlow;
+      if (startedAtMs === 0) startedAtMs = Date.now();
+      if (cancelled) {
+        try {
+          canceler();
+        } catch {
+          // already gone
+        }
+        return true;
+      }
+      cancelers.add(canceler);
+      return true;
+    },
+    end: (flowId) => {
+      if (flowId !== undefined && flow !== null && flow.flowId !== flowId) {
+        return;
+      }
       inFlight = false;
       cancelers.clear();
       flow = null;
       cancelled = false;
+      cleanupUnknown = false;
+      startedAtMs = 0;
     },
     cancelAll: () => {
       cancelled = true;
@@ -156,6 +193,55 @@ export const loginSlot = (provider: string): TLoginSlot => {
   };
   slots.set(provider, slot);
   return slot;
+};
+
+setPendingAuthOwnerLive(
+  (slug) => loginSlot(slug).inFlight(),
+  () => {
+    for (const slot of slots.values()) {
+      if (slot.inFlight()) return true;
+    }
+    return false;
+  },
+);
+
+let applyHeld = false;
+
+/** Exclusive with login slot.start. Hold across background daemon reexec. */
+export const tryBeginDaemonApply = (): boolean => {
+  if (applyHeld) return false;
+  if (logoutOps.size > 0) return false;
+  for (const slot of slots.values()) {
+    if (slot.inFlight()) return false;
+  }
+  applyHeld = true;
+  return true;
+};
+
+export const endDaemonApply = (): void => {
+  applyHeld = false;
+};
+
+export const daemonApplyActive = (): boolean => applyHeld;
+
+/** Non-secret marker for a live owner — TTL does not expire this. */
+export const loginOwnershipPending = (
+  slug: string,
+): {
+  readonly pending: true;
+  readonly flow_id: string;
+  readonly started_at_ms: number;
+  readonly cancel_requested: boolean;
+} | null => {
+  const slot = loginSlot(slug);
+  const flow = slot.flow();
+  if (!slot.inFlight() || flow === null) return null;
+  return {
+    pending: true,
+    flow_id: flow.flowId,
+    started_at_ms: slot.startedAtMs(),
+    cancel_requested: slot.wasCancelled(),
+  };
 };
 
 /** Providers whose logout is in flight (login uses {@link loginSlot}). */
@@ -179,6 +265,10 @@ export const providerAuthOperationActive = (slug: string): boolean =>
 
 export const resetProviderAuthOperationsForTests = (): void => {
   logoutOps.clear();
+  applyHeld = false;
+  for (const slot of slots.values()) {
+    slot.end();
+  }
 };
 
 /** Wrap logout (or other auth mutation) so observers see an active operation. */
@@ -444,8 +534,11 @@ export const guard = async (
   if (opts.slot?.inFlight() === true) {
     const pending = getPendingAuth(opts.provider);
     const live = opts.slot.flow();
-    if (pending !== null && live !== null) {
-      emitLoginPrompt(live, pending);
+    if (pending !== null && live !== null && isPromptPending(pending)) {
+      emitLoginPrompt(live, {
+        url: pending.url ?? "",
+        code: pending.code ?? "",
+      });
     }
     if (opts.resurface !== undefined) return opts.resurface(pending);
     return {
@@ -986,6 +1079,8 @@ export const makeCancelConnect = (
   return async () => {
     const flow = slot.flow();
     const n = slot.cancelAll();
+    // Prompt secrets drop immediately; ownership/marker lives on the slot
+    // until matching end/cleanup.
     clearPendingAuth(provider);
     if (n > 0 && flow !== null) {
       emitLoginFailed(flow, {

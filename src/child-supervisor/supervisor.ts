@@ -4,6 +4,7 @@ import type { TReapOutcome } from "./posix";
 import {
   DEFAULT_FINAL_REAP_MS,
   DEFAULT_TERMINATE_GRACE_MS,
+  processGroupExists,
   signalGroup,
   terminateProcessGroup,
 } from "./posix";
@@ -41,12 +42,16 @@ export type TSupervisedChild = {
   readonly pgid: number;
   readonly terminate: (opts?: TTerminateOptions) => Promise<TReapOutcome>;
   readonly beginTask: () => () => void;
+  /** Settles when tracking is dropped (confirmed exit). Pending while unconfirmed. */
+  readonly whenReleased: Promise<TReapOutcome>;
 };
 
 type TTrackedChild = {
   readonly handle: TSupervisedChild;
   terminating: Promise<TReapOutcome> | null;
+  lastReap: TReapOutcome | null;
   activeTasks: number;
+  resolveReleased: (outcome: TReapOutcome) => void;
 };
 
 const trackedChildren = new Map<number, TTrackedChild>();
@@ -54,11 +59,70 @@ const trackedChildren = new Map<number, TTrackedChild>();
 type TExitWait = (child: TSupervisedChild) => Promise<void>;
 
 let exitWaitOverride: TExitWait | null = null;
+let reapOutcomeOverrideForTests: TReapOutcome | null = null;
+let processGroupExistsForTests: ((pgid: number) => boolean) | null = null;
+const unconfirmedWatchAbort = new Map<number, AbortController>();
+
+/**
+ * Adaptive fallback when the supervised root has exited (or never will
+ * notify) but `kill(-pgid, 0)` still succeeds — descendants are not
+ * SIGCHLD-visible. Short first probe, then exponential cap. Correctness
+ * of cancel/release does not wait on this interval: explicit terminate
+ * checks the group immediately, and root `exited` checks immediately.
+ */
+export const UNCONFIRMED_GROUP_FALLBACK_INITIAL_MS = 250;
+export const UNCONFIRMED_GROUP_FALLBACK_MAX_MS = 5_000;
+
+type TUnconfirmedWatchScheduler = (
+  callback: () => void,
+  delayMs: number,
+) => ReturnType<typeof setTimeout>;
+
+let unconfirmedWatchSchedulerForTests: TUnconfirmedWatchScheduler | null = null;
+
+/** Test-only: observe fallback cadence (must clear timers itself or use setTimeout). */
+export const setUnconfirmedWatchSchedulerForTests = (
+  scheduler: TUnconfirmedWatchScheduler | null,
+): void => {
+  unconfirmedWatchSchedulerForTests = scheduler;
+};
+
+const nextFallbackDelayMs = (currentMs: number): number =>
+  Math.min(UNCONFIRMED_GROUP_FALLBACK_MAX_MS, currentMs * 2);
 
 /** Test-only: replace the Bun `proc.exited` wait (never-settling exit cases). */
 export const setSupervisedExitWaitForTests = (wait: TExitWait | null): void => {
   exitWaitOverride = wait;
 };
+
+/**
+ * Test-only: report this reap **after** real group termination so
+ * `reap_unconfirmed` → `cleanup.confirmed === false` can be asserted
+ * without leaving a live child. This overlays the label, not live
+ * unreaped containment.
+ */
+export const setSupervisedReapOutcomeForTests = (
+  outcome: TReapOutcome | null,
+): void => {
+  reapOutcomeOverrideForTests = outcome;
+};
+
+/** Test-only: override `kill(-pgid, 0)` while proving unconfirmed containment. */
+export const setSupervisedProcessGroupExistsForTests = (
+  exists: ((pgid: number) => boolean) | null,
+): void => {
+  processGroupExistsForTests = exists;
+};
+
+/** Test-only: wake the singleton group-existence watch early. */
+export const signalSupervisedContainedExitForTests = (pid: number): void => {
+  unconfirmedWatchAbort.get(pid)?.abort();
+};
+
+const groupStillPresent = (pgid: number): boolean =>
+  processGroupExistsForTests !== null
+    ? processGroupExistsForTests(pgid)
+    : processGroupExists(pgid);
 
 const exited = async (child: TSupervisedChild): Promise<void> => {
   try {
@@ -88,19 +152,99 @@ const raceExitOrBudget = async (
   }
 };
 
-const forgetChild = (child: TSupervisedChild, outcome: TReapOutcome): void => {
+const releaseChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
+  const child = tracked.handle;
+  if (!trackedChildren.has(child.pid)) return;
+  unconfirmedWatchAbort.get(child.pid)?.abort();
+  unconfirmedWatchAbort.delete(child.pid);
+  removeChildRegistryRecord(child.pid);
+  trackedChildren.delete(child.pid);
+  tracked.resolveReleased(outcome);
+};
+
+const forgetChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
   if (outcome === "reap_unconfirmed") {
     logWarn(
       "child-supervisor",
       safeDiagnosticMessage`process group unreaped after bounded TERM/KILL`,
       {
-        pid: child.pid,
-        pgid: child.pgid,
+        pid: tracked.handle.pid,
+        pgid: tracked.handle.pgid,
       },
     );
+    void watchUnconfirmedExit(tracked);
+    return;
   }
-  removeChildRegistryRecord(child.pid);
-  trackedChildren.delete(child.pid);
+  releaseChild(tracked, outcome);
+};
+
+const waitGroupCheck = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const schedule =
+      unconfirmedWatchSchedulerForTests ??
+      ((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> =>
+        setTimeout(callback, delayMs));
+    const timer = schedule(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+
+const maybeReleaseIfGroupGone = (tracked: TTrackedChild): boolean => {
+  if (!trackedChildren.has(tracked.handle.pid)) return true;
+  if (groupStillPresent(tracked.handle.pgid)) return false;
+  releaseChild(tracked, "terminated");
+  return true;
+};
+
+const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
+  const child = tracked.handle;
+  const existing = unconfirmedWatchAbort.get(child.pid);
+  if (existing !== undefined && !existing.signal.aborted) return;
+  const ac = new AbortController();
+  unconfirmedWatchAbort.set(child.pid, ac);
+  const aborted = (): boolean =>
+    ac.signal.aborted || !trackedChildren.has(child.pid);
+  try {
+    if (maybeReleaseIfGroupGone(tracked) || aborted()) return;
+    let rootPending: Promise<"root"> | null = waitChildExited(child).then(
+      () => "root" as const,
+    );
+    const abortWait = new Promise<"abort">((resolve) => {
+      ac.signal.addEventListener("abort", () => resolve("abort"), {
+        once: true,
+      });
+    });
+    let delayMs = UNCONFIRMED_GROUP_FALLBACK_INITIAL_MS;
+    while (!aborted() && groupStillPresent(child.pgid)) {
+      const tick = waitGroupCheck(delayMs, ac.signal).then(
+        () => "tick" as const,
+      );
+      const winner = await Promise.race([
+        ...(rootPending !== null ? [rootPending] : []),
+        tick,
+        abortWait,
+      ]);
+      if (maybeReleaseIfGroupGone(tracked)) return;
+      if (ac.signal.aborted || !trackedChildren.has(child.pid)) return;
+      if (winner === "root") rootPending = null;
+      if (winner === "tick") delayMs = nextFallbackDelayMs(delayMs);
+    }
+  } finally {
+    if (unconfirmedWatchAbort.get(child.pid) === ac) {
+      unconfirmedWatchAbort.delete(child.pid);
+    }
+    maybeReleaseIfGroupGone(tracked);
+  }
 };
 
 const finishTrackedChild = async (
@@ -111,7 +255,16 @@ const finishTrackedChild = async (
   } catch {
     // Natural-exit waiter; terminate() owns cleanup if it already started.
   }
-  if (tracked.terminating !== null) return tracked.terminating;
+  if (tracked.terminating !== null) {
+    const outcome = await tracked.terminating;
+    if (
+      outcome === "reap_unconfirmed" &&
+      trackedChildren.has(tracked.handle.pid)
+    ) {
+      return tracked.handle.whenReleased;
+    }
+    return outcome;
+  }
   return terminateTrackedChild(tracked, {
     graceMs: 0,
     finalReapMs: DEFAULT_FINAL_REAP_MS,
@@ -122,9 +275,13 @@ const terminateTrackedChild = (
   tracked: TTrackedChild,
   opts: TTerminateOptions,
 ): Promise<TReapOutcome> => {
+  if (tracked.lastReap === "reap_unconfirmed" && tracked.terminating !== null) {
+    tracked.terminating = null;
+  }
   if (tracked.terminating !== null) return tracked.terminating;
   const graceMs = opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS;
   const finalReapMs = opts.finalReapMs ?? DEFAULT_FINAL_REAP_MS;
+  const stillOwned = (): boolean => groupStillPresent(tracked.handle.pgid);
   tracked.terminating = (async (): Promise<TReapOutcome> => {
     signalGroup(tracked.handle.pgid, "SIGTERM");
     const first = await raceExitOrBudget(tracked.handle, Math.max(0, graceMs));
@@ -133,20 +290,22 @@ const terminateTrackedChild = (
       outcome = await terminateProcessGroup(
         tracked.handle.pgid,
         0,
-        undefined,
+        stillOwned,
         0,
       );
     } else {
       outcome = await terminateProcessGroup(
         tracked.handle.pgid,
         0,
-        undefined,
+        stillOwned,
         Math.max(0, finalReapMs),
       );
       if (outcome === "exited") outcome = "terminated";
     }
-    forgetChild(tracked.handle, outcome);
-    return outcome;
+    const reported = reapOutcomeOverrideForTests ?? outcome;
+    tracked.lastReap = reported;
+    forgetChild(tracked, reported);
+    return reported;
   })();
   return tracked.terminating;
 };
@@ -166,6 +325,10 @@ const activeTaskRelease = (tracked: TTrackedChild): (() => void) => {
  * root record. This supervisor deliberately excludes durable session hosts.
  * macOS has no PDEATHSIG; launchd shutdown plus process-group cleanup owns it.
  */
+/** Test-only: whether a pid is still in the in-memory tracked set. */
+export const isChildTrackedForTests = (pid: number): boolean =>
+  trackedChildren.has(pid);
+
 export const superviseSpawn = (
   argv: ReadonlyArray<string>,
   opts: TSuperviseSpawnOptions,
@@ -189,6 +352,10 @@ export const superviseSpawn = (
   const pgid = pid;
   let handle: TSupervisedChild;
   let tracked: TTrackedChild;
+  let resolveReleased: (outcome: TReapOutcome) => void = () => {};
+  const whenReleased = new Promise<TReapOutcome>((resolve) => {
+    resolveReleased = resolve;
+  });
   const beginTask = (): (() => void) => {
     tracked.activeTasks += 1;
     return activeTaskRelease(tracked);
@@ -200,8 +367,15 @@ export const superviseSpawn = (
     terminate: (terminateOptions?: TTerminateOptions): Promise<TReapOutcome> =>
       terminate(handle, terminateOptions),
     beginTask,
+    whenReleased,
   };
-  tracked = { handle, terminating: null, activeTasks: 0 };
+  tracked = {
+    handle,
+    terminating: null,
+    lastReap: null,
+    activeTasks: 0,
+    resolveReleased,
+  };
   trackedChildren.set(pid, tracked);
   // Persist the cross-restart identity record OFF the spawn hot path. Reading
   // the start time is a `ps` subprocess; doing it synchronously here blocked the

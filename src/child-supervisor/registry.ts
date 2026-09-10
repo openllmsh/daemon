@@ -8,8 +8,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { stateDir } from "../env";
 import { logDebug } from "../logger";
+import { processGroupExists, signalGroup } from "./posix";
 
 export type TDisposableChildKind =
   | "probe"
@@ -78,6 +80,76 @@ export const processStartTime = (pid: number): string | null => {
 };
 
 /**
+ * Named budget for the async `ps -o lstart=` helper. Failure to obtain
+ * identity returns null; it must not drop in-memory tracking.
+ */
+export const PROCESS_START_TIME_HELPER_TIMEOUT_MS = 400;
+/** After the named budget expires, wait this long for SIGTERM before SIGKILL. */
+export const PROCESS_START_TIME_HELPER_KILL_WAIT_MS = 50;
+
+type TProcessStartTimeHelperSpawn = (
+  pid: number,
+) => ReturnType<typeof Bun.spawn>;
+
+let processStartTimeHelperSpawnForTests: TProcessStartTimeHelperSpawn | null =
+  null;
+
+/**
+ * Test-only: replace the `ps` helper spawn. Production kill/read path still
+ * runs. Do not use {@link superviseSpawn} here — that would recurse identity
+ * lookup.
+ */
+export const setProcessStartTimeHelperSpawnForTests = (
+  spawn: TProcessStartTimeHelperSpawn | null,
+): void => {
+  processStartTimeHelperSpawnForTests = spawn;
+};
+
+const defaultProcessStartTimeHelperSpawn: TProcessStartTimeHelperSpawn = (
+  pid,
+) =>
+  Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+    stdout: "pipe",
+    stderr: "ignore",
+    // Own process group so reap can SIGKILL descendants without touching
+    // the daemon group. Test fakes must also set detached: true.
+    detached: true,
+  });
+
+const closeHelperStdout = (proc: ReturnType<typeof Bun.spawn>): void => {
+  const stdout = proc.stdout;
+  if (stdout === undefined || typeof stdout === "number") return;
+  try {
+    void stdout.cancel().catch(() => {
+      // Locked by the in-flight Response reader, or already closed.
+    });
+  } catch {
+    // Already closed.
+  }
+};
+
+const reapStartTimeHelper = async (
+  proc: ReturnType<typeof Bun.spawn>,
+): Promise<void> => {
+  closeHelperStdout(proc);
+  const pgid = proc.pid;
+  // Detached helper is group leader (pgid === pid). Never signalGroup(0/1).
+  signalGroup(pgid, "SIGTERM");
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      proc.exited.then(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, PROCESS_START_TIME_HELPER_KILL_WAIT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+  if (processGroupExists(pgid)) signalGroup(pgid, "SIGKILL");
+};
+
+/**
  * Async twin of {@link processStartTime}, for the spawn HOT PATH.
  *
  * `Bun.spawnSync(["ps", …])` is a synchronous fork/exec/wait that BLOCKS the
@@ -87,26 +159,43 @@ export const processStartTime = (pid: number): string | null => {
  * status-timeout symptom). This variant reads the same `lstart` via a
  * non-blocking `Bun.spawn`, so the identity read no longer pauses the loop.
  *
+ * The helper has an owned terminate path: a hung `ps` must not leak unbounded.
+ * A miss (timeout/failure) returns null and MUST NOT imply the child is reaped.
+ *
  * The synchronous {@link processStartTime} stays for the ONE-TIME boot identity
  * and the boot-sweep `childProcessMatchesRecord`, neither of which is hot.
  */
 export const readProcessStartTime = async (
   pid: number,
 ): Promise<string | null> => {
+  // Owner-created helper budget — never a shared login/logout budget.
+  // firstOfBudget only detaches its waiter; this finally releases the helper.
+  const budget = createDeadlineBudget(PROCESS_START_TIME_HELPER_TIMEOUT_MS);
+  const spawn =
+    processStartTimeHelperSpawnForTests ?? defaultProcessStartTimeHelperSpawn;
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
   try {
-    const proc = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const [out, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    if (exitCode !== 0) return null;
-    const value = out.trim();
+    proc = spawn(pid);
+    const stdout = proc.stdout;
+    const read =
+      stdout === undefined || typeof stdout === "number"
+        ? Promise.resolve({ out: "", code: 1 })
+        : Promise.all([new Response(stdout).text(), proc.exited]).then(
+            ([out, code]) => ({ out, code }),
+          );
+    const raced = await firstOfBudget(budget, read);
+    if (raced.kind === "expired") {
+      await reapStartTimeHelper(proc);
+      return null;
+    }
+    if (raced.value.code !== 0) return null;
+    const value = raced.value.out.trim();
     return value.length > 0 ? value : null;
   } catch {
+    if (proc !== null) await reapStartTimeHelper(proc);
     return null;
+  } finally {
+    budget.release();
   }
 };
 

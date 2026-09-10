@@ -23,6 +23,18 @@ export const isUnsignallableProcessGroup = (error: unknown): boolean => {
 const assertSafePgid = (pgid: number): boolean =>
   Number.isInteger(pgid) && pgid > 1;
 
+let deliverTerminationSignalsForTests: boolean | null = null;
+
+/**
+ * Test-only: when false, TERM/KILL are not delivered so a live group can
+ * remain after bounded terminate. `kill(-pgid, 0)` still probes existence.
+ */
+export const setDeliverTerminationSignalsForTests = (
+  deliver: boolean | null,
+): void => {
+  deliverTerminationSignalsForTests = deliver;
+};
+
 export const signalGroup = (
   pgid: number,
   signal: NodeJS.Signals | 0,
@@ -31,6 +43,9 @@ export const signalGroup = (
   // sig)` targets our OWN group — neither is ever a supervised child, so a
   // bogus pgid must never reach process.kill.
   if (!assertSafePgid(pgid)) return false;
+  if (deliverTerminationSignalsForTests === false && signal !== 0) {
+    return true;
+  }
   try {
     process.kill(-pgid, signal);
     return true;
@@ -70,7 +85,7 @@ export const terminateProcessGroup = async (
   finalReapMs: number = DEFAULT_FINAL_REAP_MS,
 ): Promise<TReapOutcome> => {
   const stillPresent = (): boolean =>
-    (isStillOwned === undefined || isStillOwned()) && processGroupExists(pgid);
+    isStillOwned !== undefined ? isStillOwned() : processGroupExists(pgid);
   if (!stillPresent()) return "exited";
   const termDelivered = signalGroup(pgid, "SIGTERM");
   if (termDelivered && (await waitUntilGone(stillPresent, graceMs)))

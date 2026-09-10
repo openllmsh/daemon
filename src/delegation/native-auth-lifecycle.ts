@@ -44,6 +44,12 @@ const STAGE_MESSAGE: Record<
  * Bounded per-attempt stage recorder. Info stages never throw.
  * Durations are `performance.now()` deltas on both local meta and doctor timings.
  */
+export type TNativeAuthLifecycleTimings = {
+  readonly spawn_setup_ms?: number;
+  readonly child_wait_ms?: number;
+  readonly cleanup_ms?: number;
+};
+
 export const createNativeAuthLifecycle = (
   cfg: TNativeAuthLifecycleConfig,
 ): {
@@ -51,6 +57,7 @@ export const createNativeAuthLifecycle = (
   readonly record: (
     phase: TNativeAuthLifecyclePhase,
     startedAtMs?: number,
+    extras?: TNativeAuthLifecycleTimings,
   ) => void;
 } => {
   const attemptStartedAtMs = performance.now();
@@ -58,7 +65,7 @@ export const createNativeAuthLifecycle = (
   const correlation_id = opaqueDoctorCorrelation(cfg.operationId);
   return {
     mark: (): number => performance.now(),
-    record: (phase, startedAtMs): void => {
+    record: (phase, startedAtMs, extras): void => {
       if (remaining <= 0) return;
       remaining -= 1;
       const elapsed_ms = Math.max(
@@ -74,12 +81,31 @@ export const createNativeAuthLifecycle = (
             phase,
             clock: "performance.now",
             elapsed_ms,
+            ...(extras?.spawn_setup_ms !== undefined
+              ? { spawn_setup_ms: extras.spawn_setup_ms }
+              : {}),
+            ...(extras?.child_wait_ms !== undefined
+              ? { child_wait_ms: extras.child_wait_ms }
+              : {}),
+            ...(extras?.cleanup_ms !== undefined
+              ? { cleanup_ms: extras.cleanup_ms }
+              : {}),
             ...(correlation_id !== undefined
               ? { operation_id: correlation_id }
               : {}),
           },
           {
-            timings: { elapsed_ms },
+            timings: {
+              elapsed_ms,
+              ...(extras?.spawn_setup_ms !== undefined
+                ? { spawn_setup_ms: extras.spawn_setup_ms }
+                : {}),
+              ...(extras?.cleanup_ms !== undefined
+                ? { cleanup_ms: extras.cleanup_ms }
+                : {}),
+              // child_wait_ms is local meta only — DoctorEventTimings has no
+              // matching field. P1 should pass TLoginResult extras into record().
+            },
             ...(correlation_id !== undefined ? { correlation_id } : {}),
           },
         );

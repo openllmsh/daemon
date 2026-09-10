@@ -15,6 +15,7 @@
  * there is no cycle.
  */
 
+import type { TReapOutcome } from "../child-supervisor";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { clearPendingAuth } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
@@ -46,6 +47,22 @@ import type { TNativeAuthProducer } from "./spawn";
 import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin } from "./util";
 
+const UNCONFIRMED_CLEANUP_DETAIL = "sign-in child cleanup is unconfirmed";
+
+const whenReleasedOf = (value: object): Promise<TReapOutcome> | undefined => {
+  if (!("whenReleased" in value)) return undefined;
+  const released = value.whenReleased;
+  if (
+    released !== null &&
+    typeof released === "object" &&
+    "then" in released &&
+    typeof released.then === "function"
+  ) {
+    return released as Promise<TReapOutcome>;
+  }
+  return undefined;
+};
+
 // ─── claude: blocking native login ───────────────────────────────────────
 
 export type TBlockingConnectConfig = {
@@ -73,13 +90,15 @@ export type TBlockingConnectConfig = {
   readonly nativeAuth?: {
     readonly producer: TNativeAuthProducer;
   };
+  /** Shared with paste-back for this provider. */
+  readonly slot?: TLoginSlot;
 };
 
 /**
  * claude's `connect`: a SYNCHRONOUS browser login — `claude auth login` opens
- * the browser and blocks until its own localhost callback completes, then the
- * credential is in the CLI's store. No single-flight / pending-auth (the call
- * blocks for the whole flow), so no slot.
+ * the browser and blocks until its own localhost callback completes. Ownership
+ * is the shared per-provider slot (same as paste-back), reserved before
+ * readiness/spawn so cancel can reach the operation with no child yet.
  */
 export const makeBlockingConnect = (
   cfg: TBlockingConnectConfig,
@@ -91,9 +110,22 @@ export const makeBlockingConnect = (
         installed: cfg.installed,
         installHint: cfg.installHint,
         mode: "browser",
+        ...(cfg.slot !== undefined ? { slot: cfg.slot } : {}),
+        inProgressDetail:
+          "Sign-in already in progress — this updates automatically.",
       },
       async () => {
         const flow = resolveLoginFlow(cfg.provider, "browser");
+        const slot = cfg.slot;
+        const operation = new AbortController();
+        if (slot !== undefined && !slot.start(() => operation.abort(), flow)) {
+          emitLoginFailed(flow, {
+            code: "spawn_denied",
+            message: "daemon update in progress",
+            retryable: true,
+          });
+          return { connected: false, detail: "daemon update in progress" };
+        }
         const correlation = opaqueDoctorCorrelation(flow.flowId);
         const lifecycle =
           cfg.nativeAuth === undefined
@@ -105,41 +137,153 @@ export const makeBlockingConnect = (
                   ? { operationId: correlation }
                   : {}),
               });
+        const releaseNoChild = (): void => {
+          slot?.end(flow.flowId);
+          clearPendingAuth(cfg.provider, flow.flowId);
+        };
+        const cancelledResult = (): TConnectResult => {
+          emitLoginFailed(flow, {
+            code: "user_cancelled",
+            message: "sign-in cancelled",
+            retryable: false,
+          });
+          return { connected: false, detail: "sign-in cancelled" };
+        };
+        const retainUnconfirmedCleanup = (
+          released: Promise<TReapOutcome> | undefined,
+        ): TConnectResult => {
+          slot?.markCleanupUnknown();
+          if (released !== undefined) {
+            void released.then(() => {
+              if (slot?.flow()?.flowId === flow.flowId) {
+                slot.end(flow.flowId);
+                clearPendingAuth(cfg.provider, flow.flowId);
+              }
+            });
+          }
+          finalizeLoginTerminal({
+            flow,
+            event: {
+              kind: "failed",
+              code: "poll_expired",
+              message: UNCONFIRMED_CLEANUP_DETAIL,
+              retryable: true,
+            },
+            provider: cfg.provider,
+            clearPending: false,
+          });
+          return {
+            connected: false,
+            pending: true,
+            detail: UNCONFIRMED_CLEANUP_DETAIL,
+          };
+        };
         try {
+          if (operation.signal.aborted || slot?.wasCancelled() === true) {
+            releaseNoChild();
+            return cancelledResult();
+          }
           const readyMark = lifecycle?.mark();
           lifecycle?.record("readiness_wait", readyMark);
           const ready = await cfg.beforeLogin?.();
           lifecycle?.record("readiness", readyMark);
+          if (operation.signal.aborted || slot?.wasCancelled() === true) {
+            releaseNoChild();
+            return cancelledResult();
+          }
           if (!loginReady(ready)) {
             emitLoginFailed(flow, {
               code: "spawn_denied",
               message: KEYCHAIN_NOT_READY_DETAIL,
               retryable: true,
             });
+            releaseNoChild();
             return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
           }
           emitLoginStarted(flow);
           lifecycle?.record("start");
-          // Keychain-dependent login (claude) runs unconfined on macOS — see
-          // `sandbox/policy.ts`; codex/kimi/grok stay confined on both platforms.
+          if (operation.signal.aborted || slot?.wasCancelled() === true) {
+            releaseNoChild();
+            return cancelledResult();
+          }
           const childMark = lifecycle?.mark();
           lifecycle?.record("child_wait", childMark);
-          const result = await spawnLogin([...cfg.argv()], cfg.env(), {
-            probe: unwrapKeychainSpawn(cfg.provider),
-            ...(cfg.nativeAuth !== undefined
-              ? {
-                  producer: cfg.nativeAuth.producer,
-                  ...(correlation !== undefined
-                    ? { operationId: correlation }
-                    : {}),
-                }
+          let result: TLoginResult;
+          try {
+            result = await spawnLogin([...cfg.argv()], cfg.env(), {
+              probe: unwrapKeychainSpawn(cfg.provider),
+              signal: operation.signal,
+              ...(cfg.nativeAuth !== undefined
+                ? {
+                    producer: cfg.nativeAuth.producer,
+                    ...(correlation !== undefined
+                      ? { operationId: correlation }
+                      : {}),
+                  }
+                : {}),
+            });
+          } catch (err) {
+            const cleanup =
+              err !== null &&
+              typeof err === "object" &&
+              "cleanup" in err &&
+              err.cleanup !== null &&
+              typeof err.cleanup === "object"
+                ? (err.cleanup as TLoginResult["cleanup"])
+                : undefined;
+            if (cleanup?.confirmed === false) {
+              return retainUnconfirmedCleanup(
+                err !== null && typeof err === "object"
+                  ? whenReleasedOf(err)
+                  : undefined,
+              );
+            }
+            if (operation.signal.aborted || slot?.wasCancelled() === true) {
+              releaseNoChild();
+              return cancelledResult();
+            }
+            emitLoginFailed(flow, {
+              code: "spawn_denied",
+              message: "login spawn failed",
+              retryable: true,
+            });
+            releaseNoChild();
+            return { connected: false, detail: "login spawn failed" };
+          }
+          lifecycle?.record("child", childMark, {
+            ...(result.spawn_setup_ms !== undefined
+              ? { spawn_setup_ms: result.spawn_setup_ms }
+              : {}),
+            ...(result.child_wait_ms !== undefined
+              ? { child_wait_ms: result.child_wait_ms }
               : {}),
           });
-          lifecycle?.record("child", childMark);
+          if (
+            result.cleanup !== undefined &&
+            result.cleanup.confirmed === false
+          ) {
+            return retainUnconfirmedCleanup(result.whenReleased);
+          }
+          if (operation.signal.aborted || slot?.wasCancelled() === true) {
+            slot?.end(flow.flowId);
+            clearPendingAuth(cfg.provider, flow.flowId);
+            return cancelledResult();
+          }
+          if (result.child_pid === null && result.spawned_at_ms === null) {
+            if (operation.signal.aborted || slot?.wasCancelled() === true) {
+              releaseNoChild();
+              return cancelledResult();
+            }
+          }
           const prepMark = lifecycle?.mark();
           lifecycle?.record("prep_wait", prepMark);
           const granted = await cfg.afterLogin?.();
           lifecycle?.record("prep", prepMark);
+          if (operation.signal.aborted || slot?.wasCancelled() === true) {
+            slot?.end(flow.flowId);
+            clearPendingAuth(cfg.provider, flow.flowId);
+            return cancelledResult();
+          }
           const sample = async (): Promise<TLoginVerify> => {
             try {
               return await cfg.verifyConnected();
@@ -159,6 +303,11 @@ export const makeBlockingConnect = (
             verified = await sample();
           }
           lifecycle?.record("verify", verifyMark);
+          if (operation.signal.aborted || slot?.wasCancelled() === true) {
+            slot?.end(flow.flowId);
+            clearPendingAuth(cfg.provider, flow.flowId);
+            return cancelledResult();
+          }
           if (verified.state === "connected") {
             if (granted === false) {
               emitLoginFailed(flow, {
@@ -166,10 +315,14 @@ export const makeBlockingConnect = (
                 message: KEYCHAIN_NOT_READY_DETAIL,
                 retryable: true,
               });
+              slot?.end(flow.flowId);
+              clearPendingAuth(cfg.provider, flow.flowId);
               return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
             }
             await cfg.onConnected?.();
             emitLoginSucceeded(flow);
+            slot?.end(flow.flowId);
+            clearPendingAuth(cfg.provider, flow.flowId);
             return { connected: true, detail: await cfg.successDetail() };
           }
           const detail = cfg.failDetail(result);
@@ -179,6 +332,8 @@ export const makeBlockingConnect = (
               message: detail,
               retryable: true,
             });
+            slot?.end(flow.flowId);
+            clearPendingAuth(cfg.provider, flow.flowId);
             return { connected: false, detail };
           }
           const crashed =
@@ -190,6 +345,8 @@ export const makeBlockingConnect = (
             message: detail,
             retryable: !crashed,
           });
+          slot?.end(flow.flowId);
+          clearPendingAuth(cfg.provider, flow.flowId);
           return { connected: false, detail };
         } finally {
           lifecycle?.record("terminal");

@@ -32,7 +32,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { autoUpdateEnabled } from "./auto-update-pref";
-import { cliVersion } from "./delegation/util";
+import { invalidateMatchingCliVersionOutput } from "./cli-version-cache";
+import { cliVersion } from "./delegation/spawn";
 import { daemonEnv, stateDir } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
@@ -80,9 +81,23 @@ export const resolveOpenllmCli = (): string | null =>
  * the converger then leaves it alone. Shares in-flight work with
  * `device-state`; an unchanged binary is not re-spawned.
  */
-const installedCliVersion = async (bin: string): Promise<string | null> => {
-  const out = await cliVersion(bin);
-  return out?.match(/openllmc? v(\S+)/)?.[1] ?? null;
+const parseProductCliVersion = (out: string | null): string | null =>
+  out?.match(/openllmc? v(\S+)/)?.[1] ?? null;
+
+const installedCliVersion = async (
+  bin: string,
+  opts?: { readonly reprobeUnknown?: boolean },
+): Promise<string | null> => {
+  const versionOpts =
+    opts?.reprobeUnknown === true ? { reprobe: true } : undefined;
+  const out = await cliVersion(bin, undefined, versionOpts);
+  const parsed = parseProductCliVersion(out);
+  if (parsed !== null) return parsed;
+  if (opts?.reprobeUnknown !== true) return null;
+  if (out === null) return null;
+  if (!invalidateMatchingCliVersionOutput(bin, out)) return null;
+  const again = await cliVersion(bin, undefined, { reprobe: true });
+  return parseProductCliVersion(again);
 };
 
 // Re-entrancy guard: a bootstrap tick and a forced dashboard update could both
@@ -100,9 +115,20 @@ let updating = false;
  * ({@link autoUpdateEnabled}); an explicit user request (the dashboard's
  * "update now" command) passes `force: true` to bypass it.
  */
+export type TMaybeUpdateCliOpts = {
+  readonly force?: boolean;
+  /**
+   * Explicit `update` only. Bypass a process-local miss / invalidate one
+   * unparseable product observation and allow a single recovery probe.
+   * Not `force` (preference override). Bootstrap, periodic ticks, status
+   * readers, and auto-update-enable catch-up must omit this.
+   */
+  readonly reprobeUnknown?: boolean;
+};
+
 export const maybeUpdateCli = async (
   latest: string | null,
-  opts?: { readonly force?: boolean },
+  opts?: TMaybeUpdateCliOpts,
 ): Promise<void> => {
   if (updating) return;
   if (opts?.force !== true && !autoUpdateEnabled()) return;
@@ -116,7 +142,9 @@ export const maybeUpdateCli = async (
   if (legacyOnly) bin = legacy;
   // The daemon never installs the CLI — absent means skip, not install.
   if (!existsSync(bin)) return;
-  const current = await installedCliVersion(bin);
+  const current = await installedCliVersion(bin, {
+    reprobeUnknown: opts?.reprobeUnknown === true,
+  });
   if (current === null) {
     logWarn(
       "cli-update",

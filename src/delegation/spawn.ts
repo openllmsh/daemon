@@ -12,7 +12,7 @@ import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type { TDoctorEventTimings } from "@openllmsh/protocol";
-import type { TSuperviseSpawnOptions } from "../child-supervisor";
+import type { TReapOutcome, TSuperviseSpawnOptions } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
 import type { TCliVersionOpts } from "../cli-version-cache";
 import { cachedCliVersion } from "../cli-version-cache";
@@ -24,7 +24,13 @@ import {
   timeoutCallbackLatenessMs,
 } from "../deadline-budget";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
-import { logDebug, logError, logWarn, safeDiagnosticMessage } from "../logger";
+import {
+  logDebug,
+  logError,
+  logInfo,
+  logWarn,
+  safeDiagnosticMessage,
+} from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -184,6 +190,14 @@ export const bindAbort = (
   };
 };
 
+/**
+ * Read abort without using `=== true` on a property TypeScript may have
+ * narrowed to `false` after an earlier early-return. A later abort remains
+ * observable.
+ */
+const signalAbortRequested = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted ?? false;
+
 type TCaptureOutcome =
   | { readonly kind: "complete"; readonly out: string; readonly code: number }
   | { readonly kind: "timeout" }
@@ -285,7 +299,7 @@ export const runCaptureResult = async (
   env?: Record<string, string>,
   opts?: TRunCaptureOpts,
 ): Promise<TRunCaptureResult> => {
-  if (opts?.signal?.aborted === true) return { kind: "aborted" };
+  if (signalAbortRequested(opts?.signal)) return { kind: "aborted" };
   try {
     const setupStartedAtMs = performance.now();
     const command = spawnCommand(
@@ -445,61 +459,79 @@ export const runCaptureResult = async (
           proc.exitCode !== null ||
           proc.signalCode !== null;
         const rootExitCodeAtRace = rootExitCode ?? proc.exitCode;
-        const cleanupStartedAtMs = performance.now();
-        await child.terminate(splitReapBudget(budget.remainingMs()));
-        const cleanupMs = performance.now() - cleanupStartedAtMs;
         const armed = timerArmedAtMs ?? spawnedAtMs;
         const fired = timerFiredAtMs ?? raceObservedAtMs;
-        logWarn(
-          "spawn",
+        const lateness = timeoutCallbackLatenessMs(armed, fired, timerDelayMs);
+        const timeoutMessage =
           opts?.producer === "claude-auth-status"
             ? safeDiagnosticMessage`Authentication status probe exceeded its time budget.`
             : opts?.producer === "claude-refresh"
               ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
               : opts?.producer === "claude-logout"
                 ? safeDiagnosticMessage`Logout exceeded its time budget.`
-                : safeDiagnosticMessage`Native capture exceeded its time budget.`,
+                : safeDiagnosticMessage`Native capture exceeded its time budget.`;
+        const raceMeta = {
+          configured_timeout_ms: configuredTimeoutMs,
+          deadline_ms: remainingAtSpawn,
+          remaining_at_spawn_ms: remainingAtSpawn,
+          budget_remaining_ms_at_spawn: remainingAtSpawn,
+          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+          spawn_setup_ms: spawnSetupMs,
+          timer_armed_at_ms: armed,
+          timer_fired_at_ms: fired,
+          race_observed_at_ms: raceObservedAtMs,
+          timeout_callback_lateness_ms: lateness,
+          stdout_closed: stdoutClosedAtRace,
+          root_exited: rootExitedAtRace,
+          root_exit_code: rootExitCodeAtRace,
+          clock: "performance.now" as const,
+          child_pid: typeof proc.pid === "number" ? proc.pid : null,
+          tick_id: currentTickId(),
+          kind: spawnOptions.kind,
+          probe: opts?.probe === true,
+          reason_code: "timeout" as const,
+          phase: "timeout_race" as const,
+          cancel_requested: signalAbortRequested(opts?.signal),
+          ...(opts?.producer !== undefined ? { producer: opts.producer } : {}),
+          ...nativeAuthOperationMeta(opts?.operationId),
+          ...(opts?.producer === undefined
+            ? { argv: redactSensitiveArgv(argv) }
+            : {}),
+        };
+        const raceDoctor = nativeAuthDoctorObservation(opts?.operationId, {
+          configured_timeout_ms: configuredTimeoutMs,
+          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+          budget_remaining_ms_at_spawn: remainingAtSpawn,
+          timeout_callback_lateness_ms: Math.max(0, lateness),
+          stdout_closed: stdoutClosedAtRace,
+          root_exited: rootExitedAtRace,
+          ...(typeof rootExitCodeAtRace === "number"
+            ? { root_exit_code: rootExitCodeAtRace }
+            : {}),
+        });
+        logWarn("spawn", timeoutMessage, raceMeta, raceDoctor);
+        const cleanupStartedAtMs = performance.now();
+        const reap = await child.terminate(
+          splitReapBudget(budget.remainingMs()),
+        );
+        const cleanupMs = performance.now() - cleanupStartedAtMs;
+        const cleanup = childCleanupOutcome(
+          reap,
+          signalAbortRequested(opts?.signal),
+        );
+        logInfo(
+          "spawn",
+          safeDiagnosticMessage`Native capture cleanup finished.`,
           {
-            configured_timeout_ms: configuredTimeoutMs,
-            deadline_ms: remainingAtSpawn,
-            remaining_at_spawn_ms: remainingAtSpawn,
-            budget_remaining_ms_at_spawn: remainingAtSpawn,
-            spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-            spawn_setup_ms: spawnSetupMs,
-            timer_armed_at_ms: armed,
-            timer_fired_at_ms: fired,
-            race_observed_at_ms: raceObservedAtMs,
-            timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-              armed,
-              fired,
-              timerDelayMs,
-            ),
-            stdout_closed: stdoutClosedAtRace,
-            root_exited: rootExitedAtRace,
-            root_exit_code: rootExitCodeAtRace,
+            ...raceMeta,
+            phase: "cleanup",
+            reason_code: "cleanup",
             cleanup_ms: cleanupMs,
-            clock: "performance.now",
-            child_pid: typeof proc.pid === "number" ? proc.pid : null,
-            tick_id: currentTickId(),
-            kind: spawnOptions.kind,
-            probe: opts?.probe === true,
-            reason_code: "timeout",
-            ...(opts?.producer !== undefined
-              ? { producer: opts.producer }
-              : {}),
-            ...nativeAuthOperationMeta(opts?.operationId),
-            ...(opts?.producer === undefined
-              ? { argv: redactSensitiveArgv(argv) }
-              : {}),
+            cleanup_reap: cleanup.reap,
+            cleanup_confirmed: cleanup.confirmed,
+            cancel_requested: cleanup.cancel_requested,
           },
           nativeAuthDoctorObservation(opts?.operationId, {
-            configured_timeout_ms: configuredTimeoutMs,
-            spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-            budget_remaining_ms_at_spawn: remainingAtSpawn,
-            timeout_callback_lateness_ms: Math.max(
-              0,
-              timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
-            ),
             cleanup_ms: cleanupMs,
             stdout_closed: stdoutClosedAtRace,
             root_exited: rootExitedAtRace,
@@ -534,6 +566,7 @@ export const runCaptureResult = async (
       unbind();
       unbindAbortWait();
       if (timer !== null) clearTimeout(timer);
+      budget.release();
     }
   } catch {
     return { kind: "failed" };
@@ -578,7 +611,41 @@ export type TLoginResult = {
   readonly spawned_at_ms: number | null;
   /** Child pid immediately after `superviseSpawn`. Null when no child ran. */
   readonly child_pid: number | null;
+  /** `performance.now()` spawn setup duration. */
+  readonly spawn_setup_ms?: number;
+  /** `performance.now()` child-wait duration until race/exit. */
+  readonly child_wait_ms?: number;
+  /**
+   * Actual group-reap result. Absent when no child ran. `confirmed: false`
+   * means termination was not observed — retain ownership. Not implied by
+   * `signal` being cancellable.
+   */
+  readonly cleanup?: TChildCleanupOutcome;
+  /**
+   * Settles when supervisor tracking is dropped. Pending while cleanup is
+   * unconfirmed. P1 should await this instead of parsing thrown handles.
+   */
+  readonly whenReleased?: Promise<TReapOutcome>;
 };
+
+/**
+ * Confirmed process-group cleanup for an owned login/capture child.
+ * `cancellable: true` on a signal is never treated as completed termination.
+ */
+export type TChildCleanupOutcome = {
+  readonly reap: TReapOutcome;
+  readonly confirmed: boolean;
+  readonly cancel_requested: boolean;
+};
+
+export const childCleanupOutcome = (
+  reap: TReapOutcome,
+  cancelRequested: boolean,
+): TChildCleanupOutcome => ({
+  reap,
+  confirmed: reap !== "reap_unconfirmed",
+  cancel_requested: cancelRequested,
+});
 
 const noChildResult = (abandoned: boolean): TLoginResult => ({
   code: -1,
@@ -637,15 +704,35 @@ const awaitOnDeadline = async (
   check: (() => boolean | Promise<boolean>) | undefined,
 ): Promise<boolean> => {
   if (check === undefined) return false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   try {
     return await Promise.race([
       Promise.resolve(check()).then((v) => v === true),
       new Promise<boolean>((resolve) => {
-        setTimeout(() => resolve(false), DEADLINE_CHECK_CAP_MS);
+        timer = setTimeout(() => resolve(false), DEADLINE_CHECK_CAP_MS);
       }),
     ]);
   } catch {
     return false;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+};
+
+const waitWithCap = async (
+  work: Promise<unknown>,
+  capMs: number,
+): Promise<void> => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      work.then(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, capMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
 };
 
@@ -677,7 +764,7 @@ export const spawnLogin = async (
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
   const loginOpts = opts;
-  if (loginOpts?.signal?.aborted === true) {
+  if (signalAbortRequested(loginOpts?.signal)) {
     return noChildResult(true);
   }
   const setupStartedAtMs = performance.now();
@@ -698,279 +785,397 @@ export const spawnLogin = async (
       ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
     },
   );
-  const spawnedAtMs = performance.now();
-  const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
-  const proc = child.subprocess;
-  const stamp = spawnStamp(proc);
-  if (loginOpts?.producer !== undefined) {
-    logDebug("spawn", "native auth child started", {
-      producer: loginOpts.producer,
-      ...nativeAuthOperationMeta(loginOpts.operationId),
-      phase: "start",
-      child_pid: stamp.child_pid,
-      tick_id: currentTickId(),
-      configured_timeout_ms: timeoutMs,
-      remaining_at_spawn_ms: remainingAtSpawn,
-      spawn_setup_ms: spawnSetupMs,
-      clock: "performance.now",
+  try {
+    const spawnedAtMs = performance.now();
+    const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
+    const proc = child.subprocess;
+    const stamp = spawnStamp(proc);
+    const unbindEarlyAbort = bindAbort(loginOpts?.signal, () => {
+      void child.terminate(splitReapBudget(budget.remainingMs()));
     });
-  }
-  const stdout = proc.stdout;
-  const stderr = proc.stderr;
-  if (
-    stdout === undefined ||
-    typeof stdout === "number" ||
-    stderr === undefined ||
-    typeof stderr === "number"
-  ) {
-    await child.terminate(splitReapBudget(budget.remainingMs()));
-    return { code: -1, output: "", abandoned: true, ...stamp };
-  }
-  const dec = new TextDecoder();
-  let out = "";
-  let err = "";
-  let abandoned = false;
-  let killTimer: ReturnType<typeof setTimeout> | null = null;
-  let settleTimer: ReturnType<typeof setTimeout> | null = null;
-  let timerArmedAtMs: number | null = null;
-  let timerFiredAtMs: number | null = null;
-  let timerDelayMs = remainingAtSpawn;
-  let stdoutClosed = false;
-  let stderrClosed = false;
-  let rootExitCode: number | null = null;
-  let cleanupMs: number | null = null;
-  void proc.exited.then((code) => {
-    rootExitCode = code;
-  });
-  let markAbandoned!: () => void;
-  const abandonedGate = new Promise<void>((resolve) => {
-    markAbandoned = resolve;
-  });
-  const readers: Array<ReadableStreamDefaultReader<Uint8Array>> = [];
-  const kill = (): void => {
-    if (abandoned) return;
-    abandoned = true;
-    markAbandoned();
-    for (const reader of readers) {
-      void reader.cancel().catch(() => {});
-    }
-    void child.terminate(splitReapBudget(budget.remainingMs()));
-  };
-
-  const emitLoginTimeout = (opts: {
-    readonly stdoutClosed: boolean;
-    readonly stderrClosed: boolean;
-    readonly rootExited: boolean;
-    readonly rootExitCode: number | null;
-    readonly cleanupMs: number;
-  }): void => {
-    const raceObservedAtMs = performance.now();
-    const armed = timerArmedAtMs ?? spawnedAtMs;
-    const fired = timerFiredAtMs ?? raceObservedAtMs;
-    logWarn(
-      "spawn",
-      loginOpts?.producer === "claude-refresh"
-        ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
-        : safeDiagnosticMessage`Login exceeded its time budget.`,
-      {
-        configured_timeout_ms: timeoutMs,
-        deadline_ms: remainingAtSpawn,
-        remaining_at_spawn_ms: remainingAtSpawn,
-        budget_remaining_ms_at_spawn: remainingAtSpawn,
-        spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-        spawn_setup_ms: spawnSetupMs,
-        timer_armed_at_ms: armed,
-        timer_fired_at_ms: fired,
-        race_observed_at_ms: raceObservedAtMs,
-        timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
-          armed,
-          fired,
-          timerDelayMs,
-        ),
-        stdout_closed: opts.stdoutClosed,
-        stderr_closed: opts.stderrClosed,
-        root_exited: opts.rootExited,
-        root_exit_code: opts.rootExitCode,
-        cleanup_ms: opts.cleanupMs,
-        clock: "performance.now",
+    if (loginOpts?.producer !== undefined) {
+      logDebug("spawn", "native auth child started", {
+        producer: loginOpts.producer,
+        ...nativeAuthOperationMeta(loginOpts.operationId),
+        phase: "start",
         child_pid: stamp.child_pid,
         tick_id: currentTickId(),
-        kind: "login",
-        probe: loginOpts?.probe === true,
-        reason_code: "timeout",
-        abandoned: true,
-        ...(loginOpts?.producer !== undefined
-          ? { producer: loginOpts.producer }
-          : {}),
-        ...nativeAuthOperationMeta(loginOpts?.operationId),
-      },
-      nativeAuthDoctorObservation(loginOpts?.operationId, {
         configured_timeout_ms: timeoutMs,
-        spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
-        budget_remaining_ms_at_spawn: remainingAtSpawn,
-        timeout_callback_lateness_ms: Math.max(
-          0,
-          timeoutCallbackLatenessMs(armed, fired, timerDelayMs),
-        ),
-        cleanup_ms: opts.cleanupMs,
-        stdout_closed: opts.stdoutClosed,
-        stderr_closed: opts.stderrClosed,
-        root_exited: opts.rootExited,
-        ...(typeof opts.rootExitCode === "number"
-          ? { root_exit_code: opts.rootExitCode }
-          : {}),
-      }),
-    );
-  };
-
-  const onTimeout = (): void => {
-    void (async (): Promise<void> => {
-      if (abandoned) return;
-      const stdoutClosedAtDeadline = stdoutClosed;
-      const stderrClosedAtDeadline = stderrClosed;
-      const rootExitedAtDeadline =
-        rootExitCode !== null ||
-        proc.exitCode !== null ||
-        proc.signalCode !== null;
-      const rootExitCodeAtDeadline = rootExitCode ?? proc.exitCode;
-      const defer = await awaitOnDeadline(loginOpts?.onDeadline);
-      if (abandoned) return;
-      if (defer) {
-        const graceMs = Math.max(0, loginOpts?.persistenceGraceMs ?? 0);
-        if (graceMs > 0 && proc.exitCode === null && proc.signalCode === null) {
-          await Promise.race([
-            proc.exited,
-            new Promise<void>((resolve) => {
-              setTimeout(resolve, graceMs);
-            }),
-          ]);
-        }
-        if (abandoned) return;
-        if (proc.exitCode !== null || proc.signalCode !== null) return;
-      }
-      const cleanupStartedAtMs = performance.now();
-      kill();
-      await child.terminate(splitReapBudget(budget.remainingMs()));
-      cleanupMs = performance.now() - cleanupStartedAtMs;
-      emitLoginTimeout({
-        stdoutClosed: stdoutClosedAtDeadline,
-        stderrClosed: stderrClosedAtDeadline,
-        rootExited: rootExitedAtDeadline,
-        rootExitCode: rootExitCodeAtDeadline,
-        cleanupMs,
+        remaining_at_spawn_ms: remainingAtSpawn,
+        spawn_setup_ms: spawnSetupMs,
+        clock: "performance.now",
       });
-    })();
-  };
-  const scheduleTimeout =
-    loginTimeoutSchedulerForTests ??
-    ((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> =>
-      setTimeout(callback, delayMs));
-  timerDelayMs = budget.remainingMs();
-  timerArmedAtMs = performance.now();
-  killTimer = scheduleTimeout(() => {
-    timerFiredAtMs = performance.now();
-    onTimeout();
-  }, timerDelayMs);
-  const unbindAbort = bindAbort(opts?.signal, kill);
-
-  const pump = async (
-    stream: ReadableStream<Uint8Array>,
-    onChunk: (s: string) => void,
-    onClose: () => void,
-  ): Promise<void> => {
-    const reader = stream.getReader();
-    readers.push(reader);
-    try {
-      for (;;) {
-        if (abandoned) break;
-        const { done, value } = await reader.read();
-        if (done) {
-          onClose();
-          break;
-        }
-        if (abandoned) break;
-        if (value !== undefined) onChunk(dec.decode(value));
-        // Early-return once the awaited output appears (the child may never exit
-        // cleanly — it can WEDGE after printing the token). Match the COMBINED
-        // stream so a token on either fd is seen. We don't kill immediately: a
-        // token can arrive split across read chunks, so a SETTLE delay lets the
-        // remaining bytes land before we kill + parse — capturing the FULL token
-        // without needing a stricter (and more brittle) trailing-boundary regex.
-        if (
-          opts?.until !== undefined &&
-          settleTimer === null &&
-          !abandoned &&
-          opts.until.test(`${out}\n${err}`)
-        ) {
-          settleTimer = setTimeout(kill, UNTIL_SETTLE_MS);
-        }
-      }
-    } catch {
-      // Cancelled reader after abandon — captured output is still valid.
-    } finally {
-      try {
-        reader.releaseLock();
-      } catch {
-        // Already cancelled.
-      }
     }
-  };
-
-  await Promise.race([
-    Promise.all([
-      pump(
-        stdout,
-        (s) => {
-          out += s;
-        },
-        () => {
-          stdoutClosed = true;
-        },
-      ),
-      pump(
-        stderr,
-        (s) => {
-          err += s;
-        },
-        () => {
-          stderrClosed = true;
-        },
-      ),
-      proc.exited,
-    ]),
-    abandonedGate,
-  ]);
-  unbindAbort();
-  if (killTimer !== null) clearTimeout(killTimer);
-  if (settleTimer !== null) clearTimeout(settleTimer);
-  if (abandoned) {
-    await child.terminate(splitReapBudget(budget.remainingMs()));
-  }
-
-  // Only surface a SIGNAL kill we did NOT cause (a sandbox/OS kill) — our own
-  // `until`/timeout kill is expected and its output is valid.
-  if (!abandoned) logIfKilled(argv, proc, { confined: opts?.probe !== true });
-  if (loginOpts?.producer !== undefined) {
-    logDebug("spawn", "native auth child finished", {
-      producer: loginOpts.producer,
-      ...nativeAuthOperationMeta(loginOpts.operationId),
-      phase: "result",
-      reason_code: abandoned ? "abandoned" : "complete",
-      abandoned,
-      child_pid: stamp.child_pid,
-      tick_id: currentTickId(),
-      clock: "performance.now",
+    const stdout = proc.stdout;
+    const stderr = proc.stderr;
+    if (
+      stdout === undefined ||
+      typeof stdout === "number" ||
+      stderr === undefined ||
+      typeof stderr === "number"
+    ) {
+      unbindEarlyAbort();
+      const reap = await child.terminate(splitReapBudget(budget.remainingMs()));
+      return {
+        code: -1,
+        output: "",
+        abandoned: true,
+        spawn_setup_ms: spawnSetupMs,
+        cleanup: childCleanupOutcome(
+          reap,
+          signalAbortRequested(loginOpts?.signal),
+        ),
+        whenReleased: child.whenReleased,
+        ...stamp,
+      };
+    }
+    const dec = new TextDecoder();
+    let out = "";
+    let err = "";
+    let abandoned = false;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    let timerArmedAtMs: number | null = null;
+    let timerFiredAtMs: number | null = null;
+    let timerDelayMs = remainingAtSpawn;
+    let stdoutClosed = false;
+    let stderrClosed = false;
+    let rootExitCode: number | null = null;
+    let cleanupMs: number | null = null;
+    let cleanup: TChildCleanupOutcome | undefined;
+    let terminatePromise: Promise<TReapOutcome> | null = null;
+    const cancelRequested = (): boolean =>
+      signalAbortRequested(loginOpts?.signal);
+    const requestTerminate = (): Promise<TReapOutcome> => {
+      if (terminatePromise === null) {
+        terminatePromise = child.terminate(
+          splitReapBudget(budget.remainingMs()),
+        );
+      }
+      return terminatePromise;
+    };
+    void proc.exited.then((code) => {
+      rootExitCode = code;
     });
+    let markAbandoned!: () => void;
+    const abandonedGate = new Promise<void>((resolve) => {
+      markAbandoned = resolve;
+    });
+    const readers: Array<ReadableStreamDefaultReader<Uint8Array>> = [];
+    const kill = (): void => {
+      if (abandoned) return;
+      abandoned = true;
+      markAbandoned();
+      for (const reader of readers) {
+        void reader.cancel().catch(() => {});
+      }
+      void requestTerminate();
+    };
+
+    const emitLoginTimeoutRace = (opts: {
+      readonly stdoutClosed: boolean;
+      readonly stderrClosed: boolean;
+      readonly rootExited: boolean;
+      readonly rootExitCode: number | null;
+    }): {
+      readonly raceObservedAtMs: number;
+      readonly armed: number;
+      readonly fired: number;
+      readonly lateness: number;
+    } => {
+      const raceObservedAtMs = performance.now();
+      const armed = timerArmedAtMs ?? spawnedAtMs;
+      const fired = timerFiredAtMs ?? raceObservedAtMs;
+      const lateness = timeoutCallbackLatenessMs(armed, fired, timerDelayMs);
+      logWarn(
+        "spawn",
+        loginOpts?.producer === "claude-refresh"
+          ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
+          : safeDiagnosticMessage`Login exceeded its time budget.`,
+        {
+          configured_timeout_ms: timeoutMs,
+          deadline_ms: remainingAtSpawn,
+          remaining_at_spawn_ms: remainingAtSpawn,
+          budget_remaining_ms_at_spawn: remainingAtSpawn,
+          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+          spawn_setup_ms: spawnSetupMs,
+          timer_armed_at_ms: armed,
+          timer_fired_at_ms: fired,
+          race_observed_at_ms: raceObservedAtMs,
+          timeout_callback_lateness_ms: lateness,
+          stdout_closed: opts.stdoutClosed,
+          stderr_closed: opts.stderrClosed,
+          root_exited: opts.rootExited,
+          root_exit_code: opts.rootExitCode,
+          clock: "performance.now",
+          child_pid: stamp.child_pid,
+          tick_id: currentTickId(),
+          kind: "login",
+          probe: loginOpts?.probe === true,
+          reason_code: "timeout",
+          phase: "timeout_race",
+          abandoned: true,
+          cancel_requested: cancelRequested(),
+          ...(loginOpts?.producer !== undefined
+            ? { producer: loginOpts.producer }
+            : {}),
+          ...nativeAuthOperationMeta(loginOpts?.operationId),
+        },
+        nativeAuthDoctorObservation(loginOpts?.operationId, {
+          configured_timeout_ms: timeoutMs,
+          spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+          budget_remaining_ms_at_spawn: remainingAtSpawn,
+          timeout_callback_lateness_ms: Math.max(0, lateness),
+          stdout_closed: opts.stdoutClosed,
+          stderr_closed: opts.stderrClosed,
+          root_exited: opts.rootExited,
+          ...(typeof opts.rootExitCode === "number"
+            ? { root_exit_code: opts.rootExitCode }
+            : {}),
+        }),
+      );
+      return { raceObservedAtMs, armed, fired, lateness };
+    };
+
+    const emitLoginCleanup = (opts: {
+      readonly stdoutClosed: boolean;
+      readonly stderrClosed: boolean;
+      readonly rootExited: boolean;
+      readonly rootExitCode: number | null;
+      readonly cleanupMs: number;
+      readonly cleanup: TChildCleanupOutcome;
+    }): void => {
+      logInfo(
+        "spawn",
+        safeDiagnosticMessage`Login cleanup finished.`,
+        {
+          configured_timeout_ms: timeoutMs,
+          spawn_setup_ms: spawnSetupMs,
+          stdout_closed: opts.stdoutClosed,
+          stderr_closed: opts.stderrClosed,
+          root_exited: opts.rootExited,
+          root_exit_code: opts.rootExitCode,
+          cleanup_ms: opts.cleanupMs,
+          cleanup_reap: opts.cleanup.reap,
+          cleanup_confirmed: opts.cleanup.confirmed,
+          cancel_requested: opts.cleanup.cancel_requested,
+          clock: "performance.now",
+          child_pid: stamp.child_pid,
+          tick_id: currentTickId(),
+          kind: "login",
+          probe: loginOpts?.probe === true,
+          reason_code: "cleanup",
+          phase: "cleanup",
+          abandoned: true,
+          ...(loginOpts?.producer !== undefined
+            ? { producer: loginOpts.producer }
+            : {}),
+          ...nativeAuthOperationMeta(loginOpts?.operationId),
+        },
+        nativeAuthDoctorObservation(loginOpts?.operationId, {
+          cleanup_ms: opts.cleanupMs,
+          stdout_closed: opts.stdoutClosed,
+          stderr_closed: opts.stderrClosed,
+          root_exited: opts.rootExited,
+          ...(typeof opts.rootExitCode === "number"
+            ? { root_exit_code: opts.rootExitCode }
+            : {}),
+        }),
+      );
+    };
+
+    const onTimeout = (): void => {
+      void (async (): Promise<void> => {
+        if (abandoned) return;
+        const stdoutClosedAtDeadline = stdoutClosed;
+        const stderrClosedAtDeadline = stderrClosed;
+        const rootExitedAtDeadline =
+          rootExitCode !== null ||
+          proc.exitCode !== null ||
+          proc.signalCode !== null;
+        const rootExitCodeAtDeadline = rootExitCode ?? proc.exitCode;
+        emitLoginTimeoutRace({
+          stdoutClosed: stdoutClosedAtDeadline,
+          stderrClosed: stderrClosedAtDeadline,
+          rootExited: rootExitedAtDeadline,
+          rootExitCode: rootExitCodeAtDeadline,
+        });
+        const defer = await awaitOnDeadline(loginOpts?.onDeadline);
+        if (abandoned) return;
+        if (defer) {
+          const graceMs = Math.max(0, loginOpts?.persistenceGraceMs ?? 0);
+          if (
+            graceMs > 0 &&
+            proc.exitCode === null &&
+            proc.signalCode === null
+          ) {
+            await waitWithCap(proc.exited, graceMs);
+          }
+          if (abandoned) return;
+          if (proc.exitCode !== null || proc.signalCode !== null) return;
+        }
+        const cleanupStartedAtMs = performance.now();
+        kill();
+        const reap = await requestTerminate();
+        cleanupMs = performance.now() - cleanupStartedAtMs;
+        cleanup = childCleanupOutcome(reap, cancelRequested());
+        emitLoginCleanup({
+          stdoutClosed: stdoutClosedAtDeadline,
+          stderrClosed: stderrClosedAtDeadline,
+          rootExited: rootExitedAtDeadline,
+          rootExitCode: rootExitCodeAtDeadline,
+          cleanupMs,
+          cleanup,
+        });
+      })();
+    };
+    const scheduleTimeout =
+      loginTimeoutSchedulerForTests ??
+      ((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> =>
+        setTimeout(callback, delayMs));
+    timerDelayMs = budget.remainingMs();
+    timerArmedAtMs = performance.now();
+    killTimer = scheduleTimeout(() => {
+      timerFiredAtMs = performance.now();
+      onTimeout();
+    }, timerDelayMs);
+    const unbindAbort = bindAbort(opts?.signal, kill);
+
+    const pump = async (
+      stream: ReadableStream<Uint8Array>,
+      onChunk: (s: string) => void,
+      onClose: () => void,
+    ): Promise<void> => {
+      const reader = stream.getReader();
+      readers.push(reader);
+      try {
+        for (;;) {
+          if (abandoned) break;
+          const { done, value } = await reader.read();
+          if (done) {
+            onClose();
+            break;
+          }
+          if (abandoned) break;
+          if (value !== undefined) onChunk(dec.decode(value));
+          // Early-return once the awaited output appears (the child may never exit
+          // cleanly — it can WEDGE after printing the token). Match the COMBINED
+          // stream so a token on either fd is seen. We don't kill immediately: a
+          // token can arrive split across read chunks, so a SETTLE delay lets the
+          // remaining bytes land before we kill + parse — capturing the FULL token
+          // without needing a stricter (and more brittle) trailing-boundary regex.
+          if (
+            opts?.until !== undefined &&
+            settleTimer === null &&
+            !abandoned &&
+            opts.until.test(`${out}\n${err}`)
+          ) {
+            settleTimer = setTimeout(kill, UNTIL_SETTLE_MS);
+          }
+        }
+      } catch {
+        // Cancelled reader after abandon — captured output is still valid.
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // Already cancelled.
+        }
+      }
+    };
+
+    await Promise.race([
+      Promise.all([
+        pump(
+          stdout,
+          (s) => {
+            out += s;
+          },
+          () => {
+            stdoutClosed = true;
+          },
+        ),
+        pump(
+          stderr,
+          (s) => {
+            err += s;
+          },
+          () => {
+            stderrClosed = true;
+          },
+        ),
+        proc.exited,
+      ]),
+      abandonedGate,
+    ]);
+    unbindEarlyAbort();
+    unbindAbort();
+    if (killTimer !== null) clearTimeout(killTimer);
+    if (settleTimer !== null) clearTimeout(settleTimer);
+    if (abandoned) {
+      const cleanupStartedAtMs = performance.now();
+      const reap = await requestTerminate();
+      cleanupMs = performance.now() - cleanupStartedAtMs;
+      cleanup = childCleanupOutcome(reap, cancelRequested());
+    }
+
+    // Only surface a SIGNAL kill we did NOT cause (a sandbox/OS kill) — our own
+    // `until`/timeout kill is expected and its output is valid.
+    if (!abandoned) logIfKilled(argv, proc, { confined: opts?.probe !== true });
+    const childWaitMs = performance.now() - spawnedAtMs;
+    if (loginOpts?.producer !== undefined) {
+      logDebug("spawn", "native auth child finished", {
+        producer: loginOpts.producer,
+        ...nativeAuthOperationMeta(loginOpts.operationId),
+        phase: "result",
+        reason_code: abandoned ? "abandoned" : "complete",
+        abandoned,
+        child_pid: stamp.child_pid,
+        tick_id: currentTickId(),
+        clock: "performance.now",
+        spawn_setup_ms: spawnSetupMs,
+        child_wait_ms: childWaitMs,
+        ...(cleanupMs !== null ? { cleanup_ms: cleanupMs } : {}),
+        ...(cleanup !== undefined
+          ? {
+              cleanup_reap: cleanup.reap,
+              cleanup_confirmed: cleanup.confirmed,
+              cancel_requested: cleanup.cancel_requested,
+            }
+          : {}),
+      });
+    }
+    // Join with a newline, NOT bare concatenation: a token printed as the last
+    // bytes of stdout (no trailing newline) must not fuse with the first bytes
+    // of stderr, or a greedy token match would swallow the spillover.
+    return {
+      code: proc.exitCode ?? -1,
+      output: `${out}\n${err}`.trim(),
+      abandoned,
+      spawn_setup_ms: spawnSetupMs,
+      child_wait_ms: childWaitMs,
+      ...(cleanup !== undefined ? { cleanup } : {}),
+      whenReleased: child.whenReleased,
+      ...stamp,
+    };
+  } catch {
+    const reap = await child.terminate(splitReapBudget(budget.remainingMs()));
+    return {
+      code: -1,
+      output: "",
+      abandoned: true,
+      cleanup: childCleanupOutcome(
+        reap,
+        signalAbortRequested(loginOpts?.signal),
+      ),
+      whenReleased: child.whenReleased,
+      spawned_at_ms: Date.now(),
+      child_pid:
+        typeof child.subprocess.pid === "number" ? child.subprocess.pid : null,
+    };
+  } finally {
+    budget.release();
   }
-  // Join with a newline, NOT bare concatenation: a token printed as the last
-  // bytes of stdout (no trailing newline) must not fuse with the first bytes
-  // of stderr, or a greedy token match would swallow the spillover.
-  return {
-    code: proc.exitCode ?? -1,
-    output: `${out}\n${err}`.trim(),
-    abandoned,
-    ...stamp,
-  };
 };
 
 // OSC (ESC ] … BEL/ST), CSI (ESC [ … final), and lone ESC. Built from a
@@ -1057,7 +1262,7 @@ export const spawnLoginPty = async (
   const ptyOpts = opts;
   const os = platform();
   if (os !== "darwin" && os !== "linux") return spawnLogin(argv, env, ptyOpts);
-  if (ptyOpts?.signal?.aborted === true) {
+  if (signalAbortRequested(ptyOpts?.signal)) {
     return noChildResult(true);
   }
 
@@ -1077,102 +1282,165 @@ export const spawnLoginPty = async (
   const budget =
     parentBudget?.child(timeoutMs) ??
     createDeadlineBudget(timeoutMs, opts?.signal);
-  const child = superviseSpawn(
-    sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }),
-    {
-      kind: "login",
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      cwd: spawnCwd(env),
-      ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
-    },
-  );
-  const proc = child.subprocess;
-  const stamp = spawnStamp(proc);
-
-  const readFile = (): Promise<string> =>
-    Bun.file(tsFile)
-      .text()
-      .catch(() => "");
-  let abandoned = false;
-  let captured = "";
-  const kill = (): void => {
-    if (abandoned) return;
-    abandoned = true;
-    void child.terminate(splitReapBudget(budget.remainingMs()));
-  };
-  const unbindAbort = bindAbort(opts?.signal, kill);
   try {
-    for (;;) {
-      if (abandoned) break;
-      captured = await readFile();
-      if (opts?.until?.test(stripAnsi(captured)) === true) {
-        // Settle: let the rest of the token line render before we kill + parse.
-        await new Promise((r) => setTimeout(r, UNTIL_SETTLE_MS));
+    const child = superviseSpawn(
+      sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }),
+      {
+        kind: "login",
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        cwd: spawnCwd(env),
+        ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
+      },
+    );
+    const proc = child.subprocess;
+    const stamp = spawnStamp(proc);
+    const spawnedAtMs = performance.now();
+
+    const readFile = (): Promise<string> =>
+      Bun.file(tsFile)
+        .text()
+        .catch(() => "");
+    let abandoned = false;
+    let captured = "";
+    const kill = (): void => {
+      if (abandoned) return;
+      abandoned = true;
+      void child.terminate(splitReapBudget(budget.remainingMs()));
+    };
+    const unbindAbort = bindAbort(opts?.signal, kill);
+    let ptyCleanup: TChildCleanupOutcome | undefined;
+    try {
+      for (;;) {
+        if (abandoned) break;
         captured = await readFile();
-        kill();
-        break;
-      }
-      if (proc.exitCode !== null || proc.signalCode !== null) break; // exited
-      if (budget.expired()) {
-        const defer = await awaitOnDeadline(ptyOpts?.onDeadline);
-        if (defer) {
-          const graceMs = Math.max(0, ptyOpts?.persistenceGraceMs ?? 0);
-          if (
-            graceMs > 0 &&
-            proc.exitCode === null &&
-            proc.signalCode === null
-          ) {
-            await Promise.race([
-              proc.exited,
-              new Promise<void>((resolve) => {
-                setTimeout(resolve, graceMs);
-              }),
-            ]);
-          }
-          if (proc.exitCode !== null || proc.signalCode !== null) break;
+        if (opts?.until?.test(stripAnsi(captured)) === true) {
+          // Settle: let the rest of the token line render before we kill + parse.
+          await new Promise((r) => setTimeout(r, UNTIL_SETTLE_MS));
+          captured = await readFile();
+          kill();
+          break;
         }
-        kill();
-        break;
+        if (proc.exitCode !== null || proc.signalCode !== null) break; // exited
+        if (budget.expired()) {
+          logWarn(
+            "spawn",
+            ptyOpts?.producer === "claude-refresh"
+              ? safeDiagnosticMessage`Credential refresh exceeded its time budget.`
+              : safeDiagnosticMessage`Login exceeded its time budget.`,
+            {
+              configured_timeout_ms: timeoutMs,
+              spawn_elapsed_ms: performance.now() - spawnedAtMs,
+              clock: "performance.now",
+              child_pid: stamp.child_pid,
+              kind: "login",
+              probe: ptyOpts?.probe === true,
+              reason_code: "timeout",
+              phase: "timeout_race",
+              abandoned: true,
+              cancel_requested: signalAbortRequested(ptyOpts?.signal),
+              ...(ptyOpts?.producer !== undefined
+                ? { producer: ptyOpts.producer }
+                : {}),
+              ...nativeAuthOperationMeta(ptyOpts?.operationId),
+            },
+            nativeAuthDoctorObservation(ptyOpts?.operationId, {
+              configured_timeout_ms: timeoutMs,
+              spawn_elapsed_ms: performance.now() - spawnedAtMs,
+            }),
+          );
+          const defer = await awaitOnDeadline(ptyOpts?.onDeadline);
+          if (defer) {
+            const graceMs = Math.max(0, ptyOpts?.persistenceGraceMs ?? 0);
+            if (
+              graceMs > 0 &&
+              proc.exitCode === null &&
+              proc.signalCode === null
+            ) {
+              await waitWithCap(proc.exited, graceMs);
+            }
+            if (proc.exitCode !== null || proc.signalCode !== null) break;
+          }
+          kill();
+          break;
+        }
+        await new Promise((r) =>
+          setTimeout(r, Math.min(400, budget.remainingMs())),
+        );
       }
-      await new Promise((r) =>
-        setTimeout(r, Math.min(400, budget.remainingMs())),
-      );
-    }
-    if (abandoned) {
-      await child.terminate(splitReapBudget(budget.remainingMs()));
-    } else {
-      const leftover = budget.remainingMs();
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      try {
-        await Promise.race([
-          proc.exited,
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, leftover);
+      if (abandoned) {
+        const cleanupStartedAtMs = performance.now();
+        const reap = await child.terminate(
+          splitReapBudget(budget.remainingMs()),
+        );
+        const ptyCleanupMs = performance.now() - cleanupStartedAtMs;
+        ptyCleanup = childCleanupOutcome(
+          reap,
+          signalAbortRequested(ptyOpts?.signal),
+        );
+        logInfo(
+          "spawn",
+          safeDiagnosticMessage`Login cleanup finished.`,
+          {
+            cleanup_ms: ptyCleanupMs,
+            cleanup_reap: ptyCleanup.reap,
+            cleanup_confirmed: ptyCleanup.confirmed,
+            cancel_requested: ptyCleanup.cancel_requested,
+            clock: "performance.now",
+            child_pid: stamp.child_pid,
+            kind: "login",
+            reason_code: "cleanup",
+            phase: "cleanup",
+            abandoned: true,
+            ...(ptyOpts?.producer !== undefined
+              ? { producer: ptyOpts.producer }
+              : {}),
+            ...nativeAuthOperationMeta(ptyOpts?.operationId),
+          },
+          nativeAuthDoctorObservation(ptyOpts?.operationId, {
+            cleanup_ms: ptyCleanupMs,
           }),
-        ]);
-      } finally {
-        if (timer !== null) clearTimeout(timer);
+        );
+      } else {
+        const leftover = budget.remainingMs();
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        try {
+          await Promise.race([
+            proc.exited,
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, leftover);
+            }),
+          ]);
+        } finally {
+          if (timer !== null) clearTimeout(timer);
+        }
+        if (proc.exitCode === null && proc.signalCode === null) {
+          const reap = await child.terminate(splitReapBudget(0));
+          abandoned = true;
+          ptyCleanup = childCleanupOutcome(
+            reap,
+            signalAbortRequested(ptyOpts?.signal),
+          );
+        }
       }
-      if (proc.exitCode === null && proc.signalCode === null) {
-        await child.terminate(splitReapBudget(0));
-        abandoned = true;
-      }
+    } finally {
+      unbindAbort();
     }
+    captured = await readFile(); // final read (token written just before exit)
+    await rm(tsFile, { force: true }).catch(() => {});
+    if (!abandoned)
+      logIfKilled(scriptArgv, proc, { confined: opts?.probe !== true });
+    return {
+      code: proc.exitCode ?? -1,
+      output: stripAnsi(captured),
+      abandoned,
+      ...(ptyCleanup !== undefined ? { cleanup: ptyCleanup } : {}),
+      ...stamp,
+    };
   } finally {
-    unbindAbort();
+    budget.release();
   }
-  captured = await readFile(); // final read (token written just before exit)
-  await rm(tsFile, { force: true }).catch(() => {});
-  if (!abandoned)
-    logIfKilled(scriptArgv, proc, { confined: opts?.probe !== true });
-  return {
-    code: proc.exitCode ?? -1,
-    output: stripAnsi(captured),
-    abandoned,
-    ...stamp,
-  };
 };
 
 /**

@@ -16,6 +16,8 @@ export type TDeadlineBudget = {
   remainingMs(): number;
   expired(): boolean;
   child(maxMs: number): TDeadlineBudget;
+  /** Clear the deadline timer. Safe to call more than once. */
+  release(): void;
 };
 
 const attached = new WeakMap<AbortSignal, TDeadlineBudget>();
@@ -63,6 +65,7 @@ export const createDeadlineBudget = (
     child(maxMs: number): TDeadlineBudget {
       return createDeadlineBudget(Math.min(Math.max(0, maxMs), remainingMs()));
     },
+    release: abortFromDeadline,
   };
   attached.set(ac.signal, budget);
   return budget;
@@ -79,12 +82,26 @@ export const waitUntilExpired = (budget: TDeadlineBudget): Promise<void> => {
 export const firstOfBudget = async <T>(
   budget: TDeadlineBudget,
   work: Promise<T>,
-): Promise<{ readonly kind: "value"; readonly value: T } | { readonly kind: "expired" }> => {
+): Promise<
+  { readonly kind: "value"; readonly value: T } | { readonly kind: "expired" }
+> => {
   if (budget.expired()) return { kind: "expired" };
-  return Promise.race([
-    work.then((value) => ({ kind: "value" as const, value })),
-    waitUntilExpired(budget).then(() => ({ kind: "expired" as const })),
-  ]);
+  let onAbort: () => void = () => {};
+  const expired = new Promise<{ readonly kind: "expired" }>((resolve) => {
+    onAbort = (): void => resolve({ kind: "expired" });
+    budget.signal.addEventListener("abort", onAbort, { once: true });
+    if (budget.expired()) onAbort();
+  });
+  try {
+    return await Promise.race([
+      work.then((value) => ({ kind: "value" as const, value })),
+      expired,
+    ]);
+  } finally {
+    // A caller may race several stages against one operation budget. Remove
+    // only this waiter's listener; the owner releases the shared deadline.
+    budget.signal.removeEventListener("abort", onAbort);
+  }
 };
 
 /**

@@ -35,8 +35,14 @@ import {
   notifyQuotaStatus,
   notifySessionLost,
 } from "./cloud-client";
+import type { TScheduleResult } from "./command-scheduler";
+import {
+  daemonCommandScheduler,
+  schedulerProviderSlugs,
+} from "./command-scheduler";
 import { runCommandInner } from "./control-relay";
 import { logKeychainWatcherTick } from "./delegation/keychain";
+import { loginSlot } from "./delegation/login-flow";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
@@ -77,7 +83,11 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
-import { computeStatusFresh, setStatusPublishQueueSnapshot } from "./status";
+import {
+  computeStatusFresh,
+  refreshUsage,
+  setStatusPublishQueueSnapshot,
+} from "./status";
 import type { TStatusPublishTrigger } from "./status-publish-coalesce";
 import { createStatusPublishCoalescer } from "./status-publish-coalesce";
 import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
@@ -721,9 +731,10 @@ const startMigrationCheck = (): void => {
 // — by design (the command never completed; the cloud's stale reaper is the
 // give-up bound).
 const commandResults = new Map<string, TDaemonCommandAck | null>();
-/** Commands change shared vendor CLI and integration state. Keep execution FIFO so
- * competing browser tabs cannot race login, logout, or install operations. */
-let commandTail: Promise<void> = Promise.resolve();
+const commandScheduler = daemonCommandScheduler;
+/** Per-kind read admission (F7 generation fence). Hung list_local must not block status. */
+let statusReadTail: Promise<void> = Promise.resolve();
+let listLocalReadTail: Promise<void> = Promise.resolve();
 const PROCESSED_CAP = 500;
 
 /** Max chars of error detail carried into the log line — enough to name the
@@ -917,31 +928,132 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
       );
     }
     const publishStartedAt = performance.now();
-    try {
-      await pushStatus(undefined, "command");
-      if (isAuthCommand) {
-        logAuthCommandStage(
-          safeDiagnosticMessage`auth command status publish request completed`,
+    void pushStatus(undefined, "command")
+      .then(() => {
+        if (isAuthCommand) {
+          logAuthCommandStage(
+            safeDiagnosticMessage`auth command status publish request completed`,
+            kind,
+            id,
+            authCommandElapsedMs(publishStartedAt),
+          );
+        }
+      })
+      .catch((err: unknown) => {
+        if (isAuthCommand) {
+          logAuthCommandStage(
+            safeDiagnosticMessage`auth command status publish request error`,
+            kind,
+            id,
+            authCommandElapsedMs(publishStartedAt),
+            "warn",
+          );
+        }
+        logDebug("control-channel", "status publish request failed", {
           kind,
           id,
-          authCommandElapsedMs(publishStartedAt),
-        );
-      }
-    } catch (err) {
-      if (isAuthCommand) {
-        logAuthCommandStage(
-          safeDiagnosticMessage`auth command status publish request error`,
-          kind,
-          id,
-          authCommandElapsedMs(publishStartedAt),
-          "warn",
-        );
-      }
-      throw err;
-    }
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
   };
-  commandTail = commandTail.catch(() => {}).then(run);
-  await commandTail;
+  const refreshPayload =
+    command.command.kind === "refresh" ? command.command.payload : undefined;
+  const refreshSlug =
+    refreshPayload !== undefined &&
+    refreshPayload !== null &&
+    "slug" in refreshPayload
+      ? refreshPayload.slug
+      : undefined;
+  if (command.command.kind === "refresh" && refreshSlug === undefined) {
+    send({ type: "ack", ack: { id, status: "ack" } });
+    const usage = await commandScheduler.schedulePerProviderUsage(
+      async (slug) => {
+        if (generation !== connectionGeneration) return { deferred: true };
+        const one = await refreshUsage(slug, {
+          manual: refreshPayload?.manual === true,
+        });
+        if (one.deferred.length > 0) return { deferred: true };
+        return undefined;
+      },
+    );
+    if (generation !== connectionGeneration) {
+      commandResults.delete(id);
+      return;
+    }
+    const allDeferred =
+      usage.deferred.length > 0 &&
+      usage.deferred.length === schedulerProviderSlugs().length;
+    const ack: TDaemonCommandAck = allDeferred
+      ? {
+          id,
+          status: "error",
+          result: {
+            error: "login_conflict",
+            retryable: true,
+            deferred: usage.deferred,
+          },
+        }
+      : {
+          id,
+          status: "done",
+          ...(usage.deferred.length > 0
+            ? { result: { deferred: usage.deferred } }
+            : {}),
+        };
+    commandResults.set(id, ack);
+    send({ type: "ack", ack });
+    void pushStatus(undefined, "command").catch((err: unknown) => {
+      logDebug("control-channel", "status publish request failed", {
+        kind,
+        id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return;
+  }
+  if (command.command.kind === "status") {
+    statusReadTail = statusReadTail.catch(() => undefined).then(run);
+    await statusReadTail;
+    return;
+  }
+  if (command.command.kind === "list_local_sessions") {
+    listLocalReadTail = listLocalReadTail.catch(() => undefined).then(run);
+    await listLocalReadTail;
+    return;
+  }
+  const scheduled: TScheduleResult = await commandScheduler.schedule(
+    command.command,
+    run,
+  );
+  if (!scheduled.admitted) {
+    const slug = scheduled.slug;
+    const flow = slug !== undefined ? loginSlot(slug).flow() : null;
+    const ack: TDaemonCommandAck =
+      scheduled.reason === "resurface"
+        ? {
+            id,
+            status: "done",
+            result: {
+              connected: false,
+              pending: true,
+              ...(flow !== null ? { flow_id: flow.flowId } : {}),
+              detail: "sign-in already in progress",
+            },
+          }
+        : {
+            id,
+            status: "error",
+            result: {
+              error: scheduled.reason,
+              retryable: true,
+              ...(slug !== undefined ? { slug } : {}),
+            },
+          };
+    commandResults.set(id, ack);
+    send({ type: "ack", ack: { id, status: "ack" } });
+    send({ type: "ack", ack });
+    return;
+  }
 };
 
 const onFrame = (frame: TRelayFrame): void => {

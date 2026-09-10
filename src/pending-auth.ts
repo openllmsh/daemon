@@ -16,8 +16,10 @@
 import { PENDING_AUTH_TTL_MS } from "@openllmsh/protocol";
 
 export type TPendingAuth = {
-  readonly url: string;
-  readonly code: string;
+  /** Absent/empty on a marker-only owner snapshot — never a fake prompt. */
+  readonly url?: string;
+  readonly code?: string;
+  readonly kind?: "marker" | "prompt";
   /** `device_code` (codex/kimi: the user enters `code` in their browser at
    *  `url`, the daemon polls) or `paste_code` (claude headless login: the user
    *  signs in at `url`, the hosted page shows a code, the user pastes it back
@@ -39,6 +41,18 @@ type TStoredAuth = TPendingAuth & { readonly startedAt: number };
 
 const pending = new Map<string, TStoredAuth>();
 
+let loginOwnerLive: (slug: string) => boolean = () => false;
+let anyLoginOwnerLive: () => boolean = () => false;
+
+/** Bound from login-flow to avoid a module cycle. */
+export const setPendingAuthOwnerLive = (
+  ownerLive: (slug: string) => boolean,
+  anyOwnerLive: () => boolean,
+): void => {
+  loginOwnerLive = ownerLive;
+  anyLoginOwnerLive = anyOwnerLive;
+};
+
 const isExpired = (auth: TStoredAuth): boolean =>
   Date.now() - auth.startedAt > PENDING_AUTH_TTL_MS;
 
@@ -50,10 +64,14 @@ export const setPendingAuth = (slug: string, auth: TPendingAuth): void => {
  *  TTL — its login was abandoned, or the daemon restarted and dropped the live
  *  child without the background-exit cleanup running) is treated as absent and
  *  evicted, so a dead flow can never be re-surfaced or persisted. */
+export const isPromptPending = (auth: TPendingAuth): boolean =>
+  auth.kind !== "marker" && typeof auth.url === "string" && auth.url.length > 0;
+
 export const getPendingAuth = (slug: string): TPendingAuth | null => {
   const auth = pending.get(slug);
   if (auth === undefined) return null;
   if (isExpired(auth)) {
+    if (auth.kind === "marker" || loginOwnerLive(slug)) return auth;
     pending.delete(slug);
     return null;
   }
@@ -83,8 +101,9 @@ export const clearPendingAuth = (slug: string, flowId?: string): void => {
  *  refresh. See `docs/proposals/daemon-browser-status-sync.md` §2.2. Expired
  *  entries are evicted here too, so a stale one can't keep the watcher hot. */
 export const hasPendingAuth = (): boolean => {
+  if (anyLoginOwnerLive()) return true;
   for (const [slug, auth] of pending) {
-    if (isExpired(auth)) {
+    if (isExpired(auth) && !loginOwnerLive(slug) && auth.kind !== "marker") {
       pending.delete(slug);
       continue;
     }
@@ -98,9 +117,39 @@ export const hasPendingAuth = (): boolean => {
  *  hosted page shows; device-code flows that carry a `code` ask the user to
  *  enter it in the browser; the browser-OAuth flow (codex) has none (the
  *  localhost callback completes it), so the code clause is omitted. */
-export const pendingAuthDetail = (auth: TPendingAuth): string =>
-  auth.mode === "paste_code"
-    ? `Open ${auth.url} in your browser, sign in, then paste the code it shows back here to authorize.`
-    : auth.code.length > 0
-      ? `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`
-      : `Open ${auth.url} in your browser to authorize. This updates automatically once you're done.`;
+export const pendingAuthDetail = (auth: TPendingAuth): string => {
+  if (!isPromptPending(auth) || auth.url === undefined) {
+    return "Sign-in is running on this machine.";
+  }
+  if (auth.mode === "paste_code") {
+    return `Open ${auth.url} in your browser, sign in, then paste the code it shows back here to authorize.`;
+  }
+  return (auth.code ?? "").length > 0
+    ? `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`
+    : `Open ${auth.url} in your browser to authorize. This updates automatically once you're done.`;
+};
+
+export const pendingAuthWire = (
+  auth: TPendingAuth,
+  extras?: { readonly cancel_requested?: boolean },
+): {
+  readonly url?: string;
+  readonly code?: string;
+  readonly pending?: true;
+  readonly mode?: TPendingAuth["mode"];
+  readonly flow_id?: string;
+  readonly started_at_ms?: number;
+  readonly cancel_requested?: boolean;
+} => {
+  const prompt = isPromptPending(auth);
+  return {
+    ...(prompt && auth.url !== undefined
+      ? { url: auth.url }
+      : { pending: true }),
+    ...(prompt && auth.code !== undefined ? { code: auth.code } : {}),
+    ...(auth.mode !== undefined ? { mode: auth.mode } : {}),
+    started_at_ms: auth.startedAt,
+    ...(auth.flowId !== undefined ? { flow_id: auth.flowId } : {}),
+    ...(extras?.cancel_requested === true ? { cancel_requested: true } : {}),
+  };
+};

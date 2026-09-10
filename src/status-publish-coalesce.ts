@@ -128,9 +128,10 @@ export const createStatusPublishCoalescer = (
     return enqueueWaiter(followUp);
   };
 
-  const runJob = async (job: TJob): Promise<void> => {
+  const runJob = async (job: TJob, serial: number): Promise<void> => {
     try {
       const computed = await host.computeFresh(job.trigger);
+      if (serial !== pumpSerial) return;
       if (!host.canSend(job.epoch)) {
         resolveWaiters(job.waiters);
         return;
@@ -148,25 +149,32 @@ export const createStatusPublishCoalescer = (
       host.setLastFingerprint(computed.fingerprint);
       resolveWaiters(job.waiters);
     } catch (err) {
+      if (serial !== pumpSerial) return;
       rejectWaiters(job.waiters, err);
     }
   };
 
+  let pumpSerial = 0;
+
   const pump = async (): Promise<void> => {
     if (pumpRunning) return;
     pumpRunning = true;
+    const myPump = pumpSerial;
     try {
-      while (active !== null) {
+      while (active !== null && myPump === pumpSerial) {
         const job = active;
-        await runJob(job);
+        await runJob(job, myPump);
+        if (myPump !== pumpSerial) return;
         if (active === job) {
           active = followUp;
           followUp = null;
         }
       }
     } finally {
-      pumpRunning = false;
-      if (active !== null) void pump();
+      if (myPump === pumpSerial) {
+        pumpRunning = false;
+        if (active !== null) void pump();
+      }
     }
   };
 
@@ -189,13 +197,21 @@ export const createStatusPublishCoalescer = (
     return waiter;
   };
 
+  /**
+   * Drop queued follow-up and the current job so a new connection generation
+   * can compute immediately. An in-flight compute is left as a zombie: its
+   * result is generation-fenced by `canSend`, and this pump serial is
+   * invalidated so it cannot occupy the coalescer behind dead work.
+   */
   const abandon = (): void => {
     resolveWaiters(followUp?.waiters ?? []);
     followUp = null;
-    if (active !== null && !pumpRunning) {
+    if (active !== null) {
       resolveWaiters(active.waiters);
       active = null;
     }
+    pumpSerial += 1;
+    pumpRunning = false;
   };
 
   return { request, abandon, snapshot };
