@@ -785,13 +785,20 @@ export const spawnLogin = async (
       ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
     },
   );
+  let terminatePromise: Promise<TReapOutcome> | null = null;
+  const requestTerminate = (): Promise<TReapOutcome> => {
+    if (terminatePromise === null) {
+      terminatePromise = child.terminate(splitReapBudget(budget.remainingMs()));
+    }
+    return terminatePromise;
+  };
   try {
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
     const stamp = spawnStamp(proc);
     const unbindEarlyAbort = bindAbort(loginOpts?.signal, () => {
-      void child.terminate(splitReapBudget(budget.remainingMs()));
+      void requestTerminate();
     });
     if (loginOpts?.producer !== undefined) {
       logDebug("spawn", "native auth child started", {
@@ -815,7 +822,7 @@ export const spawnLogin = async (
       typeof stderr === "number"
     ) {
       unbindEarlyAbort();
-      const reap = await child.terminate(splitReapBudget(budget.remainingMs()));
+      const reap = await requestTerminate();
       return {
         code: -1,
         output: "",
@@ -843,17 +850,8 @@ export const spawnLogin = async (
     let rootExitCode: number | null = null;
     let cleanupMs: number | null = null;
     let cleanup: TChildCleanupOutcome | undefined;
-    let terminatePromise: Promise<TReapOutcome> | null = null;
     const cancelRequested = (): boolean =>
       signalAbortRequested(loginOpts?.signal);
-    const requestTerminate = (): Promise<TReapOutcome> => {
-      if (terminatePromise === null) {
-        terminatePromise = child.terminate(
-          splitReapBudget(budget.remainingMs()),
-        );
-      }
-      return terminatePromise;
-    };
     void proc.exited.then((code) => {
       rootExitCode = code;
     });
@@ -1159,7 +1157,7 @@ export const spawnLogin = async (
       ...stamp,
     };
   } catch {
-    const reap = await child.terminate(splitReapBudget(budget.remainingMs()));
+    const reap = await requestTerminate();
     return {
       code: -1,
       output: "",
@@ -1297,6 +1295,15 @@ export const spawnLoginPty = async (
     const proc = child.subprocess;
     const stamp = spawnStamp(proc);
     const spawnedAtMs = performance.now();
+    let terminatePromise: Promise<TReapOutcome> | null = null;
+    const requestTerminate = (): Promise<TReapOutcome> => {
+      if (terminatePromise === null) {
+        terminatePromise = child.terminate(
+          splitReapBudget(budget.remainingMs()),
+        );
+      }
+      return terminatePromise;
+    };
 
     const readFile = (): Promise<string> =>
       Bun.file(tsFile)
@@ -1307,7 +1314,7 @@ export const spawnLoginPty = async (
     const kill = (): void => {
       if (abandoned) return;
       abandoned = true;
-      void child.terminate(splitReapBudget(budget.remainingMs()));
+      void requestTerminate();
     };
     const unbindAbort = bindAbort(opts?.signal, kill);
     let ptyCleanup: TChildCleanupOutcome | undefined;
@@ -1371,9 +1378,7 @@ export const spawnLoginPty = async (
       }
       if (abandoned) {
         const cleanupStartedAtMs = performance.now();
-        const reap = await child.terminate(
-          splitReapBudget(budget.remainingMs()),
-        );
+        const reap = await requestTerminate();
         const ptyCleanupMs = performance.now() - cleanupStartedAtMs;
         ptyCleanup = childCleanupOutcome(
           reap,
@@ -1416,7 +1421,7 @@ export const spawnLoginPty = async (
           if (timer !== null) clearTimeout(timer);
         }
         if (proc.exitCode === null && proc.signalCode === null) {
-          const reap = await child.terminate(splitReapBudget(0));
+          const reap = await requestTerminate();
           abandoned = true;
           ptyCleanup = childCleanupOutcome(
             reap,
@@ -1436,6 +1441,7 @@ export const spawnLoginPty = async (
       output: stripAnsi(captured),
       abandoned,
       ...(ptyCleanup !== undefined ? { cleanup: ptyCleanup } : {}),
+      whenReleased: child.whenReleased,
       ...stamp,
     };
   } finally {

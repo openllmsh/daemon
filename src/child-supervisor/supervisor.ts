@@ -172,7 +172,12 @@ const forgetChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
         pgid: tracked.handle.pgid,
       },
     );
-    void watchUnconfirmedExit(tracked);
+    void watchUnconfirmedExit(tracked).catch((error) =>
+      logError("child-supervisor", error, {
+        pid: tracked.handle.pid,
+        pgid: tracked.handle.pgid,
+      }),
+    );
     return;
   }
   releaseChild(tracked, outcome);
@@ -217,6 +222,7 @@ const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
   try {
     if (maybeReleaseIfGroupGone(tracked) || aborted()) return;
     let rootPending: Promise<"root"> | null = waitChildExited(child).then(
+      () => "root" as const,
       () => "root" as const,
     );
     const abortWait = new Promise<"abort">((resolve) => {

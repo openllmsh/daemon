@@ -352,18 +352,30 @@ export const createCommandScheduler = (): TCommandScheduler => {
           const reason = cmd.kind === "logout" ? "login_conflict" : "resurface";
           return Promise.resolve(reject(reason, slug));
         }
-        if (cmd.kind === "connect" || cmd.kind === "connect_device_code") {
+        if ((mutationQueued.get(slug) ?? 0) >= MUTATION_QUEUE_MAX) {
+          return Promise.resolve(reject("overflow", slug));
+        }
+        const reserveLogin =
+          cmd.kind === "connect" || cmd.kind === "connect_device_code";
+        if (reserveLogin) {
           loginReserved.add(slug);
         }
-        return enqueueMutation(slug, async () => {
-          try {
-            await job();
-          } finally {
-            if (cmd.kind === "connect" || cmd.kind === "connect_device_code") {
-              loginReserved.delete(slug);
+        try {
+          return enqueueMutation(slug, async () => {
+            try {
+              await job();
+            } finally {
+              if (reserveLogin) {
+                loginReserved.delete(slug);
+              }
             }
+          });
+        } catch (error) {
+          if (reserveLogin) {
+            loginReserved.delete(slug);
           }
-        });
+          throw error;
+        }
       }
 
       if (lane === "usage") {

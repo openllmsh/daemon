@@ -30,6 +30,7 @@ import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { drainDisposableChildren } from "./child-supervisor";
+import { endDaemonApply, tryBeginDaemonApply } from "./delegation/login-flow";
 import { daemonEnv } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
@@ -161,6 +162,25 @@ const waitUntilIdle = async (): Promise<void> => {
 let updating = false;
 
 /**
+ * Exclusive apply lease for a daemon swap. `alreadyHeld` is the explicit
+ * `update` command (scheduler apply lane). Passive/catch-up acquire here or
+ * skip when auth/apply already owns the process. Successful `process.exit`
+ * never reaches the release.
+ */
+export const withSelfUpdateApply = async (
+  alreadyHeld: boolean,
+  work: () => Promise<void>,
+): Promise<void> => {
+  const acquired = alreadyHeld ? false : tryBeginDaemonApply();
+  if (!alreadyHeld && !acquired) return;
+  try {
+    await work();
+  } finally {
+    if (acquired) endDaemonApply();
+  }
+};
+
+/**
  * Update to `latest` (the cloud's published version) when it differs from this
  * binary, then exit so the supervisor relaunches it. No-op (returns) when not
  * applicable — auto-update opted out, running from source, already converged,
@@ -175,7 +195,7 @@ let updating = false;
  */
 export const maybeSelfUpdate = async (
   latest: string | null,
-  opts?: { readonly force?: boolean },
+  opts?: { readonly force?: boolean; readonly applyHeld?: boolean },
 ): Promise<void> => {
   if (updating) return;
   // Opt-out gate: skip automatic updates only when the user disabled them
@@ -198,55 +218,57 @@ export const maybeSelfUpdate = async (
   }
   if (recentlyAttempted("daemon", latest)) return;
 
-  updating = true;
-  const dest = process.execPath;
-  const tmp = join(dirname(dest), `.openllmd.update.${process.pid}.tmp`);
-  try {
-    const origin = daemonEnv().cloudOrigin;
-    const base = `${origin}/api/daemon/binary/${target}`;
-    const [bin, expected] = await Promise.all([
-      fetchBinary(base),
-      fetchDigest(`${base}.sha256`),
-    ]);
-    const actual = createHash("sha256").update(bin).digest("hex");
-    if (actual !== expected) {
-      logError(
-        "self-update",
-        safeDiagnosticMessage`checksum mismatch — refusing update`,
-        {
-          target,
-          latest,
-          expected,
-          actual,
-        },
-      );
-      updating = false;
-      return;
-    }
-    writeFileSync(tmp, bin, { mode: 0o755 });
-    chmodSync(tmp, 0o755); // force mode regardless of umask
-    renameSync(tmp, dest); // atomic on POSIX; running process keeps old inode
-    hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
-    // Record only AFTER a successful swap — a transient download/rename failure
-    // should retry on the next tick, but a swap that doesn't converge (the
-    // relaunched binary still reports the old version) must back off.
-    recordAttempt("daemon", latest);
-    logInfo(
-      "self-update",
-      `updated ${DAEMON_VERSION} → ${latest}; restarting when idle`,
-    );
-    await waitUntilIdle();
-    // The binary has already swapped; bounded cleanup must not prevent the exit
-    // that lets launchd/systemd start the replacement daemon.
-    await drainDisposableChildren();
-    process.exit(0);
-  } catch (err) {
-    logError("self-update", err, { target, latest });
+  await withSelfUpdateApply(opts?.applyHeld === true, async () => {
+    updating = true;
+    const dest = process.execPath;
+    const tmp = join(dirname(dest), `.openllmd.update.${process.pid}.tmp`);
     try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // best-effort temp cleanup
+      const origin = daemonEnv().cloudOrigin;
+      const base = `${origin}/api/daemon/binary/${target}`;
+      const [bin, expected] = await Promise.all([
+        fetchBinary(base),
+        fetchDigest(`${base}.sha256`),
+      ]);
+      const actual = createHash("sha256").update(bin).digest("hex");
+      if (actual !== expected) {
+        logError(
+          "self-update",
+          safeDiagnosticMessage`checksum mismatch — refusing update`,
+          {
+            target,
+            latest,
+            expected,
+            actual,
+          },
+        );
+        updating = false;
+        return;
+      }
+      writeFileSync(tmp, bin, { mode: 0o755 });
+      chmodSync(tmp, 0o755); // force mode regardless of umask
+      renameSync(tmp, dest); // atomic on POSIX; running process keeps old inode
+      hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
+      // Record only AFTER a successful swap — a transient download/rename failure
+      // should retry on the next tick, but a swap that doesn't converge (the
+      // relaunched binary still reports the old version) must back off.
+      recordAttempt("daemon", latest);
+      logInfo(
+        "self-update",
+        `updated ${DAEMON_VERSION} → ${latest}; restarting when idle`,
+      );
+      await waitUntilIdle();
+      // The binary has already swapped; bounded cleanup must not prevent the exit
+      // that lets launchd/systemd start the replacement daemon.
+      await drainDisposableChildren();
+      process.exit(0);
+    } catch (err) {
+      logError("self-update", err, { target, latest });
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        // best-effort temp cleanup
+      }
+      updating = false; // allow a retry on the next bootstrap tick
     }
-    updating = false; // allow a retry on the next bootstrap tick
-  }
+  });
 };

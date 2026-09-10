@@ -895,7 +895,40 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
       );
     }
     const executionStartedAt = performance.now();
-    const ack = await runCommandInner(command.command);
+    const afterAckHolder: { fn: (() => Promise<void>) | null } = {
+      fn: null,
+    };
+    const ack = await runCommandInner(command.command, {
+      registerAfterAck: (work) => {
+        afterAckHolder.fn = work;
+      },
+    });
+    const pendingAfterAck = afterAckHolder.fn;
+    // Stale AFTER execute: side effects already ran. Keep a completed dedup
+    // result so redelivery re-acks instead of repeating logout/connect/CLI
+    // update. Suppress the old-session terminal ack and afterAck. An update
+    // whose reexec was skipped is cancelled/retryable — not `{ checking: true }`.
+    if (generation !== connectionGeneration) {
+      const stored: TDaemonCommandAck =
+        pendingAfterAck !== null
+          ? {
+              id,
+              status: "error",
+              result: {
+                error: "cancelled",
+                retryable: true,
+                deferred: true,
+              },
+            }
+          : ack;
+      commandResults.set(id, stored);
+      logDebug("control-channel", "stale-session executed command kept", {
+        kind: command.command.kind,
+        id,
+        afterAckSkipped: pendingAfterAck !== null,
+      });
+      return;
+    }
     commandResults.set(id, ack);
     if (isAuthCommand) {
       logAuthCommandStage(
@@ -917,6 +950,7 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
       ...(ack.status === "error" ? { error: ackErrorDetail(ack.result) } : {}),
     });
     send({ type: "ack", ack });
+    if (pendingAfterAck !== null) await pendingAfterAck();
     // `pushStatus` returning is the publish *request* settling (compute /
     // enqueue / local send attempt). It is not browser receipt or relay persistence.
     if (isAuthCommand) {

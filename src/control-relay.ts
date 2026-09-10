@@ -22,11 +22,9 @@ import {
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import {
-  endDaemonApply,
   loginSlot,
   runWithAuthOperation,
   runWithLoginCommand,
-  tryBeginDaemonApply,
 } from "./delegation/login-flow";
 import { daemonApiKeyId } from "./env";
 import { openSealed } from "./keypair";
@@ -52,6 +50,15 @@ const listLocalSessionsCache = new Map<
   { readonly at: number; readonly sessions: TLocalCliSession[] }
 >();
 
+export type TRunCommandOptions = {
+  /**
+   * Owned by the caller's `onCommand` closure. Explicit `update` registers
+   * reexec here so the terminal ack can be sent first while the apply lease
+   * still wraps that same job. Direct callers that omit this never reexec.
+   */
+  readonly registerAfterAck?: (work: () => Promise<void>) => void;
+};
+
 /**
  * Execute one delivered command via the control handlers. Returns the terminal
  * ack. `cmd` is the CLOSED `DaemonCommand` union — the relay socket's schema
@@ -61,6 +68,7 @@ const listLocalSessionsCache = new Map<
  */
 export const runCommandInner = async (
   cmd: TDaemonCommand,
+  opts?: TRunCommandOptions,
 ): Promise<TDaemonCommandAck> => {
   try {
     switch (cmd.kind) {
@@ -406,15 +414,19 @@ export const runCommandInner = async (
       // it passes `force` to converge regardless of the opt-in preference.
       // Refresh the bootstrap first so a release published since the last tick is
       // seen — otherwise a forced check would read a stale `latestVersion()`.
-      // Fire-and-forget: it self-guards and, if it updates, swaps the binary +
-      // exits once idle so the supervisor relaunches it.
+      // Terminal ack is sent before reexec: `maybeSelfUpdate` can `process.exit`
+      // after a successful swap. The apply lane holds the lease across that
+      // after-ack flush (not released just because we return here).
       case "update": {
         await refreshBootstrap();
         await maybeUpdateCli(latestCliVersion(), {
           force: true,
           reprobeUnknown: true,
         });
-        await maybeSelfUpdate(latestVersion(), { force: true });
+        const latest = latestVersion();
+        opts?.registerAfterAck?.(async () => {
+          await maybeSelfUpdate(latest, { force: true, applyHeld: true });
+        });
         return { id: cmd.id, status: "done", result: { checking: true } };
       }
       // Toggle the auto-update opt-in from the dashboard. Persisted locally so it
@@ -443,14 +455,12 @@ export const runCommandInner = async (
         // Only converge now if it actually stuck on.
         if (enabled) {
           void (async () => {
-            const apply = tryBeginDaemonApply();
-            try {
-              await refreshBootstrap();
-              await maybeUpdateCli(latestCliVersion());
-              if (apply) await maybeSelfUpdate(latestVersion());
-            } finally {
-              if (apply) endDaemonApply();
-            }
+            await refreshBootstrap();
+            await maybeUpdateCli(latestCliVersion());
+            // Apply lease is taken inside maybeSelfUpdate only if a daemon
+            // swap will actually run — bootstrap/CLI catch-up must not fence
+            // auth for the whole background window.
+            await maybeSelfUpdate(latestVersion());
           })().catch((err) => logError("control-relay", err));
         }
         return {
