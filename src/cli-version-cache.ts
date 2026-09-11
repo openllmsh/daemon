@@ -34,6 +34,7 @@ import {
 import { join } from "node:path";
 import { resolveVersionBinary, versionBinaryStamp } from "./cli-version-stamp";
 import { stateDir } from "./env";
+import { withoutCommandReplayContext } from "./op-context";
 
 export type TCliVersionOpts = {
   readonly timeoutMs?: number;
@@ -339,15 +340,17 @@ export const cachedCliVersion = (
   if (existing !== undefined) {
     return joinObserver(existing, opts?.signal);
   }
-  const shared = runProbe(
-    bin,
-    resolved,
-    stamp,
-    env,
-    versionProbeTimeoutMs(opts?.timeoutMs),
-  ).finally(() => {
-    inflight.delete(key);
-  });
+  const shared = withoutCommandReplayContext(() =>
+    runProbe(
+      bin,
+      resolved,
+      stamp,
+      env,
+      versionProbeTimeoutMs(opts?.timeoutMs),
+    ).finally(() => {
+      inflight.delete(key);
+    }),
+  );
   inflight.set(key, shared);
   return joinObserver(shared, opts?.signal);
 };

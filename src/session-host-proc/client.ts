@@ -32,6 +32,7 @@ import {
   firstOfBudget,
 } from "../deadline-budget";
 import { isDevMode, stateDir } from "../env";
+import { withoutCommandReplayContext } from "../op-context";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
 
@@ -395,7 +396,7 @@ const discoverSessionHostsOnce = async (): Promise<TDiscoveryOutcome> => {
 
 const discoverSessionHostOutcome = async (): Promise<TDiscoveryOutcome> => {
   if (discoveryInFlight !== null) return discoveryInFlight;
-  const run = discoverSessionHostsOnce();
+  const run = withoutCommandReplayContext(discoverSessionHostsOnce);
   discoveryInFlight = run;
   void run.finally(() => {
     if (discoveryInFlight === run) discoveryInFlight = null;
