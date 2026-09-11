@@ -287,6 +287,20 @@ measurement. There is no parallel `note*` reporting surface. Repeat
 cooldowns and CLI version-probe streaks stay as local domain counters.
 No additional status, authentication, or provider probes are started.
 
+Browser commands may carry an optional UUIDv7 `replay_session_id`. The existing
+`op-context.ts` ALS owns a per-admitted-command lease, closed in `finally`;
+logger observations alone read it (ordinary local log metadata does not).
+Detached work loses attribution when the lease closes. Shared status/usage/model
+workers, bootstrap and auth-event subscribers explicitly run outside that lease;
+CLI work and unrelated background diagnostics stay unlinked. Command
+`correlation_id` remains separate. Replay attribution is not session ownership
+proof and does not guarantee a retained recording.
+
+**Receiver-first rollout:** deploy the optional doctor parser and relay support
+before enabling browser emission/new-daemon attribution. Older v3 origins reject
+unknown report fields; the daemon-before-app release flow needs separate receiver
+and producer releases. Publishing a binary alone does not deploy its receiver.
+
 New events use report schema v3 exclusively. There is no legacy decoder,
 normalizer, downgrade, or special old-server retry path. Old-format journal
 records and reports are unsupported; cloud and daemon must use matching report

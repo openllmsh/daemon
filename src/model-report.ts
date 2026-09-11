@@ -31,6 +31,7 @@ import {
   MODEL_REPORT_FAILURE_RETRY_MS,
   MODEL_REPORT_TTL_MS,
 } from "./model-report-policy";
+import { withoutCommandReplayContext } from "./op-context";
 import { computeStatus, peekLastKnownConnection } from "./status";
 
 export {
@@ -309,32 +310,37 @@ const withInFlightAuto = (
  * delegates are not probed or listed. `mode: "auto"` never calls
  * `listModels` and never joins a force listing.
  */
-export const maybeReportModels = async (
+export const maybeReportModels = (
   now: number = Date.now(),
   slug?: string,
   mode: TModelReportMode = "force",
-): Promise<TMaybeModelReportResult> => {
-  if (mode === "auto") {
+): Promise<TMaybeModelReportResult> =>
+  withoutCommandReplayContext(async () => {
+    if (mode === "auto") {
+      const due =
+        slug === undefined
+          ? dueFromLastKnown(now, undefined)
+          : dueForUsedProvider(now, slug);
+      const joined = withInFlightAuto(due, slug);
+      const results = await Promise.all(
+        joined.map((item) => runAutoDiscoverAndReport(item, now)),
+      );
+      return aggregateListed(results, { alreadyPosted: true });
+    }
+
     const due =
       slug === undefined
-        ? dueFromLastKnown(now, undefined)
-        : dueForUsedProvider(now, slug);
-    const joined = withInFlightAuto(due, slug);
-    const results = await Promise.all(
-      joined.map((item) => runAutoDiscoverAndReport(item, now)),
-    );
-    return aggregateListed(results, { alreadyPosted: true });
-  }
+        ? dueFromConnections(
+            now,
+            (await computeStatus()).connections,
+            undefined,
+          )
+        : dueForSucceededLogin(now, slug);
 
-  const due =
-    slug === undefined
-      ? dueFromConnections(now, (await computeStatus()).connections, undefined)
-      : dueForSucceededLogin(now, slug);
-
-  const results = await Promise.all(due.map((item) => runForceList(item)));
-  for (const listed of results) stampAttempt(listed, now);
-  return aggregateListed(results, { alreadyPosted: false });
-};
+    const results = await Promise.all(due.map((item) => runForceList(item)));
+    for (const listed of results) stampAttempt(listed, now);
+    return aggregateListed(results, { alreadyPosted: false });
+  });
 
 const aggregateListed = async (
   results: ReadonlyArray<TListed>,

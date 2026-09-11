@@ -38,6 +38,7 @@ import {
   localDiagnosticMessage,
 } from "./doctor-report/message";
 import type { TDoctorObservationInput } from "./doctor-report/record";
+import { currentCommandReplaySessionId } from "./op-context";
 
 export { safeDiagnosticMessage } from "./doctor-report/message";
 
@@ -189,6 +190,7 @@ const write = (
         message,
         timings: observation?.timings,
         correlation_id: observation?.correlation_id,
+        replay_session_id: currentCommandReplaySessionId(),
       });
     } catch {
       // Reporting must never throw or log recursively.

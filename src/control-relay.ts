@@ -31,6 +31,7 @@ import { openSealed } from "./keypair";
 import { clampLimit, readLocalSessions } from "./local-sessions";
 import { logError } from "./logger";
 import { maybeReportModels, resetModelReportThrottle } from "./model-report";
+import { withoutCommandReplayContext } from "./op-context";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
 import { maybeSelfUpdate } from "./self-update";
@@ -458,14 +459,16 @@ export const runCommandInner = async (
         }
         // Only converge now if it actually stuck on.
         if (enabled) {
-          void (async () => {
+          void withoutCommandReplayContext(async () => {
             await refreshBootstrap();
             await maybeUpdateCli(latestCliVersion());
             // Apply lease is taken inside maybeSelfUpdate only if a daemon
             // swap will actually run — bootstrap/CLI catch-up must not fence
             // auth for the whole background window.
             await maybeSelfUpdate(latestVersion());
-          })().catch((err) => logError("control-relay", err));
+          }).catch((err) =>
+            withoutCommandReplayContext(() => logError("control-relay", err)),
+          );
         }
         return {
           id: cmd.id,

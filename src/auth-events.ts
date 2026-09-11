@@ -8,6 +8,7 @@
  * → delegates → login-flow).
  */
 import type { TAuthEvent } from "@openllmsh/protocol";
+import { withoutCommandReplayContext } from "./op-context";
 
 export type TAuthSink = {
   readonly emit: (event: TAuthEvent) => void;
@@ -33,13 +34,13 @@ export const addAuthObserver = (
 /** Best-effort: no-op when the control channel is not running (tests, headless). */
 export const emitAuth = (event: TAuthEvent): void => {
   try {
-    sink?.emit(event);
+    withoutCommandReplayContext(() => sink?.emit(event));
   } catch {
     // Relay delivery must not prevent independent observers from running.
   }
   for (const observer of observers) {
     try {
-      observer(event);
+      withoutCommandReplayContext(() => observer(event));
     } catch {
       // Observers are advisory and must never disrupt relay delivery or peers.
     }
@@ -48,5 +49,5 @@ export const emitAuth = (event: TAuthEvent): void => {
 
 /** Best-effort status push so a background login finalize flips the card. */
 export const requestStatusPush = (): void => {
-  sink?.pushStatus();
+  withoutCommandReplayContext(() => sink?.pushStatus());
 };

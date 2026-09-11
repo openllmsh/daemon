@@ -10,6 +10,7 @@ import type {
   TDoctorSeverity,
 } from "@openllmsh/protocol";
 import {
+  isReplaySessionId,
   parseDoctorReportEvent,
   projectDoctorTimings,
   sanitizeDoctorScope,
@@ -30,6 +31,7 @@ export type TDoctorObservationInput = {
   readonly scope: unknown;
   readonly message: unknown;
   readonly correlation_id?: string;
+  readonly replay_session_id?: string;
   readonly timings?: TDoctorEventTimings;
   readonly observed_at_ms?: number;
 };
@@ -89,6 +91,9 @@ export const recordDoctorObservation = (
     message: diagnosticMessageText(input.message, input.severity),
     ...(opaqueDoctorCorrelation(input.correlation_id) !== undefined
       ? { correlation_id: input.correlation_id }
+      : {}),
+    ...(isReplaySessionId(input.replay_session_id)
+      ? { replay_session_id: input.replay_session_id }
       : {}),
     ...(input.timings !== undefined
       ? { timings: projectDoctorTimings(input.timings) }

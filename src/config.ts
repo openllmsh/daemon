@@ -32,6 +32,7 @@ import {
 import { setDeviceAccessPubkey } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { loadIdentityKey } from "./keypair";
+import { withoutCommandReplayContext } from "./op-context";
 import { clearPlanCache } from "./plan-cache";
 
 const EMPTY: TDaemonBootstrap = {
@@ -88,56 +89,57 @@ export const setReportingPolicyForTests = (
  * (otherwise the dashboard shows "can't reach the cloud" indefinitely even
  * though everything is working — the bug this fixes).
  */
-export const refreshBootstrap = async (): Promise<boolean> => {
-  const prev = cloudState;
-  const reportingRevision = ++reportingPolicyRevision;
-  try {
-    const next = await fetchBootstrap();
-    if (reportingRevision !== reportingPolicyRevision) return false;
-    snapshot = next;
-    byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
-    cloudState = "ok";
-    void import("./doctor-report")
-      .then((m) => m.onBootstrapReportingPolicy(reportingRevision))
-      .catch(() => {});
-    // A fresh snapshot may carry new routing config — drop any cached signed
-    // plans so a stale chain never outlives the config that produced it.
-    clearPlanCache();
-    // Pin the seed-gated device-access verifier when the cloud includes it.
-    // Explicit null clears a previous pin (key un-provisioned / wiped).
-    // Absent (older cloud) leaves the last-known pin alone so a rolling
-    // deploy cannot silently drop enforcement.
-    if (snapshot.device_access_pubkey !== undefined) {
-      setDeviceAccessPubkey(snapshot.device_access_pubkey);
-    }
-    // Best-effort: publish the durable X25519 pin on every successful
-    // bootstrap so cold dashboards / fleet peers pin via the cloud path
-    // (not solely relay status_push). Isolated from cloudState — a local
-    // keypair/construction failure must not flip a successful bootstrap
-    // to "unreachable".
+export const refreshBootstrap = (): Promise<boolean> =>
+  withoutCommandReplayContext(async () => {
+    const prev = cloudState;
+    const reportingRevision = ++reportingPolicyRevision;
     try {
-      // R5: publish ONLY a key that reached disk. The cloud pin is write-once,
-      // so pinning an in-memory key that a failed write never persisted means
-      // the next boot generates a different key and 409s forever — a transient
-      // full disk becomes a permanent wedge. Skipping leaves no pin, and the
-      // next boot pins cleanly. `keypair.ts` already logged the errno.
-      // Fire-and-forget: a slow POST must not hold bootstrap. Sync throws from
-      // loadIdentityKey still land in this catch (must not flip cloudState).
-      const identity = loadIdentityKey();
-      if (identity.persisted) {
-        void publishIdentity(identity.publicKeyB64).catch(() => {});
+      const next = await fetchBootstrap();
+      if (reportingRevision !== reportingPolicyRevision) return false;
+      snapshot = next;
+      byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
+      cloudState = "ok";
+      void import("./doctor-report")
+        .then((m) => m.onBootstrapReportingPolicy(reportingRevision))
+        .catch(() => {});
+      // A fresh snapshot may carry new routing config — drop any cached signed
+      // plans so a stale chain never outlives the config that produced it.
+      clearPlanCache();
+      // Pin the seed-gated device-access verifier when the cloud includes it.
+      // Explicit null clears a previous pin (key un-provisioned / wiped).
+      // Absent (older cloud) leaves the last-known pin alone so a rolling
+      // deploy cannot silently drop enforcement.
+      if (snapshot.device_access_pubkey !== undefined) {
+        setDeviceAccessPubkey(snapshot.device_access_pubkey);
       }
-    } catch {
-      // swallow — identity pin is non-critical hardening
+      // Best-effort: publish the durable X25519 pin on every successful
+      // bootstrap so cold dashboards / fleet peers pin via the cloud path
+      // (not solely relay status_push). Isolated from cloudState — a local
+      // keypair/construction failure must not flip a successful bootstrap
+      // to "unreachable".
+      try {
+        // R5: publish ONLY a key that reached disk. The cloud pin is write-once,
+        // so pinning an in-memory key that a failed write never persisted means
+        // the next boot generates a different key and 409s forever — a transient
+        // full disk becomes a permanent wedge. Skipping leaves no pin, and the
+        // next boot pins cleanly. `keypair.ts` already logged the errno.
+        // Fire-and-forget: a slow POST must not hold bootstrap. Sync throws from
+        // loadIdentityKey still land in this catch (must not flip cloudState).
+        const identity = loadIdentityKey();
+        if (identity.persisted) {
+          void publishIdentity(identity.publicKeyB64).catch(() => {});
+        }
+      } catch {
+        // swallow — identity pin is non-critical hardening
+      }
+    } catch (err) {
+      if (reportingRevision !== reportingPolicyRevision) return false;
+      if (err instanceof NoApiKeyError) cloudState = "no_key";
+      else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
+      else cloudState = "unreachable";
     }
-  } catch (err) {
-    if (reportingRevision !== reportingPolicyRevision) return false;
-    if (err instanceof NoApiKeyError) cloudState = "no_key";
-    else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
-    else cloudState = "unreachable";
-  }
-  return cloudState !== prev;
-};
+    return cloudState !== prev;
+  });
 
 /**
  * The per-user key for verifying the cloud's `?__plan=` signature (handed

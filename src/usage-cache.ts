@@ -72,6 +72,7 @@ import type {
 } from "@openllmsh/protocol";
 import { classifyUsageRefreshFailureReason } from "@openllmsh/protocol";
 import { isDevMode } from "./env";
+import { withoutCommandReplayContext } from "./op-context";
 
 // Hit the vendor at most once per this window — applies to BOTH a successful
 // read (the figures are reused) and a failed one (we back off instead of
@@ -444,38 +445,40 @@ export const cachedUsage = async (
     }
   }
 
-  const run = (async (): Promise<TProviderUsageSnapshot> => {
-    let next: TProviderUsageSnapshot;
-    try {
-      next = await fetcher();
-    } catch {
-      next = {
-        kind: "unavailable",
-        reason: GENERIC_FETCH_FAILURE,
+  const run = withoutCommandReplayContext(
+    async (): Promise<TProviderUsageSnapshot> => {
+      let next: TProviderUsageSnapshot;
+      try {
+        next = await fetcher();
+      } catch {
+        next = {
+          kind: "unavailable",
+          reason: GENERIC_FETCH_FAILURE,
+        };
+      }
+      const at = Date.now();
+      if (generationFor(key) !== generation) {
+        return { kind: "unavailable", reason: "usage cache invalidated" };
+      }
+      const prev = cache.get(key);
+      const observed = isUsable(next)
+        ? stampLiveFetch(stripRefreshFailure(next), at)
+        : next;
+      const updated: TUsageEntry = {
+        good: isUsable(observed)
+          ? { snapshot: observed, atMs: at }
+          : (prev?.good ?? null),
+        failure: isUsable(next) ? null : next,
+        lastAttemptAtMs: at,
+        inFlight: null,
       };
-    }
-    const at = Date.now();
-    if (generationFor(key) !== generation) {
-      return { kind: "unavailable", reason: "usage cache invalidated" };
-    }
-    const prev = cache.get(key);
-    const observed = isUsable(next)
-      ? stampLiveFetch(stripRefreshFailure(next), at)
-      : next;
-    const updated: TUsageEntry = {
-      good: isUsable(observed)
-        ? { snapshot: observed, atMs: at }
-        : (prev?.good ?? null),
-      failure: isUsable(next) ? null : next,
-      lastAttemptAtMs: at,
-      inFlight: null,
-    };
-    cache.set(key, updated);
-    // Persist the good snapshot (+ attempt time) so a daemon restart can serve
-    // it instead of going dark when the post-restart read is rate-limited.
-    persist();
-    return servable(updated, at);
-  })();
+      cache.set(key, updated);
+      // Persist the good snapshot (+ attempt time) so a daemon restart can serve
+      // it instead of going dark when the post-restart read is rate-limited.
+      persist();
+      return servable(updated, at);
+    },
+  );
 
   // Publish the in-flight promise so a concurrent caller shares this fetch,
   // preserving the prior good/failure/attempt state for the fallback path.

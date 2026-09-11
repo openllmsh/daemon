@@ -66,6 +66,10 @@ import {
   resetAllChannels,
   updateMuxPeerCaps,
 } from "./mux-host";
+import {
+  withCommandReplayContext,
+  withoutCommandReplayContext,
+} from "./op-context";
 import { noteConnectionsForQuota } from "./quota-status-notify";
 import {
   configureRtcClient,
@@ -850,139 +854,144 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
       }
     }
   }
-  const run = async (): Promise<void> => {
-    if (isAuthCommand) {
-      logAuthCommandStage(
-        safeDiagnosticMessage`auth command queue wait ended`,
-        kind,
-        id,
-        authCommandElapsedMs(receivedAt),
-      );
-    }
-    // Queued under a replaced session — skip, and drop the in-flight dedup
-    // marker so the relay's redelivery of this id can run on the CURRENT
-    // session (a retained `null` entry would suppress that valid redelivery).
-    if (generation !== connectionGeneration) {
-      commandResults.delete(id);
-      logDebug("control-channel", "stale-session command dropped", {
-        kind: command.command.kind,
-        id,
-      });
-      return;
-    }
-    // Log only non-sensitive metadata — a command `payload` (e.g. `set_config`)
-    // and an ack `result` can carry control-plane secrets, so they must not land
-    // in the daemon's logs. Kind + id + status are enough to trace a command.
-    logInfo("control-channel", "command received", {
-      kind: command.command.kind,
-      id: command.command.id,
-    });
-    // This daemon, not the relay's socket send, confirms execution has started.
-    send({ type: "ack", ack: { id, status: "ack" } });
-    if (isAuthCommand) {
-      logAuthCommandStage(
-        safeDiagnosticMessage`auth command execution started`,
-        kind,
-        id,
-        0,
-      );
-    }
-    const executionStartedAt = performance.now();
-    const afterAckHolder: { fn: (() => Promise<void>) | null } = {
-      fn: null,
-    };
-    const ack = await runCommandInner(command.command, {
-      registerAfterAck: (work) => {
-        afterAckHolder.fn = work;
-      },
-    });
-    const pendingAfterAck = afterAckHolder.fn;
-    // Stale AFTER execute: side effects already ran. Keep a completed dedup
-    // result so redelivery re-acks instead of repeating logout/connect/CLI
-    // update. Suppress the old-session terminal ack and afterAck. An update
-    // whose reexec was skipped is cancelled/retryable — not `{ checking: true }`.
-    if (generation !== connectionGeneration) {
-      const stored: TDaemonCommandAck =
-        pendingAfterAck !== null
-          ? {
-              id,
-              status: "error",
-              result: {
-                error: "cancelled",
-                retryable: true,
-                deferred: true,
-              },
-            }
-          : ack;
-      commandResults.set(id, stored);
-      logDebug("control-channel", "stale-session executed command kept", {
-        kind: command.command.kind,
-        id,
-        afterAckSkipped: pendingAfterAck !== null,
-      });
-      return;
-    }
-    commandResults.set(id, ack);
-    if (isAuthCommand) {
-      logAuthCommandStage(
-        safeDiagnosticMessage`auth command terminal`,
-        kind,
-        id,
-        authCommandElapsedMs(executionStartedAt),
-      );
-    }
-    // On SUCCESS the result stays out of the log (it can carry control-plane
-    // secrets — see the received-side note above). On ERROR, surface the
-    // diagnostic fields (`error` / the tail of `output`) — without them a
-    // failed command logs only `status: "error"`, which is undebuggable from
-    // the daemon log alone (field-reported). Truncated: diagnostics, not dumps.
-    logInfo("control-channel", "command done", {
-      kind: command.command.kind,
-      id: command.command.id,
-      status: ack.status,
-      ...(ack.status === "error" ? { error: ackErrorDetail(ack.result) } : {}),
-    });
-    send({ type: "ack", ack });
-    if (pendingAfterAck !== null) await pendingAfterAck();
-    // `pushStatus` returning is the publish *request* settling (compute /
-    // enqueue / local send attempt). It is not browser receipt or relay persistence.
-    if (isAuthCommand) {
-      logAuthCommandStage(
-        safeDiagnosticMessage`auth command status publish request attempted`,
-        kind,
-        id,
-        0,
-      );
-    }
-    const publishStartedAt = performance.now();
-    void pushStatus(undefined, "command")
-      .then(() => {
-        if (isAuthCommand) {
-          logAuthCommandStage(
-            safeDiagnosticMessage`auth command status publish request completed`,
-            kind,
-            id,
-            authCommandElapsedMs(publishStartedAt),
-          );
-        }
-      })
-      .catch((err: unknown) => {
-        if (isAuthCommand) {
-          logAuthCommandStage(
-            safeDiagnosticMessage`auth command status publish request error`,
-            kind,
-            id,
-            authCommandElapsedMs(publishStartedAt),
-            "warn",
-          );
-        }
-        logDebug("control-channel", "status publish request failed", {
+  const run = (): Promise<void> =>
+    withCommandReplayContext(command.command.replay_session_id, async () => {
+      if (isAuthCommand) {
+        logAuthCommandStage(
+          safeDiagnosticMessage`auth command queue wait ended`,
           kind,
           id,
-          err: err instanceof Error ? err.message : String(err),
+          authCommandElapsedMs(receivedAt),
+        );
+      }
+      // Queued under a replaced session — skip, and drop the in-flight dedup
+      // marker so the relay's redelivery of this id can run on the CURRENT
+      // session (a retained `null` entry would suppress that valid redelivery).
+      if (generation !== connectionGeneration) {
+        commandResults.delete(id);
+        logDebug("control-channel", "stale-session command dropped", {
+          kind: command.command.kind,
+          id,
         });
+        return;
+      }
+      // Log only non-sensitive metadata — a command `payload` (e.g. `set_config`)
+      // and an ack `result` can carry control-plane secrets, so they must not land
+      // in the daemon's logs. Kind + id + status are enough to trace a command.
+      logInfo("control-channel", "command received", {
+        kind: command.command.kind,
+        id: command.command.id,
       });
-  };
+      // This daemon, not the relay's socket send, confirms execution has started.
+      send({ type: "ack", ack: { id, status: "ack" } });
+      if (isAuthCommand) {
+        logAuthCommandStage(
+          safeDiagnosticMessage`auth command execution started`,
+          kind,
+          id,
+          0,
+        );
+      }
+      const executionStartedAt = performance.now();
+      const afterAckHolder: { fn: (() => Promise<void>) | null } = {
+        fn: null,
+      };
+      const ack = await runCommandInner(command.command, {
+        registerAfterAck: (work) => {
+          afterAckHolder.fn = work;
+        },
+      });
+      const pendingAfterAck = afterAckHolder.fn;
+      // Stale AFTER execute: side effects already ran. Keep a completed dedup
+      // result so redelivery re-acks instead of repeating logout/connect/CLI
+      // update. Suppress the old-session terminal ack and afterAck. An update
+      // whose reexec was skipped is cancelled/retryable — not `{ checking: true }`.
+      if (generation !== connectionGeneration) {
+        const stored: TDaemonCommandAck =
+          pendingAfterAck !== null
+            ? {
+                id,
+                status: "error",
+                result: {
+                  error: "cancelled",
+                  retryable: true,
+                  deferred: true,
+                },
+              }
+            : ack;
+        commandResults.set(id, stored);
+        logDebug("control-channel", "stale-session executed command kept", {
+          kind: command.command.kind,
+          id,
+          afterAckSkipped: pendingAfterAck !== null,
+        });
+        return;
+      }
+      commandResults.set(id, ack);
+      if (isAuthCommand) {
+        logAuthCommandStage(
+          safeDiagnosticMessage`auth command terminal`,
+          kind,
+          id,
+          authCommandElapsedMs(executionStartedAt),
+        );
+      }
+      // On SUCCESS the result stays out of the log (it can carry control-plane
+      // secrets — see the received-side note above). On ERROR, surface the
+      // diagnostic fields (`error` / the tail of `output`) — without them a
+      // failed command logs only `status: "error"`, which is undebuggable from
+      // the daemon log alone (field-reported). Truncated: diagnostics, not dumps.
+      logInfo("control-channel", "command done", {
+        kind: command.command.kind,
+        id: command.command.id,
+        status: ack.status,
+        ...(ack.status === "error"
+          ? { error: ackErrorDetail(ack.result) }
+          : {}),
+      });
+      send({ type: "ack", ack });
+      if (pendingAfterAck !== null) await pendingAfterAck();
+      // `pushStatus` returning is the publish *request* settling (compute /
+      // enqueue / local send attempt). It is not browser receipt or relay persistence.
+      if (isAuthCommand) {
+        logAuthCommandStage(
+          safeDiagnosticMessage`auth command status publish request attempted`,
+          kind,
+          id,
+          0,
+        );
+      }
+      const publishStartedAt = performance.now();
+      void withoutCommandReplayContext(() =>
+        pushStatus(undefined, "command")
+          .then(() => {
+            if (isAuthCommand) {
+              logAuthCommandStage(
+                safeDiagnosticMessage`auth command status publish request completed`,
+                kind,
+                id,
+                authCommandElapsedMs(publishStartedAt),
+              );
+            }
+          })
+          .catch((err: unknown) => {
+            if (isAuthCommand) {
+              logAuthCommandStage(
+                safeDiagnosticMessage`auth command status publish request error`,
+                kind,
+                id,
+                authCommandElapsedMs(publishStartedAt),
+                "warn",
+              );
+            }
+            logDebug("control-channel", "status publish request failed", {
+              kind,
+              id,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }),
+      );
+    });
   if (command.command.kind === "status") {
     statusReadTail = statusReadTail.catch(() => undefined).then(run);
     await statusReadTail;

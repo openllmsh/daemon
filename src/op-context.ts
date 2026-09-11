@@ -1,9 +1,48 @@
 /**
  * The daemon's ONE AsyncLocalStorage module. Refresh spawn metadata and the
- * status-tick correlation bag both live here so a later reader never has to
- * hunt a second ALS.
+ * status-tick correlation bag and bounded command replay lease live here so
+ * a later reader never has to hunt a second ALS module.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isReplaySessionId } from "@openllmsh/protocol";
+
+type TCommandReplayContext = {
+  active: boolean;
+  readonly replaySessionId: string | undefined;
+};
+const commandReplayContext = new AsyncLocalStorage<
+  TCommandReplayContext | undefined
+>();
+
+export const currentCommandReplaySessionId = (): string | undefined => {
+  const context = commandReplayContext.getStore();
+  return context?.active ? context.replaySessionId : undefined;
+};
+
+/** Close the shared lease: inherited detached callbacks cannot retain attribution. */
+export const withCommandReplayContext = async <TResult>(
+  replaySessionId: string | undefined,
+  work: () => Promise<TResult>,
+): Promise<TResult> => {
+  const context: TCommandReplayContext = {
+    active: true,
+    replaySessionId: isReplaySessionId(replaySessionId)
+      ? replaySessionId
+      : undefined,
+  };
+  return commandReplayContext.run(context, async () => {
+    try {
+      return await work();
+    } finally {
+      context.active = false;
+    }
+  });
+};
+
+/** Shared workers and event subscribers are not owned by the triggering command. */
+export const withoutCommandReplayContext = <TResult>(
+  work: () => TResult,
+): TResult => commandReplayContext.run(undefined, work);
 
 export type TRefreshSpawnBag = {
   meta:

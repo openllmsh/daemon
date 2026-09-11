@@ -49,6 +49,7 @@ import {
   currentTickId,
   nextStatusTickId,
   opTickContext,
+  withoutCommandReplayContext,
   withUsageNativeRefresh,
 } from "./op-context";
 import { resolveOnPath } from "./path-utils";
@@ -503,8 +504,11 @@ const boundedDelegateStatus = async (
       false,
     );
   };
-  if (parentTick === undefined) return run();
-  return opTickContext.run({ tick_id: parentTick.tick_id, slug }, run);
+  return withoutCommandReplayContext(() =>
+    parentTick === undefined
+      ? run()
+      : opTickContext.run({ tick_id: parentTick.tick_id, slug }, run),
+  );
 };
 
 /** OpenCode is a device-session client (not a subscription delegate). Surface
@@ -716,7 +720,9 @@ export const computeStatusFresh = (
     dropSettledSlugProbes();
   }
   const tick_id = nextStatusTickId();
-  return opTickContext.run({ tick_id }, () => computeStatusFreshInner(options));
+  return withoutCommandReplayContext(() =>
+    opTickContext.run({ tick_id }, () => computeStatusFreshInner(options)),
+  );
 };
 
 export const computeStatus = async (): Promise<TDaemonStatus> => {
