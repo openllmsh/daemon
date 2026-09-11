@@ -767,10 +767,12 @@ export const refreshUsage = async (
   }
   const d = DELEGATES[slug];
   if (d === undefined) return { deferred: [] };
-  const conn = await boundedDelegateStatus(slug, (signal) => d.status(signal), {
+  const raw = await boundedDelegateStatus(slug, (signal) => d.status(signal), {
     force: manual,
   });
-  if (conn === undefined || !normalizeProviderConnection(conn).serviceable) {
+  const conn = applyAuthLiteral(slug, raw);
+  rememberConnection(slug, raw, conn);
+  if (!normalizeProviderConnection(conn).serviceable) {
     return { deferred: [] };
   }
   const fetchUsage = (): Promise<TProviderUsageSnapshot> =>

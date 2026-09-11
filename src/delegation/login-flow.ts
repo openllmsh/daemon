@@ -461,7 +461,7 @@ export const streamLoginFail = (
     return {
       code: "spawn_denied",
       message: `${title} [${res.spawnFailure.code}] ${res.spawnFailure.message}`,
-      retryable: false,
+      retryable: res.spawnFailure.code === "spawn_denied",
     };
   }
   const body = captureBody(res.captured);
@@ -813,8 +813,8 @@ export type TStreamLoginOpts<T> = {
  * credential lands); `proc.exited` runs {@link finishInBackground}. On no
  * match the child is reaped only at the hard login ceiling, not at 30s.
  *
- * Single-flight is marked AFTER a successful spawn (a `Bun.spawn` throw must not
- * wedge the slot), mirroring the pre-refactor "set loginInFlight after spawn".
+ * Single-flight is reserved BEFORE spawn (apply-hold must not create a child).
+ * A `Bun.spawn` throw releases only that matching `flowId`.
  */
 const SPAWN_FAILURE_MAX_ERROR_CHARS = 400;
 
@@ -892,7 +892,28 @@ export const spawnStreamLogin = async <T>(
   opts: TStreamLoginOpts<T>,
 ): Promise<TStreamLoginResult<T>> => {
   const flow = resolveLoginFlow(opts.provider, opts.mode ?? "browser");
-  let proc: ReturnType<typeof Bun.spawn>;
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  if (
+    !opts.slot.start(() => {
+      try {
+        proc?.kill();
+      } catch {
+        // already exited — its own exit handler ran
+      }
+    }, flow)
+  ) {
+    return {
+      found: null,
+      captured: "daemon update in progress",
+      exitCode: null,
+      crashed: false,
+      spawnFailure: {
+        code: "spawn_denied",
+        message: "daemon update in progress",
+      },
+      flow,
+    };
+  }
   try {
     proc = Bun.spawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
       stdin: "ignore",
@@ -904,6 +925,7 @@ export const spawnStreamLogin = async <T>(
       env: { ...process.env, ...opts.env },
     });
   } catch (error) {
+    opts.slot.end(flow.flowId);
     const spawnFailure = spawnFailureFromError(error);
     return {
       found: null,
@@ -914,20 +936,25 @@ export const spawnStreamLogin = async <T>(
       flow,
     };
   }
-  opts.slot.start(() => {
-    try {
-      proc.kill();
-    } catch {
-      // already exited — its own exit handler ran
-    }
-  }, flow);
+  if (proc === null) {
+    opts.slot.end(flow.flowId);
+    return {
+      found: null,
+      captured: "login spawn failed",
+      exitCode: null,
+      crashed: false,
+      spawnFailure: { code: "unknown", message: "login spawn failed" },
+      flow,
+    };
+  }
+  const child = proc;
   emitLoginStarted(flow);
 
   const promptStream = (
-    opts.stream === "stdout" ? proc.stdout : proc.stderr
+    opts.stream === "stdout" ? child.stdout : child.stderr
   ) as ReadableStream<Uint8Array>;
   const otherStream = (
-    opts.stream === "stdout" ? proc.stderr : proc.stdout
+    opts.stream === "stdout" ? child.stderr : child.stdout
   ) as ReadableStream<Uint8Array>;
   let promptBuf = "";
   let otherBuf = "";
@@ -992,12 +1019,12 @@ export const spawnStreamLogin = async <T>(
       // expiry, so a wedged child can't hang the connect indefinitely.
       const EXIT_GRACE_MS = 2_000;
       const exitCode = await Promise.race([
-        proc.exited,
+        child.exited,
         sleep(EXIT_GRACE_MS).then(() => null),
       ]);
       if (exitCode === null) {
         try {
-          proc.kill();
+          child.kill();
         } catch {
           // already gone
         }
@@ -1013,7 +1040,7 @@ export const spawnStreamLogin = async <T>(
       };
     }
     try {
-      proc.kill();
+      child.kill();
     } catch {
       // already gone
     }
@@ -1044,12 +1071,12 @@ export const spawnStreamLogin = async <T>(
   const reaper = setTimeout(() => {
     reaped = true;
     try {
-      proc.kill();
+      child.kill();
     } catch {
       // already exited — its own exit handler ran
     }
   }, ceilingMs);
-  void proc.exited.then((exitCode) => {
+  void child.exited.then((exitCode) => {
     clearTimeout(reaper);
     return finishInBackground({
       provider: opts.provider,

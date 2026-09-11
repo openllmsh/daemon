@@ -124,6 +124,18 @@ export const makePasteBackDevice = (
           });
           return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
         }
+        if (
+          !cfg.slot.start(() => {
+            handle?.cancel();
+          }, flow)
+        ) {
+          emitLoginFailed(flow, {
+            code: "spawn_denied",
+            message: "daemon update in progress",
+            retryable: true,
+          });
+          return { connected: false, detail: "daemon update in progress" };
+        }
         // Keychain-dependent paste-back login (claude) is unconfined on macOS
         // (`sandbox/policy.ts`).
         const login = await spawnHeadlessLogin([...cfg.argv()], cfg.env(), {
@@ -135,10 +147,10 @@ export const makePasteBackDevice = (
             message: login.error,
             retryable: false,
           });
+          cfg.slot.end(flow.flowId);
           return { connected: false, detail: login.error };
         }
         handle = login;
-        cfg.slot.start(() => login.cancel(), flow);
         emitLoginStarted(flow);
         const auth = {
           url: login.url,

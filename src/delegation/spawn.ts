@@ -1025,7 +1025,25 @@ export const spawnLogin = async (
           cleanupMs,
           cleanup,
         });
-      })();
+      })().catch((err: unknown) => {
+        logError("spawn", err, {
+          phase: "timeout_worker",
+          child_pid: stamp.child_pid,
+          tick_id: currentTickId(),
+        });
+        try {
+          kill();
+        } catch {
+          // containment — do not end login-slot ownership from this worker
+        }
+        void requestTerminate().catch((reapErr: unknown) => {
+          logError("spawn", reapErr, {
+            phase: "timeout_worker_reap",
+            child_pid: stamp.child_pid,
+            tick_id: currentTickId(),
+          });
+        });
+      });
     };
     const scheduleTimeout =
       loginTimeoutSchedulerForTests ??

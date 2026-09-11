@@ -269,12 +269,6 @@ export const makeBlockingConnect = (
             clearPendingAuth(cfg.provider, flow.flowId);
             return cancelledResult();
           }
-          if (result.child_pid === null && result.spawned_at_ms === null) {
-            if (operation.signal.aborted || slot?.wasCancelled() === true) {
-              releaseNoChild();
-              return cancelledResult();
-            }
-          }
           const prepMark = lifecycle?.mark();
           lifecycle?.record("prep_wait", prepMark);
           const granted = await cfg.afterLogin?.();
@@ -518,12 +512,16 @@ const startDeviceCodePoll = (
   cfg: TDeviceCodeConnectConfig,
   auth: TDeviceAuth,
   flow: TLoginFlowCtx,
-): void => {
+): boolean => {
   let aborted = false;
   let outcome: "success" | "stop" | "expired" | "aborted" = "expired";
-  cfg.slot.start(() => {
-    aborted = true;
-  }, flow);
+  if (
+    !cfg.slot.start(() => {
+      aborted = true;
+    }, flow)
+  ) {
+    return false;
+  }
   void (async () => {
     const deadline = Date.now() + auth.expiresInMs;
     let delayMs = auth.intervalMs;
@@ -569,7 +567,7 @@ const startDeviceCodePoll = (
       // swallow — the user can retry Connect
     } finally {
       const cancelled = cfg.slot.wasCancelled() || aborted;
-      cfg.slot.end();
+      cfg.slot.end(flow.flowId);
       const event: TLoginTerminalEvent =
         outcome === "success"
           ? { kind: "succeeded" }
@@ -592,6 +590,7 @@ const startDeviceCodePoll = (
       });
     }
   })();
+  return true;
 };
 
 /**
@@ -628,15 +627,23 @@ export const makeDeviceCodeConnect = (
           return { connected: false, detail: cfg.startFailDetail };
         }
         emitLoginStarted(flow);
-        // A cancel_connect can land while `requestDeviceAuth` was in flight —
-        // the slot isn't in-flight yet, but `cancelAll` still set `wasCancelled`.
-        // Check it BEFORE `startDeviceCodePoll`, whose `slot.start()` resets the
-        // flag: otherwise we'd open a browser + start polling a login the user
-        // already cancelled. Guarding the URL-open here is that last observation.
+        // Reserve the slot before opening a browser or storing pending — apply
+        // hold must deny without a poll, pending snapshot, or slot.end of another
+        // flow. `slot.start()` still fires the canceler when `wasCancelled` is
+        // already set (cancel during `requestDeviceAuth`).
+        if (!startDeviceCodePoll(cfg, auth, flow)) {
+          emitLoginFailed(flow, {
+            code: "spawn_denied",
+            message: "daemon update in progress",
+            retryable: true,
+          });
+          return { connected: false, detail: "daemon update in progress" };
+        }
         if (
           !openAuthUrlUnlessCancelled(cfg.slot, auth.verificationUriComplete)
         ) {
-          clearPendingAuth(cfg.provider);
+          cfg.slot.cancelAll();
+          clearPendingAuth(cfg.provider, flow.flowId);
           emitLoginFailed(flow, {
             code: "user_cancelled",
             message: "sign-in cancelled",
@@ -644,15 +651,10 @@ export const makeDeviceCodeConnect = (
           });
           return { connected: false, detail: "sign-in cancelled" };
         }
-        // Surface URL+code to the dashboard (the daemon may be on a different
-        // machine than the user's browser). The browser is already up (above);
-        // on a remote box it opens nothing useful but the dashboard shows these
-        // so the user authorizes from THEIR machine.
         publishPendingAuth(flow, cfg.provider, {
           url: auth.verificationUriComplete,
           code: auth.userCode,
         });
-        startDeviceCodePoll(cfg, auth, flow);
         return {
           connected: false,
           pending: true,

@@ -170,13 +170,15 @@ export const createCommandScheduler = (): TCommandScheduler => {
     await new Promise<void>((resolve) => {
       usageWait.push(resolve);
     });
-    usageActive += 1;
   };
 
   const releaseUsage = (): void => {
-    usageActive = Math.max(0, usageActive - 1);
     const next = usageWait.shift();
-    next?.();
+    if (next !== undefined) {
+      next();
+      return;
+    }
+    usageActive = Math.max(0, usageActive - 1);
   };
 
   const enqueueCounted = (
@@ -205,28 +207,14 @@ export const createCommandScheduler = (): TCommandScheduler => {
   const enqueueMutation = (
     slug: string,
     job: () => Promise<void>,
-  ): Promise<TScheduleResult> => {
-    const occupancy = mutationQueued.get(slug) ?? 0;
-    if (occupancy >= MUTATION_QUEUE_MAX) {
-      return Promise.resolve(reject("overflow", slug));
-    }
-    mutationQueued.set(slug, occupancy + 1);
-    const next = chain(
-      mutationTails.get(slug) ?? Promise.resolve(),
-      async () => {
-        try {
-          await job();
-        } finally {
-          mutationQueued.set(
-            slug,
-            Math.max(0, (mutationQueued.get(slug) ?? 1) - 1),
-          );
-        }
-      },
+  ): Promise<TScheduleResult> =>
+    enqueueCounted(
+      mutationTails,
+      mutationQueued,
+      MUTATION_QUEUE_MAX,
+      slug,
+      job,
     );
-    mutationTails.set(slug, next);
-    return next.then(() => ADMITTED);
-  };
 
   const runUsageOnSlug = (
     slug: string,

@@ -36,10 +36,7 @@ import {
   notifySessionLost,
 } from "./cloud-client";
 import type { TScheduleResult } from "./command-scheduler";
-import {
-  daemonCommandScheduler,
-  schedulerProviderSlugs,
-} from "./command-scheduler";
+import { daemonCommandScheduler } from "./command-scheduler";
 import { runCommandInner } from "./control-relay";
 import { logKeychainWatcherTick } from "./delegation/keychain";
 import { loginSlot } from "./delegation/login-flow";
@@ -83,11 +80,7 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
-import {
-  computeStatusFresh,
-  refreshUsage,
-  setStatusPublishQueueSnapshot,
-} from "./status";
+import { computeStatusFresh, setStatusPublishQueueSnapshot } from "./status";
 import type { TStatusPublishTrigger } from "./status-publish-coalesce";
 import { createStatusPublishCoalescer } from "./status-publish-coalesce";
 import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
@@ -990,61 +983,6 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
         });
       });
   };
-  const refreshPayload =
-    command.command.kind === "refresh" ? command.command.payload : undefined;
-  const refreshSlug =
-    refreshPayload !== undefined &&
-    refreshPayload !== null &&
-    "slug" in refreshPayload
-      ? refreshPayload.slug
-      : undefined;
-  if (command.command.kind === "refresh" && refreshSlug === undefined) {
-    send({ type: "ack", ack: { id, status: "ack" } });
-    const usage = await commandScheduler.schedulePerProviderUsage(
-      async (slug) => {
-        if (generation !== connectionGeneration) return { deferred: true };
-        const one = await refreshUsage(slug, {
-          manual: refreshPayload?.manual === true,
-        });
-        if (one.deferred.length > 0) return { deferred: true };
-        return undefined;
-      },
-    );
-    if (generation !== connectionGeneration) {
-      commandResults.delete(id);
-      return;
-    }
-    const allDeferred =
-      usage.deferred.length > 0 &&
-      usage.deferred.length === schedulerProviderSlugs().length;
-    const ack: TDaemonCommandAck = allDeferred
-      ? {
-          id,
-          status: "error",
-          result: {
-            error: "login_conflict",
-            retryable: true,
-            deferred: usage.deferred,
-          },
-        }
-      : {
-          id,
-          status: "done",
-          ...(usage.deferred.length > 0
-            ? { result: { deferred: usage.deferred } }
-            : {}),
-        };
-    commandResults.set(id, ack);
-    send({ type: "ack", ack });
-    void pushStatus(undefined, "command").catch((err: unknown) => {
-      logDebug("control-channel", "status publish request failed", {
-        kind,
-        id,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    });
-    return;
-  }
   if (command.command.kind === "status") {
     statusReadTail = statusReadTail.catch(() => undefined).then(run);
     await statusReadTail;

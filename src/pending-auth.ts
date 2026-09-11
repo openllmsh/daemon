@@ -71,7 +71,7 @@ export const getPendingAuth = (slug: string): TPendingAuth | null => {
   const auth = pending.get(slug);
   if (auth === undefined) return null;
   if (isExpired(auth)) {
-    if (auth.kind === "marker" || loginOwnerLive(slug)) return auth;
+    if (loginOwnerLive(slug)) return auth;
     pending.delete(slug);
     return null;
   }
@@ -103,7 +103,7 @@ export const clearPendingAuth = (slug: string, flowId?: string): void => {
 export const hasPendingAuth = (): boolean => {
   if (anyLoginOwnerLive()) return true;
   for (const [slug, auth] of pending) {
-    if (isExpired(auth) && !loginOwnerLive(slug) && auth.kind !== "marker") {
+    if (isExpired(auth) && !loginOwnerLive(slug)) {
       pending.delete(slug);
       continue;
     }

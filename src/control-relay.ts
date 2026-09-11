@@ -138,16 +138,9 @@ export const runCommandInner = async (
         };
       }
       case "cancel_connect": {
-        const delegate = getDelegate(cmd.payload.slug);
-        if (delegate === null) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "unknown provider" },
-          };
-        }
+        const slot = loginSlot(cmd.payload.slug);
         const requestedFlow = cmd.payload.flow_id;
-        const liveFlow = loginSlot(cmd.payload.slug).flow();
+        const liveFlow = slot.flow();
         if (
           requestedFlow !== undefined &&
           liveFlow !== null &&
@@ -159,7 +152,8 @@ export const runCommandInner = async (
             result: { error: "flow_id does not match the active login" },
           };
         }
-        const cancelConnect = delegate.cancelConnect;
+        const delegate = getDelegate(cmd.payload.slug);
+        const cancelConnect = delegate?.cancelConnect;
         if (cancelConnect !== undefined) {
           const r = await runWithLoginCommand(
             { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
@@ -167,7 +161,17 @@ export const runCommandInner = async (
           );
           return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
         }
-        if (loginSlot(cmd.payload.slug).inFlight()) {
+        // No cancelConnect (unknown provider or a delegate without one): still
+        // signal the slot so an in-flight login is not left running after ack.
+        slot.cancelAll();
+        if (delegate === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        if (slot.inFlight()) {
           return {
             id: cmd.id,
             status: "done",
