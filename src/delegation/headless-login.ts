@@ -171,8 +171,23 @@ export const spawnHeadlessLogin = async (
     void requestTerminate();
   });
 
-  let combined = "";
-  const pump = async (stream: ReadableStream<Uint8Array>): Promise<void> => {
+  let stdoutBuf = "";
+  let stderrBuf = "";
+  const combinedDiagnostics = (): string => `${stdoutBuf}${stderrBuf}`;
+  const matchAuthorizeUrl = (): string | undefined => {
+    const clean = (raw: string | undefined): string | undefined => {
+      if (raw === undefined) return undefined;
+      const url = raw.replace(/�+$/g, "");
+      return url.length > 0 ? url : undefined;
+    };
+    const fromStdout = clean(stripAnsi(stdoutBuf).match(HEADLESS_URL_RE)?.[1]);
+    if (fromStdout !== undefined) return fromStdout;
+    return clean(stripAnsi(stderrBuf).match(HEADLESS_URL_RE)?.[1]);
+  };
+  const pump = async (
+    stream: ReadableStream<Uint8Array>,
+    into: "stdout" | "stderr",
+  ): Promise<void> => {
     const dec = new TextDecoder();
     const reader = stream.getReader();
     try {
@@ -180,11 +195,15 @@ export const spawnHeadlessLogin = async (
         const { done, value } = await reader.read();
         if (done) break;
         if (value !== undefined) {
-          combined += dec.decode(value, { stream: true });
+          const chunk = dec.decode(value, { stream: true });
+          if (into === "stdout") stdoutBuf += chunk;
+          else stderrBuf += chunk;
         }
       }
     } finally {
-      combined += dec.decode();
+      const rest = dec.decode();
+      if (into === "stdout") stdoutBuf += rest;
+      else stderrBuf += rest;
       reader.releaseLock();
     }
   };
@@ -204,9 +223,9 @@ export const spawnHeadlessLogin = async (
       whenReleased: child.whenReleased,
     };
   }
-  void pump(stdout);
+  void pump(stdout, "stdout");
   if (typeof stderr === "object" && stderr !== null) {
-    void pump(stderr);
+    void pump(stderr, "stderr");
   }
   const done = proc.exited.then(() => {});
 
@@ -220,8 +239,8 @@ export const spawnHeadlessLogin = async (
     };
     settleUrl = finish;
     const poll = setInterval(() => {
-      const m = stripAnsi(combined).match(HEADLESS_URL_RE);
-      if (m !== null) finish(m[1]);
+      const found = matchAuthorizeUrl();
+      if (found !== undefined) finish(found);
     }, 50);
     void proc.exited.then(() => finish(null));
   });
@@ -234,7 +253,7 @@ export const spawnHeadlessLogin = async (
     unbindAbort();
     budget.release();
     const exitCode = proc.exitCode;
-    const sample = stripAnsi(combined)
+    const sample = stripAnsi(combinedDiagnostics())
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 300);
@@ -257,7 +276,8 @@ export const spawnHeadlessLogin = async (
   const submitCode = (
     code: string,
   ): Promise<{ ok: boolean; detail: string }> => {
-    const mark = combined.length;
+    const stdoutMark = stdoutBuf.length;
+    const stderrMark = stderrBuf.length;
     if (!writeStdin(proc, code)) {
       return Promise.resolve({
         ok: false,
@@ -275,7 +295,9 @@ export const spawnHeadlessLogin = async (
       // Invalid paste is an event on stdout; a valid code exits the child.
       // The operation deadline (not a per-submit ceiling) reaps a hung exchange.
       const poll = setInterval(() => {
-        if (HEADLESS_INVALID_RE.test(stripAnsi(combined.slice(mark)))) {
+        const out = stripAnsi(stdoutBuf.slice(stdoutMark));
+        const err = stripAnsi(stderrBuf.slice(stderrMark));
+        if (HEADLESS_INVALID_RE.test(out) || HEADLESS_INVALID_RE.test(err)) {
           finish({
             ok: false,
             detail:

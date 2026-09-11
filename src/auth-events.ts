@@ -40,8 +40,14 @@ export const setVerifiedLoginAdmitter = (
 export const admitVerifiedLogin = (flow: {
   readonly slug: string;
   readonly flowId: string;
-}): boolean =>
-  verifiedLoginAdmit === null ? true : verifiedLoginAdmit(flow) === true;
+}): boolean => {
+  if (verifiedLoginAdmit === null) return true;
+  try {
+    return verifiedLoginAdmit(flow) === true;
+  } catch {
+    return false;
+  }
+};
 
 /** Add an independent best-effort auth-event observer. */
 export const addAuthObserver = (

@@ -208,6 +208,11 @@ export const makeBlockingConnect = (
             return cancelledResult();
           }
           if (!loginReady(ready)) {
+            terminalLedger = {
+              outcome: "failed",
+              observation: "unknown",
+              reason_code: "keychain_unavailable",
+            };
             emitLoginFailed(flow, {
               code: "spawn_denied",
               message: KEYCHAIN_NOT_READY_DETAIL,

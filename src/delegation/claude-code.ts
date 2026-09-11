@@ -1300,8 +1300,15 @@ export const claudeCodeDelegate: TProviderDelegate = {
       clearAuthStatusCache();
       const verifyMark = lifecycle.mark();
       lifecycle.record("verify_wait", verifyMark);
-      const store = await loadStore(budget.signal);
+      const storeWait = await firstOfBudget(budget, loadStore(budget.signal));
       lifecycle.record("verify", verifyMark);
+      if (storeWait.kind === "expired" || budget.expired()) {
+        capture = { kind: "timeout" };
+      }
+      const store =
+        storeWait.kind === "value"
+          ? storeWait.value
+          : { kind: "indeterminate" as const, cause: "timeout" };
       const classified = classifyClaudeLogout({ capture, store });
       terminalLedger = {
         outcome:
