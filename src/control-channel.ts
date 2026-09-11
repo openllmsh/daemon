@@ -344,7 +344,7 @@ const statusPublishCoalescer = createStatusPublishCoalescer({
       connections as ReadonlyArray<TDaemonProviderConnection>,
     );
   },
-  send: (status, active) => {
+  send: (status, active, trigger) => {
     const ordered = supportsOrderedStatus === true && daemonSessionId !== null;
     if (ordered) statusSeq += 1;
     send({
@@ -355,6 +355,25 @@ const statusPublishCoalescer = createStatusPublishCoalescer({
         ? { daemon_session_id: daemonSessionId, status_seq: statusSeq }
         : {}),
     });
+    if (
+      trigger === "command" ||
+      trigger === "auth-sink" ||
+      trigger === "late-probe"
+    ) {
+      try {
+        logInfo(
+          "control-channel",
+          safeDiagnosticMessage`Status publish requested.`,
+          { trigger },
+          {
+            operation_kind: "status_publish",
+            ...(ordered ? { status_seq: statusSeq } : {}),
+          },
+        );
+      } catch {
+        // Reporting must never change publication.
+      }
+    }
   },
   onCollapsed: (queue) => {
     if (queue.collapsed_count !== 1) return;

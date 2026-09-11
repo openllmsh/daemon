@@ -38,6 +38,7 @@ import { maybeSelfUpdate } from "./self-update";
 import { deviceSessionsForList } from "./session-host";
 import {
   clearProviderSignedOut,
+  loginAdmittedForCommand,
   markProviderSignedOut,
   refreshUsage,
 } from "./status";
@@ -91,10 +92,13 @@ export const runCommandInner = async (
         // THIS slug's throttle first — pre-login attempts stamped it
         // with a failure backoff, and a fresh credential must report
         // immediately. Fire-and-forget — never delays the ack.
-        if (r.connected) {
-          clearProviderSignedOut(cmd.payload.slug);
+        const connected =
+          r.connected === true &&
+          loginAdmittedForCommand(cmd.payload.slug, cmd.id);
+        if (connected) {
           invalidateUsage(cmd.payload.slug);
         }
+        const result = connected ? r : { ...r, connected: false };
         // Model catalog: `auth.login.succeeded` (observeLoginModelReports),
         // not this ack — pending logins land later; r.connected can race a
         // stale unknown probe. Duplicate immediate report is avoided there.
@@ -106,8 +110,8 @@ export const runCommandInner = async (
         // a silent "done" with no dialog (issue #2).
         return {
           id: cmd.id,
-          status: r.connected || r.pending === true ? "done" : "error",
-          result: r,
+          status: connected || r.pending === true ? "done" : "error",
+          result,
         };
       }
       case "connect_device_code": {
@@ -128,14 +132,17 @@ export const runCommandInner = async (
               ? delegate.connectDeviceCode()
               : delegate.connect(),
         );
-        if (r.connected) {
-          clearProviderSignedOut(cmd.payload.slug);
+        const connected =
+          r.connected === true &&
+          loginAdmittedForCommand(cmd.payload.slug, cmd.id);
+        if (connected) {
           invalidateUsage(cmd.payload.slug);
         }
+        const result = connected ? r : { ...r, connected: false };
         return {
           id: cmd.id,
-          status: r.connected || r.pending === true ? "done" : "error",
-          result: r,
+          status: connected || r.pending === true ? "done" : "error",
+          result,
         };
       }
       case "cancel_connect": {

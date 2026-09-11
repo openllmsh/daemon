@@ -75,6 +75,7 @@ import {
   currentLoginCommandCorrelation,
   loginOwnershipPending,
 } from "./login-flow";
+import type { TNativeAuthLifecycleTimings } from "./native-auth-lifecycle";
 import { createNativeAuthLifecycle } from "./native-auth-lifecycle";
 import {
   createPassiveObservationCache,
@@ -1209,12 +1210,14 @@ export const claudeCodeDelegate: TProviderDelegate = {
     const lifecycle = createNativeAuthLifecycle({
       scope: "logout",
       producer: "claude-logout",
+      provider: PROVIDER,
       ...(correlation !== undefined ? { operationId: correlation } : {}),
     });
     // The credential is about to disappear — drop the cached status so no
     // caller can read a stale "connected" for up to the TTL.
     clearAuthStatusCache();
     let capture: TClaudeLogoutCapture = { kind: "skipped" };
+    let terminalLedger: TNativeAuthLifecycleTimings | undefined;
     const timedOut = async (): Promise<{
       readonly ok: boolean;
       readonly detail: string;
@@ -1279,9 +1282,27 @@ export const claudeCodeDelegate: TProviderDelegate = {
       lifecycle.record("verify_wait", verifyMark);
       const store = await loadStore(budget.signal);
       lifecycle.record("verify", verifyMark);
-      return classifyClaudeLogout({ capture, store });
+      const classified = classifyClaudeLogout({ capture, store });
+      terminalLedger = {
+        outcome:
+          capture.kind === "timeout" || capture.kind === "aborted"
+            ? "timeout"
+            : classified.ok
+              ? "succeeded"
+              : "failed",
+        observation: classified.ok ? "signed_out" : "unknown",
+        ...(classified.ok
+          ? {}
+          : {
+              reason_code:
+                capture.kind === "timeout" || capture.kind === "aborted"
+                  ? "probe_timeout"
+                  : "store_unreadable",
+            }),
+      };
+      return classified;
     } finally {
-      lifecycle.record("terminal");
+      lifecycle.record("terminal", undefined, terminalLedger);
     }
   },
 };

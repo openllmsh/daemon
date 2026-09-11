@@ -17,6 +17,7 @@ import type {
   TProviderUsageSnapshot,
 } from "@openllmsh/protocol";
 import { normalizeProviderConnection } from "@openllmsh/protocol";
+import { setVerifiedLoginAdmitter } from "./auth-events";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import type { TDeadlineBudget } from "./deadline-budget";
@@ -30,6 +31,7 @@ import {
   loginOwnershipPending,
   loginSlot,
   providerAuthOperationActive,
+  providerLogoutActive,
   resetProviderAuthOperationsForTests,
 } from "./delegation/login-flow";
 import {
@@ -103,7 +105,14 @@ const signedOutByUser = new Set<string>();
 /** Mark `slug` signed-out at logout command receipt, before `delegate.logout()`. */
 export const markProviderSignedOut = (slug: string): void => {
   signedOutByUser.add(slug);
+  pendingVerifiedPublish.delete(slug);
+  admittedLoginFlow.delete(slug);
 };
+
+/** One-shot: publish the verified login row without a passive probe. */
+const pendingVerifiedPublish = new Set<string>();
+/** Last verified login `flow_id` per slug — not last-known observation. */
+const admittedLoginFlow = new Map<string, string>();
 
 /** Clear sticky signed-out (successful login, or a logout that did not take). */
 export const clearProviderSignedOut = (slug: string): void => {
@@ -125,6 +134,49 @@ const providerAuthOwned = (slug: string): boolean =>
 
 export const lateProviderAdmitBlocked = (slug: string): boolean =>
   signedOutByUser.has(slug) || providerAuthOwned(slug);
+
+/**
+ * Seed last-known Connected from a still-owned verified login. Does not probe,
+ * copy prior account/usage, or invent cli_installed. Login-flow calls this
+ * through the auth-events admitter so status does not import back into
+ * delegation.
+ */
+export const admitVerifiedLoginObservation = (flow: {
+  readonly slug: string;
+  readonly flowId: string;
+}): boolean => {
+  const slug = flow.slug;
+  if (providerLogoutActive(slug)) return false;
+  const slot = loginSlot(slug);
+  const live = slot.flow();
+  if (live !== null && live.flowId !== flow.flowId) return false;
+  if (live !== null && slot.wasCancelled()) return false;
+  if (live === null && slot.inFlight()) return false;
+  if (live === null && signedOutByUser.has(slug)) return false;
+  const previous = lastKnownConnections.get(slug);
+  signedOutByUser.delete(slug);
+  lastKnownConnections.set(slug, {
+    provider: slug,
+    status: "connected",
+    observation: "connected",
+    ...(previous?.cli_installed !== undefined
+      ? { cli_installed: previous.cli_installed }
+      : {}),
+    last_login_at_ms: statusNow(),
+  });
+  pendingVerifiedPublish.add(slug);
+  admittedLoginFlow.set(slug, flow.flowId);
+  return true;
+};
+
+/** True only for this command's successful admit, not leftover last-known. */
+export const loginAdmittedForCommand = (
+  slug: string,
+  flowId: string,
+): boolean =>
+  !signedOutByUser.has(slug) && admittedLoginFlow.get(slug) === flowId;
+
+setVerifiedLoginAdmitter(admitVerifiedLoginObservation);
 
 const PROBE_BACKOFF_AFTER = 2;
 const PROBE_BACKOFF_BASE_MS = 15_000;
@@ -322,6 +374,8 @@ export const resetLastKnownConnectionsForTests = (): void => {
   signedOutByUser.clear();
   resetProviderAuthOperationsForTests();
   resetStoreIdentityEpochsForTests();
+  pendingVerifiedPublish.clear();
+  admittedLoginFlow.clear();
   probeBackoff.clear();
   inFlightSlugProbes.clear();
   inFlightStatus = null;
@@ -633,6 +687,13 @@ const computeStatusFreshInner = async (
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
+        if (pendingVerifiedPublish.has(d.slug)) {
+          pendingVerifiedPublish.delete(d.slug);
+          const seeded = lastKnownConnections.get(d.slug);
+          if (seeded?.observation === "connected") {
+            return attachUpstreamAuthCooldown(d.slug, seeded);
+          }
+        }
         const raw = await boundedDelegateStatus(
           d.slug,
           (signal) => d.status(signal),

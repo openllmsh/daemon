@@ -1,24 +1,22 @@
+import type {
+  TDoctorAuthOperationKind,
+  TDoctorAuthPhase,
+  TDoctorOutcomeLedger,
+  TSubscriptionProviderSlug,
+} from "@openllmsh/protocol";
+import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { logInfo, safeDiagnosticMessage } from "../logger";
 import type { TNativeAuthProducer } from "./spawn";
 
-/** Local phase labels. Not doctor-report fields. */
-export type TNativeAuthLifecyclePhase =
-  | "readiness_wait"
-  | "readiness"
-  | "start"
-  | "child_wait"
-  | "child"
-  | "prep_wait"
-  | "prep"
-  | "verify_wait"
-  | "verify"
-  | "terminal";
+/** Same closed set as protocol `DoctorAuthPhase`. */
+export type TNativeAuthLifecyclePhase = TDoctorAuthPhase;
 
 export type TNativeAuthLifecycleConfig = {
   readonly scope: string;
   readonly producer: TNativeAuthProducer;
   readonly operationId?: string;
+  readonly provider?: TSubscriptionProviderSlug;
 };
 
 /** Bounded per-attempt logging; independent of doctor-report batching. */
@@ -40,6 +38,15 @@ const STAGE_MESSAGE: Record<
   terminal: safeDiagnosticMessage`Native authentication attempt finished.`,
 };
 
+const operationKindFromProducer = (
+  producer: TNativeAuthProducer,
+): TDoctorAuthOperationKind | undefined => {
+  if (producer === "claude-login") return "login";
+  if (producer === "claude-logout") return "logout";
+  if (producer === "claude-auth-status") return "status_probe";
+  return undefined;
+};
+
 /**
  * Bounded per-attempt stage recorder. Info stages never throw.
  * Durations are `performance.now()` deltas on both local meta and doctor timings.
@@ -48,7 +55,7 @@ export type TNativeAuthLifecycleTimings = {
   readonly spawn_setup_ms?: number;
   readonly child_wait_ms?: number;
   readonly cleanup_ms?: number;
-};
+} & TDoctorOutcomeLedger;
 
 export const createNativeAuthLifecycle = (
   cfg: TNativeAuthLifecycleConfig,
@@ -63,6 +70,7 @@ export const createNativeAuthLifecycle = (
   const attemptStartedAtMs = performance.now();
   let remaining = MAX_STAGE_RECORDS;
   const correlation_id = opaqueDoctorCorrelation(cfg.operationId);
+  const operation_kind = operationKindFromProducer(cfg.producer);
   return {
     mark: (): number => performance.now(),
     record: (phase, startedAtMs, extras): void => {
@@ -73,6 +81,12 @@ export const createNativeAuthLifecycle = (
         performance.now() - (startedAtMs ?? attemptStartedAtMs),
       );
       try {
+        const ledger = projectDoctorOutcomeLedger({
+          ...(cfg.provider !== undefined ? { provider: cfg.provider } : {}),
+          ...(operation_kind !== undefined ? { operation_kind } : {}),
+          phase,
+          ...(extras ?? {}),
+        });
         logInfo(
           cfg.scope,
           STAGE_MESSAGE[phase],
@@ -103,10 +117,9 @@ export const createNativeAuthLifecycle = (
               ...(extras?.cleanup_ms !== undefined
                 ? { cleanup_ms: extras.cleanup_ms }
                 : {}),
-              // child_wait_ms is local meta only — DoctorEventTimings has no
-              // matching field. P1 should pass TLoginResult extras into record().
             },
             ...(correlation_id !== undefined ? { correlation_id } : {}),
+            ...ledger,
           },
         );
       } catch {

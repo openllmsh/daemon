@@ -15,6 +15,7 @@
  * there is no cycle.
  */
 
+import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
 import type { TReapOutcome } from "../child-supervisor";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { clearPendingAuth } from "../pending-auth";
@@ -42,6 +43,7 @@ import {
   waitLoginVerifyHint,
 } from "./login-flow";
 import { KEYCHAIN_NOT_READY_DETAIL, loginReady } from "./login-readiness";
+import type { TNativeAuthLifecycleTimings } from "./native-auth-lifecycle";
 import { createNativeAuthLifecycle } from "./native-auth-lifecycle";
 import type { TNativeAuthProducer } from "./spawn";
 import type { TLoginResult, TStoreRead } from "./util";
@@ -127,6 +129,15 @@ export const makeBlockingConnect = (
           return { connected: false, detail: "daemon update in progress" };
         }
         const correlation = opaqueDoctorCorrelation(flow.flowId);
+        const lifecycleProvider = (
+          [
+            "claude_code",
+            "chatgpt",
+            "kimi_code",
+            "grok",
+            "cursor",
+          ] as const satisfies ReadonlyArray<TSubscriptionProviderSlug>
+        ).find((item) => item === cfg.provider);
         const lifecycle =
           cfg.nativeAuth === undefined
             ? null
@@ -136,12 +147,17 @@ export const makeBlockingConnect = (
                 ...(correlation !== undefined
                   ? { operationId: correlation }
                   : {}),
+                ...(lifecycleProvider !== undefined
+                  ? { provider: lifecycleProvider }
+                  : {}),
               });
+        let terminalLedger: TNativeAuthLifecycleTimings | undefined;
         const releaseNoChild = (): void => {
           slot?.end(flow.flowId);
           clearPendingAuth(cfg.provider, flow.flowId);
         };
         const cancelledResult = (): TConnectResult => {
+          terminalLedger = { outcome: "cancelled" };
           emitLoginFailed(flow, {
             code: "user_cancelled",
             message: "sign-in cancelled",
@@ -242,6 +258,7 @@ export const makeBlockingConnect = (
               releaseNoChild();
               return cancelledResult();
             }
+            terminalLedger = { outcome: "failed" };
             emitLoginFailed(flow, {
               code: "spawn_denied",
               message: "login spawn failed",
@@ -304,6 +321,11 @@ export const makeBlockingConnect = (
           }
           if (verified.state === "connected") {
             if (granted === false) {
+              terminalLedger = {
+                outcome: "failed",
+                observation: "unknown",
+                reason_code: "keychain_unavailable",
+              };
               emitLoginFailed(flow, {
                 code: "spawn_denied",
                 message: KEYCHAIN_NOT_READY_DETAIL,
@@ -314,13 +336,30 @@ export const makeBlockingConnect = (
               return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
             }
             await cfg.onConnected?.();
-            emitLoginSucceeded(flow);
+            terminalLedger = {
+              outcome: "succeeded",
+              observation: "connected",
+            };
+            if (!emitLoginSucceeded(flow)) {
+              terminalLedger = { outcome: "cancelled" };
+              slot?.end(flow.flowId);
+              clearPendingAuth(cfg.provider, flow.flowId);
+              return {
+                connected: false,
+                detail: "sign-in is no longer the active attempt",
+              };
+            }
             slot?.end(flow.flowId);
             clearPendingAuth(cfg.provider, flow.flowId);
             return { connected: true, detail: await cfg.successDetail() };
           }
           const detail = cfg.failDetail(result);
           if (verified.state === "unavailable") {
+            terminalLedger = {
+              outcome: "timeout",
+              observation: "unknown",
+              reason_code: "probe_timeout",
+            };
             emitLoginFailed(flow, {
               code: "poll_expired",
               message: detail,
@@ -334,6 +373,11 @@ export const makeBlockingConnect = (
             result.abandoned !== true &&
             typeof result.code === "number" &&
             result.code !== 0;
+          terminalLedger = {
+            outcome: crashed ? "failed" : "timeout",
+            observation: "disconnected",
+            reason_code: "credential_absent",
+          };
           emitLoginFailed(flow, {
             code: crashed ? "cli_crash" : "poll_expired",
             message: detail,
@@ -343,7 +387,7 @@ export const makeBlockingConnect = (
           clearPendingAuth(cfg.provider, flow.flowId);
           return { connected: false, detail };
         } finally {
-          lifecycle?.record("terminal");
+          lifecycle?.record("terminal", undefined, terminalLedger);
         }
       },
     );

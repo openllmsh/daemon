@@ -172,7 +172,15 @@ export const flushLogs = (): Promise<void> => appendTail;
 
 type TLogObservation = Pick<
   TDoctorObservationInput,
-  "timings" | "correlation_id"
+  | "timings"
+  | "correlation_id"
+  | "provider"
+  | "operation_kind"
+  | "phase"
+  | "outcome"
+  | "observation"
+  | "reason_code"
+  | "status_seq"
 >;
 
 const write = (
@@ -191,6 +199,27 @@ const write = (
         timings: observation?.timings,
         correlation_id: observation?.correlation_id,
         replay_session_id: currentCommandReplaySessionId(),
+        ...(observation?.provider !== undefined
+          ? { provider: observation.provider }
+          : {}),
+        ...(observation?.operation_kind !== undefined
+          ? { operation_kind: observation.operation_kind }
+          : {}),
+        ...(observation?.phase !== undefined
+          ? { phase: observation.phase }
+          : {}),
+        ...(observation?.outcome !== undefined
+          ? { outcome: observation.outcome }
+          : {}),
+        ...(observation?.observation !== undefined
+          ? { observation: observation.observation }
+          : {}),
+        ...(observation?.reason_code !== undefined
+          ? { reason_code: observation.reason_code }
+          : {}),
+        ...(observation?.status_seq !== undefined
+          ? { status_seq: observation.status_seq }
+          : {}),
       });
     } catch {
       // Reporting must never throw or log recursively.

@@ -23,12 +23,14 @@ import {
   DOCTOR_REPORT_MAX_SPOOL_BYTES,
   DOCTOR_REPORT_PENDING_TTL_MS,
   DOCTOR_REPORT_SCHEMA_VERSION,
+  doctorEventHasOutcomeLedger,
   doctorReportingScopeId,
   parseDoctorReport,
   parseDoctorReportAck,
   parseDoctorReportEvent,
   parseDoctorReportReject,
   reportingPolicyAllowsUpload,
+  stripDoctorOutcomeLedger,
 } from "@openllmsh/protocol";
 import { InvalidApiKeyError, NoApiKeyError } from "../cloud-client";
 import { getReportingPolicy, getReportingPolicyRevision } from "../config";
@@ -709,7 +711,15 @@ const flushLocked = async (
   inFlight = true;
   const uploadRevision = transitionRevision;
   try {
-    const result = await (uploadImpl ?? defaultUpload)(report);
+    const upload = uploadImpl ?? defaultUpload;
+    let result = await upload(report);
+    if (
+      result.kind === "reject" &&
+      result.status === 422 &&
+      report.events.some(doctorEventHasOutcomeLedger)
+    ) {
+      result = await upload(stripDoctorOutcomeLedger(report));
+    }
     if (
       uploadRevision !== transitionRevision ||
       !cursorMatchesScope(cursorAfter, reportingScope()) ||

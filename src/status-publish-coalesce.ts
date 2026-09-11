@@ -53,7 +53,11 @@ export type TStatusPublishCoalescerHost = {
   readonly lastFingerprint: () => string;
   readonly setLastFingerprint: (fingerprint: string) => void;
   readonly observe: (connections: ReadonlyArray<unknown>) => void;
-  readonly send: (status: unknown, active: boolean | undefined) => void;
+  readonly send: (
+    status: unknown,
+    active: boolean | undefined,
+    trigger: TStatusPublishTrigger,
+  ) => void;
   readonly onCollapsed?: (snapshot: TStatusPublishQueueSnapshot) => void;
 };
 
@@ -145,7 +149,7 @@ export const createStatusPublishCoalescer = (
         return;
       }
       host.observe(computed.status.connections);
-      host.send(computed.status, job.active);
+      host.send(computed.status, job.active, job.trigger);
       host.setLastFingerprint(computed.fingerprint);
       resolveWaiters(job.waiters);
     } catch (err) {
