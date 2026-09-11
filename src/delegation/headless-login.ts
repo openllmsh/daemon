@@ -171,9 +171,9 @@ export const spawnHeadlessLogin = async (
     void requestTerminate();
   });
 
-  const dec = new TextDecoder();
   let combined = "";
   const pump = async (stream: ReadableStream<Uint8Array>): Promise<void> => {
+    const dec = new TextDecoder();
     const reader = stream.getReader();
     try {
       for (;;) {

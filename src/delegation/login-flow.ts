@@ -428,9 +428,9 @@ export const finalizeLoginTerminal = (opts: {
     );
   }
   if (opts.flow !== null) {
-    if (opts.event.kind === "succeeded") {
-      emitLoginSucceeded(opts.flow);
-    } else if (opts.event.kind === "failed") {
+    const admitted =
+      opts.event.kind === "succeeded" ? emitLoginSucceeded(opts.flow) : false;
+    if (opts.event.kind === "failed") {
       emitLoginFailed(opts.flow, {
         code: opts.event.code,
         message: opts.event.message,
@@ -440,7 +440,9 @@ export const finalizeLoginTerminal = (opts: {
     const correlation_id = opaqueDoctorCorrelation(opts.flow.flowId);
     const outcome =
       opts.event.kind === "succeeded"
-        ? "succeeded"
+        ? admitted
+          ? "succeeded"
+          : "cancelled"
         : opts.event.kind === "failed" && opts.event.code === "user_cancelled"
           ? "cancelled"
           : opts.event.kind === "failed" &&
@@ -455,7 +457,7 @@ export const finalizeLoginTerminal = (opts: {
       operation_kind: "login",
       phase: "terminal",
       ...(outcome !== undefined ? { outcome } : {}),
-      ...(opts.event.kind === "succeeded" ? { observation: "connected" } : {}),
+      ...(admitted ? { observation: "connected" } : {}),
     });
     try {
       logInfo(

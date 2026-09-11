@@ -1235,6 +1235,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
       const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
       if (installed.kind === "expired") {
         lifecycle.record("readiness", readyMark);
+        terminalLedger = {
+          outcome: "timeout",
+          observation: "unknown",
+          reason_code: "probe_timeout",
+        };
         return await timedOut();
       }
       if (installed.value.installed) {
@@ -1244,15 +1249,30 @@ export const claudeCodeDelegate: TProviderDelegate = {
         );
         lifecycle.record("readiness", readyMark);
         if (ready.kind === "expired") {
+          terminalLedger = {
+            outcome: "timeout",
+            observation: "unknown",
+            reason_code: "probe_timeout",
+          };
           return await timedOut();
         }
         if (ready.value.kind !== "present") {
+          terminalLedger = {
+            outcome: "failed",
+            observation: "unknown",
+            reason_code: "store_unreadable",
+          };
           return {
             ok: false,
             detail: "could not reach the credential store to sign out",
           };
         }
         if (budget.expired()) {
+          terminalLedger = {
+            outcome: "timeout",
+            observation: "unknown",
+            reason_code: "probe_timeout",
+          };
           return await timedOut();
         }
         lifecycle.record("start");
