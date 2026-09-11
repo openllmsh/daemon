@@ -19,10 +19,15 @@
  */
 
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
-import { emitAuth, requestStatusPush } from "../auth-events";
+import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
+import {
+  admitVerifiedLogin,
+  emitAuth,
+  requestStatusPush,
+} from "../auth-events";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
-import { logWarn, safeDiagnosticMessage } from "../logger";
+import { logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -263,6 +268,10 @@ export const endProviderAuthOperation = (slug: string): void => {
 export const providerAuthOperationActive = (slug: string): boolean =>
   logoutOps.has(slug) || loginSlot(slug).inFlight();
 
+/** Logout owns this provider (login in-flight is a separate slot). */
+export const providerLogoutActive = (slug: string): boolean =>
+  logoutOps.has(slug);
+
 export const resetProviderAuthOperationsForTests = (): void => {
   logoutOps.clear();
   applyHeld = false;
@@ -353,7 +362,10 @@ export const publishPendingAuth = (
   emitLoginPrompt(flow, { url: pending.url, code: pending.code });
 };
 
-export const emitLoginSucceeded = (flow: TLoginFlowCtx): void => {
+export const emitLoginSucceeded = (flow: TLoginFlowCtx): boolean => {
+  if (!admitVerifiedLogin({ slug: flow.slug, flowId: flow.flowId })) {
+    return false;
+  }
   noteAuthStoreIdentityChange(flow.slug);
   emitAuth({
     event: "auth.login.succeeded",
@@ -361,6 +373,8 @@ export const emitLoginSucceeded = (flow: TLoginFlowCtx): void => {
     key_id: flow.keyId,
     slug: flow.slug,
   });
+  requestStatusPush();
+  return true;
 };
 
 export const emitLoginFailed = (
@@ -414,14 +428,49 @@ export const finalizeLoginTerminal = (opts: {
     );
   }
   if (opts.flow !== null) {
-    if (opts.event.kind === "succeeded") {
-      emitLoginSucceeded(opts.flow);
-    } else if (opts.event.kind === "failed") {
+    const admitted =
+      opts.event.kind === "succeeded" ? emitLoginSucceeded(opts.flow) : false;
+    if (opts.event.kind === "failed") {
       emitLoginFailed(opts.flow, {
         code: opts.event.code,
         message: opts.event.message,
         retryable: opts.event.retryable,
       });
+    }
+    const correlation_id = opaqueDoctorCorrelation(opts.flow.flowId);
+    const outcome =
+      opts.event.kind === "succeeded"
+        ? admitted
+          ? "succeeded"
+          : "cancelled"
+        : opts.event.kind === "failed" && opts.event.code === "user_cancelled"
+          ? "cancelled"
+          : opts.event.kind === "failed" &&
+              (opts.event.code === "poll_expired" ||
+                opts.event.code === "prompt_timeout")
+            ? "timeout"
+            : opts.event.kind === "failed"
+              ? "failed"
+              : undefined;
+    const ledger = projectDoctorOutcomeLedger({
+      provider: opts.provider,
+      operation_kind: "login",
+      phase: "terminal",
+      ...(outcome !== undefined ? { outcome } : {}),
+      ...(admitted ? { observation: "connected" } : {}),
+    });
+    try {
+      logInfo(
+        "login-flow",
+        safeDiagnosticMessage`Native authentication attempt finished.`,
+        { phase: "terminal" },
+        {
+          ...(correlation_id !== undefined ? { correlation_id } : {}),
+          ...ledger,
+        },
+      );
+    } catch {
+      // Reporting must never change login outcome.
     }
   }
   if (opts.clearPending) {
@@ -557,7 +606,12 @@ export const guard = async (
   ) {
     clearPendingAuth(opts.provider);
     const flow = resolveLoginFlow(opts.provider, mode);
-    emitLoginSucceeded(flow);
+    if (!emitLoginSucceeded(flow)) {
+      return {
+        connected: false,
+        detail: "sign-in is no longer the active attempt",
+      };
+    }
     return { connected: true, detail: opts.shortCircuit.detail };
   }
   return run();
@@ -667,6 +721,13 @@ export const finishInBackground = async (opts: {
   // Both callbacks are BEST-EFFORT: this runs from a `void proc.exited.then(...)`
   // / `void login.done.then(...)`, so a throw here would be an unhandled
   // rejection AND could skip `clearPendingAuth`.
+  if (opts.slot.wasCancelled()) {
+    settleNone(true);
+    return;
+  }
+  if (!stillThisFlow()) {
+    return;
+  }
   let sampled = await sampleVerify(opts.verify);
   if (opts.slot.wasCancelled()) {
     settleNone(true);
@@ -748,15 +809,27 @@ export const finishInBackground = async (opts: {
                   : "sign-in ended without a stored credential",
                 retryable: !crashed,
               };
+  const clearPending =
+    opts.alwaysClearPending === true ||
+    sampled.state !== "connected" ||
+    grantDenied;
+  // Admit verified Connected while this flow still owns the slot.
+  if (event.kind === "succeeded") {
+    finalizeLoginTerminal({
+      flow,
+      event,
+      provider: opts.provider,
+      clearPending,
+    });
+    if (stillThisFlow()) opts.slot.end();
+    return;
+  }
   opts.slot.end();
   finalizeLoginTerminal({
     flow,
     event,
     provider: opts.provider,
-    clearPending:
-      opts.alwaysClearPending === true ||
-      sampled.state !== "connected" ||
-      grantDenied,
+    clearPending,
   });
 };
 

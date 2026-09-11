@@ -18,11 +18,17 @@
 
 import { pendingAuthDetail } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import type { TConnectResult, TLoginSlot, TLoginVerify } from "./login-flow";
+import type {
+  TConnectResult,
+  TLoginSlot,
+  TLoginTerminalEvent,
+  TLoginVerify,
+} from "./login-flow";
 import {
   booleanLoginVerify,
   emitLoginFailed,
   emitLoginStarted,
+  finalizeLoginTerminal,
   finishInBackground,
   guard,
   makeCancelConnect,
@@ -33,7 +39,8 @@ import {
   streamLoginFail,
 } from "./login-flow";
 import { KEYCHAIN_NOT_READY_DETAIL, loginReady } from "./login-readiness";
-import type { THeadlessLogin, TStoreRead } from "./util";
+import type { TChildCleanupOutcome } from "./spawn";
+import type { THeadlessLogin, THeadlessLoginMiss, TStoreRead } from "./util";
 import { spawnHeadlessLogin } from "./util";
 
 type TCancelConnect = () => Promise<{
@@ -70,6 +77,8 @@ export type TPasteBackConfig = {
   readonly submitSuccessDetail: () => Promise<string>;
   /** File-store identity hint after child exit (not Darwin keychain). */
   readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
+  /** Whole-operation safety budget forwarded to paste-back spawn (tests inject). */
+  readonly timeoutMs?: number;
 };
 
 export type TPasteBackDevice = {
@@ -124,9 +133,10 @@ export const makePasteBackDevice = (
           });
           return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
         }
+        const abort = new AbortController();
         if (
           !cfg.slot.start(() => {
-            handle?.cancel();
+            abort.abort();
           }, flow)
         ) {
           emitLoginFailed(flow, {
@@ -136,35 +146,134 @@ export const makePasteBackDevice = (
           });
           return { connected: false, detail: "daemon update in progress" };
         }
-        // Keychain-dependent paste-back login (claude) is unconfined on macOS
-        // (`sandbox/policy.ts`).
-        const login = await spawnHeadlessLogin([...cfg.argv()], cfg.env(), {
-          probe: unwrapKeychainSpawn(cfg.provider),
-        });
-        if ("error" in login) {
-          emitLoginFailed(flow, {
-            code: "cli_crash",
-            message: login.error,
-            retryable: false,
+        const endOwnership = (
+          cleanup: TChildCleanupOutcome | undefined,
+          whenReleased: Promise<unknown> | undefined,
+        ): void => {
+          if (whenReleased !== undefined) {
+            if (cleanup !== undefined && !cleanup.confirmed) {
+              cfg.slot.markCleanupUnknown();
+            }
+            void whenReleased.finally(() => {
+              cfg.slot.end(flow.flowId);
+            });
+            return;
+          }
+          cfg.slot.end(flow.flowId);
+        };
+        const failFromMiss = (miss: THeadlessLoginMiss): TConnectResult => {
+          if (miss.cancelled || cfg.slot.wasCancelled()) {
+            // cancelConnect already emitted `user_cancelled` via makeCancelConnect.
+            if (!cfg.slot.wasCancelled()) {
+              finalizeLoginTerminal({
+                flow,
+                event: {
+                  kind: "failed",
+                  code: "user_cancelled",
+                  message: "sign-in cancelled",
+                  retryable: false,
+                },
+                provider: cfg.provider,
+                clearPending: true,
+              });
+            }
+            endOwnership(miss.cleanup, miss.whenReleased);
+            return { connected: false, detail: "sign-in cancelled" };
+          }
+          const event: TLoginTerminalEvent = miss.crashed
+            ? {
+                kind: "failed",
+                code: "cli_crash",
+                message: miss.error,
+                retryable: false,
+              }
+            : miss.timedOut
+              ? {
+                  kind: "failed",
+                  code: "prompt_timeout",
+                  message: miss.error,
+                  retryable: true,
+                }
+              : {
+                  kind: "failed",
+                  code: "poll_expired",
+                  message: miss.error,
+                  retryable: true,
+                };
+          finalizeLoginTerminal({
+            flow,
+            event,
+            provider: cfg.provider,
+            clearPending: true,
+          });
+          endOwnership(miss.cleanup, miss.whenReleased);
+          return { connected: false, detail: miss.error };
+        };
+        let login: THeadlessLogin | THeadlessLoginMiss;
+        try {
+          // Keychain-dependent paste-back login (claude) is unconfined on macOS
+          // (`sandbox/policy.ts`).
+          login = await spawnHeadlessLogin([...cfg.argv()], cfg.env(), {
+            probe: unwrapKeychainSpawn(cfg.provider),
+            signal: abort.signal,
+            ...(cfg.timeoutMs !== undefined
+              ? { timeoutMs: cfg.timeoutMs }
+              : {}),
+            onSpawned: () => {
+              if (!abort.signal.aborted) emitLoginStarted(flow);
+            },
+          });
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "login spawn failed";
+          finalizeLoginTerminal({
+            flow,
+            event: {
+              kind: "failed",
+              code: "spawn_denied",
+              message,
+              retryable: true,
+            },
+            provider: cfg.provider,
+            clearPending: true,
           });
           cfg.slot.end(flow.flowId);
-          return { connected: false, detail: login.error };
+          return { connected: false, detail: message };
         }
-        handle = login;
-        emitLoginStarted(flow);
-        const auth = {
-          url: login.url,
-          code: "",
-          mode: "paste_code" as const,
-        };
-        publishPendingAuth(flow, cfg.provider, auth);
+        if ("error" in login) {
+          return failFromMiss(login);
+        }
+        const cancelledAfterUrl =
+          cfg.slot.wasCancelled() || abort.signal.aborted;
+        if (cancelledAfterUrl) {
+          login.cancel();
+        } else {
+          handle = login;
+          publishPendingAuth(flow, cfg.provider, {
+            url: login.url,
+            code: "",
+            mode: "paste_code",
+          });
+        }
         // On exit (success, cancel, or expiry) drop the handle + the stale
         // pending URL; on success run onConnected (warn + refresh auth config).
         // Wait for any in-flight submit FIRST so the keychain grant lands before
         // the connection check (a valid code triggers both at once).
+        // Cancel-after-URL still uses this terminal so a late connected verify
+        // cannot emit succeeded (finishInBackground fences wasCancelled).
         void login.done.then(async () => {
           handle = null;
           if (submitting !== null) await submitting.catch(() => {});
+          if (cfg.slot.wasCancelled() || abort.signal.aborted) {
+            await login.whenReleased.catch(() => {});
+            if (
+              cfg.slot.flow()?.flowId === flow.flowId &&
+              cfg.slot.inFlight()
+            ) {
+              cfg.slot.end(flow.flowId);
+            }
+            return;
+          }
           await finishInBackground({
             provider: cfg.provider,
             slot: cfg.slot,
@@ -174,10 +283,17 @@ export const makePasteBackDevice = (
             alwaysClearPending: true,
           });
         });
+        if (cancelledAfterUrl) {
+          return { connected: false, detail: "sign-in cancelled" };
+        }
         return {
           connected: false,
           pending: true,
-          detail: pendingAuthDetail(auth),
+          detail: pendingAuthDetail({
+            url: login.url,
+            code: "",
+            mode: "paste_code",
+          }),
         };
       },
     );

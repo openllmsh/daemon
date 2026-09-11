@@ -15,12 +15,38 @@ export type TAuthSink = {
   readonly pushStatus: () => void;
 };
 
+export type TVerifiedLoginAdmit = (flow: {
+  readonly slug: string;
+  readonly flowId: string;
+}) => boolean;
+
 let sink: TAuthSink | null = null;
+let verifiedLoginAdmit: TVerifiedLoginAdmit | null = null;
 const observers = new Set<(event: TAuthEvent) => void>();
 
 /** Install (or clear) the transport sink. Called from `startControlChannel`. */
 export const setAuthSink = (next: TAuthSink | null): void => {
   sink = next;
+};
+
+/** Status registers the last-known seed. Login-flow must not import status. */
+export const setVerifiedLoginAdmitter = (
+  next: TVerifiedLoginAdmit | null,
+): void => {
+  verifiedLoginAdmit = next;
+};
+
+/** Seed a verified login observation when an admitter is registered. */
+export const admitVerifiedLogin = (flow: {
+  readonly slug: string;
+  readonly flowId: string;
+}): boolean => {
+  if (verifiedLoginAdmit === null) return true;
+  try {
+    return verifiedLoginAdmit(flow) === true;
+  } catch {
+    return false;
+  }
 };
 
 /** Add an independent best-effort auth-event observer. */

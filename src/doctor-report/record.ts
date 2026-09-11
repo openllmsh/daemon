@@ -6,12 +6,14 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import type {
   TDoctorEventTimings,
+  TDoctorOutcomeLedger,
   TDoctorReportEvent,
   TDoctorSeverity,
 } from "@openllmsh/protocol";
 import {
   isReplaySessionId,
   parseDoctorReportEvent,
+  projectDoctorOutcomeLedger,
   projectDoctorTimings,
   sanitizeDoctorScope,
 } from "@openllmsh/protocol";
@@ -34,7 +36,7 @@ export type TDoctorObservationInput = {
   readonly replay_session_id?: string;
   readonly timings?: TDoctorEventTimings;
   readonly observed_at_ms?: number;
-};
+} & TDoctorOutcomeLedger;
 
 let nowMs = (): number => Date.now();
 let approxBytes = 0;
@@ -98,6 +100,7 @@ export const recordDoctorObservation = (
     ...(input.timings !== undefined
       ? { timings: projectDoctorTimings(input.timings) }
       : {}),
+    ...projectDoctorOutcomeLedger(input),
   };
   let parsed: TDoctorReportEvent;
   try {
