@@ -77,6 +77,9 @@ const which = (name: string): string | null => {
   return null;
 };
 
+export const bundledBsPath = (executable: string = process.execPath): string =>
+  join(dirname(executable), executableName("bridgesessions"));
+
 const candidateBinaries = (): readonly string[] => {
   const override = process.env.OPENLLM_BS_BIN?.trim();
   const home = process.env.HOME?.trim() || homedir();
@@ -84,6 +87,7 @@ const candidateBinaries = (): readonly string[] => {
     ...(override !== undefined && override.length > 0 && isAbsolute(override)
       ? [override]
       : []),
+    bundledBsPath(),
     ...[which("bs"), which("bridgesessions")].filter(
       (value): value is string => value !== null,
     ),

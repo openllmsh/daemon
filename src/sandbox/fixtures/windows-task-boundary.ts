@@ -41,7 +41,7 @@ spyOn(ffi, "dlopen").mockImplementation((() => ({ symbols: {
     const b = view(out, bytes); b.setUint32(16, mode === "breakaway-policy" ? 0x808 : 8, true); b.setUint32(40, mode === "weakened-policy" ? 17 : limit, true); return mode === "query-failure" ? 0 : 1;
   },
   CloseHandle: () => { calls.push("close"); return 1; },
-}, close() {} })) as typeof ffi.dlopen);
+}, close() {} })) as unknown as typeof ffi.dlopen);
 
 Object.defineProperty(process, "platform", { value: "win32" });
 Object.defineProperty(process, "arch", { value: "x64" });

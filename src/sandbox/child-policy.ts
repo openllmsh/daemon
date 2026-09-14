@@ -10,6 +10,12 @@ const canonical = (p: string): string => {
 };
 const beneath = (p: string, root: string): boolean => p === root || p.startsWith(root + "/");
 
+const xcodeSelectEnvironment = (): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: "/usr/bin:/bin" };
+  for (const name of Object.keys(env)) if (name !== "PATH") delete env[name];
+  return env;
+};
+
 /** Daemon authority is never a grant to a vendor child. Include aliases so
  * relocated state cannot fall through macOS's outside-home runtime allow. */
 export const childProtectedPaths = (home?: string): string[] => {
@@ -33,7 +39,7 @@ export const childWorkingSet = (home?: string): TWorkingSet => {
   if (process.platform === "darwin") {
     // Read the administrator-selected toolchain, ignoring a caller's
     // DEVELOPER_DIR override. Grant this root-owned directory read-only.
-    const selected = spawnSync("/usr/bin/xcode-select", ["-p"], { env: { PATH: "/usr/bin:/bin" } as NodeJS.ProcessEnv, encoding: "utf8", timeout: 3000 });
+    const selected = spawnSync("/usr/bin/xcode-select", ["-p"], { env: xcodeSelectEnvironment(), encoding: "utf8", timeout: 3000 });
     const developer = selected.status === 0 ? selected.stdout.trim() : "";
     if (isAbsolute(developer) && existsSync(developer) && !overlaps(developer) && canonical(developer) !== "/" && statSync(developer).uid === 0) {
       readOnly.push(developer, canonical(developer));

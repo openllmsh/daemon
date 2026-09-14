@@ -28,7 +28,6 @@ import {
   verifyAnswerInner,
   weriftIceServers,
 } from "@openllmsh/tunnel/rtc-auth";
-import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import { preflightIceCandidate } from "@openllmsh/tunnel/rtc-ice";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
@@ -37,6 +36,7 @@ import type { TEphKeypair } from "./keypair";
 import { generateEphKeypair, openSealedWith, sealTo } from "./keypair";
 import { logDebug, logWarn, safeDiagnosticMessage } from "./logger";
 import { closeRtcPeer } from "./rtc-close";
+import { asRtcDataChannelLike } from "./rtc-data-channel";
 import { rtcCandidateErrors } from "./rtc-udp";
 
 const RTC_SIGNALING_TIMEOUT_MS = 10_000;
@@ -99,49 +99,6 @@ const iceServers = (): Array<{
       handshakeIceServers,
     ),
   );
-
-const asRtcDataChannelLike = (dc: RTCDataChannel): TRtcDataChannelLike => ({
-  get readyState() {
-    return dc.readyState;
-  },
-  get bufferedAmount() {
-    return dc.bufferedAmount;
-  },
-  send: (data) => {
-    if (typeof data === "string" || Buffer.isBuffer(data)) {
-      dc.send(data);
-      return;
-    }
-    if (data instanceof ArrayBuffer) {
-      dc.send(Buffer.from(data));
-      return;
-    }
-    dc.send(
-      Buffer.from(
-        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-      ),
-    );
-  },
-  close: () => dc.close(),
-  get onmessage() {
-    return dc.onmessage as TRtcDataChannelLike["onmessage"];
-  },
-  set onmessage(value) {
-    dc.onmessage = value as RTCDataChannel["onmessage"];
-  },
-  get onclose() {
-    return dc.onclose as TRtcDataChannelLike["onclose"];
-  },
-  set onclose(value) {
-    dc.onclose = value as RTCDataChannel["onclose"];
-  },
-  get onerror() {
-    return dc.onerror as TRtcDataChannelLike["onerror"];
-  },
-  set onerror(value) {
-    dc.onerror = value as RTCDataChannel["onerror"];
-  },
-});
 
 const clearTimers = (session: TRtcClientSession): void => {
   if (session.signalingTimer !== null) {

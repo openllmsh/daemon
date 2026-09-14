@@ -114,6 +114,26 @@ class OpenllmWindowsWorker {
         }
         b.Append('\\',slashes*2);b.Append('"');return b.ToString();
     }
+    static bool IsCmdExecutable(string executable) {
+        string name=Path.GetFileName(executable);
+        return String.Equals(name,"cmd",StringComparison.OrdinalIgnoreCase)||String.Equals(name,"cmd.exe",StringComparison.OrdinalIgnoreCase);
+    }
+    static StringBuilder BuildCommandLine(string[] args) {
+        var command=new StringBuilder();
+        bool cmdCommand=IsCmdExecutable(args[3])&&Array.Exists(args,a=>String.Equals(a,"/c",StringComparison.OrdinalIgnoreCase));
+        if(cmdCommand) {
+            // cmd.exe /s /c consumes quotes as its command envelope rather
+            // than using CRT argv rules. lpApplicationName selects cmd.exe;
+            // preserve only the explicitly requested command payload raw.
+            bool commandPayload=false;
+            for(int i=4;i<args.Length;i++) {
+                if(i>4)command.Append(' ');
+                command.Append(commandPayload?args[i]:Quote(args[i]));
+                if(String.Equals(args[i],"/c",StringComparison.OrdinalIgnoreCase))commandPayload=true;
+            }
+        } else for(int i=3;i<args.Length;i++){if(i>3)command.Append(' ');command.Append(Quote(args[i]));}
+        return command;
+    }
     static void SecureDirectory(string path) {
         var d=new DirectoryInfo(path);
         if(!d.Exists || (d.Attributes & FileAttributes.ReparsePoint)!=0) throw new InvalidOperationException("unsafe directory");
@@ -168,7 +188,7 @@ class OpenllmWindowsWorker {
             // Explicit null standard handles bind the child to ConPTY. Without
             // STARTF_USESTDHANDLES Windows duplicates this worker's JSON pipes.
             si.si.flags=0x100;
-            var command=new StringBuilder();for(int i=3;i<args.Length;i++){if(i>3)command.Append(' ');command.Append(Quote(args[i]));}
+            var command=BuildCommandLine(args);
             // The parent's ignore-Ctrl+C attribute is inherited by the shell.
             // Clear it before spawning, even under a noninteractive supervisor.
             Check(SetConsoleCtrlHandler(IntPtr.Zero,false),"Reset console control");

@@ -1,4 +1,5 @@
-import { StunProtocol, type PeerConfig } from "werift";
+import { StunProtocol } from "werift";
+import type { CandidatePair } from "werift";
 import { logDebug, logWarn } from "./logger";
 
 /**
@@ -9,9 +10,11 @@ import { logDebug, logWarn } from "./logger";
  * ICMP errors remain advisory: ICE still owns nomination and consent expiry,
  * so a failed alternate candidate cannot tear down a healthy selected path.
  */
+type TRtcCandidateObserver = (pair: Pick<CandidatePair, "protocol">) => true;
+
 export const rtcCandidateErrors = (
   onFatal: () => void,
-): NonNullable<PeerConfig["iceFilterCandidatePair"]> => {
+): TRtcCandidateObserver => {
   const observed = new WeakSet<object>();
   return (pair) => {
     const protocol = pair.protocol;
