@@ -238,6 +238,36 @@ export const startCodexToolTurn = async (
  *  results (e.g. loaded Skill instructions) — the paused `item/tool/call` is
  *  the only channel back into the live turn, so it rides the LAST answer as
  *  an extra `inputText` content item instead of being dropped. */
+/**
+ * Dispose the held codex turn these call ids belong to. Used when a
+ * continuation is REJECTED for a reason that ends the turn for good (the
+ * walker serves the hop through the manual transport), so nobody will answer
+ * the paused `item/tool/call`. Leaving it parked blocks a turn inside the
+ * SHARED app-server process until the idle TTL, so the paused call is answered
+ * with a failure — the same shutdown `evictStale` performs. Returns whether a
+ * session was closed.
+ */
+export const disposeHeldCodexToolSession = (
+  callIds: ReadonlyArray<string>,
+): boolean => {
+  const closed = new Set<THeld>();
+  for (const id of callIds) {
+    const h = held.get(id);
+    if (h === undefined || closed.has(h)) continue;
+    closed.add(h);
+    for (const [, requestId] of h.pending) {
+      h.client.respondToServer(requestId, {
+        contentItems: [{ type: "inputText", text: "(cancelled)" }],
+        success: false,
+      });
+    }
+    h.pending.clear();
+    h.client.removeSink(h.threadId);
+    dropIndex(h);
+  }
+  return closed.size > 0;
+};
+
 export const continueCodexToolTurn = async (
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
   injectedContext: string | null = null,

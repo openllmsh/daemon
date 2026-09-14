@@ -394,8 +394,19 @@ protocol mismatch degrades to slower, never broken.
 
 Current native scope (`nativeRequestOf`): multi-turn TEXT (system +
 user/assistant text) via the CLI resume path; claude_code tool requests take
-the SDK tool path. **Native decline → manual fallback.** Anything the native
-path declines — images, structured output, chatgpt tools (until Codex
+the SDK tool path. The claude_code TOOL path additionally carries ATTACHMENTS
+on the active user turn: `claude-tool-media.ts` reuses wire's Anthropic
+conversion (`anthropicContentBlocksOf`) and hands the SDK a one-message
+streaming input whose ordered image/document blocks the CLI receives verbatim
+(`claude-tool-session.ts`, `sdkPromptOf`). Only the ATTACHING turn is
+projected — prior turns stay in the lossy text transcript, so a re-sent history
+cannot double-attach — and anything the SDK's own `MessageParam` cannot
+represent (audio, an un-admitted image media type, a Files-API reference, new
+media arriving mid tool round) DECLINES explicitly rather than degrading to a
+sentence about an attachment the model never saw. **Native decline → manual
+fallback.** Anything the native
+path declines — text-path images, structured output, chatgpt tool-path
+attachments, chatgpt tools (until Codex
 activates), or ANY pre-commit failure — falls through to the MANUAL transport
 on the SAME hop (`claude_code` → Anthropic Messages with the OAuth bearer,
 `chatgpt` → Codex Responses), so no client workflow is blocked. Auth + refresh
