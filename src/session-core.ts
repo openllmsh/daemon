@@ -1397,7 +1397,11 @@ export const openSession = async (
       const pendingOutput: Uint8Array[] = [];
       let ptyReady = false;
       let pendingExit: number | null = null;
+      let ownedPty: TPtyLike | null = null;
+      const stillOwnsPty = (): boolean =>
+        sessions.get(s.id) === s && s.pty === ownedPty;
       const onData = (chunk: Uint8Array): void => {
+        if (ptyReady && !stillOwnsPty()) return;
         s.lastOutputAtMs = Date.now();
         // Keep raw scrollback for the no-stream fallback path, and feed the
         // shared emulator that backs per-consumer reflow + attach replay.
@@ -1435,6 +1439,7 @@ export const openSession = async (
             pendingExit = typeof exitCode === "number" ? exitCode : 1;
             return;
           }
+          if (!stillOwnsPty()) return;
           s.exitCode = typeof exitCode === "number" ? exitCode : null;
           const reason = s.lastExitReason ?? "done";
           endPty(s, reason, false);
@@ -1451,6 +1456,7 @@ export const openSession = async (
         return;
       }
       const pty = spawned.pty;
+      ownedPty = pty;
       s.ptyBackend = spawned.backend;
       s.pty = pty;
       s.pid = pty.pid ?? null;

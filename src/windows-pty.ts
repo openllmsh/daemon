@@ -5,6 +5,8 @@ import { workerEnv } from "./bs-pty";
 import { DAEMON_VERSION } from "./version";
 import { validWindowsAdmission, signedWindowsExitCode } from "./windows-process";
 
+const WINDOWS_PTY_KILL_GRACE_MS = 250;
+
 type Args = {
   argv: readonly string[]; cwd: string; env: Record<string, string>;
   cols: number; rows: number;
@@ -20,6 +22,23 @@ export const windowsPtySpawner = async (args: Args) => {
     windowsHide: true,
   });
   let ready = false, ended = false, childPid = 0;
+  let workerExited = false, killRequested = false, forceKillRequested = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearKillTimer = (): void => {
+    if (killTimer === undefined) return;
+    clearTimeout(killTimer);
+    killTimer = undefined;
+  };
+  const forceKill = (): void => {
+    if (workerExited || forceKillRequested) return;
+    forceKillRequested = true;
+    clearKillTimer();
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // The worker may have exited between the promise and this escalation.
+    }
+  };
   let accept!: () => void, reject!: (error: Error) => void;
   const started = new Promise<void>((resolve, fail) => { accept = resolve; reject = fail; });
   const finish = (code: number) => {
@@ -51,19 +70,42 @@ export const windowsPtySpawner = async (args: Args) => {
       }
     }
   })();
-  void outputDone.catch(() => { proc.kill(); finish(1); });
-  void proc.exited.then(async (code) => { await outputDone.catch(() => {}); finish(signedWindowsExitCode(code) || 1); });
+  void outputDone.catch(() => { forceKill(); finish(1); });
+  void proc.exited.then(async (code) => {
+    workerExited = true;
+    clearKillTimer();
+    await outputDone.catch(() => {});
+    finish(signedWindowsExitCode(code) || 1);
+  });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([started, new Promise<never>((_, fail) => {
       timer = setTimeout(() => fail(new Error("ConPTY worker startup timed out")), 10000);
     })]);
-  } catch (error) { proc.kill(); throw error; }
+  } catch (error) { forceKill(); throw error; }
   finally { if (timer) clearTimeout(timer); }
   const send = (value: unknown) => {
     if (ended) return;
     proc.stdin.write(`${JSON.stringify(value)}\n`);
     proc.stdin.flush();
+  };
+  const kill = (signal: NodeJS.Signals = "SIGTERM"): void => {
+    if (workerExited || forceKillRequested) return;
+    if (signal === "SIGKILL") {
+      forceKill();
+      return;
+    }
+    if (ended || killRequested) return;
+    killRequested = true;
+    try {
+      send({ t: "kill" });
+    } catch {
+      forceKill();
+      return;
+    }
+    if (workerExited || forceKillRequested) return;
+    killTimer = setTimeout(forceKill, WINDOWS_PTY_KILL_GRACE_MS);
+    killTimer.unref?.();
   };
   return {
     pid: childPid,
@@ -73,6 +115,6 @@ export const windowsPtySpawner = async (args: Args) => {
         send({ t: "input", data: bytes.subarray(offset, offset + 65536).toString("base64") });
     },
     resize: (cols: number, rows: number) => send({ t: "resize", cols, rows }),
-    kill: () => send({ t: "kill" }),
+    kill,
   };
 };
