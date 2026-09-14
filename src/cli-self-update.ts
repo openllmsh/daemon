@@ -31,6 +31,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { executableName } from "@openllmsh/protocol/local-runtime";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { invalidateMatchingCliVersionOutput } from "./cli-version-cache";
 import { cliVersion } from "./delegation/spawn";
@@ -41,13 +42,13 @@ import { currentTarget, fetchBinary, fetchDigest } from "./self-update";
 import { recentlyAttempted, recordAttempt } from "./state-file";
 
 /** Where the install script places the CLI (`~/.openllm/bin/openllm`). */
-export const cliBinaryPath = (): string => join(stateDir(), "bin", "openllm");
+export const cliBinaryPath = (): string => join(stateDir(), "bin", executableName("openllm"));
 
 /** Pre-rename install location (`~/.openllm/bin/openllmc`) — still converged
  *  (and migrated to the new name) so existing machines pick up the renamed
  *  binary through auto-update alone. */
 export const legacyCliBinaryPath = (): string =>
-  join(stateDir(), "bin", "openllmc");
+  join(stateDir(), "bin", executableName("openllmc"));
 
 /**
  * DEV-ONLY override: an absolute path to a runnable `openllm` the daemon should

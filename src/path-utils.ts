@@ -3,7 +3,8 @@
  */
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
+import { executableCandidates, executablePathDirs } from "@openllmsh/protocol/executable-paths";
 
 /**
  * Standard user bin dirs the daemon prepends to a spawned integration's PATH.
@@ -34,7 +35,7 @@ export const DEFAULT_BIN_DIRS: readonly string[] = [
  */
 export const resolveOnPath = (cmd: string): string[] => {
   const dirs = [
-    ...(process.env.PATH?.split(delimiter) ?? []),
+    ...executablePathDirs(),
     ...DEFAULT_BIN_DIRS,
     "/usr/bin",
     "/bin",
@@ -42,10 +43,11 @@ export const resolveOnPath = (cmd: string): string[] => {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const dir of dirs) {
-    const p = join(dir, cmd);
+    for (const p of executableCandidates(join(dir, cmd))) {
     if (seen.has(p)) continue;
     seen.add(p);
     if (existsSync(p)) out.push(p);
+    }
   }
   return out;
 };

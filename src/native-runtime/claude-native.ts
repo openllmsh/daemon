@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Claude native bridge — executes an eligible `claude_code` hop through the
  * OFFICIAL Claude Code runtime instead of exporting its OAuth bearer for a
@@ -199,7 +200,7 @@ export const runClaudeNative = async (
     // The bridge reads claude's isolated login-keychain credential to serve the
     // request; securityd denies a Seatbelt-confined caller, so it runs
     // unconfined on macOS (confined on Linux) — `sandbox/policy.ts`.
-    proc = Bun.spawn(
+    proc = admittedSpawn(
       sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
       {
         stdin: new TextEncoder().encode(params.userText),

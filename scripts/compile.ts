@@ -21,11 +21,13 @@
  *   bun run packages/daemon/scripts/compile.ts --host     # current host only
  *   bun run packages/daemon/scripts/compile.ts --version 1.2.3
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { $ } from "bun";
+import { compileWindowsWorker } from "./compile-windows-worker";
+import { assertRtcDependency } from "./rtc-dependency";
 
 // Resolve paths from THIS script's location, not the cwd. `scripts/` sits
 // directly under the package root in BOTH layouts — the monorepo
@@ -147,10 +149,14 @@ const TARGETS = [
   "bun-darwin-x64-baseline",
   "bun-linux-x64-baseline",
   "bun-linux-arm64",
+  "bun-windows-x64-baseline",
 ] as const;
 
 const argv = process.argv.slice(2);
 const hostOnly = argv.includes("--host");
+const targetIdx = argv.indexOf("--target");
+const selectedTarget = targetIdx < 0 ? null : argv[targetIdx + 1];
+if (selectedTarget !== null && !TARGETS.includes(selectedTarget as typeof TARGETS[number])) throw new Error("Invalid compile target");
 const versionIdx = argv.indexOf("--version");
 // The daemon has ONE version identity: the app/manifest tag the release CLI
 // passes via `--version` (commands/daemon.ts always passes it). There is no
@@ -167,53 +173,80 @@ const version =
 
 const outfileFor = (target: string): string => {
   const suffix = target.replace(/^bun-/, "");
-  return `${OUT_DIR}/openllmd-${suffix}`;
+  return `${OUT_DIR}/openllmd-${suffix}${target.includes("windows") ? ".exe" : ""}`;
 };
 
 const buildOne = async (
   target: string | null,
   cloudOrigin: string,
 ): Promise<string> => {
-  const outfile = target === null ? `${OUT_DIR}/openllmd` : outfileFor(target);
+  const outfile = target === null ? `${OUT_DIR}/openllmd${process.platform === "win32" ? ".exe" : ""}` : outfileFor(target);
   const targetArgs = target === null ? [] : ["--target", target];
   const defines = compileDefineArgs(cloudOrigin, version);
-  await $`bun build ${ENTRY} \
-    ${COMPILE_BUN_FLAGS} \
-    ${defines} \
-    ${targetArgs} \
-    --outfile ${outfile}`;
-  // Emit a gzip sidecar for DISTRIBUTION. The embedded Bun runtime is most of
-  // the ~100MB and compresses ~66%, so the published GitHub asset is the `.gz`
-  // (faster upload, less org storage). The release pins the sha256 of the
-  // DECOMPRESSED binary, and install.sh + self-update decompress before
-  // verifying — so the integrity gate is independent of gzip's
-  // non-determinism. The raw binary stays for local runs + the sha source.
-  writeFileSync(`${outfile}.gz`, gzipSync(readFileSync(outfile), { level: 9 }));
+  // Bun 1.3.14 cross-built Windows bytecode crashes before main on the
+  // supported Server 2019 baseline host. The same source without it passes,
+  // so a Windows target (or a `--host` build on Windows) drops `--bytecode`;
+  // every other platform keeps the source-hiding flag.
+  const windowsBuild =
+    target?.includes("windows") ||
+    (target === null && process.platform === "win32");
+  const bunFlags = windowsBuild || argv.includes("--no-bytecode")
+    ? COMPILE_BUN_FLAGS.filter((flag) => flag !== "--bytecode")
+    : COMPILE_BUN_FLAGS;
+  // Bun's standalone compiler uses process-local intermediate names. Separate
+  // both cwd and outfile directories so concurrent targets cannot collide.
+  const scratch = mkdtempSync(join(OUT_DIR, ".compile-"));
+  const staged = join(scratch, basename(outfile));
+  try {
+    await $`bun build ${ENTRY} \
+      ${bunFlags} \
+      ${defines} \
+      ${targetArgs} \
+      --outfile ${staged}`.cwd(scratch);
+    // Emit a gzip sidecar for DISTRIBUTION. The embedded Bun runtime is most of
+    // the ~100MB and compresses ~66%, so the published GitHub asset is the `.gz`
+    // (faster upload, less org storage). The release pins the sha256 of the
+    // DECOMPRESSED binary, and install.sh + self-update decompress before
+    // verifying — so the integrity gate is independent of gzip's
+    // non-determinism. The raw binary stays for local runs + the sha source.
+    writeFileSync(`${staged}.gz`, gzipSync(readFileSync(staged), { level: 9 }));
+    renameSync(staged, outfile);
+    renameSync(`${staged}.gz`, `${outfile}.gz`);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
   return outfile;
 };
 
 const main = async (): Promise<void> => {
+  assertRtcDependency();
   // Resolve (+ validate) the bake origin lazily inside main so importing this
   // module (e.g. from a unit test of `isAllowedCloudHost`) has no side effects.
   const cloudOrigin = resolveCloudOrigin();
   await $`mkdir -p ${OUT_DIR}`;
+  if (selectedTarget) {
+    console.log(`built ${selectedTarget} → ${await buildOne(selectedTarget, cloudOrigin)}`);
+    return;
+  }
   if (hostOnly) {
     const out = await buildOne(null, cloudOrigin);
+    if (process.platform === "win32") {
+      compileWindowsWorker(PKG_ROOT, OUT_DIR, version);
+    }
     console.log(`built host binary → ${out}`);
     return;
   }
-  // Build all four targets IN PARALLEL. Each `bun build --compile` is an
-  // independent cross-compile writing its own `--outfile`, so there's no
-  // shared state — running them concurrently turns ~4× sequential wall-time
-  // into roughly one build's worth (the previous sequential loop is why a
-  // release "took ages"). Logs land as each finishes.
+  // Every parallel compiler has private intermediates. Wait for all cleanup
+  // before reporting an error so a failed build leaves no active writers.
   const t0 = Date.now();
-  await Promise.all(
+  const builds = await Promise.allSettled(
     TARGETS.map(async (target) => {
       const out = await buildOne(target, cloudOrigin);
       console.log(`built ${target} → ${out}`);
     }),
   );
+  const failed = builds.find((build) => build.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
   console.log(`compiled ${TARGETS.length} targets in ${Date.now() - t0}ms`);
 };
 

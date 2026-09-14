@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Shared, provider-agnostic login-flow scaffolding for the subscription
  * delegates.
@@ -988,7 +989,7 @@ export const spawnStreamLogin = async <T>(
     };
   }
   try {
-    proc = Bun.spawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
+    proc = admittedSpawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
       stdin: "ignore",
       // Always pipe BOTH fds: the prompt may be on stdout (device-code) while
       // the `--sandbox-exec` shim writes inner posix_spawn EPERM to stderr.

@@ -236,7 +236,8 @@ install_component() {
   # cloud images mount a tiny RAM-backed /tmp where a download this size fails.
   local dl="$BIN_DIR/.$name.download.$$"
   local bin="$BIN_DIR/.$name.bin.$$"
-  trap 'rm -f "$dl" "$bin"' RETURN
+  # `die` exits the shell without returning from this function.
+  trap 'rm -f "$dl" "$bin"' EXIT
   if [ -t 2 ]; then
     curl -fL --progress-bar "$url" -o "$dl" || die "download failed: $url"
   else
@@ -259,18 +260,23 @@ install_component() {
   fi
 
   chmod 0755 "$bin"
-  mv -f "$bin" "$dest"
 
   # macOS: strip quarantine. Preserve a valid Developer ID / notarized
   # signature (codesign --verify). Only ad-hoc sign when the signature is
   # missing/invalid — force ad-hoc would strip notarization and rewrite bytes.
   if [ "$OS" = "darwin" ]; then
-    xattr -d com.apple.quarantine "$dest" >/dev/null 2>&1 || true
-    if ! codesign --verify "$dest" >/dev/null 2>&1; then
-      codesign --force --sign - "$dest" >/dev/null 2>&1 || true
-      printf '%s %s\n' "$published" "$(sha256_of "$dest")" > "$stamp" 2>/dev/null || true
+    xattr -d com.apple.quarantine "$bin" >/dev/null 2>&1 || true
+    if ! codesign --verify --strict "$bin" >/dev/null 2>&1; then
+      codesign --force --sign - "$bin" >/dev/null 2>&1 \
+        || die "could not sign $name — refusing to install"
+      codesign --verify --strict "$bin" >/dev/null 2>&1 \
+        || die "signature verification failed for $name — refusing to install"
+      printf '%s %s\n' "$published" "$(sha256_of "$bin")" > "$stamp" 2>/dev/null || true
     fi
   fi
+  mv -f "$bin" "$dest"
+  rm -f "$dl" "$bin"
+  trap - EXIT
   echo "  $name installed → $dest"
   INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
 }

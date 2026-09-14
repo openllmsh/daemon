@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { nodeSpawnSync as spawnSync } from "./windows-process";
 import { closeSync, openSync, readSync } from "node:fs";
 import type {
   TCredentialGateMode,

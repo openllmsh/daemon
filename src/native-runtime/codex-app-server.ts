@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Codex native bridge — executes an eligible `chatgpt` hop through the
  * OFFICIAL `codex app-server` JSON-RPC runtime instead of the manual
@@ -112,7 +113,7 @@ class CodexAppServerClient {
   }
 
   private async start(): Promise<void> {
-    const proc = Bun.spawn(sandboxSpawnArgs([this.bin, "app-server"]), {
+    const proc = admittedSpawn(sandboxSpawnArgs([this.bin, "app-server"]), {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",

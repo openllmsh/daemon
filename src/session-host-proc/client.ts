@@ -1,3 +1,4 @@
+import { spawnSync as admittedSpawnSync, spawn as admittedSpawn } from "../windows-process";
 /**
  * Durable session-host discovery, spawn, and CLI-pipe attach client.
  *
@@ -16,6 +17,8 @@ import {
   statSync,
 } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { executableName, localSessionEndpointPresent, processStartCommand, sourceEntrypoint } from "@openllmsh/protocol/local-runtime";
 import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
@@ -23,6 +26,7 @@ import type {
 import { DeviceSessionCli, SESSION_ID_PATTERN } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
+import { requestedPtyBackend } from "../bs-pty";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";
 import type { TDeadlineBudget } from "../deadline-budget";
@@ -35,10 +39,13 @@ import { isDevMode, stateDir } from "../env";
 import { withoutCommandReplayContext } from "../op-context";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
+import { inServiceCgroup, planSessionHostLaunch, type SessionHostLaunch } from "./linux-scope";
 
 const SPAWN_SOCKET_TIMEOUT_MS = 2_000;
+// Allow time for BridgeSessions worker startup and protocol negotiation.
+const BS_SPAWN_SOCKET_TIMEOUT_MS = 15_000;
 /** Per-pid `ps` identity read. Expiry is unknown, never dead. */
-const PROCESS_IDENTITY_TIMEOUT_MS = 250;
+const PROCESS_IDENTITY_TIMEOUT_MS = process.platform === "win32" ? 1500 : 250;
 const DISCOVERY_CONCURRENCY = 4;
 /**
  * Outer bound for one registry scan (and attach-path slot wait). Per-pid checks
@@ -46,7 +53,7 @@ const DISCOVERY_CONCURRENCY = 4;
  * and boot cannot wait N/concurrency waves. Shared with boot reconcile — the
  * scan honors the budget (no abandoned post-expiry reap).
  */
-const DISCOVERY_TIMEOUT_MS = 1_000;
+const DISCOVERY_TIMEOUT_MS = process.platform === "win32" ? 5000 : 1000;
 /** RS (0x1e) prefixes a JSON control line on the pipe-mode attach stdio. */
 const PIPE_CTRL = 0x1e;
 const PIPE_CTRL_MAX_BYTES = 512;
@@ -127,7 +134,7 @@ const readProcessStartTime = async (
 ): Promise<string | null | undefined> => {
   if (budget.expired()) return undefined;
   try {
-    const proc = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+    const proc = admittedSpawn(processStartCommand(pid, stateDir()), {
       stdout: "pipe",
       stderr: "ignore",
     });
@@ -145,7 +152,7 @@ const readProcessStartTime = async (
       }
       return undefined;
     }
-    if (raced.value.code !== 0) return null;
+    if (raced.value.code !== 0) return process.platform === "win32" && raced.value.code !== 3 ? undefined : null;
     const value = raced.value.out.trim();
     return value.length > 0 ? value : null;
   } catch {
@@ -264,11 +271,7 @@ const boundedProcessIdentity = async (
 };
 
 const socketPresent = (path: string): boolean => {
-  try {
-    return statSync(path).isSocket();
-  } catch {
-    return false;
-  }
+  return localSessionEndpointPresent(path);
 };
 
 type TDiscoveryCandidate = {
@@ -454,7 +457,11 @@ export const releaseSessionHostProbeSlotForTests = releaseProbeSlot;
 
 const waitForSessionHostSocket = async (id: string): Promise<string | null> => {
   const socketPath = sessionHostSocketPath(id);
-  const deadline = Date.now() + SPAWN_SOCKET_TIMEOUT_MS;
+  const timeoutMs =
+    requestedPtyBackend() === "bridgesessions"
+      ? BS_SPAWN_SOCKET_TIMEOUT_MS
+      : SPAWN_SOCKET_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (socketPresent(socketPath)) return socketPath;
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
@@ -470,17 +477,44 @@ const daemonBinary = (): readonly string[] => {
   // rather than the INSTALLED `~/.openllm/bin/openllmd`, which would otherwise
   // run shipped code with none of the dev overrides (and can protocol-skew the
   // source daemon, surfacing as `spawn_failed` in the browser).
-  const sourceRunner = process.argv[1];
+  const sourceRunner = sourceEntrypoint(process.argv[1]);
   if (isDevMode()) {
-    return sourceRunner === undefined
+    return sourceRunner === null
       ? [process.execPath]
       : [process.execPath, sourceRunner];
   }
-  const installed = join(stateDir(), "bin", "openllmd");
+  const installed = join(stateDir(), "bin", executableName("openllmd"));
   if (existsSync(installed)) return [installed];
-  return sourceRunner === undefined
+  return sourceRunner === null
     ? [process.execPath]
     : [process.execPath, sourceRunner];
+};
+
+const systemdVersions = new Map<string, number | null>();
+const sessionHostLaunch = (command: readonly string[]): SessionHostLaunch => {
+  let cgroup = "";
+  if (process.platform === "linux") {
+    try { cgroup = readFileSync("/proc/self/cgroup", "utf8"); }
+    catch { if (process.env.INVOCATION_ID) throw new Error("Cannot establish service ownership"); }
+  }
+  const managed = process.platform === "linux" && inServiceCgroup(cgroup);
+  const runner = managed ? Bun.which("systemd-run") : null;
+  if (runner && !systemdVersions.has(runner)) {
+    const probe = admittedSpawnSync([runner, "--version"], { stdout: "pipe", stderr: "ignore", timeout: 1000 });
+    const match = /^systemd (\d+)\b/.exec(probe.stdout.toString());
+    systemdVersions.set(runner, probe.exitCode === 0 && match ? Number(match[1]) : null);
+  }
+  return planSessionHostLaunch(command, { platform: process.platform, cgroup, runner,
+    major: runner ? systemdVersions.get(runner) ?? null : null, nonce: randomUUID().replaceAll("-", "") });
+};
+
+const stopFailedSessionScope = async (scopeName: string): Promise<void> => {
+  const ctl = Bun.which("systemctl");
+  if (!ctl) return;
+  // The name is generated locally for this attempt; never stop a caller's unit.
+  const stop = admittedSpawn([ctl, "--user", "stop", scopeName], { stdio: ["ignore", "ignore", "ignore"] });
+  const timer = setTimeout(() => stop.kill(), 5000);
+  try { await stop.exited; } finally { clearTimeout(timer); }
 };
 
 /** Spawn a detached sibling session host and wait for its private control socket. */
@@ -504,16 +538,23 @@ export const spawnSessionHostProc = async (
     "--rows",
     String(args.rows),
   ];
+  let launch: SessionHostLaunch | undefined;
   try {
-    const proc = Bun.spawn([...daemonBinary(), ...argv], {
+    launch = sessionHostLaunch([...daemonBinary(), ...argv]);
+    const proc = admittedSpawn(launch.command, {
       detached: true,
+      // Preserve runtime-loaded state selectors in the durable sibling too.
+      env: { ...process.env },
       stdio: ["ignore", "ignore", "ignore"],
     });
     proc.unref();
+    const socket = await waitForSessionHostSocket(args.id);
+    if (socket === null && launch.scopeName) await stopFailedSessionScope(launch.scopeName);
+    return socket;
   } catch {
+    if (launch?.scopeName) await stopFailedSessionScope(launch.scopeName).catch(() => {});
     return null;
   }
-  return waitForSessionHostSocket(args.id);
 };
 
 const openllmCliBinary = (): string | null => resolveOpenllmCli();
@@ -525,7 +566,7 @@ const openllmCliBinary = (): string | null => resolveOpenllmCli();
  * and the bridge. Binary frames go to the child's stdin; RS-prefixed JSON
  * lines carry resize/close controls. The child's stdout is PTY output.
  */
-class CliPipeSessionStream implements TSessionStream {
+export class CliPipeSessionStream implements TSessionStream {
   private readonly dataHandlers = new Set<(payload: Uint8Array) => unknown>();
   private readonly ctrlHandlers = new Set<(payload: Uint8Array) => unknown>();
   private readonly resetHandlers = new Set<(payload: Uint8Array) => unknown>();
@@ -617,8 +658,11 @@ class CliPipeSessionStream implements TSessionStream {
           this.fireEnd();
         }
       })();
+    } else {
+      void proc.exited.then(() => this.fireEnd());
     }
-    void proc.exited.then(() => this.fireEnd());
+    // With a stdout pipe, EOF owns completion. Reaping the child can happen
+    // before buffered output/control frames have reached this reader.
   }
 
   private fireEnd = (): void => {
@@ -726,7 +770,7 @@ export const attachSessionHostViaCli = (
 ): TSessionStream | null => {
   const bin = openllmCliBinary();
   if (bin === null) return null;
-  const proc = Bun.spawn(
+  const proc = admittedSpawn(
     spawnCommand(process.platform, bin, [
       "sessions",
       "attach",
@@ -738,6 +782,7 @@ export const attachSessionHostViaCli = (
       String(open.rows),
     ]),
     {
+      env: { ...process.env },
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",

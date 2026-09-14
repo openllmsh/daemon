@@ -185,6 +185,7 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
       status.control_caps,
       (status.control_caps ?? []).join(","),
     ),
+    status.pty_backend ?? "",
     status.pty_supported === undefined ? "" : String(status.pty_supported),
     connections,
     sessions,

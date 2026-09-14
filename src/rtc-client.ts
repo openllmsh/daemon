@@ -36,6 +36,8 @@ import { RTCPeerConnection } from "werift";
 import type { TEphKeypair } from "./keypair";
 import { generateEphKeypair, openSealedWith, sealTo } from "./keypair";
 import { logDebug, logWarn, safeDiagnosticMessage } from "./logger";
+import { closeRtcPeer } from "./rtc-close";
+import { rtcCandidateErrors } from "./rtc-udp";
 
 const RTC_SIGNALING_TIMEOUT_MS = 10_000;
 const RTC_ICE_TIMEOUT_MS = 20_000;
@@ -168,7 +170,7 @@ const closeSession = (session: TRtcClientSession, reason: string): void => {
     // mux already closed
   }
   session.mux = null;
-  void session.pc.close().catch(() => {});
+  void closeRtcPeer(session.pc, session.dc);
   logDebug("rtc-client", "session closed", { keyId: session.keyId, reason });
 };
 
@@ -279,7 +281,13 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
   let pc: RTCPeerConnection | null = null;
   let session: TRtcClientSession | null = null;
   try {
-    pc = new RTCPeerConnection({ iceServers: [...iceServers()] });
+    pc = new RTCPeerConnection({
+      iceServers: [...iceServers()],
+      iceFilterCandidatePair: rtcCandidateErrors(() => {
+        if (session === null || session.closed || sessionsByChannel.get(session.channelId) !== session) return;
+        markRtcFailure(keyId);
+      }),
+    });
     const dc = pc.createDataChannel("mux", { ordered: true });
     const eph = generateEphKeypair();
     const channelId = crypto.randomUUID();
@@ -398,7 +406,7 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
     }
     cacheFailure(keyId);
     if (pc !== null) {
-      void pc.close().catch(() => {});
+      void closeRtcPeer(pc);
     }
   }
 };

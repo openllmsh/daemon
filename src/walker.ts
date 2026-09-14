@@ -51,6 +51,7 @@ import type {
   TRequestStatus,
   TServerSearchCall,
 } from "@openllmsh/protocol";
+import { isSandboxRejectionResponse } from "./sandbox/exec";
 import {
   AnthropicResponse,
   ChatCompletionChunk,
@@ -2748,6 +2749,9 @@ const walkPlan = async (
           ),
       });
       if (native instanceof Response) {
+        if (isSandboxRejectionResponse(native)) {
+          return { response: native, servedLocally: true };
+        }
         if (!native.ok) {
           const raw = await native
             .clone()

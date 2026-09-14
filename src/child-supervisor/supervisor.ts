@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 import { logError, logWarn, safeDiagnosticMessage } from "../logger";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
 import type { TReapOutcome } from "./posix";
@@ -349,7 +350,7 @@ export const superviseSpawn = (
     process.platform === "linux"
       ? linuxPdeathsigArgv(argv, daemonSelfInvocation(), process.pid)
       : argv;
-  const subprocess = Bun.spawn([...spawnArgv], {
+  const subprocess = admittedSpawn([...spawnArgv], {
     ...opts,
     // POSIX: lead an independently killable process group (pgid === pid).
     detached: true,

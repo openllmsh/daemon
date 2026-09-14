@@ -4,7 +4,7 @@
  * The browser signs grants with a vault-derived Ed25519 key (noble); this
  * module verifies them with node:crypto only — the daemon package must
  * NEVER import `@openllm/vault`. Pin comes from bootstrap
- * (`device_access_pubkey`); when null, seedgate enforcement is off.
+ * (`device_access_pubkey`); when null, browser admission fails closed.
  */
 import { createPublicKey, verify as nodeVerify } from "node:crypto";
 import {
@@ -31,6 +31,13 @@ const nonceSeen = new Map<string, number>();
 /** In-memory pin; hydrated from state.json on first read. */
 let pinnedPubkey: string | null | undefined;
 
+/** Transport owners invalidate access granted by a changed authority. */
+const authorityChangeListeners = new Set<() => void>();
+export const onDeviceAccessAuthorityChange = (listener: () => void): (() => void) => {
+  authorityChangeListeners.add(listener);
+  return () => { authorityChangeListeners.delete(listener); };
+};
+
 const hydratePin = (): string | null => {
   if (pinnedPubkey !== undefined) return pinnedPubkey;
   const fromDisk = readState().deviceAccessPubkey;
@@ -50,8 +57,19 @@ export const getDeviceAccessPubkey = (): string | null => hydratePin();
  */
 export const setDeviceAccessPubkey = (pubkey: string | null): void => {
   const prev = hydratePin();
-  if (prev === pubkey) return;
+  const changed = prev !== pubkey;
   pinnedPubkey = pubkey;
+  // Revoke in memory before persistence, including if the state write fails.
+  // An unchanged bootstrap pin must preserve established transports.
+  if (changed) {
+    for (const listener of authorityChangeListeners) {
+      try { listener(); } catch {
+        logWarn("device-access", "authority change transport cleanup failed");
+      }
+    }
+  }
+  // State writes are best-effort. Retry even an identical in-memory pin so a
+  // transient failure cannot leave the old authority persisted indefinitely.
   mutateState((s) => ({ ...s, deviceAccessPubkey: pubkey }));
   logWarn(
     "device-access",

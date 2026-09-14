@@ -17,9 +17,11 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
+import { executableCandidates } from "@openllmsh/protocol/executable-paths";
 import { stateDir } from "./env";
 import { resolveOnPath } from "./path-utils";
 import { daemonTempDir } from "./sandbox/working-set";
+import { platformIsolatedHomeEnv, platformTempEnv } from "./cli-platform-env";
 
 /** The providers with an isolated CLI — exactly the closed
  *  `SubscriptionProviderSlug` vocabulary of the control schema, so a slug
@@ -221,7 +223,7 @@ export const hostCliCandidates = (
   // production; unset there, so host discovery is unchanged.
   if (process.env.OPENLLM_NO_HOST_CLI_DISCOVERY === "1") return [];
   const home = homeOverride ?? homedir();
-  const vendorDefaults = SPECS[provider].hostCandidates(home);
+  const vendorDefaults = SPECS[provider].hostCandidates(home).flatMap(p => executableCandidates(p));
   const out: string[] = [];
   const seen = new Set<string>();
   for (const p of [...vendorDefaults, ...resolveOnPath(SPECS[provider].cmd)]) {
@@ -280,6 +282,7 @@ export const sessionEnv = (): Record<string, string> => {
   return {
     HOME: homedir(),
     TMPDIR: tmp,
+    ...platformTempEnv(tmp),
     TERM: "xterm-256color",
   };
 };
@@ -319,5 +322,9 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
   const config = cliConfigDir(provider);
   // The daemon-owned, sandbox-granted staging dir for `mktemp -d` (see above).
   const tmp = verifiedDaemonTempDir();
-  return SPECS[provider].env({ home, root, config, tmp });
+  return {
+    ...SPECS[provider].env({ home, root, config, tmp }),
+    ...platformIsolatedHomeEnv(home),
+    ...platformTempEnv(tmp),
+  };
 };

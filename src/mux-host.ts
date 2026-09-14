@@ -8,10 +8,11 @@ import { encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
-import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
+import { enforceSeedGate, getDeviceAccessPubkey, onDeviceAccessAuthorityChange } from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logInfo, logWarn, safeDiagnosticMessage } from "./logger";
+import { BS_CAP, bridgesessionsAvailable } from "./bs-pty";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import type { TSessionStream } from "./session-core";
 import {
@@ -53,6 +54,7 @@ export const currentDaemonCaps = (): string[] => {
     (cap) => cap !== RTC_CAP || !rtcDisabled(),
   );
   if (getDeviceAccessPubkey() !== null) caps.push(SEEDGATE_CAP);
+  if (bridgesessionsAvailable()) caps.push(BS_CAP);
   return caps;
 };
 
@@ -316,6 +318,7 @@ const registerChannel = (
   channelId: string,
   keyId: string | null,
   side: "consumer" | "daemon",
+  consumer: "browser" | "daemon" = "browser",
 ): TRelayChannel => {
   let muxSink: ((bytes: Uint8Array | null) => void) | null = null;
   let record: TRelayChannel | null = null;
@@ -354,7 +357,7 @@ const registerChannel = (
     channel,
     channelId,
     keyId,
-    consumer: side === "daemon" ? "browser" : null,
+    consumer: side === "daemon" ? consumer : null,
     muxSink,
     sink: null,
     lastActivityAt: Date.now(),
@@ -407,7 +410,11 @@ const pipeSessionStreams = (
     host.end();
   };
   relay.onData((bytes) => {
+    if (closed) return;
     void host.write(bytes).catch(() => {
+      // A pending stdin flush can reject after a clean terminal END. Preserve
+      // that terminal result instead of replacing it with an empty RESET.
+      if (closed) return;
       closed = true;
       host.reset();
       relay.reset();
@@ -567,6 +574,10 @@ export const acceptChannel = (frame: {
   }
   const existing = channels.get(frame.channel_id);
   if (existing !== undefined && existing.muxSink !== null) {
+    if (existing.keyId === null && existing.consumer !== (frame.consumer ?? "browser")) {
+      send({ type: "channel_open_ack", channel_id: frame.channel_id, ok: false, error: "unauthorized" });
+      return;
+    }
     if (existing.keyId !== null) {
       // A consumer-side channel id is OURS — a peer re-opening it is a
       // protocol bug, not a reconnect. Keep the refusal for that narrow case.
@@ -606,7 +617,7 @@ export const acceptChannel = (frame: {
   // got reaped — drop it so the re-open registers fresh below.
   if (existing !== undefined) channels.delete(frame.channel_id);
   if (!admitBySeedGate(frame, send)) return;
-  registerChannel(frame.channel_id, null, "daemon");
+  registerChannel(frame.channel_id, null, "daemon", frame.consumer ?? "browser");
   logInfo("mux-host", "channel_open accepted", {
     channelId: frame.channel_id,
     consumer: frame.consumer ?? "browser",
@@ -676,3 +687,12 @@ export const resetAllChannels = (): void => {
     record.channel.close("relay_restart");
   }
 };
+
+onDeviceAccessAuthorityChange(() => {
+  for (const record of [...channels.values()]) {
+    if (record.consumer !== "browser") continue;
+    channels.delete(record.channelId);
+    record.sink = null;
+    try { record.channel.close("device_access_changed"); } catch { /* already closed */ }
+  }
+});

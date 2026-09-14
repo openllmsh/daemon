@@ -134,6 +134,14 @@ export const runCli = (): boolean => {
   const args = userArgs();
   if (args.length === 0) return false; // bare invocation → boot the server
 
+  if (args[0] === "--confined-task") {
+    if (args.length !== 1) { process.stderr.write("--confined-task takes command input on stdin\n"); process.exit(2); }
+    runSandboxExec(["windows-cmd-v1"], {profile:"windows-cmd-v1"}).catch(error => {
+      process.stderr.write(`--confined-task: ${error instanceof Error ? error.message : String(error)}\n`); process.exit(78);
+    });
+    return true;
+  }
+
   // The per-child sandbox shim (`sandbox/exec.ts`): apply the working-set
   // sandbox to THIS re-exec'd process, then run the tail argv. Matched BEFORE
   // the `--help`/`--version` scans — the tail may legitimately contain
@@ -161,7 +169,9 @@ export const runCli = (): boolean => {
     // apply + spawn + mirror exit. `runSandboxExec` never resolves; guard a
     // REJECTION (an unexpected throw before the exit mirror) so it can't
     // become an unhandled rejection / silent success.
-    runSandboxExec(tail, home !== undefined ? { home } : undefined).catch(
+    const profileFlag = args.indexOf("--profile");
+    const profile = profileFlag >= 0 && profileFlag < sep ? args[profileFlag + 1] : undefined;
+    runSandboxExec(tail, { ...(home !== undefined ? {home} : {}), ...(profile !== undefined ? {profile} : {}) }).catch(
       (err: unknown) => {
         process.stderr.write(
           `--sandbox-exec: ${err instanceof Error ? err.message : String(err)}\n`,

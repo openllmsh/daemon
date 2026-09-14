@@ -56,6 +56,7 @@ import {
 } from "./op-context";
 import { resolveOnPath } from "./path-utils";
 import { getPendingAuth, pendingAuthWire } from "./pending-auth";
+import { requestedPtyBackend } from "./bs-pty";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
@@ -770,6 +771,7 @@ const computeStatusFreshInner = async (
     // Device chat sessions (feature §2.2): whether this box can host a
     // PTY, and the sessions it currently holds (live/dormant).
     pty_supported: ptySupported(),
+    pty_backend: requestedPtyBackend(),
     sessions: await sessionStatusReport(),
   };
 };

@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Cursor ACP bridge — executes a `cursor` hop through the OFFICIAL
  * `cursor-agent acp` runtime (Agent Client Protocol v1). Cursor has NO manual
@@ -344,7 +345,7 @@ class AcpClient {
     // The ACP bridge reads cursor's isolated macOS keychain credential;
     // securityd denies a Seatbelt-confined caller, so it runs unconfined on
     // macOS (confined on Linux) — `sandbox/policy.ts`.
-    this.proc = Bun.spawn(
+    this.proc = admittedSpawn(
       sandboxSpawnArgs([bin, "acp"], { probe: unwrapKeychainSpawn("cursor") }),
       {
         stdin: "pipe",

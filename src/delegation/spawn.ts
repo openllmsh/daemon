@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Spawn helpers for official-CLI delegation: capture runs, browser/PTY
  * login spawns, and terminal-output hygiene. Split out of `util.ts`
@@ -1495,7 +1496,7 @@ export const openUrl = (url: string): void => {
     // browser is a user-facing action like the session-PTY exemption — the
     // launcher must reach the real GUI session/LaunchServices state, and it
     // takes only the URL string (no filesystem payload to confine).
-    Bun.spawn(argv, {
+    admittedSpawn(argv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",

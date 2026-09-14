@@ -31,6 +31,7 @@
 // tsyringe error message itself prescribes. `tests/daemon/compiled-boot.test.ts`
 // guards it.
 import "reflect-metadata";
+import "./windows-process-init";
 
 import { isStreamResetError } from "@openllmsh/tunnel";
 import {
@@ -89,6 +90,11 @@ import {
 import { reconcileSessionHostsAtBoot } from "./session-host";
 import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
+import { bindServiceControl } from "./service-control";
+
+// Consume this private supervisor setting before spawning any durable child.
+const serviceControl = process.platform === "win32" && process.env.OPENLLM_SERVICE_CONTROL === "stdio-v1";
+delete process.env.OPENLLM_SERVICE_CONTROL;
 
 // Once the cloud snapshot is healthy, refresh every 5 minutes to stay in
 // lockstep with dashboard config changes.
@@ -342,6 +348,7 @@ const main = async (): Promise<void> => {
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+  if (serviceControl) bindServiceControl(process.stdin, () => shutdown("SIGTERM"));
 
   // Bun.serve throws synchronously when the port can't be bound. The headline
   // failure is EADDRINUSE (another openllmd, or a stray process, on the port) —

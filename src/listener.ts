@@ -40,6 +40,7 @@ import {
   planFetchFailureAction,
 } from "./net-error";
 import { lookupPlan, storePlan } from "./plan-cache";
+import { requiresRestrictedWebSearch } from "./web-search-policy";
 import { isBodylessVideoOp, videoOperationFor } from "./video-ops";
 import {
   runVideoCancel,
@@ -169,6 +170,15 @@ export const handleInference = async (req: Request): Promise<Response> => {
         err instanceof Error ? err.message : "Invalid request body",
       ),
     );
+  }
+
+  // Native search is live and some manual upstreams reject the restriction.
+  // Refuse explicitly instead of dropping it, spawning, or falling back to a
+  // transport with weaker semantics. This is not cache-only search support.
+  if (requiresRestrictedWebSearch(rawBody)) {
+    return withCors(req, errorJson(400,
+      "Cache-only web search (external_web_access=false) is not supported by this daemon; the request was not forwarded.",
+      "unsupported_web_search_policy"));
   }
 
   // Signed-plan cache (flag-gated rider — `plan-cache.ts`). A 307-borne

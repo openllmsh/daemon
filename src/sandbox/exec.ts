@@ -1,3 +1,5 @@
+import { spawn as admittedSpawn } from "../windows-process";
+import { childEnvironment } from "./child-policy";
 /**
  * Per-child OS sandboxing — the ONE module that knows about the
  * `openllmd --sandbox-exec -- <argv…>` self-re-exec shim
@@ -15,17 +17,16 @@
  *
  * The daemon process itself is NOT sandboxed (device-session PTYs must run
  * the user's real CLI over their real files); each risky child is confined at
- * spawn time instead. Fail-open lives HERE and in the shim, nowhere else:
- * when sandboxing is off/unsupported the wrap is an identity passthrough and
- * a shim whose apply degrades still runs the child — surfaced loudly
- * per-spawn (stderr + `logWarn` in `runSandboxExec`) on top of the boot-time
- * capability posture (`probeSandboxCapability`).
+ * spawn time instead. Windows risky spawns and explicitly required policies
+ * fail closed before launch. The explicit shim always requires enforcement.
+ * Existing POSIX development/exemption routing is retained.
  */
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { logWarn, safeDiagnosticMessage } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import type { TSandboxState } from "./landlock";
+import { runWindowsConfinedTask } from "./windows-task";
 import {
   applyDaemonSandbox,
   probeLandlockSupport,
@@ -33,12 +34,15 @@ import {
 } from "./landlock";
 
 export type TSandboxSpawnOpts = {
-  /** Extra allow-list paths for THIS child (v1: ignored; future: appended to
-   *  the child's profile via a working-set extension the shim applies). */
+  /** Explicit uncredentialed operation; never inferred for vendor launches. */
+  readonly profile?: "windows-cmd-v1";
+  /** Require confinement even in POSIX source/development runs. Windows
+   *  non-probe launches always require it; false cannot weaken that rule. */
+  readonly required?: boolean;
+  /** Per-child grants are not implemented; nonempty requests are rejected. */
   readonly extraReadWrite?: readonly string[];
   readonly extraReadOnly?: readonly string[];
-  /** Future network on/off knob (v1: ignored — network policy stays with
-   *  systemd / (allow default)). */
+  /** Per-child network policy is not implemented; requests are rejected. */
   readonly network?: boolean;
   /** Fixed-argv read-only probe (`<bin> --version`, keychain `security`
    *  reads): skip the shim. The shim re-execs the whole daemon binary and
@@ -48,6 +52,23 @@ export type TSandboxSpawnOpts = {
    *  never set this. */
   readonly probe?: boolean;
 };
+
+export class SandboxLaunchError extends Error {
+  constructor(readonly code: "SANDBOX_UNAVAILABLE" | "POLICY_INVALID" | "PROFILE_UNSUPPORTED", reason: string) {
+    super(`${code}: ${reason}`);
+    this.name = "SandboxLaunchError";
+  }
+}
+
+// An internal identity, not a client-controlled header. The walker must surface
+// these responses without cooldown, retry, manual transport or fleet fallback.
+const terminalRejections = new WeakSet<Response>();
+export const sandboxUnavailableResponse = (): Response => {
+  const response = Response.json({ error: { code: "SANDBOX_UNAVAILABLE", message: "Required Windows vendor confinement is unavailable" } }, { status: 503 });
+  terminalRejections.add(response);
+  return response;
+};
+export const isSandboxRejectionResponse = (response: Response): boolean => terminalRejections.has(response);
 
 /** Whether per-child sandboxing is enabled for this process — the two env
  *  gates plus the platform support check, resolved in ONE place. */
@@ -86,27 +107,51 @@ const DEV_ENTRY: string | undefined =
 /**
  * Wrap a child argv for sandboxed execution via the `--sandbox-exec` shim.
  * INVARIANTS:
- *  - identity passthrough (`[...argv]`) when sandboxing is disabled
- *    (`OPENLLM_DAEMON_NO_SANDBOX=1`), unsupported (win32), or an ungated dev
- *    source run — callers never branch on posture;
- *  - never throws (fail-open lives HERE and in the shim, nowhere else);
+ *  - Windows non-probe and explicitly required policies throw on unavailable
+ *    enforcement; callers must not downgrade a security rejection;
+ *  - POSIX legacy development gates and fixed probe exemptions are retained;
  *  - pure argv-in/argv-out: no spawn, no I/O — callers keep their own
  *    `Bun.spawn` options (cwd, env, stdio) unchanged.
  *
- * `opts` is reserved (v1: ignored) so future per-child grants / network
- * policy never churn call sites.
+ * Unsupported per-child grants/network policy are rejected, never ignored.
  */
 export const sandboxSpawnArgs = (
   argv: readonly string[],
   opts?: TSandboxSpawnOpts,
 ): string[] => {
+  if (opts?.profile !== undefined) {
+    if (opts.profile !== "windows-cmd-v1" || argv.length !== 1 || argv[0] !== opts.profile || opts.probe === true)
+      throw new SandboxLaunchError("POLICY_INVALID", "invalid uncredentialed task operation");
+    if (opts.network !== undefined || (opts.extraReadWrite?.length ?? 0) > 0 || (opts.extraReadOnly?.length ?? 0) > 0)
+      throw new SandboxLaunchError("PROFILE_UNSUPPORTED", "task profile grants cannot be overridden");
+    if (process.platform !== "win32" || process.env.OPENLLM_DAEMON_NO_SANDBOX === "1")
+      throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Windows task confinement is unavailable or disabled");
+    return [process.execPath, ...(isDevSourceRun() && DEV_ENTRY ? [DEV_ENTRY] : []), "--sandbox-exec", "--profile", opts.profile, "--", ...argv];
+  }
+  if (opts?.required === true && opts.probe === true) {
+    throw new SandboxLaunchError("POLICY_INVALID", "required confinement conflicts with a probe exemption");
+  }
+  if (opts?.network !== undefined || (opts?.extraReadWrite?.length ?? 0) > 0 || (opts?.extraReadOnly?.length ?? 0) > 0) {
+    throw new SandboxLaunchError("PROFILE_UNSUPPORTED", "per-child path and network policy is not implemented");
+  }
   if (opts?.probe === true) return [...argv];
+  const required = process.platform === "win32" || opts?.required === true;
+  if (required && process.platform !== "darwin" && process.platform !== "linux") {
+    throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "no qualified confinement backend on this platform");
+  }
+  if (sandboxAppliedInProcess()) return [...argv];
+  if (required && process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {
+    throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "required confinement is disabled");
+  }
   if (!sandboxingEnabled()) return [...argv];
   if (isDevSourceRun()) {
     // Dev source runs are OPT-IN (`OPENLLM_DAEMON_SANDBOX=1`), and the wrap
     // must go through `bun <entry>` since execPath is the bun runtime.
-    if (process.env.OPENLLM_DAEMON_SANDBOX !== "1") return [...argv];
-    if (DEV_ENTRY === undefined) return [...argv];
+    if (process.env.OPENLLM_DAEMON_SANDBOX !== "1" && !required) return [...argv];
+    if (DEV_ENTRY === undefined) {
+      if (required) throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "missing sandbox entry point");
+      return [...argv];
+    }
     return [
       process.execPath,
       DEV_ENTRY,
@@ -145,38 +190,39 @@ const HOME_FLAG = (): string[] => ["--home", homedir()];
  * (inherited by the child), spawn the tail argv with inherited stdio, and
  * exit with the child's code (or `128 + signal` on a signal death — shell
  * convention, so `logIfKilled` still detects sandbox kills upstream).
- * Fail-open: if the apply degrades (`error`/`unsupported`) the child STILL
- * runs — parity with the old boot posture. Spawn failure of the inner
+ * If application does not return enforced, reject with exit 78 and no child.
+ * Spawn failure of the inner
  * command (ENOENT etc.) exits 127 with a stderr line.
  */
 export const runSandboxExec = async (
   tail: readonly string[],
-  opts?: { readonly home?: string },
+  opts?: { readonly home?: string; readonly profile?: string },
 ): Promise<never> => {
+  if (opts?.profile !== undefined) {
+    // Revalidate in the actual child: no caller can bypass policy using the
+    // explicit shim or a disable switch. Unsupported vendor paths stay closed.
+    sandboxSpawnArgs(tail, { required: true, profile: opts.profile as "windows-cmd-v1" });
+    return process.exit(await runWindowsConfinedTask());
+  }
   // Build the working set from the DAEMON's home (see `HOME_FLAG`), NOT this
   // process's `HOME` — the shim inherits the child's isolated one. The tail's
   // env is untouched, so the child still gets its isolated `HOME`.
   const state = await applyDaemonSandbox({
     force: true,
+    child: true,
     ...(opts?.home !== undefined ? { home: opts.home } : {}),
   });
-  if (state === "error" || state === "unsupported") {
-    // Loud on BOTH channels: stderr for the immediate caller, and the shared
-    // daemon log so per-spawn degradation is visible next to the boot-time
-    // capability probe's posture (the probe can say "enforced" while an
-    // individual apply later degrades — fail-open, but never silent).
+  if (state !== "enforced") {
     process.stderr.write(
-      `openllmd --sandbox-exec: sandbox not applied (${state}) — running unconfined\n`,
+      `openllmd --sandbox-exec: SANDBOX_UNAVAILABLE: confinement not applied (${state}); child rejected\n`,
     );
-    logWarn("sandbox", `--sandbox-exec apply degraded (${state})`, {
-      command: tail[0] ?? "?",
-    });
+    return process.exit(78);
   }
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn([...tail], {
+    proc = admittedSpawn([...tail], {
       stdio: ["inherit", "inherit", "inherit"],
-      env: process.env,
+      env: childEnvironment(process.env),
       cwd: process.cwd(),
     });
   } catch (err) {

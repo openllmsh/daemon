@@ -5,7 +5,7 @@
  * prefers the user systemd journal when its unit is registered, then falls back
  * to the same state-dir files for from-source and non-systemd installations.
  */
-import { spawn, spawnSync } from "node:child_process";
+import { nodeSpawn as spawn, nodeSpawnSync as spawnSync } from "./windows-process";
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import {

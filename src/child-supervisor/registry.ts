@@ -1,3 +1,4 @@
+import { spawnSync as admittedSpawnSync, spawn as admittedSpawn } from "../windows-process";
 import { createHash } from "node:crypto";
 import {
   mkdirSync,
@@ -67,7 +68,7 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
 /** PID-reuse-safe process identity. Mirrors the durable session-host lstart check. */
 export const processStartTime = (pid: number): string | null => {
   try {
-    const output = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+    const output = admittedSpawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
       stdout: "pipe",
       stderr: "ignore",
     });
@@ -108,7 +109,7 @@ export const setProcessStartTimeHelperSpawnForTests = (
 const defaultProcessStartTimeHelperSpawn: TProcessStartTimeHelperSpawn = (
   pid,
 ) =>
-  Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+  admittedSpawn(["ps", "-o", "lstart=", "-p", String(pid)], {
     stdout: "pipe",
     stderr: "ignore",
     // Own process group so reap can SIGKILL descendants without touching

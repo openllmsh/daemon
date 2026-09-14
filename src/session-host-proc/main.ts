@@ -14,7 +14,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { ensureWindowsProcessAdmission } from "../windows-process";
+import { processStartIdentity, secureSessionDirectory } from "@openllmsh/protocol/local-runtime";
 import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
@@ -39,22 +42,10 @@ import {
 
 const SESSION_DIR_MODE = 0o700;
 const ACTIVITY_POLL_MS = 15_000;
+const EXIT_DRAIN_TIMEOUT_MS = 1_000;
 
 const processStartTime = (): string | null => {
-  try {
-    const output = Bun.spawnSync(
-      ["ps", "-o", "lstart=", "-p", String(process.pid)],
-      {
-        stdout: "pipe",
-        stderr: "ignore",
-      },
-    );
-    if (output.exitCode !== 0) return null;
-    const value = new TextDecoder().decode(output.stdout).trim();
-    return value.length > 0 ? value : null;
-  } catch {
-    return null;
-  }
+  return processStartIdentity(process.pid, stateDir()) ?? null;
 };
 
 export type TSessionHostArgs = {
@@ -79,6 +70,8 @@ export type TSessionHostMeta = {
   readonly startedAtMs: number;
   readonly processStartTime: string;
   readonly generation: number;
+  /** Optional for discovery compatibility with already-running older hosts. */
+  readonly attached?: boolean;
 };
 
 type TSocketData = {
@@ -177,7 +170,7 @@ export const parseSessionHostArgs = (
           value.length < 1 ||
           value.length > 1024 ||
           value.includes("\0") ||
-          !value.startsWith("/")
+          !isAbsolute(value)
         )
           return null;
         cwd = value;
@@ -347,23 +340,28 @@ export type TSessionHostOptions = {
 };
 
 /** Start one durable session host. Kept exportable so tests can use its fake PTY seam. */
-export const runSessionHost = (
+export const runSessionHost = async (
   args: TSessionHostArgs,
   options: TSessionHostOptions = {},
-): void => {
+): Promise<void> => {
+  // Direct broker callers also precede protocol-owned identity/ACL helpers.
+  ensureWindowsProcessAdmission();
   const directory = sessionHostDir(args.id);
   const root = join(stateDir(), "sessions");
   const claim = join(root, `.${args.id}.claim`);
   const stagingDirectory = join(root, `.${args.id}.${process.pid}.staging`);
   const socketPath = join(stagingDirectory, "ctl.sock");
+  const localToken = process.platform === "win32" ? randomBytes(32).toString("hex") : null;
 
   let server: Bun.Server<TSocketData> | null = null;
   let activityTimer: ReturnType<typeof setInterval> | null = null;
   let ownerTimer: ReturnType<typeof setInterval> | null = null;
   let cleaned = false;
+  let exiting = false;
   let ownsClaim = false;
   let meta: TSessionHostMeta | null = null;
   let published = false;
+  const attachedSockets = new Set<TSocket>();
 
   const fail = (): void => {
     cleanup();
@@ -382,8 +380,34 @@ export const runSessionHost = (
     if (ownsClaim) rmSync(claim, { recursive: true, force: true });
   };
   const exit = (): void => {
-    cleanup();
-    (options.exit ?? process.exit)(0);
+    if (exiting || cleaned) return;
+    exiting = true;
+    if (server === null) {
+      cleanup();
+      (options.exit ?? process.exit)(0);
+      return;
+    }
+    const current = server;
+    // The core calls onEnd before terminalClose sends the exit envelope.
+    // Yield that stack, then let the broker sockets flush and close. A forced
+    // stop here drops the real shell status and makes the CLI report success.
+    queueMicrotask(async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          current.stop(false),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, EXIT_DRAIN_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        // A failed graceful stop still reaches the bounded forced cleanup.
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        cleanup();
+        (options.exit ?? process.exit)(0);
+      }
+    });
   };
 
   const publish = (): void => {
@@ -401,10 +425,11 @@ export const runSessionHost = (
 
   const writeMeta = (): void => {
     if (meta === null) return;
-    const temp = join(stagingDirectory, `.meta.json.${process.pid}.tmp`);
+    const targetDirectory = published ? directory : stagingDirectory;
+    const temp = join(targetDirectory, `.meta.json.${process.pid}.tmp`);
     try {
       writeFileSync(temp, `${JSON.stringify(meta)}\n`, { mode: 0o600 });
-      renameSync(temp, join(stagingDirectory, "meta.json"));
+      renameSync(temp, join(targetDirectory, "meta.json"));
     } catch (error) {
       try {
         rmSync(temp, { force: true });
@@ -412,6 +437,18 @@ export const runSessionHost = (
         // Best-effort temp cleanup.
       }
       throw error;
+    }
+  };
+
+  const recordAttachment = (socket: TSocket, attached: boolean): void => {
+    if (attached) attachedSockets.add(socket);
+    else attachedSockets.delete(socket);
+    if (cleaned || meta === null || meta.attached === (attachedSockets.size > 0)) return;
+    meta = { ...meta, attached: attachedSockets.size > 0 };
+    try { writeMeta(); }
+    catch {
+      // Telemetry persistence must not terminate an otherwise working terminal.
+      process.stderr.write("session-host: attachment metadata update failed\n");
     }
   };
 
@@ -433,6 +470,7 @@ export const runSessionHost = (
     rmSync(stagingDirectory, { recursive: true, force: true });
     mkdirSync(stagingDirectory, { mode: SESSION_DIR_MODE });
     chmodSync(stagingDirectory, SESSION_DIR_MODE);
+    secureSessionDirectory(stagingDirectory, stateDir());
   } catch {
     fail();
     return;
@@ -455,6 +493,7 @@ export const runSessionHost = (
         startedAtMs: session.startedAtMs,
         processStartTime: ownProcessStartTime,
         generation: session.generation,
+        attached: attachedSockets.size > 0,
       };
       writeMeta();
     },
@@ -462,7 +501,9 @@ export const runSessionHost = (
   });
 
   let spawnFailed = false;
-  openSession(
+  // BridgeSessions startup yields before onSpawn writes metadata. Keep our
+  // claim and staging directory until the spawn has actually settled.
+  await openSession(
     {
       session_id: args.id,
       cli: args.cli,
@@ -483,6 +524,8 @@ export const runSessionHost = (
       },
     },
   );
+  // A short-lived PTY can call onEnd while openSession is still settling.
+  if (cleaned) return;
   if (spawnFailed || meta === null) {
     fail();
     return;
@@ -490,8 +533,14 @@ export const runSessionHost = (
 
   try {
     server = Bun.serve({
-      unix: socketPath,
+      ...(localToken === null ? { unix: socketPath } : { hostname: "127.0.0.1", port: 0 }),
       fetch: (request, current): Response | undefined => {
+        if (localToken !== null) {
+          const candidate = new URL(request.url).pathname.slice(1);
+          if (request.headers.has("origin") || !/^[a-f0-9]{64}$/.test(candidate) ||
+              !timingSafeEqual(Buffer.from(candidate), Buffer.from(localToken)))
+            return new Response("forbidden", { status: 403 });
+        }
         if (request.method !== "GET")
           return new Response("not found", { status: 404 });
         return current.upgrade(request, {
@@ -538,6 +587,7 @@ export const runSessionHost = (
                 onExit: (code) =>
                   socket.sendText(JSON.stringify({ t: "exit", code })),
               });
+              recordAttachment(socket, true);
               return;
             }
             if (envelope.t === "ctrl" && stream !== null)
@@ -552,9 +602,11 @@ export const runSessionHost = (
           for (const waiter of waiters)
             waiter.reject(new Error("session host socket closed"));
           socket.data.stream?.closed();
+          recordAttachment(socket, false);
         },
       },
     });
+    if (localToken !== null) writeFileSync(socketPath, JSON.stringify({ port: server.port, token: localToken }), { mode: 0o600 });
     publish();
   } catch {
     fail();
@@ -604,6 +656,11 @@ export const runSessionHostProcess = (argv: readonly string[]): boolean => {
     // handled even when malformed, so it must never fall through to that path.
     return true;
   }
-  runSessionHost(args);
+  void runSessionHost(args).catch((error: unknown) => {
+    process.stderr.write(
+      `__session-host: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exit(1);
+  });
   return true;
 };

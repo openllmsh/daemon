@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Per-provider AUTH CONFIG — a `config.json` sidecar next to the isolated CLI
  * (`<cliRoot>/config.json`) that caches:
@@ -432,7 +433,7 @@ const captureInferenceRequest = async (
     // claude's identity capture runs the CLI's `exec`, which reads the isolated
     // keychain credential; unconfined on macOS for the keychain providers,
     // confined otherwise — `sandbox/policy.ts`.
-    proc = Bun.spawn(
+    proc = admittedSpawn(
       sandboxSpawnArgs(spawnArgv, { probe: unwrapKeychainSpawn(provider) }),
       {
         stdin: "ignore",

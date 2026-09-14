@@ -1,3 +1,4 @@
+import "./src/windows-process-init";
 export * from "./src/cloud-client";
 export * from "./src/config";
 export * from "./src/control-relay";

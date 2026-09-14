@@ -9,7 +9,7 @@
  * signature is missing/invalid, so a future real (notarized) signature is
  * preserved. No-op off darwin. Best-effort: never throws into the caller.
  */
-import { execFileSync } from "node:child_process";
+import { nodeExecFileSync as execFileSync } from "./windows-process";
 import { logWarn } from "./logger";
 
 export const hardenMacBinary = (path: string): void => {
