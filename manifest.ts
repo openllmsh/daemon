@@ -10,7 +10,7 @@ import type { TDaemonRelease } from "./release-types";
 
 export const DAEMON_RELEASE: TDaemonRelease = {
   repo: "openllmsh/daemon",
-  tag: "v2.6.39-alpha.1",
+  tag: "v2.6.39-alpha.2",
   targets: [
     "darwin-arm64",
     "darwin-x64-baseline",
@@ -19,15 +19,18 @@ export const DAEMON_RELEASE: TDaemonRelease = {
   ],
   sha256: {
     "darwin-arm64":
-      "a5bab5089f8722fef104cdd5c56f836a553f6a93b7b1579a03d90b5cffd3b587",
+      "1e6fa7437106596f758aca8850bdbe1e2af61ddaee5d126cda1537f9db2fb978",
     "darwin-x64-baseline":
-      "6c05bb6628f77d8b67ca10cddc8ccc2f00fb4c4b4159d153633f0f8763a43414",
+      "6c8cb3624e36cccf357b79a62f2c85261b53e76bc50e137f85434b9fe6294126",
     "linux-x64-baseline":
-      "b4c688a4bfe6463990f4c4168d977e114a60ba6362efadfc8978d7e57572d5a5",
+      "ae368350c897e8f1ef84559450fde5e9cc533ed2e4bd0c68ff3db25b826b86a8",
     "linux-arm64":
-      "3b6fa53b52711dca5fe7c3e7e9bb6ff978a740ffd26d43b4f9ffecfdbc36b04d",
+      "74e5977b16b01d1bacd6e3a3a3abf5f6415306d22aed788f4ccadde5d8b48adc",
   },
-  // Filled by the release CLI when bridgesessions-<target>.gz assets are
-  // published alongside the daemon binaries. Empty = not yet published.
-  bridgesessions_sha256: {},
+  bridgesessions_sha256: {
+    "darwin-arm64":
+      "4d6dbbb7bcdf09b22b96827f8d0d0ab3cf6c4dc02c94b1abb120346948f8f0e5",
+    "darwin-x64-baseline":
+      "3ec68af473dcf34077a27e70908eeeaded8f02cbd0fae0241667e2ed0483305c",
+  },
 };
