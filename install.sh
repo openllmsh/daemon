@@ -290,6 +290,22 @@ else
   echo "  note: no CLI release published yet — skipping openllm"
 fi
 
+# BridgeSessions PTY backend — OPTIONAL third component. Lands next to
+# openllmd in $BIN_DIR, which is exactly where the daemon's bundledBsPath()
+# looks first (before any PATH/mesh copy), so PTY sessions run a
+# version-matched worker. Probe the checksum route: 404 = this target has no
+# BS asset in the pinned release (the daemon then uses its bundled `bun` PTY
+# backend) — that is a normal state, never an install error.
+BS_PROBE="$(curl -fsSL "$ORIGIN/api/bridgesessions/binary/$TARGET.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
+case "$BS_PROBE" in
+  [0-9a-f]*)
+    install_component bridgesessions api/bridgesessions/binary "$DAEMON_VERSION"
+    ;;
+  *)
+    echo "  note: no bridgesessions asset for $TARGET — the daemon will use its bundled PTY backend"
+    ;;
+esac
+
 # --- the shared config file ------------------------------------------------
 # Re-read under the same exclusive `$ENV_FILE.lock` protocol as the daemon's
 # writeEnvFileVars. Never rebuild this file from a pre-download snapshot: a daemon

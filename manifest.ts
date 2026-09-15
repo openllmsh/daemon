@@ -27,4 +27,7 @@ export const DAEMON_RELEASE: TDaemonRelease = {
     "linux-arm64":
       "3b6fa53b52711dca5fe7c3e7e9bb6ff978a740ffd26d43b4f9ffecfdbc36b04d",
   },
+  // Filled by the release CLI when bridgesessions-<target>.gz assets are
+  // published alongside the daemon binaries. Empty = not yet published.
+  bridgesessions_sha256: {},
 };

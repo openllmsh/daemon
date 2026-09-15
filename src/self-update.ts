@@ -150,6 +150,42 @@ export const fetchDigest = async (url: string): Promise<string> => {
   return hex.toLowerCase();
 };
 
+/**
+ * Converge the version-matched bridgesessions PTY worker next to the running
+ * daemon binary (`bundledBsPath()` resolution order puts that location FIRST,
+ * before PATH/mesh copies). Downloads `bridgesessions-<target>.gz` from the
+ * release, verifies the decompressed sha256 against the `.sha256` sibling, and
+ * atomically swaps it in. THROWS (caller catches) when: this target has no BS
+ * asset (404), the download fails, or the digest mismatches — never installs
+ * unverified bytes. Callers treat every failure as "keep what you have".
+ */
+const convergeBridgesessions = async (
+  origin: string,
+  target: string,
+): Promise<void> => {
+  const dest = join(dirname(process.execPath), "bridgesessions");
+  const base = `${origin}/api/bridgesessions/binary/${target}`;
+  // 404 = no BS asset for this target — expected on partial releases.
+  const digestRes = await fetch(`${base}.sha256`, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+  });
+  if (digestRes.status === 404) return;
+  if (!digestRes.ok) throw new Error(`bs checksum fetch failed: ${digestRes.status}`);
+  const [bin, expected] = [
+    await fetchBinary(base),
+    await fetchDigest(`${base}.sha256`),
+  ];
+  const actual = createHash("sha256").update(bin).digest("hex");
+  if (actual !== expected) throw new Error("bridgesessions checksum mismatch");
+  const tmp = `${dest}.update.${process.pid}.tmp`;
+  writeFileSync(tmp, bin, { mode: 0o755 });
+  chmodSync(tmp, 0o755);
+  renameSync(tmp, dest);
+  hardenMacBinary(dest);
+  logInfo("self-update", `converged bridgesessions worker for ${target}`);
+};
+
 const waitUntilIdle = async (): Promise<void> => {
   const deadline = Date.now() + DRAIN_MAX_MS;
   while (inFlight() > 0 && Date.now() < deadline) {
@@ -248,6 +284,12 @@ export const maybeSelfUpdate = async (
       chmodSync(tmp, 0o755); // force mode regardless of umask
       renameSync(tmp, dest); // atomic on POSIX; running process keeps old inode
       hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
+      // Converge the version-matched bridgesessions PTY worker next to the new
+      // daemon binary (bundledBsPath() resolution order puts it FIRST). Best
+      // effort: no BS asset for this target, a failed download, or a checksum
+      // mismatch must never block the daemon restart — the daemon keeps whatever
+      // PTY backend it already has and retries on the next update tick.
+      await convergeBridgesessions(origin, target).catch(() => {});
       // Record only AFTER a successful swap — a transient download/rename failure
       // should retry on the next tick, but a swap that doesn't converge (the
       // relaunched binary still reports the old version) must back off.

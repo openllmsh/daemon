@@ -8,6 +8,13 @@
  * `packages/release` imports it (rather than re-declaring the list), and the
  * union + the sha256 map key derive from it, so a missing or unknown-target
  * checksum is a compile error instead of silent drift.
+ *
+ * BridgeSessions PTY-backend assets ride the SAME daemon release (same tag,
+ * same repo, asset name `bridgesessions-<target>.gz`). The daemon resolves the
+ * PTY worker next to its own executable (`bundledBsPath()` in `src/bs-pty.ts`),
+ * so the pair versions together. Optional per target: a target with no
+ * published BS asset keeps the daemon's `bun` PTY backend, and installs skip
+ * it there.
  */
 
 export const DAEMON_TARGETS = [
@@ -31,4 +38,13 @@ export type TDaemonRelease = {
    *  type rejects unknown/misspelled targets so the map can't silently drift
    *  from the supported set. */
   readonly sha256: Readonly<Partial<Record<TDaemonTarget, string>>>;
+  /** sha256 of the published BridgeSessions PTY-backend binary per target
+   *  (`bridgesessions-<target>.gz` asset on the SAME daemon release). OPTIONAL:
+   *  the map may be `{}` (pre-first-BS-publish) or partial — a target without
+   *  an entry has no BS asset, installs skip it, and the daemon falls back to
+   *  its bundled `bun` PTY backend there. Same TDaemonTarget key type so the
+   *  map cannot drift from the supported set. */
+  readonly bridgesessions_sha256: Readonly<
+    Partial<Record<TDaemonTarget, string>>
+  >;
 };
