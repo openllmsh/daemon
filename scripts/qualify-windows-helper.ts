@@ -262,13 +262,17 @@ const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
 if (systemRoot === undefined)
   throw new Error("Windows system root is unavailable");
 const cmd = join(systemRoot, "System32", "cmd.exe");
+const whoami = join(systemRoot, "System32", "whoami.exe");
+// Qualification must preserve the caller identity, not require LocalSystem.
+const expectedIdentity = run([whoami], "Windows caller identity", 0).stdout.trim();
+if (expectedIdentity.length === 0) throw new Error("Windows caller identity is empty");
 const results = [
   runPty(helper, {
     name: "whoami",
-    executable: join(systemRoot, "System32", "whoami.exe"),
+    executable: whoami,
     args: [],
     expectedExit: 0,
-    expectedOutput: "nt authority\\system",
+    expectedOutput: expectedIdentity,
   }),
   runPty(helper, {
     name: "echo",
