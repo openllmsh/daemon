@@ -23,6 +23,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   createSdkMcpServer,
   query,
@@ -42,6 +43,7 @@ import {
   mintToolContinuation,
   validateToolContinuation,
 } from "./claude-tool-continuation";
+import type { TSdkUserContent } from "./claude-tool-media";
 import type { TNativeTokens } from "./types";
 import { cleanNativeSpawnEnv, normalizeNativeTerminalResult } from "./types";
 
@@ -371,6 +373,41 @@ const evictStale = (): void => {
 const sweep = setInterval(evictStale, HELD_TTL_MS);
 sweep.unref?.();
 
+/**
+ * The SDK prompt for this turn: the plain string when the turn is text-only,
+ * otherwise a ONE-MESSAGE streaming input carrying the ordered structured
+ * content (images / documents alongside the text).
+ *
+ * Why a finite generator is safe here (qualified against the pinned
+ * `@anthropic-ai/claude-agent-sdk@0.3.207` implementation, `sdk.mjs`):
+ * the SDK ALWAYS spawns the CLI with `--input-format stream-json` and, for a
+ * string prompt, writes exactly this same `{type:"user", message:{role:"user",
+ * content:[…]}, parent_tool_use_id:null}` frame itself — so structured content
+ * differs only in the blocks, not in the mechanism. `Query.streamInput` drains
+ * the iterable, and because this path always supplies SDK MCP servers and
+ * `canUseTool` (`hasBidirectionalNeeds()` is true) it then AWAITS the first
+ * result before closing stdin — i.e. the generator completing does NOT end the
+ * turn, and a paused client tool keeps the query alive exactly as on the string
+ * path. The loop also breaks on abort, and `close()`/abort ends stdin, so no
+ * never-resolving generator and no extra cleanup path are introduced.
+ */
+export const sdkPromptOf = (
+  params: TStartToolTurnParams,
+): string | AsyncIterable<SDKUserMessage> => {
+  const content = params.userContent;
+  if (content === undefined || content === null) return params.userText;
+  const message: SDKUserMessage = {
+    type: "user",
+    parent_tool_use_id: null,
+    message: { role: "user", content },
+  };
+  return {
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
+      yield message;
+    },
+  };
+};
+
 const buildIterator = (
   params: TStartToolTurnParams,
   chan: TChannel,
@@ -403,7 +440,7 @@ const buildIterator = (
     params.tools.map((t) => `${MCP_PREFIX}${sanitize(t.name)}`),
   );
   const q = query({
-    prompt: params.userText,
+    prompt: sdkPromptOf(params),
     options: {
       model: params.providerModelId,
       pathToClaudeCodeExecutable: params.bin,
@@ -445,6 +482,10 @@ export type TStartToolTurnParams = {
   readonly systemText: string | null;
   readonly resumeSessionId: string | null;
   readonly userText: string;
+  /** Structured content for the active user turn (ordered text + image +
+   *  document blocks). Present ONLY when the turn carries media; a text-only
+   *  turn keeps the plain-string prompt path unchanged. */
+  readonly userContent?: TSdkUserContent | null;
 };
 
 /** Builds the message-iterator for a tool turn. The production default is
@@ -821,6 +862,61 @@ export const toolTurnToResponse = (
       },
     ],
   } as TChatCompletionResponse;
+};
+
+/**
+ * Dispose the held query these tool-call ids belong to, when the caller owns
+ * it. Used when a continuation is REJECTED for a reason that ends the turn for
+ * good (the walker serves the hop through the manual transport instead), so
+ * nobody will ever answer the paused tool call: without this the live `claude`
+ * subprocess sits parked until the idle TTL.
+ *
+ * Admission is the SAME two-part check `continueToolTurn` applies, in the same
+ * order, because closing a hold is as destructive as resuming it:
+ *
+ *   1. SCOPE — the held query's own continuation scope (subject + daemon key +
+ *      daemon epoch) must match the caller's, so a caller can never touch a
+ *      session belonging to another key or an earlier daemon epoch that happens
+ *      to reuse a tool-call id.
+ *   2. CAPABILITY — when the caller SUPPLIES a continuation token it must
+ *      validate (against the HELD session's stored identity, so a signing-key
+ *      refresh mid-pause doesn't reject its own token) and must cover these
+ *      ids. An invalid, expired, or foreign token does NOT fall back to
+ *      scope-only: presenting a bad capability is a failed authorization, not
+ *      an absent one, and must not close a legitimate same-scope hold.
+ *
+ * A caller that supplies NO token keeps the legacy scope-only semantics —
+ * exactly the latitude `continueToolTurn` still grants a live same-daemon hold
+ * — and no more.
+ *
+ * Returns whether a session was closed.
+ */
+export const disposeHeldToolSession = (
+  toolCallIds: ReadonlyArray<string>,
+  continuationIdentity: TToolContinuationIdentity = DEFAULT_CONTINUATION_IDENTITY,
+  continuationToken: string | null = null,
+): boolean => {
+  const now = nowMs();
+  const closed = new Set<THeld>();
+  for (const id of toolCallIds) {
+    const h = held.get(id);
+    if (h === undefined || closed.has(h)) continue;
+    if (!sameContinuationScope(h.continuationIdentity, continuationIdentity)) {
+      continue;
+    }
+    if (continuationToken !== null) {
+      const validation = validateToolContinuation(
+        continuationToken,
+        h.continuationIdentity,
+        toolCallIds,
+        now,
+      );
+      if (validation.kind === "invalid") continue;
+    }
+    closed.add(h);
+    closeHeld(h);
+  }
+  return closed.size > 0;
 };
 
 /** Test/introspection: count of held (paused) queries. */
