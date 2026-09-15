@@ -194,7 +194,7 @@ export const tryServeNativeToolTurn = async (
           params.continuationToken ?? null,
         );
       } else {
-        disposeHeldCodexToolSession(ids);
+        disposeHeldCodexToolSession(ids, params.continuationToken ?? null);
       }
       return {
         declined:
