@@ -729,6 +729,104 @@ export const chatgptDelegate: TProviderDelegate = {
       };
     }),
 
+  // Local-only credential for `/backend-api/codex/images/edits` — a sibling
+  // of the generation endpoint (same host, same identity backfill), but a
+  // DISTINCT path so a walker never conflates edit and generation targets.
+  // Verified live (foundation research, ac06f4cb).
+  credentialForImageEdit: (inbound?: Headers): Promise<TImageCredential> =>
+    withRefreshCaller("upstream", async (): Promise<TImageCredential> => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("chatgpt: not signed in (no stored credential)");
+      }
+      const url = await resolveProviderUrl(
+        PROVIDER,
+        "/backend-api/codex/images/edits",
+      );
+      const headers: Record<string, string> =
+        token.accountId !== null
+          ? { "chatgpt-account-id": token.accountId }
+          : {};
+      if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+      if (!hasCodexUserAgent(inbound))
+        headers["user-agent"] = OPENLLM_USER_AGENT;
+      return {
+        access_token: token.accessToken,
+        headers,
+        url,
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
+        ...(token.accountId !== null
+          ? { account_hash: accountHash(PROVIDER, token.accountId) }
+          : {}),
+      };
+    }),
+
+  // Local-only credential for `POST /backend-api/transcribe` (batch
+  // speech-to-text, multipart `file`+`language`). Verified live (foundation
+  // research, ac06f4cb) — the route is OUTSIDE `/backend-api/codex`, unlike
+  // images/generations.
+  credentialForTranscription: (inbound?: Headers): Promise<TImageCredential> =>
+    withRefreshCaller("upstream", async (): Promise<TImageCredential> => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("chatgpt: not signed in (no stored credential)");
+      }
+      const url = await resolveProviderUrl(PROVIDER, "/backend-api/transcribe");
+      const headers: Record<string, string> =
+        token.accountId !== null
+          ? { "chatgpt-account-id": token.accountId }
+          : {};
+      if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+      if (!hasCodexUserAgent(inbound))
+        headers["user-agent"] = OPENLLM_USER_AGENT;
+      return {
+        access_token: token.accessToken,
+        headers,
+        url,
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
+        ...(token.accountId !== null
+          ? { account_hash: accountHash(PROVIDER, token.accountId) }
+          : {}),
+      };
+    }),
+
+  // Local-only credential for `POST /backend-api/pronunciation/synthesize`
+  // (standalone text-to-speech; JSON in, raw MP3 bytes out; no voice
+  // selector). Verified live (foundation research, ac06f4cb).
+  credentialForSpeech: (inbound?: Headers): Promise<TImageCredential> =>
+    withRefreshCaller("upstream", async (): Promise<TImageCredential> => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("chatgpt: not signed in (no stored credential)");
+      }
+      const url = `${await resolveProviderUrl(
+        PROVIDER,
+        "/backend-api/pronunciation/synthesize",
+      )}?format=mp3`;
+      const headers: Record<string, string> =
+        token.accountId !== null
+          ? { "chatgpt-account-id": token.accountId }
+          : {};
+      if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+      if (!hasCodexUserAgent(inbound))
+        headers["user-agent"] = OPENLLM_USER_AGENT;
+      return {
+        access_token: token.accessToken,
+        headers,
+        url,
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
+        ...(token.accountId !== null
+          ? { account_hash: accountHash(PROVIDER, token.accountId) }
+          : {}),
+      };
+    }),
+
   logout: async () => {
     // `codex logout` revokes the token server-side; then ensure the isolated
     // auth.json is gone regardless of CLI version.

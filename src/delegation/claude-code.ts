@@ -97,6 +97,7 @@ import {
 import type { TRunCaptureResult } from "./spawn";
 import { runCaptureResult } from "./spawn";
 import type {
+  TImageCredential,
   TModelDiscoveryOptions,
   TModelDiscoveryResult,
   TProviderDelegate,
@@ -1197,6 +1198,41 @@ export const claudeCodeDelegate: TProviderDelegate = {
         headers: identity ?? {},
         url,
         // Which account this hop's cost attributes to (recorded on the row).
+        ...(acct !== null ? { account_hash: acct } : {}),
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
+      };
+    }),
+
+  // Local-only credential for the native dictation WebSocket
+  // (`wss://api.anthropic.com/api/ws/speech_to_text/voice_stream` —
+  // verified live, foundation research ac06f4cb). The HOST is derived from
+  // the captured `/v1/messages` upstream (same origin, `resolveProviderUrl`)
+  // so a vendor host migration is auto-tracked; only the leaf path + fixed
+  // query params (the verified recipe) are constants. `headers` carries the
+  // same OAuth identity `credentialForUpstream` presents — no `authorization`
+  // (the walker/session layers the bearer separately).
+  credentialForTranscription: (): Promise<TImageCredential> =>
+    withRefreshCaller("upstream", async (): Promise<TImageCredential> => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("claude_code: not signed in (no stored credential)");
+      }
+      const base = await resolveProviderUrl(
+        PROVIDER,
+        "/api/ws/speech_to_text/voice_stream",
+      );
+      const url = `${base.replace(/^https:/, "wss:")}?encoding=linear16&sample_rate=16000&channels=1&endpointing_ms=300&utterance_end_ms=1000&language=en&use_conversation_engine=true`;
+      const acct = await readAccountHash();
+      return {
+        access_token: token.accessToken,
+        headers: {
+          "user-agent": await userAgent(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": OAUTH_BETA,
+        },
+        url,
         ...(acct !== null ? { account_hash: acct } : {}),
         ...(token.staleRefresh !== undefined
           ? { stale_refresh: token.staleRefresh }

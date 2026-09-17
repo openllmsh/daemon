@@ -112,10 +112,15 @@ import {
 
 const PROVIDER = "grok" as const;
 
-// Image endpoint host differs from the chat/proxy host.
-// Grok image requests must go directly to `api.x.ai`, so we don't try to
-// resolve from captured upstream URL.
+// Image/audio/realtime endpoints all differ from the chat/proxy host.
+// These requests must go directly to `api.x.ai`, so we don't try to
+// resolve from the captured upstream URL. Verified live (foundation
+// research, ac06f4cb).
 const GROK_IMAGE_URL = "https://api.x.ai/v1/images/generations";
+const GROK_IMAGE_EDIT_URL = "https://api.x.ai/v1/images/edits";
+const GROK_STT_URL = "https://api.x.ai/v1/stt";
+const GROK_TTS_URL = "https://api.x.ai/v1/tts";
+const GROK_REALTIME_URL = "wss://api.x.ai/v1/realtime?model=grok-voice-latest";
 
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
@@ -1005,6 +1010,53 @@ export const grokDelegate: TProviderDelegate = {
       > => ({
         ...(await grokClientCredential()),
         url: GROK_VIDEO_BASE,
+      }),
+    ),
+
+  // `POST /v1/images/edits` — a DISTINCT model (`grok-imagine-image-2.0`)
+  // from the generation alias; never infer editing from generation.
+  // Verified live (foundation research, ac06f4cb).
+  credentialForImageEdit: (): Promise<TImageCredential> =>
+    withRefreshCaller(
+      "upstream",
+      async (): Promise<TImageCredential> => ({
+        ...(await grokClientCredential()),
+        url: GROK_IMAGE_EDIT_URL,
+      }),
+    ),
+
+  // `POST /v1/stt` — batch speech-to-text, multipart `file`+`language`
+  // (+`format=true`, verified live). Mono 16-bit 16kHz WAV input.
+  credentialForTranscription: (): Promise<TImageCredential> =>
+    withRefreshCaller(
+      "upstream",
+      async (): Promise<TImageCredential> => ({
+        ...(await grokClientCredential()),
+        url: GROK_STT_URL,
+      }),
+    ),
+
+  // `POST /v1/tts` — JSON `{text, voice_id:"eve", language}` → MP3.
+  // Verified live (foundation research, ac06f4cb).
+  credentialForSpeech: (): Promise<TImageCredential> =>
+    withRefreshCaller(
+      "upstream",
+      async (): Promise<TImageCredential> => ({
+        ...(await grokClientCredential()),
+        url: GROK_TTS_URL,
+      }),
+    ),
+
+  // `wss://api.x.ai/v1/realtime?model=grok-voice-latest` — text-to-audio
+  // realtime session (verified live; microphone/barge-in unverified — see
+  // `GROK_REALTIME_OPERATIONS`). Local-only credential; no walker consumes
+  // this yet (out of scope for this slice — see delegation/types.ts).
+  credentialForRealtime: (): Promise<TImageCredential> =>
+    withRefreshCaller(
+      "upstream",
+      async (): Promise<TImageCredential> => ({
+        ...(await grokClientCredential()),
+        url: GROK_REALTIME_URL,
       }),
     ),
 

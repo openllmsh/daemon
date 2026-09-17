@@ -20,19 +20,31 @@ import {
   AnthropicRequest,
   ChatCompletionRequest,
   ImageGenerationRequest,
+  parseImageEditInput,
+  parseImageEditMultipart,
   ResponsesRequest,
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
+import {
+  collectBoundedBytes,
+  TUNNEL_MEDIA_MAX_BODY_BYTES,
+} from "@openllmsh/tunnel";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { Schema } from "effect";
+import {
+  runAudioSpeechWalker,
+  runAudioTranscriptionWalker,
+} from "./audio-walker";
 import { fetchPlan } from "./cloud-client";
 import { planCacheEnabled } from "./config";
 import { notePresenceActivity } from "./control-channel";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
-import { runImageWalker } from "./image-walker";
+import { runImageEditWalker, runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
+import type { TParsedMultipart } from "./multipart";
+import { parseMultipartBytes } from "./multipart";
 import {
   originFailureMessage,
   originFailureStatus,
@@ -102,6 +114,9 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // schema, no walk.
   const isResponsesCompact = url.pathname.endsWith("/responses/compact");
   const isImages = url.pathname.endsWith("/images/generations");
+  const isImageEdits = url.pathname.endsWith("/images/edits");
+  const isTranscriptions = url.pathname.endsWith("/audio/transcriptions");
+  const isSpeech = url.pathname.endsWith("/audio/speech");
   // Normalize the optional `/api` prefix once; reused for video routing + the
   // recorded `endpoint`.
   const normalizedPath = url.pathname.replace(/^\/api(?=\/v1\/)/, "");
@@ -132,15 +147,75 @@ export const handleInference = async (req: Request): Promise<Response> => {
         : "chat_completions";
   const endpoint = normalizedPath;
 
+  // Audio uploads (`/v1/audio/transcriptions`) and inline image edits
+  // (`/v1/images/edits`) may arrive as `multipart/form-data` — every other
+  // surface stays JSON-only. Bounded by the SAME cap the tunnel enforces on
+  // a mux-forwarded media body (`TUNNEL_MEDIA_MAX_BODY_BYTES`), so a huge
+  // upload can't stall or OOM the local listener either.
+  const requestContentType = req.headers.get("content-type") ?? "";
+  const isMultipart = requestContentType
+    .toLowerCase()
+    .includes("multipart/form-data");
+
   let rawBytes: ArrayBuffer;
-  let rawBody: unknown;
+  let rawBody: unknown = null;
+  let multipart: TParsedMultipart | null = null;
   try {
-    rawBytes = await req.arrayBuffer();
-    rawBody = isBodylessVideoOp(videoOperation)
-      ? null
-      : JSON.parse(new TextDecoder().decode(rawBytes));
-  } catch {
-    return withCors(req, errorJson(400, "Body must be valid JSON"));
+    if (isBodylessVideoOp(videoOperation)) {
+      rawBytes = await req.arrayBuffer();
+    } else if (isMultipart) {
+      const collected = await collectBoundedBytes(
+        req.body,
+        TUNNEL_MEDIA_MAX_BODY_BYTES,
+        req.signal,
+      );
+      // Keep the ORIGINAL bytes (not a re-serialized FormData) so an
+      // eventual cloud passthrough forwards the caller's exact multipart
+      // body — `Response(collected, ...).formData()` only READS the bytes,
+      // it never consumes/mutates the buffer we hand back to the caller.
+      rawBytes = collected.buffer.slice(
+        collected.byteOffset,
+        collected.byteOffset + collected.byteLength,
+      ) as ArrayBuffer;
+      multipart = await parseMultipartBytes(collected, requestContentType);
+    } else {
+      rawBytes = await req.arrayBuffer();
+      rawBody = JSON.parse(new TextDecoder().decode(rawBytes));
+    }
+  } catch (err) {
+    const tooLarge = err instanceof Error && err.message.includes("too large");
+    return withCors(
+      req,
+      errorJson(
+        tooLarge ? 413 : 400,
+        tooLarge
+          ? "Request body too large"
+          : "Body must be valid JSON or multipart/form-data",
+      ),
+    );
+  }
+
+  // Inline image edits are normalized to the SAME canonical JSON shape
+  // regardless of encoding, so every downstream consumer of `rawBody`
+  // (the local-first-gateway alias read below, `runImageEditWalker`) sees
+  // one contract. `parseImageEditMultipart` flattens the uploaded file into
+  // a `data:` URL first; `parseImageEditInput` handles an inbound JSON body
+  // directly.
+  if (isImageEdits) {
+    const parsedEdit =
+      multipart !== null
+        ? parseImageEditMultipart({
+            fields: multipart.fields,
+            files: multipart.files,
+          })
+        : parseImageEditInput(rawBody);
+    if (!parsedEdit.ok) {
+      return withCors(
+        req,
+        errorJson(400, parsedEdit.error.message, parsedEdit.error.code),
+      );
+    }
+    rawBody = parsedEdit.request;
   }
 
   // Validate against the surface schema for a clean 400 — the walker
@@ -158,7 +233,12 @@ export const handleInference = async (req: Request): Promise<Response> => {
       // no-op — id-addressed video ops carry no body (rawBody is null); the
       // signed plan rides the query string, so there's nothing to validate.
     } else if (isImages) parseImageRequest(rawBody);
-    else if (surface === "messages") parseAnthropicRequest(rawBody);
+    else if (isImageEdits) {
+      // no-op — already normalized + validated above.
+    } else if (isTranscriptions || isSpeech) {
+      // no-op — the audio walker validates its own shape (either JSON or
+      // multipart for transcriptions; JSON-only for speech).
+    } else if (surface === "messages") parseAnthropicRequest(rawBody);
     else if (surface === "responses") parseResponsesRequest(rawBody);
     else parseOpenAIRequest(rawBody);
   } catch (err) {
@@ -194,7 +274,12 @@ export const handleInference = async (req: Request): Promise<Response> => {
     url.searchParams.get("__context_overflow_strategy"),
   );
   let sigParam = url.searchParams.get("__sig");
-  const alias = (rawBody as { model?: unknown } | null)?.model;
+  // A multipart transcription upload carries its alias in the form field,
+  // not a JSON `rawBody` (`rawBody` stays null for that shape).
+  const alias =
+    rawBody !== null
+      ? (rawBody as { model?: unknown }).model
+      : multipart?.fields.model;
   if (planCacheEnabled() && typeof alias === "string" && alias.length > 0) {
     if (planParam !== null) {
       if (
@@ -336,6 +421,12 @@ export const handleInference = async (req: Request): Promise<Response> => {
                 ? runCountTokens(walkArgs)
                 : isImages
                   ? runImageWalker(walkArgs)
-                  : runWalker(walkArgs)),
+                  : isImageEdits
+                    ? runImageEditWalker(walkArgs)
+                    : isTranscriptions
+                      ? runAudioTranscriptionWalker(walkArgs, multipart)
+                      : isSpeech
+                        ? runAudioSpeechWalker(walkArgs)
+                        : runWalker(walkArgs)),
   );
 };

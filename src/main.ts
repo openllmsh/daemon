@@ -78,6 +78,12 @@ import { handleInference } from "./listener";
 import { logError, logInfo, safeDiagnosticMessage } from "./logger";
 import { observeLoginModelReports } from "./model-report";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
+import type { TLocalRealtimeSocketData } from "./realtime-handler";
+import {
+  authorizeLocalRealtimeRequest,
+  localRealtimeWebSocket,
+  parseLocalRealtimeOpen,
+} from "./realtime-handler";
 import { probeSandboxCapability } from "./sandbox/exec";
 import { recordSandboxState, sandboxState } from "./sandbox/landlock";
 import {
@@ -355,8 +361,38 @@ const main = async (): Promise<void> => {
       // ~10s idle timeout would sever a stream between writes, so raise it to
       // Bun's max; the stream emits its own keep-alives well under it.
       idleTimeout: 255,
-      fetch: async (req: Request): Promise<Response | undefined> => {
+      fetch: async (
+        req: Request,
+        server: Bun.Server<TLocalRealtimeSocketData>,
+      ): Promise<Response | undefined> => {
         const url = new URL(req.url);
+        // `/v1/realtime` is a WebSocket upgrade, not `handleInference` HTTP —
+        // handled BEFORE the generic `/v1/` branch below so it never reaches
+        // the inference listener. Authenticated LOCAL clients only: a
+        // browser's `WebSocket` API cannot set `Authorization`, so this gate
+        // alone keeps browsers off this path (they use the mux `realtime1`
+        // channel instead — see `realtime-handler.ts`'s module doc).
+        if (url.pathname === "/v1/realtime") {
+          if (isPreflight(req)) return preflightResponse(req);
+          if (!authorizeLocalRealtimeRequest(req)) {
+            return new Response("unauthorized", { status: 401 });
+          }
+          const open = parseLocalRealtimeOpen(url);
+          if (open === null) {
+            return new Response(
+              JSON.stringify({
+                error: { message: "unsupported provider/model/voice" },
+              }),
+              { status: 400, headers: { "content-type": "application/json" } },
+            );
+          }
+          const upgraded = server.upgrade(req, {
+            data: { open, handle: null },
+          });
+          return upgraded
+            ? undefined
+            : new Response("websocket upgrade failed", { status: 400 });
+        }
         if (url.pathname.startsWith("/v1/")) {
           // Stamp every inference response as daemon-served — an
           // observability marker (you can always tell a response came from
@@ -455,9 +491,11 @@ const main = async (): Promise<void> => {
           headers: { "content-type": "application/json" },
         });
       },
-      websocket: {
-        message: (): void => {},
-      },
+      // The ONLY local WS surface: `/v1/realtime` (see `fetch` above). Every
+      // upgrade this handler ever sees already carried a validated `open`
+      // payload in `data` — `localRealtimeWebSocket` never re-parses the
+      // request itself.
+      websocket: localRealtimeWebSocket,
     });
   } catch (err) {
     const code =

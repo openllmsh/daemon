@@ -1,4 +1,5 @@
 import type {
+  TImageEditRequest,
   TImageGenerationRequest,
   TImageGenerationResponse,
 } from "@openllmsh/protocol";
@@ -7,12 +8,19 @@ import {
   ImageGenerationRequest,
   ImageGenerationResponse,
   normalizeContentType,
+  parseImageEditInput,
 } from "@openllmsh/protocol";
+import { inspectImageBytes } from "@openllmsh/wire/lib/canonical/image-signature";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
+import type { TImageCredential } from "./delegation/types";
+import {
+  buildImageEditUpstreamBody,
+  isSupportedImageEditReference,
+} from "./image-edit-wire";
 import type { TWalkArgs } from "./walker";
 import {
   coolHopAfterStaleRefresh,
@@ -40,7 +48,7 @@ type TImageDataItem = {
   readonly b64_json?: string;
 };
 
-const persistImageDataItem = async (
+export const persistImageDataItem = async (
   item: TImageGenerationResponse["data"][number],
   includeBase64: boolean,
   args: TWalkArgs,
@@ -50,6 +58,16 @@ const persistImageDataItem = async (
 
   if (item.b64_json !== undefined) {
     bytes = base64ToBytes(item.b64_json);
+    // Sniff the real bytes rather than trusting the vendor's declared
+    // format: a subscription bridge has been observed returning JPEG bytes
+    // where the wire contract implied PNG (see
+    // `wire/lib/canonical/image-signature.ts`). Unrecognized bytes keep the
+    // historical "image/png" default — generation output that fails to
+    // sniff is not necessarily malformed (a format `inspectImageBytes`
+    // doesn't parse), so it is still persisted, just under the fallback
+    // label it always used.
+    const inspected = inspectImageBytes(bytes);
+    if (inspected !== null) contentType = inspected.mime;
   } else if (item.url !== undefined && item.url.length > 0) {
     const image = await (args.fetchImpl ?? fetch)(item.url, {
       method: "GET",
@@ -320,6 +338,296 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
     );
   } catch {
     return errorJson(502, "Failed to persist generated image");
+  }
+
+  const response = {
+    ...normalized,
+    data: persistedItems,
+  };
+  report(
+    {
+      model: hop.modelId,
+      provider: hop.provider,
+      status: statusFor(resp.status),
+      tokens_in: 0,
+      tokens_out: 0,
+      latency_ms: Date.now() - args.startedAt,
+      endpoint: args.endpoint,
+      ...(acquired.accountHash !== null
+        ? { account_hash: acquired.accountHash }
+        : {}),
+    },
+    args.originParam,
+  );
+  return new Response(JSON.stringify(response), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+};
+
+// ─── Image EDITS ───────────────────────────────────────────────────────────
+//
+// A distinct entry point (`runImageEditWalker`) rather than a branch inside
+// `runImageWalker`: edits have their own request shape (single reference
+// image, no `style`/`background`, masks explicitly rejected — see
+// `@openllmsh/protocol/image-edit-parse`), their own upstream wire per
+// provider (`buildImageEditUpstreamBody`), and — critically — they must
+// NEVER silently fall back to generation when a provider/credential is
+// missing.
+
+type TImageEditDataItem = {
+  readonly url: string;
+  readonly b64_json?: string;
+};
+
+/**
+ * Acquire the local credential for ONE subscription provider's image-EDIT
+ * endpoint. Mirrors {@link acquireImageUpstream} but reads
+ * `credentialForImageEdit` — a distinct delegate method so a provider can
+ * target `/images/edits` without reusing its generation URL/headers.
+ */
+export const acquireImageEditUpstream = async (
+  provider: string,
+  args: TWalkArgs,
+  hop: { readonly provider: string; readonly modelId: string },
+  walkSessionKey?: string,
+): Promise<TImageUpstream | "retry"> => {
+  const delegate = getDelegate(provider);
+  if (delegate?.credentialForImageEdit === undefined) return "retry";
+  try {
+    const cred: TImageCredential = await delegate.credentialForImageEdit(
+      args.req.headers,
+    );
+    if (cred.stale_refresh !== undefined) {
+      coolHopAfterStaleRefresh(hop, cred.stale_refresh, walkSessionKey);
+      return "retry";
+    }
+    return {
+      headers: {
+        ...originatorHeadersFrom(args.req.headers),
+        ...cred.headers,
+        authorization: `Bearer ${cred.access_token}`,
+      },
+      url: cred.url,
+      accountHash: cred.account_hash ?? null,
+    };
+  } catch {
+    return "retry";
+  }
+};
+
+/** Decode the base64 payload out of a `data:...;base64,<payload>` URL. */
+const bytesFromDataUrl = (url: string): Uint8Array => {
+  const comma = url.indexOf(",");
+  return base64ToBytes(comma === -1 ? "" : url.slice(comma + 1));
+};
+
+/**
+ * Persist ONE edit-result image. Unlike generation's `persistImageDataItem`,
+ * a result whose bytes don't sniff as a real image is REJECTED rather than
+ * stored under a fallback MIME: an edit endpoint returning garbage (or a
+ * truncated/corrupted payload) is a malformed provider result, and this is
+ * a brand-new persistence path with no legacy behavior to preserve.
+ */
+export const persistImageEditResultItem = async (
+  item: { readonly url?: string; readonly b64_json?: string },
+  includeBase64: boolean,
+  args: TWalkArgs,
+): Promise<TImageEditDataItem> => {
+  let bytes: Uint8Array;
+  if (item.b64_json !== undefined) {
+    bytes = base64ToBytes(item.b64_json);
+  } else if (item.url !== undefined && item.url.length > 0) {
+    // Every edit upstream this daemon knows (`buildImageEditUpstreamBody`)
+    // requests `response_format: "b64_json"` / an inline `image_url`; a
+    // provider answering with a bare `https://` result would mean fetching
+    // a vendor-controlled URL this box cannot SSRF-vet. Only an inline
+    // `data:` result is accepted.
+    if (!isSupportedImageEditReference(item.url)) {
+      throw new Error(
+        "upstream image edit returned a fetchable URL result, which this daemon does not fetch",
+      );
+    }
+    bytes = bytesFromDataUrl(item.url);
+  } else {
+    throw new Error("image edit result has no content");
+  }
+
+  const inspected = inspectImageBytes(bytes);
+  if (inspected === null) {
+    throw new Error("upstream image edit returned unrecognized image bytes");
+  }
+
+  const saved = await uploadMedia(
+    bytes,
+    { contentType: inspected.mime, kind: "image", sourceRef: undefined },
+    args.originParam,
+  );
+  if (saved === null) {
+    throw new Error("failed to upload edited image");
+  }
+  return {
+    url: saved.url,
+    ...(includeBase64 && item.b64_json !== undefined
+      ? { b64_json: item.b64_json }
+      : {}),
+  };
+};
+
+/**
+ * Walk one image-EDIT request. Same 403/400 plan gate as {@link runImageWalker}.
+ * The plan candidate must be a subscription provider whose delegate exposes
+ * `credentialForImageEdit` — an API-key (BYOK) hop is never considered here;
+ * the cloud handler is responsible for refusing BYOK explicitly rather than
+ * ever 307ing one to this walker.
+ */
+export const runImageEditWalker = async (
+  args: TWalkArgs,
+): Promise<Response> => {
+  if (
+    !planSignatureOk(
+      args.planParam,
+      args.pmidsParam,
+      args.originParam,
+      args.contextOverflowStrategy ?? null,
+      args.sigParam,
+    )
+  ) {
+    return errorJson(403, "invalid or missing __plan signature");
+  }
+  if (args.planParam === null) {
+    return errorJson(400, "image edits require a daemon plan");
+  }
+
+  // The SINGLE normalization pass — whatever shape the listener handed us
+  // (a JSON body, or fields already flattened from a multipart upload) is
+  // read exactly once here. `parseImageEditInput` is the only place this
+  // request is interpreted; nothing upstream of this call re-reads it.
+  const parsed = parseImageEditInput(args.rawBody);
+  if (!parsed.ok) {
+    return errorJson(400, parsed.error.message, parsed.error.code);
+  }
+  const editRequest: TImageEditRequest = parsed.request;
+
+  if (!isSupportedImageEditReference(editRequest.image.url)) {
+    return errorJson(
+      400,
+      "Image edits accept only an inline (data:) image upload in this release — remote image URLs are not supported.",
+      "image_edit_remote_url_unsupported",
+    );
+  }
+
+  const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
+  const hop = parsePlan(args.planParam)
+    .map((modelId, index) => resolveHop(modelId, pmids[index]))
+    .find((candidate) => {
+      const delegate = getDelegate(candidate.provider);
+      return (
+        isSubscriptionSlug(candidate.provider) &&
+        delegate?.credentialForImageEdit !== undefined
+      );
+    });
+  if (hop === undefined) {
+    return errorJson(
+      404,
+      "No subscription image-edit provider in the daemon plan can serve this request",
+    );
+  }
+
+  const acquired = await acquireImageEditUpstream(hop.provider, args, hop);
+  if (acquired === "retry") {
+    return errorJson(
+      404,
+      `No image-edit credential available for ${hop.provider}`,
+    );
+  }
+
+  let upstreamBody: Record<string, unknown>;
+  try {
+    upstreamBody = buildImageEditUpstreamBody(
+      hop.provider,
+      editRequest,
+      hop.providerModelId,
+    );
+  } catch (err) {
+    return errorJson(
+      400,
+      err instanceof Error ? err.message : "Unsupported image-edit provider",
+    );
+  }
+
+  const resp = await postUpstream(
+    acquired.url,
+    {
+      method: "POST",
+      headers: {
+        ...acquired.headers,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(upstreamBody),
+      signal: args.req.signal,
+    },
+    // One attempt, like generation — a 5xx retry could double-edit if the
+    // first attempt actually succeeded upstream.
+  );
+  if (resp === null) {
+    return args.req.signal.aborted
+      ? errorJson(499, "client aborted request")
+      : errorJson(502, "upstream image-edit provider is unreachable");
+  }
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    report(
+      {
+        model: hop.modelId,
+        provider: hop.provider,
+        status: statusFor(resp.status),
+        tokens_in: 0,
+        tokens_out: 0,
+        latency_ms: Date.now() - args.startedAt,
+        endpoint: args.endpoint,
+        ...(acquired.accountHash !== null
+          ? { account_hash: acquired.accountHash }
+          : {}),
+      },
+      args.originParam,
+    );
+    return new Response(body.length > 0 ? body : null, {
+      status: resp.status,
+      headers: passthroughHeaders(resp),
+    });
+  }
+
+  let upstream: unknown;
+  try {
+    upstream = await resp.json();
+  } catch {
+    return errorJson(502, "upstream image-edit provider returned invalid JSON");
+  }
+  let normalized: TImageGenerationResponse;
+  try {
+    normalized = normalizeImageResponse(upstream);
+  } catch (err) {
+    return errorJson(
+      502,
+      err instanceof Error
+        ? `upstream image-edit provider returned invalid data: ${err.message}`
+        : "upstream image-edit provider returned invalid data",
+    );
+  }
+
+  const includeBase64 = editRequest.response_format === "b64_json";
+  let persistedItems: ReadonlyArray<TImageEditDataItem>;
+  try {
+    persistedItems = await Promise.all(
+      normalized.data.map((item) =>
+        persistImageEditResultItem(item, includeBase64, args),
+      ),
+    );
+  } catch {
+    return errorJson(502, "Failed to persist edited image");
   }
 
   const response = {
