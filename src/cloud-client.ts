@@ -20,9 +20,11 @@ import type {
   TRelayChannelResponse,
 } from "@openllmsh/protocol";
 import {
+  DAEMON_BOOTSTRAP_CAPS_HEADER,
   DAEMON_DEVICE_ID_HEADER,
   DAEMON_DEVICE_LABEL_HEADER,
   DaemonPlanResponse,
+  MODEL_CAPABILITIES_OPEN_CAP,
   RelayChannelResponse,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
@@ -121,6 +123,11 @@ const authHeaders = (): Record<string, string> => {
     // `docs/proposals/daemon-device-aware-this-machine.md`.
     [DAEMON_DEVICE_ID_HEADER]: deviceId(),
     [DAEMON_DEVICE_LABEL_HEADER]: deviceLabel(),
+    // This binary decodes DaemonCatalogEntry.capabilities as an open string
+    // array (post image_editing/realtime widening) — advertise it so the
+    // bootstrap encoder sends the full modern capability list instead of
+    // filtering to the bootstrap-safe subset. Never gated on a version bump.
+    [DAEMON_BOOTSTRAP_CAPS_HEADER]: MODEL_CAPABILITIES_OPEN_CAP,
   };
 };
 

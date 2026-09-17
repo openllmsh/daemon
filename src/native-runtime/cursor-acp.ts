@@ -49,6 +49,8 @@
  */
 
 import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { spawnCwd } from "../delegation/util";
@@ -56,6 +58,17 @@ import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
+import type { TCursorNativeImageAsset } from "./cursor-image-assets";
+import {
+  collectJailedCursorImages,
+  cursorImageJailOf,
+  provenancePathsOf,
+} from "./cursor-image-assets";
+import {
+  cursorImageToolEnforcement,
+  handleCursorImageServerRequest,
+  isCursorGenerateImageTool,
+} from "./cursor-image-permissions";
 import type { TCursorMcpServer } from "./cursor-mcp-server";
 import { startCursorMcpServer } from "./cursor-mcp-server";
 import {
@@ -1052,4 +1065,315 @@ export const listCursorModelsViaAcp = async (params: {
   } finally {
     client.dispose();
   }
+};
+
+export type { TCursorNativeImageAsset } from "./cursor-image-assets";
+
+export type TCursorNativeImageInput = {
+  readonly bin: string;
+  readonly env: Record<string, string>;
+  readonly providerModelId: string;
+  readonly prompt: string;
+  readonly signal: AbortSignal;
+  readonly precommitMs?: number;
+  readonly idleMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly rpcTimeoutMs?: number;
+};
+
+export type TCursorNativeImageUsageEstimate = {
+  readonly prompt_tokens: number;
+  readonly completion_tokens: number;
+  readonly total_tokens: number;
+};
+
+export type TCursorNativeImageResult =
+  | {
+      readonly kind: "ok";
+      readonly assets: ReadonlyArray<TCursorNativeImageAsset>;
+      readonly stopReason: string | null;
+      /** chars/4 estimate — ACP reports no token usage. */
+      readonly estimatedUsage: TCursorNativeImageUsageEstimate;
+    }
+  | {
+      readonly kind: "declined";
+      readonly reason: string;
+      readonly cooldownReason?: "auth";
+    }
+  | { readonly kind: "failed"; readonly reason: string };
+
+const IMAGE_PROMPT_PREFIX =
+  "Use the native Generate Image tool once. Do not write code, SVG, or other files. Do not run shell commands.\n\n";
+
+const updateKind = (update: unknown): string | null => {
+  if (typeof update !== "object" || update === null) return null;
+  const u = update as { readonly sessionUpdate?: unknown };
+  return typeof u.sessionUpdate === "string" ? u.sessionUpdate : null;
+};
+
+/**
+ * Native Cursor image generation via ACP session/prompt. Does not call
+ * `cursor/generate_image` as a client RPC. Installed cursor-agent
+ * (2026.07.23) emits Generate Image `tool_call` updates and typically does
+ * NOT send `session/request_permission` for that tool — ACP also has no
+ * session-level allowlist (`--allowed-tools` is print-mode only). Image-mode
+ * therefore: isolated empty workspace, fs/terminal client caps off, no MCP,
+ * deny any identifiable non-image permission ask, cancel if a non-image
+ * native tool_call is observed, and collect only provenance paths through a
+ * realpath jail. Auto-run of other native tools before we observe an update
+ * is an unavoidable runtime limitation, not claimed isolation.
+ */
+export const runCursorNativeImage = async (
+  params: TCursorNativeImageInput,
+): Promise<TCursorNativeImageResult> => {
+  if (!existsSync(params.bin)) {
+    return { kind: "declined", reason: "cursor-agent CLI not installed" };
+  }
+  if (params.signal.aborted) {
+    return { kind: "declined", reason: "client aborted" };
+  }
+
+  const homeDir = spawnCwd(params.env);
+  const workspaceDir = await mkdtemp(join(homeDir, "cursor-img-"));
+  const jail = cursorImageJailOf({ workspaceDir, homeDir });
+  const promptText = `${IMAGE_PROMPT_PREFIX}${params.prompt}`;
+  const estimatedUsage = (): TCursorNativeImageUsageEstimate => {
+    const prompt_tokens = estimateBodyTokens(promptText);
+    const completion_tokens = Math.ceil(outputChars / 4);
+    return {
+      prompt_tokens,
+      completion_tokens,
+      total_tokens: prompt_tokens + completion_tokens,
+    };
+  };
+
+  const provenance: string[] = [];
+  let sawGenerateImage = false;
+  let foreignTool = false;
+  let outputChars = 0;
+  let sessionId: string | null = null;
+  let promptSettled = false;
+  let stopReason: string | null = null;
+  let lastActivityAt = Date.now();
+  let sawActivity = false;
+
+  const noteUpdate = (update: unknown): void => {
+    lastActivityAt = Date.now();
+    const kind = updateKind(update);
+    if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
+      const text = updateText(
+        (update as { readonly content?: unknown }).content,
+      );
+      if (text !== null) {
+        outputChars += text.length;
+        sawActivity = true;
+      }
+    }
+    if (kind === "tool_call" || kind === "tool_call_update") {
+      sawActivity = true;
+      if (isCursorGenerateImageTool(update)) {
+        sawGenerateImage = true;
+        provenance.push(...provenancePathsOf(update));
+      } else {
+        foreignTool = true;
+      }
+    }
+  };
+
+  const client = new AcpClient(
+    params.bin,
+    params.env,
+    (method, p) => {
+      if (method === "cursor/generate_image") {
+        // Agent→client notification variant (documented; not observed on the
+        // installed CLI). Collect provenance; never send this as a client RPC.
+        sawGenerateImage = true;
+        sawActivity = true;
+        lastActivityAt = Date.now();
+        provenance.push(...provenancePathsOf(p));
+        return;
+      }
+      if (method !== "session/update") return;
+      const notif = p as
+        | { readonly sessionId?: unknown; readonly update?: unknown }
+        | undefined;
+      if (sessionId === null || notif?.sessionId !== sessionId) return;
+      noteUpdate(notif.update);
+    },
+    handleCursorImageServerRequest,
+  );
+
+  /** Cancel-then-kill grace: `dispose()` sends SIGTERM immediately, which can
+   *  race the child's own event loop reading the just-flushed `session/cancel`
+   *  notification off stdin and kill it before it ever sees the message —
+   *  silently defeating the one cancellation this path relies on. A short
+   *  delay before the kill does not change the bounded-decline guarantees
+   *  (callers never await it), it only gives the notify a real chance to
+   *  land. */
+  const CANCEL_GRACE_MS = 75;
+  const cancelAndDispose = (): void => {
+    if (sessionId !== null) client.notify("session/cancel", { sessionId });
+    setTimeout(() => client.dispose(), CANCEL_GRACE_MS);
+  };
+
+  const abort = (): void => {
+    cancelAndDispose();
+  };
+  params.signal.addEventListener("abort", abort, { once: true });
+
+  const rpcTimeoutMs = params.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
+  const cleanupWorkspace = async (): Promise<void> => {
+    try {
+      await rm(workspaceDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  };
+
+  const failSetup = async (
+    error: unknown,
+  ): Promise<TCursorNativeImageResult> => {
+    client.dispose();
+    await cleanupWorkspace();
+    if (params.signal.aborted) {
+      return { kind: "declined", reason: "client aborted" };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      kind: "declined",
+      reason: `cursor ACP handshake failed: ${message}`,
+      ...(isExplicitAuthenticateRejection(error)
+        ? { cooldownReason: "auth" as const }
+        : {}),
+    };
+  };
+
+  try {
+    await handshake(client, rpcTimeoutMs);
+  } catch (error) {
+    return failSetup(error);
+  }
+
+  let opened: unknown;
+  try {
+    opened = await client.request(
+      "session/new",
+      {
+        cwd: workspaceDir,
+        mcpServers: [],
+      },
+      rpcTimeoutMs,
+    );
+  } catch (error) {
+    return failSetup(error);
+  }
+  const sid = (opened as { readonly sessionId?: unknown }).sessionId;
+  if (typeof sid !== "string" || sid.length === 0) {
+    client.dispose();
+    await cleanupWorkspace();
+    return { kind: "declined", reason: "session/new returned no sessionId" };
+  }
+  sessionId = sid;
+  await trySetModel(client, sid, params.providerModelId, opened);
+
+  const turnBudget = params.turnTimeoutMs ?? CURSOR_TURN_TIMEOUT_MS;
+  const idleBudget = params.idleMs ?? CURSOR_IDLE_TIMEOUT_MS;
+  const precommitMs = params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS;
+
+  const promptDone = client
+    .request(
+      "session/prompt",
+      {
+        sessionId,
+        prompt: acpPromptBlocks(promptText, []),
+      },
+      turnBudget,
+    )
+    .then((result) => {
+      const stop = (result as { readonly stopReason?: unknown }).stopReason;
+      stopReason = typeof stop === "string" ? stop : null;
+      promptSettled = true;
+    })
+    .catch(() => {
+      promptSettled = true;
+    });
+
+  const started = Date.now();
+  let idleTimer: ReturnType<typeof setInterval> | undefined;
+  try {
+    await new Promise<void>((resolve) => {
+      const finish = (): void => {
+        if (idleTimer !== undefined) clearInterval(idleTimer);
+        resolve();
+      };
+      idleTimer = setInterval(() => {
+        if (params.signal.aborted || foreignTool) {
+          cancelAndDispose();
+          finish();
+          return;
+        }
+        if (promptSettled) {
+          finish();
+          return;
+        }
+        if (!sawActivity && Date.now() - started > precommitMs) {
+          cancelAndDispose();
+          finish();
+          return;
+        }
+        if (sawActivity && Date.now() - lastActivityAt > idleBudget) {
+          cancelAndDispose();
+          finish();
+          return;
+        }
+      }, 50);
+      void promptDone.then(() => finish());
+    });
+  } finally {
+    if (idleTimer !== undefined) clearInterval(idleTimer);
+  }
+
+  if (params.signal.aborted) {
+    cancelAndDispose();
+    await cleanupWorkspace();
+    return { kind: "declined", reason: "client aborted" };
+  }
+
+  if (foreignTool) {
+    cancelAndDispose();
+    await cleanupWorkspace();
+    return {
+      kind: "failed",
+      reason: `cursor image mode observed a non-image native tool_call; session cancelled after the fact, not prevented (${cursorImageToolEnforcement.reason})`,
+    };
+  }
+
+  if (!sawActivity && !promptSettled) {
+    cancelAndDispose();
+    await cleanupWorkspace();
+    return {
+      kind: "declined",
+      reason: "cursor ACP produced no output before the pre-commit deadline",
+    };
+  }
+
+  const assets = await collectJailedCursorImages(provenance, jail);
+  cancelAndDispose();
+  await cleanupWorkspace();
+
+  if (assets.length === 0) {
+    return {
+      kind: "failed",
+      reason: sawGenerateImage
+        ? "generate image completed but no jailed image bytes were collected"
+        : "cursor image mode did not complete a Generate Image tool",
+    };
+  }
+
+  return {
+    kind: "ok",
+    assets,
+    stopReason,
+    estimatedUsage: estimatedUsage(),
+  };
 };

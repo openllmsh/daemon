@@ -245,6 +245,31 @@ export type TProviderDelegate = {
   credentialForVideo?: (inbound?: Headers) => Promise<TImageCredential>;
 
   /**
+   * Local-only credential for batch transcription. Same shape as image
+   * credentials; never serialized off-box.
+   */
+  credentialForTranscription?: (
+    inbound?: Headers,
+  ) => Promise<TImageCredential>;
+
+  /**
+   * Local-only credential for speech synthesis.
+   */
+  credentialForSpeech?: (inbound?: Headers) => Promise<TImageCredential>;
+
+  /**
+   * Local-only credential for image edits. Distinct from generation so a
+   * delegate can target `/images/edits` without reusing generation URLs.
+   */
+  credentialForImageEdit?: (inbound?: Headers) => Promise<TImageCredential>;
+
+  /**
+   * Local-only credential for a vendor realtime session. Not a transport
+   * mux capability.
+   */
+  credentialForRealtime?: (inbound?: Headers) => Promise<TImageCredential>;
+
+  /**
    * Sign out of the official CLI's LOGIN credential on this box: run the
    * vendor's own logout (revoking server-side where it supports it) and/or
    * clear the isolated store. Idempotent: already-signed-out is success.

@@ -50,6 +50,14 @@ const surfacePath = (surface: TTunnelSurface): string => {
       return "/v1/responses";
     case "responses_compact":
       return "/v1/responses/compact";
+    case "audio_transcriptions":
+      return "/v1/audio/transcriptions";
+    case "audio_speech":
+      return "/v1/audio/speech";
+    case "images_generations":
+      return "/v1/images/generations";
+    case "images_edits":
+      return "/v1/images/edits";
   }
 };
 
