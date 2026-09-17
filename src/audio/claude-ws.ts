@@ -11,6 +11,7 @@
  * with a fake socket — no live network in tests, matching the coordinator's
  * "no live provider calls until post-review" constraint.
  */
+import { PCM_S16LE_16K_MONO_BYTES_PER_SECOND } from "./pcm";
 
 /** The minimal WebSocket surface this module needs — satisfied by the
  *  global `WebSocket` (Bun/Node) or a test fake. */
@@ -61,7 +62,18 @@ export type TTranscriptEvent =
 /** Lenient parse of one dictation WS text frame. Unknown message types are
  *  ignored rather than treated as errors — the research recipe warns a
  *  production adapter must tolerate native message types beyond the ones it
- *  acts on. */
+ *  acts on.
+ *
+ *  Field name, verified live (2026-09-17 spoken-phrase capability re-test):
+ *  the real `TranscriptText`/`TranscriptInterim` payload carries the
+ *  transcript under `data` — `{"type":"TranscriptText","data":"Capability
+ *  test. One, two, three."}` — not `text`/`transcript`. Checking only
+ *  `text`/`transcript` (the foundation research's own written recipe never
+ *  pinned the exact field name, only the message `type`s) meant every real
+ *  session fell through to `""` and finalized with an empty transcript
+ *  despite a clean 200/`TranscriptEndpoint` close — the reported "200 empty
+ *  text" bug. `data` is checked last so a future/other build that does key
+ *  it under `text`/`transcript` keeps working unchanged. */
 export const parseDictationMessage = (raw: string): TTranscriptEvent | null => {
   let json: unknown;
   try {
@@ -76,7 +88,9 @@ export const parseDictationMessage = (raw: string): TTranscriptEvent | null => {
       ? msg.text
       : typeof msg.transcript === "string"
         ? msg.transcript
-        : "";
+        : typeof msg.data === "string"
+          ? msg.data
+          : "";
   switch (msg.type) {
     case "TranscriptText":
       return { type: "final", text };
@@ -108,6 +122,18 @@ export type TClaudeDictationOptions = {
   readonly openTimeoutMs?: number;
   readonly finalizeTimeoutMs?: number;
   readonly signal?: AbortSignal;
+  /**
+   * Silent PCM padding sent AFTER the real frames and BEFORE `CloseStream`
+   * — the verified research recipe explicitly calls this out ("Send
+   * silence at the tail, then CloseStream") and the connection's own
+   * `utterance_end_ms`/`endpointing_ms` query params need a quiet tail to
+   * detect the end of the utterance. Bursting straight into `CloseStream`
+   * starves that VAD window and the vendor never emits a final transcript
+   * for a short clip. Defaults to 0 (no padding) so existing callers/tests
+   * that assert an exact `frames` → `CloseStream` sequence are unaffected;
+   * the production caller (`audio-walker.ts`) sets this explicitly.
+   */
+  readonly trailingSilenceMs?: number;
 };
 
 export type TClaudeDictationResult =
@@ -199,6 +225,25 @@ export const runClaudeDictationSession = (
             if (settled) return;
             if (frame.byteLength > 0) ws.send(frame);
             await pace(frameIntervalMs);
+          }
+          const trailingSilenceMs = options.trailingSilenceMs ?? 0;
+          if (trailingSilenceMs > 0) {
+            const bytesPerMs = PCM_S16LE_16K_MONO_BYTES_PER_SECOND / 1000;
+            // Keep the silence frame 16-bit-aligned (even byte count),
+            // matching `framePcm`'s own alignment.
+            const frameBytes = Math.max(
+              2,
+              Math.floor((bytesPerMs * frameIntervalMs) / 2) * 2,
+            );
+            const silenceFrame = new Uint8Array(frameBytes);
+            const silenceFrameCount = Math.ceil(
+              trailingSilenceMs / frameIntervalMs,
+            );
+            for (let i = 0; i < silenceFrameCount; i++) {
+              if (settled) return;
+              ws.send(silenceFrame);
+              await pace(frameIntervalMs);
+            }
           }
           if (settled) return;
           ws.send(JSON.stringify({ type: "CloseStream" }));

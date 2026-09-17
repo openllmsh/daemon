@@ -156,6 +156,17 @@ export type TRealtimeUpstreamHandlers = {
   readonly onMessage: (data: string) => void;
   readonly onClose: () => void;
   readonly onError?: (error: unknown) => void;
+  /**
+   * Fires once the transport has actually completed its handshake with the
+   * vendor (the WebSocket's own `open` event) — distinct from
+   * `upstreamFactory`'s call RETURNING, which happens the instant the
+   * transport object is constructed, before any network round trip to the
+   * vendor completes. `openRealtimeSession` queues `sendClientEvent` calls
+   * until this fires (see its `outboundQueue`) — a test fake standing in for
+   * an already-connected transport should call it synchronously, before
+   * returning, so queued sends flush immediately.
+   */
+  readonly onOpen?: () => void;
 };
 
 export type TRealtimeUpstreamFactory = (
@@ -174,6 +185,7 @@ const defaultUpstreamFactory: TRealtimeUpstreamFactory = (
   // browser CANNOT do this, which is exactly why this transport is
   // daemon-only (see `realtime-handler.ts`'s local-WS auth gate).
   const socket = new WebSocket(url, { headers } as unknown as string[]);
+  socket.onopen = (): void => handlers.onOpen?.();
   socket.onmessage = (event: MessageEvent): void => {
     if (typeof event.data === "string") handlers.onMessage(event.data);
   };
@@ -291,6 +303,7 @@ export const openRealtimeSession = async (
     if (closed) return;
     closed = true;
     if (lifetimeTimer !== undefined) clearTimeout(lifetimeTimer);
+    outboundQueue.length = 0;
     release();
     try {
       upstream?.close();
@@ -334,10 +347,49 @@ export const openRealtimeSession = async (
     });
   };
 
+  // Bounded OUTBOUND queue: `sendClientEvent` can be called the instant this
+  // function's promise resolves (both consumer transports do exactly that —
+  // the local WS's `open` handler stashes the handle as soon as admission
+  // settles, and `serveMuxRealtime` starts pumping right after), which is
+  // BEFORE the just-constructed `upstream` socket has actually completed its
+  // own handshake with the vendor. Calling `.send()` on a not-yet-open
+  // WebSocket throws synchronously — this used to surface as an immediate
+  // `dispatch_failed` on every session, caught live: a probe against the
+  // real Grok realtime endpoint through this exact path opened, received
+  // `session.created`, and then the FIRST client-sent `session.update`
+  // ended the session with `dispatch_failed` before the vendor ever saw it.
+  // Queue until `onOpen` fires; bounded like the inbound `deliver` queue
+  // above, for the same reason (a caller that never gets a chance to slow
+  // down must not grow this without limit).
+  let upstreamReady = false;
+  const outboundQueue: string[] = [];
+  const flushOutbound = (): void => {
+    upstreamReady = true;
+    // The session may have already ended (e.g. `lagging` from the bound
+    // below, or any other `finish`) by the time a belated `onOpen` fires —
+    // never replay a stale queue onto a socket nothing is consuming for
+    // anymore.
+    if (closed) {
+      outboundQueue.length = 0;
+      return;
+    }
+    while (outboundQueue.length > 0) {
+      const data = outboundQueue.shift();
+      if (data === undefined) break;
+      try {
+        upstream?.send(data);
+      } catch {
+        finish("dispatch_failed");
+        return;
+      }
+    }
+  };
+
   upstream = upstreamFactory(
     cred.url,
     { ...cred.headers, authorization: `Bearer ${cred.access_token}` },
     {
+      onOpen: flushOutbound,
       onMessage: (data) => {
         let parsed: unknown;
         try {
@@ -384,8 +436,17 @@ export const openRealtimeSession = async (
     session: {
       sendClientEvent: (event) => {
         if (closed) return;
+        const data = JSON.stringify(event);
+        if (!upstreamReady) {
+          if (outboundQueue.length >= REALTIME_MAX_QUEUED_EVENTS) {
+            finish("lagging");
+            return;
+          }
+          outboundQueue.push(data);
+          return;
+        }
         try {
-          upstream?.send(JSON.stringify(event));
+          upstream?.send(data);
         } catch {
           finish("dispatch_failed");
         }

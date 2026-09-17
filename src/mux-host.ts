@@ -1,5 +1,10 @@
 import type { TRelayFrame } from "@openllmsh/protocol";
-import { MUX_CAP, RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
+import {
+  MUX_CAP,
+  REALTIME_DUPLEX_CAP,
+  RTC_CAP,
+  SEEDGATE_CAP,
+} from "@openllmsh/protocol";
 import {
   decodeChannelEnvelope,
   encodeChannelEnvelope,
@@ -31,23 +36,25 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
  * a single mux directly, with no relay hop. `seedgate1` is layered on when a
  * device-access pubkey is pinned — see {@link currentDaemonCaps}.
  */
-export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP] as const;
-// `REALTIME_DUPLEX_CAP` ("realtime1") is intentionally NOT in this list yet.
-// `serveMuxOnStream` below already dispatches a `kind:"realtime"` OPEN end to
-// end — `realtime-handler.ts` -> `realtime-session.ts` -> Grok's
-// `credentialForRealtime` (`packages/daemon/src/delegation/grok.ts`, dialing
-// `wss://api.x.ai/v1/realtime?model=grok-voice-latest`) is fully wired as of
-// this change. The ONLY remaining blocker is that NO LIVE CALL against that
-// URL has been made from this change (explicitly out of scope pre-review).
-// EXACT ENABLE HANDOFF: once a live probe confirms the mux `kind:"realtime"`
-// path actually completes a session against the real vendor endpoint,
-// flip this to `[MUX_CAP, RTC_CAP, REALTIME_DUPLEX_CAP] as const` (still
-// respecting `rtcDisabled()`/seedgate below) — no other code change should
-// be required. A peer that opens `kind:"realtime"` without seeing the cap
-// gets an honest `realtime_unsupported`/`realtime_refused` today; advertising
-// the cap before live validation would tell an old-peer-fail-before-OPEN
-// check upstream that a session is available before it has actually been
-// proven to work.
+export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP, REALTIME_DUPLEX_CAP] as const;
+// `REALTIME_DUPLEX_CAP` ("realtime1") ENABLED — the prior "not yet advertised"
+// state is resolved. A live probe through this exact source path
+// (`realtime-handler.ts` -> `realtime-session.ts` -> the Grok delegate's
+// `credentialForRealtime`, dialing `wss://api.x.ai/v1/realtime`, driven by
+// `tests/transport/realtime-live-local.e2e.ts`) completed a full session
+// against the real vendor: `session.created -> session.updated ->
+// response.created -> response.output_audio.delta (real non-zero PCM16) ->
+// response.output_audio_transcript.delta -> response.done`, then a clean
+// close. That same probe surfaced (and this change fixes) two real races the
+// live path exposed that no unit double had caught: `realtime-handler.ts`
+// silently dropped a client event sent before the local WS's async admission
+// resolved, and `realtime-session.ts` threw `dispatch_failed` on the first
+// `sendClientEvent` because the vendor WebSocket hadn't finished ITS OWN
+// handshake yet. Both are now bounded queues, flushed in order once ready —
+// see each file's regression tests. A peer that opens `kind:"realtime"`
+// without seeing this cap still gets an honest
+// `realtime_unsupported`/`realtime_refused` (old-peer-fail-before-OPEN stays
+// a consumer-side check on `hasRealtimeDuplexCap`).
 
 /**
  * `OPENLLM_RTC_DISABLE=1` withdraws `rtc1` only.

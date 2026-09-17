@@ -21,9 +21,13 @@
  * (a script, the openllm CLI) can supply it. See `main.ts` for where the
  * request is rejected (401) BEFORE the upgrade.
  */
-import type { TRealtimeStreamOpenPayload } from "@openllmsh/protocol";
+import type {
+  TRealtimeClientEvent,
+  TRealtimeStreamOpenPayload,
+} from "@openllmsh/protocol";
 import {
   parseRealtimeClientEvent,
+  REALTIME_MAX_QUEUED_EVENTS,
   RealtimeStreamOpenPayload,
 } from "@openllmsh/protocol";
 import { encodeJsonPayload } from "@openllmsh/tunnel/codec";
@@ -130,6 +134,23 @@ export type TLocalRealtimeSocketData = {
    *  is what lets the completion callback below tell that apart from a
    *  handle that simply hasn't arrived yet. */
   closed: boolean;
+  /**
+   * Client events received BEFORE `handle` exists. Unlike the mux-serving
+   * path (`serveMuxRealtime`), which never starts reading the stream's
+   * inbound events until `openRealtimeSession` has already resolved and
+   * sent `open_ack`, the local WS is upgraded — and therefore accepting
+   * client sends — the moment `main.ts` calls `server.upgrade`, well before
+   * the async admission chain (cloud plan fetch, then the delegate's
+   * `credentialForRealtime`) settles. A client that sends its opening
+   * `session.update`/`conversation.item.create` right after `onopen` (the
+   * documented, expected usage — see `lib/realtime-voice-client.ts`) races
+   * ahead of that admission and would otherwise be silently dropped by
+   * `message` below, since `handle` is still `null`. Bounded the same as
+   * the outbound queue (`REALTIME_MAX_QUEUED_EVENTS`) — a client opening a
+   * session sends a handful of setup events, never an unbounded stream,
+   * before it has any server event telling it to stop.
+   */
+  pending: TRealtimeClientEvent[];
 };
 
 /**
@@ -169,6 +190,16 @@ export const localRealtimeWebSocket = {
         return;
       }
       socket.data.handle = result.session;
+      // Flush, IN ORDER, whatever the client already sent while admission
+      // was still in flight (see `pending`'s doc on `TLocalRealtimeSocketData`)
+      // — a client that opened and immediately sent `session.update` must
+      // not have that setup event silently dropped just because it won the
+      // race against the daemon's own async admission chain.
+      if (socket.data.pending.length > 0) {
+        const queued = socket.data.pending;
+        socket.data.pending = [];
+        for (const event of queued) result.session.sendClientEvent(event);
+      }
     });
   },
   message: (
@@ -189,7 +220,21 @@ export const localRealtimeWebSocket = {
       );
       return;
     }
-    socket.data.handle?.sendClientEvent(event);
+    if (socket.data.handle !== null) {
+      socket.data.handle.sendClientEvent(event);
+      return;
+    }
+    // Admission hasn't resolved yet — queue rather than drop (see `pending`'s
+    // doc). Bounded exactly like the outbound queue: a client racing ahead of
+    // admission with more than this many setup events before any server
+    // event has told it to stop is treated as `lagging`, the same verdict a
+    // slow-consumer overflow gets on the outbound side.
+    if (socket.data.pending.length >= REALTIME_MAX_QUEUED_EVENTS) {
+      socket.sendText(JSON.stringify({ type: "error", code: "lagging" }));
+      socket.close(1011, "lagging");
+      return;
+    }
+    socket.data.pending.push(event);
   },
   close: (socket: Bun.ServerWebSocket<TLocalRealtimeSocketData>): void => {
     // Mark closed BEFORE touching any existing handle, so the `open` handler

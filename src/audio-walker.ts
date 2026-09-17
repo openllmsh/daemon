@@ -317,8 +317,23 @@ const stripCodexAssetPointers = (
   throw new Error("upstream transcription response missing text");
 };
 
+/** Extensionless fallback filename per detected format — Codex's ASR
+ *  backend identifies the container by the multipart filename's extension
+ *  (verified live: an extensionless `audio` filename produced an opaque
+ *  500 `Error in ASR API`; the verified working recipe explicitly used
+ *  `input.webm`). The JSON `data:<mime>;base64,...` request shape
+ *  (`jsonAudioToFormData`'s convention) carries no filename at all, so
+ *  every JSON-body caller needs this fallback — a multipart caller that
+ *  already supplies a real filename is untouched. */
+const FILENAME_FALLBACK_FOR_FORMAT: Record<TDetectedAudioFormat, string> = {
+  webm_opus: "audio.webm",
+  wav_pcm16_16khz_mono: "audio.wav",
+  pcm_s16le_16khz_mono: "audio.pcm",
+};
+
 const buildTranscriptionForm = (
   file: TTranscriptionFileInput,
+  format: TDetectedAudioFormat,
   language: string | undefined,
   extra?: Readonly<Record<string, string>>,
 ): FormData => {
@@ -330,7 +345,11 @@ const buildTranscriptionForm = (
   const blob = new Blob([new Uint8Array(file.bytes)], {
     type: file.contentType ?? "application/octet-stream",
   });
-  form.append("file", blob, file.filename ?? "audio");
+  form.append(
+    "file",
+    blob,
+    file.filename ?? FILENAME_FALLBACK_FOR_FORMAT[format],
+  );
   if (language !== undefined) form.append("language", language);
   for (const [key, value] of Object.entries(extra ?? {})) {
     form.append(key, value);
@@ -437,6 +456,12 @@ export const runAudioTranscriptionWalker = async (
       headers: acquired.headers,
       pcm: pcmResult.pcm,
       frames: framePcm(pcmResult.pcm),
+      // Verified research recipe: "Send silence at the tail, then
+      // CloseStream" — the connection's own `utterance_end_ms=1000` needs a
+      // quiet tail to finalize the last utterance; bursting straight into
+      // CloseStream starves it and a short clip comes back with an EMPTY
+      // transcript despite a 200 (live-verified on this branch).
+      trailingSilenceMs: 1_200,
       ...(claudeWsFactoryForTests !== undefined
         ? { wsFactory: claudeWsFactoryForTests }
         : {}),
@@ -457,12 +482,30 @@ export const runAudioTranscriptionWalker = async (
 
   // ── chatgpt / grok: batch multipart POST, forwarded verbatim ────────────
   const startedAt = Date.now();
+  // Both verified subscription STT recipes ALWAYS sent an explicit
+  // `language: en` (docs/research/subscription-provider-capabilities-
+  // 2026-09-17.md: grok's "Working fields: file=input.wav, language=en,
+  // format=true"; chatgpt's "Working form fields: file: input.webm,
+  // language: en"). Grok's `/v1/stt` outright REJECTS a request missing it
+  // (400 `Field 'language' is required when 'format' is true`) — verified
+  // live. The OpenAI-compatible `/v1/audio/transcriptions` contract treats
+  // `language` as fully optional, so every caller that omits it (the common
+  // case) needs a server-side default here, never a bare pass-through of
+  // `undefined`, for either provider. An explicit caller-supplied language
+  // still wins.
   const form =
     hop.provider === "grok"
-      ? buildTranscriptionForm(normalized.file, normalized.language, {
-          format: "true",
-        })
-      : buildTranscriptionForm(normalized.file, normalized.language);
+      ? buildTranscriptionForm(
+          normalized.file,
+          format,
+          normalized.language ?? "en",
+          { format: "true" },
+        )
+      : buildTranscriptionForm(
+          normalized.file,
+          format,
+          normalized.language ?? "en",
+        );
 
   const resp = await postUpstream(acquired.url, {
     method: "POST",

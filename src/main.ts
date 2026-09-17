@@ -387,7 +387,7 @@ const main = async (): Promise<void> => {
             );
           }
           const upgraded = server.upgrade(req, {
-            data: { open, handle: null, closed: false },
+            data: { open, handle: null, closed: false, pending: [] },
           });
           return upgraded
             ? undefined

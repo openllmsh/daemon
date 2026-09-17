@@ -64,38 +64,64 @@ export const isCursorGenerateImageTool = (value: unknown): boolean => {
 };
 
 /**
- * SECURITY (concrete, evidenced): native tool-call auto-run posture for
- * Cursor ACP image mode.
+ * SECURITY (concrete, evidenced — now LIVE-verified): native tool-call
+ * auto-run posture for Cursor ACP image mode.
  *
  * Evidence — installed `cursor-agent` 2026.07.23-e383d2b:
  *   `cursor-agent acp --help` lists ONLY `-h, --help`. The ACP subcommand
  *   exposes no permission/sandbox/allowed-tools flag of its own. The
  *   top-level `agent` command's `--sandbox <enabled|disabled>`,
  *   `--mode <plan|ask>` and `-f/--force` are documented only for the
- *   interactive/print command; the binary does not reject them when placed
- *   before `acp`, but nothing in `--help` or shipped docs states they take
- *   effect inside an ACP session, and confirming real effect would require
- *   a live authenticated ACP run against Cursor's cloud, which is out of
- *   scope for this daemon to do just to find out.
+ *   interactive/print command, and the binary does not reject them when
+ *   placed before `acp`.
  *
- * Conclusion: no VERIFIED before-the-fact mechanism exists to stop the
- * agent auto-running a non-image native tool (Shell, Write, …) inside an
- * ACP session at this CLI version. `session/request_permission` denial
- * (`rejectOutcome` above) only covers tools the agent asks permission for —
- * the installed build frequently does not ask before its first native
- * tool_call. Cancelling the session when a foreign `tool_call` is observed
- * (`runCursorNativeImage` in `cursor-acp.ts`) is cleanup AFTER an
- * already-started action, not prevention, and MUST NOT be reported or
- * relied on as a sandbox guarantee. `enforced: false` here is the signal a
- * future capability-negotiation layer should gate the image-generation
- * entry point on; this module does not itself decide whether to expose
- * that entry point.
+ *   LIVE RUN (2026-09-17, authenticated real account, real ACP session, see
+ *   `tests/transport/cursor-native-sandbox-flags-live.e2e.test.ts`):
+ *   prepending `--sandbox enabled` before `acp` changes NOTHING observable.
+ *   Both the flag-less baseline and the `--sandbox enabled` session:
+ *     (a) DID send `session/request_permission` for the native Edit/Shell
+ *         tools (so the earlier "frequently does not ask" caveat undersold
+ *         it — it CAN ask for these two);
+ *     (b) when every such ask was REJECTED (`reject-once`, the same fixture
+ *         handler `handleCursorImageServerRequest` uses), the agent simply
+ *         RETRIED the identical tool_call a second time with no further ask
+ *         and it SUCCEEDED — both a file-write and a shell-redirect marker
+ *         landed on disk with the correct content despite every permission
+ *         ask on that turn being denied. Denial is not just occasionally
+ *         skipped; it is actively bypassable by the agent's own retry;
+ *     (c) a native Read tool_call fetched a decoy file OUTSIDE the session
+ *         `cwd` (a sibling scratch directory) and the exact secret content
+ *         came back in the model's reply — despite `clientCapabilities.fs`
+ *         being advertised OFF. Cursor's native fs/shell tools run through
+ *         the vendor's own local execution engine directly against the host
+ *         filesystem; they are not mediated by the ACP client-capability
+ *         negotiation at all, flag or no flag.
+ *   `--sandbox enabled` was also confirmed COMPATIBLE with Generate Image
+ *   (the tool_call still fires, the turn still completes) — but since the
+ *   flag adds no verified protection, there is no benefit to threading it
+ *   through `runCursorNativeImage`'s spawn args, and it is NOT added.
+ *
+ * Conclusion (UPGRADED from inference to live proof): no verified
+ * before-the-fact mechanism exists — with or without `--sandbox enabled` —
+ * to stop the agent auto-running or retrying-past-a-denial a non-image
+ * native tool (Shell, Write, Read, Edit, …) inside an ACP session at this
+ * CLI version. `session/request_permission` denial (`rejectOutcome` above)
+ * is, at best, a speed bump the agent can and does route around by
+ * retrying; it is not a gate. Cancelling the session when a foreign
+ * `tool_call` is observed (`runCursorNativeImage` in `cursor-acp.ts`) is
+ * cleanup AFTER an already-started (and possibly already-succeeded) action,
+ * not prevention, and MUST NOT be reported or relied on as a sandbox
+ * guarantee. `enforced: false` here is the signal a future
+ * capability-negotiation layer should gate the image-generation entry point
+ * on; this module does not itself decide whether to expose that entry
+ * point. Do not flip `enforced` to `true` without a NEW verified mechanism —
+ * this live run closes the `--sandbox` avenue, it does not open one.
  */
 export const cursorImageToolEnforcement = {
   enforced: false,
   mechanism: "none-verified",
   reason:
-    "cursor-agent acp exposes no permission/sandbox flags (verified via --help on 2026.07.23-e383d2b); session/request_permission denial and post-hoc session/cancel on a foreign tool_call are mitigations, not prevention",
+    "cursor-agent acp exposes no permission/sandbox flags of its own, and a live run confirms --sandbox enabled (placed before acp) changes nothing: session/request_permission denial is bypassed by the agent simply retrying the same tool_call, and native Shell/Read/Write/Edit run through cursor's own local execution engine, unmediated by our declared ACP client capabilities; session/cancel on a foreign tool_call is cleanup, not prevention",
 } as const;
 
 export type TCursorImageToolEnforcement = typeof cursorImageToolEnforcement;
