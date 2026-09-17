@@ -60,6 +60,7 @@ import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
 import {
+  cleanupCursorImageProjectDir,
   collectJailedCursorImages,
   cursorImageJailOf,
   provenancePathsOf,
@@ -1228,6 +1229,11 @@ export const runCursorNativeImage = async (
     } catch {
       // best-effort
     }
+    // Cursor writes generated assets under `.cursor/projects/<name>/assets`
+    // in the isolated HOME, outside `workspaceDir` — remove that per-run
+    // project directory too, best-effort, without touching the shared
+    // `.cursor/projects` root other runs live under.
+    await cleanupCursorImageProjectDir(jail);
   };
 
   const failSetup = async (

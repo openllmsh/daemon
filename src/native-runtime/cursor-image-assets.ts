@@ -5,7 +5,7 @@
  * isolated workspace and the Cursor project assets root.
  */
 
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import {
   IMAGE_INSPECT_MAX_BYTES,
@@ -107,6 +107,43 @@ export const cursorImageJailOf = (params: {
     join(params.homeDir, ".cursor", "projects", name, "assets"),
   );
   return { workspaceRoot, assetsRoot };
+};
+
+/**
+ * Best-effort removal of the per-run Cursor project directory that owns
+ * `jail.assetsRoot` — i.e. `<homeDir>/.cursor/projects/<workspace-name>`,
+ * the parent of `.../assets`. `workspace-name` is derived from the unique
+ * `mkdtemp`-generated workspace directory name, so this directory is never
+ * shared across runs; the shared `.cursor/projects` root itself is never a
+ * target and is left untouched. Resolves both the shared root and the
+ * candidate project dir through `realpath` first so a symlink swapped in
+ * under `assetsRoot` can't be used to walk the removal outside the jail.
+ */
+export const cleanupCursorImageProjectDir = async (
+  jail: TCursorImageJail,
+): Promise<void> => {
+  const projectDir = resolve(jail.assetsRoot, "..");
+  const projectsRoot = resolve(jail.assetsRoot, "..", "..");
+  if (projectDir === projectsRoot) return;
+  let realProjectsRoot: string;
+  try {
+    realProjectsRoot = await realpath(projectsRoot);
+  } catch {
+    return; // shared root doesn't exist — nothing to protect or clean
+  }
+  let realProjectDir: string;
+  try {
+    realProjectDir = await realpath(projectDir);
+  } catch {
+    return; // nothing to remove
+  }
+  if (realProjectDir === realProjectsRoot) return;
+  if (!isPathInside(realProjectsRoot, realProjectDir)) return;
+  try {
+    await rm(projectDir, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
 };
 
 const resolveInsideJail = async (

@@ -271,6 +271,17 @@ export const openRealtimeSession = async (
   const startedAt = Date.now();
   let closed = false;
   let released = false;
+  // Declared here (not at their point of assignment below) and left OPTIONAL
+  // on purpose: `upstreamFactory` can synchronously invoke `onClose` (and
+  // thus `finish`) from inside its own construction call — a fake factory in
+  // tests does this deliberately, and a real vendor transport can too on an
+  // immediate connect failure. If `finish` referenced `const upstream` /
+  // `const lifetimeTimer` declared after this point, that synchronous
+  // reentrancy would hit them in the temporal dead zone and throw. Optional
+  // + assigned-not-redeclared below keeps `finish` safe no matter when it
+  // first runs.
+  let upstream: TRealtimeUpstreamSocket | undefined;
+  let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
   const release = (): void => {
     if (released) return;
     released = true;
@@ -279,10 +290,10 @@ export const openRealtimeSession = async (
   const finish = (code: TStreamResetCode | "done"): void => {
     if (closed) return;
     closed = true;
-    clearTimeout(lifetimeTimer);
+    if (lifetimeTimer !== undefined) clearTimeout(lifetimeTimer);
     release();
     try {
-      upstream.close();
+      upstream?.close();
     } catch {
       // Already-closed transport — nothing to do.
     }
@@ -323,7 +334,7 @@ export const openRealtimeSession = async (
     });
   };
 
-  const upstream = upstreamFactory(
+  upstream = upstreamFactory(
     cred.url,
     { ...cred.headers, authorization: `Bearer ${cred.access_token}` },
     {
@@ -350,9 +361,23 @@ export const openRealtimeSession = async (
     },
   );
 
-  const lifetimeTimer = setTimeout(() => {
-    finish("timeout");
-  }, REALTIME_SESSION_MAX_LIFETIME_MS);
+  if (closed) {
+    // `finish` already ran SYNCHRONOUSLY from inside the factory call above
+    // (its own `upstream?.close()` was a no-op then — `upstream` wasn't
+    // assigned yet). The real socket now exists but nothing has closed it:
+    // close it here so a synchronous construction failure can never leak a
+    // live upstream connection, and never arm a lifetime timer for a session
+    // that is already over.
+    try {
+      upstream.close();
+    } catch {
+      // Already-closed transport — nothing to do.
+    }
+  } else {
+    lifetimeTimer = setTimeout(() => {
+      finish("timeout");
+    }, REALTIME_SESSION_MAX_LIFETIME_MS);
+  }
 
   return {
     ok: true,
@@ -360,7 +385,7 @@ export const openRealtimeSession = async (
       sendClientEvent: (event) => {
         if (closed) return;
         try {
-          upstream.send(JSON.stringify(event));
+          upstream?.send(JSON.stringify(event));
         } catch {
           finish("dispatch_failed");
         }

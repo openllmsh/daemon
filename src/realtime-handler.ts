@@ -125,14 +125,19 @@ export const parseLocalRealtimeOpen = (
 export type TLocalRealtimeSocketData = {
   readonly open: TRealtimeStreamOpenPayload;
   handle: TRealtimeSessionHandle | null;
+  /** Set the moment the LOCAL socket closes. Admission (`openRealtimeSession`)
+   *  is async, so the socket can close while it's still in flight — `closed`
+   *  is what lets the completion callback below tell that apart from a
+   *  handle that simply hasn't arrived yet. */
+  closed: boolean;
 };
 
 /**
  * `Bun.serve({ websocket })` handlers for the local realtime upgrade.
  * `main.ts` validates + parses the request and only calls `server.upgrade`
- * with `data: { open, handle: null }` once `authorizeLocalRealtimeRequest`
- * and `parseLocalRealtimeOpen` both succeed — this object never sees an
- * unauthenticated or malformed open.
+ * with `data: { open, handle: null, closed: false }` once
+ * `authorizeLocalRealtimeRequest` and `parseLocalRealtimeOpen` both succeed —
+ * this object never sees an unauthenticated or malformed open.
  */
 export const localRealtimeWebSocket = {
   open: (socket: Bun.ServerWebSocket<TLocalRealtimeSocketData>): void => {
@@ -151,9 +156,18 @@ export const localRealtimeWebSocket = {
         socket.close(1011, result.refused);
         return;
       }
-      // The socket may already be closing by the time the (async) upstream
-      // dial settles — `close` below always tears the session down too, so
-      // a handle stashed after close is harmless (never read again).
+      // The LOCAL socket may already have closed by the time the (async)
+      // upstream dial settles. `close` below only ever tears down a handle
+      // it actually SEES — a socket that closed before this point already
+      // ran through `close` with `socket.data.handle` still `null`, so it
+      // never called `.close()` on this session at all. Stashing the handle
+      // here regardless would leak a live upstream connection forever (no
+      // consumer transport left to eventually close it). Close it now
+      // instead of storing it whenever the socket is already gone.
+      if (socket.data.closed) {
+        result.session.close();
+        return;
+      }
       socket.data.handle = result.session;
     });
   },
@@ -178,6 +192,10 @@ export const localRealtimeWebSocket = {
     socket.data.handle?.sendClientEvent(event);
   },
   close: (socket: Bun.ServerWebSocket<TLocalRealtimeSocketData>): void => {
+    // Mark closed BEFORE touching any existing handle, so the `open` handler
+    // above — running concurrently on the still-in-flight admission promise
+    // — can tell a socket that closed just now from one that never will.
+    socket.data.closed = true;
     socket.data.handle?.close();
   },
 };
