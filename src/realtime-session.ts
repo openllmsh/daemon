@@ -385,33 +385,48 @@ export const openRealtimeSession = async (
     }
   };
 
-  upstream = upstreamFactory(
-    cred.url,
-    { ...cred.headers, authorization: `Bearer ${cred.access_token}` },
-    {
-      onOpen: flushOutbound,
-      onMessage: (data) => {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(data);
-        } catch {
-          return;
-        }
-        // Unknown/unsupported vendor events are dropped, never forwarded
-        // verbatim — the closed vocabulary in `@openllmsh/protocol/realtime`
-        // is the entire supported subset (see
-        // docs/research/subscription-provider-capabilities-2026-09-17.md).
-        const event = parseRealtimeServerEvent(parsed);
-        if (event !== null) deliver(event);
+  try {
+    upstream = upstreamFactory(
+      cred.url,
+      { ...cred.headers, authorization: `Bearer ${cred.access_token}` },
+      {
+        onOpen: flushOutbound,
+        onMessage: (data) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            return;
+          }
+          // Unknown/unsupported vendor events are dropped, never forwarded
+          // verbatim — the closed vocabulary in `@openllmsh/protocol/realtime`
+          // is the entire supported subset (see
+          // docs/research/subscription-provider-capabilities-2026-09-17.md).
+          const event = parseRealtimeServerEvent(parsed);
+          if (event !== null) deliver(event);
+        },
+        onError: () => {
+          logWarn("realtime", "upstream realtime socket error", {
+            provider: open.provider,
+          });
+        },
+        onClose: () => finish("peer_gone"),
       },
-      onError: () => {
-        logWarn("realtime", "upstream realtime socket error", {
-          provider: open.provider,
-        });
-      },
-      onClose: () => finish("peer_gone"),
-    },
-  );
+    );
+  } catch {
+    // A SYNCHRONOUS throw from the factory itself (e.g. an invalid URL, or a
+    // test fake) never reached `finish`/`release` above — nothing else in
+    // this function will ever call them for this attempt, so without this
+    // catch the reserved session slot (`reserveRealtimeSession` above) leaks
+    // forever and the caller sees a thrown exception instead of the same
+    // `TRealtimeSessionResult` refusal shape every other admission failure
+    // in this function returns. No upstream object exists yet, so there is
+    // nothing to close and no report to file (matches the
+    // `credentialForRealtime` throw path just above, which also releases and
+    // refuses without reporting).
+    release();
+    return { ok: false, refused: "realtime_refused" };
+  }
 
   if (closed) {
     // `finish` already ran SYNCHRONOUSLY from inside the factory call above

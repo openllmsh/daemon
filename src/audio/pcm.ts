@@ -140,6 +140,16 @@ export const extractClaudeDictationPcm = (
         error: `expected 16kHz sample rate, got ${parsed.sampleRate}Hz`,
       };
     }
+    // Same shape guards the raw branch below applies — a WAV `data` chunk
+    // is just as capable of arriving empty (a zero-length recording) or
+    // byte-misaligned for 16-bit samples (a truncated/corrupt encoder) as a
+    // headerless raw payload is, and neither was checked here before.
+    if (parsed.pcm.length === 0) {
+      return { error: "empty audio payload" };
+    }
+    if (parsed.pcm.length % 2 !== 0) {
+      return { error: "WAV PCM data has an odd byte length" };
+    }
     return parsed;
   }
   // Raw `pcm_s16le_16khz_mono`: no header, so we can only validate shape

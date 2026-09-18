@@ -1112,6 +1112,18 @@ const updateKind = (update: unknown): string | null => {
   return typeof u.sessionUpdate === "string" ? u.sessionUpdate : null;
 };
 
+/** The `toolCallId` correlating a `tool_call`/`tool_call_update` payload to
+ *  its earlier sibling, or null when absent/malformed. Per the ACP spec
+ *  (`ToolCallUpdate`), `toolCallId` is the ONLY field a `tool_call_update`
+ *  is guaranteed to carry — title/kind/name are "only the ones being
+ *  changed" and are routinely omitted on a progress/completion update for a
+ *  tool call already announced by an earlier `tool_call`. */
+const toolCallIdOf = (update: unknown): string | null => {
+  if (typeof update !== "object" || update === null) return null;
+  const id = (update as { readonly toolCallId?: unknown }).toolCallId;
+  return typeof id === "string" && id.length > 0 ? id : null;
+};
+
 /**
  * Native Cursor image generation via ACP session/prompt. Does not call
  * `cursor/generate_image` as a client RPC. Installed cursor-agent
@@ -1157,6 +1169,20 @@ export const runCursorNativeImage = async (
   let stopReason: string | null = null;
   let lastActivityAt = Date.now();
   let sawActivity = false;
+  // The toolCallIds of every Generate Image tool_call already accepted by
+  // name (`isCursorGenerateImageTool`) in this turn — lets a later
+  // `tool_call_update` for any of THOSE ids be recognized as its
+  // continuation even when that update omits every identifying field (see
+  // `toolCallIdOf`). A `Set`, not a single last-accepted id: ACP's own spec
+  // allows several tool calls to be in flight/interleaved within one turn
+  // (a `tool_call` announcement for a second call can arrive before the
+  // first one's own completion `tool_call_update`), and the prompt's "use
+  // it once" instruction is advisory, not enforced by the protocol. A
+  // single-id variable would be overwritten by the SECOND Generate Image
+  // announcement, so the FIRST call's later bare completion update (no
+  // toolCallId match, no name) would fall through to "foreign tool" and
+  // fail the whole run on what is actually a legitimate continuation.
+  const acceptedImageToolCallIds = new Set<string>();
 
   const noteUpdate = (update: unknown): void => {
     lastActivityAt = Date.now();
@@ -1172,10 +1198,19 @@ export const runCursorNativeImage = async (
     }
     if (kind === "tool_call" || kind === "tool_call_update") {
       sawActivity = true;
-      if (isCursorGenerateImageTool(update)) {
+      const id = toolCallIdOf(update);
+      const namedAsImage = isCursorGenerateImageTool(update);
+      const isAcceptedContinuation =
+        !namedAsImage && id !== null && acceptedImageToolCallIds.has(id);
+      if (namedAsImage || isAcceptedContinuation) {
         sawGenerateImage = true;
+        if (namedAsImage && id !== null) acceptedImageToolCallIds.add(id);
         provenance.push(...provenancePathsOf(update));
       } else {
+        // Fails closed: an update that neither names the Generate Image
+        // tool nor correlates by id to an already-accepted one — including
+        // one with no toolCallId at all — is treated as foreign, same as
+        // before this correlation was added.
         foreignTool = true;
       }
     }

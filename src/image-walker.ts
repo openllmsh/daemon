@@ -563,10 +563,17 @@ export const runImageEditWalker = async (
     return errorJson(400, "image edits require a daemon plan");
   }
 
-  // The SINGLE normalization pass — whatever shape the listener handed us
-  // (a JSON body, or fields already flattened from a multipart upload) is
-  // read exactly once here. `parseImageEditInput` is the only place this
-  // request is interpreted; nothing upstream of this call re-reads it.
+  // The listener (`listener.ts`) already normalized this request once: a
+  // JSON body goes straight through `parseImageEditInput`, and a multipart
+  // upload is flattened by `parseImageEditMultipart` into the same shape
+  // first — either way, `args.rawBody` here is that already-decoded
+  // `TImageEditRequest`, not the original wire body. This is therefore a
+  // SECOND, safe pass over the listener's own output: re-running the same
+  // pure parser on its already-canonical shape is idempotent (no
+  // `mask`/`style`/`background` survive the first pass, and `image` is
+  // already `{ url }`), so it can't reject a request the listener accepted.
+  // It exists so this walker never trusts an upstream cast without
+  // re-validating against the one parser that owns the contract.
   const parsed = parseImageEditInput(args.rawBody);
   if (!parsed.ok) {
     return errorJson(400, parsed.error.message, parsed.error.code);
