@@ -1,5 +1,6 @@
 import type { TRelayFrame } from "@openllmsh/protocol";
 import {
+  MEDIA_HTTP_CAP,
   MUX_CAP,
   REALTIME_DUPLEX_CAP,
   RTC_CAP,
@@ -36,7 +37,12 @@ import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
  * a single mux directly, with no relay hop. `seedgate1` is layered on when a
  * device-access pubkey is pinned — see {@link currentDaemonCaps}.
  */
-export const DAEMON_MUX_CAPS = [MUX_CAP, RTC_CAP, REALTIME_DUPLEX_CAP] as const;
+export const DAEMON_MUX_CAPS = [
+  MUX_CAP,
+  RTC_CAP,
+  REALTIME_DUPLEX_CAP,
+  MEDIA_HTTP_CAP,
+] as const;
 // `REALTIME_DUPLEX_CAP` ("realtime1") ENABLED — the prior "not yet advertised"
 // state is resolved. A live probe through this exact source path
 // (`realtime-handler.ts` -> `realtime-session.ts` -> the Grok delegate's

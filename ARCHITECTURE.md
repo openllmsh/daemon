@@ -98,7 +98,7 @@ daemon/
     cloud-client.ts         sk-llm-authed cloud calls (bootstrap + record)
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
-    mux-host.ts             mux2/rtc1 channel negotiation, relay duplex ownership, and OPEN dispatch
+    mux-host.ts             mux2/rtc1 channel negotiation, media1 capability advertisement, relay duplex ownership, and OPEN dispatch
     session-core.ts         transport-neutral PTY state machine: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping
     session-host.ts         durable session-host registry/status adapter and boot reconciler; never owns a daemon PTY
     session-host-proc/      detached per-session host: owns one durable PTY, scrollback, idle reaping, meta.json, and ctl.sock
@@ -106,6 +106,7 @@ daemon/
     rtc-client.ts           fleet WebRTC offerer: rtc_offer/answer/ice/nack + mux over data channel
     tunnel-client.ts        consuming subscription tunnel: RTC (when open) → relay binary mux only (no JSON splice)
     tunnel-server.ts        serving in-process tunneled request dispatch for mux streams
+    audio-walker.ts         transcription/speech; speech persists in the daemon by default, or acknowledges explicit browser-owned persistence over mux so only the browser uploads
     image-walker.ts         locally delegated image generation + cloud media-library upload
     video-walker.ts         locally delegated video operations + cloud media-library upload
     version.ts/env.ts       version metadata and environment-file loader

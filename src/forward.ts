@@ -11,7 +11,10 @@
  * Authenticated with the user's `sk-llm-...` key — the same key the cloud
  * already validates for `/v1/*`.
  */
-import { NO_DAEMON_HEADER } from "@openllmsh/protocol";
+import {
+  MEDIA_PERSISTENCE_REQUEST_HEADER,
+  NO_DAEMON_HEADER,
+} from "@openllmsh/protocol";
 import { CLOUD_FETCH_TIMEOUT_MS } from "./cloud-client";
 import { errorJson } from "./cors";
 import { daemonEnv } from "./env";
@@ -117,6 +120,7 @@ export const forwardToCloud = async (
       : daemonEnv().cloudOrigin;
   const target = `${base}${url.pathname}`;
   const headers = new Headers(inbound.headers);
+  headers.delete(MEDIA_PERSISTENCE_REQUEST_HEADER);
   headers.set("authorization", `Bearer ${daemonEnv().apiKey}`);
   // Lock the cloud to the exact concrete model the local chain picked, so
   // the cloud doesn't re-run its own alias/fallback resolution.
@@ -165,6 +169,7 @@ export const passthroughToOrigin = async (
   const qs = search.toString();
   const target = `${daemonEnv().cloudOrigin}${url.pathname}${qs.length > 0 ? `?${qs}` : ""}`;
   const headers = new Headers(inbound.headers);
+  headers.delete(MEDIA_PERSISTENCE_REQUEST_HEADER);
   headers.delete("x-openllm-pin-model");
   const callerAuth = inbound.headers.get("authorization");
   if (callerAuth === null || callerAuth.length === 0) {

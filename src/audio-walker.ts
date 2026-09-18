@@ -31,6 +31,9 @@ import {
   GROK_STT_INPUT_FORMATS,
   GROK_TTS_OUTPUT_FORMATS,
   GROK_TTS_VOICES,
+  MEDIA_PERSISTENCE_BROWSER,
+  MEDIA_PERSISTENCE_REQUEST_HEADER,
+  MEDIA_PERSISTENCE_RESPONSE_HEADER,
 } from "@openllmsh/protocol";
 import { TUNNEL_MEDIA_MAX_BODY_BYTES } from "@openllmsh/tunnel";
 import type { TWebSocketFactory } from "./audio/claude-ws";
@@ -826,6 +829,18 @@ export const runAudioSpeechWalker = async (
     return new Response(null, {
       status: 200,
       headers: { "content-type": contentType },
+    });
+  }
+  if (
+    args.req.headers.get(MEDIA_PERSISTENCE_REQUEST_HEADER) ===
+    MEDIA_PERSISTENCE_BROWSER
+  ) {
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "content-type": contentType,
+        [MEDIA_PERSISTENCE_RESPONSE_HEADER]: MEDIA_PERSISTENCE_BROWSER,
+      },
     });
   }
   const [clientBranch, persistBranch] = body.tee();

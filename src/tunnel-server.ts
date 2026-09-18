@@ -25,6 +25,11 @@ import type {
   TTunnelSurface,
 } from "@openllmsh/protocol";
 import {
+  MEDIA_PERSISTENCE_BROWSER,
+  MEDIA_PERSISTENCE_REQUEST_HEADER,
+  MEDIA_PERSISTENCE_RESPONSE_HEADER,
+  MEDIA_URL_RESPONSE_HEADER,
+  TUNNEL_MEDIA_URL_MAX_LENGTH,
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
 } from "@openllmsh/protocol";
@@ -68,6 +73,8 @@ const forwardedHeaders = (open: {
   readonly headers?: TTunnelForwardHeaders;
 }): Headers => {
   const headers = new Headers();
+  if (open.headers?.media_persistence === MEDIA_PERSISTENCE_BROWSER)
+    headers.set(MEDIA_PERSISTENCE_REQUEST_HEADER, MEDIA_PERSISTENCE_BROWSER);
   headers.set("content-type", open.headers?.content_type ?? "application/json");
   if (open.headers?.accept !== undefined)
     headers.set("accept", open.headers.accept);
@@ -163,9 +170,19 @@ export const serveMuxTunnel: TServeTunnel = async (open, body, signal) => {
     const response = await dispatch(tunneledRequest(open, body, signal));
     const contentType =
       response.headers.get("content-type") ?? "application/json";
+    const mediaUrl = response.headers.get(MEDIA_URL_RESPONSE_HEADER);
     return {
       status: response.status,
       headers: {
+        ...(mediaUrl === null ||
+        mediaUrl.length === 0 ||
+        mediaUrl.length > TUNNEL_MEDIA_URL_MAX_LENGTH
+          ? {}
+          : { media_url: mediaUrl }),
+        ...(response.headers.get(MEDIA_PERSISTENCE_RESPONSE_HEADER) ===
+        MEDIA_PERSISTENCE_BROWSER
+          ? { media_persistence: MEDIA_PERSISTENCE_BROWSER }
+          : {}),
         content_type: contentType,
         is_sse: contentType.includes("text/event-stream"),
       },
