@@ -31,6 +31,7 @@ import {
   GROK_STT_INPUT_FORMATS,
   GROK_TTS_OUTPUT_FORMATS,
   GROK_TTS_VOICES,
+  isSubscriptionProviderSlug,
   MEDIA_PERSISTENCE_BROWSER,
   MEDIA_PERSISTENCE_REQUEST_HEADER,
   MEDIA_PERSISTENCE_RESPONSE_HEADER,
@@ -45,9 +46,12 @@ import {
 } from "./audio/pcm";
 import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
-import { getDelegate, isSubscriptionSlug } from "./delegation";
+import { getDelegate } from "./delegation";
 import type { TImageCredential } from "./delegation/types";
 import { logWarn, safeDiagnosticMessage } from "./logger";
+import { withMediaAttribution } from "./media-attribution";
+import { forwardMediaHopToCloud } from "./media-cloud-forward";
+import { mediaHopAdvances, mediaHttpErrorCode } from "./media-retry";
 import type { TParsedMultipart, TParsedMultipartFile } from "./multipart";
 import { multipartFile } from "./multipart";
 import type { TWalkArgs } from "./walker";
@@ -123,28 +127,12 @@ const acquireAudioUpstream = async (
   }
 };
 
-/** First plan hop whose provider is a subscription slug AND exposes the
- *  requested audio credential hook. */
-const findAudioHop = (
-  args: TWalkArgs,
-  op: TAudioOp,
-):
-  | {
-      readonly provider: string;
-      readonly modelId: string;
-      readonly providerModelId: string;
-    }
-  | undefined => {
+/** Ordered plan hops. Subscription audio hooks and API-key tails both appear. */
+const listAudioHops = (args: TWalkArgs) => {
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
-  const hook = delegateHookFor(op);
-  return parsePlan(args.planParam)
-    .map((modelId, index) => resolveHop(modelId, pmids[index]))
-    .find((candidate) => {
-      const delegate = getDelegate(candidate.provider);
-      return (
-        isSubscriptionSlug(candidate.provider) && delegate?.[hook] !== undefined
-      );
-    });
+  return parsePlan(args.planParam).map((modelId, index) =>
+    resolveHop(modelId, pmids[index]),
+  );
 };
 
 const requirePlanned = (args: TWalkArgs): Response | null => {
@@ -377,191 +365,297 @@ export const runAudioTranscriptionWalker = async (
     return errorJson(normalized.status, normalized.message);
   }
 
-  const hop = findAudioHop(args, "transcription");
-  if (hop === undefined) {
-    return errorJson(
-      404,
-      "No subscription transcription provider in the daemon plan can serve this request",
-    );
-  }
-
+  const hops = listAudioHops(args);
+  const attempted: string[] = [];
+  const stamp = (resp: Response, resolved?: string): Response =>
+    withMediaAttribution(resp, {
+      attempted,
+      ...(resolved !== undefined ? { resolvedModel: resolved } : {}),
+    });
+  let lastError: Response | null = null;
   const format = detectAudioFormat(normalized.file);
-  const allowed = inputFormatsFor(hop.provider);
-  if (format === null || !allowed.includes(format)) {
-    return errorJson(
-      415,
-      `Unsupported audio input for ${hop.provider}. Accepted: ${
-        allowed.length > 0 ? allowed.join(", ") : "none"
-      }.`,
-    );
-  }
-  // A claimed `wav_pcm16_16khz_mono` (grok's ONLY accepted format, and one
-  // of claude_code's two) is verified by actually parsing the container —
-  // a WAV with the wrong sample rate/channel count/bit depth is rejected
-  // explicitly (415) rather than forwarded and left to the vendor's own
-  // (opaque) validation. `pcm_s16le_16khz_mono` (claude_code-only, no
-  // header) is validated for shape (even byte count, non-empty) the same
-  // way. Grok still gets the ORIGINAL file bytes forwarded untouched below
-  // — this is a validation pass, not a transcode.
-  const pcmValidation =
-    format === "wav_pcm16_16khz_mono" || format === "pcm_s16le_16khz_mono"
-      ? extractClaudeDictationPcm(normalized.file.bytes, format)
-      : null;
-  if (pcmValidation !== null && isPcmParseFailure(pcmValidation)) {
-    return errorJson(415, `Invalid ${format} audio: ${pcmValidation.error}`);
-  }
 
-  const acquired = await acquireAudioUpstream(
-    "transcription",
-    hop.provider,
-    args,
-    hop,
-  );
-  if (acquired === "retry") {
-    return errorJson(
-      404,
-      `No transcription credential available for ${hop.provider}`,
-    );
-  }
-
-  const reportResult = (
-    status: "success" | "error",
-    latencyMs: number,
-  ): void => {
-    report(
-      {
-        model: hop.modelId,
-        provider: hop.provider,
-        status,
-        tokens_in: 0,
-        tokens_out: 0,
-        latency_ms: latencyMs,
-        endpoint: args.endpoint,
-        ...(acquired.accountHash !== null
-          ? { account_hash: acquired.accountHash }
-          : {}),
-      },
-      args.originParam,
-    );
-  };
-
-  // ── claude_code: decode + stream over the dictation WebSocket ──────────
-  if (hop.provider === "claude_code") {
-    // Already validated above (`pcmValidation`) — `format` being accepted
-    // for claude_code guarantees it was one of the two PCM shapes, so this
-    // is always the success variant here.
-    if (pcmValidation === null || isPcmParseFailure(pcmValidation)) {
-      return errorJson(415, "Invalid dictation audio");
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    if (hop === undefined) continue;
+    const last = i === hops.length - 1;
+    const transcribeHook = getDelegate(
+      hop.provider,
+    )?.credentialForTranscription;
+    if (
+      isSubscriptionProviderSlug(hop.provider) &&
+      transcribeHook === undefined
+    ) {
+      lastError = errorJson(
+        404,
+        `No transcription credential available for ${hop.provider}`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
     }
-    const pcmResult = pcmValidation;
+    if (!isSubscriptionProviderSlug(hop.provider)) {
+      attempted.push(hop.modelId);
+      const forwarded = await forwardMediaHopToCloud(args, hop.modelId);
+      if (forwarded.ok) return stamp(forwarded, hop.modelId);
+      lastError = forwarded;
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: forwarded.status,
+          errorCode: mediaHttpErrorCode(forwarded.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(forwarded);
+    }
+
+    const allowed = inputFormatsFor(hop.provider);
+    if (format === null || !allowed.includes(format)) {
+      lastError = errorJson(
+        415,
+        `Unsupported audio input for ${hop.provider}. Accepted: ${
+          allowed.length > 0 ? allowed.join(", ") : "none"
+        }.`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "model_unavailable",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    // A claimed `wav_pcm16_16khz_mono` (grok's ONLY accepted format, and one
+    // of claude_code's two) is verified by actually parsing the container —
+    // a WAV with the wrong sample rate/channel count/bit depth is rejected
+    // explicitly (415) rather than forwarded and left to the vendor's own
+    // (opaque) validation. `pcm_s16le_16khz_mono` (claude_code-only, no
+    // header) is validated for shape (even byte count, non-empty) the same
+    // way. Grok still gets the ORIGINAL file bytes forwarded untouched below
+    // — this is a validation pass, not a transcode.
+    const pcmValidation =
+      format === "wav_pcm16_16khz_mono" || format === "pcm_s16le_16khz_mono"
+        ? extractClaudeDictationPcm(normalized.file.bytes, format)
+        : null;
+    if (pcmValidation !== null && isPcmParseFailure(pcmValidation)) {
+      lastError = errorJson(
+        415,
+        `Invalid ${format} audio: ${pcmValidation.error}`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      )
+        continue;
+      return stamp(lastError);
+    }
+
+    attempted.push(hop.modelId);
+    const acquired = await acquireAudioUpstream(
+      "transcription",
+      hop.provider,
+      args,
+      hop,
+    );
+    if (acquired === "retry") {
+      lastError = errorJson(
+        404,
+        `No transcription credential available for ${hop.provider}`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      )
+        continue;
+      return stamp(lastError);
+    }
+
+    const reportResult = (
+      status: "success" | "error",
+      latencyMs: number,
+    ): void => {
+      report(
+        {
+          model: hop.modelId,
+          provider: hop.provider,
+          status,
+          tokens_in: 0,
+          tokens_out: 0,
+          latency_ms: latencyMs,
+          endpoint: args.endpoint,
+          ...(acquired.accountHash !== null
+            ? { account_hash: acquired.accountHash }
+            : {}),
+        },
+        args.originParam,
+      );
+    };
+
+    // ── claude_code: decode + stream over the dictation WebSocket ──────────
+    if (hop.provider === "claude_code") {
+      // Already validated above (`pcmValidation`) — `format` being accepted
+      // for claude_code guarantees it was one of the two PCM shapes, so this
+      // is always the success variant here.
+      if (pcmValidation === null || isPcmParseFailure(pcmValidation)) {
+        return errorJson(415, "Invalid dictation audio");
+      }
+      const pcmResult = pcmValidation;
+      const startedAt = Date.now();
+      const session = await runClaudeDictationSession({
+        url: acquired.url,
+        headers: acquired.headers,
+        pcm: pcmResult.pcm,
+        frames: framePcm(pcmResult.pcm),
+        // Verified research recipe: "Send silence at the tail, then
+        // CloseStream" — the connection's own `utterance_end_ms=1000` needs a
+        // quiet tail to finalize the last utterance; bursting straight into
+        // CloseStream starves it and a short clip comes back with an EMPTY
+        // transcript despite a 200 (live-verified on this branch).
+        trailingSilenceMs: 1_200,
+        ...(claudeWsFactoryForTests !== undefined
+          ? { wsFactory: claudeWsFactoryForTests }
+          : {}),
+        ...(claudePaceForTests !== undefined
+          ? { pace: claudePaceForTests }
+          : {}),
+        signal: args.req.signal,
+      });
+      const latencyMs = Date.now() - startedAt;
+      if (session.kind === "error") {
+        reportResult("error", latencyMs);
+        return errorJson(502, session.message);
+      }
+      reportResult("success", latencyMs);
+      return stamp(
+        new Response(JSON.stringify({ text: session.text }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        hop.modelId,
+      );
+    }
+
+    // ── chatgpt / grok: batch multipart POST, forwarded verbatim ────────────
     const startedAt = Date.now();
-    const session = await runClaudeDictationSession({
-      url: acquired.url,
-      headers: acquired.headers,
-      pcm: pcmResult.pcm,
-      frames: framePcm(pcmResult.pcm),
-      // Verified research recipe: "Send silence at the tail, then
-      // CloseStream" — the connection's own `utterance_end_ms=1000` needs a
-      // quiet tail to finalize the last utterance; bursting straight into
-      // CloseStream starves it and a short clip comes back with an EMPTY
-      // transcript despite a 200 (live-verified on this branch).
-      trailingSilenceMs: 1_200,
-      ...(claudeWsFactoryForTests !== undefined
-        ? { wsFactory: claudeWsFactoryForTests }
-        : {}),
-      ...(claudePaceForTests !== undefined ? { pace: claudePaceForTests } : {}),
+    // Both verified subscription STT recipes ALWAYS sent an explicit
+    // `language: en` (docs/research/subscription-provider-capabilities-
+    // 2026-09-17.md: grok's "Working fields: file=input.wav, language=en,
+    // format=true"; chatgpt's "Working form fields: file: input.webm,
+    // language: en"). Grok's `/v1/stt` outright REJECTS a request missing it
+    // (400 `Field 'language' is required when 'format' is true`) — verified
+    // live. The OpenAI-compatible `/v1/audio/transcriptions` contract treats
+    // `language` as fully optional, so every caller that omits it (the common
+    // case) needs a server-side default here, never a bare pass-through of
+    // `undefined`, for either provider. An explicit caller-supplied language
+    // still wins.
+    const form =
+      hop.provider === "grok"
+        ? buildTranscriptionForm(
+            normalized.file,
+            format,
+            normalized.language ?? "en",
+            { format: "true" },
+          )
+        : buildTranscriptionForm(
+            normalized.file,
+            format,
+            normalized.language ?? "en",
+          );
+
+    const resp = await postUpstream(acquired.url, {
+      method: "POST",
+      headers: { ...acquired.headers, accept: "application/json" },
+      body: form,
       signal: args.req.signal,
     });
     const latencyMs = Date.now() - startedAt;
-    if (session.kind === "error") {
+    if (resp === null) {
       reportResult("error", latencyMs);
-      return errorJson(502, session.message);
+      return args.req.signal.aborted
+        ? errorJson(499, "client aborted request")
+        : errorJson(502, "upstream transcription provider is unreachable");
+    }
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      reportResult("error", latencyMs);
+      lastError = new Response(body.length > 0 ? body : null, {
+        status: resp.status,
+        headers: passthroughHeaders(resp),
+      });
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: resp.status,
+          errorCode: mediaHttpErrorCode(resp.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    let upstream: unknown;
+    try {
+      upstream = await resp.json();
+    } catch {
+      reportResult("error", latencyMs);
+      return errorJson(
+        502,
+        "upstream transcription provider returned invalid JSON",
+      );
+    }
+    let normalizedResponse: { readonly text: string };
+    try {
+      // Never leak Codex's internal asset pointers (`asset_pointer` /
+      // `asset_ttl` / `asset_format`) — the OpenAI-compatible contract is
+      // `{text}` (plus optional verbose fields we don't populate here).
+      normalizedResponse = stripCodexAssetPointers(upstream);
+    } catch (err) {
+      reportResult("error", latencyMs);
+      return errorJson(
+        502,
+        err instanceof Error
+          ? `upstream transcription provider returned invalid data: ${err.message}`
+          : "upstream transcription provider returned invalid data",
+      );
     }
     reportResult("success", latencyMs);
-    return new Response(JSON.stringify({ text: session.text }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  // ── chatgpt / grok: batch multipart POST, forwarded verbatim ────────────
-  const startedAt = Date.now();
-  // Both verified subscription STT recipes ALWAYS sent an explicit
-  // `language: en` (docs/research/subscription-provider-capabilities-
-  // 2026-09-17.md: grok's "Working fields: file=input.wav, language=en,
-  // format=true"; chatgpt's "Working form fields: file: input.webm,
-  // language: en"). Grok's `/v1/stt` outright REJECTS a request missing it
-  // (400 `Field 'language' is required when 'format' is true`) — verified
-  // live. The OpenAI-compatible `/v1/audio/transcriptions` contract treats
-  // `language` as fully optional, so every caller that omits it (the common
-  // case) needs a server-side default here, never a bare pass-through of
-  // `undefined`, for either provider. An explicit caller-supplied language
-  // still wins.
-  const form =
-    hop.provider === "grok"
-      ? buildTranscriptionForm(
-          normalized.file,
-          format,
-          normalized.language ?? "en",
-          { format: "true" },
-        )
-      : buildTranscriptionForm(
-          normalized.file,
-          format,
-          normalized.language ?? "en",
-        );
-
-  const resp = await postUpstream(acquired.url, {
-    method: "POST",
-    headers: { ...acquired.headers, accept: "application/json" },
-    body: form,
-    signal: args.req.signal,
-  });
-  const latencyMs = Date.now() - startedAt;
-  if (resp === null) {
-    reportResult("error", latencyMs);
-    return args.req.signal.aborted
-      ? errorJson(499, "client aborted request")
-      : errorJson(502, "upstream transcription provider is unreachable");
-  }
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
-    reportResult("error", latencyMs);
-    return new Response(body.length > 0 ? body : null, {
-      status: resp.status,
-      headers: passthroughHeaders(resp),
-    });
-  }
-  let upstream: unknown;
-  try {
-    upstream = await resp.json();
-  } catch {
-    reportResult("error", latencyMs);
-    return errorJson(
-      502,
-      "upstream transcription provider returned invalid JSON",
+    return stamp(
+      new Response(JSON.stringify(normalizedResponse), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      hop.modelId,
     );
   }
-  let normalizedResponse: { readonly text: string };
-  try {
-    // Never leak Codex's internal asset pointers (`asset_pointer` /
-    // `asset_ttl` / `asset_format`) — the OpenAI-compatible contract is
-    // `{text}` (plus optional verbose fields we don't populate here).
-    normalizedResponse = stripCodexAssetPointers(upstream);
-  } catch (err) {
-    reportResult("error", latencyMs);
-    return errorJson(
-      502,
-      err instanceof Error
-        ? `upstream transcription provider returned invalid data: ${err.message}`
-        : "upstream transcription provider returned invalid data",
-    );
-  }
-  reportResult("success", latencyMs);
-  return new Response(JSON.stringify(normalizedResponse), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  return stamp(
+    lastError ??
+      errorJson(
+        404,
+        "No transcription provider in the daemon plan can serve this request",
+      ),
+  );
 };
 
 // ─── Speech (TTS) ───────────────────────────────────────────────────────
@@ -730,124 +824,207 @@ export const runAudioSpeechWalker = async (
     return errorJson(parsedBody.status, parsedBody.message);
   }
 
-  const hop = findAudioHop(args, "speech");
-  if (hop === undefined) {
-    return errorJson(
-      404,
-      "No subscription speech provider in the daemon plan can serve this request",
-    );
-  }
-
-  const formatError = validateOutputFormat(
-    hop.provider,
-    parsedBody.responseFormat,
-  );
-  if (formatError !== null) return errorJson(400, formatError);
-  const voiceError = validateVoice(hop.provider, parsedBody.voice);
-  if (voiceError !== null) return errorJson(400, voiceError);
-
-  const acquired = await acquireAudioUpstream(
-    "speech",
-    hop.provider,
-    args,
-    hop,
-  );
-  if (acquired === "retry") {
-    return errorJson(404, `No speech credential available for ${hop.provider}`);
-  }
-
-  const startedAt = Date.now();
-  const upstreamBody =
-    hop.provider === "grok"
-      ? JSON.stringify({
-          text: parsedBody.input,
-          voice_id: "eve",
-          language: "en",
-        })
-      : JSON.stringify({
-          text: parsedBody.input,
-          // No documented locale field on the request shape today —
-          // `en-US` matches the verified probe body. See module doc.
-          pronunciation_language: "en-US",
-          speed: parsedBody.speed ?? 1,
-        });
-
-  const resp = await postUpstream(acquired.url, {
-    method: "POST",
-    headers: {
-      ...acquired.headers,
-      "content-type": "application/json",
-      accept: "audio/mpeg, application/json",
-    },
-    body: upstreamBody,
-    signal: args.req.signal,
-  });
-  const latencyMs = Date.now() - startedAt;
-  // `tokens_in` here is a CHARACTER COUNT, not upstream token usage — neither
-  // verified subscription TTS vendor (chatgpt/pronunciation, grok/tts)
-  // reports token usage for speech, and their real billing units are
-  // undocumented for these bridged endpoints. This mirrors the cloud
-  // handler's own `/v1/audio/speech` convention (`audio-speech.ts`) exactly
-  // so the two paths don't silently diverge; it is NOT a claim of genuine
-  // provider token usage, and no per-character/per-minute price is invented
-  // here — cost stays uncomputed for this surface.
+  const hops = listAudioHops(args);
+  const attempted: string[] = [];
+  const stamp = (resp: Response, resolved?: string): Response =>
+    withMediaAttribution(resp, {
+      attempted,
+      ...(resolved !== undefined ? { resolvedModel: resolved } : {}),
+    });
+  let lastError: Response | null = null;
   const chars = parsedBody.input.length;
-  const reportResult = (status: "success" | "error"): void => {
-    report(
-      {
-        model: hop.modelId,
-        provider: hop.provider,
-        status,
-        tokens_in: chars,
-        tokens_out: 0,
-        latency_ms: latencyMs,
-        endpoint: args.endpoint,
-        ...(acquired.accountHash !== null
-          ? { account_hash: acquired.accountHash }
-          : {}),
-      },
-      args.originParam,
+
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    if (hop === undefined) continue;
+    const last = i === hops.length - 1;
+    if (!isSubscriptionProviderSlug(hop.provider)) {
+      attempted.push(hop.modelId);
+      const forwarded = await forwardMediaHopToCloud(args, hop.modelId);
+      if (forwarded.ok) return stamp(forwarded, hop.modelId);
+      lastError = forwarded;
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: forwarded.status,
+          errorCode: mediaHttpErrorCode(forwarded.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(forwarded);
+    }
+    const speechHook = getDelegate(hop.provider)?.credentialForSpeech;
+    if (speechHook === undefined) {
+      lastError = errorJson(
+        404,
+        `No speech credential available for ${hop.provider}`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    const formatError = validateOutputFormat(
+      hop.provider,
+      parsedBody.responseFormat,
     );
-  };
-  if (resp === null) {
-    reportResult("error");
-    return args.req.signal.aborted
-      ? errorJson(499, "client aborted request")
-      : errorJson(502, "upstream speech provider is unreachable");
-  }
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
-    reportResult("error");
-    return new Response(body.length > 0 ? body : null, {
-      status: resp.status,
-      headers: passthroughHeaders(resp),
-    });
-  }
-  reportResult("success");
-  const contentType = resp.headers.get("content-type") ?? "audio/mpeg";
-  const body = resp.body;
-  if (body === null) {
-    return new Response(null, {
-      status: 200,
-      headers: { "content-type": contentType },
-    });
-  }
-  if (
-    args.req.headers.get(MEDIA_PERSISTENCE_REQUEST_HEADER) ===
-    MEDIA_PERSISTENCE_BROWSER
-  ) {
-    return new Response(body, {
-      status: 200,
+    const voiceError = validateVoice(hop.provider, parsedBody.voice);
+    if (formatError !== null || voiceError !== null) {
+      lastError = errorJson(400, formatError ?? voiceError ?? "invalid speech");
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "model_unavailable",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    const acquired = await acquireAudioUpstream(
+      "speech",
+      hop.provider,
+      args,
+      hop,
+    );
+    if (acquired === "retry") {
+      lastError = errorJson(
+        404,
+        `No speech credential available for ${hop.provider}`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    attempted.push(hop.modelId);
+    const startedAt = Date.now();
+    const upstreamBody =
+      hop.provider === "grok"
+        ? JSON.stringify({
+            text: parsedBody.input,
+            voice_id: "eve",
+            language: "en",
+          })
+        : JSON.stringify({
+            text: parsedBody.input,
+            pronunciation_language: "en-US",
+            speed: parsedBody.speed ?? 1,
+          });
+    const resp = await postUpstream(acquired.url, {
+      method: "POST",
       headers: {
-        "content-type": contentType,
-        [MEDIA_PERSISTENCE_RESPONSE_HEADER]: MEDIA_PERSISTENCE_BROWSER,
+        ...acquired.headers,
+        "content-type": "application/json",
+        accept: "audio/mpeg, application/json",
       },
+      body: upstreamBody,
+      signal: args.req.signal,
     });
+    const latencyMs = Date.now() - startedAt;
+    const reportResult = (status: "success" | "error"): void => {
+      report(
+        {
+          model: hop.modelId,
+          provider: hop.provider,
+          status,
+          tokens_in: chars,
+          tokens_out: 0,
+          latency_ms: latencyMs,
+          endpoint: args.endpoint,
+          ...(acquired.accountHash !== null
+            ? { account_hash: acquired.accountHash }
+            : {}),
+        },
+        args.originParam,
+      );
+    };
+    if (resp === null) {
+      reportResult("error");
+      return stamp(
+        args.req.signal.aborted
+          ? errorJson(499, "client aborted request")
+          : errorJson(502, "upstream speech provider is unreachable"),
+      );
+    }
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      reportResult("error");
+      lastError = new Response(body.length > 0 ? body : null, {
+        status: resp.status,
+        headers: passthroughHeaders(resp),
+      });
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: resp.status,
+          errorCode: mediaHttpErrorCode(resp.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    reportResult("success");
+    const contentType = resp.headers.get("content-type") ?? "audio/mpeg";
+    const body = resp.body;
+    if (body === null) {
+      return stamp(
+        new Response(null, {
+          status: 200,
+          headers: { "content-type": contentType },
+        }),
+        hop.modelId,
+      );
+    }
+    if (
+      args.req.headers.get(MEDIA_PERSISTENCE_REQUEST_HEADER) ===
+      MEDIA_PERSISTENCE_BROWSER
+    ) {
+      return stamp(
+        new Response(body, {
+          status: 200,
+          headers: {
+            "content-type": contentType,
+            [MEDIA_PERSISTENCE_RESPONSE_HEADER]: MEDIA_PERSISTENCE_BROWSER,
+          },
+        }),
+        hop.modelId,
+      );
+    }
+    const [clientBranch, persistBranch] = body.tee();
+    persistSpeechInBackground(persistBranch, contentType, args.originParam);
+    return stamp(
+      new Response(clientBranch, {
+        status: 200,
+        headers: { "content-type": contentType },
+      }),
+      hop.modelId,
+    );
   }
-  const [clientBranch, persistBranch] = body.tee();
-  persistSpeechInBackground(persistBranch, contentType, args.originParam);
-  return new Response(clientBranch, {
-    status: 200,
-    headers: { "content-type": contentType },
-  });
+  return stamp(
+    lastError ??
+      errorJson(
+        404,
+        "No speech provider in the daemon plan can serve this request",
+      ),
+  );
 };

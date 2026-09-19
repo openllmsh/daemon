@@ -8,6 +8,7 @@ import type {
 import {
   decodeVideoId,
   encodeVideoId,
+  isSubscriptionProviderSlug,
   normalizeContentType,
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
@@ -15,8 +16,12 @@ import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
-import { getDelegate, isSubscriptionSlug } from "./delegation";
+import { getDelegate } from "./delegation";
+import { passthroughToOrigin } from "./forward";
 import { logWarn, safeDiagnosticMessage } from "./logger";
+import { withMediaAttribution } from "./media-attribution";
+import { forwardMediaHopToCloud } from "./media-cloud-forward";
+import { mediaHopAdvances, mediaHttpErrorCode } from "./media-retry";
 import type { TWalkArgs } from "./walker";
 import {
   coolHopAfterStaleRefresh,
@@ -72,19 +77,37 @@ export const acquireVideoUpstream = async (
   }
 };
 
-const videoHop = (
+const hopForVideoJob = (
   args: TWalkArgs,
+  payload: TVideoIdPayload,
 ): ReturnType<typeof resolveHop> | undefined => {
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
   return parsePlan(args.planParam)
     .map((modelId, index) => resolveHop(modelId, pmids[index]))
-    .find((candidate) => {
-      const delegate = getDelegate(candidate.provider);
-      return (
-        isSubscriptionSlug(candidate.provider) &&
-        delegate?.credentialForVideo !== undefined
-      );
-    });
+    .find(
+      (candidate) =>
+        candidate.modelId === payload.m && candidate.provider === payload.p,
+    );
+};
+
+const EMPTY_BODY = new ArrayBuffer(0);
+
+const followVideoJob = async (
+  args: TWalkArgs,
+  payload: TVideoIdPayload,
+): Promise<Response | TVideoUpstream> => {
+  if (!isSubscriptionProviderSlug(payload.p)) {
+    return passthroughToOrigin(args.req, EMPTY_BODY, { pinModel: payload.m });
+  }
+  const hop = hopForVideoJob(args, payload);
+  if (hop === undefined) {
+    return errorJson(403, "Signed plan does not cover this video job");
+  }
+  const upstream = await acquireVideoUpstream(payload.p, args, hop);
+  if (upstream === "retry") {
+    return errorJson(404, `No video credential available for ${payload.p}`);
+  }
+  return upstream;
 };
 
 const signedPlanError = (args: TWalkArgs): Response | null => {
@@ -293,30 +316,78 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       err instanceof Error ? err.message : "Invalid video generation request",
     );
   }
-  const hop = videoHop(args);
-  if (hop === undefined) {
-    return errorJson(
-      404,
-      "No subscription video provider in the daemon plan can serve this request",
-    );
-  }
-  const upstream = await acquireVideoUpstream(hop.provider, args, hop);
-  if (upstream === "retry") {
-    return errorJson(404, `No video credential available for ${hop.provider}`);
-  }
+  const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
+  const hops = parsePlan(args.planParam).map((modelId, index) =>
+    resolveHop(modelId, pmids[index]),
+  );
+  const attempted: string[] = [];
+  const stamp = (resp: Response, resolved?: string): Response =>
+    withMediaAttribution(resp, {
+      attempted,
+      ...(resolved !== undefined ? { resolvedModel: resolved } : {}),
+    });
+  let lastError: Response | null = null;
 
-  let body: Record<string, unknown>;
-  try {
-    body = buildVideoUpstreamBody(hop.provider, request, hop.providerModelId);
-  } catch (err) {
-    return errorJson(
-      400,
-      err instanceof Error ? err.message : "Unsupported video provider",
-    );
-  }
-  const resp = await postUpstream(
-    `${upstream.url}/videos/generations`,
-    {
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    if (hop === undefined) continue;
+    const last = i === hops.length - 1;
+    if (!isSubscriptionProviderSlug(hop.provider)) {
+      attempted.push(hop.modelId);
+      const forwarded = await forwardMediaHopToCloud(args, hop.modelId);
+      if (forwarded.ok) return stamp(forwarded, hop.modelId);
+      lastError = forwarded;
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: forwarded.status,
+          errorCode: mediaHttpErrorCode(forwarded.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(forwarded);
+    }
+    const upstream = await acquireVideoUpstream(hop.provider, args, hop);
+    if (upstream === "retry") {
+      lastError = errorJson(
+        404,
+        `No video credential available for ${hop.provider}`,
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    attempted.push(hop.modelId);
+    let body: Record<string, unknown>;
+    try {
+      body = buildVideoUpstreamBody(hop.provider, request, hop.providerModelId);
+    } catch (err) {
+      lastError = errorJson(
+        400,
+        err instanceof Error ? err.message : "Unsupported video provider",
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "model_unavailable",
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    const resp = await postUpstream(`${upstream.url}/videos/generations`, {
       method: "POST",
       headers: {
         ...upstream.headers,
@@ -325,16 +396,63 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       },
       body: JSON.stringify(body),
       signal: args.req.signal,
-    },
-    // `postUpstream` makes exactly one attempt — correct for a non-idempotent
-    // video job (a retry could enqueue a second render / double-spend quota).
-  );
-  if (resp === null) {
-    return args.req.signal.aborted
-      ? errorJson(499, "client aborted request")
-      : errorJson(502, "upstream video provider is unreachable");
-  }
-  if (!resp.ok) {
+    });
+    if (resp === null) {
+      return stamp(
+        args.req.signal.aborted
+          ? errorJson(499, "client aborted request")
+          : errorJson(502, "upstream video provider is unreachable"),
+      );
+    }
+    if (!resp.ok) {
+      reportVideo(
+        args,
+        hop.provider,
+        hop.modelId,
+        resp.status,
+        upstream.accountHash,
+      );
+      lastError = await upstreamError(resp);
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: resp.status,
+          errorCode: mediaHttpErrorCode(resp.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    let requestId: string | null;
+    try {
+      requestId = videoRequestIdFrom(await resp.json());
+    } catch {
+      requestId = null;
+    }
+    if (requestId === null) {
+      return stamp(
+        errorJson(502, "upstream video provider returned no request_id"),
+      );
+    }
+    const createdAt = Math.floor(Date.now() / 1000);
+    const job: TVideoJob = {
+      id: encodeVideoId({
+        p: hop.provider,
+        u: requestId,
+        m: hop.modelId,
+        c: createdAt,
+      }),
+      object: "video",
+      created_at: createdAt,
+      status: "queued",
+      model: hop.modelId,
+      progress: 0,
+      ...(request.seconds !== undefined ? { seconds: request.seconds } : {}),
+      ...(request.size !== undefined ? { size: request.size } : {}),
+    };
     reportVideo(
       args,
       hop.provider,
@@ -342,42 +460,15 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       resp.status,
       upstream.accountHash,
     );
-    return upstreamError(resp);
+    return stamp(responseJson(job), hop.modelId);
   }
-
-  let requestId: string | null;
-  try {
-    requestId = videoRequestIdFrom(await resp.json());
-  } catch {
-    requestId = null;
-  }
-  if (requestId === null) {
-    return errorJson(502, "upstream video provider returned no request_id");
-  }
-  const createdAt = Math.floor(Date.now() / 1000);
-  const job: TVideoJob = {
-    id: encodeVideoId({
-      p: hop.provider,
-      u: requestId,
-      m: hop.modelId,
-      c: createdAt,
-    }),
-    object: "video",
-    created_at: createdAt,
-    status: "queued",
-    model: hop.modelId,
-    progress: 0,
-    ...(request.seconds !== undefined ? { seconds: request.seconds } : {}),
-    ...(request.size !== undefined ? { size: request.size } : {}),
-  };
-  reportVideo(
-    args,
-    hop.provider,
-    hop.modelId,
-    resp.status,
-    upstream.accountHash,
+  return stamp(
+    lastError ??
+      errorJson(
+        404,
+        "No video provider in the daemon plan can serve this request",
+      ),
   );
-  return responseJson(job);
 };
 
 export const runVideoPoll = async (
@@ -388,13 +479,9 @@ export const runVideoPoll = async (
   if (signatureError !== null) return signatureError;
   const payload = decodeJob(videoId);
   if (payload instanceof Response) return payload;
-  const hop = videoHop(args);
-  if (hop === undefined)
-    return errorJson(404, "No subscription video provider available");
-  const upstream = await acquireVideoUpstream(hop.provider, args, hop);
-  if (upstream === "retry")
-    return errorJson(404, `No video credential available for ${hop.provider}`);
-  const status = await getStatus(args, upstream, payload);
+  const followed = await followVideoJob(args, payload);
+  if (followed instanceof Response) return followed;
+  const status = await getStatus(args, followed, payload);
   if (status instanceof Response) return status;
   const errorMessage = errorMessageFrom(status);
   const job: TVideoJob = {
@@ -419,13 +506,9 @@ export const runVideoContent = async (
   if (signatureError !== null) return signatureError;
   const payload = decodeJob(videoId);
   if (payload instanceof Response) return payload;
-  const hop = videoHop(args);
-  if (hop === undefined)
-    return errorJson(404, "No subscription video provider available");
-  const upstream = await acquireVideoUpstream(hop.provider, args, hop);
-  if (upstream === "retry")
-    return errorJson(404, `No video credential available for ${hop.provider}`);
-  const status = await getStatus(args, upstream, payload);
+  const followed = await followVideoJob(args, payload);
+  if (followed instanceof Response) return followed;
+  const status = await getStatus(args, followed, payload);
   if (status instanceof Response) return status;
   if (status.status !== "done") {
     return errorJson(
@@ -528,19 +611,16 @@ export const runVideoCancel = async (
   if (signatureError !== null) return signatureError;
   const payload = decodeJob(videoId);
   if (payload instanceof Response) return payload;
-  const hop = videoHop(args);
-  if (hop !== undefined) {
-    const upstream = await acquireVideoUpstream(hop.provider, args, hop);
-    if (upstream !== "retry") {
-      await fetch(`${upstream.url}/videos/${encodeURIComponent(payload.u)}`, {
-        method: "DELETE",
-        headers: upstreamHeaders(upstream.headers),
-        signal: AbortSignal.any([
-          args.req.signal,
-          AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
-        ]),
-      }).catch(() => {});
-    }
+  const followed = await followVideoJob(args, payload);
+  if (!(followed instanceof Response)) {
+    await fetch(`${followed.url}/videos/${encodeURIComponent(payload.u)}`, {
+      method: "DELETE",
+      headers: upstreamHeaders(followed.headers),
+      signal: AbortSignal.any([
+        args.req.signal,
+        AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
+      ]),
+    }).catch(() => {});
   }
   const deleted: TVideoDeleted = {
     id: videoId ?? "",

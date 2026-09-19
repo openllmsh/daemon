@@ -160,24 +160,37 @@ the cloud-signed `?__plan=<provider/model,…>` (see
 [`coreless-daemon-passthrough.md`](../../docs/proposals/coreless-daemon-passthrough.md)).
 For a direct local-first request, `listener.ts` first reuses a valid cached
 plan or fetches one from the cloud without sending the request body; a pure
-BYOK plan, or a failed plan fetch, is forwarded to the cloud. **Model-less
-media** (image, image edit, transcription, speech, video create) does not
-cache under an empty alias: the listener sends `GET /api/daemon/plan?media_default=`
-with surface + sanitized format constraints only (never prompt, image, audio,
-or speech text). The cloud's shared resolver picks a subscription-first then
-compatible API-key model. After the signed tuple verifies, the listener
-materializes that concrete model into JSON or a re-serialized multipart body
-(new boundary; stale Content-Length/Content-Type dropped) and either walks a
-subscription hop or passthrough-pins the selected API-key model — no second
-default on the cloud, no paid retry after a subscription attempt. A failed
-or unverifiable media-default plan returns an error and never forwards the
-original media body to origin. Explicit-model plan-fetch failures still
-passthrough as before. A 307 with
-a model-less original body is the same: verify the plan **before**
-required-model decode (including image-edit multipart); unsigned/tampered
-plans never authorize inference; an explicit caller model is never rewritten.
-The listener
-validates the body and hands a subscription-containing plan to the walker.
+BYOK plan, or a failed explicit-model plan fetch, is forwarded to the cloud.
+**Model-less media** (image, image edit, transcription, speech, video create)
+does not cache under an empty alias: the listener sends
+`GET /api/daemon/plan?media_default=` with surface + sanitized format
+constraints only (never prompt, image, audio, or speech text). The cloud's
+catalog-ranked resolver returns a **full signed chain** (subscription hops
+then compatible API-key tails). After HMAC verifies, the listener
+materializes the first hop id into JSON or a re-serialized multipart body
+(new boundary; stale Content-Length/Content-Type dropped) for schema decode
+only — walkers still iterate remaining hops. A failed or unverifiable
+media-default plan returns an error and never forwards the original media
+body to origin. Explicit-model plan-fetch failures still passthrough as
+before. A 307 with a model-less original body is the same: verify the plan
+**before** required-model decode (including image-edit multipart);
+unsigned/tampered plans never authorize inference; an explicit caller model
+is never rewritten. The listener validates the body and hands the signed
+plan to the walker. Media walkers (`image-walker`, `audio-walker`,
+`video-walker`) iterate the **full signed plan**. Advance uses protocol
+`decideMediaChainAdvance` (429/auth/quota/missing credential before accept,
+including API hops). Timeout, network, 5xx after submit, accepted 2xx,
+delivered output, and persist-after-success are terminal. Image edits never
+forward a paid generation hop. Successful responses set
+`x-openllm-resolved-model` / `x-openllm-chain` from protocol header constants.
+Bodyless video retrieve/content/cancel (mux GET) have no `?__plan=`: the
+listener `decodeVideoId`s the opaque job and `GET /api/daemon/plan?video_job=`
+with `{model, provider}` only (never prompt, aliases, or cooldown rewrite),
+verifies HMAC, and requires the plan to contain that exact model id.
+Subscription jobs poll the job's own provider; API-key (Google) jobs
+pin-forward GET to the cloud — never the first Grok hop. API-key media hops
+rewrite JSON/multipart `model` to the current hop before `forwardToCloud`.
+
 The walker makes **zero** routing decisions — the cloud already resolved the
 alias + cooldowns — it walks the ordered plan, serving each subscription hop
 locally (delegate credential injected, vendor called directly) and forwarding

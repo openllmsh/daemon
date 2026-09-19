@@ -19,6 +19,7 @@ import type {
   TDaemonSessionLost,
   TMediaDefaultRequest,
   TRelayChannelResponse,
+  TVideoJobPlanRequest,
 } from "@openllmsh/protocol";
 import {
   DAEMON_BOOTSTRAP_CAPS_HEADER,
@@ -26,9 +27,11 @@ import {
   DAEMON_DEVICE_LABEL_HEADER,
   DaemonPlanResponse,
   encodeMediaDefaultPlanQuery,
+  encodeVideoJobPlanQuery,
   MediaDefaultRequest,
   MODEL_CAPABILITIES_OPEN_CAP,
   RelayChannelResponse,
+  VideoJobPlanRequest,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
@@ -38,6 +41,7 @@ import { logWarn, safeDiagnosticMessage } from "./logger";
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
 const decodePlan = Schema.decodeUnknownSync(DaemonPlanResponse);
 const decodeMediaDefault = Schema.decodeUnknownSync(MediaDefaultRequest);
+const decodeVideoJobPlan = Schema.decodeUnknownSync(VideoJobPlanRequest);
 
 /** Thrown when no API key is configured yet — the daemon is keyless. */
 export class NoApiKeyError extends Error {
@@ -314,6 +318,31 @@ export const fetchMediaDefaultPlan = async (
   const query = encodeMediaDefaultPlanQuery(validated);
   if (query === null) {
     throw new Error("invalid media default plan request");
+  }
+  const resp = await cloudFetch(cloudUrl(`/api/daemon/plan?${query}`), {
+    method: "GET",
+    headers: authHeaders(),
+    signal,
+  });
+  if (resp.status >= 400 && resp.status < 500) {
+    throw await mediaDefaultPlanErrorFromResponse(resp);
+  }
+  if (!resp.ok) throw new Error(`plan fetch failed: ${resp.status}`);
+  return decodePlan(await resp.json());
+};
+
+/**
+ * Metadata-only plan for an existing video job (poll/content/cancel).
+ * `video_job={model,provider}` — never aliases, never cooldowns, never prompt.
+ */
+export const fetchVideoJobPlan = async (
+  request: TVideoJobPlanRequest,
+  signal?: AbortSignal,
+): Promise<TDaemonPlanResponse> => {
+  const validated = decodeVideoJobPlan(request);
+  const query = encodeVideoJobPlanQuery(validated);
+  if (query === null) {
+    throw new Error("invalid video job plan request");
   }
   const resp = await cloudFetch(cloudUrl(`/api/daemon/plan?${query}`), {
     method: "GET",

@@ -21,6 +21,9 @@ import {
   buildImageEditUpstreamBody,
   isSupportedImageEditReference,
 } from "./image-edit-wire";
+import { withMediaAttribution } from "./media-attribution";
+import { forwardMediaHopToCloud } from "./media-cloud-forward";
+import { mediaHopAdvances, mediaHttpErrorCode } from "./media-retry";
 import type { TWalkArgs } from "./walker";
 import {
   coolHopAfterStaleRefresh,
@@ -276,142 +279,206 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
   }
 
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
-  const hop = parsePlan(args.planParam)
-    .map((modelId, index) => resolveHop(modelId, pmids[index]))
-    .find((candidate) => {
-      const delegate = getDelegate(candidate.provider);
-      return (
-        isSubscriptionSlug(candidate.provider) &&
-        delegate?.credentialForImage !== undefined
+  const hops = parsePlan(args.planParam).map((modelId, index) =>
+    resolveHop(modelId, pmids[index]),
+  );
+  const attempted: string[] = [];
+  const stamp = (resp: Response, resolved?: string): Response =>
+    withMediaAttribution(resp, {
+      attempted,
+      ...(resolved !== undefined ? { resolvedModel: resolved } : {}),
+    });
+
+  let lastError: Response | null = null;
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    if (hop === undefined) continue;
+    const last = i === hops.length - 1;
+    if (isSubscriptionSlug(hop.provider)) {
+      const delegate = getDelegate(hop.provider);
+      if (delegate?.credentialForImage === undefined) {
+        if (
+          !last &&
+          mediaHopAdvances({
+            dispatched: false,
+            errorCode: "missing_credential",
+          })
+        ) {
+          continue;
+        }
+        return stamp(
+          errorJson(404, `No image credential available for ${hop.provider}`),
+        );
+      }
+      const acquired = await acquireImageUpstream(hop.provider, args, hop);
+      if (acquired === "retry") {
+        if (
+          !last &&
+          mediaHopAdvances({
+            dispatched: false,
+            errorCode: "missing_credential",
+          })
+        )
+          continue;
+        return stamp(
+          errorJson(404, `No image credential available for ${hop.provider}`),
+        );
+      }
+      attempted.push(hop.modelId);
+      let upstreamBody: Record<string, unknown>;
+      try {
+        upstreamBody = buildImageUpstreamBody(
+          hop.provider,
+          imageRequest,
+          hop.providerModelId,
+        );
+      } catch (err) {
+        lastError = errorJson(
+          400,
+          err instanceof Error ? err.message : "Unsupported image provider",
+        );
+        if (
+          !last &&
+          mediaHopAdvances({
+            dispatched: false,
+            errorCode: "missing_credential",
+          })
+        )
+          continue;
+        return stamp(lastError);
+      }
+
+      const resp = await postUpstream(acquired.url, {
+        method: "POST",
+        headers: {
+          ...acquired.headers,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify(upstreamBody),
+        signal: args.req.signal,
+      });
+      if (resp === null) {
+        const terminal = args.req.signal.aborted
+          ? errorJson(499, "client aborted request")
+          : errorJson(502, "upstream image provider is unreachable");
+        return stamp(terminal);
+      }
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        report(
+          {
+            model: hop.modelId,
+            provider: hop.provider,
+            status: statusFor(resp.status),
+            tokens_in: 0,
+            tokens_out: 0,
+            latency_ms: Date.now() - args.startedAt,
+            endpoint: args.endpoint,
+            ...(acquired.accountHash !== null
+              ? { account_hash: acquired.accountHash }
+              : {}),
+          },
+          args.originParam,
+        );
+        lastError = new Response(body.length > 0 ? body : null, {
+          status: resp.status,
+          headers: passthroughHeaders(resp),
+        });
+        if (
+          !last &&
+          mediaHopAdvances({
+            dispatched: true,
+            httpStatus: resp.status,
+            errorCode: mediaHttpErrorCode(resp.status),
+            accepted: false,
+          })
+        ) {
+          continue;
+        }
+        return stamp(lastError);
+      }
+      let upstream: unknown;
+      try {
+        upstream = await resp.json();
+      } catch {
+        return stamp(
+          errorJson(502, "upstream image provider returned invalid JSON"),
+        );
+      }
+      let normalized: TImageGenerationResponse;
+      try {
+        normalized = normalizeImageResponse(upstream);
+      } catch (err) {
+        return stamp(
+          errorJson(
+            502,
+            err instanceof Error
+              ? `upstream image provider returned invalid data: ${err.message}`
+              : "upstream image provider returned invalid data",
+          ),
+        );
+      }
+      const includeBase64 = imageRequest.response_format === "b64_json";
+      let persistedItems: ReadonlyArray<TImageDataItem>;
+      try {
+        persistedItems = await Promise.all(
+          normalized.data.map((item) =>
+            persistImageDataItem(item, includeBase64, args),
+          ),
+        );
+      } catch {
+        return stamp(errorJson(502, "Failed to persist generated image"));
+      }
+      report(
+        {
+          model: hop.modelId,
+          provider: hop.provider,
+          status: statusFor(resp.status),
+          tokens_in: 0,
+          tokens_out: 0,
+          latency_ms: Date.now() - args.startedAt,
+          endpoint: args.endpoint,
+          ...(acquired.accountHash !== null
+            ? { account_hash: acquired.accountHash }
+            : {}),
+        },
+        args.originParam,
       );
-    });
-  if (hop === undefined) {
-    return errorJson(
-      404,
-      "No subscription image provider in the daemon plan can serve this request",
-    );
+      return stamp(
+        new Response(JSON.stringify({ ...normalized, data: persistedItems }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        hop.modelId,
+      );
+    }
+    attempted.push(hop.modelId);
+    const forwarded = await forwardMediaHopToCloud(args, hop.modelId);
+    if (forwarded.ok) {
+      return stamp(forwarded, hop.modelId);
+    }
+    lastError = forwarded;
+    if (
+      !last &&
+      mediaHopAdvances({
+        dispatched: true,
+        httpStatus: forwarded.status,
+        errorCode: mediaHttpErrorCode(forwarded.status),
+        accepted: false,
+      })
+    ) {
+      continue;
+    }
+    return stamp(forwarded);
   }
-
-  const acquired = await acquireImageUpstream(hop.provider, args, hop);
-  if (acquired === "retry") {
-    return errorJson(404, `No image credential available for ${hop.provider}`);
-  }
-
-  let upstreamBody: Record<string, unknown>;
-  try {
-    upstreamBody = buildImageUpstreamBody(
-      hop.provider,
-      imageRequest,
-      hop.providerModelId,
-    );
-  } catch (err) {
-    return errorJson(
-      400,
-      err instanceof Error ? err.message : "Unsupported image provider",
-    );
-  }
-
-  const resp = await postUpstream(
-    acquired.url,
-    {
-      method: "POST",
-      headers: {
-        ...acquired.headers,
-        "content-type": "application/json",
-        accept: "application/json",
-      },
-      body: JSON.stringify(upstreamBody),
-      signal: args.req.signal,
-    },
-    // `postUpstream` makes exactly one attempt — correct for non-idempotent
-    // image generation (a 5xx retry could double-generate if the first attempt
-    // actually succeeded upstream).
-  );
-  if (resp === null) {
-    return args.req.signal.aborted
-      ? errorJson(499, "client aborted request")
-      : errorJson(502, "upstream image provider is unreachable");
-  }
-
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
-    report(
-      {
-        model: hop.modelId,
-        provider: hop.provider,
-        status: statusFor(resp.status),
-        tokens_in: 0,
-        tokens_out: 0,
-        latency_ms: Date.now() - args.startedAt,
-        endpoint: args.endpoint,
-        ...(acquired.accountHash !== null
-          ? { account_hash: acquired.accountHash }
-          : {}),
-      },
-      args.originParam,
-    );
-    // Preserve upstream headers (retry-after, the real content-type) minus
-    // hop-by-hop; forcing application/json here would drop rate-limit hints and
-    // mislabel non-JSON error bodies.
-    return new Response(body.length > 0 ? body : null, {
-      status: resp.status,
-      headers: passthroughHeaders(resp),
-    });
-  }
-
-  let upstream: unknown;
-  try {
-    upstream = await resp.json();
-  } catch {
-    return errorJson(502, "upstream image provider returned invalid JSON");
-  }
-  let normalized: TImageGenerationResponse;
-  try {
-    normalized = normalizeImageResponse(upstream);
-  } catch (err) {
-    return errorJson(
-      502,
-      err instanceof Error
-        ? `upstream image provider returned invalid data: ${err.message}`
-        : "upstream image provider returned invalid data",
-    );
-  }
-
-  const includeBase64 = imageRequest.response_format === "b64_json";
-  let persistedItems: ReadonlyArray<TImageDataItem>;
-  try {
-    persistedItems = await Promise.all(
-      normalized.data.map((item) =>
-        persistImageDataItem(item, includeBase64, args),
+  return stamp(
+    lastError ??
+      errorJson(
+        404,
+        "No image provider in the daemon plan can serve this request",
       ),
-    );
-  } catch {
-    return errorJson(502, "Failed to persist generated image");
-  }
-
-  const response = {
-    ...normalized,
-    data: persistedItems,
-  };
-  report(
-    {
-      model: hop.modelId,
-      provider: hop.provider,
-      status: statusFor(resp.status),
-      tokens_in: 0,
-      tokens_out: 0,
-      latency_ms: Date.now() - args.startedAt,
-      endpoint: args.endpoint,
-      ...(acquired.accountHash !== null
-        ? { account_hash: acquired.accountHash }
-        : {}),
-    },
-    args.originParam,
   );
-  return new Response(JSON.stringify(response), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
 };
 
 // ─── Image EDITS ───────────────────────────────────────────────────────────
@@ -589,47 +656,65 @@ export const runImageEditWalker = async (
   }
 
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
-  const hop = parsePlan(args.planParam)
-    .map((modelId, index) => resolveHop(modelId, pmids[index]))
-    .find((candidate) => {
-      const delegate = getDelegate(candidate.provider);
-      return (
-        isSubscriptionSlug(candidate.provider) &&
-        delegate?.credentialForImageEdit !== undefined
-      );
+  const hops = parsePlan(args.planParam).map((modelId, index) =>
+    resolveHop(modelId, pmids[index]),
+  );
+  const attempted: string[] = [];
+  const stamp = (resp: Response, resolved?: string): Response =>
+    withMediaAttribution(resp, {
+      attempted,
+      ...(resolved !== undefined ? { resolvedModel: resolved } : {}),
     });
-  if (hop === undefined) {
-    return errorJson(
-      404,
-      "No subscription image-edit provider in the daemon plan can serve this request",
-    );
-  }
 
-  const acquired = await acquireImageEditUpstream(hop.provider, args, hop);
-  if (acquired === "retry") {
-    return errorJson(
-      404,
-      `No image-edit credential available for ${hop.provider}`,
-    );
-  }
-
-  let upstreamBody: Record<string, unknown>;
-  try {
-    upstreamBody = buildImageEditUpstreamBody(
-      hop.provider,
-      editRequest,
-      hop.providerModelId,
-    );
-  } catch (err) {
-    return errorJson(
-      400,
-      err instanceof Error ? err.message : "Unsupported image-edit provider",
-    );
-  }
-
-  const resp = await postUpstream(
-    acquired.url,
-    {
+  let lastError: Response | null = null;
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    if (hop === undefined) continue;
+    const last = i === hops.length - 1;
+    if (!isSubscriptionSlug(hop.provider)) {
+      continue;
+    }
+    const acquired = await acquireImageEditUpstream(hop.provider, args, hop);
+    if (acquired === "retry") {
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      )
+        continue;
+      return stamp(
+        errorJson(
+          404,
+          `No image-edit credential available for ${hop.provider}`,
+        ),
+      );
+    }
+    attempted.push(hop.modelId);
+    let upstreamBody: Record<string, unknown>;
+    try {
+      upstreamBody = buildImageEditUpstreamBody(
+        hop.provider,
+        editRequest,
+        hop.providerModelId,
+      );
+    } catch (err) {
+      lastError = errorJson(
+        400,
+        err instanceof Error ? err.message : "Unsupported image-edit provider",
+      );
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: false,
+          errorCode: "missing_credential",
+        })
+      )
+        continue;
+      return stamp(lastError);
+    }
+    const resp = await postUpstream(acquired.url, {
       method: "POST",
       headers: {
         ...acquired.headers,
@@ -638,18 +723,80 @@ export const runImageEditWalker = async (
       },
       body: JSON.stringify(upstreamBody),
       signal: args.req.signal,
-    },
-    // One attempt, like generation — a 5xx retry could double-edit if the
-    // first attempt actually succeeded upstream.
-  );
-  if (resp === null) {
-    return args.req.signal.aborted
-      ? errorJson(499, "client aborted request")
-      : errorJson(502, "upstream image-edit provider is unreachable");
-  }
-
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
+    });
+    if (resp === null) {
+      return stamp(
+        args.req.signal.aborted
+          ? errorJson(499, "client aborted request")
+          : errorJson(502, "upstream image-edit provider is unreachable"),
+      );
+    }
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      report(
+        {
+          model: hop.modelId,
+          provider: hop.provider,
+          status: statusFor(resp.status),
+          tokens_in: 0,
+          tokens_out: 0,
+          latency_ms: Date.now() - args.startedAt,
+          endpoint: args.endpoint,
+          ...(acquired.accountHash !== null
+            ? { account_hash: acquired.accountHash }
+            : {}),
+        },
+        args.originParam,
+      );
+      lastError = new Response(body.length > 0 ? body : null, {
+        status: resp.status,
+        headers: passthroughHeaders(resp),
+      });
+      if (
+        !last &&
+        mediaHopAdvances({
+          dispatched: true,
+          httpStatus: resp.status,
+          errorCode: mediaHttpErrorCode(resp.status),
+          accepted: false,
+        })
+      ) {
+        continue;
+      }
+      return stamp(lastError);
+    }
+    let upstream: unknown;
+    try {
+      upstream = await resp.json();
+    } catch {
+      return stamp(
+        errorJson(502, "upstream image-edit provider returned invalid JSON"),
+      );
+    }
+    let normalized: TImageGenerationResponse;
+    try {
+      normalized = normalizeImageResponse(upstream);
+    } catch (err) {
+      return stamp(
+        errorJson(
+          502,
+          err instanceof Error
+            ? `upstream image-edit provider returned invalid data: ${err.message}`
+            : "upstream image-edit provider returned invalid data",
+        ),
+      );
+    }
+    const includeBase64 = editRequest.response_format === "b64_json";
+    let persistedItems: ReadonlyArray<TImageEditDataItem>;
+    try {
+      persistedItems = await Promise.all(
+        normalized.data.map((item) =>
+          persistImageEditResultItem(item, includeBase64, args),
+        ),
+      );
+    } catch {
+      return stamp(errorJson(502, "Failed to persist edited image"));
+    }
     report(
       {
         model: hop.modelId,
@@ -665,63 +812,19 @@ export const runImageEditWalker = async (
       },
       args.originParam,
     );
-    return new Response(body.length > 0 ? body : null, {
-      status: resp.status,
-      headers: passthroughHeaders(resp),
-    });
-  }
-
-  let upstream: unknown;
-  try {
-    upstream = await resp.json();
-  } catch {
-    return errorJson(502, "upstream image-edit provider returned invalid JSON");
-  }
-  let normalized: TImageGenerationResponse;
-  try {
-    normalized = normalizeImageResponse(upstream);
-  } catch (err) {
-    return errorJson(
-      502,
-      err instanceof Error
-        ? `upstream image-edit provider returned invalid data: ${err.message}`
-        : "upstream image-edit provider returned invalid data",
+    return stamp(
+      new Response(JSON.stringify({ ...normalized, data: persistedItems }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      hop.modelId,
     );
   }
-
-  const includeBase64 = editRequest.response_format === "b64_json";
-  let persistedItems: ReadonlyArray<TImageEditDataItem>;
-  try {
-    persistedItems = await Promise.all(
-      normalized.data.map((item) =>
-        persistImageEditResultItem(item, includeBase64, args),
+  return stamp(
+    lastError ??
+      errorJson(
+        404,
+        "No subscription image-edit provider in the daemon plan can serve this request",
       ),
-    );
-  } catch {
-    return errorJson(502, "Failed to persist edited image");
-  }
-
-  const response = {
-    ...normalized,
-    data: persistedItems,
-  };
-  report(
-    {
-      model: hop.modelId,
-      provider: hop.provider,
-      status: statusFor(resp.status),
-      tokens_in: 0,
-      tokens_out: 0,
-      latency_ms: Date.now() - args.startedAt,
-      endpoint: args.endpoint,
-      ...(acquired.accountHash !== null
-        ? { account_hash: acquired.accountHash }
-        : {}),
-    },
-    args.originParam,
   );
-  return new Response(JSON.stringify(response), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
 };

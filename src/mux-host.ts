@@ -1,6 +1,7 @@
 import type { TRelayFrame } from "@openllmsh/protocol";
 import {
   MEDIA_HTTP_CAP,
+  MEDIA_HTTP_VIDEO_CAP,
   MUX_CAP,
   REALTIME_DUPLEX_CAP,
   RTC_CAP,
@@ -42,6 +43,7 @@ export const DAEMON_MUX_CAPS = [
   RTC_CAP,
   REALTIME_DUPLEX_CAP,
   MEDIA_HTTP_CAP,
+  MEDIA_HTTP_VIDEO_CAP,
 ] as const;
 // `REALTIME_DUPLEX_CAP` ("realtime1") ENABLED — the prior "not yet advertised"
 // state is resolved. A live probe through this exact source path

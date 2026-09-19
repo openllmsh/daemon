@@ -27,11 +27,9 @@ import type {
 import {
   MEDIA_PERSISTENCE_BROWSER,
   MEDIA_PERSISTENCE_REQUEST_HEADER,
-  MEDIA_PERSISTENCE_RESPONSE_HEADER,
-  MEDIA_URL_RESPONSE_HEADER,
-  TUNNEL_MEDIA_URL_MAX_LENGTH,
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
+  tunnelResponseHeadersFromHttp,
 } from "@openllmsh/protocol";
 import type { TServeTunnel } from "@openllmsh/tunnel/streams";
 import { handleInference } from "./listener";
@@ -45,7 +43,15 @@ const MAX_SERVED_TUNNELS = 8;
 
 /** The local endpoint each closed-vocabulary surface maps to. No free URL
  *  path ever crosses the relay — the serving daemon owns this mapping. */
-const surfacePath = (surface: TTunnelSurface): string => {
+const isVideoGetSurface = (
+  surface: TTunnelSurface,
+): surface is "video_retrieve" | "video_content" =>
+  surface === "video_retrieve" || surface === "video_content";
+
+const surfacePath = (
+  surface: TTunnelSurface,
+  videoId: string | undefined,
+): string => {
   switch (surface) {
     case "chat_completions":
       return "/v1/chat/completions";
@@ -63,6 +69,12 @@ const surfacePath = (surface: TTunnelSurface): string => {
       return "/v1/images/generations";
     case "images_edits":
       return "/v1/images/edits";
+    case "video_create":
+      return "/v1/videos";
+    case "video_retrieve":
+      return `/v1/videos/${encodeURIComponent(videoId ?? "")}`;
+    case "video_content":
+      return `/v1/videos/${encodeURIComponent(videoId ?? "")}/content`;
   }
 };
 
@@ -115,18 +127,22 @@ function tunneledRequest(
   body: ReadableStream<Uint8Array> | Uint8Array,
   signal: AbortSignal,
 ): Request {
-  const url = `http://127.0.0.1${surfacePath(open.surface)}`;
+  const url = `http://127.0.0.1${surfacePath(open.surface, open.headers?.video_id)}`;
   const headers = forwardedHeaders(open);
+  const method = isVideoGetSurface(open.surface) ? "GET" : "POST";
+  if (method === "GET") {
+    return new Request(url, { method, headers, signal });
+  }
   if (body instanceof Uint8Array) {
     return new Request(url, {
-      method: "POST",
+      method,
       headers,
       body: body as unknown as BodyInit,
       signal,
     });
   }
   return new Request(url, {
-    method: "POST",
+    method,
     headers,
     body,
     duplex: "half",
@@ -168,24 +184,9 @@ export const serveMuxTunnel: TServeTunnel = async (open, body, signal) => {
   }
   try {
     const response = await dispatch(tunneledRequest(open, body, signal));
-    const contentType =
-      response.headers.get("content-type") ?? "application/json";
-    const mediaUrl = response.headers.get(MEDIA_URL_RESPONSE_HEADER);
     return {
       status: response.status,
-      headers: {
-        ...(mediaUrl === null ||
-        mediaUrl.length === 0 ||
-        mediaUrl.length > TUNNEL_MEDIA_URL_MAX_LENGTH
-          ? {}
-          : { media_url: mediaUrl }),
-        ...(response.headers.get(MEDIA_PERSISTENCE_RESPONSE_HEADER) ===
-        MEDIA_PERSISTENCE_BROWSER
-          ? { media_persistence: MEDIA_PERSISTENCE_BROWSER }
-          : {}),
-        content_type: contentType,
-        is_sse: contentType.includes("text/event-stream"),
-      },
+      headers: tunnelResponseHeadersFromHttp(response.headers),
       body: response.body,
       onComplete: complete,
     };

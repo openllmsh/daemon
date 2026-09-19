@@ -19,6 +19,7 @@ import {
   AnthropicCountTokensRequest,
   AnthropicRequest,
   ChatCompletionRequest,
+  decodeVideoId,
   ImageGenerationInput,
   ImageGenerationRequest,
   parseImageEditInput,
@@ -40,6 +41,7 @@ import {
 import {
   fetchMediaDefaultPlan,
   fetchPlan,
+  fetchVideoJobPlan,
   MediaDefaultPlanError,
 } from "./cloud-client";
 import { planCacheEnabled } from "./config";
@@ -565,27 +567,14 @@ export const handleInference = async (req: Request): Promise<Response> => {
     }
     const materialized = await materializeFromVerifiedPlan(fetched.plan);
     if (materialized !== null) return withCors(req, materialized);
-    const hasSubscriptionHop = parsePlan(fetched.plan).some((entry) =>
-      isSubscriptionSlug(entry.split("/")[0] ?? ""),
-    );
-    const selected = selectedModelFromPlan(fetched.plan);
-    if (!hasSubscriptionHop) {
-      if (selected === null) {
-        return withCors(
-          req,
-          errorJson(400, "Signed plan did not include a model"),
-        );
-      }
+    if (selectedModelFromPlan(fetched.plan) === null) {
       return withCors(
         req,
-        await passthroughToOrigin(req, rawBytes, {
-          pinModel: selected,
-          ...(passthroughContentType !== null
-            ? { contentType: passthroughContentType }
-            : {}),
-        }),
+        errorJson(400, "Signed plan did not include a model"),
       );
     }
+    // Keep the FULL signed chain. Materialized body model is for decode
+    // only; walkers iterate remaining hops (subscription then pinned API).
     planParam = fetched.plan;
     pmidsParam = fetched.pmids;
     originParam = fetched.origin;
@@ -593,8 +582,97 @@ export const handleInference = async (req: Request): Promise<Response> => {
     sigParam = fetched.sig;
   }
 
+  // Mux GET video retrieve/content has no body and no ?__plan=. Decode the
+  // opaque job id (provider + model) and fetch a signed plan for that model.
+  // HMAC is still required; a plan that does not cover the job is rejected.
+  if (
+    planParam === null &&
+    isBodylessVideoOp(videoOperation) &&
+    videoId !== undefined
+  ) {
+    let jobId = videoId;
+    try {
+      jobId = decodeURIComponent(videoId);
+    } catch {
+      return withCors(req, errorJson(400, "Invalid video job id"));
+    }
+    const payload = decodeVideoId(jobId);
+    if (payload === null) {
+      return withCors(req, errorJson(400, "Invalid video job id"));
+    }
+    let fetched: Awaited<ReturnType<typeof fetchVideoJobPlan>> | null = null;
+    try {
+      fetched = await fetchVideoJobPlan(
+        { model: payload.m, provider: payload.p },
+        req.signal,
+      );
+    } catch (err) {
+      if (err instanceof MediaDefaultPlanError) {
+        return withCors(
+          req,
+          errorJson(err.status, err.message, err.type, err.code),
+        );
+      }
+      const outcome = handlePlanFetchError(err, payload.m);
+      if (outcome === "throw") throw err;
+      if (outcome !== "passthrough") return outcome;
+      return withCors(
+        req,
+        errorJson(502, "Video job plan is unavailable", "plan_error"),
+      );
+    }
+    if (fetched === null) {
+      return withCors(
+        req,
+        errorJson(502, "Video job plan is unavailable", "plan_error"),
+      );
+    }
+    const fetchedContextOverflowStrategy =
+      fetched.context_overflow_strategy ?? null;
+    const verified = planSignatureOk(
+      fetched.plan,
+      fetched.pmids,
+      fetched.origin,
+      fetchedContextOverflowStrategy,
+      fetched.sig,
+    );
+    if (!verified) {
+      return withCors(
+        req,
+        errorJson(403, "invalid or missing __plan signature"),
+      );
+    }
+    planParam = fetched.plan;
+    pmidsParam = fetched.pmids;
+    originParam = fetched.origin;
+    contextOverflowStrategy = fetchedContextOverflowStrategy;
+    sigParam = fetched.sig;
+    const hops = parsePlan(planParam);
+    const coversJob = hops.some((id) => id === payload.m);
+    if (!coversJob) {
+      return withCors(
+        req,
+        errorJson(403, "Signed plan does not cover this video job"),
+      );
+    }
+  }
+
+  const walkHeaders = new Headers(req.headers);
+  if (passthroughContentType !== null) {
+    walkHeaders.set("content-type", passthroughContentType);
+    walkHeaders.delete("content-length");
+  }
+  const walkReq =
+    passthroughContentType !== null
+      ? new Request(req.url, {
+          method: req.method,
+          headers: walkHeaders,
+          signal: req.signal,
+        })
+      : req;
+
   const walkArgs = {
-    req,
+    req: walkReq,
     surface,
     endpoint,
     rawBody,
