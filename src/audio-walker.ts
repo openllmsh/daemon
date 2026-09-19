@@ -248,7 +248,8 @@ const normalizeTranscriptionInput = (
   if (match === null) {
     return {
       status: 400,
-      message: "`file` must be a `data:<mime>;base64,...` URL",
+      message:
+        'Daemon HTTP JSON requires `file` starting with "data:audio/wav;base64," followed by actual encoded audio, or a multipart/form-data file upload. The CLI MCP transcription tool accepts {"path":"./voice-note.ogg"} instead and reads the local audio itself.',
     };
   }
   const bytes = decodeBase64(match[2] ?? "");
