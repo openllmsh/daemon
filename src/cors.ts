@@ -123,12 +123,14 @@ export const errorJson = (
   status: number,
   message: string,
   type?: string,
+  code?: string,
 ): Response =>
   new Response(
     JSON.stringify({
       error: {
         message,
         ...(type !== undefined ? { type } : {}),
+        ...(code !== undefined ? { code } : {}),
       },
     }),
     {

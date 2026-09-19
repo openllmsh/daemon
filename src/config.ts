@@ -237,3 +237,11 @@ export const setCatalogForTest = (
   snapshot = { ...EMPTY, catalog: [...catalog] };
   byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
 };
+
+/** Test seam: pin the per-user plan HMAC key (null = unsigned-dev mode). */
+export const setPlanSigningKeyForTest = (key: string | null): void => {
+  snapshot = {
+    ...snapshot,
+    plan_signing_key: key,
+  };
+};

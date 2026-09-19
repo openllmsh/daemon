@@ -88,3 +88,36 @@ export const multipartFile = (
   fieldName: string,
 ): TParsedMultipartFile | undefined =>
   parsed.files.find((file) => file.fieldName === fieldName);
+
+/**
+ * Re-serialize a parsed multipart body with extra/overridden string fields
+ * (used to inject a cloud-selected `model` into a model-less upload). Uses
+ * the platform FormData serializer so quotes/CRLF in names cannot inject
+ * extra parts. The original inbound Content-Type/boundary/Content-Length
+ * MUST NOT be reused.
+ */
+export const serializeMultipartWithFields = async (
+  parsed: TParsedMultipart,
+  extraFields: Readonly<Record<string, string>>,
+): Promise<{ readonly bytes: ArrayBuffer; readonly contentType: string }> => {
+  const form = new FormData();
+  const fields = { ...parsed.fields, ...extraFields };
+  for (const [name, value] of Object.entries(fields)) {
+    form.set(name, value);
+  }
+  for (const file of parsed.files) {
+    const filename = file.filename ?? "blob";
+    const type = file.contentType ?? "application/octet-stream";
+    form.append(
+      file.fieldName,
+      new File([new Uint8Array(file.bytes)], filename, { type }),
+    );
+  }
+  const encoded = new Response(form);
+  const contentType = encoded.headers.get("content-type");
+  if (contentType === null || !contentType.includes("multipart/form-data")) {
+    throw new Error("failed to serialize multipart body");
+  }
+  const bytes = await encoded.arrayBuffer();
+  return { bytes, contentType };
+};

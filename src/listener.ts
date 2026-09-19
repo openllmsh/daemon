@@ -19,10 +19,12 @@ import {
   AnthropicCountTokensRequest,
   AnthropicRequest,
   ChatCompletionRequest,
+  ImageGenerationInput,
   ImageGenerationRequest,
   parseImageEditInput,
   parseImageEditMultipart,
   ResponsesRequest,
+  VideoGenerationInput,
   VideoGenerationRequest,
 } from "@openllmsh/protocol";
 import {
@@ -35,7 +37,11 @@ import {
   runAudioSpeechWalker,
   runAudioTranscriptionWalker,
 } from "./audio-walker";
-import { fetchPlan } from "./cloud-client";
+import {
+  fetchMediaDefaultPlan,
+  fetchPlan,
+  MediaDefaultPlanError,
+} from "./cloud-client";
 import { planCacheEnabled } from "./config";
 import { notePresenceActivity } from "./control-channel";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
@@ -43,6 +49,13 @@ import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
 import { runImageEditWalker, runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
+import {
+  buildMediaDefaultRequest,
+  materializeSelectedModel,
+  mediaDefaultSurfaceFor,
+  modelFieldFromRequest,
+  selectedModelFromPlan,
+} from "./media-default-handoff";
 import type { TParsedMultipart } from "./multipart";
 import { parseMultipartBytes } from "./multipart";
 import {
@@ -70,7 +83,9 @@ import {
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
 const parseImageRequest = Schema.decodeUnknownSync(ImageGenerationRequest);
+const parseImageInput = Schema.decodeUnknownSync(ImageGenerationInput);
 const parseVideoRequest = Schema.decodeUnknownSync(VideoGenerationRequest);
+const parseVideoInput = Schema.decodeUnknownSync(VideoGenerationInput);
 const parseResponsesRequest = Schema.decodeUnknownSync(ResponsesRequest);
 const parseCountTokensRequest = Schema.decodeUnknownSync(
   AnthropicCountTokensRequest,
@@ -195,27 +210,55 @@ export const handleInference = async (req: Request): Promise<Response> => {
     );
   }
 
-  // Inline image edits are normalized to the SAME canonical JSON shape
-  // regardless of encoding, so every downstream consumer of `rawBody`
-  // (the local-first-gateway alias read below, `runImageEditWalker`) sees
-  // one contract. `parseImageEditMultipart` flattens the uploaded file into
-  // a `data:` URL first; `parseImageEditInput` handles an inbound JSON body
-  // directly.
+  const mediaSurface = mediaDefaultSurfaceFor({
+    isImages,
+    isImageEdits,
+    isTranscriptions,
+    isSpeech,
+    isVideoCreate: videoOperation === "create",
+  });
+  const modelField = modelFieldFromRequest(rawBody, multipart);
+  // Empty/non-string `model` is only a media-default concern. Compact and
+  // other non-media surfaces keep their existing parsers (compact is a
+  // verbatim vendor passthrough).
+  if (mediaSurface !== null && modelField.kind === "invalid") {
+    return withCors(req, errorJson(400, "Invalid request body"));
+  }
+
+  // Inline image edits: explicit model normalizes immediately. Model-less
+  // edits only run structural validation (mask/refs) here; required-model
+  // decoding waits until a verified signed plan supplies the selection.
+  let imageEditPending = false;
   if (isImageEdits) {
+    const fieldsForParse =
+      multipart !== null
+        ? {
+            ...multipart.fields,
+            ...(modelField.kind === "absent" ? { model: "_" } : {}),
+          }
+        : null;
+    const bodyForParse =
+      multipart === null && modelField.kind === "absent"
+        ? { ...(rawBody as Record<string, unknown>), model: "_" }
+        : rawBody;
     const parsedEdit =
       multipart !== null
         ? parseImageEditMultipart({
-            fields: multipart.fields,
+            fields: fieldsForParse ?? multipart.fields,
             files: multipart.files,
           })
-        : parseImageEditInput(rawBody);
+        : parseImageEditInput(bodyForParse);
     if (!parsedEdit.ok) {
       return withCors(
         req,
         errorJson(400, parsedEdit.error.message, parsedEdit.error.code),
       );
     }
-    rawBody = parsedEdit.request;
+    if (modelField.kind === "explicit") {
+      rawBody = parsedEdit.request;
+    } else {
+      imageEditPending = true;
+    }
   }
 
   // Validate against the surface schema for a clean 400 — the walker
@@ -223,18 +266,23 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // body would otherwise surface as an opaque upstream/transform failure.
   // Compact bodies skip this: the vendor owns that contract and the call
   // is forwarded verbatim (strictness here would 400 shapes the upstream
-  // accepts).
+  // accepts). Model-less media uses optional-model INPUT schemas; concrete
+  // required-model schemas run after a verified plan materializes `model`.
   try {
     if (isResponsesCompact) {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
-    else if (videoOperation === "create") parseVideoRequest(rawBody);
-    else if (isBodylessVideoOp(videoOperation)) {
+    else if (videoOperation === "create") {
+      if (modelField.kind === "explicit") parseVideoRequest(rawBody);
+      else parseVideoInput(rawBody);
+    } else if (isBodylessVideoOp(videoOperation)) {
       // no-op — id-addressed video ops carry no body (rawBody is null); the
       // signed plan rides the query string, so there's nothing to validate.
-    } else if (isImages) parseImageRequest(rawBody);
-    else if (isImageEdits) {
-      // no-op — already normalized + validated above.
+    } else if (isImages) {
+      if (modelField.kind === "explicit") parseImageRequest(rawBody);
+      else parseImageInput(rawBody);
+    } else if (isImageEdits) {
+      // no-op — structural validation above; concrete decode after plan.
     } else if (isTranscriptions || isSpeech) {
       // no-op — the audio walker validates its own shape (either JSON or
       // multipart for transcriptions; JSON-only for speech).
@@ -274,13 +322,12 @@ export const handleInference = async (req: Request): Promise<Response> => {
     url.searchParams.get("__context_overflow_strategy"),
   );
   let sigParam = url.searchParams.get("__sig");
-  // A multipart transcription upload carries its alias in the form field,
-  // not a JSON `rawBody` (`rawBody` stays null for that shape).
-  const alias =
-    rawBody !== null
-      ? (rawBody as { model?: unknown }).model
-      : multipart?.fields.model;
-  if (planCacheEnabled() && typeof alias === "string" && alias.length > 0) {
+  let passthroughContentType: string | null = null;
+  const explicitAlias =
+    modelField.kind === "explicit" ? modelField.value : null;
+  // Never cache model-less defaults under one empty alias — selection
+  // depends on surface/options and current availability.
+  if (planCacheEnabled() && explicitAlias !== null) {
     if (planParam !== null) {
       if (
         planSignatureOk(
@@ -291,7 +338,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
           sigParam,
         )
       ) {
-        storePlan(alias, {
+        storePlan(explicitAlias, {
           planParam,
           pmidsParam,
           originParam,
@@ -300,7 +347,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
         });
       }
     } else {
-      const cached = lookupPlan(alias);
+      const cached = lookupPlan(explicitAlias);
       if (cached !== null) {
         ({
           planParam,
@@ -313,6 +360,90 @@ export const handleInference = async (req: Request): Promise<Response> => {
     }
   }
 
+  const materializeFromVerifiedPlan = async (
+    plan: string,
+  ): Promise<Response | null> => {
+    if (explicitAlias !== null) return null;
+    const selected = selectedModelFromPlan(plan);
+    if (selected === null) {
+      return errorJson(400, "Signed plan did not include a model");
+    }
+    const next = await materializeSelectedModel({
+      model: selected,
+      rawBody,
+      rawBytes,
+      multipart,
+      requestContentType,
+    });
+    rawBody = next.rawBody;
+    rawBytes = next.rawBytes;
+    multipart = next.multipart;
+    passthroughContentType = next.contentType;
+    if (imageEditPending) {
+      const parsedEdit =
+        multipart !== null
+          ? parseImageEditMultipart({
+              fields: multipart.fields,
+              files: multipart.files,
+            })
+          : parseImageEditInput(rawBody);
+      if (!parsedEdit.ok) {
+        return errorJson(400, parsedEdit.error.message, parsedEdit.error.code);
+      }
+      rawBody = parsedEdit.request;
+    }
+    return null;
+  };
+
+  const rejectUnverifiedRedirect = (): Response =>
+    withCors(req, errorJson(403, "invalid or missing __plan signature"));
+
+  // 307-borne: verify the signed tuple BEFORE deriving a missing model or
+  // running required-model decode. Unsigned/tampered plans never authorize
+  // inference; an explicit caller model is never rewritten.
+  if (planParam !== null && explicitAlias === null && mediaSurface !== null) {
+    if (
+      !planSignatureOk(
+        planParam,
+        pmidsParam,
+        originParam,
+        contextOverflowStrategy,
+        sigParam,
+      )
+    ) {
+      return rejectUnverifiedRedirect();
+    }
+    const materialized = await materializeFromVerifiedPlan(planParam);
+    if (materialized !== null) return withCors(req, materialized);
+  }
+
+  const handlePlanFetchError = (
+    err: unknown,
+    label: string,
+  ): Response | "passthrough" | "throw" => {
+    const decision = planFetchFailureAction(err, req.signal);
+    if (decision.action === "origin-error") {
+      logWarn(
+        "listener",
+        `plan fetch ${decision.kind} for ${label} — not repeating the same origin`,
+      );
+      return withCors(
+        req,
+        errorJson(
+          originFailureStatus(decision.kind),
+          originFailureMessage(decision.kind),
+          originFailureType(decision.kind),
+        ),
+      );
+    }
+    if (decision.action === "throw") return "throw";
+    logWarn(
+      "listener",
+      `plan fetch failed for ${label} — passing through to origin (${err instanceof Error ? err.message : String(err)})`,
+    );
+    return "passthrough";
+  };
+
   // Local-first gateway (docs/proposals/local-first-gateway.md): a DIRECT
   // request (no `?__plan=` — the client's base URL is the daemon, baked at
   // install time by a `--gateway local` setup) that the plan cache didn't
@@ -323,36 +454,18 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // verbatim — the cloud keeps its own fallback/cooldown machinery,
   // byte-identical to a directly-pointed client. 307-borne requests are
   // untouched by this branch.
-  if (
-    planParam === null &&
-    !isResponsesCompact &&
-    typeof alias === "string" &&
-    alias.length > 0
-  ) {
+  if (planParam === null && !isResponsesCompact && explicitAlias !== null) {
     let fetched: Awaited<ReturnType<typeof fetchPlan>> | null = null;
     try {
-      fetched = await fetchPlan(alias, estimateBodyTokens(rawBody), req.signal);
-    } catch (err) {
-      const decision = planFetchFailureAction(err, req.signal);
-      if (decision.action === "origin-error") {
-        logWarn(
-          "listener",
-          `plan fetch ${decision.kind} for ${alias} — not repeating the same origin`,
-        );
-        return withCors(
-          req,
-          errorJson(
-            originFailureStatus(decision.kind),
-            originFailureMessage(decision.kind),
-            originFailureType(decision.kind),
-          ),
-        );
-      }
-      if (decision.action === "throw") throw err;
-      logWarn(
-        "listener",
-        `plan fetch failed for ${alias} — passing through to origin (${err instanceof Error ? err.message : String(err)})`,
+      fetched = await fetchPlan(
+        explicitAlias,
+        estimateBodyTokens(rawBody),
+        req.signal,
       );
+    } catch (err) {
+      const outcome = handlePlanFetchError(err, explicitAlias);
+      if (outcome === "throw") throw err;
+      if (outcome !== "passthrough") return outcome;
     }
     if (fetched === null) {
       return withCors(req, await passthroughToOrigin(req, rawBytes));
@@ -372,8 +485,6 @@ export const handleInference = async (req: Request): Promise<Response> => {
         isSubscriptionSlug(entry.split("/")[0] ?? ""),
       );
     if (!verified || !hasSubscriptionHop) {
-      // Unverifiable, or nothing for the box to serve — the origin is
-      // strictly better placed to run this request.
       return withCors(req, await passthroughToOrigin(req, rawBytes));
     }
     planParam = fetched.plan;
@@ -382,7 +493,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
     contextOverflowStrategy = fetchedContextOverflowStrategy;
     sigParam = fetched.sig;
     if (planCacheEnabled()) {
-      storePlan(alias, {
+      storePlan(explicitAlias, {
         planParam,
         pmidsParam,
         originParam,
@@ -390,6 +501,96 @@ export const handleInference = async (req: Request): Promise<Response> => {
         sigParam,
       });
     }
+  } else if (
+    planParam === null &&
+    !isResponsesCompact &&
+    explicitAlias === null &&
+    mediaSurface !== null
+  ) {
+    const mediaRequest = buildMediaDefaultRequest(
+      mediaSurface,
+      rawBody,
+      multipart,
+    );
+    if (mediaRequest === null) {
+      return withCors(req, errorJson(400, "Invalid media default constraints"));
+    }
+    let fetched: Awaited<ReturnType<typeof fetchMediaDefaultPlan>> | null =
+      null;
+    try {
+      fetched = await fetchMediaDefaultPlan(mediaRequest, req.signal);
+    } catch (err) {
+      if (err instanceof MediaDefaultPlanError) {
+        logWarn(
+          "listener",
+          `media default plan ${err.status} ${err.type} — not forwarding media`,
+        );
+        return withCors(
+          req,
+          errorJson(err.status, err.message, err.type, err.code),
+        );
+      }
+      const outcome = handlePlanFetchError(err, mediaSurface);
+      if (outcome === "throw") throw err;
+      if (outcome !== "passthrough") return outcome;
+      // Model-less media must not forward prompt/bytes to origin after a
+      // failed selection — that would leak content and let the cloud pick
+      // a paid model under NO_DAEMON. Explicit-model failures still
+      // passthrough above.
+      return withCors(
+        req,
+        errorJson(502, "Media default plan is unavailable", "plan_error"),
+      );
+    }
+    if (fetched === null) {
+      return withCors(
+        req,
+        errorJson(502, "Media default plan is unavailable", "plan_error"),
+      );
+    }
+    const fetchedContextOverflowStrategy =
+      fetched.context_overflow_strategy ?? null;
+    const verified = planSignatureOk(
+      fetched.plan,
+      fetched.pmids,
+      fetched.origin,
+      fetchedContextOverflowStrategy,
+      fetched.sig,
+    );
+    if (!verified) {
+      return withCors(
+        req,
+        errorJson(403, "invalid or missing __plan signature"),
+      );
+    }
+    const materialized = await materializeFromVerifiedPlan(fetched.plan);
+    if (materialized !== null) return withCors(req, materialized);
+    const hasSubscriptionHop = parsePlan(fetched.plan).some((entry) =>
+      isSubscriptionSlug(entry.split("/")[0] ?? ""),
+    );
+    const selected = selectedModelFromPlan(fetched.plan);
+    if (!hasSubscriptionHop) {
+      if (selected === null) {
+        return withCors(
+          req,
+          errorJson(400, "Signed plan did not include a model"),
+        );
+      }
+      return withCors(
+        req,
+        await passthroughToOrigin(req, rawBytes, {
+          pinModel: selected,
+          ...(passthroughContentType !== null
+            ? { contentType: passthroughContentType }
+            : {}),
+        }),
+      );
+    }
+    planParam = fetched.plan;
+    pmidsParam = fetched.pmids;
+    originParam = fetched.origin;
+    contextOverflowStrategy = fetchedContextOverflowStrategy;
+    sigParam = fetched.sig;
   }
 
   const walkArgs = {

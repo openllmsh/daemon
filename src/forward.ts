@@ -157,9 +157,17 @@ export const forwardToCloud = async (
  * wasted loopback bounce — we ARE the machine, and we already chose not to
  * walk this request).
  */
+export type TPassthroughOptions = {
+  /** Pin the cloud to this concrete model (media-default BYOK). */
+  readonly pinModel?: string;
+  /** Replacement Content-Type after a multipart rewrite (new boundary). */
+  readonly contentType?: string;
+};
+
 export const passthroughToOrigin = async (
   inbound: Request,
   bodyBytes: ArrayBuffer,
+  options?: TPassthroughOptions,
 ): Promise<Response> => {
   const url = new URL(inbound.url);
   const search = new URLSearchParams(url.search);
@@ -170,7 +178,14 @@ export const passthroughToOrigin = async (
   const target = `${daemonEnv().cloudOrigin}${url.pathname}${qs.length > 0 ? `?${qs}` : ""}`;
   const headers = new Headers(inbound.headers);
   headers.delete(MEDIA_PERSISTENCE_REQUEST_HEADER);
-  headers.delete("x-openllm-pin-model");
+  if (options?.pinModel !== undefined && options.pinModel.length > 0) {
+    headers.set("x-openllm-pin-model", options.pinModel);
+  } else {
+    headers.delete("x-openllm-pin-model");
+  }
+  if (options?.contentType !== undefined) {
+    headers.set("content-type", options.contentType);
+  }
   const callerAuth = inbound.headers.get("authorization");
   if (callerAuth === null || callerAuth.length === 0) {
     const { apiKey } = daemonEnv();

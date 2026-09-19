@@ -17,6 +17,7 @@ import type {
   TDaemonQuotaStatusReached,
   TDaemonRecordRequest,
   TDaemonSessionLost,
+  TMediaDefaultRequest,
   TRelayChannelResponse,
 } from "@openllmsh/protocol";
 import {
@@ -24,6 +25,8 @@ import {
   DAEMON_DEVICE_ID_HEADER,
   DAEMON_DEVICE_LABEL_HEADER,
   DaemonPlanResponse,
+  encodeMediaDefaultPlanQuery,
+  MediaDefaultRequest,
   MODEL_CAPABILITIES_OPEN_CAP,
   RelayChannelResponse,
 } from "@openllmsh/protocol";
@@ -34,6 +37,7 @@ import { logWarn, safeDiagnosticMessage } from "./logger";
 
 const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
 const decodePlan = Schema.decodeUnknownSync(DaemonPlanResponse);
+const decodeMediaDefault = Schema.decodeUnknownSync(MediaDefaultRequest);
 
 /** Thrown when no API key is configured yet — the daemon is keyless. */
 export class NoApiKeyError extends Error {
@@ -50,6 +54,90 @@ export class InvalidApiKeyError extends Error {
     this.name = "InvalidApiKeyError";
   }
 }
+
+/**
+ * Cloud HTTP 4xx for a media-default plan fetch. Distinct from
+ * {@link InvalidApiKeyError} so the listener can echo the actionable
+ * envelope (400 `no_media_default`, 402 budget, 401/403 auth) instead of
+ * collapsing to a generic 502 or treating it as explicit-model passthrough.
+ */
+export class MediaDefaultPlanError extends Error {
+  readonly status: number;
+  readonly type: string;
+  readonly code: string | undefined;
+  constructor(status: number, message: string, type: string, code?: string) {
+    super(message);
+    this.name = "MediaDefaultPlanError";
+    this.status = status;
+    this.type = type;
+    this.code = code;
+  }
+}
+
+const MAX_PLAN_ERROR_TEXT = 512;
+
+const boundedText = (value: unknown, fallback: string): string => {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return fallback;
+  return trimmed.length > MAX_PLAN_ERROR_TEXT
+    ? trimmed.slice(0, MAX_PLAN_ERROR_TEXT)
+    : trimmed;
+};
+
+const fallbackMediaDefaultError = (
+  status: number,
+): { readonly message: string; readonly type: string } => {
+  if (status === 401 || status === 403) {
+    return {
+      message: `cloud rejected the API key (${status})`,
+      type: "auth_error",
+    };
+  }
+  if (status === 402) {
+    return {
+      message: "OpenLLM: payment required — free tier exhausted",
+      type: "free_tier_exhausted",
+    };
+  }
+  if (status === 400) {
+    return {
+      message: "No media default is available for this request",
+      type: "no_media_default",
+    };
+  }
+  return {
+    message: "Media default plan request failed",
+    type: "request_error",
+  };
+};
+
+const mediaDefaultPlanErrorFromResponse = async (
+  resp: Response,
+): Promise<MediaDefaultPlanError> => {
+  const fallback = fallbackMediaDefaultError(resp.status);
+  let message = fallback.message;
+  let type = fallback.type;
+  let code: string | undefined;
+  try {
+    const raw: unknown = await resp.json();
+    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+      const err = (raw as { error?: unknown }).error;
+      if (err !== null && typeof err === "object" && !Array.isArray(err)) {
+        const rec = err as Record<string, unknown>;
+        message = boundedText(rec.message, fallback.message);
+        type = boundedText(rec.type, fallback.type);
+        if (typeof rec.code === "string" && rec.code.trim().length > 0) {
+          const clipped = rec.code.trim().slice(0, MAX_PLAN_ERROR_TEXT);
+          code = clipped;
+        }
+      }
+    }
+  } catch {
+    // Malformed body keeps the status-specific fallback.
+  }
+  return new MediaDefaultPlanError(resp.status, message, type, code);
+};
 
 /**
  * Thrown when `GET /api/daemon/channel` returns 403 `device_limit_exceeded`.
@@ -208,6 +296,32 @@ export const fetchPlan = async (
   );
   if (resp.status === 401 || resp.status === 403) {
     throw new InvalidApiKeyError(resp.status);
+  }
+  if (!resp.ok) throw new Error(`plan fetch failed: ${resp.status}`);
+  return decodePlan(await resp.json());
+};
+
+/**
+ * Metadata-only media-default plan fetch (no `model` query, never prompt
+ * or media bytes). The cloud resolver picks a subscription-first then
+ * API-key model; the caller verifies `sig` before using the tuple.
+ */
+export const fetchMediaDefaultPlan = async (
+  request: TMediaDefaultRequest,
+  signal?: AbortSignal,
+): Promise<TDaemonPlanResponse> => {
+  const validated = decodeMediaDefault(request);
+  const query = encodeMediaDefaultPlanQuery(validated);
+  if (query === null) {
+    throw new Error("invalid media default plan request");
+  }
+  const resp = await cloudFetch(cloudUrl(`/api/daemon/plan?${query}`), {
+    method: "GET",
+    headers: authHeaders(),
+    signal,
+  });
+  if (resp.status >= 400 && resp.status < 500) {
+    throw await mediaDefaultPlanErrorFromResponse(resp);
   }
   if (!resp.ok) throw new Error(`plan fetch failed: ${resp.status}`);
   return decodePlan(await resp.json());
