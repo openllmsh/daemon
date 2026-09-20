@@ -7,7 +7,12 @@
  * + reflect an allowed origin. Access control stays the localhost bind +
  * this origin lock — no control token.
  */
-import { NO_DAEMON_HEADER, TOOL_SESSION_HEADER } from "@openllmsh/protocol";
+import {
+  MEDIA_ERROR_RESPONSE_HEADER,
+  MEDIA_PERSISTENCE_RESPONSE_HEADER,
+  NO_DAEMON_HEADER,
+  TOOL_SESSION_HEADER,
+} from "@openllmsh/protocol";
 import { daemonEnv, isDevMode } from "./env";
 
 /**
@@ -100,12 +105,19 @@ const allowOrigin = (req: Request): string => {
  *    cross-origin call; the preflight must allow them even though the daemon
  *    ignores them (the plan rides in the `?__plan=` query, not a header).
  * (The control surface only needs `content-type`, but a superset is harmless.)
+ *
+ * `expose-headers` covers the DIRECT cross-origin path only (the browser
+ * replaying a gateway 307 to `127.0.0.1`); the mux carries its own closed
+ * `res_head` struct instead. An unexposed response header is unreadable to
+ * the page and therefore indistinguishable from one the daemon never sent —
+ * so every media header the browser BRANCHES on must be listed, or an
+ * omission degrades silently into the WRONG diagnosis rather than an error.
  */
 export const corsHeaders = (req: Request): Record<string, string> => ({
   "access-control-allow-origin": allowOrigin(req),
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers": `content-type, authorization, ${TOOL_SESSION_HEADER}, ${NO_DAEMON_HEADER}`,
-  "access-control-expose-headers": `x-openllm-media-id, x-openllm-media-url, x-openllm-resolved-model, x-openllm-chain, ${TOOL_SESSION_HEADER}`,
+  "access-control-expose-headers": `x-openllm-media-id, x-openllm-media-url, x-openllm-resolved-model, x-openllm-chain, ${MEDIA_ERROR_RESPONSE_HEADER}, ${MEDIA_PERSISTENCE_RESPONSE_HEADER}, ${TOOL_SESSION_HEADER}`,
   "access-control-allow-private-network": "true",
   vary: "origin",
 });

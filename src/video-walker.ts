@@ -1,4 +1,5 @@
 import type {
+  TMediaPersistError,
   TVideoDeleted,
   TVideoGenerationRequest,
   TVideoIdPayload,
@@ -9,6 +10,8 @@ import {
   decodeVideoId,
   encodeVideoId,
   isSubscriptionProviderSlug,
+  MEDIA_ERROR_RESPONSE_HEADER,
+  MEDIA_URL_RESPONSE_HEADER,
   normalizeContentType,
   parseVideoGenerationInput,
   redactVideoErrorText,
@@ -18,6 +21,7 @@ import {
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
+import type { TUploadMediaDiagnostic } from "./cloud-client";
 import { uploadMedia } from "./cloud-client";
 import { errorJson } from "./cors";
 import { getDelegate } from "./delegation";
@@ -582,45 +586,86 @@ export const runVideoContent = async (
   const contentType = rawContentType.startsWith("video/")
     ? rawContentType
     : "video/mp4";
-  const [clientBranch, persistBranch] = body.tee();
+  // Persistence is CONFIRMED before the response head, because the media URL
+  // header is the only durability evidence the consumer ever gets: the browser
+  // tool reads it, cancels the body and settles the job `ready`. Advertising it
+  // from a detached upload made a 200 + header mean "a row will probably
+  // exist", so an ingest failure became a permanently dead URL on a job nobody
+  // polls again (audit M1).
+  //
+  // Buffering first is not a new cost — the old persist branch already read the
+  // whole body into an ArrayBuffer for the upload; the tee only let the client
+  // branch drain in parallel. What it does cost is time to first byte for a
+  // plain content consumer (curl), which now waits out the cloud upload. That
+  // is the price of a truthful header, and the bytes are still served in full.
+  //
+  // Neither the download nor the upload is tied to `args.req.signal`: a client
+  // that walks away mid-flight must not abort persistence — the generation is
+  // already paid for. Each hop carries its own timeout instead.
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await new Response(body).arrayBuffer();
+  } catch {
+    return errorJson(502, "video download failed mid-stream");
+  }
 
-  void (async () => {
-    const bytes = await new Response(persistBranch).arrayBuffer();
-    await uploadMedia(
-      bytes,
-      {
-        contentType,
-        kind: "video",
-        sourceRef: videoId,
-        id,
-      },
-      args.originParam,
-    );
-  })().catch((err) => {
+  // A collected list rather than a reassigned `let`: TS narrows a variable
+  // only ever written inside a callback to its initializer type.
+  const failures: Array<TUploadMediaDiagnostic> = [];
+  const saved = await uploadMedia(
+    bytes,
+    {
+      contentType,
+      kind: "video",
+      sourceRef: videoId,
+      id,
+    },
+    args.originParam,
+    (diagnostic) => {
+      failures.push(diagnostic);
+    },
+  ).catch((err: unknown) => {
+    // `uploadMedia` resolves `null` for every failure it owns, but a caller
+    // must not depend on that: an unexpected rejection degrades to the same
+    // not-persisted decision rather than escaping as an unhandled error
+    // (same posture as `image-walker`).
     logWarn(
       "video-walker",
       safeDiagnosticMessage`Failed to persist generated video`,
-      {
-        error: err instanceof Error ? err.message : String(err),
-        videoId,
-      },
+      { error: err instanceof Error ? err.message : String(err), videoId },
     );
+    return null;
   });
-
-  const durable = args.originParam
-    ? `${args.originParam}/api/media/${id}`
-    : null;
 
   const responseHeaders: Record<string, string> = {
     "content-type": contentType,
     "cache-control": "no-store",
     "x-openllm-media-id": id,
   };
-  if (durable !== null) {
-    responseHeaders["x-openllm-media-url"] = durable;
+  if (saved !== null && args.originParam) {
+    responseHeaders[MEDIA_URL_RESPONSE_HEADER] =
+      `${args.originParam}/api/media/${id}`;
+  } else if (saved === null) {
+    // Reason only — no URL, no status, no bytes. This is what lets the
+    // consumer separate "persistence failed" from "this responder does not
+    // advertise durability" (an older daemon sends neither header).
+    const diagnostic = failures[0];
+    const reason: TMediaPersistError = diagnostic?.reason ?? "ingest_failed";
+    responseHeaders[MEDIA_ERROR_RESPONSE_HEADER] = reason;
+    logWarn(
+      "video-walker",
+      safeDiagnosticMessage`Generated video was not persisted to the library`,
+      {
+        reason,
+        ...(diagnostic?.status === undefined
+          ? {}
+          : { status: diagnostic.status }),
+        videoId,
+      },
+    );
   }
 
-  return new Response(clientBranch, {
+  return new Response(bytes, {
     status: 200,
     headers: responseHeaders,
   });

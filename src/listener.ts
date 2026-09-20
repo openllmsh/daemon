@@ -267,18 +267,28 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // is forwarded verbatim (strictness here would 400 shapes the upstream
   // accepts). Model-less media uses optional-model INPUT schemas; concrete
   // required-model schemas run after a verified plan materializes `model`.
+  // Set by the branches below that REWRITE `rawBody` (dropping a blank
+  // `model`, dropping empty reference arrays). `rawBytes` — not `rawBody`
+  // — is what a BYOK passthrough and a cloud hop actually put on the
+  // wire, so a rewrite has to be mirrored onto the bytes or the two
+  // disagree and the cloud sees the pre-normalization shape.
+  let normalizedJsonBody = false;
   try {
     if (isResponsesCompact) {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
     else if (videoOperation === "create") {
       rawBody = parseVideoGenerationInput(rawBody);
+      normalizedJsonBody = true;
     } else if (isBodylessVideoOp(videoOperation)) {
       // no-op — id-addressed video ops carry no body (rawBody is null); the
       // signed plan rides the query string, so there's nothing to validate.
     } else if (isImages) {
       if (modelField.kind === "explicit") parseImageRequest(rawBody);
-      else rawBody = parseImageInput(rawBody, { onExcessProperty: "preserve" });
+      else {
+        rawBody = parseImageInput(rawBody, { onExcessProperty: "preserve" });
+        normalizedJsonBody = true;
+      }
     } else if (isImageEdits) {
       // no-op — structural validation above; concrete decode after plan.
     } else if (isTranscriptions || isSpeech) {
@@ -295,6 +305,23 @@ export const handleInference = async (req: Request): Promise<Response> => {
         err instanceof Error ? err.message : "Invalid request body",
       ),
     );
+  }
+
+  // Re-encode so the bytes agree with the normalized body. Both BYOK
+  // passthroughs (`fetched === null`, and a verified plan with no
+  // subscription hop) forward `rawBytes` verbatim, and `forwardCloudHop`
+  // does the same for an API-key hop inside a mixed chain — a
+  // media-default selection is the only path that rebuilds the bytes on
+  // its own (`materializeSelectedModel`). JSON only: multipart keeps the
+  // caller's exact original bytes, and a non-media surface is never
+  // rewritten, so neither is touched here. Content-type is unchanged —
+  // this stays `application/json`, so no header fixup is needed.
+  if (normalizedJsonBody && multipart === null) {
+    const encoded = new TextEncoder().encode(JSON.stringify(rawBody));
+    rawBytes = encoded.buffer.slice(
+      encoded.byteOffset,
+      encoded.byteOffset + encoded.byteLength,
+    ) as ArrayBuffer;
   }
 
   // Signed-plan cache (flag-gated rider — `plan-cache.ts`). A 307-borne

@@ -18,6 +18,7 @@ import type {
   TDaemonRecordRequest,
   TDaemonSessionLost,
   TMediaDefaultRequest,
+  TMediaPersistError,
   TRelayChannelResponse,
   TVideoJobPlanRequest,
 } from "@openllmsh/protocol";
@@ -596,6 +597,34 @@ export type TUploadMediaResponse = {
 };
 
 /**
+ * Observe WHY an ingest failed, without changing `uploadMedia`'s resolved
+ * shape. A `null` result is the single "not persisted" answer every caller
+ * already branches on; this optional sink adds the coarse reason for the one
+ * caller that must tell its consumer something more useful than "no URL".
+ *
+ * Optional + additive on purpose: every existing call site (and every test
+ * double that implements `uploadMedia` with three parameters) keeps working
+ * unchanged, and a caller that passes no sink pays nothing.
+ */
+export type TUploadMediaDiagnostic = {
+  readonly reason: TMediaPersistError;
+  /** Ingest HTTP status, when one was actually received. Never a URL, body,
+   *  credential or byte count — this is logged locally AND (as `reason`
+   *  alone) crosses the relay. */
+  readonly status?: number;
+};
+
+const uploadFailureReason = (err: unknown): TMediaPersistError => {
+  if (err instanceof DOMException && err.name === "TimeoutError") {
+    return "ingest_timeout";
+  }
+  if (err instanceof Error && err.name === "TimeoutError") {
+    return "ingest_timeout";
+  }
+  return "ingest_unreachable";
+};
+
+/**
  * Best-effort ingest of locally generated media into the cloud library. Media
  * bytes can be large, so this deliberately uses a longer timeout than the
  * daemon control plane. Failures are swallowed so callers can choose a local
@@ -605,7 +634,12 @@ export const uploadMedia = async (
   bytes: ArrayBuffer | Uint8Array,
   opts: TUploadMediaOptions,
   origin?: string | null,
+  onFailure?: (diagnostic: TUploadMediaDiagnostic) => void,
 ): Promise<TUploadMediaResponse | null> => {
+  const fail = (diagnostic: TUploadMediaDiagnostic): null => {
+    onFailure?.(diagnostic);
+    return null;
+  };
   try {
     const headers = {
       ...authHeaders(),
@@ -627,8 +661,15 @@ export const uploadMedia = async (
       ]),
       signal: AbortSignal.timeout(MEDIA_UPLOAD_TIMEOUT_MS),
     });
-    if (!resp.ok) return null;
-    const body: unknown = await resp.json();
+    if (!resp.ok) {
+      return fail({ reason: "ingest_rejected", status: resp.status });
+    }
+    let body: unknown;
+    try {
+      body = await resp.json();
+    } catch {
+      return fail({ reason: "ingest_invalid_response", status: resp.status });
+    }
     if (
       typeof body !== "object" ||
       body === null ||
@@ -637,11 +678,11 @@ export const uploadMedia = async (
       typeof body.id !== "string" ||
       typeof body.url !== "string"
     ) {
-      return null;
+      return fail({ reason: "ingest_invalid_response", status: resp.status });
     }
     return { id: body.id, url: body.url };
-  } catch {
-    return null;
+  } catch (err) {
+    return fail({ reason: uploadFailureReason(err) });
   }
 };
 
