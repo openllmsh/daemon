@@ -10,11 +10,18 @@ import {
   encodeVideoId,
   isSubscriptionProviderSlug,
   normalizeContentType,
+  parseVideoGenerationInput,
+  supportsVideoInput,
+  VIDEO_INPUT_ERROR,
+  VIDEO_UNSUPPORTED_INPUT_ERROR,
   VideoGenerationRequest,
+  videoInputReceiptFromCounts,
+  videoInputRequirements,
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
+import { lookupCatalogEntry } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate } from "./delegation";
 import { passthroughToOrigin } from "./forward";
@@ -200,6 +207,7 @@ export const buildVideoUpstreamBody = (
   req: TVideoGenerationRequest,
   providerModelId: string,
 ): Record<string, unknown> => {
+  parseVideoGenerationInput(req);
   if (provider !== "grok") {
     throw new Error(`Unsupported subscription video provider: ${provider}`);
   }
@@ -309,12 +317,9 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
 
   let request: TVideoGenerationRequest;
   try {
-    request = parseVideoRequest(args.rawBody);
-  } catch (err) {
-    return errorJson(
-      400,
-      err instanceof Error ? err.message : "Invalid video generation request",
-    );
+    request = parseVideoRequest(parseVideoGenerationInput(args.rawBody));
+  } catch {
+    return errorJson(400, VIDEO_INPUT_ERROR);
   }
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
   const hops = parsePlan(args.planParam).map((modelId, index) =>
@@ -332,6 +337,20 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
     const hop = hops[i];
     if (hop === undefined) continue;
     const last = i === hops.length - 1;
+    if (
+      !supportsVideoInput(
+        videoInputRequirements(request),
+        lookupCatalogEntry(hop.modelId)?.video_support,
+      )
+    ) {
+      lastError = errorJson(400, VIDEO_UNSUPPORTED_INPUT_ERROR);
+      if (
+        !last &&
+        mediaHopAdvances({ dispatched: false, errorCode: "model_unavailable" })
+      )
+        continue;
+      return stamp(lastError);
+    }
     if (!isSubscriptionProviderSlug(hop.provider)) {
       attempted.push(hop.modelId);
       const forwarded = await forwardMediaHopToCloud(args, hop.modelId);
@@ -450,6 +469,16 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       status: "queued",
       model: hop.modelId,
       progress: 0,
+      // Read forwarding evidence from the accepted outbound body, not user intent.
+      input_receipt: videoInputReceiptFromCounts({
+        starting_images: body.image === undefined ? 0 : 1,
+        subject_images: Array.isArray(body.reference_images)
+          ? body.reference_images.length
+          : 0,
+        voices: Array.isArray(body.reference_audios)
+          ? body.reference_audios.length
+          : 0,
+      }),
       ...(request.seconds !== undefined ? { seconds: request.seconds } : {}),
       ...(request.size !== undefined ? { size: request.size } : {}),
     };

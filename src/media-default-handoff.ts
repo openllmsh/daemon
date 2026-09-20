@@ -119,6 +119,8 @@ export const buildMediaDefaultRequest = (
   rawBody: unknown,
   multipart: TParsedMultipart | null,
 ): TMediaDefaultRequest | null => {
+  // Validate and derive bounded requirements before content is removed.
+  if (surface === "video") return mediaDefaultRequestFromBody(surface, rawBody);
   const body = jsonRecord(rawBody) ?? {};
   const audioFile = multipart?.files.find((file) => file.fieldName === "file");
   const jsonAudio =

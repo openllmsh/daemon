@@ -24,9 +24,8 @@ import {
   ImageGenerationRequest,
   parseImageEditInput,
   parseImageEditMultipart,
+  parseVideoGenerationInput,
   ResponsesRequest,
-  VideoGenerationInput,
-  VideoGenerationRequest,
 } from "@openllmsh/protocol";
 import {
   collectBoundedBytes,
@@ -86,8 +85,6 @@ const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
 const parseImageRequest = Schema.decodeUnknownSync(ImageGenerationRequest);
 const parseImageInput = Schema.decodeUnknownSync(ImageGenerationInput);
-const parseVideoRequest = Schema.decodeUnknownSync(VideoGenerationRequest);
-const parseVideoInput = Schema.decodeUnknownSync(VideoGenerationInput);
 const parseResponsesRequest = Schema.decodeUnknownSync(ResponsesRequest);
 const parseCountTokensRequest = Schema.decodeUnknownSync(
   AnthropicCountTokensRequest,
@@ -275,8 +272,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
     else if (videoOperation === "create") {
-      if (modelField.kind === "explicit") parseVideoRequest(rawBody);
-      else parseVideoInput(rawBody);
+      parseVideoGenerationInput(rawBody);
     } else if (isBodylessVideoOp(videoOperation)) {
       // no-op — id-addressed video ops carry no body (rawBody is null); the
       // signed plan rides the query string, so there's nothing to validate.
