@@ -10,7 +10,10 @@ import type {
   TMediaDefaultRequest,
   TMediaDefaultSurface,
 } from "@openllmsh/protocol";
-import { mediaDefaultRequestFromBody } from "@openllmsh/protocol";
+import {
+  decodeMediaModelSelection,
+  mediaDefaultRequestFromBody,
+} from "@openllmsh/protocol";
 import type { TParsedMultipart } from "./multipart";
 import { serializeMultipartWithFields } from "./multipart";
 
@@ -20,10 +23,14 @@ export type TModelField =
   | { readonly kind: "explicit"; readonly value: string };
 
 export const classifyModelField = (value: unknown): TModelField => {
-  if (value === undefined) return { kind: "absent" };
-  if (typeof value !== "string" || value.length === 0)
+  try {
+    const { model } = decodeMediaModelSelection({ model: value });
+    return model === undefined
+      ? { kind: "absent" }
+      : { kind: "explicit", value: model };
+  } catch {
     return { kind: "invalid" };
-  return { kind: "explicit", value };
+  }
 };
 
 export const modelFieldFromRequest = (

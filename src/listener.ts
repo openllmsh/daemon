@@ -217,7 +217,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
     isVideoCreate: videoOperation === "create",
   });
   const modelField = modelFieldFromRequest(rawBody, multipart);
-  // Empty/non-string `model` is only a media-default concern. Compact and
+  // Invalid `model` types are only a media-default concern. Compact and
   // other non-media surfaces keep their existing parsers (compact is a
   // verbatim vendor passthrough).
   if (mediaSurface !== null && modelField.kind === "invalid") {
@@ -272,13 +272,13 @@ export const handleInference = async (req: Request): Promise<Response> => {
       // no-op — verbatim vendor passthrough
     } else if (isCountTokens) parseCountTokensRequest(rawBody);
     else if (videoOperation === "create") {
-      parseVideoGenerationInput(rawBody);
+      rawBody = parseVideoGenerationInput(rawBody);
     } else if (isBodylessVideoOp(videoOperation)) {
       // no-op — id-addressed video ops carry no body (rawBody is null); the
       // signed plan rides the query string, so there's nothing to validate.
     } else if (isImages) {
       if (modelField.kind === "explicit") parseImageRequest(rawBody);
-      else parseImageInput(rawBody);
+      else rawBody = parseImageInput(rawBody, { onExcessProperty: "preserve" });
     } else if (isImageEdits) {
       // no-op — structural validation above; concrete decode after plan.
     } else if (isTranscriptions || isSpeech) {
