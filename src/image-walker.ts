@@ -19,6 +19,7 @@ import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TImageCredential } from "./delegation/types";
 import {
   buildImageEditUpstreamBody,
+  ImageProviderUnavailableError,
   isSupportedImageEditReference,
 } from "./image-edit-wire";
 import { withMediaAttribution } from "./media-attribution";
@@ -195,8 +196,27 @@ export const sizeToAspect = (size?: string): string => {
       return "16:9";
     case "1024x1792":
       return "9:16";
-    default:
+    case undefined:
+    case "1024x1024":
       return "1:1";
+    case "auto":
+      return "auto";
+    default: {
+      const dimensions = /^(\d+)x(\d+)$/.exec(size);
+      const width = Number(dimensions?.[1]);
+      const height = Number(dimensions?.[2]);
+      if (
+        !Number.isSafeInteger(width) ||
+        !Number.isSafeInteger(height) ||
+        width <= 0 ||
+        height <= 0
+      )
+        throw new Error("Grok image size is not supported by this transport");
+      const gcd = (a: number, b: number): number =>
+        b === 0 ? a : gcd(b, a % b);
+      const divisor = gcd(width, height);
+      return `${width / divisor}:${height / divisor}`;
+    }
   }
 };
 
@@ -221,8 +241,21 @@ export const buildImageUpstreamBody = (
     };
   }
   if (provider === "grok") {
+    const unmapped =
+      req.style !== undefined
+        ? "style"
+        : req.background !== undefined
+          ? "background"
+          : req.user !== undefined
+            ? "user"
+            : undefined;
+    if (unmapped !== undefined)
+      throw new Error(
+        `Grok image adapter cannot map ${unmapped}; it was not discarded. Use an image adapter that serializes this option, or remove it only if it is not intended.`,
+      );
     return {
       model: providerModelId,
+      ...(req.quality !== undefined ? { quality: req.quality } : {}),
       prompt: req.prompt,
       n: req.n ?? 1,
       aspect_ratio: sizeToAspect(req.size),
@@ -230,7 +263,9 @@ export const buildImageUpstreamBody = (
       response_format: "b64_json",
     };
   }
-  throw new Error(`Unsupported subscription image provider: ${provider}`);
+  throw new ImageProviderUnavailableError(
+    `Unsupported subscription image provider: ${provider}`,
+  );
 };
 
 export const normalizeImageResponse = (
@@ -295,6 +330,28 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
     if (hop === undefined) continue;
     const last = i === hops.length - 1;
     if (isSubscriptionSlug(hop.provider)) {
+      // Validate before credential fallback can advance to an unchecked transport.
+      let upstreamBody: Record<string, unknown>;
+      try {
+        upstreamBody = buildImageUpstreamBody(
+          hop.provider,
+          imageRequest,
+          hop.providerModelId,
+        );
+      } catch (err) {
+        const errorCode =
+          err instanceof ImageProviderUnavailableError
+            ? "model_unavailable"
+            : "caller_error";
+        lastError = errorJson(
+          400,
+          err instanceof Error ? err.message : "Invalid image request",
+          errorCode,
+        );
+        if (!last && mediaHopAdvances({ dispatched: false, errorCode }))
+          continue;
+        return stamp(lastError);
+      }
       const delegate = getDelegate(hop.provider);
       if (delegate?.credentialForImage === undefined) {
         if (
@@ -325,28 +382,6 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         );
       }
       attempted.push(hop.modelId);
-      let upstreamBody: Record<string, unknown>;
-      try {
-        upstreamBody = buildImageUpstreamBody(
-          hop.provider,
-          imageRequest,
-          hop.providerModelId,
-        );
-      } catch (err) {
-        lastError = errorJson(
-          400,
-          err instanceof Error ? err.message : "Unsupported image provider",
-        );
-        if (
-          !last &&
-          mediaHopAdvances({
-            dispatched: false,
-            errorCode: "missing_credential",
-          })
-        )
-          continue;
-        return stamp(lastError);
-      }
 
       const resp = await postUpstream(acquired.url, {
         method: "POST",
@@ -674,6 +709,27 @@ export const runImageEditWalker = async (
     if (!isSubscriptionSlug(hop.provider)) {
       continue;
     }
+    // Invalid caller options are terminal, even when this hop lacks credentials.
+    let upstreamBody: Record<string, unknown>;
+    try {
+      upstreamBody = buildImageEditUpstreamBody(
+        hop.provider,
+        editRequest,
+        hop.providerModelId,
+      );
+    } catch (err) {
+      const errorCode =
+        err instanceof ImageProviderUnavailableError
+          ? "model_unavailable"
+          : "caller_error";
+      lastError = errorJson(
+        400,
+        err instanceof Error ? err.message : "Invalid image-edit request",
+        errorCode,
+      );
+      if (!last && mediaHopAdvances({ dispatched: false, errorCode })) continue;
+      return stamp(lastError);
+    }
     const acquired = await acquireImageEditUpstream(hop.provider, args, hop);
     if (acquired === "retry") {
       if (
@@ -692,28 +748,6 @@ export const runImageEditWalker = async (
       );
     }
     attempted.push(hop.modelId);
-    let upstreamBody: Record<string, unknown>;
-    try {
-      upstreamBody = buildImageEditUpstreamBody(
-        hop.provider,
-        editRequest,
-        hop.providerModelId,
-      );
-    } catch (err) {
-      lastError = errorJson(
-        400,
-        err instanceof Error ? err.message : "Unsupported image-edit provider",
-      );
-      if (
-        !last &&
-        mediaHopAdvances({
-          dispatched: false,
-          errorCode: "missing_credential",
-        })
-      )
-        continue;
-      return stamp(lastError);
-    }
     const resp = await postUpstream(acquired.url, {
       method: "POST",
       headers: {

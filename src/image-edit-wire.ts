@@ -7,9 +7,8 @@
  * Verified upstream shapes (foundation research, ac06f4cb):
  *   - chatgpt (Codex `gpt-image-2` edit): the Responses-adjacent images edit
  *     body — `{model,prompt,images:[{image_url:<data-url>}],n,quality,size}`.
- *   - grok (xAI `grok-imagine-image-2.0` edit — a DISTINCT model from the
- *     `grok-imagine-image-quality` generation alias; never infer editing
- *     from generation): `{model,prompt,image:{url:<data-url>},n,
+ *   - grok (xAI `grok-imagine-image-2.0` generation+edit model):
+ *     `{model,prompt,image:{url:<data-url>},n,
  *     response_format:"b64_json",quality}`.
  *
  * The `quality` param forwarded to grok here is carried over from the
@@ -22,6 +21,9 @@
  */
 
 import type { TImageEditRequest } from "@openllmsh/protocol";
+
+/** Only a missing provider implementation is an availability failure; invalid inputs are terminal. */
+export class ImageProviderUnavailableError extends Error {}
 
 /** Subscription providers this daemon knows an image-edit upstream shape for. */
 export type TImageEditProvider = "chatgpt" | "grok";
@@ -52,6 +54,11 @@ export const buildImageEditUpstreamBody = (
     };
   }
   if (provider === "grok") {
+    // No verified canonical size mapping on this edit transport.
+    if (req.size !== undefined)
+      throw new Error(
+        "Grok image-edit size is not supported by this transport",
+      );
     return {
       model: providerModelId,
       prompt: req.prompt,
@@ -61,7 +68,9 @@ export const buildImageEditUpstreamBody = (
       ...(req.quality !== undefined ? { quality: req.quality } : {}),
     };
   }
-  throw new Error(`Unsupported subscription image-edit provider: ${provider}`);
+  throw new ImageProviderUnavailableError(
+    `Unsupported subscription image-edit provider: ${provider}`,
+  );
 };
 
 /**

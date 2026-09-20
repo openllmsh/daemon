@@ -11,17 +11,14 @@ import {
   isSubscriptionProviderSlug,
   normalizeContentType,
   parseVideoGenerationInput,
-  supportsVideoInput,
+  redactVideoErrorText,
   VIDEO_INPUT_ERROR,
-  VIDEO_UNSUPPORTED_INPUT_ERROR,
   VideoGenerationRequest,
   videoInputReceiptFromCounts,
-  videoInputRequirements,
 } from "@openllmsh/protocol";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
-import { lookupCatalogEntry } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate } from "./delegation";
 import { passthroughToOrigin } from "./forward";
@@ -171,16 +168,15 @@ const videoRequestIdFrom = (body: unknown): string | null => {
 
 /**
  * Derive Grok's `aspect_ratio` from a `WIDTHxHEIGHT` size by reducing the
- * ratio; defaults to `1:1` when the size is absent or unparsable. (Video needs
- * its own W:H derivation — the image walker's `sizeToAspect` only recognizes a
- * few fixed image sizes and would map, e.g., 1280x720 to 1:1.)
+ * ratio. Only an absent size defaults to `1:1`; other explicit values are
+ * preserved for native provider validation rather than silently replaced.
  */
 export const videoAspectRatio = (size?: string): string => {
   const match = size?.match(/^(\d+)x(\d+)$/i);
-  if (!match) return "1:1";
+  if (!match) return size ?? "1:1";
   const width = Number.parseInt(match[1] ?? "", 10);
   const height = Number.parseInt(match[2] ?? "", 10);
-  if (!(width > 0 && height > 0)) return "1:1";
+  if (!(width > 0 && height > 0)) return size ?? "1:1";
   const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
   const divisor = gcd(width, height);
   return `${width / divisor}:${height / divisor}`;
@@ -195,10 +191,9 @@ export const mapVideoStatus = (status: unknown): TVideoJobStatus => {
 
 /** Select Grok's required output resolution from a WIDTHxHEIGHT size. */
 export const sizeToResolution = (size?: string): string => {
-  const height = size?.match(/^\d+x(\d+)$/i)?.[1];
-  return height !== undefined && Number.parseInt(height, 10) >= 720
-    ? "720p"
-    : "480p";
+  if (size === undefined) return "480p";
+  const match = /^(\d+)x(\d+)$/.exec(size);
+  return match ? `${Math.min(Number(match[1]), Number(match[2]))}p` : size;
 };
 
 /** Build the provider-native video generation request without performing I/O. */
@@ -211,13 +206,12 @@ export const buildVideoUpstreamBody = (
   if (provider !== "grok") {
     throw new Error(`Unsupported subscription video provider: ${provider}`);
   }
-  // Only forward `duration` when `seconds` is a whole positive-integer string.
-  // Require a full `\d+` match so "6.5"/"6junk" are omitted rather than
-  // truncated to 6; `parseInt` alone would forward a wrong value.
   const duration =
-    req.seconds !== undefined && /^\d+$/.test(req.seconds)
-      ? Number.parseInt(req.seconds, 10)
-      : Number.NaN;
+    req.seconds === undefined
+      ? undefined
+      : req.seconds.trim() !== "" && Number.isFinite(Number(req.seconds))
+        ? Number(req.seconds)
+        : req.seconds;
   return {
     model: providerModelId,
     prompt: req.prompt,
@@ -234,7 +228,7 @@ export const buildVideoUpstreamBody = (
           })),
         }
       : {}),
-    ...(Number.isInteger(duration) && duration > 0 ? { duration } : {}),
+    ...(duration !== undefined ? { duration } : {}),
     aspect_ratio: videoAspectRatio(req.size),
     resolution: sizeToResolution(req.size),
   };
@@ -337,20 +331,6 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
     const hop = hops[i];
     if (hop === undefined) continue;
     const last = i === hops.length - 1;
-    if (
-      !supportsVideoInput(
-        videoInputRequirements(request),
-        lookupCatalogEntry(hop.modelId)?.video_support,
-      )
-    ) {
-      lastError = errorJson(400, VIDEO_UNSUPPORTED_INPUT_ERROR);
-      if (
-        !last &&
-        mediaHopAdvances({ dispatched: false, errorCode: "model_unavailable" })
-      )
-        continue;
-      return stamp(lastError);
-    }
     if (!isSubscriptionProviderSlug(hop.provider)) {
       attempted.push(hop.modelId);
       const forwarded = await forwardMediaHopToCloud(args, hop.modelId);
@@ -431,7 +411,21 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
         resp.status,
         upstream.accountHash,
       );
-      lastError = await upstreamError(resp);
+      const rawError = await upstreamError(resp);
+      const errorText = redactVideoErrorText(await rawError.text(), [
+        request.input_image ?? "",
+        ...(request.reference_images ?? []),
+        ...(request.reference_voices ?? []),
+        ...Object.entries(upstream.headers).flatMap(([key, value]) =>
+          /authorization|cookie|token|key/i.test(key)
+            ? [value, value.replace(/^(?:Bearer|Basic)\s+/i, "")]
+            : [],
+        ),
+      ]);
+      lastError = new Response(errorText, {
+        status: rawError.status,
+        headers: rawError.headers,
+      });
       if (
         !last &&
         mediaHopAdvances({
