@@ -126,6 +126,10 @@ export const noteConnectionsForQuota = (
           : { account_hash: connection.account_hash }),
         ...(usage.plan === undefined ? {} : { plan: usage.plan }),
         ...(resetEpoch === undefined ? {} : { reset_at_ms: resetEpoch }),
+        // The snapshot this transition was computed from, so the email can
+        // list every limit. The relay already stores the same object from
+        // the status frame, so this sends nothing new off the machine.
+        usage,
       });
       lastQuotaStatus.set(key, { status: next, resetEpoch });
     }
