@@ -2,6 +2,7 @@ import type {
   TImageEditRequest,
   TImageGenerationRequest,
   TImageGenerationResponse,
+  TMediaOptionIssue,
   TModelCaps,
 } from "@openllmsh/protocol";
 import {
@@ -12,10 +13,12 @@ import {
   ImageGenerationResponse,
   isAllowedMediaOption,
   matchDeclaredAspectRatio,
+  mediaOptionRejection,
   normalizeContentType,
   parseImageEditInput,
   parseMediaDimensions,
   resolutionTierForLongEdge,
+  unsupportedParamIssue,
 } from "@openllmsh/protocol";
 import { inspectImageBytes } from "@openllmsh/wire/lib/canonical/image-signature";
 import {
@@ -293,16 +296,62 @@ export const buildImageUpstreamBody = (
   caps?: TModelCaps,
 ): Record<string, unknown> => {
   if (provider === "chatgpt") {
-    // Forward the `gpt-image`-supported options so client settings aren't
-    // silently dropped. `style` + `response_format` are DALL·E-era params that
-    // gpt-image (what Codex serves) rejects — forwarding them would 400, so
-    // they're intentionally omitted (gpt-image always returns b64_json).
+    // `response_format` is GATEWAY-OWNED and stays omitted: the walker
+    // persists the bytes and builds `data[]` itself, so the caller's choice
+    // is honoured whatever reaches the upstream. That is a translation, not
+    // a drop.
+    //
+    // Every other option the caller sent is FORWARDED. This branch is
+    // OpenAI-shaped and `style` / `output_format` / `output_compression` /
+    // `moderation` are canonical fields of that very wire, spelled here
+    // exactly as they are spelled when a card declares support — so the
+    // absence of a card is absence of EVIDENCE, not evidence of absence.
+    // Two behaviours were wrong in opposite directions and both are fixed
+    // here: dropping `style` in silence returned a picture nobody asked for
+    // (the original bug), and refusing it on an un-carded model invented an
+    // incapability from missing metadata (the over-correction). Unknown
+    // forwards and lets the provider — the only authority on its own wire —
+    // answer; a card that says `false` refuses before anything is spent.
+    const issues: TMediaOptionIssue[] = [];
+    const refuse = (param: string): void => {
+      issues.push(
+        unsupportedParamIssue({
+          param,
+          reason:
+            "is declared unsupported by this ChatGPT image model's card, so it was refused rather than discarded. Remove it, or choose a model whose card serves it.",
+        }),
+      );
+    };
+    // `style` is checked on its OWN fact — it is not a member of the output
+    // group, so a card that serves the group says nothing about it.
+    if (req.style !== undefined && caps?.supportsStyle === false)
+      refuse("style");
+    if (caps?.supportsGptImageOutputOptions === false) {
+      // Named one by one, so a caller who sent three learns about three.
+      if (req.output_format !== undefined) refuse("output_format");
+      if (req.output_compression !== undefined) refuse("output_compression");
+      if (req.moderation !== undefined) refuse("moderation");
+      if (req.background !== undefined) refuse("background");
+    }
+    // ONE refusal carrying every locally-known issue: a first-failure
+    // validator turns a four-field request into a four-round-trip staircase.
+    const rejection = mediaOptionRejection(issues);
+    if (rejection !== null)
+      throw new MediaInputError(rejection.param, rejection.message);
     return {
       model: providerModelId,
       prompt: req.prompt,
       ...(req.n !== undefined ? { n: req.n } : {}),
       ...(req.size !== undefined ? { size: req.size } : {}),
       ...(req.quality !== undefined ? { quality: req.quality } : {}),
+      ...(req.style !== undefined ? { style: req.style } : {}),
+      ...(req.output_format !== undefined
+        ? { output_format: req.output_format }
+        : {}),
+      ...(req.output_compression !== undefined
+        ? { output_compression: req.output_compression }
+        : {}),
+      ...(req.moderation !== undefined ? { moderation: req.moderation } : {}),
       ...(req.background !== undefined ? { background: req.background } : {}),
       ...(req.user !== undefined ? { user: req.user } : {}),
     };
@@ -543,6 +592,17 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
     if (hop === undefined) continue;
     const last = i === hops.length - 1;
     if (isSubscriptionSlug(hop.provider)) {
+      // Recorded the moment this hop is UNDERTAKEN, not once it has been
+      // dispatched. Everything below can refuse before a byte leaves the
+      // box — an option this wire cannot map, a provider with no local
+      // credential — and a refusal that names nobody is the one thing a
+      // caller cannot act on: the MCP tool renders "Served by <model>"
+      // from these headers, so without them an agent re-sends the same
+      // rejected field hoping a different model was at fault. The cloud
+      // lane (`runMediaApiChain`) pushes before attempting for exactly
+      // this reason; this is not a claim that anything was submitted —
+      // the dispatch facts handed to `mediaHopAdvances` are untouched.
+      attempted.push(hop.modelId);
       // Validate before credential fallback can advance to an unchecked transport.
       let upstreamBody: Record<string, unknown>;
       try {
@@ -572,7 +632,10 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
               error: err instanceof Error ? err.message : String(err),
             },
           );
-          return stamp(errorJson(500, MEDIA_BUILD_FAILURE_MESSAGE));
+          return stamp(
+            errorJson(500, MEDIA_BUILD_FAILURE_MESSAGE),
+            hop.modelId,
+          );
         }
         const errorCode = unavailable ? "model_unavailable" : "caller_error";
         lastError = errorJson(
@@ -584,7 +647,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         );
         if (!last && mediaHopAdvances({ dispatched: false, errorCode }))
           continue;
-        return stamp(lastError);
+        return stamp(lastError, hop.modelId);
       }
       const delegate = getDelegate(hop.provider);
       if (delegate?.credentialForImage === undefined) {
@@ -599,6 +662,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         }
         return stamp(
           errorJson(404, `No image credential available for ${hop.provider}`),
+          hop.modelId,
         );
       }
       const acquired = await acquireImageUpstream(hop.provider, args, hop);
@@ -613,9 +677,9 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
           continue;
         return stamp(
           errorJson(404, `No image credential available for ${hop.provider}`),
+          hop.modelId,
         );
       }
-      attempted.push(hop.modelId);
 
       const resp = await postUpstream(acquired.url, {
         method: "POST",
@@ -631,7 +695,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         const terminal = args.req.signal.aborted
           ? errorJson(499, "client aborted request")
           : errorJson(502, "upstream image provider is unreachable");
-        return stamp(terminal);
+        return stamp(terminal, hop.modelId);
       }
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
@@ -665,7 +729,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         ) {
           continue;
         }
-        return stamp(lastError);
+        return stamp(lastError, hop.modelId);
       }
       let upstream: unknown;
       try {
@@ -673,6 +737,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
       } catch {
         return stamp(
           errorJson(502, "upstream image provider returned invalid JSON"),
+          hop.modelId,
         );
       }
       let normalized: TImageGenerationResponse;
@@ -686,6 +751,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
               ? `upstream image provider returned invalid data: ${err.message}`
               : "upstream image provider returned invalid data",
           ),
+          hop.modelId,
         );
       }
       // The SSE lane's `completed` event REQUIRES `b64_json`, so a streaming
@@ -703,7 +769,10 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
           ),
         );
       } catch {
-        return stamp(errorJson(502, "Failed to persist generated image"));
+        return stamp(
+          errorJson(502, "Failed to persist generated image"),
+          hop.modelId,
+        );
       }
       report(
         {
@@ -753,7 +822,10 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
     ) {
       continue;
     }
-    return stamp(forwarded);
+    // Only names the hop when the cloud's own answer carried no attribution
+    // of its own (`withMediaAttribution` never overwrites a set header), so a
+    // forwarded refusal keeps whatever the cloud lane resolved.
+    return stamp(forwarded, hop.modelId);
   }
   return stamp(
     lastError ??
@@ -955,8 +1027,15 @@ export const runImageEditWalker = async (
     if (hop === undefined) continue;
     const last = i === hops.length - 1;
     if (!isSubscriptionSlug(hop.provider)) {
+      // A BYOK hop is the cloud's to serve; this walker never attempts one,
+      // so it must not appear in the chain it reports.
       continue;
     }
+    // Recorded before the body is built, for the same reason as the
+    // generation walker above: an edit refused on this wire (a size this
+    // transport has no mapping for) or for want of a local credential still
+    // names the hop that refused it.
+    attempted.push(hop.modelId);
     // Invalid caller options are terminal, even when this hop lacks credentials.
     let upstreamBody: Record<string, unknown>;
     try {
@@ -976,7 +1055,7 @@ export const runImageEditWalker = async (
         errorCode,
       );
       if (!last && mediaHopAdvances({ dispatched: false, errorCode })) continue;
-      return stamp(lastError);
+      return stamp(lastError, hop.modelId);
     }
     const acquired = await acquireImageEditUpstream(hop.provider, args, hop);
     if (acquired === "retry") {
@@ -993,9 +1072,9 @@ export const runImageEditWalker = async (
           404,
           `No image-edit credential available for ${hop.provider}`,
         ),
+        hop.modelId,
       );
     }
-    attempted.push(hop.modelId);
     const resp = await postUpstream(acquired.url, {
       method: "POST",
       headers: {
@@ -1011,6 +1090,7 @@ export const runImageEditWalker = async (
         args.req.signal.aborted
           ? errorJson(499, "client aborted request")
           : errorJson(502, "upstream image-edit provider is unreachable"),
+        hop.modelId,
       );
     }
     if (!resp.ok) {
@@ -1045,7 +1125,7 @@ export const runImageEditWalker = async (
       ) {
         continue;
       }
-      return stamp(lastError);
+      return stamp(lastError, hop.modelId);
     }
     let upstream: unknown;
     try {
@@ -1053,6 +1133,7 @@ export const runImageEditWalker = async (
     } catch {
       return stamp(
         errorJson(502, "upstream image-edit provider returned invalid JSON"),
+        hop.modelId,
       );
     }
     let normalized: TImageGenerationResponse;
@@ -1066,6 +1147,7 @@ export const runImageEditWalker = async (
             ? `upstream image-edit provider returned invalid data: ${err.message}`
             : "upstream image-edit provider returned invalid data",
         ),
+        hop.modelId,
       );
     }
     const includeBase64 = editRequest.response_format === "b64_json";
@@ -1077,7 +1159,10 @@ export const runImageEditWalker = async (
         ),
       );
     } catch {
-      return stamp(errorJson(502, "Failed to persist edited image"));
+      return stamp(
+        errorJson(502, "Failed to persist edited image"),
+        hop.modelId,
+      );
     }
     report(
       {
