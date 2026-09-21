@@ -350,9 +350,19 @@ export const handleInference = async (req: Request): Promise<Response> => {
   let passthroughContentType: string | null = null;
   const explicitAlias =
     modelField.kind === "explicit" ? modelField.value : null;
+  // A cached plan is now SURFACE-scoped, because the plan itself is: the
+  // same `grok` resolves to the chat model on `/v1/chat/completions` and
+  // to the image model on `/v1/images/generations`, so one alias-keyed
+  // entry would serve an image request the chat plan it cached a moment
+  // earlier. Encode the pair structurally: concatenating with a colon
+  // would collide with a chat alias literally named `image:grok`.
+  const planCacheKey =
+    explicitAlias === null
+      ? null
+      : JSON.stringify([mediaSurface ?? "chat", explicitAlias]);
   // Never cache model-less defaults under one empty alias — selection
   // depends on surface/options and current availability.
-  if (planCacheEnabled() && explicitAlias !== null) {
+  if (planCacheEnabled() && planCacheKey !== null) {
     if (planParam !== null) {
       if (
         planSignatureOk(
@@ -363,7 +373,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
           sigParam,
         )
       ) {
-        storePlan(explicitAlias, {
+        storePlan(planCacheKey, {
           planParam,
           pmidsParam,
           originParam,
@@ -372,7 +382,7 @@ export const handleInference = async (req: Request): Promise<Response> => {
         });
       }
     } else {
-      const cached = lookupPlan(explicitAlias);
+      const cached = lookupPlan(planCacheKey);
       if (cached !== null) {
         ({
           planParam,
@@ -486,6 +496,13 @@ export const handleInference = async (req: Request): Promise<Response> => {
         explicitAlias,
         estimateBodyTokens(rawBody),
         req.signal,
+        // The surface this request is FOR — already decided by the path
+        // above. Sending it is what stops an ambiguous family name from
+        // being planned on the wrong surface: `model=grok` posted to
+        // `/v1/images/generations` must plan grok's IMAGE model, not the
+        // chat one the cloud's chat default would pick. `null` (a chat or
+        // compact request) omits it and keeps the historical default.
+        mediaSurface ?? undefined,
       );
     } catch (err) {
       const outcome = handlePlanFetchError(err, explicitAlias);
@@ -517,8 +534,8 @@ export const handleInference = async (req: Request): Promise<Response> => {
     originParam = fetched.origin;
     contextOverflowStrategy = fetchedContextOverflowStrategy;
     sigParam = fetched.sig;
-    if (planCacheEnabled()) {
-      storePlan(explicitAlias, {
+    if (planCacheEnabled() && planCacheKey !== null) {
+      storePlan(planCacheKey, {
         planParam,
         pmidsParam,
         originParam,

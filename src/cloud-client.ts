@@ -19,6 +19,7 @@ import type {
   TDaemonSessionLost,
   TMediaDefaultRequest,
   TMediaPersistError,
+  TPlanSurface,
   TRelayChannelResponse,
   TVideoJobPlanRequest,
 } from "@openllmsh/protocol";
@@ -28,9 +29,11 @@ import {
   DAEMON_DEVICE_LABEL_HEADER,
   DaemonPlanResponse,
   encodeMediaDefaultPlanQuery,
+  encodePlanSurfaceQueryValue,
   encodeVideoJobPlanQuery,
   MediaDefaultRequest,
   MODEL_CAPABILITIES_OPEN_CAP,
+  PLAN_SURFACE_QUERY_KEY,
   RelayChannelResponse,
   VideoJobPlanRequest,
 } from "@openllmsh/protocol";
@@ -292,9 +295,19 @@ export const fetchPlan = async (
   model: string,
   estTokens: number,
   signal?: AbortSignal,
+  surface?: TPlanSurface,
 ): Promise<TDaemonPlanResponse> => {
   const params = new URLSearchParams({ model });
   if (estTokens > 0) params.set("est_tokens", String(Math.ceil(estTokens)));
+  // The surface this request is FOR, when the listener knows it (every
+  // media endpoint does — it is decided by the path). Without it the
+  // cloud can only resolve the name under its chat default, which for an
+  // ambiguous family name (`grok` on `/v1/images/generations`) plans the
+  // chat model while the cloud's own image handler would select the image
+  // one. Omitted on chat, where the default IS the answer, so an older
+  // plan cache key and an unbumped daemon keep behaving identically.
+  if (surface !== undefined)
+    params.set(PLAN_SURFACE_QUERY_KEY, encodePlanSurfaceQueryValue(surface));
   const resp = await cloudFetch(
     cloudUrl(`/api/daemon/plan?${params.toString()}`),
     { method: "GET", headers: authHeaders(), signal },
