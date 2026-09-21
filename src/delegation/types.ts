@@ -1,5 +1,6 @@
 import type {
   TDaemonProviderConnection,
+  TModelCaps,
   TProviderModelEntry,
   TProviderUsageSnapshot,
 } from "@openllmsh/protocol";
@@ -165,17 +166,25 @@ export type TProviderDelegate = {
   ) => Promise<TModelDiscoveryResult>;
 
   /**
-   * Whether ONE model accepts a configurable `reasoning.effort` on this
-   * provider's wire, read from the vendor's live model list (grok's
-   * `/v1/models` rows carry `supports_reasoning_effort`; only current
-   * flagship models set it — the partner client strips the param for the
-   * rest, and so does the walker). `null` = unknown (row missing, list
-   * unreachable, or field absent) — the walker then leaves the request
-   * untouched. Absent on providers whose wire has no such per-model gate.
+   * Per-model caps OBSERVED on the vendor's own live model list, in the
+   * same `ModelCaps` vocabulary the catalog uses — so a live fact and a
+   * catalog fact are the same kind of thing to every consumer, rather
+   * than one boolean policy per vendor quirk.
+   *
+   * Grok today: a `/v1/models` row without `supports_reasoning_effort`
+   * observes `{ deniedParams: ["reasoning"] }` (the row omits false-y
+   * fields proto3-style, and sending effort anyway 400s). `null` =
+   * NOTHING observed — a missing row, an unreachable list — which
+   * leaves the request untouched.
+   *
+   * An observation may only NARROW: it is unioned with the authored
+   * caps, never allowed to clear an authored denial, and it is re-read
+   * per request rather than accumulated, so a transient row can neither
+   * stick nor widen. Absent on providers with no such live gate.
    */
-  supportsReasoningEffort?: (
+  getObservedModelCaps?: (
     providerModelId: string,
-  ) => Promise<boolean | null>;
+  ) => Promise<TModelCaps | null>;
 
   /**
    * JSON-Schema keywords this provider's endpoint REJECTS in tool
@@ -248,9 +257,7 @@ export type TProviderDelegate = {
    * Local-only credential for batch transcription. Same shape as image
    * credentials; never serialized off-box.
    */
-  credentialForTranscription?: (
-    inbound?: Headers,
-  ) => Promise<TImageCredential>;
+  credentialForTranscription?: (inbound?: Headers) => Promise<TImageCredential>;
 
   /**
    * Local-only credential for speech synthesis.

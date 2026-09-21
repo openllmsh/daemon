@@ -56,6 +56,7 @@ import {
   ChatCompletionChunk,
   cooldownPolicyFor,
   daemonPlanSigningPayload,
+  resolveDefaultModelCaps,
   TOOL_SESSION_HEADER,
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
@@ -186,6 +187,7 @@ import {
   activeSubMethod,
   activeSubMethodOverrides,
   contextOverflowStrategy as bootstrapContextOverflowStrategy,
+  catalogCapsDefaults,
   fleetSubscriptionServerFor,
   lookupCatalogEntry,
   planSigningKey,
@@ -355,7 +357,16 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
   const provider = slash > 0 ? modelId.slice(0, slash) : modelId;
   const entry = lookupCatalogEntry(modelId);
   const capabilities = entry?.capabilities ?? [];
-  const caps = entry?.caps;
+  // A card always wins. With no row, fall back to the catalog-owned
+  // family defaults using the SAME shared matcher the cloud runs, so an
+  // un-catalogued id resolves identically on both paths.
+  const caps =
+    entry?.caps ??
+    resolveDefaultModelCaps(
+      catalogCapsDefaults(),
+      provider,
+      providerModelId ?? modelId.slice(slash + 1),
+    );
   const stripSubagentIsolation = entry?.strip_subagent_isolation === true;
   if (providerModelId !== undefined && providerModelId.length > 0) {
     return {
@@ -1067,10 +1078,14 @@ const mapToolParameters = (
  * Delegate-owned per-model request compat, applied to the BUILT upstream body
  * (grok today; a no-op for delegates that declare neither knob — audit
  * 2026-07-14 §F2/§F7):
- *   - `reasoning` dropped when the vendor's live model row says configurable
- *     effort is unsupported (`supportsReasoningEffort` → `false`; `null` =
- *     unknown leaves the request untouched) — the shared wire builder can't
- *     know this, only the delegate sees the vendor's `/v1/models`;
+ *   - parameters the delegate OBSERVES as denied on the vendor's live model
+ *     list are dropped (`getObservedModelCaps` → `deniedParams`; grok's rows
+ *     deny `reasoning` when they advertise no configurable effort, and
+ *     `null` = nothing observed leaves the request untouched) — the shared
+ *     wire builder can't know this, only the delegate sees `/v1/models`.
+ *     The observation is in the catalog's own `ModelCaps` vocabulary, so a
+ *     live fact and an authored one are the same kind of thing (see
+ *     `mergeObservedModelCaps`), and it may only ever NARROW;
  *   - tool-schema keywords the endpoint rejects stripped recursively from
  *     every tool's `parameters`.
  * The delegate rides in as a parameter (callers pass `getDelegate(...)`) so
@@ -1085,15 +1100,17 @@ export const applyDelegateModelCompat = async (
     return body;
   }
   let out = body as Record<string, unknown>;
-  if (
-    out.reasoning !== undefined &&
-    delegate.supportsReasoningEffort !== undefined
-  ) {
-    const supported = await delegate
-      .supportsReasoningEffort(providerModelId)
+  if (delegate.getObservedModelCaps !== undefined) {
+    // Read per request, exactly where the boolean hook used to be read:
+    // same phase, same (cached) fetch, no bootstrap round-trip — a live
+    // vendor fact must not wait on the next catalog refresh. `null` =
+    // nothing observed, which leaves the body untouched.
+    const observed = await delegate
+      .getObservedModelCaps(providerModelId)
       .catch((): null => null);
-    if (supported === false) {
-      const { reasoning: _dropped, ...rest } = out;
+    for (const param of observed?.deniedParams ?? []) {
+      if (out[param] === undefined) continue;
+      const { [param]: _dropped, ...rest } = out;
       out = rest;
     }
   }

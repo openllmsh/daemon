@@ -2,15 +2,26 @@ import type {
   TImageEditRequest,
   TImageGenerationRequest,
   TImageGenerationResponse,
+  TModelCaps,
 } from "@openllmsh/protocol";
 import {
+  aspectRatioFromDimensions,
   base64ToBytes,
+  describeAllowed,
   ImageGenerationRequest,
   ImageGenerationResponse,
+  isAllowedMediaOption,
+  matchDeclaredAspectRatio,
   normalizeContentType,
   parseImageEditInput,
+  parseMediaDimensions,
+  resolutionTierForLongEdge,
 } from "@openllmsh/protocol";
 import { inspectImageBytes } from "@openllmsh/wire/lib/canonical/image-signature";
+import {
+  completedEventFromFinalImage,
+  encodeImageSseEvent,
+} from "@openllmsh/wire/lib/canonical/image-sse";
 import { originatorHeadersFrom } from "@openllmsh/wire/lib/forwarded-headers";
 import { Schema } from "effect";
 import { uploadMedia } from "./cloud-client";
@@ -22,8 +33,14 @@ import {
   ImageProviderUnavailableError,
   isSupportedImageEditReference,
 } from "./image-edit-wire";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 import { withMediaAttribution } from "./media-attribution";
 import { forwardMediaHopToCloud } from "./media-cloud-forward";
+import {
+  classifyMediaBuildFailure,
+  MEDIA_BUILD_FAILURE_MESSAGE,
+  MediaInputError,
+} from "./media-input-error";
 import { mediaHopAdvances, mediaHttpErrorCode } from "./media-retry";
 import type { TWalkArgs } from "./walker";
 import {
@@ -153,8 +170,15 @@ export const persistImageDataItem = async (
   }
   return {
     url: saved.url,
-    ...(includeBase64 && item.b64_json !== undefined
-      ? { b64_json: item.b64_json }
+    // When base64 was asked for, the vendor's own encoding is reused when it
+    // sent one; a `url`-delivered item is encoded from the bytes this walker
+    // already downloaded. Dropping them (the previous behaviour) left a
+    // URL-returning vendor's item with no bytes at all — which a `b64_json`
+    // caller explicitly asked for, and which starved the SSE lane, whose
+    // `completed` event REQUIRES `b64_json`. Matches the storage-failure
+    // branch above, which already encodes the downloaded bytes.
+    ...(includeBase64
+      ? { b64_json: item.b64_json ?? bytesToBase64(bytes) }
       : {}),
     ...(item.revised_prompt !== undefined
       ? { revised_prompt: item.revised_prompt }
@@ -190,7 +214,7 @@ export const acquireImageUpstream = async (
   }
 };
 
-export const sizeToAspect = (size?: string): string => {
+export const sizeToAspect = (size?: string, caps?: TModelCaps): string => {
   switch (size) {
     case "1792x1024":
       return "16:9";
@@ -202,28 +226,71 @@ export const sizeToAspect = (size?: string): string => {
     case "auto":
       return "auto";
     default: {
-      const dimensions = /^(\d+)x(\d+)$/.exec(size);
-      const width = Number(dimensions?.[1]);
-      const height = Number(dimensions?.[2]);
-      if (
-        !Number.isSafeInteger(width) ||
-        !Number.isSafeInteger(height) ||
-        width <= 0 ||
-        height <= 0
-      )
-        throw new Error("Grok image size is not supported by this transport");
-      const gcd = (a: number, b: number): number =>
-        b === 0 ? a : gcd(b, a % b);
-      const divisor = gcd(width, height);
-      return `${width / divisor}:${height / divisor}`;
+      const parsed = parseMediaDimensions(size);
+      if (parsed === null)
+        throw new MediaInputError(
+          "size",
+          "Grok image size is not supported by this transport",
+        );
+      // Matched by VALUE against the catalog's declared vocabulary: a
+      // vendor may publish non-integer spellings (`9:19.5`) that a gcd
+      // reduction can never produce, so 1080x2340 is served as the
+      // declared `9:19.5` instead of being refused as `6:13`. With no
+      // declared set the reduced ratio rides through.
+      return (
+        matchDeclaredAspectRatio(caps?.mediaImageAspectRatios ?? [], parsed) ??
+        aspectRatioFromDimensions(parsed)
+      );
     }
   }
+};
+
+/**
+ * Translate the caller's size into a published resolution tier.
+ *
+ * Only the DOCUMENTED tier sizes map: `1k` is "~1024x1024" and `2k` is
+ * "~2048x2048" (docs.x.ai pricing enum), so a long edge of exactly 1024
+ * or 2048 is expressible and anything else is not. No nearest-tier
+ * guessing — that promoted 1536 to the pricier `2k` and demoted 512 to
+ * an upscaled `1k`, both of them requests nobody made. `1.5k` is in the
+ * request enum with no published pixel size, so no size reaches it; a
+ * caller who wants it needs an explicit resolution control, which this
+ * canonical surface does not model yet.
+ */
+export const sizeToImageResolution = (
+  size: string | undefined,
+  caps?: TModelCaps,
+): string | undefined => {
+  // Tier names, their documented pixel meanings and the default all come
+  // from the catalog. With no tier data the size is UNKNOWN to us: no
+  // resolution is sent at all rather than guessing one, and the provider
+  // applies its own default.
+  const tiers = caps?.mediaImageResolutionTiers;
+  const allowed = caps?.mediaImageResolutions;
+  const fallback = caps?.mediaImageDefaultResolution;
+  if (size === undefined || size === "auto") return fallback;
+  const parsed = parseMediaDimensions(size);
+  if (parsed === null)
+    throw new MediaInputError(
+      "size",
+      "Grok image size is not supported by this transport",
+    );
+  if (tiers === undefined) return fallback;
+  const longEdge = Math.max(parsed.width, parsed.height);
+  const resolution = resolutionTierForLongEdge(tiers, longEdge, allowed);
+  if (resolution === null)
+    throw new MediaInputError(
+      "size",
+      `size ${size} has no documented resolution tier for this model: published tiers are ${describeAllowed(tiers.map((tier) => `${tier.resolution} (~${tier.longEdge} long edge)`))}. Omit size for the provider default, or send a size matching a published tier — it is not rounded to a neighbouring tier for you.`,
+    );
+  return resolution;
 };
 
 export const buildImageUpstreamBody = (
   provider: string,
   req: TImageGenerationRequest,
   providerModelId: string,
+  caps?: TModelCaps,
 ): Record<string, unknown> => {
   if (provider === "chatgpt") {
     // Forward the `gpt-image`-supported options so client settings aren't
@@ -241,26 +308,74 @@ export const buildImageUpstreamBody = (
     };
   }
   if (provider === "grok") {
-    const unmapped =
-      req.style !== undefined
-        ? "style"
-        : req.background !== undefined
+    // `user` IS part of xAI's published GenerateImageRequest
+    // (docs.x.ai/openapi.json), so it is forwarded rather than refused;
+    // `style` and the gpt-image output group have no field there and are
+    // still reported instead of being dropped.
+    //
+    // A card may say a specific model DOES serve one of these
+    // (`supportsStyle` / `supportsGptImageOutputOptions`), and then it is
+    // forwarded: the refusal exists because the published request schema
+    // has no field for it, not because we decided the model cannot.
+    const styleUnmapped =
+      req.style !== undefined && caps?.supportsStyle !== true;
+    const outputGroupUnmapped =
+      caps?.supportsGptImageOutputOptions !== true &&
+      (req.background !== undefined ||
+        req.output_format !== undefined ||
+        req.output_compression !== undefined ||
+        req.moderation !== undefined);
+    const unmapped = styleUnmapped
+      ? "style"
+      : outputGroupUnmapped
+        ? req.background !== undefined
           ? "background"
-          : req.user !== undefined
-            ? "user"
-            : undefined;
+          : req.output_format !== undefined
+            ? "output_format"
+            : req.output_compression !== undefined
+              ? "output_compression"
+              : "moderation"
+        : undefined;
     if (unmapped !== undefined)
-      throw new Error(
+      throw new MediaInputError(
+        unmapped,
         `Grok image adapter cannot map ${unmapped}; it was not discarded. Use an image adapter that serializes this option, or remove it only if it is not intended.`,
       );
+    const aspectRatio = sizeToAspect(req.size, caps);
+    if (!isAllowedMediaOption(caps?.mediaImageAspectRatios, aspectRatio))
+      throw new MediaInputError(
+        "size",
+        `size ${req.size ?? ""} implies aspect ratio ${aspectRatio}, which this model does not accept. Accepted aspect ratios: ${describeAllowed(caps?.mediaImageAspectRatios ?? [])}.`,
+      );
+    const n = req.n ?? 1;
+    const countRange = caps?.mediaImageCountRange;
+    if (
+      countRange !== undefined &&
+      (!Number.isInteger(n) || n < countRange.min || n > countRange.max)
+    )
+      throw new MediaInputError(
+        "n",
+        `n must be a whole number from ${countRange.min} to ${countRange.max}; received ${n}.`,
+      );
+    const resolution = sizeToImageResolution(req.size, caps);
     return {
       model: providerModelId,
+      // `quality` is forwarded unchanged: the published request schema
+      // did not resolve this field, so neither dropping nor validating
+      // it would be evidence-backed.
       ...(req.quality !== undefined ? { quality: req.quality } : {}),
       prompt: req.prompt,
-      n: req.n ?? 1,
-      aspect_ratio: sizeToAspect(req.size),
-      resolution: "1k",
-      response_format: "b64_json",
+      n,
+      aspect_ratio: aspectRatio,
+      ...(resolution === undefined ? {} : { resolution }),
+      // Omitted only when a card says this model's upstream has no such
+      // knob. That is NOT a refusal: the walker persists the bytes and
+      // builds `data[]` itself, so the caller's `response_format` is
+      // honoured either way.
+      ...(caps?.upstreamAcceptsResponseFormat === false
+        ? {}
+        : { response_format: "b64_json" }),
+      ...(req.user !== undefined ? { user: req.user } : {}),
     };
   }
   throw new ImageProviderUnavailableError(
@@ -285,6 +400,104 @@ export const normalizeImageResponse = (
     created: Math.floor(Date.now() / 1000),
     data,
   });
+};
+
+/**
+ * Final-only image SSE for the local lane.
+ *
+ * NEITHER subscription provider this walker serves emits progressive
+ * image bytes — xAI's docs state streaming "is not supported by models
+ * with image output capability", and the Gemini image wire documents no
+ * partial-image events — so there is nothing real to forward as a
+ * partial frame. Rather than refuse `stream: true` (the caller asked
+ * for a transport, not a capability) or fabricate progress, this emits
+ * exactly ONE genuine `image_generation.completed` event carrying the
+ * real bytes, the real usage when the upstream sent one, and the
+ * durable library URL.
+ *
+ * Ordering is the promise: persistence runs BEFORE the stream opens, so
+ * a `completed` event is only ever written once the bytes are stored
+ * and the `url` it advertises exists. A persistence failure therefore
+ * answers a normal JSON error, never a `completed` event describing
+ * media that was not saved.
+ *
+ * This DELIBERATELY differs from the cloud image lane, which opens the
+ * stream first so genuine progressive frames can reach the client while
+ * generation is still running, and persists when its completed event
+ * arrives. That lane cannot persist first — it does not hold the final
+ * image until the end, and buffering to get it would destroy the
+ * progressive property it exists to provide; it therefore needs a
+ * terminal SSE `error` frame for a post-open persistence failure, which
+ * this lane never reaches for. Do not "harmonise" the two: each order
+ * is correct for its inputs, and the invariant they share is the one
+ * that matters — `url` is emitted only after the bytes are stored, so
+ * on both lanes its presence is a fact rather than a promise.
+ */
+export const imageStreamResponse = (
+  normalized: TImageGenerationResponse,
+  persisted: ReadonlyArray<TImageDataItem>,
+  request: TImageGenerationRequest,
+): Response => {
+  const createdAt = normalized.created;
+  const frames: Uint8Array[] = [];
+  for (const [index, item] of persisted.entries()) {
+    const b64 = item.b64_json ?? normalized.data[index]?.b64_json;
+    if (b64 === undefined) continue;
+    const event = completedEventFromFinalImage({
+      b64_json: b64,
+      createdAt,
+      ...(request.size !== undefined ? { size: request.size } : {}),
+      ...(normalized.quality !== undefined
+        ? { quality: normalized.quality }
+        : {}),
+      ...(normalized.background !== undefined
+        ? { background: normalized.background }
+        : {}),
+      ...(normalized.output_format !== undefined
+        ? { outputFormat: normalized.output_format }
+        : {}),
+      // Real counts only: an upstream that sends none gets none, and
+      // the `output_tokens_details` that only the non-streaming shape
+      // carries is dropped rather than invented.
+      ...(normalized.usage !== undefined
+        ? {
+            usage: {
+              input_tokens: normalized.usage.input_tokens,
+              output_tokens: normalized.usage.output_tokens,
+              total_tokens: normalized.usage.total_tokens,
+              ...(normalized.usage.input_tokens_details !== undefined
+                ? {
+                    input_tokens_details: normalized.usage.input_tokens_details,
+                  }
+                : {}),
+            },
+          }
+        : {}),
+    });
+    frames.push(
+      encodeImageSseEvent(
+        item.url === undefined ? event : { ...event, url: item.url },
+      ),
+    );
+  }
+  if (frames.length === 0)
+    return errorJson(502, "upstream image provider returned no image bytes");
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller): void {
+        for (const frame of frames) controller.enqueue(frame);
+        controller.close();
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+      },
+    },
+  );
 };
 
 export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
@@ -337,15 +550,36 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
           hop.provider,
           imageRequest,
           hop.providerModelId,
+          // Catalog-resolved, model-specific facts for THIS hop; the
+          // provider branch is only the family default beneath them.
+          hop.caps,
         );
       } catch (err) {
-        const errorCode =
-          err instanceof ImageProviderUnavailableError
-            ? "model_unavailable"
-            : "caller_error";
+        const failure = classifyMediaBuildFailure(err);
+        // `ImageProviderUnavailableError` predates the shared brands and
+        // is still thrown by the image-edit wire, so it keeps its own
+        // check rather than being reclassified as a gateway fault.
+        const unavailable =
+          failure.kind === "provider_unavailable" ||
+          err instanceof ImageProviderUnavailableError;
+        if (failure.kind === "unexpected" && !unavailable) {
+          logWarn(
+            "image-walker",
+            safeDiagnosticMessage`Failed to build image request`,
+            {
+              provider: hop.provider,
+              model: hop.providerModelId,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+          return stamp(errorJson(500, MEDIA_BUILD_FAILURE_MESSAGE));
+        }
+        const errorCode = unavailable ? "model_unavailable" : "caller_error";
         lastError = errorJson(
           400,
-          err instanceof Error ? err.message : "Invalid image request",
+          unavailable && err instanceof Error
+            ? err.message
+            : (failure as { readonly message: string }).message,
           errorCode,
         );
         if (!last && mediaHopAdvances({ dispatched: false, errorCode }))
@@ -454,7 +688,13 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
           ),
         );
       }
-      const includeBase64 = imageRequest.response_format === "b64_json";
+      // The SSE lane's `completed` event REQUIRES `b64_json`, so a streaming
+      // request needs the bytes retained whatever `response_format` says —
+      // otherwise a URL-returning vendor yields zero frames and the walker
+      // reports 502 for a generation that actually succeeded and persisted.
+      const includeBase64 =
+        imageRequest.response_format === "b64_json" ||
+        imageRequest.stream === true;
       let persistedItems: ReadonlyArray<TImageDataItem>;
       try {
         persistedItems = await Promise.all(
@@ -480,11 +720,19 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
         },
         args.originParam,
       );
+      // `stream: true` changes the TRANSPORT, not the result: the same
+      // persisted bytes either ride one real completion event or the
+      // JSON body. `false`/absent keeps the JSON path byte-for-byte.
       return stamp(
-        new Response(JSON.stringify({ ...normalized, data: persistedItems }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+        imageRequest.stream === true
+          ? imageStreamResponse(normalized, persistedItems, imageRequest)
+          : new Response(
+              JSON.stringify({ ...normalized, data: persistedItems }),
+              {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              },
+            ),
         hop.modelId,
       );
     }

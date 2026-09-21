@@ -1,5 +1,6 @@
 import type {
   TMediaPersistError,
+  TModelCaps,
   TVideoDeleted,
   TVideoGenerationRequest,
   TVideoIdPayload,
@@ -7,14 +8,20 @@ import type {
   TVideoJobStatus,
 } from "@openllmsh/protocol";
 import {
+  aspectRatioFromDimensions,
   decodeVideoId,
+  describeAllowed,
   encodeVideoId,
+  isAllowedMediaOption,
   isSubscriptionProviderSlug,
   MEDIA_ERROR_RESPONSE_HEADER,
   MEDIA_URL_RESPONSE_HEADER,
+  matchDeclaredAspectRatio,
   normalizeContentType,
+  parseMediaDimensions,
   parseVideoGenerationInput,
   redactVideoErrorText,
+  resolutionFromDimensions,
   VIDEO_INPUT_ERROR,
   VideoGenerationRequest,
   videoInputReceiptFromCounts,
@@ -29,6 +36,12 @@ import { passthroughToOrigin } from "./forward";
 import { logWarn, safeDiagnosticMessage } from "./logger";
 import { withMediaAttribution } from "./media-attribution";
 import { forwardMediaHopToCloud } from "./media-cloud-forward";
+import {
+  classifyMediaBuildFailure,
+  MEDIA_BUILD_FAILURE_MESSAGE,
+  MediaInputError,
+  MediaProviderUnavailableError,
+} from "./media-input-error";
 import { mediaHopAdvances, mediaHttpErrorCode } from "./media-retry";
 import type { TWalkArgs } from "./walker";
 import {
@@ -171,19 +184,46 @@ const videoRequestIdFrom = (body: unknown): string | null => {
 };
 
 /**
- * Derive Grok's `aspect_ratio` from a `WIDTHxHEIGHT` size by reducing the
- * ratio. Only an absent size defaults to `1:1`; other explicit values are
- * preserved for native provider validation rather than silently replaced.
+ * Raised when a canonical video request has no faithful expression in
+ * xAI's declared request domain (`docs.x.ai/openapi.json`,
+ * `GenerateVideoRequest`). Nothing is clamped or dropped — the caller
+ * is told which values the surface accepts.
  */
-export const videoAspectRatio = (size?: string): string => {
-  const match = size?.match(/^(\d+)x(\d+)$/i);
-  if (!match) return size ?? "1:1";
-  const width = Number.parseInt(match[1] ?? "", 10);
-  const height = Number.parseInt(match[2] ?? "", 10);
-  if (!(width > 0 && height > 0)) return size ?? "1:1";
-  const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
-  const divisor = gcd(width, height);
-  return `${width / divisor}:${height / divisor}`;
+export class XaiVideoInputError extends MediaInputError {
+  constructor(field: string, message: string) {
+    super(field, message);
+    this.name = "XaiVideoInputError";
+  }
+}
+
+/**
+ * Derive Grok's `aspect_ratio` from a `WIDTHxHEIGHT` size by reducing the
+ * ratio. Only an absent size defaults to `1:1`; a size that reduces to a
+ * ratio outside the published enum is refused rather than sent (the
+ * upstream would 400 after the request was already billed against the
+ * user's account rate limits).
+ */
+export const videoAspectRatio = (size?: string, caps?: TModelCaps): string => {
+  if (size === undefined) return "1:1";
+  const parsed = parseMediaDimensions(size);
+  if (parsed === null)
+    throw new XaiVideoInputError(
+      "size",
+      `size must use positive WIDTHxHEIGHT dimensions, for example 1280x720; received ${size}.`,
+    );
+  // Matched by VALUE against the catalog's declared vocabulary, so a
+  // size whose gcd spelling differs from the published one still goes
+  // through with the caller's framing intact. No declared set means
+  // UNKNOWN: the reduced ratio rides through unchallenged.
+  const declaredRatios = caps?.mediaVideoAspectRatios;
+  if (declaredRatios === undefined) return aspectRatioFromDimensions(parsed);
+  const declared = matchDeclaredAspectRatio(declaredRatios, parsed);
+  if (declared === null)
+    throw new XaiVideoInputError(
+      "size",
+      `size ${size} implies aspect ratio ${aspectRatioFromDimensions(parsed)}, which this model does not generate. Accepted aspect ratios: ${describeAllowed(declaredRatios)}.`,
+    );
+  return declared;
 };
 
 /** Map xAI's asynchronous video statuses to OpenLLM's job lifecycle. */
@@ -193,11 +233,31 @@ export const mapVideoStatus = (status: unknown): TVideoJobStatus => {
   return status === "queued" ? "queued" : "in_progress";
 };
 
-/** Select Grok's required output resolution from a WIDTHxHEIGHT size. */
-export const sizeToResolution = (size?: string): string => {
+/**
+ * Select Grok's required output resolution from a WIDTHxHEIGHT size.
+ *
+ * Validated against the published REQUEST enum (480p / 720p / 1080p)
+ * only, so a size whose short edge has no enum value (`1536p` was never
+ * one) is reported instead of invented. Which of those a given model
+ * actually prices is left to xAI's own rejection — see the note in
+ * `media-limits.ts` on why no per-model table gates this.
+ */
+export const sizeToResolution = (size?: string, caps?: TModelCaps): string => {
   if (size === undefined) return "480p";
-  const match = /^(\d+)x(\d+)$/.exec(size);
-  return match ? `${Math.min(Number(match[1]), Number(match[2]))}p` : size;
+  const parsed = parseMediaDimensions(size);
+  if (parsed === null)
+    throw new XaiVideoInputError(
+      "size",
+      `size must use positive WIDTHxHEIGHT dimensions, for example 1280x720; received ${size}.`,
+    );
+  const resolution = resolutionFromDimensions(parsed);
+  const allowed = caps?.videoResolutions;
+  if (!isAllowedMediaOption(allowed, resolution))
+    throw new XaiVideoInputError(
+      "size",
+      `size ${size} implies resolution ${resolution}, which this model does not generate. Accepted resolutions: ${describeAllowed(allowed ?? [])}.`,
+    );
+  return resolution;
 };
 
 /** Build the provider-native video generation request without performing I/O. */
@@ -205,17 +265,63 @@ export const buildVideoUpstreamBody = (
   provider: string,
   req: TVideoGenerationRequest,
   providerModelId: string,
+  caps?: TModelCaps,
 ): Record<string, unknown> => {
   parseVideoGenerationInput(req);
   if (provider !== "grok") {
-    throw new Error(`Unsupported subscription video provider: ${provider}`);
+    throw new MediaProviderUnavailableError(
+      `Unsupported subscription video provider: ${provider}`,
+    );
   }
-  const duration =
-    req.seconds === undefined
-      ? undefined
-      : req.seconds.trim() !== "" && Number.isFinite(Number(req.seconds))
-        ? Number(req.seconds)
-        : req.seconds;
+  // `duration` is an int32 in [1, 15] (openapi.json
+  // `GenerateVideoRequest.duration`). A non-numeric or out-of-range
+  // value is reported, never coerced to a string the upstream rejects
+  // and never clamped into range on the caller's behalf.
+  let duration: number | undefined;
+  if (req.seconds !== undefined) {
+    const parsedSeconds = Number(req.seconds);
+    if (req.seconds.trim() === "" || !Number.isFinite(parsedSeconds))
+      throw new XaiVideoInputError(
+        "seconds",
+        `seconds must be a numeric duration string; received ${req.seconds}.`,
+      );
+    if (!Number.isInteger(parsedSeconds))
+      throw new XaiVideoInputError(
+        "seconds",
+        `Grok Imagine video durations are whole seconds; received ${req.seconds}.`,
+      );
+    const range = caps?.mediaVideoDurationRange;
+    if (
+      range !== undefined &&
+      (parsedSeconds < range.min || parsedSeconds > range.max)
+    )
+      throw new XaiVideoInputError(
+        "seconds",
+        `This model generates clips from ${range.min} to ${range.max} seconds; received ${req.seconds}. The request is not shortened for you.`,
+      );
+    const durations = caps?.mediaVideoDurationsSeconds;
+    if (
+      durations !== undefined &&
+      !durations.some((allowed) => allowed === parsedSeconds)
+    )
+      throw new XaiVideoInputError(
+        "seconds",
+        `This model generates clips of ${describeAllowed(durations)} seconds; received ${req.seconds}.`,
+      );
+    duration = parsedSeconds;
+  }
+  const voiceCount = req.reference_voices?.length ?? 0;
+  const maxVoices = caps?.mediaVideoMaxReferenceVoices;
+  if (maxVoices !== undefined && voiceCount > maxVoices)
+    throw new XaiVideoInputError(
+      "reference_voices",
+      `This model accepts up to ${maxVoices} reference voices; received ${voiceCount}.`,
+    );
+  // Voice references are FORWARDED for every Grok video model. The
+  // published per-model input modalities say only `-1.5` declares
+  // AUDIO, but refusing here would label a vendor model incapable from
+  // a table of ours; the transport carries `reference_audios` fine, so
+  // the provider's own error is the authority.
   return {
     model: providerModelId,
     prompt: req.prompt,
@@ -233,8 +339,8 @@ export const buildVideoUpstreamBody = (
         }
       : {}),
     ...(duration !== undefined ? { duration } : {}),
-    aspect_ratio: videoAspectRatio(req.size),
-    resolution: sizeToResolution(req.size),
+    aspect_ratio: videoAspectRatio(req.size, caps),
+    resolution: sizeToResolution(req.size, caps),
   };
 };
 
@@ -373,12 +479,35 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
     attempted.push(hop.modelId);
     let body: Record<string, unknown>;
     try {
-      body = buildVideoUpstreamBody(hop.provider, request, hop.providerModelId);
-    } catch (err) {
-      lastError = errorJson(
-        400,
-        err instanceof Error ? err.message : "Unsupported video provider",
+      body = buildVideoUpstreamBody(
+        hop.provider,
+        request,
+        hop.providerModelId,
+        // Catalog-resolved facts for THIS hop.
+        hop.caps,
       );
+    } catch (err) {
+      const failure = classifyMediaBuildFailure(err);
+      if (failure.kind === "unexpected") {
+        // Our bug, not the caller's: log the detail, return one
+        // sanitized sentence, and do NOT advance — another hop would
+        // hit the same code path.
+        logWarn(
+          "video-walker",
+          safeDiagnosticMessage`Failed to build video request`,
+          {
+            provider: hop.provider,
+            model: hop.providerModelId,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+        return stamp(errorJson(500, MEDIA_BUILD_FAILURE_MESSAGE));
+      }
+      // Both remaining kinds are known BEFORE dispatch, so their own
+      // text is safe to return with the field that caused it.
+      const errorCode =
+        failure.kind === "input" ? "video_input_invalid" : "model_unavailable";
+      lastError = errorJson(400, failure.message, errorCode);
       if (
         !last &&
         mediaHopAdvances({

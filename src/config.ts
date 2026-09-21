@@ -20,6 +20,7 @@ import type {
   TDaemonBootstrap,
   TDaemonCatalogEntry,
   TDaemonReportingPolicy,
+  TModelCapsDefaultRule,
   TSubMethod,
 } from "@openllmsh/protocol";
 import { resolveContextOverflowStrategy } from "@openllmsh/wire";
@@ -228,13 +229,26 @@ export const lookupCatalogEntry = (
 ): TDaemonCatalogEntry | null => byModelId.get(modelId) ?? null;
 
 /**
+ * Catalog-owned caps DEFAULTS from the last bootstrap, for models with
+ * no catalog row. Empty when the cloud is too old to advertise them —
+ * the walker then resolves no defaults, which is today's behaviour.
+ */
+export const catalogCapsDefaults = (): ReadonlyArray<TModelCapsDefaultRule> =>
+  snapshot.caps_defaults ?? [];
+
+/**
  * Test seam: pin the in-memory catalog the walker resolves hops against.
  * Production never calls this — bootstrap is the only writer.
  */
 export const setCatalogForTest = (
   catalog: ReadonlyArray<TDaemonCatalogEntry>,
+  capsDefaults: ReadonlyArray<TModelCapsDefaultRule> = [],
 ): void => {
-  snapshot = { ...EMPTY, catalog: [...catalog] };
+  snapshot = {
+    ...EMPTY,
+    catalog: [...catalog],
+    caps_defaults: [...capsDefaults],
+  };
   byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
 };
 

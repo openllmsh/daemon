@@ -53,6 +53,7 @@ import type {
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
+import { REALTIME_DEFAULT_MODEL_BY_PROVIDER } from "@openllmsh/protocol/realtime-generated";
 import { Option, Schema as S } from "effect";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
@@ -120,7 +121,11 @@ const GROK_IMAGE_URL = "https://api.x.ai/v1/images/generations";
 const GROK_IMAGE_EDIT_URL = "https://api.x.ai/v1/images/edits";
 const GROK_STT_URL = "https://api.x.ai/v1/stt";
 const GROK_TTS_URL = "https://api.x.ai/v1/tts";
-const GROK_REALTIME_URL = "wss://api.x.ai/v1/realtime?model=grok-voice-latest";
+// The `model` query param is CATALOG-OWNED via the generated realtime
+// artifact (`@openllmsh/protocol/realtime-generated`), so this URL cannot
+// drift from the catalog row the admission schema accepts. The HOST is a
+// vendor fact and stays local. Byte-identical to the previous literal.
+const GROK_REALTIME_URL = `wss://api.x.ai/v1/realtime?model=${REALTIME_DEFAULT_MODEL_BY_PROVIDER.grok}`;
 
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
@@ -962,10 +967,17 @@ export const grokDelegate: TProviderDelegate = {
     );
   },
 
-  supportsReasoningEffort: async (providerModelId) => {
+  // The live row, normalized into the catalog's own caps vocabulary: a
+  // model that advertises no configurable effort DENIES `reasoning`.
+  // Unknown (missing row, unreachable list) stays `null` — nothing
+  // observed, so the request is left untouched. Same call site, same
+  // cached `/v1/models`: no extra fetch and no bootstrap lag.
+  getObservedModelCaps: async (providerModelId) => {
     const rows = await modelRows();
     if (rows === null) return null;
-    return reasoningEffortFromRows(rows, providerModelId);
+    return reasoningEffortFromRows(rows, providerModelId) === false
+      ? { deniedParams: ["reasoning"] }
+      : null;
   },
 
   // xAI rejects contains-count bounds in tool schemas (partner compat:

@@ -45,6 +45,7 @@ import {
   isPcmParseFailure,
 } from "./audio/pcm";
 import { uploadMedia } from "./cloud-client";
+import { lookupCatalogEntry } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate } from "./delegation";
 import type { TImageCredential } from "./delegation/types";
@@ -284,7 +285,25 @@ const detectAudioFormat = (
   return null;
 };
 
-const inputFormatsFor = (
+/** The formats this daemon can actually detect AND frame. A catalog card
+ *  may name an encoding a future daemon handles; accepting it here would
+ *  hand un-decodable bytes to a verified recipe (Claude's dictation
+ *  socket wants framed PCM), so a declared format is only honoured when
+ *  this build has a decode path for it. */
+const DECODABLE_AUDIO_FORMATS: ReadonlyArray<TDetectedAudioFormat> = [
+  "webm_opus",
+  "wav_pcm16_16khz_mono",
+  "pcm_s16le_16khz_mono",
+];
+
+const isDecodableAudioFormat = (value: string): value is TDetectedAudioFormat =>
+  (DECODABLE_AUDIO_FORMATS as ReadonlyArray<string>).includes(value);
+
+/** Verified per-provider recipe, used ONLY when the catalog says nothing
+ *  (an older cloud's bootstrap carries no `audio_support`). Keeping it
+ *  means an un-advertised catalog never widens a wire that has a single
+ *  verified encoding, and never narrows one either. */
+const verifiedInputFormatsFor = (
   provider: string,
 ): ReadonlyArray<TDetectedAudioFormat> => {
   switch (provider) {
@@ -297,6 +316,25 @@ const inputFormatsFor = (
     default:
       return [];
   }
+};
+
+/**
+ * Accepted transcription input encodings for THIS model.
+ *
+ * The fact is per-model catalog data (`audio_support.input_formats`),
+ * delivered by the authenticated bootstrap, so a vendor adding an
+ * encoding is a catalog edit rather than a daemon release. A card that
+ * declares nothing falls back to the verified constant for the provider
+ * — absence is compatibility, not a widened wire.
+ */
+const inputFormatsFor = (hop: {
+  readonly provider: string;
+  readonly modelId: string;
+}): ReadonlyArray<TDetectedAudioFormat> => {
+  const declared = lookupCatalogEntry(hop.modelId)?.audio_support
+    ?.input_formats;
+  if (declared === undefined) return verifiedInputFormatsFor(hop.provider);
+  return declared.filter(isDecodableAudioFormat);
 };
 
 const stripCodexAssetPointers = (
@@ -420,7 +458,7 @@ export const runAudioTranscriptionWalker = async (
       return stamp(forwarded);
     }
 
-    const allowed = inputFormatsFor(hop.provider);
+    const allowed = inputFormatsFor(hop);
     if (format === null || !allowed.includes(format)) {
       lastError = errorJson(
         415,
@@ -706,35 +744,60 @@ const parseSpeechRequestBody = (
   };
 };
 
-/** Reject an output format the provider doesn't produce. Both verified
- *  subscription TTS providers are mp3-only today. */
+/** Verified TTS output encodings, used only when the catalog declares
+ *  none. Both verified subscription TTS providers are mp3-only today. */
+const verifiedOutputFormatsFor = (provider: string): ReadonlyArray<string> =>
+  provider === "chatgpt"
+    ? CODEX_SPEECH_OUTPUT_FORMATS
+    : GROK_TTS_OUTPUT_FORMATS;
+
+/**
+ * Reject an output format the model doesn't produce.
+ *
+ * The accepted set is per-model catalog data
+ * (`audio_support.output_formats`); the provider constant is the
+ * fallback for a bootstrap that carries no card. Nothing is substituted:
+ * an unsupported explicit format is named and refused, and an omitted
+ * one stays omitted.
+ */
 const validateOutputFormat = (
-  provider: string,
+  hop: { readonly provider: string; readonly modelId: string },
   requested: string | undefined,
 ): string | null => {
-  const allowed =
-    provider === "chatgpt"
-      ? CODEX_SPEECH_OUTPUT_FORMATS
-      : GROK_TTS_OUTPUT_FORMATS;
   if (requested === undefined) return null;
-  return (allowed as ReadonlyArray<string>).includes(requested)
+  const allowed =
+    lookupCatalogEntry(hop.modelId)?.audio_support?.output_formats ??
+    verifiedOutputFormatsFor(hop.provider);
+  return allowed.includes(requested)
     ? null
-    : `${provider} speech only supports: ${allowed.join(", ")}.`;
+    : `${hop.provider} speech only supports: ${allowed.join(", ")}.`;
 };
 
-/** Reject an EXPLICIT unsupported voice rather than silently forwarding or
- *  dropping it. `grok/tts` accepts only `eve`; `chatgpt/pronunciation` has
- *  no voice selector at all — the field is a required part of the OpenAI
- *  request shape, so it is simply not forwarded upstream (the verified
- *  wire contract carries no voice parameter), never validated as "chosen". */
+/**
+ * Reject an EXPLICIT unsupported voice rather than silently forwarding
+ * or substituting one.
+ *
+ * The voice menu is per-model catalog data (`audio_support.voices`).
+ * ABSENT means unknown, so nothing is refused — which is exactly
+ * `chatgpt/pronunciation`, whose verified wire carries no voice
+ * parameter at all: the field is part of the inbound OpenAI shape, is
+ * simply not serialized upstream, and was never validated as "chosen".
+ * A DECLARED menu (`grok/tts` → `eve`) refuses anything outside it, and
+ * a declared EMPTY menu says so explicitly rather than guessing.
+ */
 const validateVoice = (
-  provider: string,
+  hop: { readonly provider: string; readonly modelId: string },
   requested: string | undefined,
 ): string | null => {
-  if (provider !== "grok" || requested === undefined) return null;
-  return (GROK_TTS_VOICES as ReadonlyArray<string>).includes(requested)
-    ? null
-    : `grok speech only supports the voice: ${GROK_TTS_VOICES.join(", ")}.`;
+  if (requested === undefined) return null;
+  const declared = lookupCatalogEntry(hop.modelId)?.audio_support?.voices;
+  const allowed =
+    declared ?? (hop.provider === "grok" ? GROK_TTS_VOICES : undefined);
+  if (allowed === undefined) return null;
+  if ((allowed as ReadonlyArray<string>).includes(requested)) return null;
+  return allowed.length === 0
+    ? `${hop.provider} speech does not support a voice selector.`
+    : `${hop.provider} speech only supports the voice: ${allowed.join(", ")}.`;
 };
 
 // Silence unused-import lint for a constant kept for documentation/reuse by
@@ -873,11 +936,8 @@ export const runAudioSpeechWalker = async (
       }
       return stamp(lastError);
     }
-    const formatError = validateOutputFormat(
-      hop.provider,
-      parsedBody.responseFormat,
-    );
-    const voiceError = validateVoice(hop.provider, parsedBody.voice);
+    const formatError = validateOutputFormat(hop, parsedBody.responseFormat);
+    const voiceError = validateVoice(hop, parsedBody.voice);
     if (formatError !== null || voiceError !== null) {
       lastError = errorJson(400, formatError ?? voiceError ?? "invalid speech");
       if (
@@ -919,7 +979,14 @@ export const runAudioSpeechWalker = async (
       hop.provider === "grok"
         ? JSON.stringify({
             text: parsedBody.input,
-            voice_id: "eve",
+            // The caller's voice, once `validateVoice` has accepted it
+            // against the model's declared menu — forwarding a DIFFERENT
+            // voice than the one accepted would be the silent
+            // substitution the validation exists to prevent. With no
+            // voice sent, grok's single verified voice is used, which is
+            // the byte-identical previous behaviour for today's card
+            // (`grok/tts` declares exactly `eve`).
+            voice_id: parsedBody.voice ?? GROK_TTS_VOICES[0],
             language: "en",
           })
         : JSON.stringify({

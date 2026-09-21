@@ -212,6 +212,17 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     // recorder. The OpenAI SDK appends `/chat/completions` to the base, so the
     // base must NOT include it.
     argv: (bin) => [bin, "-p", "ping"],
+    // CAPTURE FIXTURE — deliberately NOT catalog-owned, and not an exception
+    // to "model-specific facts live in the catalog": none of this trio is a
+    // model FACT. They exist only to make one `kimi -p ping` land in the local
+    // recorder. `KIMI_MODEL_API_KEY` is a placeholder, `KIMI_MODEL_BASE_URL`
+    // is the recorder, and `KIMI_MODEL_NAME` is not load-bearing either — the
+    // recorder matches on PATH (`match` above), never on the model name. The
+    // name merely coincides with the real catalog id `kimi_code/kimi-for-coding`.
+    // Deriving it from the catalog would put a catalog read on the login path
+    // (before bootstrap is even needed) for zero behavioural gain, and would
+    // make a catalog rename BREAK capture rather than be caught by it. A drift
+    // guard here would assert a coincidence, not a contract.
     env: (base) => ({
       KIMI_MODEL_NAME: "kimi-for-coding",
       KIMI_MODEL_API_KEY: "sk-openllm-capture",
