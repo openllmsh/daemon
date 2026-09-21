@@ -187,6 +187,28 @@ export type TProviderDelegate = {
   ) => Promise<TModelCaps | null>;
 
   /**
+   * The request params this delegate's live rows are CAPABLE of denying —
+   * the demand predicate for {@link getObservedModelCaps}.
+   *
+   * Reading a live row costs a vendor `/v1/models` round trip on a cold or
+   * expired cache (and a failed fetch is not negatively cached), so the
+   * walker must not pay it for a request no denial could possibly change.
+   * The boolean hook this replaced was consulted only when the body carried
+   * `reasoning`; this restores that demand-driven shape WITHOUT hardcoding
+   * `reasoning` anywhere outside the delegate that owns the fact.
+   *
+   * It is a DOMAIN declaration, not a decision: the walker still strips
+   * whatever `deniedParams` the observation actually returns, so declaring a
+   * param here never denies it and omitting one from a returned denial never
+   * matters. Widening the set only widens when the lookup runs.
+   *
+   * ABSENT means UNKNOWN, which asks: a delegate that declares nothing is
+   * consulted for every request, exactly as before. Declare it only when the
+   * delegate knows the closed set its rows can deny.
+   */
+  observedDeniedParamCandidates?: ReadonlyArray<string>;
+
+  /**
    * JSON-Schema keywords this provider's endpoint REJECTS in tool
    * `parameters` (xAI: `minContains`/`maxContains`). The walker strips them
    * recursively from every tool schema before the upstream call. Absent =

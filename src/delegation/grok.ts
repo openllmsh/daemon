@@ -972,6 +972,14 @@ export const grokDelegate: TProviderDelegate = {
   // Unknown (missing row, unreachable list) stays `null` — nothing
   // observed, so the request is left untouched. Same call site, same
   // cached `/v1/models`: no extra fetch and no bootstrap lag.
+  // The CLOSED set this delegate's live rows can deny, so the walker skips
+  // the `/v1/models` read entirely for a body that carries none of them (a
+  // cold or expired cache is a network round trip with a 10s timeout, and a
+  // failed fetch is not negatively cached). `reasoningEffortFromRows` is the
+  // only row fact read below, and `reasoning` is the only param it denies —
+  // extend this list in the same commit that observes a second one.
+  observedDeniedParamCandidates: ["reasoning"],
+
   getObservedModelCaps: async (providerModelId) => {
     const rows = await modelRows();
     if (rows === null) return null;

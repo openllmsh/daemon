@@ -1075,6 +1075,34 @@ const mapToolParameters = (
 };
 
 /**
+ * Whether reading this delegate's LIVE row could change this body at all.
+ *
+ * Reading it is not free: `getObservedModelCaps` resolves against the
+ * vendor's `/v1/models`, which on a cold or expired cache is a network round
+ * trip with a 10s timeout — and a failed fetch is not negatively cached, so a
+ * vendor outage makes every request pay it again. The boolean hook this
+ * replaced was consulted only when the body carried the one param it could
+ * remove; calling its successor unconditionally put that cost on requests no
+ * denial could possibly affect.
+ *
+ * The predicate is GENERIC — it asks the delegate which params its rows can
+ * deny (`observedDeniedParamCandidates`) and never names one itself, so the
+ * fact stays owned by the delegate and a wider candidate set simply widens
+ * the demand. It is a skip condition only: when the lookup DOES run, every
+ * `deniedParams` entry the observation returns is still applied, candidate or
+ * not. A delegate that declares no candidates is always consulted (unknown =
+ * ask), which preserves today's behaviour for anything but grok.
+ */
+const observationCouldApply = (
+  delegate: TProviderDelegate,
+  body: Record<string, unknown>,
+): boolean => {
+  const candidates = delegate.observedDeniedParamCandidates;
+  if (candidates === undefined) return true;
+  return candidates.some((param) => body[param] !== undefined);
+};
+
+/**
  * Delegate-owned per-model request compat, applied to the BUILT upstream body
  * (grok today; a no-op for delegates that declare neither knob — audit
  * 2026-07-14 §F2/§F7):
@@ -1100,7 +1128,10 @@ export const applyDelegateModelCompat = async (
     return body;
   }
   let out = body as Record<string, unknown>;
-  if (delegate.getObservedModelCaps !== undefined) {
+  if (
+    delegate.getObservedModelCaps !== undefined &&
+    observationCouldApply(delegate, out)
+  ) {
     // Read per request, exactly where the boolean hook used to be read:
     // same phase, same (cached) fetch, no bootstrap round-trip — a live
     // vendor fact must not wait on the next catalog refresh. `null` =
