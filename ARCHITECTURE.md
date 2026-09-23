@@ -24,6 +24,12 @@ moves that data plane onto the user's machine and **delegates to the official
 vendor CLI** for each provider, clearing both triggers. It also owns the
 `cursor-agent` CLI's login, status, usage, and model discovery; Cursor
 inference uses its ACP bridge rather than a manual upstream HTTP transport.
+Muse (`muse`) is also bridge-only: official CLI login/logout own the local
+credential store, and the pinned official `@muse-code/sdk` controls `muse serve`
+through MSP. Subscription credentials are never exported for direct Meta API
+calls. Muse session token usage is not subscription allowance, and its gateway
+distribution authorization remains a separate launch requirement; see the
+[Muse implementation plan](../../docs/plan/2026-09-23-muse-subscription-native-runtime.md).
 API-key (BYOK) providers keep running on the cloud unchanged.
 
 ## Dependency boundary (load-bearing)
