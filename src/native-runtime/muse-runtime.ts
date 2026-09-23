@@ -663,6 +663,11 @@ export const openMuseHostWithTimeout = async (
   label: string,
   outerSignal?: AbortSignal,
 ): Promise<TMuseHost> => {
+  // Fail closed before allocating abortWait — abandoning a never-raced
+  // rejected promise would be an unhandled rejection.
+  if (outerSignal?.aborted) {
+    throw new Error(`${label} aborted`);
+  }
   const ac = new AbortController();
   /** True once this waiter has abandoned the open (timeout or outer abort). */
   let abandoned = false;
@@ -671,6 +676,9 @@ export const openMuseHostWithTimeout = async (
   const abortWait = new Promise<never>((_, reject) => {
     rejectAbort = reject;
   });
+  // Always observe abortWait: abandon may reject it after the race has
+  // already settled (or if open() throws before race).
+  void abortWait.catch(() => {});
   const abandon = (error: Error): void => {
     if (abandoned) return;
     abandoned = true;
@@ -682,10 +690,6 @@ export const openMuseHostWithTimeout = async (
   };
   outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
   try {
-    if (outerSignal?.aborted || ac.signal.aborted) {
-      abandon(new Error(`${label} aborted`));
-      throw new Error(`${label} aborted`);
-    }
     let pending: Promise<TMuseHost>;
     try {
       pending = open(ac.signal);
@@ -754,6 +758,7 @@ const confirmExactModelAndPolicy = async (
 const rememberObservedMuseModels = (
   models: ReadonlyArray<TProviderModelEntry>,
   generation: number,
+  noteAuthenticated = true,
 ): ReadonlyArray<TProviderModelEntry> => {
   if (models.length === 0) return models;
   // Cache/auth-note require a live store fingerprint; still return the native
@@ -766,7 +771,11 @@ const rememberObservedMuseModels = (
       generation,
       models,
     });
-    noteMuseAuthenticatedSession({ fingerprint });
+    // Connect verification may suppress this so the owner can note only
+    // AFTER epoch/signal fencing (see listMuseModelsDemand.noteAuthenticated).
+    if (noteAuthenticated) {
+      noteMuseAuthenticatedSession({ fingerprint });
+    }
   }
   return models;
 };
@@ -798,6 +807,13 @@ export type TListMuseModelsDemandParams = {
   readonly signal?: AbortSignal;
   readonly hostFactory?: TMuseHostFactory;
   readonly cwd?: string;
+  /**
+   * When true (default), a successful list also calls
+   * {@link noteMuseAuthenticatedSession}. Connect / login-exit verification
+   * should pass `false` and commit the auth note itself only after its
+   * epoch/signal fence — otherwise a late list can race logout/rotate.
+   */
+  readonly noteAuthenticated?: boolean;
 };
 
 /**
@@ -857,7 +873,14 @@ export const listMuseModelsDemand = async (
       MUSE_RPC_TIMEOUT_MS,
       "muse model/list",
     );
-    const observed = rememberObservedMuseModels(models, generation);
+    // Re-check after the await so a cancel during listModels cannot still
+    // cache/note auth evidence for a stale connect verification.
+    if (params.signal?.aborted) return null;
+    const observed = rememberObservedMuseModels(
+      models,
+      generation,
+      params.noteAuthenticated !== false,
+    );
     return observed.length > 0 ? observed : [];
   } catch (error) {
     logWarn(
