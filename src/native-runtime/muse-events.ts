@@ -59,6 +59,11 @@ export type TMuseTurnState = {
   readonly handleDelta: (delta: TMuseItemDelta) => TChatCompletionChunk | null;
   readonly observeUsage: (usage: TMuseSessionUsage) => void;
   readonly finish: (terminal: string | null) => TChatCompletionChunk[];
+  /** Caller-tool handoff: tool_calls delta + finish_reason tool_calls. */
+  readonly emitToolCall: (
+    name: string,
+    args: unknown,
+  ) => ReadonlyArray<TChatCompletionChunk>;
   readonly sawOutput: () => boolean;
   readonly finished: () => boolean;
 };
@@ -107,7 +112,8 @@ export const usageFromMuseSession = (
 
 const finishReasonOf = (
   terminal: string | null,
-): "stop" | "length" | "content_filter" => {
+): "stop" | "length" | "content_filter" | "tool_calls" => {
+  if (terminal === "tool_calls") return "tool_calls";
   if (terminal === "failed") return "content_filter";
   if (terminal === "cancelled") return "stop";
   return "stop";
@@ -131,7 +137,7 @@ export const createMuseTurnState = (params: {
 
   const baseChunk = (
     delta: Record<string, unknown>,
-    finish: "stop" | "length" | "content_filter" | null,
+    finish: "stop" | "length" | "content_filter" | "tool_calls" | null,
     usage?: TUsage,
   ): TChatCompletionChunk =>
     ({
@@ -235,6 +241,30 @@ export const createMuseTurnState = (params: {
           usageFromMuseSession(lastUsage),
         ),
       ];
+    },
+    emitToolCall: (name, args) => {
+      if (finished) return [];
+      finished = true;
+      const open = opener({
+        tool_calls: [
+          {
+            index: 0,
+            id: `call_${created.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            type: "function",
+            function: {
+              name,
+              arguments:
+                typeof args === "string" ? args : JSON.stringify(args ?? {}),
+            },
+          },
+        ],
+      });
+      const terminal = baseChunk(
+        {},
+        "tool_calls",
+        usageFromMuseSession(lastUsage),
+      );
+      return [open, terminal];
     },
     sawOutput: () => sawOutput,
     finished: () => finished,

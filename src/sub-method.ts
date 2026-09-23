@@ -50,9 +50,12 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
   grok: { methods: ["handrolled"] },
   // Cursor's ONLY inference transport is the ACP bridge (`cursor-agent acp`,
   // native-runtime/cursor-acp.ts) — there is no manual HTTP path (no
-  // UPSTREAM_WIRE entry), so it is the one BRIDGE-ONLY provider: a bridge
-  // decline advances the plan instead of falling to a manual transport.
+  // UPSTREAM_WIRE entry), so it is BRIDGE-ONLY: a bridge decline advances the
+  // plan instead of falling to a manual transport.
   cursor: { methods: ["bridge"] },
+  // Muse Code is likewise BRIDGE-ONLY — official `muse serve` / SDK only; no
+  // handrolled Meta Model API path on the subscription slug.
+  muse: { methods: ["bridge"] },
 };
 
 /**

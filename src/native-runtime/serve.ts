@@ -41,6 +41,8 @@ import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
 import { runCodexNative } from "./codex-app-server";
 import { runCursorNative } from "./cursor-acp";
 import { cursorRequestOf, jsonInstruction } from "./cursor-request";
+import { museRequestOf } from "./muse-request";
+import { runMuseNative } from "./muse-runtime";
 import {
   deriveConversation,
   NativeSessionStore,
@@ -69,6 +71,8 @@ const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
   // resumable id, so this store stays empty); every prior-history turn takes
   // the renderSeed path. TODO(cursor-resume): ACP `session/load` follow-up.
   cursor: new NativeSessionStore(),
+  // muse also runs COLD sessions in v1 (`runMuseNative`); store stays empty.
+  muse: new NativeSessionStore(),
 };
 
 const toolContinuationEpoch = randomUUID();
@@ -116,6 +120,7 @@ const resumeStats: Record<TNativeRuntimeProvider, TResumeStats> = {
   claude_code: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
   chatgpt: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
   cursor: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
+  muse: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
 };
 
 /** Snapshot the resume-correlation counters (introspection / tests). */
@@ -126,6 +131,7 @@ export const nativeResumeStats = (): Record<
   claude_code: { ...resumeStats.claude_code },
   chatgpt: { ...resumeStats.chatgpt },
   cursor: { ...resumeStats.cursor },
+  muse: { ...resumeStats.muse },
 });
 
 /** Reset the counters (tests). */
@@ -133,6 +139,7 @@ export const resetNativeResumeStats = (): void => {
   resumeStats.claude_code = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
   resumeStats.chatgpt = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
   resumeStats.cursor = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
+  resumeStats.muse = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
 };
 
 /**
@@ -272,6 +279,25 @@ export const tryServeNativeRuntime = async (
       };
     }
     return serveCursorHop(params, overrides);
+  }
+  if (params.provider === "muse") {
+    // muse is BRIDGE-ONLY. Decline controls the native runtime cannot honor
+    // rather than silently serving defaults; unsupported request shapes are
+    // rejected by `museRequestOf` before any spawn.
+    const museUnrepresentable =
+      (typeof params.canonical.n === "number" && params.canonical.n > 1) ||
+      params.canonical.logprobs === true;
+    if (museUnrepresentable) {
+      return {
+        declined:
+          "muse runtime can't honor n>1 or logprobs (single un-scored message per turn)",
+      };
+    }
+    const unsupported = unsupportedNativeControl(params.canonical);
+    if (unsupported !== null) {
+      return { declined: `muse runtime can't honor ${unsupported}` };
+    }
+    return serveMuseHop(params, overrides);
   }
   // Generation controls the native runtimes can't honor (non-default
   // temperature/top_p/penalties, stop, seed, n, logprobs, logit_bias,
@@ -486,6 +512,87 @@ const serveCursorHop = async (
       req.jsonMode !== null
         ? jsonInstruction(req.jsonMode, req.jsonSchema)
         : null,
+    signal: params.signal,
+  });
+  if (run.kind === "declined") {
+    return declinedOutcome(run.reason, run.cooldownReason);
+  }
+
+  const settle = (
+    resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
+  ): void => {
+    params.record(tokensFromResponse(resp), "success");
+  };
+  const fail = (err: unknown): void => {
+    if (params.signal.aborted || isClientHangUp(err)) return;
+    const usage = partialUsageFrom(err);
+    params.record(
+      usage === null ? ZERO_TOKENS : tokensFromResponse({ usage }),
+      "error",
+    );
+  };
+  const clientWire = clientWireOf(params.surface);
+  if (params.wantsStream) {
+    return deliverChunkStream(run.chunks, {
+      surface: params.surface,
+      clientWire,
+      providerModelId: params.providerModelId,
+      onResponse: settle,
+      onError: fail,
+      stripSubagentIsolation: params.stripSubagentIsolation,
+    });
+  }
+  let canonical: Awaited<ReturnType<typeof accumulateChunksToResponse>>;
+  try {
+    canonical = await accumulateChunksToResponse(
+      run.chunks,
+      params.providerModelId,
+    );
+  } catch (err) {
+    fail(err);
+    return errorJson(
+      502,
+      partialUsageFrom(err) === null
+        ? "native runtime stream ended before output"
+        : "native runtime stream failed after output began",
+    );
+  }
+  settle(canonical);
+  return deliverJsonResponse(
+    canonical,
+    params.surface,
+    clientWire,
+    undefined,
+    params.stripSubagentIsolation,
+  );
+};
+
+/**
+ * Muse serve path — bridge-only cold SDK/MSP session per request. Unsupported
+ * shapes fail closed via `museRequestOf`; exact model confirmation and native
+ * tool denial live inside `runMuseNative`.
+ */
+const serveMuseHop = async (
+  params: TNativeServeParams,
+  overrides?: {
+    readonly bin?: string;
+    readonly env?: Record<string, string>;
+  },
+): Promise<TNativeServeOutcome> => {
+  const req = museRequestOf(params.canonical);
+  if (!req.ok) {
+    return { declined: req.reason };
+  }
+  if (req.parts.length === 0) {
+    return { declined: "no user turn to answer" };
+  }
+  const run = await runMuseNative({
+    bin: overrides?.bin ?? cliBin("muse"),
+    env: overrides?.env ?? cliEnv("muse"),
+    providerModelId: params.providerModelId,
+    parts: req.parts,
+    promptText: req.promptText,
+    tools: req.tools,
     signal: params.signal,
   });
   if (run.kind === "declined") {

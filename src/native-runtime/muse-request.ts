@@ -24,14 +24,63 @@ export type TMuseInputPart =
       readonly mediaType: string;
     };
 
+/** One caller function tool exposed through the Muse loopback MCP server. */
+export type TMuseCallerTool = {
+  readonly name: string;
+  readonly description: string | null;
+  /** JSON-Schema `parameters` of the function tool (MCP `inputSchema`). */
+  readonly parameters: unknown;
+};
+
 export type TMuseRequest =
   | {
       readonly ok: true;
       readonly systemText: string | null;
       readonly promptText: string;
       readonly parts: ReadonlyArray<TMuseInputPart>;
+      readonly tools: ReadonlyArray<TMuseCallerTool>;
     }
   | { readonly ok: false; readonly reason: string };
+
+/** Extract caller function tools; reject non-function entries. */
+export const museCallerToolsOf = (
+  tools: TChatCompletionRequest["tools"] | undefined,
+):
+  | { readonly ok: true; readonly tools: ReadonlyArray<TMuseCallerTool> }
+  | { readonly ok: false; readonly reason: string } => {
+  if (tools === undefined || tools === null) {
+    return { ok: true, tools: [] };
+  }
+  if (!Array.isArray(tools)) {
+    return { ok: false, reason: "tools must be an array" };
+  }
+  const out: TMuseCallerTool[] = [];
+  for (const tool of tools) {
+    if (
+      typeof tool !== "object" ||
+      tool === null ||
+      (tool as { readonly type?: unknown }).type !== "function"
+    ) {
+      return { ok: false, reason: "only function tools are supported" };
+    }
+    const fn = (tool as { readonly function?: unknown }).function;
+    if (typeof fn !== "object" || fn === null) {
+      return { ok: false, reason: "function tool is missing function body" };
+    }
+    const name = (fn as { readonly name?: unknown }).name;
+    if (typeof name !== "string" || name.length === 0) {
+      return { ok: false, reason: "function tool requires a name" };
+    }
+    const description = (fn as { readonly description?: unknown }).description;
+    const parameters = (fn as { readonly parameters?: unknown }).parameters;
+    out.push({
+      name,
+      description: typeof description === "string" ? description : null,
+      parameters: parameters ?? { type: "object", properties: {} },
+    });
+  }
+  return { ok: true, tools: out };
+};
 
 const DATA_URL = /^data:([^;,]+);base64,(.+)$/s;
 
@@ -165,6 +214,9 @@ export const museRequestOf = (
     return { ok: false, reason: "forced tool_choice is unsupported" };
   }
 
+  const callerTools = museCallerToolsOf(canonical.tools);
+  if (!callerTools.ok) return callerTools;
+
   const systemParts: string[] = [];
   const lines: string[] = [];
   const images: TMuseInputPart[] = [];
@@ -224,5 +276,11 @@ export const museRequestOf = (
   if (parts.length === 0) {
     return { ok: false, reason: "prompt contains no text or image content" };
   }
-  return { ok: true, systemText, promptText, parts };
+  return {
+    ok: true,
+    systemText,
+    promptText,
+    parts,
+    tools: callerTools.tools,
+  };
 };
