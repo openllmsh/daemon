@@ -583,18 +583,20 @@ const serveMuseHop = async (
   if (!req.ok) {
     return { declined: req.reason };
   }
-  if (req.parts.length === 0) {
-    return { declined: "no user turn to answer" };
+  let run: TNativeRunResult;
+  try {
+    run = await runMuseNative({
+      bin: overrides?.bin ?? cliBin("muse"),
+      env: overrides?.env ?? cliEnv("muse"),
+      providerModelId: params.providerModelId,
+      parts: req.parts,
+      promptText: req.promptText,
+      tools: req.tools,
+      signal: params.signal,
+    });
+  } catch (error) {
+    return { declined: error instanceof Error ? error.message : String(error) };
   }
-  const run = await runMuseNative({
-    bin: overrides?.bin ?? cliBin("muse"),
-    env: overrides?.env ?? cliEnv("muse"),
-    providerModelId: params.providerModelId,
-    parts: req.parts,
-    promptText: req.promptText,
-    tools: req.tools,
-    signal: params.signal,
-  });
   if (run.kind === "declined") {
     return declinedOutcome(run.reason, run.cooldownReason);
   }
