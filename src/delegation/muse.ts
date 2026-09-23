@@ -36,7 +36,11 @@ import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring } from "./delegate-shared";
 import { makeStreamConnect } from "./login-direct";
-import { makeCancelConnect } from "./login-flow";
+import {
+  emitLoginSucceeded,
+  makeCancelConnect,
+  resolveLoginFlow,
+} from "./login-flow";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -208,6 +212,7 @@ export const noteMuseAuthenticatedSession = (opts: {
 
 /** Drop cached Muse status presence after login/logout mutations. */
 export const clearMuseStatusObservationCache = (): void => {
+  invalidateDemandVerify();
   museStatusCache.invalidate();
   clearMuseNativeModels();
   verifiedAuthFingerprint = null;
@@ -246,14 +251,35 @@ const loginVerifyConnected = (): boolean => {
 };
 
 /**
+ * Generation fence for in-flight demand MSP verify. Bumped on cancel, logout,
+ * and observation reset so a late `listMuseModelsDemand` completion cannot
+ * mark connected or fall through to `muse login` after the owner released.
+ */
+let demandVerifyEpoch = 0;
+let demandVerifyAbort: AbortController | null = null;
+
+const invalidateDemandVerify = (): void => {
+  demandVerifyEpoch += 1;
+  demandVerifyAbort?.abort();
+  demandVerifyAbort = null;
+};
+
+/**
  * Demand-driven MSP `model/list` to re-pin {@link verifiedAuthFingerprint}
  * after a daemon restart (or any process where memory verification was lost)
  * while a configured auth store is still present. Never treats file presence
  * alone as success; refuses when the store disappears or changes mid-flight
- * (logout / rotate). Used only from explicit connect / login-exit verify —
- * not from passive status, startup, or idle paths.
+ * (logout / rotate), and refuses when {@link opts.signal} aborts or
+ * {@link opts.epoch} is stale. Used only from explicit connect / login-exit
+ * verify — not from passive status, startup, or idle paths.
  */
-const verifyMuseAuthDemand = async (): Promise<boolean> => {
+const verifyMuseAuthDemand = async (opts?: {
+  readonly signal?: AbortSignal;
+  readonly epoch?: number;
+}): Promise<boolean> => {
+  const signal = opts?.signal;
+  const epoch = opts?.epoch ?? demandVerifyEpoch;
+  if (signal?.aborted || epoch !== demandVerifyEpoch) return false;
   if (!storeConfigured()) return false;
   const expectedFp = storeFingerprint();
   if (expectedFp === null) return false;
@@ -264,7 +290,9 @@ const verifyMuseAuthDemand = async (): Promise<boolean> => {
     const listed = await listMuseModelsDemand({
       bin: cliBin(PROVIDER),
       env: baseEnv(),
+      ...(signal !== undefined ? { signal } : {}),
     });
+    if (signal?.aborted || epoch !== demandVerifyEpoch) return false;
     if (listed === null || listed.length === 0) return false;
     // Concurrent logout / store replace must not stick a stale success.
     if (!storeConfigured()) return false;
@@ -273,23 +301,11 @@ const verifyMuseAuthDemand = async (): Promise<boolean> => {
     if (!hasVerifiedAuth()) {
       noteMuseAuthenticatedSession({ fingerprint: expectedFp });
     }
+    if (signal?.aborted || epoch !== demandVerifyEpoch) return false;
     return hasVerifiedAuth();
   } catch {
     return false;
   }
-};
-
-/**
- * Connect-lifecycle verify: sync login evidence first, then (only while a
- * login baseline is active) one demand MSP check for an unchanged existing
- * store. Short-circuit at connect start still uses this with a null baseline,
- * so preexisting auth.json alone never short-circuits as signed-in.
- */
-const connectLifecycleConnected = async (): Promise<boolean> => {
-  if (loginVerifyConnected()) return true;
-  if (loginBaselineFingerprint === null) return false;
-  if (!storeConfigured()) return false;
-  return verifyMuseAuthDemand();
 };
 
 // ─── Passive model observation (zero-spawn; filled by runtime later) ─────
@@ -358,6 +374,7 @@ export const readMuseNativeModels = (opts: {
 };
 
 export const resetMuseNativeModelObservationForTests = (): void => {
+  invalidateDemandVerify();
   museNativeModels = null;
   museNativeGeneration = 0;
   verifiedAuthFingerprint = null;
@@ -383,6 +400,32 @@ const {
   readToken: async () => (hasVerifiedAuth() ? true : null),
   isConnected: async () => loginVerifyConnected(),
 });
+
+/**
+ * Connect-lifecycle verify: sync login evidence first, then (only while a
+ * login baseline is active) one demand MSP check for an unchanged existing
+ * store. Registers a slot canceler + AbortSignal so cancelConnect aborts the
+ * MSP call. Short-circuit at connect start still uses this with a null
+ * baseline, so preexisting auth.json alone never short-circuits as signed-in.
+ */
+const connectLifecycleConnected = async (): Promise<boolean> => {
+  if (loginVerifyConnected()) return true;
+  if (loginBaselineFingerprint === null) return false;
+  if (!storeConfigured()) return false;
+  if (slot.wasCancelled()) return false;
+  const ac = new AbortController();
+  const epoch = demandVerifyEpoch;
+  // Add a canceler without replacing the live login flow identity.
+  slot.start(() => {
+    ac.abort();
+  });
+  if (slot.wasCancelled() || ac.signal.aborted) return false;
+  const ok = await verifyMuseAuthDemand({ signal: ac.signal, epoch });
+  if (slot.wasCancelled() || ac.signal.aborted || epoch !== demandVerifyEpoch) {
+    return false;
+  }
+  return ok;
+};
 
 const connectDirect = makeStreamConnect({
   provider: PROVIDER,
@@ -452,19 +495,101 @@ const cancelConnect = makeCancelConnect(PROVIDER, slot, {
 /**
  * Explicit connect: if a configured store is present but memory verification
  * was lost (daemon restart), demand-verify through official MSP `model/list`
- * before spawning `muse login`. Failed demand verify falls through to login.
- * Passive status / startup never call this path.
+ * while owning the shared login slot (so cancelConnect aborts it) before
+ * spawning `muse login`. Concurrent connects coalesce on the slot. Cancel /
+ * logout epoch fences prevent late success from marking connected or falling
+ * through to login. Passive status / startup never call this path.
  */
 const connect = async (): Promise<
   Awaited<ReturnType<typeof connectDirect>>
 > => {
-  if (!hasVerifiedAuth() && storeConfigured()) {
-    const ok = await verifyMuseAuthDemand();
+  if (hasVerifiedAuth()) {
+    return connectDirect();
+  }
+
+  // Coalesce with an in-flight demand verify or official login — do not start
+  // a second MSP/login owner.
+  if (slot.inFlight()) {
+    const pending = getPendingAuth(PROVIDER);
+    return {
+      connected: false,
+      pending: true,
+      detail:
+        pending !== null ? pendingAuthDetail(pending) : IN_PROGRESS_DETAIL,
+    };
+  }
+
+  if (!storeConfigured() || !(await isInstalled())) {
+    return connectDirect();
+  }
+
+  const flow = resolveLoginFlow(PROVIDER, "browser");
+  const ac = new AbortController();
+  demandVerifyAbort = ac;
+  const epoch = demandVerifyEpoch;
+  const wasVerified = hasVerifiedAuth();
+
+  const started = slot.start(() => {
+    demandVerifyEpoch += 1;
+    ac.abort();
+  }, flow);
+  if (!started) {
+    demandVerifyAbort = null;
+    return {
+      connected: false,
+      pending: true,
+      detail: IN_PROGRESS_DETAIL,
+    };
+  }
+  if (slot.wasCancelled() || ac.signal.aborted) {
+    slot.end(flow.flowId);
+    demandVerifyAbort = null;
+    return { connected: false, detail: "Muse sign-in cancelled" };
+  }
+
+  const dropCancelledNote = (): void => {
+    if (!wasVerified && hasVerifiedAuth()) {
+      verifiedAuthFingerprint = null;
+      museStatusCache.invalidate();
+    }
+  };
+
+  try {
+    const ok = await verifyMuseAuthDemand({ signal: ac.signal, epoch });
+    const stale =
+      ac.signal.aborted || slot.wasCancelled() || epoch !== demandVerifyEpoch;
+    if (stale) {
+      dropCancelledNote();
+      slot.end(flow.flowId);
+      demandVerifyAbort = null;
+      return { connected: false, detail: "Muse sign-in cancelled" };
+    }
     if (ok && hasVerifiedAuth()) {
+      clearPendingAuth(PROVIDER);
+      emitLoginSucceeded(flow);
+      slot.end(flow.flowId);
+      demandVerifyAbort = null;
       return { connected: true, detail: CONNECTED_DETAIL };
     }
+    // Demand failed — release ownership, then official login may take the slot.
+    slot.end(flow.flowId);
+    demandVerifyAbort = null;
+    return connectDirect();
+  } catch {
+    dropCancelledNote();
+    if (slot.flow()?.flowId === flow.flowId) {
+      slot.end(flow.flowId);
+    }
+    demandVerifyAbort = null;
+    if (
+      ac.signal.aborted ||
+      slot.wasCancelled() ||
+      epoch !== demandVerifyEpoch
+    ) {
+      return { connected: false, detail: "Muse sign-in cancelled" };
+    }
+    return connectDirect();
   }
-  return connectDirect();
 };
 
 export const museDelegate: TProviderDelegate = {

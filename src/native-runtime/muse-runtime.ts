@@ -129,7 +129,9 @@ const SETTINGS_LEAK_KEYS = new Set([
 
 type TNodeEnv = "development" | "production" | "test";
 
+/** Absent → production. Present but invalid → throw (never silently coerce). */
 const nodeEnvOf = (value: string | undefined): TNodeEnv => {
+  if (value === undefined) return "production";
   if (value === "development" || value === "production" || value === "test") {
     return value;
   }
@@ -164,7 +166,15 @@ export const cleanMuseSpawnEnv = (
   cliEnv: Record<string, string>,
 ): NodeJS.ProcessEnv => {
   const cleaned = cleanNativeSpawnEnv(cliEnv);
-  const nodeEnv = nodeEnvOf(cleaned.NODE_ENV ?? process.env.NODE_ENV);
+  // Prefer the cleaned env, then process.env; default production only when
+  // both are absent. A present invalid value still rejects.
+  const rawNodeEnv =
+    cleaned.NODE_ENV !== undefined
+      ? cleaned.NODE_ENV
+      : process.env.NODE_ENV !== undefined
+        ? process.env.NODE_ENV
+        : undefined;
+  const nodeEnv = nodeEnvOf(rawNodeEnv);
   const next: NodeJS.ProcessEnv = { NODE_ENV: nodeEnv };
   for (const [key, value] of Object.entries(cleaned)) {
     if (key === "NODE_ENV") continue;
@@ -642,9 +652,10 @@ const withTimeout = async <T>(
 };
 
 /**
- * Open a Muse host under a deadline. On timeout/abort: abort the spawn
- * signal (so official handshake can close the child) and still close any
- * host that resolves late. Preserves the original timeout error.
+ * Open a Muse host under a deadline. On timeout OR outer abort: abort the
+ * spawn signal (so official handshake can close the child), promptly reject
+ * the waiter, and still close any host that resolves late — including when
+ * `open` ignores AbortSignal. Preserves the original timeout/abort error.
  */
 export const openMuseHostWithTimeout = async (
   open: (signal: AbortSignal) => Promise<TMuseHost>,
@@ -653,32 +664,47 @@ export const openMuseHostWithTimeout = async (
   outerSignal?: AbortSignal,
 ): Promise<TMuseHost> => {
   const ac = new AbortController();
-  let timedOut = false;
-  const onOuterAbort = (): void => ac.abort();
-  outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
-  if (outerSignal?.aborted || ac.signal.aborted) {
-    outerSignal?.removeEventListener("abort", onOuterAbort);
-    throw new Error(`${label} aborted`);
-  }
-  const pending = open(ac.signal);
-  void pending.then(
-    (host) => {
-      if (timedOut) void host.close().catch(() => {});
-    },
-    () => {},
-  );
+  /** True once this waiter has abandoned the open (timeout or outer abort). */
+  let abandoned = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbort: ((error: Error) => void) | undefined;
+  const abortWait = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
+  });
+  const abandon = (error: Error): void => {
+    if (abandoned) return;
+    abandoned = true;
+    ac.abort();
+    rejectAbort?.(error);
+  };
+  const onOuterAbort = (): void => {
+    abandon(new Error(`${label} aborted`));
+  };
+  outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
   try {
-    return await Promise.race([
-      pending,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          ac.abort();
-          reject(new Error(`${label} timed out`));
-        }, ms);
-      }),
-    ]);
+    if (outerSignal?.aborted || ac.signal.aborted) {
+      abandon(new Error(`${label} aborted`));
+      throw new Error(`${label} aborted`);
+    }
+    let pending: Promise<TMuseHost>;
+    try {
+      pending = open(ac.signal);
+    } catch (error) {
+      abandoned = true;
+      throw error;
+    }
+    void pending.then(
+      (host) => {
+        if (abandoned) void host.close().catch(() => {});
+      },
+      () => {},
+    );
+    // Timeout and outer abort both settle `abortWait` via `abandon` — one
+    // rejection channel, no double-reject after the race has finished.
+    timer = setTimeout(() => {
+      abandon(new Error(`${label} timed out`));
+    }, ms);
+    return await Promise.race([pending, abortWait]);
   } finally {
     clearTimeout(timer);
     outerSignal?.removeEventListener("abort", onOuterAbort);
@@ -1138,20 +1164,34 @@ export const runMuseNative = async (
         pumpDeltas.catch(() => {}),
       ]);
       if (ended) return;
-      const terminal = outcome.terminal ?? outcome.kind;
-      const failed = outcome.kind === "failed" || terminal === "failed";
-      if (!turn.sawOutput() && outcome.kind !== "completed") {
+      // SDK TurnOutcome: success is only `kind: "completed"` with terminal
+      // completed|cancelled (or omitted). `unqueued` never ran; `terminalUnknown`
+      // is host-death/unknown; `terminal: "failed"` is a mid-turn failure on
+      // the completed arm. After partial output, none of those may look like
+      // a successful finish — error the stream. Before output, decline.
+      const terminal = outcome.terminal;
+      const acknowledgedSuccess =
+        outcome.kind === "completed" &&
+        (terminal === undefined ||
+          terminal === "completed" ||
+          terminal === "cancelled" ||
+          terminal === "tool_calls");
+      if (!turn.sawOutput() && !acknowledgedSuccess) {
         ended = true;
         push("end");
         void cleanup();
         return;
       }
-      if (failed) {
-        failStream(new Error(`muse turn failed (${terminal})`));
+      if (!acknowledgedSuccess) {
+        failStream(
+          new Error(
+            `muse turn ended without acknowledged success (${outcome.kind}${terminal !== undefined ? `/${terminal}` : ""})`,
+          ),
+        );
         void cleanup();
         return;
       }
-      endWith(turn.finish(terminal));
+      endWith(turn.finish(terminal ?? "completed"));
       void cleanup();
     } catch (error: unknown) {
       await Promise.all([
