@@ -14,6 +14,7 @@
  */
 
 import type { TChatCompletionRequest } from "@openllmsh/protocol";
+import { suppressMuseHostedSearchClientTool } from "./muse-web-search";
 
 /** Official MSP turn input part (`TurnInputPart` in `@muse-code/sdk`). */
 export type TMuseInputPart =
@@ -281,6 +282,8 @@ export const museRequestOf = (
     systemText,
     promptText,
     parts,
-    tools: callerTools.tools,
+    // Host-native Muse web_search owns search on this hop — suppress a
+    // caller function of the same name so it cannot race as MCP tool_calls.
+    tools: suppressMuseHostedSearchClientTool(callerTools.tools),
   };
 };

@@ -14,15 +14,28 @@
  * settings/hooks/skills). The first tools/call ends the turn with OpenAI
  * `tool_calls` and cancels the native turn — never a fabricated success.
  *
- * Safety is conservative: `--disable-write` + `--disable-shell`, approval
- * mode `denyUnmatched`, and every native-tool approval is denied. Exact
- * `session/setModel` + `session/read` confirmation is required before a turn
- * starts. Missing usage is omitted, never estimated as real. Session token
- * counters are never treated as subscription quota.
+ * Safety floor (what we can enforce without inventing host rules):
+ *   - `--disable-write` + `--disable-shell` (spawn argv)
+ *   - `denyUnmatched` approval mode (host policy select-never-create; no
+ *     client-authored allowlist exists on MSP)
+ *   - `onApproval` allows ONLY exact host-native `web_search` once when the
+ *     host asks; it does NOT see known-safe auto-exec under `onRequest`
+ *     (official probe: known-safe `pwd` runs without asking)
+ *   - auth overlay HOME is a SIBLING of `workspaceRoot`, not inside it, so
+ *     workspace-scoped reads cannot reach the auth symlink by relative path
+ *
+ * Residual host-policy blocker (documented, not claimed fixed): MSP cannot
+ * install a "web_search only" rule; known-safe absolute-path reads of HOME
+ * under `denyUnmatched` are unverified without a live Muse host. Do not
+ * equate callback denial with "all other native tools are denied".
+ *
+ * Completed provider-executed searches ride `server_search_calls`; they are
+ * never re-emitted as caller `tool_calls`. Exact `session/setModel` +
+ * `session/read` confirmation is required before a turn starts.
  */
 
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -56,6 +69,8 @@ import { startMuseMcpServer } from "./muse-mcp-server";
 import type { TMuseOverlay } from "./muse-overlay";
 import { createMuseExecutionOverlay } from "./muse-overlay";
 import type { TMuseCallerTool, TMuseInputPart } from "./muse-request";
+import type { TMuseApprovalRequest } from "./muse-web-search";
+import { decideMuseNativeApproval } from "./muse-web-search";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
@@ -71,7 +86,15 @@ export const MUSE_TURN_TIMEOUT_MS = 180_000;
 export const MUSE_IDLE_TIMEOUT_MS = 60_000;
 export const MUSE_RPC_TIMEOUT_MS = 30_000;
 
-/** Approval mode that refuses unmatched native tools (official `ApprovalMode`). */
+/**
+ * Fail-closed host approval mode (official `ApprovalMode`).
+ *
+ * `denyUnmatched` is the closed enum's default-deny selection. The callback
+ * still approves exact host-native `web_search` once when the host asks.
+ * This is NOT equivalent to a custom allowlist — MSP forbids client-authored
+ * rules (select-never-create). Prefer this over `onRequest`, which official
+ * probes show auto-runs known-safe tools without `onApproval`.
+ */
 export const MUSE_APPROVAL_MODE = "denyUnmatched" as const;
 
 const AUTH_REJECTION_RE =
@@ -160,6 +183,8 @@ export type TMuseHostSpawnOptions = {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
   readonly onStderr?: (chunk: string) => void;
+  /** Abort in-flight spawn/initialize (closes MSP handshake / child). */
+  readonly signal?: AbortSignal;
 };
 
 export type TMuseSessionRead = {
@@ -205,16 +230,9 @@ export type TMuseSession = {
   listModels(): Promise<ReadonlyArray<TProviderModelEntry>>;
   sendUserTurn(input: ReadonlyArray<TMuseInputPart>): Promise<TMuseTurn>;
   onApproval(
-    handler: (request: {
-      readonly approvalId: string;
-      readonly availableChoices: ReadonlyArray<{
-        readonly choiceId: string;
-        readonly decision: string;
-        readonly scope: string;
-      }>;
-    }) =>
-      | Promise<{ readonly choiceId: string }>
-      | { readonly choiceId: string },
+    handler: (
+      request: TMuseApprovalRequest,
+    ) => Promise<{ readonly choiceId: string }> | { readonly choiceId: string },
   ): void;
 };
 
@@ -243,29 +261,10 @@ const asRecord = (value: unknown): Record<string, unknown> | null =>
 const asString = (value: unknown): string | null =>
   typeof value === "string" && value.length > 0 ? value : null;
 
-const denyNativeApproval = (request: {
-  readonly availableChoices: ReadonlyArray<{
-    readonly choiceId: string;
-    readonly decision: string;
-    readonly scope: string;
-  }>;
-}): { readonly choiceId: string } => {
-  const deny =
-    request.availableChoices.find(
-      (choice) =>
-        (choice.decision === "denied" || choice.decision === "abort") &&
-        choice.scope === "once",
-    ) ??
-    request.availableChoices.find(
-      (choice) => choice.decision === "denied" || choice.decision === "abort",
-    );
-  if (deny === undefined) {
-    throw new Error(
-      "Muse offered no deny/abort choice; native tool was not approved",
-    );
-  }
-  return { choiceId: deny.choiceId };
-};
+/** Narrow host-native policy — allow web_search once; deny everything else. */
+const decideNativeApproval = (
+  request: TMuseApprovalRequest,
+): { readonly choiceId: string } => decideMuseNativeApproval(request);
 
 const usageFromFold = (session: {
   readonly fold: {
@@ -304,8 +303,56 @@ const mapFoldedItem = (item: unknown): TMuseFoldedItem | null => {
         }
       : {}),
     ...(typeof rec.truncated === "boolean" ? { truncated: rec.truncated } : {}),
+    ...(typeof rec.callId === "string" ? { callId: rec.callId } : {}),
+    ...(typeof rec.tool === "string" ? { tool: rec.tool } : {}),
+    ...(typeof rec.args === "string" ? { args: rec.args } : {}),
+    ...(typeof rec.visibleOutput === "string"
+      ? { visibleOutput: rec.visibleOutput }
+      : {}),
   };
 };
+
+const mapApprovalRequest = (request: {
+  readonly approvalId: string;
+  readonly toolName: string;
+  readonly toolCallId: string;
+  readonly rawArgs: string;
+  readonly protectedWrite: boolean;
+  readonly availableChoices: ReadonlyArray<{
+    readonly choiceId: string;
+    readonly decision: string;
+    readonly scope: string;
+  }>;
+  readonly subject: {
+    readonly kind: string;
+    readonly toolName?: string;
+    readonly path?: string;
+    readonly command?: string;
+  };
+}): TMuseApprovalRequest => ({
+  approvalId: request.approvalId,
+  toolName: request.toolName,
+  toolCallId: request.toolCallId,
+  rawArgs: request.rawArgs,
+  protectedWrite: request.protectedWrite,
+  availableChoices: request.availableChoices.map((choice) => ({
+    choiceId: choice.choiceId,
+    decision: choice.decision,
+    scope: choice.scope,
+  })),
+  subject: {
+    kind: request.subject.kind,
+    ...(request.subject.toolName !== undefined
+      ? { toolName: request.subject.toolName }
+      : {}),
+    ...(request.subject.path !== undefined
+      ? { path: request.subject.path }
+      : {}),
+    ...(request.subject.command !== undefined
+      ? { command: request.subject.command }
+      : {}),
+  },
+});
 
 const mapItemDelta = (delta: unknown): TMuseItemDelta | null => {
   const rec = asRecord(delta);
@@ -389,15 +436,26 @@ const wrapOfficialHost = async (
     ...(options.onStderr !== undefined ? { onStderr: options.onStderr } : {}),
     shutdownTimeoutMs: 1_000,
   });
+  const onAbort = (): void => {
+    void handshake.close().catch(() => {});
+  };
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) {
+    options.signal.removeEventListener("abort", onAbort);
+    await handshake.close().catch(() => {});
+    throw new Error("muse SDK spawn aborted");
+  }
   let spawned: Awaited<ReturnType<typeof handshake.initialize>>;
   try {
     spawned = await handshake.initialize({
       clientInfo: { name: "openllm-daemon", version: DAEMON_VERSION },
     });
   } catch (error) {
-    // initialize failure must not leave the owned muse serve child running.
+    // initialize failure / abort must not leave the owned muse serve child.
     await handshake.close().catch(() => {});
     throw error;
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort);
   }
   const durability = readSessionDurability(spawned.initializeResult);
   const client = new MuseClient(spawned.connection, { durability });
@@ -428,13 +486,7 @@ const wrapOfficialHost = async (
         approvalMode: start.approvalMode,
       });
       session.onApproval((request) =>
-        denyNativeApproval({
-          availableChoices: request.availableChoices.map((choice) => ({
-            choiceId: choice.choiceId,
-            decision: choice.decision,
-            scope: choice.scope,
-          })),
-        }),
+        decideNativeApproval(mapApprovalRequest(request)),
       );
       return {
         sessionId: session.sessionId,
@@ -589,6 +641,50 @@ const withTimeout = async <T>(
   }
 };
 
+/**
+ * Open a Muse host under a deadline. On timeout/abort: abort the spawn
+ * signal (so official handshake can close the child) and still close any
+ * host that resolves late. Preserves the original timeout error.
+ */
+export const openMuseHostWithTimeout = async (
+  open: (signal: AbortSignal) => Promise<TMuseHost>,
+  ms: number,
+  label: string,
+  outerSignal?: AbortSignal,
+): Promise<TMuseHost> => {
+  const ac = new AbortController();
+  let timedOut = false;
+  const onOuterAbort = (): void => ac.abort();
+  outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
+  if (outerSignal?.aborted || ac.signal.aborted) {
+    outerSignal?.removeEventListener("abort", onOuterAbort);
+    throw new Error(`${label} aborted`);
+  }
+  const pending = open(ac.signal);
+  void pending.then(
+    (host) => {
+      if (timedOut) void host.close().catch(() => {});
+    },
+    () => {},
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          ac.abort();
+          reject(new Error(`${label} timed out`));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    outerSignal?.removeEventListener("abort", onOuterAbort);
+  }
+};
+
 const confirmExactModelAndPolicy = async (
   session: TMuseSession,
   modelId: string,
@@ -692,17 +788,23 @@ export const listMuseModelsDemand = async (
   if (!existsSync(bin)) return null;
   const generation = museNativeModelGeneration();
   const baseEnv = params.env ?? cliEnv("muse");
-  const workspace =
-    params.cwd ??
-    (await mkdtemp(join(spawnCwd(baseEnv) || tmpdir(), "muse-models-")));
-  const ownedCwd = params.cwd === undefined;
+  // Auth overlay must stay OUTSIDE workspaceRoot (known-safe reads).
+  // Always allocate a unique turn root — even under params.cwd — so parallel
+  // tests sharing a parent directory cannot collide on workspace/runtime.
+  const turnRoot = await mkdtemp(
+    join(params.cwd ?? (spawnCwd(baseEnv) || tmpdir()), "muse-models-"),
+  );
+  const workspaceRoot = join(turnRoot, "workspace");
+  const runtimeParent = join(turnRoot, "runtime");
+  await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+  await mkdir(runtimeParent, { recursive: true, mode: 0o700 });
   let overlay: TMuseOverlay | null = null;
   let host: TMuseHost | null = null;
   try {
     overlay = await createMuseExecutionOverlay({
       baseEnv,
       mcp: null,
-      parentDir: workspace,
+      parentDir: runtimeParent,
     });
     const env: NodeJS.ProcessEnv = {
       ...cleanMuseSpawnEnv(baseEnv),
@@ -710,15 +812,18 @@ export const listMuseModelsDemand = async (
     };
     const spawn = wrapMuseServeSpawn(bin);
     const hostFactory = params.hostFactory ?? defaultMuseHostFactory;
-    host = await withTimeout(
-      hostFactory({
-        command: spawn.command,
-        args: spawn.args,
-        cwd: workspace,
-        env,
-      }),
+    host = await openMuseHostWithTimeout(
+      (signal) =>
+        hostFactory({
+          command: spawn.command,
+          args: spawn.args,
+          cwd: workspaceRoot,
+          env,
+          signal,
+        }),
       MUSE_RPC_TIMEOUT_MS,
       "muse model/list spawn",
+      params.signal,
     );
     if (params.signal?.aborted) return null;
     const models = await withTimeout(
@@ -740,9 +845,7 @@ export const listMuseModelsDemand = async (
   } finally {
     if (host !== null) await host.close().catch(() => {});
     if (overlay !== null) await overlay.cleanup().catch(() => {});
-    if (ownedCwd) {
-      await rm(workspace, { recursive: true, force: true }).catch(() => {});
-    }
+    await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
   }
 };
 
@@ -768,10 +871,18 @@ export const runMuseNative = async (
   }
 
   const spawn = wrapMuseServeSpawn(params.bin);
-  const workspace =
-    params.cwd ??
-    (await mkdtemp(join(spawnCwd(params.env) || tmpdir(), "muse-turn-")));
-  const ownedCwd = params.cwd === undefined;
+  // Split layout: workspaceRoot (session cwd) NEVER contains the auth
+  // overlay HOME. Known-safe workspace reads therefore cannot reach the
+  // auth symlink by a workspace-relative path. Absolute-path reads of HOME
+  // remain a residual host-policy risk (see file header).
+  // Always unique under params.cwd / tmp — avoids parallel cwd collisions.
+  const turnRoot = await mkdtemp(
+    join(params.cwd ?? (spawnCwd(params.env) || tmpdir()), "muse-turn-"),
+  );
+  const workspaceRoot = join(turnRoot, "workspace");
+  const runtimeParent = join(turnRoot, "runtime");
+  await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+  await mkdir(runtimeParent, { recursive: true, mode: 0o700 });
   const hostFactory = params.hostFactory ?? defaultMuseHostFactory;
   const rpcTimeoutMs = params.rpcTimeoutMs ?? MUSE_RPC_TIMEOUT_MS;
   const observationGeneration = museNativeModelGeneration();
@@ -779,9 +890,10 @@ export const runMuseNative = async (
     providerModelId: params.providerModelId,
   });
 
-  const queue: Array<TChatCompletionChunk | "end"> = [];
+  type TQueueItem = TChatCompletionChunk | "end" | { readonly error: Error };
+  const queue: Array<TQueueItem> = [];
   let wake: (() => void) | null = null;
-  const push = (item: TChatCompletionChunk | "end"): void => {
+  const push = (item: TQueueItem): void => {
     queue.push(item);
     wake?.();
     wake = null;
@@ -793,6 +905,12 @@ export const runMuseNative = async (
     ended = true;
     for (const chunk of chunks) push(chunk);
     push("end");
+  };
+  /** Post-commit non-moderation failure: error the stream, do not finish ok. */
+  const failStream = (error: Error): void => {
+    if (ended) return;
+    ended = true;
+    push({ error });
   };
 
   let host: TMuseHost | null = null;
@@ -824,9 +942,7 @@ export const runMuseNative = async (
       await overlay.cleanup().catch(() => {});
       overlay = null;
     }
-    if (ownedCwd) {
-      await rm(workspace, { recursive: true, force: true }).catch(() => {});
-    }
+    await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
   };
 
   const abort = (): void => {
@@ -864,34 +980,37 @@ export const runMuseNative = async (
       ...(params.providerId !== undefined
         ? { providerId: params.providerId }
         : {}),
-      parentDir: workspace,
+      parentDir: runtimeParent,
     });
     // cleanMuseSpawnEnv strips ambient XDG_*; re-apply the isolated overlay.
     const env: NodeJS.ProcessEnv = {
       ...cleanMuseSpawnEnv(params.env),
       ...overlay.env,
     };
-    host = await withTimeout(
-      hostFactory({
-        command: spawn.command,
-        args: spawn.args,
-        cwd: workspace,
-        env,
-        onStderr: (chunk) => {
-          const trimmed = chunk.trim();
-          if (trimmed.length === 0) return;
-          logWarn("native-runtime", safeDiagnosticMessage`muse-sdk stderr`, {
-            bytes: trimmed.length,
-          });
-        },
-      }),
+    host = await openMuseHostWithTimeout(
+      (signal) =>
+        hostFactory({
+          command: spawn.command,
+          args: spawn.args,
+          cwd: workspaceRoot,
+          env,
+          signal,
+          onStderr: (chunk) => {
+            const trimmed = chunk.trim();
+            if (trimmed.length === 0) return;
+            logWarn("native-runtime", safeDiagnosticMessage`muse-sdk stderr`, {
+              bytes: trimmed.length,
+            });
+          },
+        }),
       rpcTimeoutMs,
       "muse SDK spawn",
+      params.signal,
     );
     session = await withTimeout(
       host.startSession({
         sessionId: crypto.randomUUID(),
-        workspaceRoot: workspace,
+        workspaceRoot,
         modelId: params.providerModelId,
         ...(params.providerId !== undefined
           ? { providerId: params.providerId }
@@ -901,7 +1020,7 @@ export const runMuseNative = async (
       rpcTimeoutMs,
       "muse session/start",
     );
-    session.onApproval(denyNativeApproval);
+    session.onApproval(decideNativeApproval);
     await withTimeout(
       confirmExactModelAndPolicy(
         session,
@@ -1019,13 +1138,20 @@ export const runMuseNative = async (
         pumpDeltas.catch(() => {}),
       ]);
       if (ended) return;
+      const terminal = outcome.terminal ?? outcome.kind;
+      const failed = outcome.kind === "failed" || terminal === "failed";
       if (!turn.sawOutput() && outcome.kind !== "completed") {
         ended = true;
         push("end");
         void cleanup();
         return;
       }
-      endWith(turn.finish(outcome.terminal ?? outcome.kind));
+      if (failed) {
+        failStream(new Error(`muse turn failed (${terminal})`));
+        void cleanup();
+        return;
+      }
+      endWith(turn.finish(terminal));
       void cleanup();
     } catch (error: unknown) {
       await Promise.all([
@@ -1040,8 +1166,9 @@ export const runMuseNative = async (
         safeDiagnosticMessage`muse turn failed after start`,
         { error: error instanceof Error ? error.message : String(error) },
       );
-      if (turn.sawOutput()) endWith(turn.finish("failed"));
-      else {
+      if (turn.sawOutput()) {
+        failStream(error instanceof Error ? error : new Error(String(error)));
+      } else {
         ended = true;
         push("end");
       }
@@ -1049,7 +1176,7 @@ export const runMuseNative = async (
     }
   })();
 
-  const nextItem = async (): Promise<TChatCompletionChunk | "end"> => {
+  const nextItem = async (): Promise<TQueueItem> => {
     for (;;) {
       const item = queue.shift();
       if (item !== undefined) return item;
@@ -1059,7 +1186,7 @@ export const runMuseNative = async (
     }
   };
 
-  let first: TChatCompletionChunk | "end" | "timeout";
+  let first: TQueueItem | "timeout";
   for (;;) {
     let precommitTimer: ReturnType<typeof setTimeout> | undefined;
     first = await Promise.race([
@@ -1075,14 +1202,20 @@ export const runMuseNative = async (
     if (first === "timeout" && turn.sawOutput()) continue;
     break;
   }
-  if (first === "timeout" || first === "end") {
+  if (
+    first === "timeout" ||
+    first === "end" ||
+    (typeof first === "object" && first !== null && "error" in first)
+  ) {
     await cleanup();
     const reason =
       first === "timeout"
         ? "muse SDK produced no output before the pre-commit deadline"
         : params.signal.aborted
           ? "client aborted"
-          : "muse turn ended before producing output";
+          : typeof first === "object" && first !== null && "error" in first
+            ? first.error.message
+            : "muse turn ended before producing output";
     return {
       kind: "declined",
       reason,
@@ -1098,6 +1231,11 @@ export const runMuseNative = async (
       const next = await nextItem();
       if (next === "end") {
         controller.close();
+        await cleanup();
+        return;
+      }
+      if (typeof next === "object" && next !== null && "error" in next) {
+        controller.error(next.error);
         await cleanup();
         return;
       }

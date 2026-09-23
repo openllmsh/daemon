@@ -5,6 +5,11 @@
  * Durable auth (delegation) lives at:
  *   `$providerHome/.config/muse/auth.json` (= cliConfigDir("muse")/auth.json)
  *
+ * Callers MUST place `parentDir` OUTSIDE the MSP `workspaceRoot`. The auth
+ * symlink lives under this overlay HOME; keeping it outside the workspace
+ * is the enforceable read boundary against workspace-scoped known-safe
+ * reads. Absolute-path reads of HOME are a residual host-policy risk.
+ *
  * The serve child must NOT see ambient HOME skills/hooks (`.agents`, `.claude`,
  * `.codex`, `CODEX_HOME`) or user Muse settings/MCP. PATH is preserved from the
  * cleaned spawn env so the fixed muse binary resolution still works.

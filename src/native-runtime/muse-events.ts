@@ -3,9 +3,12 @@
  *
  * Maps official `@muse-code/sdk` folded items / item-deltas / session usage
  * onto `TChatCompletionChunk` without inventing reasoning signatures or
- * treating SDK-internal events as user text. Public surfaces only:
- * `agentMessage` text and `reasoning` *summaries*. Private reasoning is never
- * inspected.
+ * treating SDK-internal events as user text. Public surfaces:
+ * `agentMessage` text, `reasoning` *summaries*, and completed host-native
+ * `web_search` toolCalls (reported as canonical `server_search_calls`).
+ * Private reasoning is never inspected. Provider-executed search is NEVER
+ * re-emitted as caller `tool_calls` — that channel stays reserved for the
+ * loopback MCP handoff.
  *
  * Usage prefers vendor-reported numbers. Root-session last-call counted-once
  * totals (`promptTokens` / `totalTokens` from `session/tokenUsage`) are the
@@ -15,6 +18,7 @@
  */
 
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
+import { serverSearchCallFromMuseToolCall } from "./muse-web-search";
 
 /** Official fold item fields this mapper actually reads. */
 export type TMuseFoldedItem = {
@@ -25,6 +29,14 @@ export type TMuseFoldedItem = {
   readonly text?: string;
   readonly summary?: ReadonlyArray<string>;
   readonly truncated?: boolean;
+  /** `toolCall`: provider call id when present. */
+  readonly callId?: string;
+  /** `toolCall`: tool name (`web_search`, `search`, …). */
+  readonly tool?: string;
+  /** `toolCall`: model-authored argument JSON, verbatim. */
+  readonly args?: string;
+  /** `toolCall`/`userShell`: bounded transcript-visible result text. */
+  readonly visibleOutput?: string;
 };
 
 /** Official `item/delta` payload (`ItemDeltaParams`). */
@@ -114,7 +126,12 @@ const finishReasonOf = (
   terminal: string | null,
 ): "stop" | "length" | "content_filter" | "tool_calls" => {
   if (terminal === "tool_calls") return "tool_calls";
-  if (terminal === "failed") return "content_filter";
+  // Non-moderation turn failures must NOT look like a successful
+  // content_filter completion. Callers error the stream instead of
+  // finishing with `failed`; if `finish("failed")` is still invoked,
+  // emit no terminal chunk (empty) so a success-shaped finish_reason
+  // cannot leak.
+  if (terminal === "failed") return "stop";
   if (terminal === "cancelled") return "stop";
   return "stop";
 };
@@ -173,6 +190,8 @@ export const createMuseTurnState = (params: {
     );
   };
 
+  const reportedSearches = new Set<string>();
+
   const textFromItem = (item: TMuseFoldedItem): TChatCompletionChunk | null => {
     if (item.kind === "agentMessage") {
       return append(item.itemId, item.text ?? "", false);
@@ -187,6 +206,23 @@ export const createMuseTurnState = (params: {
         if (chunk !== null) last = chunk;
       }
       return last;
+    }
+    // Host-native web_search → canonical server_search_calls. Filesystem
+    // `search` and every other toolCall stay silent here (not tool_calls).
+    if (item.kind === "toolCall") {
+      const call = serverSearchCallFromMuseToolCall(item);
+      if (call === null) return null;
+      if (reportedSearches.has(call.id)) return null;
+      reportedSearches.add(call.id);
+      sawOutput = true;
+      if (!openerEmitted) {
+        openerEmitted = true;
+        return baseChunk(
+          { role: "assistant", content: "", server_search_calls: [call] },
+          null,
+        );
+      }
+      return baseChunk({ server_search_calls: [call] }, null);
     }
     return null;
   };
@@ -234,6 +270,8 @@ export const createMuseTurnState = (params: {
     finish: (terminal) => {
       if (finished) return [];
       finished = true;
+      // See finishReasonOf: a failed terminal is not a successful completion.
+      if (terminal === "failed") return [];
       return [
         baseChunk(
           {},
