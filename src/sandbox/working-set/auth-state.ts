@@ -15,6 +15,7 @@
  */
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { cliConfigDir } from "../../cli-paths";
 import type { TWorkingSet } from "./base";
 import { vendorExecDirs } from "./base";
 
@@ -27,9 +28,14 @@ export const authStateLayer = (home: string): TWorkingSet => {
   // time. REQUIRED on Linux: Landlock can only grant an EXISTING path
   // (`existing()` drops a missing leaf rather than widening onto bare $HOME), so
   // a fresh box would leave these ungranted. macOS is a harmless no-op.
+  // Muse's isolated auth store is `$XDG_CONFIG_HOME/muse` →
+  // `<cliHome("muse")>/.config/muse` (auth.json). Pre-create that leaf so a
+  // future decomposed `<state>/cli` grant can address it; today the whole
+  // state dir already covers it.
   for (const d of [
     join(home, ".local", "state", "claude"),
     join(home, ".cache", "claude"),
+    cliConfigDir("muse"),
   ]) {
     try {
       mkdirSync(d, { recursive: true });

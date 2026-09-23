@@ -485,6 +485,8 @@ provision_clis() {
     "Grok|grok|$HOME/.grok/bin/grok|https://x.ai/cli/install.sh"
     # ⚠️ RESEARCH-UNVERIFIED: Cursor's official installer/launcher path.
     "Cursor Agent|cursor-agent|$HOME/.local/bin/cursor-agent|https://cursor.com/install"
+    # Official Muse Code installer (https://dev.meta.ai/docs/muse-code/).
+    "Muse Code|muse|$HOME/.local/bin/muse|https://dev.meta.ai/install.sh"
   )
   # Build a PATH that (a) puts the STANDARD system dirs FIRST — covering
   # curl/bash/tar/gzip/uname/sed/grep on macOS AND Linux (all live in

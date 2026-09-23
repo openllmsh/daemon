@@ -4,6 +4,7 @@ import { claudeCodeDelegate } from "./claude-code";
 import { cursorDelegate } from "./cursor";
 import { grokDelegate } from "./grok";
 import { kimiCodeDelegate } from "./kimi-code";
+import { museDelegate } from "./muse";
 import type { TProviderDelegate } from "./types";
 
 export * from "./types";
@@ -19,6 +20,7 @@ export const DELEGATES: Readonly<Record<string, TProviderDelegate>> = {
   kimi_code: kimiCodeDelegate,
   grok: grokDelegate,
   cursor: cursorDelegate,
+  muse: museDelegate,
 };
 
 export const isSubscriptionSlug = (

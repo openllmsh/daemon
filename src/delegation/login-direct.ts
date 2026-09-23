@@ -74,7 +74,7 @@ export type TBlockingConnectConfig = {
   /** Runs before the login spawn (claude: ensure the isolated keychain). */
   readonly beforeLogin?: () => Promise<TStoreRead<void> | void>;
   readonly argv: () => ReadonlyArray<string>;
-  readonly env: () => Record<string, string>;
+  readonly env: () => Record<string, string | undefined>;
   /** Runs after the login spawn (claude: grant keychain tool access). */
   readonly afterLogin?: () => Promise<boolean | undefined>;
   /** Authoritative connection check after the login completes. */
@@ -136,6 +136,7 @@ export const makeBlockingConnect = (
             "kimi_code",
             "grok",
             "cursor",
+            "muse",
           ] as const satisfies ReadonlyArray<TSubscriptionProviderSlug>
         ).find((item) => item === cfg.provider);
         const lifecycle =
@@ -411,7 +412,8 @@ export type TStreamConnectConfig = {
   /** Re-surface detail when a login is already in flight. */
   readonly inProgressDetail: string;
   readonly argv: () => ReadonlyArray<string>;
-  readonly env: () => Record<string, string>;
+  /** Override map. `undefined` values delete keys (see mergeSpawnEnv). */
+  readonly env: () => Record<string, string | undefined>;
   /** Which fd carries the authorize URL. Codex/Grok: stderr. Cursor: stdout. Default stderr. */
   readonly stream?: "stdout" | "stderr";
   /** Parse the authorize URL off the chosen fd → `{ url, code }` (code: ""). */

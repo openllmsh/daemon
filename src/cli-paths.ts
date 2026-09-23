@@ -162,6 +162,21 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
       XDG_CONFIG_HOME: join(home, ".config"),
     }),
   },
+  // Meta Muse Code — official `muse` CLI. Auth is the XDG path
+  // `$XDG_CONFIG_HOME/muse/auth.json` (muse-code-acp + Meta docs / guides).
+  // Installer: `curl -fsSL https://dev.meta.ai/install.sh | sh` (official docs).
+  // ⚠️ RESEARCH-UNVERIFIED host launcher path beyond PATH + ~/.local/bin/muse.
+  muse: {
+    binRel: "home/.local/bin/muse",
+    cmd: "muse",
+    hostCandidates: (home) => [join(home, ".local", "bin", "muse")],
+    configDir: (home) => join(home, ".config", "muse"),
+    env: ({ home, tmp }) => ({
+      HOME: home,
+      TMPDIR: tmp,
+      XDG_CONFIG_HOME: join(home, ".config"),
+    }),
+  },
 };
 
 /** The closed runtime list of CLI providers — derived from `SPECS` keys so it

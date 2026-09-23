@@ -39,7 +39,13 @@ import {
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
-import { DEFAULT_LOGIN_TIMEOUT_MS, redactUrls, spawnCwd } from "./spawn";
+import {
+  DEFAULT_LOGIN_TIMEOUT_MS,
+  mergeSpawnEnv,
+  redactUrls,
+  spawnCwd,
+  spawnEnv,
+} from "./spawn";
 import { openUrl } from "./util";
 
 /** The shared return shape of `connect()` / `connectDeviceCode()`. */
@@ -845,7 +851,10 @@ export type TStreamLoginOpts<T> = {
   readonly provider: string;
   readonly slot: TLoginSlot;
   readonly argv: ReadonlyArray<string>;
-  readonly env: Record<string, string>;
+  /** Override map. Values of `undefined` delete the key from the child env
+   *  (see {@link mergeSpawnEnv}) so ambient secrets like `META_API_KEY` can be
+   *  stripped. */
+  readonly env: Record<string, string | undefined>;
   /** Which fd carries the prompt: codex `login` prints the authorize URL to
    *  stderr; `codex login --device-auth` prints the device prompt to stdout. */
   readonly stream: "stdout" | "stderr";
@@ -995,7 +1004,7 @@ export const spawnStreamLogin = async <T>(
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(opts.env),
-      env: { ...process.env, ...opts.env },
+      env: spawnEnv(opts.env) ?? mergeSpawnEnv(process.env),
     });
   } catch (error) {
     opts.slot.end(flow.flowId);

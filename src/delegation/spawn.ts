@@ -36,11 +36,33 @@ import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
 import { redactSensitiveArgv } from "./redact-sensitive-argv";
 
+/**
+ * Merge spawn env overrides onto a base env. An override value of `undefined`
+ * deletes that key from the result (needed so Muse can strip ambient
+ * `META_API_KEY` — Bun also treats undefined as unset, but an explicit delete
+ * keeps Node and object consumers honest).
+ */
+export const mergeSpawnEnv = (
+  base: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>,
+  overrides?: Readonly<Record<string, string | undefined>>,
+): Record<string, string> => {
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (value !== undefined) next[key] = value;
+  }
+  if (overrides === undefined) return next;
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+  }
+  return next;
+};
+
 /** Merge an env map onto the parent env for a spawned isolated CLI. */
 export const spawnEnv = (
-  env: Record<string, string> | undefined,
-): Record<string, string | undefined> | undefined =>
-  env === undefined ? undefined : { ...process.env, ...env };
+  env: Record<string, string | undefined> | undefined,
+): Record<string, string> | undefined =>
+  env === undefined ? undefined : mergeSpawnEnv(process.env, env);
 
 /**
  * The working directory for a spawned isolated CLI. SECURITY: the daemon runs
@@ -58,7 +80,9 @@ export const spawnEnv = (
  * home dir doesn't yet exist (a not-yet-created cwd would make `Bun.spawn`
  * `ENOENT`). Never returns `/`.
  */
-export const spawnCwd = (env: Record<string, string> | undefined): string => {
+export const spawnCwd = (
+  env: Record<string, string | undefined> | undefined,
+): string => {
   const home = env?.HOME;
   // Reject `/` explicitly: it "exists", so an env with `HOME=/` (or a daemon
   // whose HOME wasn't isolated) would otherwise pass the existsSync check and
@@ -296,7 +320,7 @@ export type TRunCaptureResult =
  */
 export const runCaptureResult = async (
   argv: ReadonlyArray<string>,
-  env?: Record<string, string>,
+  env?: Record<string, string | undefined>,
   opts?: TRunCaptureOpts,
 ): Promise<TRunCaptureResult> => {
   if (signalAbortRequested(opts?.signal)) return { kind: "aborted" };
@@ -577,7 +601,7 @@ export const runCaptureResult = async (
  *  spawn failure, non-zero exit, abort, or a timeout. */
 export const runCapture = async (
   argv: ReadonlyArray<string>,
-  env?: Record<string, string>,
+  env?: Record<string, string | undefined>,
   opts?: TRunCaptureOpts,
 ): Promise<string | null> => {
   const result = await runCaptureResult(argv, env, opts);
@@ -760,7 +784,7 @@ export const UNTIL_SETTLE_MS = 400;
  */
 export const spawnLogin = async (
   argv: ReadonlyArray<string>,
-  env?: Record<string, string>,
+  env?: Record<string, string | undefined>,
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
   const loginOpts = opts;
@@ -1272,7 +1296,7 @@ export const ptyScriptArgv = (
  */
 export const spawnLoginPty = async (
   argv: ReadonlyArray<string>,
-  env?: Record<string, string>,
+  env?: Record<string, string | undefined>,
   opts?: TSpawnLoginOpts,
 ): Promise<TLoginResult> => {
   const ptyOpts = opts;

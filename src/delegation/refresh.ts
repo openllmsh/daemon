@@ -219,6 +219,7 @@ const SETTLED_BY_PROVIDER: Record<
   kimi_code: safeDiagnosticMessage`Credential refresh settled for kimi_code.`,
   grok: safeDiagnosticMessage`Credential refresh settled for grok.`,
   cursor: safeDiagnosticMessage`Credential refresh settled for cursor.`,
+  muse: safeDiagnosticMessage`Credential refresh settled for muse.`,
 };
 
 const SETTLED_BY_PROVIDER_CALLER: Record<
@@ -254,6 +255,12 @@ const SETTLED_BY_PROVIDER_CALLER: Record<
     usage: safeDiagnosticMessage`Credential refresh settled for cursor (usage).`,
     models: safeDiagnosticMessage`Credential refresh settled for cursor (models).`,
     login: safeDiagnosticMessage`Credential refresh settled for cursor (login).`,
+  },
+  muse: {
+    upstream: safeDiagnosticMessage`Credential refresh settled for muse (upstream).`,
+    usage: safeDiagnosticMessage`Credential refresh settled for muse (usage).`,
+    models: safeDiagnosticMessage`Credential refresh settled for muse (models).`,
+    login: safeDiagnosticMessage`Credential refresh settled for muse (login).`,
   },
 };
 

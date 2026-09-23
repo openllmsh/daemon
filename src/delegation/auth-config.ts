@@ -259,6 +259,17 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     env: () => ({}),
     liveCapture: false,
   },
+  // Muse is bridge-only (official SDK/MSP). Shape-only auth-config entry so
+  // `Record<TCliProvider, …>` stays exhaustive — never used for Meta Model API
+  // HTTP with subscription credentials.
+  muse: {
+    origin: "https://dev.meta.ai",
+    path: "/",
+    match: () => false,
+    argv: (bin) => [bin, "--version"],
+    env: () => ({}),
+    liveCapture: false,
+  },
 };
 
 /** The default (pre-capture) upstream URL: ORIGIN + default PATH. The delegate

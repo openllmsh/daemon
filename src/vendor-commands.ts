@@ -16,6 +16,7 @@ export const VENDOR_CLI_NAMES: readonly string[] = [
   "kimi",
   "grok",
   "cursor-agent",
+  "muse",
   "opencode",
   "hermes",
   // Preferred launch path: openllm [-d] <client>

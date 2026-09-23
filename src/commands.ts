@@ -66,6 +66,7 @@ export const PROVIDERS = [
   "kimi_code",
   "grok",
   "cursor",
+  "muse",
 ] as const;
 
 /** Argument choices for the `auto-update` and `sessions` subcommands. */
