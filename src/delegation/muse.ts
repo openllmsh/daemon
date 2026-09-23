@@ -8,10 +8,14 @@
  * so child env strips ambient API-key overrides.
  *
  * Passive status never spawns the vendor CLI. Auth-file existence/size alone is
- * NEVER connected entitlement — only (1) a successful official login exit that
- * changed the store fingerprint, or (2) a successful authenticated MSP
- * operation via {@link noteMuseAuthenticatedSession}, marks connected.
- * Quota/plan are never claimed without an official source.
+ * NEVER connected entitlement. Connected is memory-verified for this process
+ * only (`verifiedAuthFingerprint`) and is restored solely on demand:
+ * (1) official login exit that changed the store fingerprint,
+ * (2) successful authenticated MSP via {@link noteMuseAuthenticatedSession}
+ *     (manual `listModels`, inference session, or explicit connect demand
+ *     verify of an unchanged existing store).
+ * No startup / idle / polling revalidation. Quota/plan are never claimed
+ * without an official source.
  */
 import { join } from "node:path";
 import type {
@@ -241,6 +245,53 @@ const loginVerifyConnected = (): boolean => {
   return fp !== null && fp !== loginBaselineFingerprint;
 };
 
+/**
+ * Demand-driven MSP `model/list` to re-pin {@link verifiedAuthFingerprint}
+ * after a daemon restart (or any process where memory verification was lost)
+ * while a configured auth store is still present. Never treats file presence
+ * alone as success; refuses when the store disappears or changes mid-flight
+ * (logout / rotate). Used only from explicit connect / login-exit verify —
+ * not from passive status, startup, or idle paths.
+ */
+const verifyMuseAuthDemand = async (): Promise<boolean> => {
+  if (!storeConfigured()) return false;
+  const expectedFp = storeFingerprint();
+  if (expectedFp === null) return false;
+  try {
+    const { listMuseModelsDemand } = await import(
+      "../native-runtime/muse-runtime"
+    );
+    const listed = await listMuseModelsDemand({
+      bin: cliBin(PROVIDER),
+      env: baseEnv(),
+    });
+    if (listed === null || listed.length === 0) return false;
+    // Concurrent logout / store replace must not stick a stale success.
+    if (!storeConfigured()) return false;
+    const live = storeFingerprint();
+    if (live === null || live !== expectedFp) return false;
+    if (!hasVerifiedAuth()) {
+      noteMuseAuthenticatedSession({ fingerprint: expectedFp });
+    }
+    return hasVerifiedAuth();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Connect-lifecycle verify: sync login evidence first, then (only while a
+ * login baseline is active) one demand MSP check for an unchanged existing
+ * store. Short-circuit at connect start still uses this with a null baseline,
+ * so preexisting auth.json alone never short-circuits as signed-in.
+ */
+const connectLifecycleConnected = async (): Promise<boolean> => {
+  if (loginVerifyConnected()) return true;
+  if (loginBaselineFingerprint === null) return false;
+  if (!storeConfigured()) return false;
+  return verifyMuseAuthDemand();
+};
+
 // ─── Passive model observation (zero-spawn; filled by runtime later) ─────
 
 type TMuseNativeModelCache = {
@@ -338,7 +389,7 @@ const connectDirect = makeStreamConnect({
   slot,
   installed: isInstalled,
   installHint: INSTALL_HINT,
-  connected: async () => loginVerifyConnected(),
+  connected: connectLifecycleConnected,
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
@@ -347,12 +398,21 @@ const connectDirect = makeStreamConnect({
   stream: "stdout",
   parse: (buffer) => parseMuseLoginPrompt(buffer),
   onConnected: (): boolean => {
-    if (!loginVerifyConnected()) return false;
     const fp = storeFingerprint();
     if (fp === null || !storeConfigured()) return false;
+    if (hasVerifiedAuth()) {
+      // Demand MSP verify already pinned this fingerprint — unchanged store OK.
+      loginBaselineFingerprint = null;
+      museStatusCache.invalidate();
+      clearMuseNativeModels();
+      noteAuthStoreIdentityChange(PROVIDER);
+      return true;
+    }
+    // Official login must change the store; file presence alone never counts.
     if (loginBaselineFingerprint !== null && fp === loginBaselineFingerprint) {
       return false;
     }
+    if (!loginVerifyConnected()) return false;
     verifiedAuthFingerprint = fp;
     loginBaselineFingerprint = null;
     museStatusCache.invalidate();
@@ -389,14 +449,33 @@ const cancelConnect = makeCancelConnect(PROVIDER, slot, {
   none: "no sign-in was in progress",
 });
 
+/**
+ * Explicit connect: if a configured store is present but memory verification
+ * was lost (daemon restart), demand-verify through official MSP `model/list`
+ * before spawning `muse login`. Failed demand verify falls through to login.
+ * Passive status / startup never call this path.
+ */
+const connect = async (): Promise<
+  Awaited<ReturnType<typeof connectDirect>>
+> => {
+  if (!hasVerifiedAuth() && storeConfigured()) {
+    const ok = await verifyMuseAuthDemand();
+    if (ok && hasVerifiedAuth()) {
+      return { connected: true, detail: CONNECTED_DETAIL };
+    }
+  }
+  return connectDirect();
+};
+
 export const museDelegate: TProviderDelegate = {
   slug: PROVIDER,
-  statusCancellable: true,
+  // cliInstallState is a shared probe and does not accept observer aborts.
+  statusCancellable: false,
   invalidateStatusObservation: clearMuseStatusObservationCache,
-  connect: connectDirect,
+  connect,
   cancelConnect,
 
-  status: async (_signal?: AbortSignal): Promise<TDaemonProviderConnection> => {
+  status: async (): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
     const storeRead = installed ? readCachedStoreObservation() : undefined;
     if (storeRead?.kind === "indeterminate") {
