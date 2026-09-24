@@ -247,9 +247,17 @@ const applyAuthLiteral = (
   const last = lastKnownConnections.get(slug);
   const inFlight = providerAuthOwned(slug);
   const normalized = normalizeProviderConnection(conn);
+  // Binary absence is a completed install probe (`cli_unavailable`),
+  // not a hung auth probe. Treating it as indeterminate left last-known
+  // empty so the next timeout/backoff overlay dropped `cli_installed`
+  // and the UI offered Connect. Do not key off `cli_installed === false`
+  // alone — failure overlays may carry that flag while still being
+  // indeterminate (`probe_timeout` / `STATUS_CHECK_FAILED_DETAIL`).
+  const cliUnavailable = normalized.reason_code === "cli_unavailable";
   const indeterminate =
-    normalized.observation === "unknown" ||
-    conn.detail === STATUS_CHECK_FAILED_DETAIL;
+    !cliUnavailable &&
+    (normalized.observation === "unknown" ||
+      conn.detail === STATUS_CHECK_FAILED_DETAIL);
   // Determinate = this tick's vendor read, not last-known overlay.
   const determinate = !inFlight && !indeterminate && !normalized.pending;
 
@@ -292,6 +300,10 @@ const applyAuthLiteral = (
       observation: "unknown",
       reason_code: normalized.reason_code ?? "probe_failed",
       ...(livePending !== undefined ? { pending_auth: livePending } : {}),
+      // Prefer this tick's binary-presence evidence over a partial last-known.
+      ...(typeof conn.cli_installed === "boolean"
+        ? { cli_installed: conn.cli_installed }
+        : {}),
     };
   }
   return {
