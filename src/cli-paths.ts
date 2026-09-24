@@ -48,6 +48,9 @@ type TCliSpec = {
   readonly env: (ctx: TCliEnvCtx) => Record<string, string>;
 };
 
+/** Shared by official Muse login/logout and isolated SDK host spawns. */
+export const MUSE_CREDENTIAL_BACKEND = "file";
+
 const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   // `claude install` (run by claude.ai/install.sh under our HOME) places
   // the launcher at $HOME/.local/bin/claude.
@@ -163,8 +166,17 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
     }),
   },
   // Meta Muse Code — official `muse` CLI. Auth is the XDG path
-  // `$XDG_CONFIG_HOME/muse/auth.json` (muse-code-acp + Meta docs / guides).
-  // Installer: `curl -fsSL https://dev.meta.ai/install.sh | sh` (official docs).
+  // `$XDG_CONFIG_HOME/muse/auth.json` (official launcher `MUSE_AUTH_PATH`
+  // default + muse-code-acp). Installer:
+  // `curl -fsSL https://dev.meta.ai/install.sh | sh` (official docs).
+  //
+  // macOS: the vendor binary defaults to KeychainStore and surfaces a GUI
+  // "Keychain … locked / can't be stored" prompt under a daemon-isolated HOME
+  // that has no usable login keychain. Force the official file backend via
+  // `TBH_CREDENTIAL_BACKEND=file` (env name embedded in the installed Muse
+  // binary; valid pairing `file/none` per its credential_backend snapshot;
+  // muse-code-acp headless/serve fixtures pin the same). Auth store path is
+  // unchanged — still `$XDG_CONFIG_HOME/muse/auth.json`.
   // ⚠️ RESEARCH-UNVERIFIED host launcher path beyond PATH + ~/.local/bin/muse.
   muse: {
     binRel: "home/.local/bin/muse",
@@ -175,6 +187,7 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
       HOME: home,
       TMPDIR: tmp,
       XDG_CONFIG_HOME: join(home, ".config"),
+      TBH_CREDENTIAL_BACKEND: MUSE_CREDENTIAL_BACKEND,
     }),
   },
 };

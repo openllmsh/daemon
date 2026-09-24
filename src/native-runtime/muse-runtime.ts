@@ -47,7 +47,7 @@ import type {
   TChatCompletionChunk,
   TProviderModelEntry,
 } from "@openllmsh/protocol";
-import { cliBin, cliEnv } from "../cli-paths";
+import { cliBin, cliEnv, MUSE_CREDENTIAL_BACKEND } from "../cli-paths";
 import {
   museNativeModelFingerprint,
   museNativeModelGeneration,
@@ -184,6 +184,10 @@ export const cleanMuseSpawnEnv = (
     if (API_KEY_OVERRIDE_RE.test(key)) continue;
     next[key] = value;
   }
+  // Always pin the vendor file credential backend (overrides ambient
+  // `keychain` / unset). Same invariant as `cliEnv("muse")` so login,
+  // logout, serve, model/list, and inference never open macOS Keychain.
+  next.TBH_CREDENTIAL_BACKEND = MUSE_CREDENTIAL_BACKEND;
   return next;
 };
 
