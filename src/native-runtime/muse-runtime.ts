@@ -462,7 +462,7 @@ const wrapOfficialHost = async (
   let spawned: Awaited<ReturnType<typeof handshake.initialize>>;
   try {
     spawned = await handshake.initialize({
-      clientInfo: { name: "openllm-daemon", version: DAEMON_VERSION },
+      clientInfo: { name: "openllm_daemon", version: DAEMON_VERSION },
     });
   } catch (error) {
     // initialize failure / abort must not leave the owned muse serve child.
