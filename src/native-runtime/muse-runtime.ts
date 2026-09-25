@@ -1128,6 +1128,41 @@ export type TListMuseModelsDemandParams = {
   readonly noteAuthenticated?: boolean;
 };
 
+export type TMuseTurnDirs = {
+  readonly turnRoot: string;
+  readonly workspaceRoot: string;
+  readonly runtimeParent: string;
+};
+
+export type TAllocateMuseTurnDirsOptions = {
+  /** Test seam for synthetic mkdir failures — production omits this. */
+  readonly mkdir?: typeof mkdir;
+};
+
+/**
+ * Unique turn root with `workspace/` + `runtime/` leaves. Mirrors
+ * {@link createMuseExecutionOverlay}: any failure after `mkdtemp` removes the
+ * partial turn root. Never deletes `parent` (caller-owned cwd).
+ */
+export const allocateMuseTurnDirs = async (
+  parent: string,
+  prefix: string,
+  options: TAllocateMuseTurnDirsOptions = {},
+): Promise<TMuseTurnDirs> => {
+  const doMkdir = options.mkdir ?? mkdir;
+  const turnRoot = await mkdtemp(join(parent, prefix));
+  try {
+    const workspaceRoot = join(turnRoot, "workspace");
+    const runtimeParent = join(turnRoot, "runtime");
+    await doMkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+    await doMkdir(runtimeParent, { recursive: true, mode: 0o700 });
+    return { turnRoot, workspaceRoot, runtimeParent };
+  } catch (error) {
+    await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+};
+
 /**
  * Demand-driven MSP `model/list` for the Muse delegate. Strips metered-key
  * overrides, uses a fresh HOME overlay with auth-only symlink, never claims
@@ -1145,20 +1180,19 @@ export const listMuseModelsDemand = async (
   // Auth overlay must stay OUTSIDE workspaceRoot (known-safe reads).
   // Always allocate a unique turn root — even under params.cwd — so parallel
   // tests sharing a parent directory cannot collide on workspace/runtime.
-  const turnRoot = await mkdtemp(
-    join(params.cwd ?? (spawnCwd(baseEnv) || tmpdir()), "muse-models-"),
-  );
-  const workspaceRoot = join(turnRoot, "workspace");
-  const runtimeParent = join(turnRoot, "runtime");
-  await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
-  await mkdir(runtimeParent, { recursive: true, mode: 0o700 });
+  let turnRoot: string | undefined;
   let overlay: TMuseOverlay | null = null;
   let host: TMuseHost | null = null;
   try {
+    const dirs = await allocateMuseTurnDirs(
+      params.cwd ?? (spawnCwd(baseEnv) || tmpdir()),
+      "muse-models-",
+    );
+    turnRoot = dirs.turnRoot;
     overlay = await createMuseExecutionOverlay({
       baseEnv,
       mcp: null,
-      parentDir: runtimeParent,
+      parentDir: dirs.runtimeParent,
     });
     const env: NodeJS.ProcessEnv = {
       ...cleanMuseSpawnEnv(baseEnv),
@@ -1171,7 +1205,7 @@ export const listMuseModelsDemand = async (
         hostFactory({
           command: spawn.command,
           args: spawn.args,
-          cwd: workspaceRoot,
+          cwd: dirs.workspaceRoot,
           env,
           signal,
         }),
@@ -1206,10 +1240,11 @@ export const listMuseModelsDemand = async (
   } finally {
     if (host !== null) await host.close().catch(() => {});
     if (overlay !== null) await overlay.cleanup().catch(() => {});
-    await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
+    if (turnRoot !== undefined) {
+      await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
+    }
   }
 };
-
 /**
  * Run one cold Muse turn through the official SDK surface. Commit-on-first
  * output; every pre-commit failure declines. The child / host is closed on
@@ -1240,13 +1275,9 @@ export const runMuseNative = async (
   // auth symlink by a workspace-relative path. Absolute-path reads of HOME
   // remain a residual host-policy risk (see file header).
   // Always unique under params.cwd / tmp — avoids parallel cwd collisions.
-  const turnRoot = await mkdtemp(
-    join(params.cwd ?? (spawnCwd(params.env) || tmpdir()), "muse-turn-"),
-  );
-  const workspaceRoot = join(turnRoot, "workspace");
-  const runtimeParent = join(turnRoot, "runtime");
-  await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
-  await mkdir(runtimeParent, { recursive: true, mode: 0o700 });
+  // Allocated inside the setup try so mkdtemp/mkdir failures decline (and
+  // allocateMuseTurnDirs removes any partial turn root) instead of throwing.
+  let turnRoot: string | undefined;
   const hostFactory = params.hostFactory ?? defaultMuseHostFactory;
   const rpcTimeoutMs = params.rpcTimeoutMs ?? MUSE_RPC_TIMEOUT_MS;
   const observationGeneration = museNativeModelGeneration();
@@ -1317,7 +1348,11 @@ export const runMuseNative = async (
       await overlay.cleanup().catch(() => {});
       overlay = null;
     }
-    await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
+    if (turnRoot !== undefined) {
+      const root = turnRoot;
+      turnRoot = undefined;
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
   };
 
   const abort = (): void => {
@@ -1335,6 +1370,12 @@ export const runMuseNative = async (
   params.signal.addEventListener("abort", abort, { once: true });
 
   try {
+    const dirs = await allocateMuseTurnDirs(
+      params.cwd ?? (spawnCwd(params.env) || tmpdir()),
+      "muse-turn-",
+    );
+    turnRoot = dirs.turnRoot;
+    const { workspaceRoot, runtimeParent } = dirs;
     if ((params.tools?.length ?? 0) > 0) {
       mcp = startMuseMcpServer({
         tools: params.tools ?? [],
