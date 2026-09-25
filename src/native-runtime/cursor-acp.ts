@@ -652,8 +652,9 @@ export const handleCursorServerRequest = (
   return null;
 };
 
-/** Read-first model pin. Bare catalog ids accept Cursor's advertised variant;
- * explicitly bracketed selections must match exactly. A rejected pin never
+/** Read-first model pin. Prefer an exact advertised id when listed; bare
+ * catalog ids accept a native variant only when that exact id is absent.
+ * Explicitly bracketed selections must match exactly. A rejected pin never
  * submits a prompt on auto. ACP set_model acknowledges application with `{}`;
  * unlike Muse it has no model-read RPC to call afterwards. */
 const ensureCursorModel = async (
@@ -680,10 +681,16 @@ const ensureCursorModel = async (
       };
     } | null
   )?.models;
-  if (requested.length > 0 && matches(models?.currentModelId)) return;
-  const match = models?.availableModels?.find((model) =>
-    matches(model.modelId),
-  );
+  const available = models?.availableModels;
+  const exact = available?.find((model) => model.modelId === requested);
+  // Skip set_model only when already on the pin we would choose: exact
+  // current always wins; a base-id variant current is enough only when no
+  // exact advertised id exists (otherwise prefer the exact pin).
+  if (requested.length > 0) {
+    if (models?.currentModelId === requested) return;
+    if (exact === undefined && matches(models?.currentModelId)) return;
+  }
+  const match = exact ?? available?.find((model) => matches(model.modelId));
   const modelId =
     typeof match?.modelId === "string" ? match.modelId : requested;
   await client.request("session/set_model", { sessionId, modelId }, timeoutMs);
