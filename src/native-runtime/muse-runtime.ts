@@ -1271,6 +1271,10 @@ export const runMuseNative = async (
   const failStream = (error: Error): void => {
     if (ended) return;
     ended = true;
+    // Clear host-facing timers here too — callers still run cleanup for the
+    // child/host, but a delayed cleanup must not leave idle/budget firing.
+    clearInterval(idleTimer);
+    clearTimeout(turnTimer);
     push({ error });
   };
 
@@ -1290,6 +1294,7 @@ export const runMuseNative = async (
   const cleanup = async (): Promise<void> => {
     clearInterval(idleTimer);
     clearTimeout(turnTimer);
+    params.signal.removeEventListener("abort", abort);
     if (activeTurn !== null) {
       await activeTurn.cancel().catch(() => {});
       activeTurn = null;
@@ -1485,9 +1490,12 @@ export const runMuseNative = async (
         { idleMs: idleBudget, code: "muse_turn_idle_timeout" },
       );
       void cleanup();
+      // Host silence after partial output is a timeout failure — never map
+      // our own cancel into finish_reason=stop success via turn.finish
+      // ("cancelled"). Client abort still uses that path; idle/budget do not.
       if (turn.sawOutput()) {
         noteFirstOutputSuccess();
-        endWith(turn.finish("cancelled"));
+        failStream(new Error("muse turn idle timeout"));
       } else {
         emitMusePhaseTimings(phaseMarks, "timeout");
         ended = true;
@@ -1511,7 +1519,7 @@ export const runMuseNative = async (
     void cleanup();
     if (turn.sawOutput()) {
       noteFirstOutputSuccess();
-      endWith(turn.finish("cancelled"));
+      failStream(new Error("muse turn budget exceeded"));
     } else {
       emitMusePhaseTimings(phaseMarks, "timeout");
       ended = true;
@@ -1593,11 +1601,14 @@ export const runMuseNative = async (
       endWith(turn.finish(terminal ?? "completed"));
       void cleanup();
     } catch (error: unknown) {
-      await Promise.all([
-        pumpItems.catch(() => {}),
-        pumpDeltas.catch(() => {}),
-      ]);
-      if (ended) return;
+      // Do not join item/delta pumps here. `completed` already rejected, so a
+      // hung iterator (or one that ignores cancel) would stall failStream
+      // forever. Pumps are already observed via the void .catch above; cancel
+      // via cleanup and surface the host error immediately.
+      if (ended) {
+        void cleanup();
+        return;
+      }
       const folded = session?.lastUsage();
       if (folded !== undefined) turn.observeUsage(folded);
       const err = error instanceof Error ? error : new Error(String(error));
