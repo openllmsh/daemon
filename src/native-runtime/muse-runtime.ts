@@ -1438,6 +1438,9 @@ export const runMuseNative = async (
       "muse turn/start",
     );
     phaseMarks.turnSubmittedAt = musePhaseNow();
+    // Generation idle starts at turn ACK — setup (overlay/MCP/host/session)
+    // must not consume the post-submit silence budget.
+    lastActivityAt = Date.now();
   } catch (error) {
     emitMusePhaseTimings(
       phaseMarks,
@@ -1554,18 +1557,20 @@ export const runMuseNative = async (
         pumpDeltas.catch(() => {}),
       ]);
       if (ended) return;
-      // Official SDK TurnOutcome (flattened): success is only `kind:
-      // "completed"` with terminal completed|cancelled (or omitted).
-      // `unqueued` never ran; `terminalUnknown` is host-death/unknown;
-      // `terminal: "failed"` (+ `error`) is a mid-turn / launch failure on
-      // the completed arm — never invent success. After partial output,
-      // error the stream. Before output, decline with the host reason.
+      // Official SDK TurnOutcome (flattened): success is `kind:
+      // "completed"` with terminal completed (or omitted), cancelled only
+      // after we already committed output, or tool_calls for caller-tool
+      // handoff. Empty completed+cancelled is a decline — never invent an
+      // empty stop success. Client abort still finishes via the abort
+      // listener (ended before this arm). `unqueued` never ran;
+      // `terminalUnknown` is host-death/unknown; `terminal: "failed"` (+
+      // `error`) is a mid-turn / launch failure on the completed arm.
       const terminal = outcome.terminal;
       const acknowledgedSuccess =
         outcome.kind === "completed" &&
         (terminal === undefined ||
           terminal === "completed" ||
-          terminal === "cancelled" ||
+          (terminal === "cancelled" && turn.sawOutput()) ||
           terminal === "tool_calls");
       if (!turn.sawOutput() && !acknowledgedSuccess) {
         const reason = museTurnDeclineReason(outcome);
