@@ -1,7 +1,7 @@
 /**
  * Muse native runtime — one cold official-SDK session per request.
  *
- * The official `@muse-code/sdk@0.1.1` spawn (`spawnMspConnection`) has no
+ * The official `@muse-code/sdk@1.3.0` spawn (`spawnMspConnection`) has no
  * custom-process hook: it calls `node:child_process.spawn(command, args)`.
  * Confinement is therefore the SAME argv wrap Cursor uses: `sandboxSpawnArgs`
  * turns `[museBin, "serve", --disable-write, --disable-shell]` into the

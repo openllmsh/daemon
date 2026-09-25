@@ -3,7 +3,7 @@
  * MSP `turn/start` input parts (`text` | `image`). Side-effect free so it is
  * unit-testable without a Muse binary or `@muse-code/sdk`.
  *
- * Official turn input is text/image only (pinned `@muse-code/sdk@0.1.1`
+ * Official turn input is text/image only (pinned `@muse-code/sdk@1.3.0`
  * `TurnInputPart`). Structured native role replay and external tool-result
  * injection are not established; prior turns and tool results are serialized
  * into prompt text. That serialization is lossy — it is not native history.
