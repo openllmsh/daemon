@@ -498,6 +498,17 @@ const isInnerSpawnDenied = (
   /EPERM|posix_spawn|operation not permitted/i.test(captured);
 
 /**
+ * Optional provider mapper for a non-zero login-child exit. Used by
+ * pre-prompt `streamLoginFail` (`crashDetail`) and, separately, by an
+ * explicit background opt-in (`backgroundCrashDetail`) — forwarding the
+ * pre-prompt mapper into background would change Grok/ChatGPT behaviour.
+ */
+export type TStreamLoginCrashDetail = (
+  captured: string,
+  exitCode: number | null,
+) => string;
+
+/**
  * Map a stream-login miss onto an `auth.login.failed` code + the dashboard
  * `detail`. The static `failDetail` is a TITLE — the body is the redacted
  * capture (and `[code]` for an outer spawn throw). Never the title alone
@@ -506,7 +517,7 @@ const isInnerSpawnDenied = (
 export const streamLoginFail = (
   title: string,
   res: Extract<TStreamLoginResult<unknown>, { found: null }>,
-  crashDetail?: (captured: string, exitCode: number | null) => string,
+  crashDetail?: TStreamLoginCrashDetail,
 ): {
   readonly code: TAuthLoginFailedCode;
   readonly message: string;
@@ -520,7 +531,11 @@ export const streamLoginFail = (
     };
   }
   const body = captureBody(res.captured);
-  const titled = body.length > 0 ? `${title}\n${body}` : title;
+  const titled =
+    body.length > 0
+      ? `${title}
+${body}`
+      : title;
   if (isInnerSpawnDenied(res.captured, res.exitCode)) {
     return { code: "spawn_denied", message: titled, retryable: false };
   }
@@ -707,6 +722,14 @@ export const finishInBackground = async (opts: {
   /** Child exit code when known. Non-zero + absent → `cli_crash`;
    *  unavailable after a live child is retryable, never `cli_crash` from unread store. */
   readonly exitCode?: number | null;
+  /** Combined stdout+stderr capture when the child exited (for mapping). */
+  readonly captured?: string;
+  /**
+   * Explicit opt-in mapping for genuine nonzero disconnected exits only.
+   * Separate from pre-prompt `crashDetail` so Grok/ChatGPT keep prior
+   * background generics unless a provider opts in.
+   */
+  readonly backgroundCrashDetail?: TStreamLoginCrashDetail;
 }): Promise<void> => {
   const flow = opts.slot.flow();
   const flowId = flow?.flowId;
@@ -788,6 +811,21 @@ export const finishInBackground = async (opts: {
   // retryable poll_expired outcome rather than asserting a crash from an
   // ambiguous exit. Unreadable/timeout store is unavailable, not a crash.
   const crashed = typeof opts.exitCode === "number" && opts.exitCode !== 0;
+  const GENERIC_BG_CRASH = "sign-in process exited before a credential landed";
+  let disconnectedMessage = crashed
+    ? GENERIC_BG_CRASH
+    : "sign-in ended without a stored credential";
+  if (crashed && opts.backgroundCrashDetail !== undefined) {
+    // Mapper is best-effort — a throw must not skip finalize/cleanup.
+    try {
+      disconnectedMessage = opts.backgroundCrashDetail(
+        opts.captured ?? "",
+        opts.exitCode ?? null,
+      );
+    } catch {
+      disconnectedMessage = GENERIC_BG_CRASH;
+    }
+  }
   const event: TLoginTerminalEvent =
     flow === null
       ? { kind: "none" }
@@ -810,9 +848,7 @@ export const finishInBackground = async (opts: {
             : {
                 kind: "failed",
                 code: crashed ? "cli_crash" : "poll_expired",
-                message: crashed
-                  ? "sign-in process exited before a credential landed"
-                  : "sign-in ended without a stored credential",
+                message: disconnectedMessage,
                 retryable: !crashed,
               };
   const clearPending =
@@ -883,6 +919,24 @@ export type TStreamLoginOpts<T> = {
   readonly probe?: boolean;
   /** `auth.login.started` mode. Default `browser`. */
   readonly mode?: TAuthLoginMode;
+  /**
+   * Fires once when the child exits AFTER a prompt was parsed (background
+   * completion path). Receives the exit code and a bounded combined
+   * stdout+stderr capture so a provider can log privacy-safe diagnostics —
+   * the shared terminal event still comes from {@link finishInBackground}.
+   * Best-effort: a throw must not skip cleanup.
+   */
+  readonly onBackgroundExit?: (info: {
+    readonly exitCode: number | null;
+    readonly captured: string;
+    readonly reaped: boolean;
+  }) => void;
+  /**
+   * Explicit opt-in mapping for {@link finishInBackground} genuine nonzero
+   * disconnected exits after a prompt was parsed. Omit (the default) to keep
+   * the shared generic public message — do NOT reuse pre-prompt crashDetail.
+   */
+  readonly backgroundCrashDetail?: TStreamLoginCrashDetail;
 };
 
 /**
@@ -1158,8 +1212,23 @@ export const spawnStreamLogin = async <T>(
       // already exited — its own exit handler ran
     }
   }, ceilingMs);
-  void child.exited.then((exitCode) => {
+  void child.exited.then(async (exitCode) => {
     clearTimeout(reaper);
+    const finalExit = reaped ? 0 : exitCode;
+    if (opts.onBackgroundExit !== undefined) {
+      // Only opted-in diagnostics wait for the non-prompt stream remainder.
+      // Existing providers keep their original completion timing.
+      await Promise.race([otherDone, sleep(200)]);
+      try {
+        opts.onBackgroundExit({
+          exitCode: finalExit,
+          captured: combined(),
+          reaped,
+        });
+      } catch {
+        // best-effort — never skip finishInBackground
+      }
+    }
     return finishInBackground({
       provider: opts.provider,
       slot: opts.slot,
@@ -1167,7 +1236,9 @@ export const spawnStreamLogin = async <T>(
       waitStoreHint: opts.waitStoreHint,
       verifyWatchdogMs: opts.verifyWatchdogMs,
       onConnected: opts.onConnected,
-      exitCode: reaped ? 0 : exitCode,
+      exitCode: finalExit,
+      captured: combined(),
+      backgroundCrashDetail: opts.backgroundCrashDetail,
     });
   });
   return { found };

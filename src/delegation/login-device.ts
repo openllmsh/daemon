@@ -23,6 +23,7 @@ import type {
   TLoginSlot,
   TLoginTerminalEvent,
   TLoginVerify,
+  TStreamLoginCrashDetail,
 } from "./login-flow";
 import {
   booleanLoginVerify,
@@ -365,7 +366,7 @@ export type TStreamDeviceConfig = {
   readonly failDetail: string;
   /** Detail when the login child CRASHED (exited non-zero before a prompt).
    *  Optional — omit to fall back to `failDetail` plus the redacted capture. */
-  readonly crashDetail?: (captured: string, exitCode: number | null) => string;
+  readonly crashDetail?: TStreamLoginCrashDetail;
   /** cancelConnect wording. */
   readonly cancelMessages: {
     readonly cancelled: string;

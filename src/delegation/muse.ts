@@ -7,15 +7,14 @@
  * material. META_API_KEY outranks stored credentials in the official runtime,
  * so child env strips ambient API-key overrides.
  *
- * Passive status never spawns the vendor CLI. Auth-file existence/size alone is
- * NEVER connected entitlement. Connected is memory-verified for this process
- * only (`verifiedAuthFingerprint`) and is restored solely on demand:
- * (1) official login exit that changed the store fingerprint,
- * (2) successful authenticated MSP via {@link noteMuseAuthenticatedSession}
- *     (manual `listModels`, inference session, or explicit connect demand
- *     verify of an unchanged existing store).
- * No startup / idle / polling revalidation. Quota/plan are never claimed
- * without an official source.
+ * Local configured login is the durable FILE-backed store under the isolated
+ * XDG config home: `providers.meta.mechanism === "oauth"` with a non-empty
+ * inline `access_token`. That is a local store observation only — not
+ * subscription/quota proof. `storage: "keychain"` pointers are rejected (macOS
+ * Keychain is not HOME-isolated). Passive status uses `readJsonStore` + shape
+ * narrowing + the shared observation cache — no MSP model/list proof, no
+ * in-memory-only session flag. Quota/plan are never claimed without an
+ * official source.
  */
 import { join } from "node:path";
 import type {
@@ -36,11 +35,11 @@ import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring } from "./delegate-shared";
 import { makeStreamConnect } from "./login-direct";
+import { makeCancelConnect } from "./login-flow";
 import {
-  emitLoginSucceeded,
-  makeCancelConnect,
-  resolveLoginFlow,
-} from "./login-flow";
+  classifyMuseLoginBackgroundExit,
+  mapMuseLoginCrashDetail,
+} from "./muse-login-diagnostics";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -56,6 +55,7 @@ import type { TStoreRead } from "./util";
 import {
   connectedObservation,
   disconnectedObservation,
+  readJsonStore,
   runCapture,
   STATUS_CHECK_FAILED_DETAIL,
   stripAnsi,
@@ -64,7 +64,7 @@ import {
 
 const PROVIDER = "muse" as const;
 
-/** Official auth store under the isolated XDG config home. Existence/size only. */
+/** Official auth store under the isolated XDG config home. */
 export const museAuthJsonPath = (): string =>
   join(cliConfigDir(PROVIDER), "auth.json");
 
@@ -145,37 +145,90 @@ export const parseMuseLoginPrompt = (
   return { url, code };
 };
 
+/** Official file-backed Muse auth.json (synthetic fixtures match this shape). */
+export type TMuseAuthFile = {
+  readonly schema_version?: number;
+  readonly providers?: {
+    readonly meta?: {
+      readonly mechanism?: string;
+      readonly storage?: string;
+      readonly access_token?: string;
+      readonly obtained_via?: string;
+      readonly user_email?: string;
+      readonly user_full_name?: string;
+      readonly api_base_url?: string;
+    };
+  };
+};
+
 type TMuseStoreObservation =
   | { readonly kind: "absent" }
-  | { readonly kind: "configured" };
+  | { readonly kind: "keychain_pointer" }
+  | { readonly kind: "file_backed" };
+
+const isJsonRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
- * Passive store observation: size > 2 means *some* credential material is
- * configured (mirrors muse-code-acp). Secrets are never read. This is NOT
- * connected evidence by itself.
+ * Presence-only parse of the durable auth store. Never returns token material.
+ * `file_backed` = oauth + inline access_token (local configured login only).
+ * `keychain_pointer` = oauth + storage:keychain (rejected for daemon isolation).
+ * Malformed shapes (null/array providers or meta) → `indeterminate`.
+ * Valid empty / missing meta → `absent`.
  */
-export const observeMuseAuthStore = (): TStoreRead<TMuseStoreObservation> => {
-  const identity = fileStoreIdentity(museAuthJsonPath());
-  if (!identity.statOk) {
-    return { kind: "indeterminate", cause: "stat_failed" };
-  }
-  if (!identity.present || (identity.size ?? 0) <= 2) {
+export const observeMuseAuthStore = async (): Promise<
+  TStoreRead<TMuseStoreObservation>
+> => {
+  const store = await readJsonStore<unknown>(museAuthJsonPath());
+  if (store.kind === "absent") {
     return { kind: "present", value: { kind: "absent" } };
   }
-  return { kind: "present", value: { kind: "configured" } };
+  if (store.kind === "indeterminate") return store;
+  if (!isJsonRecord(store.value)) {
+    return { kind: "indeterminate", cause: "malformed_auth_root" };
+  }
+  if (!("providers" in store.value) || store.value.providers === undefined) {
+    return { kind: "present", value: { kind: "absent" } };
+  }
+  const providers = store.value.providers;
+  if (
+    providers === null ||
+    Array.isArray(providers) ||
+    !isJsonRecord(providers)
+  ) {
+    return { kind: "indeterminate", cause: "malformed_providers" };
+  }
+  if (!("meta" in providers) || providers.meta === undefined) {
+    return { kind: "present", value: { kind: "absent" } };
+  }
+  const meta = providers.meta;
+  if (meta === null || Array.isArray(meta) || !isJsonRecord(meta)) {
+    return { kind: "indeterminate", cause: "malformed_meta" };
+  }
+  if (meta.mechanism !== "oauth") {
+    return { kind: "present", value: { kind: "absent" } };
+  }
+  if (meta.storage === "keychain") {
+    return { kind: "present", value: { kind: "keychain_pointer" } };
+  }
+  if (typeof meta.access_token === "string" && meta.access_token.length > 0) {
+    return { kind: "present", value: { kind: "file_backed" } };
+  }
+  return { kind: "present", value: { kind: "absent" } };
 };
 
 const museStatusCache = createPassiveObservationCache<TMuseStoreObservation>();
 
-/** Fingerprint of the store that completed a verified login or MSP auth. */
-let verifiedAuthFingerprint: string | null = null;
-
 /**
- * Baseline store fingerprint captured when `muse login` starts. Verify after
- * exit requires the store identity to change from this baseline (new write or
- * replace) — a preexisting stale/`{}x` file alone never counts.
+ * Internal connected check for loginWiring. Returns a non-null sentinel when
+ * the durable file carries an inline oauth token — the token string is never
+ * exported from the delegate / credentialForUpstream.
  */
-let loginBaselineFingerprint: string | null = null;
+const readFileBackedAuthPresence = async (): Promise<true | null> => {
+  const observed = await observeMuseAuthStore();
+  if (observed.kind !== "present") return null;
+  return observed.value.kind === "file_backed" ? true : null;
+};
 
 const storeFingerprint = (): string | null => {
   const identity = fileStoreIdentity(museAuthJsonPath());
@@ -183,44 +236,30 @@ const storeFingerprint = (): string | null => {
   return fingerprintStoreIdentity(identity);
 };
 
-const storeConfigured = (): boolean => {
-  const observed = observeMuseAuthStore();
-  return observed.kind === "present" && observed.value.kind === "configured";
-};
-
-const hasVerifiedAuth = (): boolean => {
-  if (verifiedAuthFingerprint === null) return false;
-  if (!storeConfigured()) return false;
-  const fp = storeFingerprint();
-  return fp !== null && fp === verifiedAuthFingerprint;
-};
-
 /**
- * Mark Muse as authenticated after a successful MSP operation (model/list or
- * confirmed session). Fingerprint must match the current auth-store identity —
- * never cross-seed an unknown/stale identity.
+ * Compatibility hook for the native runtime after a successful MSP model/list
+ * or session. Local configured-login status no longer depends on this memory
+ * flag — it only refreshes the passive observation cache under the live store
+ * fingerprint.
  */
 export const noteMuseAuthenticatedSession = (opts: {
   readonly fingerprint: string;
 }): void => {
-  if (!storeConfigured()) return;
   const fp = storeFingerprint();
   if (fp === null || fp !== opts.fingerprint) return;
-  verifiedAuthFingerprint = fp;
   museStatusCache.invalidate();
 };
 
 /** Drop cached Muse status presence after login/logout mutations. */
 export const clearMuseStatusObservationCache = (): void => {
-  invalidateDemandVerify();
   museStatusCache.invalidate();
   clearMuseNativeModels();
-  verifiedAuthFingerprint = null;
-  loginBaselineFingerprint = null;
   noteAuthStoreIdentityChange(PROVIDER);
 };
 
-const readCachedStoreObservation = (): TStoreRead<TMuseStoreObservation> => {
+const readCachedStoreObservation = async (): Promise<
+  TStoreRead<TMuseStoreObservation>
+> => {
   const identity = fileStoreIdentity(museAuthJsonPath());
   if (!identity.statOk) {
     return { kind: "indeterminate", cause: "stat_failed" };
@@ -231,100 +270,10 @@ const readCachedStoreObservation = (): TStoreRead<TMuseStoreObservation> => {
   if (cached !== undefined) {
     return { kind: "present", value: cached };
   }
-  const observed = observeMuseAuthStore();
+  const observed = await observeMuseAuthStore();
   if (observed.kind !== "present") return observed;
   museStatusCache.set(fingerprint, observed.value, generation);
   return observed;
-};
-
-/**
- * Login-verify predicate: verified session OR (active login baseline set and
- * the store fingerprint changed to a configured store). Used only by the
- * connect lifecycle — passive status uses {@link hasVerifiedAuth}.
- */
-const loginVerifyConnected = (): boolean => {
-  if (hasVerifiedAuth()) return true;
-  if (loginBaselineFingerprint === null) return false;
-  if (!storeConfigured()) return false;
-  const fp = storeFingerprint();
-  return fp !== null && fp !== loginBaselineFingerprint;
-};
-
-/**
- * Generation fence for in-flight demand MSP verify. Bumped on cancel, logout,
- * and observation reset so a late `listMuseModelsDemand` completion cannot
- * mark connected or fall through to `muse login` after the owner released.
- */
-let demandVerifyEpoch = 0;
-let demandVerifyAbort: AbortController | null = null;
-
-const invalidateDemandVerify = (): void => {
-  demandVerifyEpoch += 1;
-  demandVerifyAbort?.abort();
-  demandVerifyAbort = null;
-};
-
-type TDemandVerifyHit = {
-  readonly ok: true;
-  readonly fingerprint: string;
-};
-type TDemandVerifyMiss = { readonly ok: false };
-
-/**
- * Demand-driven MSP `model/list` evidence for connect recovery. Never treats
- * file presence alone as success; refuses store churn / abort / stale epoch.
- * Does **not** call {@link noteMuseAuthenticatedSession} — the owning connect
- * / login-exit path commits only after its fence so cancellation cannot stick
- * a late note. Passive status / startup never call this.
- */
-const verifyMuseAuthDemand = async (opts?: {
-  readonly signal?: AbortSignal;
-  readonly epoch?: number;
-}): Promise<TDemandVerifyHit | TDemandVerifyMiss> => {
-  const signal = opts?.signal;
-  const epoch = opts?.epoch ?? demandVerifyEpoch;
-  if (signal?.aborted || epoch !== demandVerifyEpoch) return { ok: false };
-  if (!storeConfigured()) return { ok: false };
-  const expectedFp = storeFingerprint();
-  if (expectedFp === null) return { ok: false };
-  try {
-    const { listMuseModelsDemand } = await import(
-      "../native-runtime/muse-runtime"
-    );
-    const listed = await listMuseModelsDemand({
-      bin: cliBin(PROVIDER),
-      env: baseEnv(),
-      noteAuthenticated: false,
-      ...(signal !== undefined ? { signal } : {}),
-    });
-    if (signal?.aborted || epoch !== demandVerifyEpoch) return { ok: false };
-    if (listed === null || listed.length === 0) return { ok: false };
-    if (!storeConfigured()) return { ok: false };
-    const live = storeFingerprint();
-    if (live === null || live !== expectedFp) return { ok: false };
-    return { ok: true, fingerprint: expectedFp };
-  } catch {
-    return { ok: false };
-  }
-};
-
-/** Commit auth evidence only when the caller's fence is still current. */
-const commitMuseAuthDemand = (opts: {
-  readonly fingerprint: string;
-  readonly signal?: AbortSignal;
-  readonly epoch: number;
-}): boolean => {
-  if (
-    opts.signal?.aborted ||
-    opts.epoch !== demandVerifyEpoch ||
-    slot.wasCancelled()
-  ) {
-    return false;
-  }
-  // Publication is synchronous after the fence. Verification itself never
-  // publishes, so cancellation must not erase another demand's auth evidence.
-  noteMuseAuthenticatedSession({ fingerprint: opts.fingerprint });
-  return hasVerifiedAuth();
 };
 
 // ─── Passive model observation (zero-spawn; filled by runtime later) ─────
@@ -351,8 +300,6 @@ export const clearMuseNativeModels = (): void => {
 export const museNativeModelFingerprint = (): string | null => {
   const identity = fileStoreIdentity(museAuthJsonPath());
   if (!identity.statOk) return null;
-  // Absent store still has a stable "absent" fingerprint — callers must not
-  // remember models under an absent/unreadable identity.
   if (!identity.present) return null;
   return fingerprintStoreIdentity(identity);
 };
@@ -366,7 +313,6 @@ export const rememberMuseNativeModels = (opts: {
   if (opts.generation !== museNativeGeneration) return;
   if (opts.models.length === 0) return;
   const live = museNativeModelFingerprint();
-  // Refuse unknown/absent identity and refuse cross-seeding a different store.
   if (live === null || live !== opts.fingerprint) return;
   museNativeModels = {
     fingerprint: opts.fingerprint,
@@ -393,11 +339,8 @@ export const readMuseNativeModels = (opts: {
 };
 
 export const resetMuseNativeModelObservationForTests = (): void => {
-  invalidateDemandVerify();
   museNativeModels = null;
   museNativeGeneration = 0;
-  verifiedAuthFingerprint = null;
-  loginBaselineFingerprint = null;
   museStatusCache.invalidate();
 };
 
@@ -406,6 +349,8 @@ const {
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail: IN_PROGRESS_DETAIL,
   isInstalled,
+  isConnected,
+  refreshConfig,
   slot,
 } = loginWiring({
   provider: PROVIDER,
@@ -414,67 +359,15 @@ const {
   connectedDetail: "signed in via Muse Code",
   inProgressDetail:
     "Muse sign-in already in progress — finish authorizing in your browser; this updates automatically.",
-  // Short-circuit + verify: only a verified auth fingerprint (login exit with
-  // store change, or MSP note). Preexisting auth.json alone is NOT connected.
-  readToken: async () => (hasVerifiedAuth() ? true : null),
-  isConnected: async () => loginVerifyConnected(),
+  readToken: readFileBackedAuthPresence,
 });
-
-/**
- * Connect-lifecycle verify for shortCircuit + login-exit sampling.
- * Does NOT take slot ownership — only the enclosing connect / login flow
- * may `slot.start`/`end`. A leftover baseline after failed/cancelled login
- * with no owner is cleared here so shortCircuit cannot MSP-verify and leave
- * the slot stuck inFlight.
- */
-const connectLifecycleConnected = async (): Promise<boolean> => {
-  if (loginVerifyConnected()) return true;
-  if (loginBaselineFingerprint === null) return false;
-  if (!storeConfigured()) {
-    loginBaselineFingerprint = null;
-    return false;
-  }
-  if (slot.wasCancelled()) {
-    loginBaselineFingerprint = null;
-    return false;
-  }
-  // No live owner ⇒ stale baseline from a prior terminal failure/cancel.
-  if (!slot.inFlight()) {
-    loginBaselineFingerprint = null;
-    return false;
-  }
-  const ac = new AbortController();
-  const epoch = demandVerifyEpoch;
-  // Soft-add a canceler to the EXISTING login owner (already inFlight).
-  slot.start(() => {
-    ac.abort();
-  });
-  if (slot.wasCancelled() || ac.signal.aborted) {
-    loginBaselineFingerprint = null;
-    return false;
-  }
-  const hit = await verifyMuseAuthDemand({ signal: ac.signal, epoch });
-  if (
-    !hit.ok ||
-    slot.wasCancelled() ||
-    ac.signal.aborted ||
-    epoch !== demandVerifyEpoch
-  ) {
-    return false;
-  }
-  return commitMuseAuthDemand({
-    fingerprint: hit.fingerprint,
-    signal: ac.signal,
-    epoch,
-  });
-};
 
 const connectDirect = makeStreamConnect({
   provider: PROVIDER,
   slot,
   installed: isInstalled,
   installHint: INSTALL_HINT,
-  connected: connectLifecycleConnected,
+  connected: isConnected,
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
@@ -482,42 +375,14 @@ const connectDirect = makeStreamConnect({
   waitStoreHint: (signal) => waitFileStoreHint(museAuthJsonPath(), signal),
   stream: "stdout",
   parse: (buffer) => parseMuseLoginPrompt(buffer),
-  onConnected: (): boolean => {
-    const clearBaseline = (): void => {
-      loginBaselineFingerprint = null;
-    };
-    const fp = storeFingerprint();
-    if (fp === null || !storeConfigured()) {
-      clearBaseline();
-      return false;
-    }
-    if (hasVerifiedAuth()) {
-      // Demand MSP verify already pinned this fingerprint — unchanged store OK.
-      clearBaseline();
-      museStatusCache.invalidate();
-      clearMuseNativeModels();
-      noteAuthStoreIdentityChange(PROVIDER);
-      return true;
-    }
-    // Official login must change the store; file presence alone never counts.
-    if (loginBaselineFingerprint !== null && fp === loginBaselineFingerprint) {
-      clearBaseline();
-      return false;
-    }
-    if (!loginVerifyConnected()) {
-      clearBaseline();
-      return false;
-    }
-    verifiedAuthFingerprint = fp;
-    clearBaseline();
+  onConnected: () => {
     museStatusCache.invalidate();
     clearMuseNativeModels();
+    refreshConfig();
     noteAuthStoreIdentityChange(PROVIDER);
     return true;
   },
   onStart: () => {
-    loginBaselineFingerprint =
-      storeFingerprint() ?? `${museAuthJsonPath()}\0absent`;
     logInfo("muse-connect", "spawning `muse login`");
   },
   onParsed: (url) =>
@@ -533,138 +398,59 @@ const connectDirect = makeStreamConnect({
         capturedLen: captured.length,
       },
     ),
+  onBackgroundExit: (info) => {
+    const diag = classifyMuseLoginBackgroundExit(info);
+    logError(
+      "muse-connect",
+      safeDiagnosticMessage`muse login exited before verified credential`,
+      {
+        exitCode: diag.exitCode,
+        exitCategory: diag.exitCategory,
+        stderrCategory: diag.stderrCategory,
+        capturedBytes: diag.capturedBytes,
+      },
+    );
+  },
+  crashDetail: (captured, exitCode) => {
+    const mapped = mapMuseLoginCrashDetail(captured);
+    if (mapped !== null) return mapped;
+    const diag = classifyMuseLoginBackgroundExit({
+      exitCode,
+      captured,
+      reaped: false,
+    });
+    const code =
+      typeof exitCode === "number" ? `exit ${exitCode}` : "no exit code";
+    return `Couldn't start Muse sign-in (${code}; ${diag.stderrCategory}). Retry, or run \`muse login\` on the box.`;
+  },
+  // Explicit opt-in — do not reuse crashDetail for all stream providers.
+  backgroundCrashDetail: (captured, _exitCode) =>
+    mapMuseLoginCrashDetail(captured) ??
+    "sign-in process exited before a credential landed",
   pendingDetail: (url) =>
     `Authorize Muse in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
   failDetail:
     "Couldn't start Muse sign-in. Retry, or run `muse login` on the box.",
 });
 
-const cancelConnectRaw = makeCancelConnect(PROVIDER, slot, {
+const cancelConnect = makeCancelConnect(PROVIDER, slot, {
   cancelled: "Muse sign-in cancelled",
   none: "no sign-in was in progress",
 });
-
-/** Cancel also drops a leftover login baseline so the next connect is clean. */
-const cancelConnect = async (): Promise<{
-  readonly ok: boolean;
-  readonly detail: string;
-}> => {
-  loginBaselineFingerprint = null;
-  return cancelConnectRaw();
-};
-
-/**
- * Explicit connect: if a configured store is present but memory verification
- * was lost (daemon restart), demand-verify through official MSP `model/list`
- * while owning the shared login slot (so cancelConnect aborts it) before
- * spawning `muse login`. Concurrent connects coalesce on the slot. Cancel /
- * logout epoch fences prevent late success from marking connected or falling
- * through to login. Passive status / startup never call this path.
- */
-const connect = async (): Promise<
-  Awaited<ReturnType<typeof connectDirect>>
-> => {
-  if (hasVerifiedAuth()) {
-    return connectDirect();
-  }
-
-  // Coalesce with an in-flight demand verify or official login — do not start
-  // a second MSP/login owner.
-  if (slot.inFlight()) {
-    const pending = getPendingAuth(PROVIDER);
-    return {
-      connected: false,
-      pending: true,
-      detail:
-        pending !== null ? pendingAuthDetail(pending) : IN_PROGRESS_DETAIL,
-    };
-  }
-
-  if (!storeConfigured() || !(await isInstalled())) {
-    return connectDirect();
-  }
-
-  const flow = resolveLoginFlow(PROVIDER, "browser");
-  const ac = new AbortController();
-  demandVerifyAbort = ac;
-  const epoch = demandVerifyEpoch;
-
-  const started = slot.start(() => {
-    demandVerifyEpoch += 1;
-    ac.abort();
-  }, flow);
-  if (!started) {
-    demandVerifyAbort = null;
-    return {
-      connected: false,
-      pending: true,
-      detail: IN_PROGRESS_DETAIL,
-    };
-  }
-  if (slot.wasCancelled() || ac.signal.aborted) {
-    slot.end(flow.flowId);
-    demandVerifyAbort = null;
-    return { connected: false, detail: "Muse sign-in cancelled" };
-  }
-
-  try {
-    const hit = await verifyMuseAuthDemand({ signal: ac.signal, epoch });
-    const stale =
-      ac.signal.aborted || slot.wasCancelled() || epoch !== demandVerifyEpoch;
-    if (stale) {
-      loginBaselineFingerprint = null;
-      slot.end(flow.flowId);
-      demandVerifyAbort = null;
-      return { connected: false, detail: "Muse sign-in cancelled" };
-    }
-    if (
-      hit.ok &&
-      commitMuseAuthDemand({
-        fingerprint: hit.fingerprint,
-        signal: ac.signal,
-        epoch,
-      })
-    ) {
-      loginBaselineFingerprint = null;
-      clearPendingAuth(PROVIDER);
-      emitLoginSucceeded(flow);
-      slot.end(flow.flowId);
-      demandVerifyAbort = null;
-      return { connected: true, detail: CONNECTED_DETAIL };
-    }
-    // Demand failed or commit fenced — release ownership, then official login.
-    // Do not clear a newer successful observation from another authorized path.
-    slot.end(flow.flowId);
-    demandVerifyAbort = null;
-    return connectDirect();
-  } catch {
-    loginBaselineFingerprint = null;
-    if (slot.flow()?.flowId === flow.flowId) {
-      slot.end(flow.flowId);
-    }
-    demandVerifyAbort = null;
-    if (
-      ac.signal.aborted ||
-      slot.wasCancelled() ||
-      epoch !== demandVerifyEpoch
-    ) {
-      return { connected: false, detail: "Muse sign-in cancelled" };
-    }
-    return connectDirect();
-  }
-};
 
 export const museDelegate: TProviderDelegate = {
   slug: PROVIDER,
   // cliInstallState is a shared probe and does not accept observer aborts.
   statusCancellable: false,
   invalidateStatusObservation: clearMuseStatusObservationCache,
-  connect,
+  connect: connectDirect,
   cancelConnect,
 
   status: async (): Promise<TDaemonProviderConnection> => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    const storeRead = installed ? readCachedStoreObservation() : undefined;
+    const storeRead = installed
+      ? await readCachedStoreObservation()
+      : undefined;
     if (storeRead?.kind === "indeterminate") {
       return {
         provider: PROVIDER,
@@ -675,15 +461,15 @@ export const museDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const configured =
-      storeRead?.kind === "present" && storeRead.value.kind === "configured";
-    const verified = hasVerifiedAuth();
-    // Only verified auth clears pending_auth — a preexisting store must not
-    // suppress reconnect / cancel an in-flight login.
-    if (verified) clearPendingAuth(PROVIDER);
-    const pending = verified ? null : getPendingAuth(PROVIDER);
+    const fileBacked =
+      storeRead?.kind === "present" && storeRead.value.kind === "file_backed";
+    const keychainPointer =
+      storeRead?.kind === "present" &&
+      storeRead.value.kind === "keychain_pointer";
+    if (fileBacked) clearPendingAuth(PROVIDER);
+    const pending = fileBacked ? null : getPendingAuth(PROVIDER);
 
-    if (verified) {
+    if (fileBacked) {
       return {
         provider: PROVIDER,
         status: "connected",
@@ -692,11 +478,11 @@ export const museDelegate: TProviderDelegate = {
         ...(version !== null ? { cli_version: version } : {}),
         last_login_at_ms: null,
         detail:
-          "Muse authentication verified this session (official login store change or authenticated MSP). Quota remains unverified; META_API_KEY is stripped from child env.",
+          "Muse local file-backed oauth login present under the isolated XDG store. Not subscription/quota proof; META_API_KEY is stripped from child env.",
       };
     }
 
-    if (configured) {
+    if (keychainPointer) {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -718,7 +504,7 @@ export const museDelegate: TProviderDelegate = {
         detail:
           pending !== null
             ? pendingAuthDetail(pending)
-            : "Muse auth store is present but unverified (contents never read). Reconnect via muse login, or wait for an authenticated MSP session. Not treated as signed in.",
+            : "Muse auth.json points at the macOS Keychain (`storage: keychain`), which is not isolated under the daemon HOME. Re-login with the file credential backend (TBH_CREDENTIAL_BACKEND=file) so the token is stored inline.",
       };
     }
 
@@ -776,8 +562,7 @@ export const museDelegate: TProviderDelegate = {
   },
 
   listModels: async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
-    // Explicit manual refresh: demand-driven MSP model/list via runtime helper
-    // (helper remembers + notes authenticated session when fingerprint present).
+    // Explicit manual refresh: demand-driven MSP model/list via runtime helper.
     try {
       const { listMuseModelsDemand } = await import(
         "../native-runtime/muse-runtime"
@@ -787,10 +572,8 @@ export const museDelegate: TProviderDelegate = {
         env: baseEnv(),
       });
       if (listed === null) return null;
-      // Delegate contract: never return an empty list.
       return listed.length > 0 ? listed : null;
     } catch {
-      // Helper missing / spawn failed — fall back to cache only.
       const fingerprint = museNativeModelFingerprint();
       if (fingerprint === null) return null;
       return readMuseNativeModels({ fingerprint, accountHint: null });
@@ -798,8 +581,8 @@ export const museDelegate: TProviderDelegate = {
   },
 
   credentialForUpstream: async () => {
-    if (!hasVerifiedAuth()) {
-      throw new Error("muse: not signed in (no verified Muse authentication)");
+    if ((await readFileBackedAuthPresence()) === null) {
+      throw new Error("muse: not signed in (no file-backed Muse credential)");
     }
     const url = await resolveUpstreamUrl(PROVIDER);
     throw new Error(
@@ -814,9 +597,9 @@ export const museDelegate: TProviderDelegate = {
         probe: unwrapKeychainSpawn(PROVIDER),
       });
     }
-    const cleared = !storeConfigured();
+    const stillPresent = (await readFileBackedAuthPresence()) !== null;
     clearMuseStatusObservationCache();
-    return cleared
+    return !stillPresent
       ? {
           ok: true,
           detail:

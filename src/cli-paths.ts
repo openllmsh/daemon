@@ -13,9 +13,15 @@
  *     home/            the CLI's home/config + credentials (isolated)
  */
 
-import { statSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
 import { stateDir } from "./env";
 import { resolveOnPath } from "./path-utils";
@@ -48,8 +54,59 @@ type TCliSpec = {
   readonly env: (ctx: TCliEnvCtx) => Record<string, string>;
 };
 
-/** Shared by official Muse login/logout and isolated SDK host spawns. */
+/**
+ * Shared by official Muse login/logout and isolated SDK host spawns.
+ * Env selector is `file` (name embedded as `TBH_CREDENTIAL_BACKEND` in the
+ * installed binary). Spec 8053 `file/none` is the *observed telemetry
+ * pairing* (backend/fallback), not proven here as the env literal.
+ */
 export const MUSE_CREDENTIAL_BACKEND = "file";
+
+/**
+ * Exact version grammar from the official Muse bash launcher's
+ * `version_pattern` (muse-launcher). Used to resolve `muse-bin-<version>`
+ * beside the launcher — never an arbitrary newest-glob.
+ */
+export const MUSE_LAUNCHER_VERSION_PATTERN =
+  /^[0-9]+\.[0-9]+\.[0-9]+-R[0-9]+(\.[0-9]+)?$/;
+
+/**
+ * Resolve the active native Muse Mach-O/ELF next to an official launcher.
+ * Mirrors launcher `active_binary`: realpath the launcher, read sibling
+ * `.muse-version`, require the launcher regex, require `muse-bin-<version>`
+ * is an executable regular file. Returns null when any step fails.
+ */
+export const resolveMuseNativeBinaryBesideLauncher = (
+  launcherPath: string,
+): string | null => {
+  let launcherReal: string;
+  try {
+    launcherReal = realpathSync(launcherPath);
+  } catch {
+    return null;
+  }
+  const dir = dirname(launcherReal);
+  let version = "";
+  try {
+    version = readFileSync(join(dir, ".muse-version"), "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (!MUSE_LAUNCHER_VERSION_PATTERN.test(version)) return null;
+  const native = join(dir, `muse-bin-${version}`);
+  try {
+    if (!statSync(native).isFile()) return null;
+    accessSync(native, constants.X_OK);
+  } catch {
+    return null;
+  }
+  return native;
+};
+
+/** Default Muse installer launcher path (native resolved in hostCliCandidates). */
+const museHostCandidates = (home: string): string[] => [
+  join(home, ".local", "bin", "muse"),
+];
 
 const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   // `claude install` (run by claude.ai/install.sh under our HOME) places
@@ -165,29 +222,37 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
       XDG_CONFIG_HOME: join(home, ".config"),
     }),
   },
-  // Meta Muse Code — official `muse` CLI. Auth is the XDG path
-  // `$XDG_CONFIG_HOME/muse/auth.json` (official launcher `MUSE_AUTH_PATH`
-  // default + muse-code-acp). Installer:
-  // `curl -fsSL https://dev.meta.ai/install.sh | sh` (official docs).
+  // Meta Muse Code — official `muse` CLI. Durable auth is the XDG path
+  // `$XDG_CONFIG_HOME/muse/auth.json` (muse-code-acp + native binary config
+  // root). Installer: `curl -fsSL https://dev.meta.ai/install.sh | sh`.
   //
-  // macOS: the vendor binary defaults to KeychainStore and surfaces a GUI
-  // "Keychain … locked / can't be stored" prompt under a daemon-isolated HOME
-  // that has no usable login keychain. Force the official file backend via
-  // `TBH_CREDENTIAL_BACKEND=file` (env name embedded in the installed Muse
-  // binary; valid pairing `file/none` per its credential_backend snapshot;
-  // muse-code-acp headless/serve fixtures pin the same). Auth store path is
-  // unchanged — still `$XDG_CONFIG_HOME/muse/auth.json`.
-  // ⚠️ RESEARCH-UNVERIFIED host launcher path beyond PATH + ~/.local/bin/muse.
+  // Prefer the launcher-active native `muse-bin-<version>` (`.muse-version`
+  // beside the realpath'd launcher) so login/serve never enter the bash
+  // launcher's download / device-login path. Launcher remains a fallback
+  // candidate; `MUSE_NO_AUTO_UPDATE=1` + `MUSE_LOGIN=0` then make a missing
+  // native binary fail closed instead of fetching or prompting.
+  //
+  // `MUSE_AUTH_PATH` is the official **launcher** override for reading that
+  // store during download auth (launcher never writes credentials; native
+  // `muse-bin` strings do not reference `MUSE_AUTH_PATH`). The native binary
+  // keys off `XDG_CONFIG_HOME` + `TBH_CREDENTIAL_BACKEND=file`.
+  //
+  // macOS KeychainStore is NOT HOME-isolated (SecItem / fixed service); the
+  // daemon never assumes an isolated login.keychain. File backend + inline
+  // `providers.meta.access_token` is the supported durable store.
   muse: {
     binRel: "home/.local/bin/muse",
     cmd: "muse",
-    hostCandidates: (home) => [join(home, ".local", "bin", "muse")],
+    hostCandidates: museHostCandidates,
     configDir: (home) => join(home, ".config", "muse"),
     env: ({ home, tmp }) => ({
       HOME: home,
       TMPDIR: tmp,
       XDG_CONFIG_HOME: join(home, ".config"),
       TBH_CREDENTIAL_BACKEND: MUSE_CREDENTIAL_BACKEND,
+      MUSE_AUTH_PATH: join(home, ".config", "muse", "auth.json"),
+      MUSE_NO_AUTO_UPDATE: "1",
+      MUSE_LOGIN: "0",
     }),
   },
 };
@@ -253,6 +318,15 @@ export const hostCliCandidates = (
   const out: string[] = [];
   const seen = new Set<string>();
   for (const p of [...vendorDefaults, ...resolveOnPath(SPECS[provider].cmd)]) {
+    // Muse: prefer launcher-active native muse-bin-<version> beside ANY
+    // discovered launcher (default ~/.local/bin or a PATH custom install).
+    if (provider === "muse") {
+      const native = resolveMuseNativeBinaryBesideLauncher(p);
+      if (native !== null && !seen.has(native)) {
+        seen.add(native);
+        out.push(native);
+      }
+    }
     if (seen.has(p)) continue;
     seen.add(p);
     out.push(p);

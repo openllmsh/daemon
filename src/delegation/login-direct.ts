@@ -26,6 +26,8 @@ import type {
   TLoginSlot,
   TLoginTerminalEvent,
   TLoginVerify,
+  TStreamLoginCrashDetail,
+  TStreamLoginOpts,
 } from "./login-flow";
 import {
   booleanLoginVerify,
@@ -439,9 +441,21 @@ export type TStreamConnectConfig = {
   /** Detail when the login child CRASHED (exited non-zero before a prompt).
    *  A retry can't fix a deterministic crash, so surface the captured error
    *  instead of `failDetail`. Optional — omit to keep the generic message. */
-  readonly crashDetail?: (captured: string, exitCode: number | null) => string;
+  readonly crashDetail?: TStreamLoginCrashDetail;
+  /**
+   * Explicit opt-in mapping for background nonzero disconnected exits.
+   * Separate from `crashDetail` (pre-prompt only) so providers like Grok /
+   * ChatGPT keep their prior generic background message unless they opt in.
+   * Muse may pass the same callback reference for both.
+   */
+  readonly backgroundCrashDetail?: TStreamLoginCrashDetail;
   /** File-store identity hint after child exit (not Darwin keychain). */
   readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
+  /**
+   * Optional provider hook after a parsed prompt when the login child exits
+   * (background path). See {@link spawnStreamLogin}'s `onBackgroundExit`.
+   */
+  readonly onBackgroundExit?: TStreamLoginOpts<unknown>["onBackgroundExit"];
 };
 
 /**
@@ -486,6 +500,8 @@ export const makeStreamConnect = (
           verify: () => booleanLoginVerify(cfg.connected),
           waitStoreHint: cfg.waitStoreHint,
           onConnected: cfg.onConnected,
+          onBackgroundExit: cfg.onBackgroundExit,
+          backgroundCrashDetail: cfg.backgroundCrashDetail,
           // cursor's store is the macOS keychain → unconfined on mac; codex is
           // file-backed → stays confined (`sandbox/policy.ts`).
           probe: unwrapKeychainSpawn(cfg.provider),

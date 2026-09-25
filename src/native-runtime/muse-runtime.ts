@@ -38,7 +38,9 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TurnOutcome as TOfficialMuseTurnOutcome } from "@muse-code/sdk";
 import {
+  isLaunchFailure,
   MuseClient,
   readSessionDurability,
   spawnMspConnection,
@@ -49,6 +51,7 @@ import type {
 } from "@openllmsh/protocol";
 import { cliBin, cliEnv, MUSE_CREDENTIAL_BACKEND } from "../cli-paths";
 import {
+  clearMuseStatusObservationCache,
   museNativeModelFingerprint,
   museNativeModelGeneration,
   noteMuseAuthenticatedSession,
@@ -209,6 +212,14 @@ export type TMuseSessionRead = {
   readonly approvalMode?: string | null;
 };
 
+export type TMuseTurnError = {
+  /** Official `TurnError.kind` (open enum) — branch/diagnostic code only. */
+  readonly kind: string;
+  /** Bounded human text from the host; never a prompt or credential. */
+  readonly message: string;
+  readonly retryable?: boolean;
+};
+
 export type TMuseTurnOutcome = {
   readonly kind:
     | "completed"
@@ -217,7 +228,129 @@ export type TMuseTurnOutcome = {
     | "unqueued"
     | "terminalUnknown";
   readonly terminal?: string;
+  /**
+   * Present when the host authored `turn/completed.error` (required for
+   * `terminal: "failed"`). Dropping this is what collapses live failures into
+   * the generic "before producing output" decline.
+   */
+  readonly error?: TMuseTurnError;
+  /** Wire launch-failure marker (`terminal: failed` + `error.kind: launchError`). */
+  readonly launchFailure?: boolean;
   readonly usage?: TMuseSessionUsage;
+};
+
+/** Cap host error text retained on the decline path (privacy + log size). */
+const MUSE_TURN_ERROR_MESSAGE_MAX = 200;
+
+/**
+ * Privacy-safe stderr classifier — codes only, never the raw chunk (may hold
+ * paths, tokens, or prompt fragments).
+ */
+export const classifyMuseStderr = (
+  chunk: string,
+): {
+  readonly code:
+    | "muse_stderr_invalid_initialize"
+    | "muse_stderr_auth"
+    | "muse_stderr_network"
+    | "muse_stderr_other";
+  readonly bytes: number;
+} => {
+  const trimmed = chunk.trim();
+  const bytes = trimmed.length;
+  if (/invalid initialize|clientInfo\.name|SS1\.4\.1/i.test(trimmed)) {
+    return { code: "muse_stderr_invalid_initialize", bytes };
+  }
+  if (
+    /unauthorized|unauthenticated|auth(?:entication)? failed|not signed in|credential/i.test(
+      trimmed,
+    )
+  ) {
+    return { code: "muse_stderr_auth", bytes };
+  }
+  if (/ECONN|ENOTFOUND|ETIMEDOUT|socket hang up|network/i.test(trimmed)) {
+    return { code: "muse_stderr_network", bytes };
+  }
+  return { code: "muse_stderr_other", bytes };
+};
+
+/**
+ * Decline reason for a settled Muse turn that produced no output. Prefer the
+ * host's `error.kind` / terminal over the generic empty-output string.
+ */
+export const museTurnDeclineReason = (outcome: TMuseTurnOutcome): string => {
+  if (outcome.kind === "unqueued") {
+    return "muse turn unqueued before start";
+  }
+  if (outcome.kind === "terminalUnknown") {
+    return "muse turn ended (terminalUnknown)";
+  }
+  if (outcome.kind === "cancelled" || outcome.terminal === "cancelled") {
+    return "muse turn cancelled before producing output";
+  }
+  const terminal = outcome.terminal;
+  const errorKind =
+    outcome.error?.kind ??
+    (outcome.launchFailure === true ? "launchError" : undefined);
+  const detail = outcome.error?.message?.trim();
+  if (errorKind !== undefined) {
+    const label =
+      terminal !== undefined ? `${errorKind}/${terminal}` : errorKind;
+    if (detail !== undefined && detail.length > 0) {
+      return `muse turn failed (${label}): ${detail}`;
+    }
+    return `muse turn failed (${label})`;
+  }
+  if (terminal === "failed") {
+    return "muse turn failed before producing output";
+  }
+  if (terminal !== undefined) {
+    return `muse turn ended before producing output (${outcome.kind}/${terminal})`;
+  }
+  return `muse turn ended before producing output (${outcome.kind})`;
+};
+
+const mapOfficialTurnOutcome = (
+  outcome: TOfficialMuseTurnOutcome,
+  usage: TMuseSessionUsage | undefined,
+): TMuseTurnOutcome => {
+  if (outcome.kind === "unqueued") {
+    return {
+      kind: "unqueued",
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  }
+  if (outcome.kind === "terminalUnknown") {
+    return {
+      kind: "terminalUnknown",
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  }
+  // kind === "completed" — mid-turn and launch failures stay on this arm with
+  // terminal "failed" + error (official SDK contract; never a thrown RPC).
+  const params = asRecord(outcome.params);
+  const terminal = asString(params?.terminal);
+  const errorRec = asRecord(params?.error);
+  const errorKind = asString(errorRec?.kind);
+  const rawMessage = asString(errorRec?.message);
+  const error =
+    errorKind !== null
+      ? {
+          kind: errorKind,
+          message: (rawMessage ?? "").slice(0, MUSE_TURN_ERROR_MESSAGE_MAX),
+          ...(typeof errorRec?.retryable === "boolean"
+            ? { retryable: errorRec.retryable }
+            : {}),
+        }
+      : undefined;
+  const launchFailure = isLaunchFailure(outcome);
+  return {
+    kind: "completed",
+    ...(terminal !== null ? { terminal } : {}),
+    ...(error !== undefined ? { error } : {}),
+    ...(launchFailure ? { launchFailure: true } : {}),
+    ...(usage !== undefined ? { usage } : {}),
+  };
 };
 
 export type TMuseTurn = {
@@ -548,27 +681,9 @@ const wrapOfficialHost = async (
           });
           return {
             turnId: turn.turnId,
-            completed: turn.completed.then((outcome) => {
-              const usage = usageFromFold(session);
-              if (outcome.kind === "completed") {
-                const terminal = asString(asRecord(outcome.params)?.terminal);
-                return {
-                  kind: "completed" as const,
-                  ...(terminal !== null ? { terminal } : {}),
-                  ...(usage !== undefined ? { usage } : {}),
-                };
-              }
-              if (outcome.kind === "unqueued") {
-                return {
-                  kind: "unqueued" as const,
-                  ...(usage !== undefined ? { usage } : {}),
-                };
-              }
-              return {
-                kind: "terminalUnknown" as const,
-                ...(usage !== undefined ? { usage } : {}),
-              };
-            }),
+            completed: turn.completed.then((outcome) =>
+              mapOfficialTurnOutcome(outcome, usageFromFold(session)),
+            ),
             items: async function* () {
               for await (const item of turn.items()) {
                 const mapped = mapFoldedItem(item);
@@ -1051,8 +1166,10 @@ export const runMuseNative = async (
           onStderr: (chunk) => {
             const trimmed = chunk.trim();
             if (trimmed.length === 0) return;
+            const classified = classifyMuseStderr(trimmed);
             logWarn("native-runtime", safeDiagnosticMessage`muse-sdk stderr`, {
-              bytes: trimmed.length,
+              code: classified.code,
+              bytes: classified.bytes,
             });
           },
         }),
@@ -1062,7 +1179,7 @@ export const runMuseNative = async (
     );
     session = await withTimeout(
       host.startSession({
-        sessionId: crypto.randomUUID(),
+        sessionId: Bun.randomUUIDv7(),
         workspaceRoot,
         modelId: params.providerModelId,
         ...(params.providerId !== undefined
@@ -1083,14 +1200,14 @@ export const runMuseNative = async (
       rpcTimeoutMs,
       "muse session/setModel",
     );
-    {
-      const fingerprint = museNativeModelFingerprint();
-      if (fingerprint !== null) {
-        noteMuseAuthenticatedSession({ fingerprint });
-      }
-    }
+    // Do NOT note authenticated on session/start alone — live evidence shows
+    // Muse can open a session against an empty providers shell and only fail
+    // later with turn errorKind authRequired. Auth memory is pinned by
+    // non-empty model/list, login store change + configured providers, or a
+    // turn that actually produced output (below).
     // Demand-driven observation for passive discoverModels — never blocks the
-    // turn on failure; exact native ids only.
+    // turn on failure; exact native ids only. rememberMuseModelsFromSession
+    // notes auth only when model/list returns at least one model.
     void rememberMuseModelsFromSession(session, observationGeneration).catch(
       () => {},
     );
@@ -1155,11 +1272,16 @@ export const runMuseNative = async (
       logError(
         "native-runtime",
         safeDiagnosticMessage`muse turn idle timeout — cancelling`,
-        { idleMs: idleBudget },
+        { idleMs: idleBudget, code: "muse_turn_idle_timeout" },
       );
       void cleanup();
       if (turn.sawOutput()) endWith(turn.finish("cancelled"));
-      else push("end");
+      else {
+        ended = true;
+        push({
+          error: new Error("muse turn idle timeout before producing output"),
+        });
+      }
     }
   }, 1_000);
 
@@ -1168,11 +1290,19 @@ export const runMuseNative = async (
     logError(
       "native-runtime",
       safeDiagnosticMessage`muse turn budget exceeded — cancelling`,
-      { turnTimeoutMs: params.turnTimeoutMs ?? MUSE_TURN_TIMEOUT_MS },
+      {
+        turnTimeoutMs: params.turnTimeoutMs ?? MUSE_TURN_TIMEOUT_MS,
+        code: "muse_turn_budget_exceeded",
+      },
     );
     void cleanup();
     if (turn.sawOutput()) endWith(turn.finish("cancelled"));
-    else push("end");
+    else {
+      ended = true;
+      push({
+        error: new Error("muse turn budget exceeded before producing output"),
+      });
+    }
   }, params.turnTimeoutMs ?? MUSE_TURN_TIMEOUT_MS);
 
   // Official SDK adapters wait for item/delta pumps AFTER turn.completed
@@ -1191,11 +1321,12 @@ export const runMuseNative = async (
         pumpDeltas.catch(() => {}),
       ]);
       if (ended) return;
-      // SDK TurnOutcome: success is only `kind: "completed"` with terminal
-      // completed|cancelled (or omitted). `unqueued` never ran; `terminalUnknown`
-      // is host-death/unknown; `terminal: "failed"` is a mid-turn failure on
-      // the completed arm. After partial output, none of those may look like
-      // a successful finish — error the stream. Before output, decline.
+      // Official SDK TurnOutcome (flattened): success is only `kind:
+      // "completed"` with terminal completed|cancelled (or omitted).
+      // `unqueued` never ran; `terminalUnknown` is host-death/unknown;
+      // `terminal: "failed"` (+ `error`) is a mid-turn / launch failure on
+      // the completed arm — never invent success. After partial output,
+      // error the stream. Before output, decline with the host reason.
       const terminal = outcome.terminal;
       const acknowledgedSuccess =
         outcome.kind === "completed" &&
@@ -1204,15 +1335,37 @@ export const runMuseNative = async (
           terminal === "cancelled" ||
           terminal === "tool_calls");
       if (!turn.sawOutput() && !acknowledgedSuccess) {
+        const reason = museTurnDeclineReason(outcome);
+        logWarn(
+          "native-runtime",
+          safeDiagnosticMessage`muse turn declined before output`,
+          {
+            code: "muse_turn_declined_before_output",
+            outcomeKind: outcome.kind,
+            ...(terminal !== undefined ? { terminal } : {}),
+            ...(outcome.error?.kind !== undefined
+              ? { errorKind: outcome.error.kind }
+              : {}),
+            ...(outcome.launchFailure === true ? { launchFailure: true } : {}),
+          },
+        );
+        // Host-authored authRequired means memory verification (if any) was
+        // false evidence — drop it so /providers cannot stay "connected".
+        if (outcome.error?.kind === "authRequired") {
+          clearMuseStatusObservationCache();
+        }
         ended = true;
-        push("end");
+        push({ error: new Error(reason) });
         void cleanup();
         return;
       }
       if (!acknowledgedSuccess) {
+        const parts: string[] = [outcome.kind];
+        if (terminal !== undefined) parts.push(terminal);
+        if (outcome.error?.kind !== undefined) parts.push(outcome.error.kind);
         failStream(
           new Error(
-            `muse turn ended without acknowledged success (${outcome.kind}${terminal !== undefined ? `/${terminal}` : ""})`,
+            `muse turn ended without acknowledged success (${parts.join("/")})`,
           ),
         );
         void cleanup();
@@ -1228,16 +1381,20 @@ export const runMuseNative = async (
       if (ended) return;
       const folded = session?.lastUsage();
       if (folded !== undefined) turn.observeUsage(folded);
+      const err = error instanceof Error ? error : new Error(String(error));
       logError(
         "native-runtime",
         safeDiagnosticMessage`muse turn failed after start`,
-        { error: error instanceof Error ? error.message : String(error) },
+        {
+          code: "muse_turn_failed_after_start",
+          error: err.message.slice(0, MUSE_TURN_ERROR_MESSAGE_MAX),
+        },
       );
       if (turn.sawOutput()) {
-        failStream(error instanceof Error ? error : new Error(String(error)));
+        failStream(err);
       } else {
         ended = true;
-        push("end");
+        push({ error: err });
       }
       void cleanup();
     }
