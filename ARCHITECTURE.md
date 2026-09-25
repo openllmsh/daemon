@@ -31,6 +31,26 @@ calls. Muse session token usage is not subscription allowance, and its gateway
 distribution authorization remains a separate launch requirement; see the
 [Muse implementation plan](../../docs/plan/2026-09-23-muse-subscription-native-runtime.md).
 
+Cursor chat completion follows the ACP `session/prompt` terminal response, or
+an intentional caller-MCP tool handoff. Prompt/transport failures and retained
+60s idle / 180s turn deadlines error the stream after partial output; they never
+manufacture successful `stop`. Cancellation waits for the outstanding prompt's
+response before disposal, with a 1-second teardown guard for an unresponsive
+child (not a generation cutoff). Explicit model-set rejection declines before
+submission; a matching `session/new.models.currentModelId` skips the redundant
+set, with exact matching for explicitly bracketed variants. Native stderr and
+raw RPC error bodies are not exposed in diagnostics. Closed phase offsets and
+RPC counts distinguish setup and MCP discovery from native completion. Cold
+sessions per caller-tool round remain intentional. When the canonical request
+ends in tool results, `cursorRequestOf` appends continuation framing so replayed
+history is not mistaken for a fresh request to repeat completed calls; it keeps
+additional tools available and leaves a subsequent user turn unchanged. Connected
+`cursor/grok-4.6` probes reproduced that repetition and validated the candidate
+prompt wording, including a needed-next-tool control. Full local-binary live
+latency and multi-round acceptance remain unverified. The separate image lifecycle
+has not been brought to chat parity. See the
+[Cursor follow-up](../../docs/todo/cursor-native-runtime-muse-parity.md).
+
 Muse selects the host's `onRequest` approval mode and verifies it alongside
 its exact model before submission. Controlled native 1.4.0 probes found that
 `denyUnmatched` delayed authoritative turn completion by roughly a minute;

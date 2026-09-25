@@ -149,10 +149,20 @@ export const cursorRequestOf = (
   // Single user turn feeds the bare text (no "User:" framing); anything else
   // renders the transcript (mirrors session-store's renderSeed). Keyed off the
   // message structure so a user's own "User: " prefix survives verbatim.
-  const promptText =
+  let promptText =
     nonSystemTurns === 1 && loneUserText !== null && lines.length === 1
       ? loneUserText
       : lines.join("\n\n");
+  // ACP starts cold after a caller-tool handoff. Mark the resumption boundary
+  // rather than presenting the original request as fresh work a second time.
+  // Do not apply this to historical tool results followed by a new user turn.
+  if (
+    canonical.messages.findLast((message) => message.role !== "system")
+      ?.role === "tool"
+  ) {
+    promptText +=
+      "\n\nContinue from the returned tool results above. They are completed responses from the caller, not requests to execute those same calls again. Do not restart the original request merely because its history was replayed. Additional tool calls remain available when needed for the next step.";
+  }
 
   const tools: TCursorTool[] = (canonical.tools ?? []).map((tool) => ({
     name: tool.function.name,

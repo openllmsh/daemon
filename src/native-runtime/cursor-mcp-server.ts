@@ -56,6 +56,10 @@ const rpcError = (
 export const startCursorMcpServer = (params: {
   readonly tools: ReadonlyArray<TCursorTool>;
   readonly onToolCall: (name: string, args: unknown) => void;
+  /** Closed method vocabulary only — never arguments or bearer metadata. */
+  readonly onRequest?: (
+    method: "initialize" | "tools/list" | "tools/call",
+  ) => void;
 }): TCursorMcpServer => {
   const token = randomUUID();
   const server = Bun.serve({
@@ -80,6 +84,13 @@ export const startCursorMcpServer = (params: {
         typeof body.id === "number" || typeof body.id === "string"
           ? body.id
           : null;
+      if (
+        body.method === "initialize" ||
+        body.method === "tools/list" ||
+        body.method === "tools/call"
+      ) {
+        params.onRequest?.(body.method);
+      }
       switch (body.method) {
         case "initialize":
           return rpcResult(id, {

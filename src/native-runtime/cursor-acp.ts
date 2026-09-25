@@ -16,8 +16,8 @@
  *                           (mcpServers carries the per-request loopback HTTP
  *                           MCP server exposing CLIENT tools — see
  *                           cursor-mcp-server.ts)
- *   session/set_model     → { sessionId, modelId } (best-effort; failure is
- *                           non-fatal — the session runs on Cursor's default)
+ *   session/set_model     → { sessionId, modelId } (explicit pin; rejection
+ *                           declines before submission, never auto routing)
  *   session/prompt        → { sessionId, prompt: [{ type: "text", text },
  *                           { type: "image", data, mimeType }...] };
  *                           resolves with { stopReason } when the turn ENDS
@@ -54,7 +54,7 @@ import { join } from "node:path";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { spawnCwd } from "../delegation/util";
-import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
+import { logInfo, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
@@ -120,8 +120,6 @@ const isExplicitAuthenticateRejection = (error: unknown): boolean =>
   error.kind === "rpc" &&
   AUTHENTICATE_REJECTION_RE.test(error.message);
 
-/** Cap on the retained stderr tail (bytes) used for failure diagnostics. */
-const STDERR_TAIL_MAX = 4_096;
 /** Hard per-turn budget — the prompt is abandoned (child killed) past this. */
 export const CURSOR_TURN_TIMEOUT_MS = 180_000;
 /** Idle-chunk budget — no session/update within this window kills the turn. */
@@ -339,10 +337,8 @@ class AcpClient {
   private readonly proc: ReturnType<typeof Bun.spawn>;
   private readonly stdin: { write: (s: string) => void; flush?: () => void };
   private disposed = false;
-  /** Bounded tail of the child's stderr — surfaced on a handshake/startup
-   *  failure so a decline isn't a silent black box. Capped so a chatty child
-   *  can't grow it unbounded. */
-  private stderrTail = "";
+  private cancelTimer: ReturnType<typeof setTimeout> | undefined;
+  readonly rpcCounts: Record<string, number> = {};
 
   constructor(
     bin: string,
@@ -363,7 +359,8 @@ class AcpClient {
       {
         stdin: "pipe",
         stdout: "pipe",
-        stderr: "pipe",
+        // Native stderr is not a safe diagnostic channel (may contain secrets).
+        stderr: "ignore",
         cwd: spawnCwd(env),
         env: cleanNativeSpawnEnv(env),
       },
@@ -372,17 +369,14 @@ class AcpClient {
       write: (s: string) => void;
       flush?: () => void;
     };
-    void this.pump(this.proc.stdout as ReadableStream<Uint8Array>).catch(() => {
-      // reader ends on child exit; dispose() handles state
+    void this.pump(this.proc.stdout as ReadableStream<Uint8Array>).then(
+      () => this.failAllPending("cursor-agent acp stdout closed"),
+      () => this.failAllPending("cursor-agent acp stdout failed"),
+    );
+    void this.proc.exited.then(() => {
+      clearTimeout(this.cancelTimer);
+      this.failAllPending("cursor-agent acp exited");
     });
-    void this.drainStderr(this.proc.stderr as ReadableStream<Uint8Array>).catch(
-      () => {
-        // reader ends on child exit
-      },
-    );
-    void this.proc.exited.then(() =>
-      this.failAllPending("cursor-agent acp exited"),
-    );
   }
 
   request(
@@ -390,6 +384,7 @@ class AcpClient {
     params: unknown,
     timeoutMs: number = RPC_TIMEOUT_MS,
   ): Promise<unknown> {
+    this.rpcCounts[method] = (this.rpcCounts[method] ?? 0) + 1;
     const id = this.nextId++;
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -438,9 +433,18 @@ class AcpClient {
     }
   }
 
+  /** Give the native prompt its cancellation response before killing it.
+   * The guard bounds teardown only, never successful turn completion. */
+  cancelAndDispose(sessionId: string): void {
+    if (this.disposed || this.cancelTimer !== undefined) return;
+    this.notify("session/cancel", { sessionId });
+    this.cancelTimer = setTimeout(() => this.dispose(), 1_000);
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    clearTimeout(this.cancelTimer);
     this.failAllPending("cursor-agent acp disposed");
     try {
       this.proc.kill("SIGTERM");
@@ -460,23 +464,6 @@ class AcpClient {
       );
     }
     this.pending.clear();
-  }
-
-  /** The most recent stderr output (bounded), for failure diagnostics. */
-  stderr(): string {
-    return this.stderrTail.trim();
-  }
-
-  private async drainStderr(stderr: ReadableStream<Uint8Array>): Promise<void> {
-    const decoder = new TextDecoder();
-    const reader = stderr.getReader();
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      this.stderrTail = (
-        this.stderrTail + decoder.decode(value, { stream: true })
-      ).slice(-STDERR_TAIL_MAX);
-    }
   }
 
   private send(message: Record<string, unknown>): void {
@@ -509,6 +496,9 @@ class AcpClient {
       const entry = this.pending.get(message.id);
       if (entry === undefined) return;
       this.pending.delete(message.id);
+      if (this.cancelTimer !== undefined && entry.method === "session/prompt") {
+        this.dispose();
+      }
       if (message.error !== undefined) {
         entry.reject(
           new AcpRpcError({
@@ -578,6 +568,23 @@ const handshake = async (
   await client.request("authenticate", { methodId: "cursor_login" }, timeoutMs);
 };
 
+/** Native error bodies and stderr may include prompts, paths or credentials. */
+const acpFailureMessage = (error: unknown): string => {
+  if (isExplicitAuthenticateRejection(error)) {
+    return "cursor ACP authenticate rejected the stored login";
+  }
+  if (error instanceof AcpRpcError) {
+    return `cursor ACP ${error.method} ${
+      error.kind === "timeout"
+        ? "timed out"
+        : error.kind === "transport"
+          ? "transport failed"
+          : "request rejected"
+    }`;
+  }
+  return "cursor ACP setup failed";
+};
+
 const setupDecline = (
   error: unknown,
   signal: AbortSignal,
@@ -585,10 +592,9 @@ const setupDecline = (
   if (signal.aborted) {
     return { kind: "declined", reason: "client aborted" };
   }
-  const message = error instanceof Error ? error.message : String(error);
   return {
     kind: "declined",
-    reason: `cursor ACP handshake failed: ${message}`,
+    reason: acpFailureMessage(error),
     ...(isExplicitAuthenticateRejection(error)
       ? { cooldownReason: "auth" as const }
       : {}),
@@ -646,53 +652,41 @@ export const handleCursorServerRequest = (
   return null;
 };
 
-/**
- * Best-effort model pin. `session/new` reports the selectable
- * `models.availableModels` as `modelId` strings that carry bracketed config
- * (`"claude-opus-5[thinking=true,...]"`); the provider model id is the BARE
- * value, so match on the bracket-stripped base. "auto"/"default" (or no
- * match) keeps the session on Cursor's router default. Failure is NON-FATAL:
- * the turn still runs, just on auto routing — logged so misroutes are
- * diagnosable.
- */
-const trySetModel = async (
+/** Read-first model pin. Bare catalog ids accept Cursor's advertised variant;
+ * explicitly bracketed selections must match exactly. A rejected pin never
+ * submits a prompt on auto. ACP set_model acknowledges application with `{}`;
+ * unlike Muse it has no model-read RPC to call afterwards. */
+const ensureCursorModel = async (
   client: AcpClient,
   sessionId: string,
   providerModelId: string,
   sessionResult: unknown,
+  timeoutMs: number,
 ): Promise<void> => {
-  const base = providerModelId.split("[")[0]?.trim() ?? "";
-  if (base.length === 0 || base === "auto" || base === "default") return;
+  const requested = providerModelId.trim();
+  if (requested === "auto" || requested === "default") return;
+  const matches = (value: unknown): value is string =>
+    typeof value === "string" &&
+    (requested.includes("[")
+      ? value === requested
+      : value.split("[")[0] === requested);
   const models = (
     sessionResult as {
       readonly models?: {
+        readonly currentModelId?: unknown;
         readonly availableModels?: ReadonlyArray<{
           readonly modelId?: unknown;
         }>;
       };
-    }
-  ).models?.availableModels;
-  const match = Array.isArray(models)
-    ? models.find(
-        (m) =>
-          typeof m.modelId === "string" && m.modelId.split("[")[0] === base,
-      )
-    : undefined;
+    } | null
+  )?.models;
+  if (requested.length > 0 && matches(models?.currentModelId)) return;
+  const match = models?.availableModels?.find((model) =>
+    matches(model.modelId),
+  );
   const modelId =
-    typeof match?.modelId === "string" ? match.modelId : providerModelId;
-  try {
-    await client.request("session/set_model", { sessionId, modelId });
-  } catch (error) {
-    logWarn(
-      "native-runtime",
-      safeDiagnosticMessage`cursor session/set_model failed — auto routing`,
-      {
-        providerModelId,
-        modelId,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    );
-  }
+    typeof match?.modelId === "string" ? match.modelId : requested;
+  await client.request("session/set_model", { sessionId, modelId }, timeoutMs);
 };
 
 export type TCursorNativeParams = {
@@ -724,7 +718,7 @@ export type TCursorNativeParams = {
 };
 
 /**
- * Run one COLD ACP turn: spawn → handshake → session/new → best-effort model
+ * Run one COLD ACP turn: spawn → handshake → session/new → exact model
  * pin → session/prompt, streaming `session/update` chunks until the prompt
  * response (stopReason) ends the turn. Commit-on-first-output; every
  * pre-commit failure declines (the walker advances the plan — cursor has no
@@ -742,10 +736,19 @@ export const runCursorNative = async (
     return { kind: "declined", reason: "cursor-agent CLI not installed" };
   }
 
-  // Event plumbing: notifications feed a queue the ReadableStream drains.
-  const queue: Array<TChatCompletionChunk | "end"> = [];
+  if (params.signal.aborted) {
+    return { kind: "declined", reason: "client aborted" };
+  }
+  const startedAt = performance.now();
+  const phases: Record<string, number> = {};
+  const mark = (phase: string): void => {
+    phases[phase] ??=
+      Math.round((performance.now() - startedAt) * 1_000) / 1_000;
+  };
+  type TQueueItem = TChatCompletionChunk | "end" | { readonly error: Error };
+  const queue: TQueueItem[] = [];
   let wake: (() => void) | null = null;
-  const push = (item: TChatCompletionChunk | "end"): void => {
+  const push = (item: TQueueItem): void => {
     queue.push(item);
     wake?.();
     wake = null;
@@ -766,15 +769,26 @@ export const runCursorNative = async (
 
   let sessionId: string | null = null;
   let ended = false;
+  let cleaned = false;
+  let idleTimer: ReturnType<typeof setInterval> | undefined;
   let lastActivityAt = Date.now();
-  const endWith = (chunks: ReadonlyArray<TChatCompletionChunk>): void => {
+  const endWith = (
+    chunks: ReadonlyArray<TChatCompletionChunk>,
+    outcome: "completed" | "tool_handoff",
+  ): void => {
     if (ended) return;
     ended = true;
     for (const chunk of chunks) push(chunk);
     push("end");
+    report(outcome);
+    cleanup(outcome === "tool_handoff");
   };
-  const endTurn = (stopReason: string | null): void => {
-    endWith(turn.finish(stopReason));
+  const failStream = (error: Error): void => {
+    if (ended) return;
+    ended = true;
+    push({ error });
+    report(error.name === "AbortError" ? "aborted" : "failed");
+    cleanup(true);
   };
 
   // Client tools ride an ephemeral loopback MCP server. The FIRST agent
@@ -792,73 +806,94 @@ export const runCursorNative = async (
   // it before initialization (a tools/call can only arrive after session/new,
   // which needs `client` — but declaring it first makes that ordering explicit
   // rather than relying on it).
-  const client = new AcpClient(
-    params.bin,
-    params.env,
-    (method, p) => {
-      if (method !== "session/update") return;
-      const notif = p as
-        | { readonly sessionId?: unknown; readonly update?: unknown }
-        | undefined;
-      if (sessionId === null || notif?.sessionId !== sessionId) return;
-      lastActivityAt = Date.now();
-      const chunk = turn.handleUpdate(notif.update);
-      if (chunk !== null && !ended) push(chunk);
-    },
-    handleCursorServerRequest,
-  );
-
-  if ((params.tools?.length ?? 0) > 0) {
-    mcp = startCursorMcpServer({
-      tools: params.tools ?? [],
-      onToolCall: (name, args) => {
-        if (ended) return;
+  let client: AcpClient;
+  try {
+    mark("spawn_started_ms");
+    client = new AcpClient(
+      params.bin,
+      params.env,
+      (method, p) => {
+        if (method !== "session/update" || ended) return;
+        const notif = p as
+          | { readonly sessionId?: unknown; readonly update?: unknown }
+          | undefined;
+        if (sessionId === null || notif?.sessionId !== sessionId) return;
         lastActivityAt = Date.now();
-        endWith(turn.emitToolCall(name, args));
-        if (sessionId !== null) client.notify("session/cancel", { sessionId });
+        const chunk = turn.handleUpdate(notif.update);
+        if (turn.sawOutput()) mark("first_output_ms");
+        if (chunk !== null) push(chunk);
       },
-    });
+      handleCursorServerRequest,
+    );
+  } catch (error) {
+    return setupDecline(error, params.signal);
   }
 
-  const cancelAndDispose = (): void => {
-    if (sessionId !== null) client.notify("session/cancel", { sessionId });
-    client.dispose();
+  const report = (
+    outcome: "completed" | "tool_handoff" | "failed" | "aborted",
+  ): void => {
+    mark("terminal_ms");
+    logInfo(
+      "native-runtime",
+      safeDiagnosticMessage`cursor native turn phase timings`,
+      {
+        provider: "cursor",
+        clock: "performance.now",
+        outcome,
+        // All marks are offsets from request entry, not separate durations.
+        ...phases,
+        rpc_counts: { ...client.rpcCounts },
+      },
+    );
+  };
+  const cleanup = (cancel: boolean): void => {
+    if (cleaned) return;
+    cleaned = true;
+    clearInterval(idleTimer);
+    params.signal.removeEventListener("abort", abort);
+    if (cancel && sessionId !== null) client.cancelAndDispose(sessionId);
+    else client.dispose();
     stopMcp();
   };
-
   const abort = (): void => {
-    cancelAndDispose();
-    if (!ended) {
-      ended = true;
-      push("end");
-    }
+    failStream(new DOMException("client aborted", "AbortError"));
   };
+  params.signal.addEventListener("abort", abort, { once: true });
   if (params.signal.aborted) {
-    client.dispose();
-    stopMcp();
+    abort();
     return { kind: "declined", reason: "client aborted" };
   }
-  params.signal.addEventListener("abort", abort, { once: true });
 
   // ── Handshake + session ────────────────────────────────────────────
   const rpcTimeoutMs = params.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
   const failSetup = (error: unknown): TNativeRunResult => {
-    const stderrTail = client.stderr();
-    client.dispose();
-    stopMcp();
-    if (stderrTail.length > 0) {
-      logError(
-        "native-runtime",
-        safeDiagnosticMessage`cursor ACP handshake failed`,
-        {
-          stderrTail: stderrTail.slice(-400),
-        },
-      );
+    if (!ended) {
+      ended = true;
+      report(params.signal.aborted ? "aborted" : "failed");
     }
+    cleanup(false);
     return setupDecline(error, params.signal);
   };
   try {
-    await handshake(client, rpcTimeoutMs);
+    if ((params.tools?.length ?? 0) > 0) {
+      mcp = startCursorMcpServer({
+        tools: params.tools ?? [],
+        onRequest: (method) => mark(`mcp_${method.replaceAll("/", "_")}_ms`),
+        onToolCall: (name, args) => {
+          if (ended) return;
+          mark("first_output_ms");
+          endWith(turn.emitToolCall(name, args), "tool_handoff");
+        },
+      });
+    }
+    await client.request("initialize", INIT_PARAMS, rpcTimeoutMs);
+    mark("initialized_ms");
+    await client.request(
+      "authenticate",
+      { methodId: "cursor_login" },
+      rpcTimeoutMs,
+    );
+    mark("authenticated_ms");
   } catch (error) {
     return failSetup(error);
   }
@@ -893,13 +928,18 @@ export const runCursorNative = async (
   } catch (error) {
     return failSetup(error);
   }
-  const sid = (opened as { readonly sessionId?: unknown }).sessionId;
+  const sid = (opened as { readonly sessionId?: unknown } | null)?.sessionId;
   if (typeof sid !== "string" || sid.length === 0) {
-    client.dispose();
-    stopMcp();
-    return { kind: "declined", reason: "session/new returned no sessionId" };
+    return failSetup(
+      new AcpRpcError({
+        method: "session/new",
+        kind: "rpc",
+        message: "missing sessionId",
+      }),
+    );
   }
   sessionId = sid;
+  mark("session_ready_ms");
   if (observationTicket !== null) {
     observeCursorNativeModelsFromSession({
       ticket: observationTicket,
@@ -907,9 +947,26 @@ export const runCursorNative = async (
       sessionResult: opened,
     });
   }
-  await trySetModel(client, sid, params.providerModelId, opened);
+  try {
+    if (params.signal.aborted)
+      throw new DOMException("client aborted", "AbortError");
+    await ensureCursorModel(
+      client,
+      sid,
+      params.providerModelId,
+      opened,
+      rpcTimeoutMs,
+    );
+    if (params.signal.aborted)
+      throw new DOMException("client aborted", "AbortError");
+  } catch (error) {
+    return failSetup(error);
+  }
 
+  mark("model_ready_ms");
   // ── The prompt turn ────────────────────────────────────────────────
+  lastActivityAt = Date.now();
+  mark("prompt_submitted_ms");
   const turnBudget = params.turnTimeoutMs ?? CURSOR_TURN_TIMEOUT_MS;
   const promptDone = client
     .request(
@@ -921,50 +978,42 @@ export const runCursorNative = async (
       turnBudget,
     )
     .then((result) => {
-      const stop = (result as { readonly stopReason?: unknown }).stopReason;
-      endTurn(typeof stop === "string" ? stop : null);
+      if (ended) return;
+      mark("native_terminal_ms");
+      const stop = (result as { readonly stopReason?: unknown } | null)
+        ?.stopReason;
+      if (stop === "cancelled") {
+        failStream(new Error("cursor native turn cancelled"));
+      } else if (
+        stop !== "end_turn" &&
+        stop !== "max_tokens" &&
+        stop !== "max_turn_requests" &&
+        stop !== "refusal"
+      ) {
+        failStream(
+          new Error("cursor native turn returned an invalid terminal"),
+        );
+      } else if (!turn.sawOutput() || (jsonMode && turn.contentChars() === 0)) {
+        failStream(new Error("cursor turn ended before producing output"));
+      } else {
+        endWith(turn.finish(stop), "completed");
+      }
     })
     .catch((error: unknown) => {
-      if (!turn.sawOutput()) {
-        // Pre-commit failure — surfaced by the pre-commit race below.
-        push("end");
-        return;
-      }
-      logError(
-        "native-runtime",
-        safeDiagnosticMessage`cursor prompt failed after output began`,
-        {
-          error: error instanceof Error ? error.message : String(error),
-        },
-      );
-      endTurn(null);
+      failStream(new Error(acpFailureMessage(error)));
     });
   void promptDone;
 
   // Idle-chunk watchdog: no session/update (or terminal) within the idle
   // budget kills the turn. The hard turn budget rides the RPC timeout above.
   const idleBudget = params.idleMs ?? CURSOR_IDLE_TIMEOUT_MS;
-  const idleTimer = setInterval(() => {
-    if (ended) {
-      clearInterval(idleTimer);
-      return;
-    }
+  idleTimer = setInterval(() => {
     if (Date.now() - lastActivityAt > idleBudget) {
-      clearInterval(idleTimer);
-      logError(
-        "native-runtime",
-        safeDiagnosticMessage`cursor turn idle timeout — killing child`,
-        {
-          idleMs: idleBudget,
-        },
-      );
-      cancelAndDispose();
-      if (turn.sawOutput()) endTurn(null);
-      else push("end");
+      failStream(new Error("cursor native turn idle timeout"));
     }
   }, 1_000);
 
-  const nextItem = async (): Promise<TChatCompletionChunk | "end"> => {
+  const nextItem = async (): Promise<TQueueItem> => {
     for (;;) {
       const item = queue.shift();
       if (item !== undefined) return item;
@@ -979,11 +1028,12 @@ export const runCursorNative = async (
   // so a deadline hit with output ALREADY OBSERVED (`sawOutput`) keeps
   // waiting — the model is generating, the wire is just deliberately quiet;
   // the idle watchdog + turn budget still bound the wait.
-  let first: TChatCompletionChunk | "end" | "timeout";
+  let first: TQueueItem | "timeout";
+  const pendingFirst = nextItem();
   for (;;) {
     let precommitTimer: ReturnType<typeof setTimeout> | undefined;
     first = await Promise.race([
-      nextItem(),
+      pendingFirst,
       new Promise<"timeout">((resolve) => {
         precommitTimer = setTimeout(
           () => resolve("timeout"),
@@ -995,19 +1045,24 @@ export const runCursorNative = async (
     if (first === "timeout" && turn.sawOutput()) continue;
     break;
   }
-  if (first === "timeout" || first === "end") {
-    clearInterval(idleTimer);
-    cancelAndDispose();
-    const reason =
-      first === "timeout"
-        ? "cursor ACP produced no output before the pre-commit deadline"
-        : "cursor turn ended before producing output";
-    logError(
-      "native-runtime",
-      safeDiagnosticMessage`cursor hop declined pre-commit`,
-      { reason },
+  if (first === "timeout") {
+    failStream(
+      new Error("cursor ACP produced no output before the pre-commit deadline"),
     );
-    return { kind: "declined", reason };
+    return {
+      kind: "declined",
+      reason: "cursor ACP produced no output before the pre-commit deadline",
+    };
+  }
+  if (first === "end" || "error" in first) {
+    cleanup(true);
+    return {
+      kind: "declined",
+      reason:
+        first === "end"
+          ? "cursor turn ended before producing output"
+          : first.error.message,
+    };
   }
 
   const chunks = new ReadableStream<TChatCompletionChunk>({
@@ -1018,15 +1073,13 @@ export const runCursorNative = async (
       const next = await nextItem();
       if (next === "end") {
         controller.close();
-        clearInterval(idleTimer);
-        client.dispose();
-        stopMcp();
-        return;
+      } else if ("error" in next) {
+        controller.error(next.error);
+      } else {
+        controller.enqueue(next);
       }
-      controller.enqueue(next);
     },
     cancel() {
-      clearInterval(idleTimer);
       abort();
     },
   });
@@ -1259,6 +1312,7 @@ export const runCursorNativeImage = async (
 
   const rpcTimeoutMs = params.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
   const cleanupWorkspace = async (): Promise<void> => {
+    params.signal.removeEventListener("abort", abort);
     try {
       await rm(workspaceDir, { recursive: true, force: true });
     } catch {
@@ -1279,10 +1333,9 @@ export const runCursorNativeImage = async (
     if (params.signal.aborted) {
       return { kind: "declined", reason: "client aborted" };
     }
-    const message = error instanceof Error ? error.message : String(error);
     return {
       kind: "declined",
-      reason: `cursor ACP handshake failed: ${message}`,
+      reason: acpFailureMessage(error),
       ...(isExplicitAuthenticateRejection(error)
         ? { cooldownReason: "auth" as const }
         : {}),
@@ -1315,7 +1368,21 @@ export const runCursorNativeImage = async (
     return { kind: "declined", reason: "session/new returned no sessionId" };
   }
   sessionId = sid;
-  await trySetModel(client, sid, params.providerModelId, opened);
+  try {
+    if (params.signal.aborted)
+      throw new DOMException("client aborted", "AbortError");
+    await ensureCursorModel(
+      client,
+      sid,
+      params.providerModelId,
+      opened,
+      rpcTimeoutMs,
+    );
+    if (params.signal.aborted)
+      throw new DOMException("client aborted", "AbortError");
+  } catch (error) {
+    return failSetup(error);
+  }
 
   const turnBudget = params.turnTimeoutMs ?? CURSOR_TURN_TIMEOUT_MS;
   const idleBudget = params.idleMs ?? CURSOR_IDLE_TIMEOUT_MS;
