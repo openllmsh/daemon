@@ -56,6 +56,7 @@ import {
   museNativeModelFingerprint,
   museNativeModelGeneration,
   noteMuseAuthenticatedSession,
+  readMuseNativeModels,
   rememberMuseNativeModels,
 } from "../delegation/muse";
 import { spawnCwd } from "../delegation/util";
@@ -943,11 +944,27 @@ const rememberObservedMuseModels = (
   return models;
 };
 
-/** Feed the auth-owned passive cache from a live MSP model/list snapshot. */
+/**
+ * Feed the auth-owned passive cache from a live MSP model/list snapshot.
+ * Skips `session.listModels` when the existing fingerprint+generation-scoped
+ * cache from {@link readMuseNativeModels} is still valid (TTL + auth
+ * invalidation already enforced there). Never invents a second cache or
+ * performs background auth work.
+ */
 export const rememberMuseModelsFromSession = async (
   session: TMuseSession,
   generation: number,
 ): Promise<ReadonlyArray<TProviderModelEntry>> => {
+  const fingerprint = museNativeModelFingerprint();
+  if (fingerprint !== null) {
+    const cached = readMuseNativeModels({
+      fingerprint,
+      accountHint: null,
+    });
+    // Generation + TTL + live fingerprint are enforced inside
+    // readMuseNativeModels; a hit means no session.model/list spawn.
+    if (cached !== null && cached.length > 0) return cached;
+  }
   let models: ReadonlyArray<TProviderModelEntry> = [];
   try {
     models = await session.listModels();
