@@ -36,8 +36,9 @@ its exact model before submission. Controlled native 1.4.0 probes found that
 `denyUnmatched` delayed authoritative turn completion by roughly a minute;
 `onRequest` completed the same simple requests in seconds. The runtime still
 waits for SDK `turn.completed`, drains its item/delta streams, and then closes
-the proxy stream. Output silence is not a terminal signal; client cancellation,
-precommit and absolute turn deadlines remain bounded failure paths.
+the proxy stream. Output silence is not a terminal signal; client/stream
+cancellation, setup-RPC timeouts, and the shared pre-commit first-output
+budget remain the bounded failure paths (no absolute post-submit turn cutoff).
 
 **Muse read containment remains a release limitation.** Both tested modes
 allowed an absolute read of a synthetic file in the disposable overlay HOME

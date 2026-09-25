@@ -24,7 +24,9 @@
  *   - auth overlay HOME is a SIBLING of `workspaceRoot`, not inside it, so
  *     workspace-scoped reads cannot reach the auth symlink by relative path
  *   - daemon `--sandbox-exec` wrap of the SDK-owned `muse serve` child
- *   - exact model+policy confirmation before any turn; absolute turn deadline
+ *   - exact model+policy confirmation before any turn; setup RPC + pre-commit
+ *     first-output budgets only (no absolute post-submit turn cutoff —
+ *     Claude/Codex native contract; Cursor keeps its own turn/idle budgets)
  *
  * Residual (explicit, not claimed fixed): MSP cannot install a "web_search
  * only" rule. Live OS-sandboxed probes (same 1.2 / Meta synthetic-2 marker)
@@ -94,7 +96,6 @@ export const MUSE_SERVE_SAFETY_ARGS = [
   "--disable-shell",
 ] as const;
 
-export const MUSE_TURN_TIMEOUT_MS = 180_000;
 export const MUSE_RPC_TIMEOUT_MS = 30_000;
 
 /**
@@ -747,7 +748,6 @@ export type TMuseNativeParams = {
   readonly tools?: ReadonlyArray<TMuseCallerTool>;
   readonly signal: AbortSignal;
   readonly precommitMs?: number;
-  readonly turnTimeoutMs?: number;
   readonly rpcTimeoutMs?: number;
   readonly hostFactory?: TMuseHostFactory;
   readonly cwd?: string;
@@ -1255,7 +1255,10 @@ export const listMuseModelsDemand = async (
 /**
  * Run one cold Muse turn through the official SDK surface. Commit-on-first
  * output; every pre-commit failure declines. The child / host is closed on
- * completion, abort, and both timeouts.
+ * completion, abort, setup-RPC timeout, and pre-commit silence. After the
+ * first committed output there is no absolute wall-clock turn cutoff —
+ * EOF waits on authoritative `turn.completed` + item/delta drain (or
+ * client/stream cancel / caller-tool handoff).
  */
 export const runMuseNative = async (
   params: TMuseNativeParams,
@@ -1317,9 +1320,6 @@ export const runMuseNative = async (
   const failStream = (error: Error): void => {
     if (ended) return;
     ended = true;
-    // Clear host-facing timers here too — callers still run cleanup for the
-    // child/host, but a delayed cleanup must not leave the turn budget firing.
-    clearTimeout(turnTimer);
     push({ error });
   };
 
@@ -1328,7 +1328,6 @@ export const runMuseNative = async (
   let activeTurn: TMuseTurn | null = null;
   let mcp: TMuseMcpServer | null = null;
   let overlay: TMuseOverlay | null = null;
-  let turnTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stopMcp = (): void => {
     mcp?.stop();
@@ -1336,7 +1335,6 @@ export const runMuseNative = async (
   };
 
   const cleanup = async (): Promise<void> => {
-    clearTimeout(turnTimer);
     params.signal.removeEventListener("abort", abort);
     if (activeTurn !== null) {
       await activeTurn.cancel().catch(() => {});
@@ -1526,35 +1524,12 @@ export const runMuseNative = async (
     });
   });
 
-  turnTimer = setTimeout(() => {
-    if (ended) return;
-    logError(
-      "native-runtime",
-      safeDiagnosticMessage`muse turn budget exceeded — cancelling`,
-      {
-        turnTimeoutMs: params.turnTimeoutMs ?? MUSE_TURN_TIMEOUT_MS,
-        code: "muse_turn_budget_exceeded",
-      },
-    );
-    void cleanup();
-    // Absolute turn budget is a timeout failure — never map our own cancel
-    // into finish_reason=stop success via turn.finish("cancelled"). Client
-    // abort still uses that path; the overall deadline does not.
-    if (turn.sawOutput()) {
-      noteFirstOutputSuccess();
-      failStream(new Error("muse turn budget exceeded"));
-    } else {
-      emitMusePhaseTimings(phaseMarks, "timeout");
-      ended = true;
-      push({
-        error: new Error("muse turn budget exceeded before producing output"),
-      });
-    }
-  }, params.turnTimeoutMs ?? MUSE_TURN_TIMEOUT_MS);
-
   // Official SDK adapters wait for item/delta pumps AFTER turn.completed
   // (held items can still be in the iterator). Finishing on completed alone
   // drops that tail and can emit an empty terminal as the first chunk.
+  // There is deliberately no absolute post-submit turn setTimeout here —
+  // Claude/Codex native contract: after first output, wait for authoritative
+  // completed (or client/stream cancel / caller-tool handoff).
   void (async () => {
     try {
       const outcome = await activeTurn.completed;
