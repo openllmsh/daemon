@@ -1643,11 +1643,15 @@ export const runMuseNative = async (
     }
   };
 
+  // One pending nextItem across pre-commit retries. Calling nextItem() again
+  // after a timeout&&sawOutput continue can orphan a read that already claimed
+  // the first chunk (Promise.race surfaced timeout while the item arm settled).
   let first: TQueueItem | "timeout";
+  const pendingFirst = nextItem();
   for (;;) {
     let precommitTimer: ReturnType<typeof setTimeout> | undefined;
     first = await Promise.race([
-      nextItem(),
+      pendingFirst,
       new Promise<"timeout">((resolve) => {
         precommitTimer = setTimeout(
           () => resolve("timeout"),
