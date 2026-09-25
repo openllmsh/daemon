@@ -16,18 +16,25 @@
  *
  * Safety floor (what we can enforce without inventing host rules):
  *   - `--disable-write` + `--disable-shell` (spawn argv)
- *   - `denyUnmatched` approval mode (host policy select-never-create; no
+ *   - `onRequest` approval mode (host policy select-never-create; no
  *     client-authored allowlist exists on MSP)
  *   - `onApproval` allows ONLY exact host-native `web_search` once when the
- *     host asks; it does NOT see known-safe auto-exec under `onRequest`
- *     (official probe: known-safe `pwd` runs without asking)
+ *     host asks; known-safe auto-exec under `onRequest` still bypasses the
+ *     callback (official probe: known-safe `pwd` runs without asking)
  *   - auth overlay HOME is a SIBLING of `workspaceRoot`, not inside it, so
  *     workspace-scoped reads cannot reach the auth symlink by relative path
+ *   - daemon `--sandbox-exec` wrap of the SDK-owned `muse serve` child
+ *   - exact model+policy confirmation before any turn; absolute turn deadline
  *
- * Residual host-policy blocker (documented, not claimed fixed): MSP cannot
- * install a "web_search only" rule; known-safe absolute-path reads of HOME
- * under `denyUnmatched` are unverified without a live Muse host. Do not
- * equate callback denial with "all other native tools are denied".
+ * Residual (explicit, not claimed fixed): MSP cannot install a "web_search
+ * only" rule. Live OS-sandboxed probes (same 1.2 / Meta synthetic-2 marker)
+ * showed `onRequest` completing in ~10s vs `denyUnmatched` ~71s, and BOTH
+ * modes read synthetic HOME outside the workspace with ZERO `onApproval`
+ * callbacks — so `denyUnmatched` caused pathological delayed completion
+ * without providing the claimed absolute-read protection. Do not equate
+ * callback denial or mode selection with "all other native tools are denied".
+ * This candidate is for local testing; it is not a proven full containment
+ * solution.
  *
  * Completed provider-executed searches ride `server_search_calls`; they are
  * never re-emitted as caller `tool_calls`. Exact model+policy confirmation is
@@ -88,19 +95,20 @@ export const MUSE_SERVE_SAFETY_ARGS = [
 ] as const;
 
 export const MUSE_TURN_TIMEOUT_MS = 180_000;
-export const MUSE_IDLE_TIMEOUT_MS = 60_000;
 export const MUSE_RPC_TIMEOUT_MS = 30_000;
 
 /**
- * Fail-closed host approval mode (official `ApprovalMode`).
+ * Selected host approval mode (official closed `ApprovalMode` enum).
  *
- * `denyUnmatched` is the closed enum's default-deny selection. The callback
- * still approves exact host-native `web_search` once when the host asks.
- * This is NOT equivalent to a custom allowlist — MSP forbids client-authored
- * rules (select-never-create). Prefer this over `onRequest`, which official
- * probes show auto-runs known-safe tools without `onApproval`.
+ * `onRequest` is the product candidate after live probes showed
+ * `denyUnmatched` delaying completion without blocking known-safe absolute
+ * HOME reads (both modes: zero callbacks). The callback still approves only
+ * exact host-native `web_search` once when the host asks. This is NOT a
+ * custom allowlist — MSP forbids client-authored rules (select-never-create)
+ * — and known-safe tools still auto-run without `onApproval`. Exact session
+ * verification fails closed on any other reported mode.
  */
-export const MUSE_APPROVAL_MODE = "denyUnmatched" as const;
+export const MUSE_APPROVAL_MODE = "onRequest" as const;
 
 /**
  * MSP treats absent userInputDialogs as capable. This headless client cannot
@@ -739,7 +747,6 @@ export type TMuseNativeParams = {
   readonly tools?: ReadonlyArray<TMuseCallerTool>;
   readonly signal: AbortSignal;
   readonly precommitMs?: number;
-  readonly idleMs?: number;
   readonly turnTimeoutMs?: number;
   readonly rpcTimeoutMs?: number;
   readonly hostFactory?: TMuseHostFactory;
@@ -847,7 +854,7 @@ export const openMuseHostWithTimeout = async (
 
 const assertMuseSessionPolicy = (observed: TMuseSessionRead): void => {
   // Fail closed when the host reports an approval mode that is not our
-  // requested denyUnmatched policy. Absent mode (older hosts / fakes) is
+  // requested onRequest policy. Absent mode (older hosts / fakes) is
   // tolerated only when the startSession call already requested it.
   if (
     observed.approvalMode !== undefined &&
@@ -1300,7 +1307,6 @@ export const runMuseNative = async (
     wake = null;
   };
   let ended = false;
-  let lastActivityAt = Date.now();
   const endWith = (chunks: ReadonlyArray<TChatCompletionChunk>): void => {
     if (ended) return;
     ended = true;
@@ -1312,8 +1318,7 @@ export const runMuseNative = async (
     if (ended) return;
     ended = true;
     // Clear host-facing timers here too — callers still run cleanup for the
-    // child/host, but a delayed cleanup must not leave idle/budget firing.
-    clearInterval(idleTimer);
+    // child/host, but a delayed cleanup must not leave the turn budget firing.
     clearTimeout(turnTimer);
     push({ error });
   };
@@ -1323,7 +1328,6 @@ export const runMuseNative = async (
   let activeTurn: TMuseTurn | null = null;
   let mcp: TMuseMcpServer | null = null;
   let overlay: TMuseOverlay | null = null;
-  let idleTimer: ReturnType<typeof setInterval> | undefined;
   let turnTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stopMcp = (): void => {
@@ -1332,7 +1336,6 @@ export const runMuseNative = async (
   };
 
   const cleanup = async (): Promise<void> => {
-    clearInterval(idleTimer);
     clearTimeout(turnTimer);
     params.signal.removeEventListener("abort", abort);
     if (activeTurn !== null) {
@@ -1381,7 +1384,6 @@ export const runMuseNative = async (
         tools: params.tools ?? [],
         onToolCall: (name, args) => {
           if (ended) return;
-          lastActivityAt = Date.now();
           // Capture vendor usage around cancellation when the fold already
           // holds a session/tokenUsage notification.
           const usage = session?.lastUsage();
@@ -1479,9 +1481,6 @@ export const runMuseNative = async (
       "muse turn/start",
     );
     phaseMarks.turnSubmittedAt = musePhaseNow();
-    // Generation idle starts at turn ACK — setup (overlay/MCP/host/session)
-    // must not consume the post-submit silence budget.
-    lastActivityAt = Date.now();
   } catch (error) {
     emitMusePhaseTimings(
       phaseMarks,
@@ -1492,13 +1491,11 @@ export const runMuseNative = async (
   }
 
   const emitItem = (item: TMuseFoldedItem): void => {
-    lastActivityAt = Date.now();
     const chunk = turn.handleItem(item);
     if (chunk !== null && !ended) push(chunk);
     noteFirstOutputSuccess();
   };
   const emitDelta = (delta: TMuseItemDelta): void => {
-    lastActivityAt = Date.now();
     const chunk = turn.handleDelta(delta);
     if (chunk !== null && !ended) push(chunk);
     noteFirstOutputSuccess();
@@ -1529,36 +1526,6 @@ export const runMuseNative = async (
     });
   });
 
-  const idleBudget = params.idleMs ?? MUSE_IDLE_TIMEOUT_MS;
-  idleTimer = setInterval(() => {
-    if (ended) {
-      clearInterval(idleTimer);
-      return;
-    }
-    if (Date.now() - lastActivityAt > idleBudget) {
-      clearInterval(idleTimer);
-      logError(
-        "native-runtime",
-        safeDiagnosticMessage`muse turn idle timeout — cancelling`,
-        { idleMs: idleBudget, code: "muse_turn_idle_timeout" },
-      );
-      void cleanup();
-      // Host silence after partial output is a timeout failure — never map
-      // our own cancel into finish_reason=stop success via turn.finish
-      // ("cancelled"). Client abort still uses that path; idle/budget do not.
-      if (turn.sawOutput()) {
-        noteFirstOutputSuccess();
-        failStream(new Error("muse turn idle timeout"));
-      } else {
-        emitMusePhaseTimings(phaseMarks, "timeout");
-        ended = true;
-        push({
-          error: new Error("muse turn idle timeout before producing output"),
-        });
-      }
-    }
-  }, 1_000);
-
   turnTimer = setTimeout(() => {
     if (ended) return;
     logError(
@@ -1570,6 +1537,9 @@ export const runMuseNative = async (
       },
     );
     void cleanup();
+    // Absolute turn budget is a timeout failure — never map our own cancel
+    // into finish_reason=stop success via turn.finish("cancelled"). Client
+    // abort still uses that path; the overall deadline does not.
     if (turn.sawOutput()) {
       noteFirstOutputSuccess();
       failStream(new Error("muse turn budget exceeded"));

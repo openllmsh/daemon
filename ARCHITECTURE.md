@@ -30,6 +30,32 @@ through MSP. Subscription credentials are never exported for direct Meta API
 calls. Muse session token usage is not subscription allowance, and its gateway
 distribution authorization remains a separate launch requirement; see the
 [Muse implementation plan](../../docs/plan/2026-09-23-muse-subscription-native-runtime.md).
+
+Muse selects the host's `onRequest` approval mode and verifies it alongside
+its exact model before submission. Controlled native 1.4.0 probes found that
+`denyUnmatched` delayed authoritative turn completion by roughly a minute;
+`onRequest` completed the same simple requests in seconds. The runtime still
+waits for SDK `turn.completed`, drains its item/delta streams, and then closes
+the proxy stream. Output silence is not a terminal signal; client cancellation,
+precommit and absolute turn deadlines remain bounded failure paths.
+
+**Muse read containment remains a release limitation.** Both tested modes
+allowed an absolute read of a synthetic file in the disposable overlay HOME
+without an approval callback, including with the daemon OS sandbox active.
+`--disable-write` / `--disable-shell` remain enforced, but neither these flags
+nor the narrow search approval callback establish workspace-only reads.
+No test read real credentials. Enterprise tool-rule documents can validate
+offline, but no supported per-process policy loading mechanism was verified;
+the daemon does not install machine-wide policies or experimental overrides.
+
+Caller-MCP live acceptance is also unresolved on native 1.4.0: the isolated
+settings registration was not contacted in the live probe. A grant-negotiated
+`session/start.config.mcpServers` diagnostic was rejected with `session MCP
+base configuration is unavailable`; an undocumented process-gate experiment
+did not resolve it and is not part of the runtime. Hermetic handoff tests do
+not establish live native discovery. Plain-text completion validation must not
+be presented as caller-tool or Instagram/Facebook-search acceptance.
+
 API-key (BYOK) providers keep running on the cloud unchanged.
 
 ## Dependency boundary (load-bearing)

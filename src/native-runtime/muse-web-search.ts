@@ -11,15 +11,17 @@
  * allowlist rule such as "web_search only"
  * (`SessionSetApprovalModeParams`, sdk-migration.md). Official probes:
  *   - `onRequest`: known-safe tools (e.g. `pwd`) run WITHOUT `onApproval`
- *   - `denyUnmatched` (1.2.1): unmatched tools ask then deny when rejected
+ *   - `denyUnmatched` (1.2.1): unmatched tools ask then deny when rejected;
+ *     live OS-sandboxed probes also showed pathological delayed completion
+ *     (~71s vs ~10s) while still reading synthetic HOME with zero callbacks
  *   - `--disable-write` / `--disable-shell`: spawn-time floor (not reads)
  *
  * Therefore this module's `onApproval` decision is ONLY authoritative for
  * tools the host actually prompts. It must not be described as denying
- * known-safe auto-exec. Runtime pairs `denyUnmatched` + approve-once
- * `web_search` + auth overlay outside `workspaceRoot`. Absolute-path
- * known-safe reads of HOME remain a residual BLOCKER without a live host
- * proof — fail closed, do not invent stronger claims.
+ * known-safe auto-exec. Runtime pairs `onRequest` + approve-once
+ * `web_search` + auth overlay outside `workspaceRoot` + daemon sandbox.
+ * Absolute-path known-safe reads of HOME remain an explicit residual under
+ * BOTH modes — local test candidate only; do not invent stronger claims.
  *
  * Official `rawArgs` / toolCall `args` for `web_search` are the
  * model-authored JSON object string with a `query` string
