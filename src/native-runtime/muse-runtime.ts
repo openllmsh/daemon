@@ -30,8 +30,9 @@
  * equate callback denial with "all other native tools are denied".
  *
  * Completed provider-executed searches ride `server_search_calls`; they are
- * never re-emitted as caller `tool_calls`. Exact `session/setModel` +
- * `session/read` confirmation is required before a turn starts.
+ * never re-emitted as caller `tool_calls`. Exact model+policy confirmation is
+ * required before a turn starts: `session/read` first, `session/setModel` only
+ * on mismatch, then re-`read` fail-closed.
  */
 
 import { existsSync } from "node:fs";
@@ -834,16 +835,27 @@ export const openMuseHostWithTimeout = async (
   }
 };
 
-const confirmExactModelAndPolicy = async (
+const assertMuseSessionPolicy = (observed: TMuseSessionRead): void => {
+  // Fail closed when the host reports an approval mode that is not our
+  // requested denyUnmatched policy. Absent mode (older hosts / fakes) is
+  // tolerated only when the startSession call already requested it.
+  if (
+    observed.approvalMode !== undefined &&
+    observed.approvalMode !== null &&
+    observed.approvalMode !== MUSE_APPROVAL_MODE
+  ) {
+    throw new Error(
+      `Muse effective approval mode is ${observed.approvalMode}, expected ${MUSE_APPROVAL_MODE}`,
+    );
+  }
+};
+
+const assertMuseSessionModel = (
   session: TMuseSession,
+  observed: TMuseSessionRead,
   modelId: string,
   providerId: string | undefined,
-): Promise<void> => {
-  await session.setModel({
-    modelId,
-    ...(providerId !== undefined ? { providerId } : {}),
-  });
-  const observed = await session.read();
+): void => {
   if (observed.sessionId !== session.sessionId) {
     throw new Error(
       "Muse did not confirm the requested session; no turn was started",
@@ -859,18 +871,50 @@ const confirmExactModelAndPolicy = async (
       "Muse did not confirm the requested model/provider; no turn was started",
     );
   }
-  // Fail closed when the host reports an approval mode that is not our
-  // requested denyUnmatched policy. Absent mode (older hosts / fakes) is
-  // tolerated only when the startSession call already requested it.
-  if (
-    observed.approvalMode !== undefined &&
-    observed.approvalMode !== null &&
-    observed.approvalMode !== MUSE_APPROVAL_MODE
-  ) {
+};
+
+const sessionAlreadyExact = (
+  session: TMuseSession,
+  observed: TMuseSessionRead,
+  modelId: string,
+  providerId: string | undefined,
+): boolean => {
+  if (observed.sessionId !== session.sessionId) return false;
+  if (observed.modelId !== modelId) return false;
+  if (providerId !== undefined && observed.providerId !== providerId) {
+    return false;
+  }
+  return true;
+};
+
+/**
+ * Read-first exact model+policy gate. Calls `setModel` only when the live
+ * session read disagrees, then re-reads and fails closed. Never starts a turn
+ * on mismatch.
+ */
+const confirmExactModelAndPolicy = async (
+  session: TMuseSession,
+  modelId: string,
+  providerId: string | undefined,
+): Promise<void> => {
+  const first = await session.read();
+  assertMuseSessionPolicy(first);
+  if (sessionAlreadyExact(session, first, modelId, providerId)) {
+    return;
+  }
+  // Session-id mismatch cannot be repaired via setModel — fail closed.
+  if (first.sessionId !== session.sessionId) {
     throw new Error(
-      `Muse effective approval mode is ${observed.approvalMode}, expected ${MUSE_APPROVAL_MODE}`,
+      "Muse did not confirm the requested session; no turn was started",
     );
   }
+  await session.setModel({
+    modelId,
+    ...(providerId !== undefined ? { providerId } : {}),
+  });
+  const observed = await session.read();
+  assertMuseSessionModel(session, observed, modelId, providerId);
+  assertMuseSessionPolicy(observed);
 };
 
 /** Feed the auth-owned passive cache from authentic native model ids. */
@@ -1198,7 +1242,7 @@ export const runMuseNative = async (
         params.providerId,
       ),
       rpcTimeoutMs,
-      "muse session/setModel",
+      "muse session model confirm",
     );
     // Do NOT note authenticated on session/start alone — live evidence shows
     // Muse can open a session against an empty providers shell and only fail
