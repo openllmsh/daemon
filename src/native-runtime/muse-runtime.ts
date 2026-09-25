@@ -1598,22 +1598,17 @@ export const runMuseNative = async (
         pumpDeltas.catch(() => {}),
       ]);
       if (ended) return;
-      // Official SDK TurnOutcome (flattened): success is `kind:
-      // "completed"` with terminal completed (or omitted), cancelled only
-      // after we already committed output, or tool_calls for caller-tool
-      // handoff. Empty completed+cancelled is a decline — never invent an
-      // empty stop success. Client abort still finishes via the abort
-      // listener (ended before this arm). `unqueued` never ran;
-      // `terminalUnknown` is host-death/unknown; `terminal: "failed"` (+
-      // `error`) is a mid-turn / launch failure on the completed arm.
+      // Official SDK TurnOutcome (flattened): commit-on-first-output. Any
+      // settled outcome with no sawOutput declines — including
+      // completed/completed, omitted terminal, and tool_calls without an
+      // actual emitToolCall (never invent empty stop / empty tool_calls).
+      // After output, success is `kind: "completed"` with terminal completed
+      // (or omitted), cancelled, or tool_calls. Client abort still finishes
+      // via the abort listener (ended before this arm). `unqueued` never
+      // ran; `terminalUnknown` is host-death/unknown; `terminal: "failed"`
+      // (+ `error`) is a mid-turn / launch failure on the completed arm.
       const terminal = outcome.terminal;
-      const acknowledgedSuccess =
-        outcome.kind === "completed" &&
-        (terminal === undefined ||
-          terminal === "completed" ||
-          (terminal === "cancelled" && turn.sawOutput()) ||
-          terminal === "tool_calls");
-      if (!turn.sawOutput() && !acknowledgedSuccess) {
+      if (!turn.sawOutput()) {
         const reason = museTurnDeclineReason(outcome);
         logWarn(
           "native-runtime",
@@ -1639,6 +1634,12 @@ export const runMuseNative = async (
         void cleanup();
         return;
       }
+      const acknowledgedSuccess =
+        outcome.kind === "completed" &&
+        (terminal === undefined ||
+          terminal === "completed" ||
+          terminal === "cancelled" ||
+          terminal === "tool_calls");
       if (!acknowledgedSuccess) {
         const parts: string[] = [outcome.kind];
         if (terminal !== undefined) parts.push(terminal);
