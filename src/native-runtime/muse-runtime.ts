@@ -102,6 +102,14 @@ export const MUSE_RPC_TIMEOUT_MS = 30_000;
  */
 export const MUSE_APPROVAL_MODE = "denyUnmatched" as const;
 
+/**
+ * MSP treats absent userInputDialogs as capable. This headless client cannot
+ * render dialogs, so explicitly withhold userInput/request (D-047).
+ */
+export const MUSE_CLIENT_CAPABILITIES = {
+  userInputDialogs: false,
+} as const;
+
 const AUTH_REJECTION_RE =
   /not logged in|not signed in|unauthorized|unauthenticated|authentication (?:failed|rejected)|auth(?:entication)? rejected|please (?:log|sign)[\s-]?in/i;
 
@@ -598,6 +606,7 @@ const wrapOfficialHost = async (
   try {
     spawned = await handshake.initialize({
       clientInfo: { name: "openllm_daemon", version: DAEMON_VERSION },
+      capabilities: MUSE_CLIENT_CAPABILITIES,
     });
   } catch (error) {
     // initialize failure / abort must not leave the owned muse serve child.
