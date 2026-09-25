@@ -60,7 +60,7 @@ import {
   rememberMuseNativeModels,
 } from "../delegation/muse";
 import { spawnCwd } from "../delegation/util";
-import { logError, logWarn, safeDiagnosticMessage } from "../logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import type {
@@ -888,6 +888,129 @@ const sessionAlreadyExact = (
   return true;
 };
 
+type TMuseFirstOutputOutcome =
+  | "success"
+  | "failure"
+  | "timeout"
+  | "aborted"
+  | "declined";
+
+type TMusePhaseMarks = {
+  readonly startedAt: number;
+  spawnStartedAt: number | null;
+  hostReadyAt: number | null;
+  sessionReadyAt: number | null;
+  modelVerifiedAt: number | null;
+  turnSubmittedAt: number | null;
+  firstOutputAt: number | null;
+  emitted: boolean;
+};
+
+let musePhaseNowImpl: () => number = (): number => performance.now();
+
+/** Test-only: replace the phase clock. Production always uses performance.now. */
+export const setMusePhaseClockForTests = (fn: (() => number) | null): void => {
+  musePhaseNowImpl = fn ?? ((): number => performance.now());
+};
+
+const musePhaseNow = (): number => musePhaseNowImpl();
+
+const musePhaseMs = (from: number, to: number): number =>
+  Math.max(0, Math.round((to - from) * 1000) / 1000);
+
+const createMusePhaseMarks = (): TMusePhaseMarks => ({
+  startedAt: musePhaseNow(),
+  spawnStartedAt: null,
+  hostReadyAt: null,
+  sessionReadyAt: null,
+  modelVerifiedAt: null,
+  turnSubmittedAt: null,
+  firstOutputAt: null,
+  emitted: false,
+});
+
+/**
+ * Metadata-only phase timings. Numbers + closed outcome only — never prompt,
+ * tokens, credentials, or model ids.
+ *
+ * Semantics (performance.now deltas):
+ *   - setup_ms: entry → immediately before host factory (MCP/overlay prep)
+ *   - spawn_init_ms: host factory start → host ready (SDK spawn/init only)
+ *   - session_ms: host ready → session/start settled
+ *   - model_verify_ms: session ready → model+policy confirm settled
+ *   - turn_submit_ms: model verified → turn/start ACK
+ *   - generation_wait_ms: turn ACK → first actual output (optional)
+ *   - first_output_ms / ttft_ms: entry → first actual output (request TTFT)
+ *   - elapsed_ms: entry → first output or terminal non-output end
+ */
+const emitMusePhaseTimings = (
+  marks: TMusePhaseMarks,
+  firstOutputOutcome: TMuseFirstOutputOutcome,
+): void => {
+  if (marks.emitted) return;
+  marks.emitted = true;
+  const endedAt = marks.firstOutputAt ?? musePhaseNow();
+  const setupMs =
+    marks.spawnStartedAt === null
+      ? undefined
+      : musePhaseMs(marks.startedAt, marks.spawnStartedAt);
+  const spawnInitMs =
+    marks.spawnStartedAt === null || marks.hostReadyAt === null
+      ? undefined
+      : musePhaseMs(marks.spawnStartedAt, marks.hostReadyAt);
+  const sessionMs =
+    marks.hostReadyAt === null || marks.sessionReadyAt === null
+      ? undefined
+      : musePhaseMs(marks.hostReadyAt, marks.sessionReadyAt);
+  const modelVerifyMs =
+    marks.sessionReadyAt === null || marks.modelVerifiedAt === null
+      ? undefined
+      : musePhaseMs(marks.sessionReadyAt, marks.modelVerifiedAt);
+  const turnSubmitMs =
+    marks.modelVerifiedAt === null || marks.turnSubmittedAt === null
+      ? undefined
+      : musePhaseMs(marks.modelVerifiedAt, marks.turnSubmittedAt);
+  const generationWaitMs =
+    marks.turnSubmittedAt === null || marks.firstOutputAt === null
+      ? undefined
+      : musePhaseMs(marks.turnSubmittedAt, marks.firstOutputAt);
+  const ttftMs =
+    marks.firstOutputAt === null
+      ? undefined
+      : musePhaseMs(marks.startedAt, marks.firstOutputAt);
+  const elapsedMs = musePhaseMs(marks.startedAt, endedAt);
+  logInfo(
+    "native-runtime",
+    safeDiagnosticMessage`muse native turn phase timings`,
+    {
+      provider: "muse",
+      clock: "performance.now",
+      first_output_outcome: firstOutputOutcome,
+      ...(setupMs !== undefined ? { setup_ms: setupMs } : {}),
+      ...(spawnInitMs !== undefined ? { spawn_init_ms: spawnInitMs } : {}),
+      ...(sessionMs !== undefined ? { session_ms: sessionMs } : {}),
+      ...(modelVerifyMs !== undefined
+        ? { model_verify_ms: modelVerifyMs }
+        : {}),
+      ...(turnSubmitMs !== undefined ? { turn_submit_ms: turnSubmitMs } : {}),
+      ...(generationWaitMs !== undefined
+        ? { generation_wait_ms: generationWaitMs }
+        : {}),
+      ...(ttftMs !== undefined
+        ? { first_output_ms: ttftMs, ttft_ms: ttftMs }
+        : {}),
+      elapsed_ms: elapsedMs,
+    },
+    {
+      provider: "muse",
+      timings: {
+        elapsed_ms: elapsedMs,
+        ...(spawnInitMs !== undefined ? { spawn_elapsed_ms: spawnInitMs } : {}),
+      },
+    },
+  );
+};
+
 /**
  * Read-first exact model+policy gate. Calls `setModel` only when the live
  * session read disagrees, then re-reads and fails closed. Never starts a turn
@@ -1099,6 +1222,9 @@ export const runMuseNative = async (
     };
   }
 
+  // Entry clock after invalid-request declines — setup includes turn-root
+  // prep, MCP, and overlay before the SDK host factory.
+  const phaseMarks = createMusePhaseMarks();
   const spawn = wrapMuseServeSpawn(params.bin);
   // Split layout: workspaceRoot (session cwd) NEVER contains the auth
   // overlay HOME. Known-safe workspace reads therefore cannot reach the
@@ -1118,6 +1244,12 @@ export const runMuseNative = async (
   const turn = createMuseTurnState({
     providerModelId: params.providerModelId,
   });
+  const noteFirstOutputSuccess = (): void => {
+    if (phaseMarks.firstOutputAt !== null) return;
+    if (!turn.sawOutput()) return;
+    phaseMarks.firstOutputAt = musePhaseNow();
+    emitMusePhaseTimings(phaseMarks, "success");
+  };
 
   type TQueueItem = TChatCompletionChunk | "end" | { readonly error: Error };
   const queue: Array<TQueueItem> = [];
@@ -1178,9 +1310,11 @@ export const runMuseNative = async (
     void cleanup();
     if (ended) return;
     if (turn.sawOutput()) {
+      noteFirstOutputSuccess();
       endWith(turn.finish("cancelled"));
       return;
     }
+    emitMusePhaseTimings(phaseMarks, "aborted");
     ended = true;
     push("end");
   };
@@ -1198,6 +1332,7 @@ export const runMuseNative = async (
           const usage = session?.lastUsage();
           if (usage !== undefined) turn.observeUsage(usage);
           endWith(turn.emitToolCall(name, args));
+          noteFirstOutputSuccess();
           void activeTurn?.cancel().catch(() => {});
         },
       });
@@ -1216,6 +1351,9 @@ export const runMuseNative = async (
       ...cleanMuseSpawnEnv(params.env),
       ...overlay.env,
     };
+    // Spawn/init clock starts immediately before the host factory — MCP and
+    // overlay prep belong to setup_ms, not spawn_init_ms.
+    phaseMarks.spawnStartedAt = musePhaseNow();
     host = await openMuseHostWithTimeout(
       (signal) =>
         hostFactory({
@@ -1238,6 +1376,7 @@ export const runMuseNative = async (
       "muse SDK spawn",
       params.signal,
     );
+    phaseMarks.hostReadyAt = musePhaseNow();
     session = await withTimeout(
       host.startSession({
         sessionId: Bun.randomUUIDv7(),
@@ -1251,6 +1390,7 @@ export const runMuseNative = async (
       rpcTimeoutMs,
       "muse session/start",
     );
+    phaseMarks.sessionReadyAt = musePhaseNow();
     session.onApproval(decideNativeApproval);
     await withTimeout(
       confirmExactModelAndPolicy(
@@ -1261,6 +1401,7 @@ export const runMuseNative = async (
       rpcTimeoutMs,
       "muse session model confirm",
     );
+    phaseMarks.modelVerifiedAt = musePhaseNow();
     // Do NOT note authenticated on session/start alone — live evidence shows
     // Muse can open a session against an empty providers shell and only fail
     // later with turn errorKind authRequired. Auth memory is pinned by
@@ -1273,6 +1414,7 @@ export const runMuseNative = async (
       () => {},
     );
     if (params.signal.aborted) {
+      emitMusePhaseTimings(phaseMarks, "aborted");
       await cleanup();
       return { kind: "declined", reason: "client aborted" };
     }
@@ -1281,7 +1423,12 @@ export const runMuseNative = async (
       rpcTimeoutMs,
       "muse turn/start",
     );
+    phaseMarks.turnSubmittedAt = musePhaseNow();
   } catch (error) {
+    emitMusePhaseTimings(
+      phaseMarks,
+      params.signal.aborted ? "aborted" : "declined",
+    );
     await cleanup();
     return setupDecline(error, params.signal);
   }
@@ -1290,11 +1437,13 @@ export const runMuseNative = async (
     lastActivityAt = Date.now();
     const chunk = turn.handleItem(item);
     if (chunk !== null && !ended) push(chunk);
+    noteFirstOutputSuccess();
   };
   const emitDelta = (delta: TMuseItemDelta): void => {
     lastActivityAt = Date.now();
     const chunk = turn.handleDelta(delta);
     if (chunk !== null && !ended) push(chunk);
+    noteFirstOutputSuccess();
   };
 
   const pumpItems = (async (): Promise<void> => {
@@ -1336,8 +1485,11 @@ export const runMuseNative = async (
         { idleMs: idleBudget, code: "muse_turn_idle_timeout" },
       );
       void cleanup();
-      if (turn.sawOutput()) endWith(turn.finish("cancelled"));
-      else {
+      if (turn.sawOutput()) {
+        noteFirstOutputSuccess();
+        endWith(turn.finish("cancelled"));
+      } else {
+        emitMusePhaseTimings(phaseMarks, "timeout");
         ended = true;
         push({
           error: new Error("muse turn idle timeout before producing output"),
@@ -1357,8 +1509,11 @@ export const runMuseNative = async (
       },
     );
     void cleanup();
-    if (turn.sawOutput()) endWith(turn.finish("cancelled"));
-    else {
+    if (turn.sawOutput()) {
+      noteFirstOutputSuccess();
+      endWith(turn.finish("cancelled"));
+    } else {
+      emitMusePhaseTimings(phaseMarks, "timeout");
       ended = true;
       push({
         error: new Error("muse turn budget exceeded before producing output"),
@@ -1415,6 +1570,7 @@ export const runMuseNative = async (
         if (outcome.error?.kind === "authRequired") {
           clearMuseStatusObservationCache();
         }
+        emitMusePhaseTimings(phaseMarks, "failure");
         ended = true;
         push({ error: new Error(reason) });
         void cleanup();
@@ -1424,6 +1580,7 @@ export const runMuseNative = async (
         const parts: string[] = [outcome.kind];
         if (terminal !== undefined) parts.push(terminal);
         if (outcome.error?.kind !== undefined) parts.push(outcome.error.kind);
+        noteFirstOutputSuccess();
         failStream(
           new Error(
             `muse turn ended without acknowledged success (${parts.join("/")})`,
@@ -1432,6 +1589,7 @@ export const runMuseNative = async (
         void cleanup();
         return;
       }
+      noteFirstOutputSuccess();
       endWith(turn.finish(terminal ?? "completed"));
       void cleanup();
     } catch (error: unknown) {
@@ -1452,8 +1610,10 @@ export const runMuseNative = async (
         },
       );
       if (turn.sawOutput()) {
+        noteFirstOutputSuccess();
         failStream(err);
       } else {
+        emitMusePhaseTimings(phaseMarks, "failure");
         ended = true;
         push({ error: err });
       }
@@ -1492,6 +1652,14 @@ export const runMuseNative = async (
     first === "end" ||
     (typeof first === "object" && first !== null && "error" in first)
   ) {
+    emitMusePhaseTimings(
+      phaseMarks,
+      first === "timeout"
+        ? "timeout"
+        : params.signal.aborted
+          ? "aborted"
+          : "failure",
+    );
     await cleanup();
     const reason =
       first === "timeout"
@@ -1507,6 +1675,7 @@ export const runMuseNative = async (
       ...(params.signal.aborted ? {} : {}),
     };
   }
+  noteFirstOutputSuccess();
 
   const chunks = new ReadableStream<TChatCompletionChunk>({
     start(controller) {
