@@ -1,3 +1,4 @@
+import { childProtectedPaths, childWorkingSet } from "./child-policy";
 /**
  * macOS in-process Seatbelt sandbox — the darwin counterpart to Linux Landlock
  * (`sandbox/landlock.ts`). Applied once at boot via `sandbox_init` (libsandbox)
@@ -140,11 +141,25 @@ export const homeAncestorPaths = (
  * a denial is a graceful `EPERM`. SBPL is last-match-wins, so the trailing
  * credential-file deny overrides the broader working-set allow above it.
  */
-const buildProfile = (home: string, homeOverride?: string): string => {
-  const ws = daemonWorkingSet(homeOverride);
-  const writeAllow = [...ws.readWrite, ...macRuntimeWrite(home)]
-    .map((p) => `  (subpath "${esc(p)}")`)
-    .join("\n");
+const buildProfile = (
+  home: string,
+  homeOverride?: string,
+  child = false,
+): string => {
+  const ws = child
+    ? childWorkingSet(homeOverride)
+    : daemonWorkingSet(homeOverride);
+  const excluded = child ? childProtectedPaths(homeOverride) : [];
+  const excluding = (rule: string): string =>
+    excluded.length
+      ? `(require-all ${rule} ${excluded.map((p) => `(require-not (subpath "${esc(p)}"))`).join(" ")})`
+      : rule;
+  const writeAllow = [
+    ...ws.readWrite.map((p) => `  (subpath "${esc(p)}")`),
+    ...(child ? [] : macRuntimeWrite(home)).map(
+      (p) => `  ${excluding(`(subpath "${esc(p)}")`)}`,
+    ),
+  ].join("\n");
   // Re-allow the daemon's own footprint inside `$HOME` (the working set + the
   // macOS runtime read paths). Non-home reads are blanket-allowed below, so only
   // in-`$HOME` paths need explicit re-granting — everything outside is already
@@ -152,8 +167,12 @@ const buildProfile = (home: string, homeOverride?: string): string => {
   // profile carries only live rules (on a prod build `ws.readOnly` is entirely
   // system paths, so the unfiltered list was all dead rules).
   const inHome = (p: string): boolean => p === home || p.startsWith(`${home}/`);
-  const readAllow = [...ws.readWrite, ...ws.readOnly, ...macHomeRead(home)]
-    .filter(inHome)
+  const readAllow = [
+    ...ws.readWrite,
+    ...ws.readOnly,
+    ...(child ? [] : macHomeRead(home)),
+  ]
+    .filter((p) => child || inHome(p))
     .map((p) => `  (subpath "${esc(p)}")`)
     .join("\n");
   const credDeny = credentialDeny(home)
@@ -163,14 +182,49 @@ const buildProfile = (home: string, homeOverride?: string): string => {
   // — the working set is scoped now, so intermediate nodes like `~/.claude`
   // must be stat-able for `mkdir -p` / path resolution without exposing their
   // contents.
-  const metadataAllow = homeAncestorPaths(
-    [...ws.readWrite, ...ws.readOnly, ...macRuntimeWrite(home)].filter(inHome),
-    home,
-  )
+  const metadataPaths = child
+    ? [
+        ...new Set(
+          [...ws.readWrite, ...ws.readOnly].flatMap((p) => {
+            const paths: string[] = ["/var", "/tmp", "/etc"];
+            let cur = dirname(p);
+            for (;;) {
+              paths.push(cur);
+              const parent = dirname(cur);
+              if (parent === cur) break;
+              cur = parent;
+            }
+            return paths;
+          }),
+        ),
+      ]
+    : homeAncestorPaths(
+        [...ws.readWrite, ...ws.readOnly, ...macRuntimeWrite(home)].filter(
+          inHome,
+        ),
+        home,
+      );
+  const metadataAllow = metadataPaths
     .map((p) => `  (literal "${esc(p)}")`)
     .join("\n");
   return `(version 1)
 (allow default)
+${
+  child
+    ? `(deny process-info*)
+(allow process-info* (target self))
+(deny sysctl-read)
+; Bun's page size and the five scalar uname fields used by Node runtimes.
+; No process arguments, environment, or wildcard sysctl tree is granted.
+(allow sysctl-read
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.version")
+  (sysctl-name "hw.machine"))`
+    : ""
+}
 ; WRITES — deny-by-default whitelist: only the working set + workflow targets +
 ; macOS runtime are writable; everything else is write-denied (tamper guard).
 (deny file-write*)
@@ -182,7 +236,9 @@ ${writeAllow})
 ; is granted, so ~/.ssh, ~/.aws, keychains, browser cookies — every user secret
 ; — are unreadable even if the daemon is fully compromised.
 (deny file-read*)
-(allow file-read* (require-not (subpath "${esc(home)}")))
+; libignition opens the root directory for openat; this is not a subtree grant.
+${child ? '(allow file-read* (literal "/"))' : ""}
+${child ? "" : `(allow file-read* ${excluding(`(require-not (subpath "${esc(home)}"))`)})`}
 (allow file-read*
 ${readAllow})
 ; STAT (metadata only, NOT contents) of $HOME and every in-home ANCESTOR of a
@@ -213,10 +269,13 @@ let cachedState: TSandboxState | null = null;
  * Apply the Seatbelt profile to THIS process (and, by inheritance, every child
  * it spawns). Idempotent. Never throws; returns + caches the resulting posture.
  */
-export const applySeatbelt = (homeOverride?: string): TSandboxState => {
+export const applySeatbelt = (
+  homeOverride?: string,
+  child = false,
+): TSandboxState => {
   if (cachedState !== null) return cachedState;
   try {
-    const profile = `${buildProfile(homeOverride ?? homedir(), homeOverride)}\0`;
+    const profile = `${buildProfile(homeOverride ?? homedir(), homeOverride, child)}\0`;
     const profileBuf = new TextEncoder().encode(profile);
     const lib = dlopen("/usr/lib/libsandbox.1.dylib", {
       sandbox_init: {

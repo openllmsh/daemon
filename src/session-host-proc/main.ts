@@ -2,19 +2,20 @@
  * Durable, per-session PTY host.
  *
  * This is deliberately independent of the daemon control plane: one invocation
- * owns one PTY and serves its attached terminal consumers on a private Unix
- * WebSocket. The wire envelope is the local broker envelope.
+ * owns one PTY and serves attached terminal consumers over a private Unix
+ * WebSocket on POSIX or an owner-ACL named pipe on Windows. Both carry the
+ * same local broker envelope.
  */
 
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   renameSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
@@ -24,9 +25,29 @@ import {
   SESSION_ID_PATTERN,
   TerminalDimension,
 } from "@openllmsh/protocol";
+import {
+  encodeSessionPipeFrame,
+  SESSION_PIPE_DRAIN_ACK,
+  SessionPipeFrameDecoder,
+} from "@openllmsh/protocol/session-pipe";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
+import {
+  createSessionDirectory,
+  createSessionFile,
+  localSessionEndpoint,
+  processStartIdentity,
+  secureSessionDirectory,
+  sessionHostSupported,
+  WINDOWS_SESSION_HOST_UNAVAILABLE,
+} from "../../../pty-native/session/local-runtime";
+import type { TWindowsSessionPipeServer } from "../../../pty-native/session/windows-session-pipe";
+import {
+  createWindowsSessionPipeServer,
+  verifyWindowsSessionFile,
+} from "../../../pty-native/session/windows-session-pipe";
 import { stateDir } from "../env";
+import { whenAllNativePtysTerminated } from "../native-pty";
 import type { TSessionStream } from "../session-core";
 import {
   bindSessionStream,
@@ -36,25 +57,87 @@ import {
   RESUME_ID_PATTERN,
   setSessionLifecycleHooks,
 } from "../session-core";
+import { ensureWindowsProcessAdmission } from "../windows-process";
 
 const SESSION_DIR_MODE = 0o700;
 const ACTIVITY_POLL_MS = 15_000;
+const EXIT_DRAIN_TIMEOUT_MS = 1_000;
+/**
+ * Bound on waiting for every PTY to finish TERM→KILL escalation before the
+ * host exits (PL-D7/DSN-7): escalation is 1 s, then the awaitable darwin
+ * verify-then-KILL sweep runs up to DARWIN_KILL_VERIFY_TIMEOUT_MS (2 s), so
+ * the wait needs strictly more than 3 s to never truncate a finishing sweep.
+ */
+const PTY_TERMINATE_BUDGET_MS = 4_000;
+
+export type TSessionHostStartupNack = {
+  readonly ok: false;
+  readonly reason: typeof WINDOWS_SESSION_HOST_UNAVAILABLE;
+  readonly detail: string;
+};
+
+export const SESSION_HOST_STARTUP_RECEIPT_PREFIX =
+  "openllm-session-host-startup:";
+
+export const formatSessionHostStartupNack = (
+  detail: string,
+): TSessionHostStartupNack => ({
+  ok: false,
+  reason: WINDOWS_SESSION_HOST_UNAVAILABLE,
+  detail,
+});
+
+const writeSessionHostStartupNack = (detail: string): void => {
+  process.stderr.write(
+    `${SESSION_HOST_STARTUP_RECEIPT_PREFIX}${JSON.stringify(formatSessionHostStartupNack(detail))}\n`,
+  );
+};
+
+/**
+ * Per-launch token the spawning daemon sets on this host's environment. It
+ * is recorded in owner.json (claim + staging) and meta.json so failed-launch
+ * cleanup removes only state provably written by THIS launch — a pid alone
+ * can be reused.
+ */
+export const SESSION_HOST_LAUNCH_TOKEN_ENV =
+  "OPENLLM_SESSION_HOST_LAUNCH_TOKEN";
+
+const sessionHostLaunchToken = (): string | null => {
+  const value = process.env[SESSION_HOST_LAUNCH_TOKEN_ENV];
+  return typeof value === "string" && value.length >= 1 && value.length <= 128
+    ? value
+    : null;
+};
 
 const processStartTime = (): string | null => {
-  try {
-    const output = Bun.spawnSync(
-      ["ps", "-o", "lstart=", "-p", String(process.pid)],
-      {
-        stdout: "pipe",
-        stderr: "ignore",
-      },
-    );
-    if (output.exitCode !== 0) return null;
-    const value = new TextDecoder().decode(output.stdout).trim();
-    return value.length > 0 ? value : null;
-  } catch {
-    return null;
-  }
+  const identity = processStartIdentity(process.pid);
+  if (identity === undefined || identity === null) return null;
+  return identity;
+};
+
+/**
+ * Publish this host's ownership record atomically into `dir`: write a temp
+ * sibling, then rename over `owner.json`. A concurrent discovery scan can
+ * only ever see the file absent (unproven — kept) or complete (verifiable),
+ * never torn.
+ */
+const writeSessionHostOwnerRecord = (
+  dir: string,
+  cli: TDeviceSessionCli,
+  start: string,
+): void => {
+  const temp = join(dir, `.owner.json.${process.pid}.tmp`);
+  const token = sessionHostLaunchToken();
+  createSessionFile(
+    temp,
+    `${JSON.stringify({
+      pid: process.pid,
+      processStartTime: start,
+      cli,
+      ...(token === null ? {} : { launchToken: token }),
+    })}\n`,
+  );
+  renameSync(temp, join(dir, "owner.json"));
 };
 
 export type TSessionHostArgs = {
@@ -79,6 +162,11 @@ export type TSessionHostMeta = {
   readonly startedAtMs: number;
   readonly processStartTime: string;
   readonly generation: number;
+  /** Per-launch token from the spawning daemon; binds this host's state to
+   *  exactly one launch so failed-launch cleanup can prove ownership. */
+  readonly launchToken?: string;
+  /** Optional for discovery compatibility with already-running older hosts. */
+  readonly attached?: boolean;
 };
 
 type TSocketData = {
@@ -87,7 +175,12 @@ type TSocketData = {
   drainWaiters: Set<{ resolve: () => void; reject: (error: Error) => void }>;
 };
 
-type TSocket = Bun.ServerWebSocket<TSocketData>;
+type TSocket = {
+  readonly data: TSocketData;
+  sendBinary(bytes: Uint8Array): number;
+  sendText(text: string): number;
+  close(): void;
+};
 
 type TEnvelope = {
   readonly t?: unknown;
@@ -177,7 +270,7 @@ export const parseSessionHostArgs = (
           value.length < 1 ||
           value.length > 1024 ||
           value.includes("\0") ||
-          !value.startsWith("/")
+          !isAbsolute(value)
         )
           return null;
         cwd = value;
@@ -347,10 +440,10 @@ export type TSessionHostOptions = {
 };
 
 /** Start one durable session host. Kept exportable so tests can use its fake PTY seam. */
-export const runSessionHost = (
+export const runSessionHost = async (
   args: TSessionHostArgs,
   options: TSessionHostOptions = {},
-): void => {
+): Promise<void> => {
   const directory = sessionHostDir(args.id);
   const root = join(stateDir(), "sessions");
   const claim = join(root, `.${args.id}.claim`);
@@ -358,17 +451,32 @@ export const runSessionHost = (
   const socketPath = join(stagingDirectory, "ctl.sock");
 
   let server: Bun.Server<TSocketData> | null = null;
+  let pipeServer: TWindowsSessionPipeServer | null = null;
   let activityTimer: ReturnType<typeof setInterval> | null = null;
   let ownerTimer: ReturnType<typeof setInterval> | null = null;
   let cleaned = false;
+  let exiting = false;
   let ownsClaim = false;
   let meta: TSessionHostMeta | null = null;
   let published = false;
+  const attachedSockets = new Set<TSocket>();
 
   const fail = (): void => {
-    cleanup();
-    if (options.exit === undefined) process.exitCode = 1;
-    else options.exit(1);
+    setSessionLifecycleHooks(null);
+    closeSession(args.id);
+    // A PTY may still owe captured descendants a pending SIGKILL escalation;
+    // give it the same bounded settle the clean exit path gets (DSN-7).
+    void (async () => {
+      await whenAllNativePtysTerminated(PTY_TERMINATE_BUDGET_MS);
+      cleanup();
+      if (options.exit === undefined) process.exitCode = 1;
+      else options.exit(1);
+    })();
+  };
+
+  const failUnavailable = (detail: string): void => {
+    writeSessionHostStartupNack(detail);
+    fail();
   };
 
   const cleanup = (): void => {
@@ -377,13 +485,69 @@ export const runSessionHost = (
     if (activityTimer !== null) clearInterval(activityTimer);
     if (ownerTimer !== null) clearInterval(ownerTimer);
     server?.stop(true);
+    if (pipeServer !== null) void pipeServer.close(0);
     if (published) rmSync(directory, { recursive: true, force: true });
     rmSync(stagingDirectory, { recursive: true, force: true });
     if (ownsClaim) rmSync(claim, { recursive: true, force: true });
   };
-  const exit = (): void => {
+
+  if (!sessionHostSupported()) {
+    failUnavailable(
+      "durable session-host is unavailable on this platform or architecture",
+    );
+    return;
+  }
+  // Direct broker callers also precede protocol-owned identity/ACL helpers.
+  ensureWindowsProcessAdmission();
+
+  // PL-D7/DSN-7: process.exit used to fire before the PTY's 1 s TERM→KILL
+  // escalation, so a vendor that traps TERM survived under ppid 1. Every exit
+  // path waits — with a bound — for all NativePtys to fully terminate first.
+  const settleThenExit = async (code: number): Promise<void> => {
+    await whenAllNativePtysTerminated(PTY_TERMINATE_BUDGET_MS);
     cleanup();
-    (options.exit ?? process.exit)(0);
+    (options.exit ?? process.exit)(code);
+  };
+
+  const exit = (): void => {
+    if (exiting || cleaned) return;
+    exiting = true;
+    if (server === null && pipeServer === null) {
+      void settleThenExit(0);
+      return;
+    }
+    if (server === null && pipeServer !== null) {
+      const currentPipeServer = pipeServer;
+      queueMicrotask(async () => {
+        try {
+          await currentPipeServer.close(EXIT_DRAIN_TIMEOUT_MS);
+        } finally {
+          await settleThenExit(0);
+        }
+      });
+      return;
+    }
+    const current = server;
+    if (current === null) return;
+    // The core calls onEnd before terminalClose sends the exit envelope.
+    // Yield that stack, then let the broker sockets flush and close. A forced
+    // stop here drops the real shell status and makes the CLI report success.
+    queueMicrotask(async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          current.stop(false),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, EXIT_DRAIN_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        // A failed graceful stop still reaches the bounded forced cleanup.
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        await settleThenExit(0);
+      }
+    });
   };
 
   const publish = (): void => {
@@ -401,10 +565,28 @@ export const runSessionHost = (
 
   const writeMeta = (): void => {
     if (meta === null) return;
-    const temp = join(stagingDirectory, `.meta.json.${process.pid}.tmp`);
+    const targetDirectory = published ? directory : stagingDirectory;
+    const temp = join(targetDirectory, `.meta.json.${process.pid}.tmp`);
+    const target = join(targetDirectory, "meta.json");
     try {
-      writeFileSync(temp, `${JSON.stringify(meta)}\n`, { mode: 0o600 });
-      renameSync(temp, join(stagingDirectory, "meta.json"));
+      createSessionFile(temp, `${JSON.stringify(meta)}\n`);
+      if (process.platform === "win32") {
+        let targetExists = false;
+        try {
+          lstatSync(target);
+          targetExists = true;
+        } catch (error) {
+          if (
+            error === null ||
+            typeof error !== "object" ||
+            !("code" in error) ||
+            error.code !== "ENOENT"
+          )
+            throw error;
+        }
+        if (targetExists) verifyWindowsSessionFile(target);
+      }
+      renameSync(temp, target);
     } catch (error) {
       try {
         rmSync(temp, { force: true });
@@ -415,11 +597,107 @@ export const runSessionHost = (
     }
   };
 
+  const recordAttachment = (socket: TSocket, attached: boolean): void => {
+    if (attached) attachedSockets.add(socket);
+    else attachedSockets.delete(socket);
+    if (cleaned || meta === null || meta.attached === attachedSockets.size > 0)
+      return;
+    meta = { ...meta, attached: attachedSockets.size > 0 };
+    try {
+      writeMeta();
+    } catch {
+      // Telemetry persistence must not terminate an otherwise working terminal.
+      process.stderr.write("session-host: attachment metadata update failed\n");
+    }
+  };
+
+  const handleMessage = (
+    socket: TSocket,
+    message: string | Uint8Array,
+  ): void => {
+    try {
+      const stream = socket.data.stream;
+      if (typeof message !== "string") {
+        if (!socket.data.opened || stream === null) {
+          protocolError(socket);
+          return;
+        }
+        stream.receiveData(message);
+        return;
+      }
+      const envelope: TEnvelope = JSON.parse(message) as TEnvelope;
+      if (!socket.data.opened) {
+        if (envelope.t !== "open") {
+          protocolError(socket);
+          return;
+        }
+        const open = parseAttachOpen(envelope.open, args);
+        if (open === null) {
+          protocolError(socket);
+          return;
+        }
+        const next = new SessionHostStream(socket);
+        socket.data.stream = next;
+        socket.data.opened = true;
+        bindSessionStream(next, open, {
+          onExit: (code) =>
+            socket.sendText(JSON.stringify({ t: "exit", code })),
+        });
+        recordAttachment(socket, true);
+        return;
+      }
+      if (envelope.t === "ctrl" && stream !== null)
+        stream.receiveCtrl(envelope.p);
+    } catch {
+      protocolError(socket);
+    }
+  };
+
+  const handleClosed = (socket: TSocket): void => {
+    const waiters = [...socket.data.drainWaiters];
+    socket.data.drainWaiters.clear();
+    for (const waiter of waiters)
+      waiter.reject(new Error("session host socket closed"));
+    socket.data.stream?.closed();
+    recordAttachment(socket, false);
+  };
+
+  // Own identity must be known BEFORE claiming: the claim records it so a
+  // crashed host's leftover claim is provably dead and reapable by the CLI.
+  let ownProcessStartTime: string;
   try {
-    mkdirSync(root, { recursive: true, mode: SESSION_DIR_MODE });
-    mkdirSync(claim, { mode: SESSION_DIR_MODE });
+    const identity = processStartTime();
+    if (identity === null) {
+      fail();
+      return;
+    }
+    ownProcessStartTime = identity;
+  } catch (error) {
+    failUnavailable(error instanceof Error ? error.message : String(error));
+    return;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      if (existsSync(root)) secureSessionDirectory(root);
+      else createSessionDirectory(root);
+      createSessionDirectory(claim);
+    } else {
+      mkdirSync(root, { recursive: true, mode: SESSION_DIR_MODE });
+      mkdirSync(claim, { mode: SESSION_DIR_MODE });
+    }
     ownsClaim = true;
-  } catch {
+    // Claim ownership record (S7 contract): the CLI reaps a stale claim only
+    // when this owner is provably dead by pid + start identity. Published
+    // atomically — temp + rename INSIDE the claim dir — so a scan never
+    // observes a torn owner.json, and the claim is only "owned" once the
+    // record has fully landed.
+    writeSessionHostOwnerRecord(claim, args.cli, ownProcessStartTime);
+  } catch (error) {
+    if (process.platform === "win32") {
+      failUnavailable(error instanceof Error ? error.message : String(error));
+      return;
+    }
     fail();
     return;
   }
@@ -431,20 +709,31 @@ export const runSessionHost = (
 
   try {
     rmSync(stagingDirectory, { recursive: true, force: true });
-    mkdirSync(stagingDirectory, { mode: SESSION_DIR_MODE });
-    chmodSync(stagingDirectory, SESSION_DIR_MODE);
-  } catch {
-    fail();
-    return;
-  }
-  const ownProcessStartTime = processStartTime();
-  if (ownProcessStartTime === null) {
+    if (process.platform === "win32") createSessionDirectory(stagingDirectory);
+    else {
+      mkdirSync(stagingDirectory, { mode: SESSION_DIR_MODE });
+      chmodSync(stagingDirectory, SESSION_DIR_MODE);
+    }
+    // The staging dir carries the same ownership record the claim does, so a
+    // pid reused mid-launch cannot pass for this host. It travels into the
+    // published dir with the atomic rename.
+    writeSessionHostOwnerRecord(
+      stagingDirectory,
+      args.cli,
+      ownProcessStartTime,
+    );
+  } catch (error) {
+    if (!sessionHostSupported()) {
+      failUnavailable(error instanceof Error ? error.message : String(error));
+      return;
+    }
     fail();
     return;
   }
 
   setSessionLifecycleHooks({
     onSpawn: (session) => {
+      const token = sessionHostLaunchToken();
       meta = {
         id: args.id,
         cli: args.cli,
@@ -455,6 +744,8 @@ export const runSessionHost = (
         startedAtMs: session.startedAtMs,
         processStartTime: ownProcessStartTime,
         generation: session.generation,
+        ...(token === null ? {} : { launchToken: token }),
+        attached: attachedSockets.size > 0,
       };
       writeMeta();
     },
@@ -462,7 +753,9 @@ export const runSessionHost = (
   });
 
   let spawnFailed = false;
-  openSession(
+  // Native PTY startup yields before onSpawn writes metadata. Keep our
+  // claim and staging directory until the spawn has actually settled.
+  await openSession(
     {
       session_id: args.id,
       cli: args.cli,
@@ -483,80 +776,123 @@ export const runSessionHost = (
       },
     },
   );
+  // A short-lived PTY can call onEnd while openSession is still settling.
+  if (cleaned) return;
   if (spawnFailed || meta === null) {
     fail();
     return;
   }
 
   try {
-    server = Bun.serve({
-      unix: socketPath,
-      fetch: (request, current): Response | undefined => {
-        if (request.method !== "GET")
-          return new Response("not found", { status: 404 });
-        return current.upgrade(request, {
-          data: { stream: null, opened: false, drainWaiters: new Set() },
-        })
-          ? undefined
-          : new Response("websocket upgrade failed", { status: 400 });
-      },
-      websocket: {
-        open: (socket): void => {
-          socket.binaryType = "uint8array";
-        },
-        drain: (socket): void => {
-          const waiters = [...socket.data.drainWaiters];
-          socket.data.drainWaiters.clear();
-          for (const waiter of waiters) waiter.resolve();
-        },
-        message: (socket, message): void => {
-          try {
-            const stream = socket.data.stream;
-            if (typeof message !== "string") {
-              if (!socket.data.opened || stream === null) {
-                protocolError(socket);
-                return;
+    if (process.platform === "win32") {
+      const endpoint = localSessionEndpoint(
+        join(directory, "ctl.sock"),
+        "win32",
+      );
+      pipeServer = createWindowsSessionPipeServer(
+        endpoint,
+        (connection): void => {
+          let closeTimer: ReturnType<typeof setTimeout> | null = null;
+          let closeRequested = false;
+          const data: TSocketData = {
+            stream: null,
+            opened: false,
+            drainWaiters: new Set(),
+          };
+          const socket: TSocket = {
+            data,
+            sendBinary: (bytes): number => {
+              try {
+                return connection.write(
+                  encodeSessionPipeFrame({ kind: "binary", payload: bytes }),
+                );
+              } catch {
+                return 0;
               }
-              stream.receiveData(new Uint8Array(message));
-              return;
+            },
+            sendText: (text): number => {
+              try {
+                return connection.write(
+                  encodeSessionPipeFrame({ kind: "text", payload: text }),
+                );
+              } catch {
+                return 0;
+              }
+            },
+            close: (): void => {
+              if (closeRequested) return;
+              closeRequested = true;
+              closeTimer = setTimeout(
+                () => connection.close(),
+                EXIT_DRAIN_TIMEOUT_MS,
+              );
+              closeTimer.unref?.();
+            },
+          };
+          connection.onDrain(() => {
+            const waiters = [...socket.data.drainWaiters];
+            socket.data.drainWaiters.clear();
+            for (const waiter of waiters) waiter.resolve();
+          });
+          const decoder = new SessionPipeFrameDecoder();
+          connection.onData((chunk): void => {
+            try {
+              for (const frame of decoder.push(chunk)) {
+                if (
+                  frame.kind === "text" &&
+                  frame.payload === SESSION_PIPE_DRAIN_ACK
+                ) {
+                  if (closeTimer !== null) clearTimeout(closeTimer);
+                  connection.close();
+                  continue;
+                }
+                handleMessage(socket, frame.payload);
+              }
+            } catch {
+              protocolError(socket);
             }
-            const envelope: TEnvelope = JSON.parse(message) as TEnvelope;
-            if (!socket.data.opened) {
-              if (envelope.t !== "open") {
-                protocolError(socket);
-                return;
-              }
-              const open = parseAttachOpen(envelope.open, args);
-              if (open === null) {
-                protocolError(socket);
-                return;
-              }
-              const next = new SessionHostStream(socket);
-              socket.data.stream = next;
-              socket.data.opened = true;
-              bindSessionStream(next, open, {
-                onExit: (code) =>
-                  socket.sendText(JSON.stringify({ t: "exit", code })),
-              });
-              return;
-            }
-            if (envelope.t === "ctrl" && stream !== null)
-              stream.receiveCtrl(envelope.p);
-          } catch {
-            protocolError(socket);
-          }
+          });
+          connection.onClose(() => handleClosed(socket));
         },
-        close: (socket): void => {
-          const waiters = [...socket.data.drainWaiters];
-          socket.data.drainWaiters.clear();
-          for (const waiter of waiters)
-            waiter.reject(new Error("session host socket closed"));
-          socket.data.stream?.closed();
+      );
+      createSessionFile(socketPath, `${endpoint}\n`);
+    } else {
+      server = Bun.serve({
+        unix: socketPath,
+        fetch: (request, current): Response | undefined => {
+          if (request.method !== "GET")
+            return new Response("not found", { status: 404 });
+          return current.upgrade(request, {
+            data: { stream: null, opened: false, drainWaiters: new Set() },
+          })
+            ? undefined
+            : new Response("websocket upgrade failed", { status: 400 });
         },
-      },
-    });
+        websocket: {
+          open: (socket): void => {
+            socket.binaryType = "uint8array";
+          },
+          drain: (socket): void => {
+            const waiters = [...socket.data.drainWaiters];
+            socket.data.drainWaiters.clear();
+            for (const waiter of waiters) waiter.resolve();
+          },
+          message: (socket, message): void =>
+            handleMessage(
+              socket,
+              typeof message === "string" ? message : new Uint8Array(message),
+            ),
+          close: (socket): void => {
+            handleClosed(socket);
+          },
+        },
+      });
+    }
     publish();
-  } catch {
+  } catch (error) {
+    process.stderr.write(
+      `session-host: control endpoint startup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
     fail();
     return;
   }
@@ -604,6 +940,11 @@ export const runSessionHostProcess = (argv: readonly string[]): boolean => {
     // handled even when malformed, so it must never fall through to that path.
     return true;
   }
-  runSessionHost(args);
+  void runSessionHost(args).catch((error: unknown) => {
+    process.stderr.write(
+      `__session-host: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exit(1);
+  });
   return true;
 };

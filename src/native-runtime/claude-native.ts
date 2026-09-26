@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Claude native bridge — executes an eligible `claude_code` hop through the
  * OFFICIAL Claude Code runtime instead of exporting its OAuth bearer for a
@@ -40,7 +41,7 @@ import {
   newAnthropicStreamState,
 } from "@openllmsh/wire/providers/anthropic/streaming";
 import { Schema } from "effect";
-import { spawnCwd } from "../delegation/util";
+import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
@@ -194,12 +195,23 @@ export const runClaudeNative = async (
         ? ["--system-prompt", params.systemText]
         : []),
   ];
+  // Gate the vendor spawn on the isolated keychain being VERIFIED ready —
+  // `claude` resolves its credential through the isolated HOME's search
+  // list, and an unverified store is exactly the "A keychain cannot be
+  // found" hang this run exists to avoid.
+  const store = await ensureVendorKeychainReady(params.env, params.signal);
+  if (store.kind !== "present") {
+    return {
+      kind: "declined",
+      reason: `isolated credential store not ready (${store.kind === "indeterminate" ? store.cause : store.kind})`,
+    };
+  }
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     // The bridge reads claude's isolated login-keychain credential to serve the
     // request; securityd denies a Seatbelt-confined caller, so it runs
     // unconfined on macOS (confined on Linux) — `sandbox/policy.ts`.
-    proc = Bun.spawn(
+    proc = admittedSpawn(
       sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
       {
         stdin: new TextEncoder().encode(params.userText),

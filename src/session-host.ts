@@ -41,7 +41,7 @@ export const sessionStatusReport = async (): Promise<
     id: host.id,
     cli: host.cli,
     started_at_ms: host.startedAtMs,
-    attached: false,
+    attached: host.attached === true,
     live: true,
     busy: false,
     ...(host.title === null ? {} : { title: host.title }),

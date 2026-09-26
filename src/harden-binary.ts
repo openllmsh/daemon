@@ -9,8 +9,9 @@
  * signature is missing/invalid, so a future real (notarized) signature is
  * preserved. No-op off darwin. Best-effort: never throws into the caller.
  */
-import { execFileSync } from "node:child_process";
+
 import { logWarn } from "./logger";
+import { nodeExecFileSync as execFileSync } from "./windows-process";
 
 export const hardenMacBinary = (path: string): void => {
   if (process.platform !== "darwin") return;

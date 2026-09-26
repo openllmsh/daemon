@@ -45,6 +45,11 @@
  *                            default ON). Read/written by
  *                            `auto-update-pref.ts`; lives here so ALL daemon
  *                            config is in the one file.
+ * - `OPENLLM_UPDATE_CHANNEL` — reserved for a future update channel. Published
+ *                            prerelease binary replacement remains disabled
+ *                            until artifact routing is separate from the
+ *                            credentialed cloud origin and has its own digest
+ *                            policy. Stable binaries ignore this key.
  * - `OPENLLM_SESSION_IDLE_TIMEOUT_MIN` — detached PTY idle-reap window in
  *                            minutes (default `60`; `0` disables). Read by
  *                            `session-host.ts` from this same env file.
@@ -56,25 +61,32 @@
  * Pre-launch standalone API-key files are intentionally ignored; native
  * onboarding is the only credential source.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   chmodSync,
   closeSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
+import type { TUpdateRouteConfig } from "@openllmsh/protocol/update-policy";
+import { resolveUpdateSetting } from "@openllmsh/protocol/update-policy";
+import { processStartIdentity } from "../../pty-native/session/local-runtime";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
 // both sides only dereference the other's exports lazily inside functions.
 import { logWarn, safeDiagnosticMessage } from "./logger";
+import { DAEMON_VERSION } from "./version";
 
 export type TDaemonEnv = {
   /** The user's `sk-llm-...` key, or null until the dashboard sets it. */
@@ -127,14 +139,61 @@ const compiledCloudOrigin = (): string => {
 };
 
 /**
+ * Dev posture is a BUILD property, not a runtime switch. The only builds that
+ * may honor `OPENLLM_DAEMON_DEV` are source runs and `0.0.0-dev` sentinel
+ * builds (`compile:host` / `dev:dist` — see `DEV_VERSION_SENTINEL` in
+ * `scripts/compile.ts`). A release binary bakes a real
+ * `__OPENLLM_DAEMON_VERSION__`, so it can never be flipped into permissive
+ * dev behavior (local cloud origin, dev env-file isolation, dev token file)
+ * by an environment variable.
+ */
+export const isReleaseBuild = (): boolean => DAEMON_VERSION !== "0.0.0-dev";
+
+let warnedIgnoredDevFlag = false;
+
+/**
  * Dev mode (`OPENLLM_DAEMON_DEV=1`, set by `bun run dev:daemon`). Lets
  * the daemon boot from source with `bun --watch` without a full install:
  * the cloud origin defaults to the local Next server and a failed/absent
  * cloud bootstrap is non-fatal. The API key is NOT defaulted — you set a
  * real one from the dashboard's Providers tab (same as production), which
- * also exercises that flow during development. Never set in production.
+ * also exercises that flow during development. Never set in production —
+ * release builds refuse it outright (one-time warning).
  */
-export const isDevMode = (): boolean => process.env.OPENLLM_DAEMON_DEV === "1";
+export const isDevMode = (): boolean => {
+  if (process.env.OPENLLM_DAEMON_DEV !== "1") return false;
+  if (isReleaseBuild()) {
+    if (!warnedIgnoredDevFlag) {
+      warnedIgnoredDevFlag = true;
+      logWarn(
+        "env",
+        "release build ignores OPENLLM_DAEMON_DEV — dev mode is a build property",
+      );
+    }
+    return false;
+  }
+  return true;
+};
+
+/**
+ * The cloud origin must be HTTPS — plain HTTP is accepted only for a loopback
+ * gateway (`http://127.0.0.1`/`http://localhost`, the dev Next server and
+ * same-box test clouds). Anything else would put the user's `sk-llm` bearer —
+ * and self-update downloads — on the wire in cleartext for a network MITM.
+ * Same predicate the CLI enforces (`cli/src/self-update.ts`).
+ */
+export const isSecureOrigin = (raw: string): boolean => {
+  try {
+    const url = new URL(raw);
+    if (url.protocol === "https:") return true;
+    return (
+      url.protocol === "http:" &&
+      (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+    );
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Dev-mode `.dev.env` loading is special: when `OPENLLM_DAEMON_DEV=1`, existing
@@ -311,40 +370,600 @@ const lockWait = (): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
 };
 
+/**
+ * Shared env-file lock protocol `openllm-env-lock/v1` — the SAME protocol the
+ * shell installers implement in `packages/daemon/install.sh` and
+ * `packages/cli/install.sh` (the block is duplicated verbatim there; keep all
+ * three in sync).
+ *
+ * The lock is the DIRECTORY `<envfile>.lock.d`: `mkdir` is atomic on every
+ * POSIX filesystem (flock does not exist on macOS). Ownership is a record
+ * published atomically INSIDE the directory — written to `owner.tmp.<pid>`
+ * then renamed to `owner`:
+ *
+ *   kind=openllm-env-lock/v1 pid=<pid> start=<start identity> nonce=<hex>
+ *
+ * `start` is the owner's `ps -o lstart=` identity under LC_ALL=C TZ=UTC with
+ * whitespace collapsed to single spaces (`processStartIdentity`, normalised
+ * the same way) — it distinguishes a LIVE-but-reused pid from the real owner
+ * (PID reuse). A `-` records an owner that could not read its own identity.
+ *
+ * A held lock is STALE only when its marked owner record names a dead pid,
+ * or a live pid whose current start identity differs from the recorded one.
+ * A lock dir with no/unreadable/unmarked owner is HELD — the one exception
+ * is a dir older than the stale window that still has no complete owner
+ * (a holder killed between `mkdir` and publish), which may be reclaimed.
+ *
+ * Reclaim is an atomic `mv` of the lock dir to `<envfile>.lock.stale.<pid>.
+ * <nonce>` — exactly one contender wins the rename. The winner re-reads the
+ * owner INSIDE the quarantine: if it turns out to be live after all (it was
+ * published between the check and the move), it is moved back — but only
+ * when `.lock.d` still does not exist (rename is a no-replace), otherwise
+ * it stays quarantined. Either way acquisition is retried. Quarantine dirs
+ * older than the stale window are deleted during acquisition passes when
+ * their contents are only `owner.tmp.*` publish residue (or empty — the
+ * crash-between-mkdir-and-publish shape) or a complete marked owner record.
+ *
+ * Release moves `.lock.d` to `<envfile>.lock.rel.<pid>.<nonce>` first, then
+ * verifies the nonce inside matches before deleting — a holder whose lock
+ * was stolen/replaced never deletes a successor's lock: the moved dir holds
+ * the successor's record, the nonce differs, and it is moved back.
+ *
+ * The pre-dir `.env.lock` FILE format is still honoured for one release:
+ * a legacy file lock can never prove its owner's start identity, so it is
+ * HELD only inside the bounded reclaim window ({@link envLockStaleMs}) —
+ * while a recorded pid is alive or its content is unparseable — and is
+ * reclaimed past the window even when the pid is still alive. A dead-pid
+ * record is reclaimed ONLY by atomic rename to a unique quarantine name —
+ * the live path is never unlinked directly — then re-read inside the
+ * quarantine: a record that turns out to be live AND young is put back with
+ * a no-replace restore, never over a successor lock file.
+ */
+const ENV_LOCK_KIND = "openllm-env-lock/v1";
+const ENV_LOCK_MARKER = `kind=${ENV_LOCK_KIND}`;
+
+// Both knobs share the installers' exact rule: decimal digits AND > 0 —
+// "0" (or anything non-numeric, including "0x10"/"1e3") falls back to the
+// defaults, never a zero-length window.
+const envLockStaleMs = (): number => {
+  const raw = process.env.OPENLLM_ENV_LOCK_STALE_SECS;
+  if (raw !== undefined && /^[0-9]+$/.test(raw) && Number(raw) > 0) {
+    return Number(raw) * 1000;
+  }
+  return 600_000;
+};
+
+const envLockWaitMs = (): number => {
+  const raw = process.env.OPENLLM_ENV_LOCK_WAIT_SECS;
+  if (raw !== undefined && /^[0-9]+$/.test(raw) && Number(raw) > 0) {
+    return Number(raw) * 1000;
+  }
+  return 10_000;
+};
+
+export type TEnvLockOwner =
+  | {
+      readonly state: "marked";
+      readonly pid: number;
+      readonly start: string;
+      readonly nonce: string;
+    }
+  | { readonly state: "unmarked"; readonly pid: number | null };
+
+/**
+ * Read `<dir>/owner`. Unmarked covers a missing, unreadable or foreign
+ * record. Exported so the parity tests can feed the installers' shared bash
+ * `env_lock_read_owner` the same records and compare verdicts — the field
+ * rules are identical on both sides by contract.
+ */
+export const envLockReadOwner = (dir: string): TEnvLockOwner => {
+  let text = "";
+  try {
+    text = readFileSync(join(dir, "owner"), "utf-8").trim();
+  } catch {
+    text = "";
+  }
+  const marked = text.match(
+    /^kind=openllm-env-lock\/v1 pid=([0-9]+) start=(.+) nonce=([0-9a-fA-F]+)$/,
+  );
+  if (marked !== null) {
+    return {
+      state: "marked",
+      pid: Number(marked[1]),
+      start: marked[2],
+      nonce: marked[3],
+    };
+  }
+  // Unmarked — still surface any parseable pid for the live-pid guard, with
+  // the same token rule as the bash side: the first whitespace-bounded
+  // `pid=<digits>` token, else a leading bare-pid token.
+  const pidField =
+    text.match(/(?:^|\s)pid=([0-9]+)(?:\s|$)/)?.[1] ??
+    text.match(/^([0-9]+)(?:\s|$)/)?.[1];
+  const pid = pidField === undefined ? Number.NaN : Number(pidField);
+  return {
+    state: "unmarked",
+    pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+  };
+};
+
+/** Is `pid` a live process? EPERM means it exists but is owned by another user. */
+const envLockOwnerAlive = (pid: number): boolean => {
+  // kill(0,0) probes the caller's OWN process group — never a real owner.
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/**
+ * The owner's start identity, normalised exactly like the shell side
+ * (`ps -o lstart=` under LC_ALL=C TZ=UTC, whitespace collapsed). Tri-state:
+ * a string identity, null for a confirmed-dead pid, undefined when unknown.
+ */
+const envLockStartIdentity = (pid: number): string | null | undefined => {
+  const raw = processStartIdentity(pid);
+  if (typeof raw !== "string") return raw;
+  const value = raw.trim().replace(/\s+/g, " ");
+  return value.length > 0 ? value : undefined;
+};
+
+/** The shared staleness predicate — identical rules on both sides. */
+const envLockDirIsStale = (dir: string): boolean => {
+  const owner = envLockReadOwner(dir);
+  if (owner.state === "marked") {
+    if (!envLockOwnerAlive(owner.pid)) return true;
+    if (owner.start === "-") {
+      // The start identity can never be proven ("-"): the lock is held only
+      // inside the same bounded window an ownerless dir gets — past it a
+      // live-but-unidentifiable pid no longer wedges the lock.
+      try {
+        return Date.now() - lstatSync(dir).mtimeMs >= envLockStaleMs();
+      } catch {
+        return false;
+      }
+    }
+    // PID reuse: only a REAL recorded start compared against a successfully
+    // read current identity can prove the holder is gone. Anything unknown
+    // keeps the lock held.
+    const current = envLockStartIdentity(owner.pid);
+    return current !== null && current !== undefined && current !== owner.start;
+  }
+  // Unmarked: HELD unless the dir is old AND still has no complete owner —
+  // and never while a parseable pid in it is still alive.
+  let ageMs = Number.NaN;
+  try {
+    ageMs = Date.now() - lstatSync(dir).mtimeMs;
+  } catch {
+    return false;
+  }
+  if (!(ageMs >= envLockStaleMs())) return false;
+  if (owner.pid !== null && envLockOwnerAlive(owner.pid)) return false;
+  return true;
+};
+
+/** Move an apparently-stale lock dir aside; only one contender's rename wins. */
+const envLockQuarantine = (
+  lockDir: string,
+  stem: string,
+  nonce: string,
+): void => {
+  const quarantine = `${stem}.stale.${process.pid}.${nonce}`;
+  try {
+    renameSync(lockDir, quarantine);
+  } catch {
+    return; // another contender moved it first, or it was released.
+  }
+  // Re-read inside the quarantine: a live owner that raced publication is
+  // restored — but never over an existing lock dir (no-replace).
+  if (envLockDirIsStale(quarantine)) return;
+  try {
+    lstatSync(lockDir);
+    return; // a successor lock exists — leave it quarantined.
+  } catch {
+    // absent
+  }
+  try {
+    renameSync(quarantine, lockDir);
+  } catch {
+    // raced — leave it quarantined.
+  }
+};
+
+/**
+ * Delete old quarantine/release dirs whose contents are only `owner.tmp.*`
+ * publish residue (or NOTHING — a holder killed between the lock mkdir and
+ * the owner publish, then quarantined) or a complete marked owner record.
+ * Anything foreign — an unmarked owner, an unrelated file — keeps the dir.
+ * Exported as a protocol seam for the regression tests.
+ */
+export const envLockSweepQuarantine = (
+  parentDir: string,
+  baseName: string,
+): void => {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(parentDir);
+  } catch {
+    return;
+  }
+  const staleMs = envLockStaleMs();
+  for (const entry of entries) {
+    if (
+      !entry.startsWith(`${baseName}.lock.stale.`) &&
+      !entry.startsWith(`${baseName}.lock.rel.`)
+    )
+      continue;
+    const path = join(parentDir, entry);
+    let isDir = false;
+    let mtimeMs = 0;
+    try {
+      const stat = lstatSync(path);
+      isDir = stat.isDirectory();
+      mtimeMs = stat.mtimeMs;
+    } catch {
+      continue;
+    }
+    if (!isDir || Date.now() - mtimeMs < staleMs) continue;
+    // Contents must be limited to the owner record (+ an unfinished tmp).
+    // An OWNERLESS residue — a holder killed between the lock mkdir and the
+    // publish, then quarantined — is swept too when all it holds is
+    // `owner.tmp.*` files (or nothing); anything foreign keeps it.
+    let clean = true;
+    let hasOwner = false;
+    try {
+      for (const child of readdirSync(path)) {
+        if (child === "owner") hasOwner = true;
+        else if (!child.startsWith("owner.tmp.")) clean = false;
+      }
+    } catch {
+      clean = false;
+    }
+    if (!clean) continue;
+    if (hasOwner && envLockReadOwner(path).state !== "marked") continue;
+    for (const child of readdirSync(path)) {
+      try {
+        unlinkSync(join(path, child));
+      } catch {
+        // best effort
+      }
+    }
+    try {
+      rmdirSync(path);
+    } catch {
+      // best effort
+    }
+  }
+};
+
+/**
+ * Adjudicate a legacy lock file that was ALREADY moved into quarantine:
+ * re-read the CAPTURED record (the file may have been swapped between the
+ * caller's first read and the rename). A live pid means the moved file is a
+ * real lock — but it carries no provable start identity, so it is restored
+ * only while still inside the bounded reclaim window; a live pid PAST the
+ * window is dropped like a dead one. The restore is a no-replace
+ * (hardlink), never over a successor lock file. A dead/unparseable record
+ * is deleted — inside the quarantine, never on the live path. Returns true
+ * when the legacy path still blocks acquisition (a live record was found).
+ * Exported as a protocol seam for the regression tests.
+ */
+export const envLockLegacyResolveQuarantine = (
+  quarantinePath: string,
+  legacyPath: string,
+): boolean => {
+  let movedText = "";
+  try {
+    movedText = readFileSync(quarantinePath, "utf-8");
+  } catch {
+    movedText = "";
+  }
+  const movedPid = Number(movedText.trim().split(/\s+/)[0]);
+  let withinWindow = false;
+  if (
+    Number.isInteger(movedPid) &&
+    movedPid > 0 &&
+    envLockOwnerAlive(movedPid)
+  ) {
+    // No provable start identity: a live pid may hold the lock only inside
+    // the bounded window (an unreadable age stays conservative); past it
+    // the captured record is dropped, not restored.
+    withinWindow = true;
+    try {
+      withinWindow =
+        Date.now() - lstatSync(quarantinePath).mtimeMs < envLockStaleMs();
+    } catch {
+      // keep the conservative default
+    }
+  }
+  if (withinWindow) {
+    try {
+      // `link` is a true no-replace rename: it fails outright when a
+      // successor lock file already occupies the path.
+      linkSync(quarantinePath, legacyPath);
+      try {
+        unlinkSync(quarantinePath);
+      } catch {
+        // best effort — the record is restored either way
+      }
+    } catch {
+      // Either a successor holds the path or the fs took no hardlink. An
+      // O_EXCL create is the same strict no-replace guarantee (rename would
+      // not be — it silently replaces a successor that lands mid-check).
+      let restored = false;
+      let fd = -1;
+      try {
+        fd = openSync(legacyPath, "wx");
+        writeFileSync(fd, movedText);
+        closeSync(fd);
+        fd = -1;
+        restored = true;
+      } catch {
+        if (fd >= 0) {
+          try {
+            closeSync(fd);
+          } catch {
+            // best effort
+          }
+          // A half-written file must not masquerade as a lock — remove
+          // only OUR fresh create, never whatever a successor wrote.
+          try {
+            unlinkSync(legacyPath);
+          } catch {
+            // best effort
+          }
+        }
+      }
+      if (restored) {
+        try {
+          unlinkSync(quarantinePath);
+        } catch {
+          // best effort
+        }
+      } else {
+        try {
+          lstatSync(legacyPath);
+          // Occupied by a successor — the captured copy is obsolete.
+          try {
+            unlinkSync(quarantinePath);
+          } catch {
+            // best effort
+          }
+        } catch {
+          // Path free but the restore itself failed — keep the captured
+          // record quarantined so a later pass can retry.
+        }
+      }
+    }
+    return true;
+  }
+  try {
+    unlinkSync(quarantinePath);
+  } catch {
+    // best effort
+  }
+  return false;
+};
+
+/**
+ * The legacy `.env.lock` FILE format (pre-dir protocol): the record can
+ * never prove its owner's start identity, so it is HELD only inside the
+ * bounded reclaim window — while a recorded pid is alive or its content is
+ * unparseable — and reclaimed past the window even on a live pid. A
+ * dead-pid record is reclaimed WITHOUT check-then-unlink on the live path:
+ * an atomic rename to a unique quarantine name (exactly one contender
+ * wins), then {@link envLockLegacyResolveQuarantine} re-reads the captured
+ * file — so a live lock swapped in mid-check, or a successor's fresh file,
+ * can never be unlinked by us. Returns true while the legacy file still
+ * blocks acquisition.
+ */
+const envLockLegacyHeld = (legacyPath: string, nonce: string): boolean => {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let text: string;
+    try {
+      text = readFileSync(legacyPath, "utf-8");
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    const pid = Number(text.trim().split(/\s+/)[0]);
+    const pidProvenDead =
+      Number.isInteger(pid) && pid > 0 && !envLockOwnerAlive(pid);
+    if (!pidProvenDead) {
+      // A live pid — or a record that cannot be parsed at all — can never
+      // prove the owner's start identity: the lock is held only inside the
+      // bounded reclaim window, past which it is reclaimed like a stale dir.
+      let ageMs = Number.NaN;
+      try {
+        ageMs = Date.now() - lstatSync(legacyPath).mtimeMs;
+      } catch {
+        // the file exists but its age is unknown — stay held
+      }
+      if (!(ageMs >= envLockStaleMs())) return true;
+    }
+    const quarantine = `${legacyPath}.stale.${process.pid}.${nonce}.${attempt}`;
+    try {
+      renameSync(legacyPath, quarantine);
+    } catch {
+      continue; // it vanished or another contender moved it — re-read
+    }
+    if (envLockLegacyResolveQuarantine(quarantine, legacyPath)) return true;
+    // Verified dead and deleted — loop to re-check for a successor file.
+  }
+  return true; // could not stabilise this pass — treat as still held
+};
+
+/**
+ * Publish OUR owner record inside the just-mkdir'd lock dir — NO-REPLACE.
+ * A publisher paused between the mkdir and this call may have been
+ * quarantined and its path re-taken by a successor, and `rename` would
+ * silently stamp over the successor's record. `link` fails outright on an
+ * existing owner; the O_EXCL create carries the same guarantee where
+ * hardlinks do not work. Returns true ONLY when the live record afterwards
+ * carries OUR nonce — the dir may be swapped even after a successful link,
+ * so holding is never assumed from the write alone. A return of false means
+ * "did not acquire" (a successor owns this path — retry from the top);
+ * a throw means the tmp write itself failed. Exported as a protocol seam
+ * for the regression tests.
+ */
+export const envLockPublishOwner = (
+  lockDir: string,
+  nonce: string,
+): boolean => {
+  const start = envLockStartIdentity(process.pid) ?? "-";
+  const record = `${ENV_LOCK_MARKER} pid=${process.pid} start=${start} nonce=${nonce}\n`;
+  const tmp = join(lockDir, `owner.tmp.${process.pid}`);
+  const ownerPath = join(lockDir, "owner");
+  writeFileSync(tmp, record, "utf-8");
+  let published = false;
+  try {
+    linkSync(tmp, ownerPath);
+    published = true;
+  } catch {
+    // EEXIST means a successor owns this dir — never replace its record.
+    // Any other failure (no hardlink support) gets the same no-replace
+    // guarantee from an O_EXCL create.
+    let fd = -1;
+    try {
+      fd = openSync(ownerPath, "wx");
+      writeFileSync(fd, record);
+      closeSync(fd);
+      fd = -1;
+      published = true;
+    } catch {
+      if (fd >= 0) {
+        try {
+          closeSync(fd);
+        } catch {
+          // best effort
+        }
+        // A half-written create must not masquerade as an owner — remove
+        // only OUR fresh file, never a successor's record.
+        try {
+          unlinkSync(ownerPath);
+        } catch {
+          // best effort
+        }
+      }
+    }
+  }
+  try {
+    unlinkSync(tmp);
+  } catch {
+    // best effort — swept later either way
+  }
+  if (!published) return false;
+  const now = envLockReadOwner(lockDir);
+  return now.state === "marked" && now.nonce === nonce;
+};
+
 /** Serialize env-file read/modify/write operations across daemon processes. */
 const withEnvFileLock = (
   targetPath: string,
   operation: () => boolean,
 ): boolean => {
-  const lockPath = `${targetPath}.lock`;
+  const stem = `${targetPath}.lock`;
+  const lockDir = `${stem}.d`;
+  const parentDir = dirname(targetPath);
+  const baseName = basename(targetPath);
+  const nonce = randomUUID().replace(/-/g, "");
+  const deadline = Date.now() + envLockWaitMs();
+  let sweeps = 0;
   let acquired = false;
-  for (let attempts = 0; attempts < 500; attempts += 1) {
+  // Bounded cleanup once per acquire so quarantined residue cannot linger
+  // until the next contested acquire (identical trigger on the bash side).
+  envLockSweepQuarantine(parentDir, baseName);
+  while (Date.now() < deadline) {
+    if (envLockLegacyHeld(stem, nonce)) {
+      lockWait();
+      continue;
+    }
     try {
-      const fd = openSync(lockPath, "wx", 0o600);
-      closeSync(fd);
-      acquired = true;
-      break;
+      mkdirSync(lockDir);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-      // A process killed while holding the lock must not block configuration forever.
+      sweeps += 1;
+      if (sweeps % 25 === 0) envLockSweepQuarantine(parentDir, baseName);
       try {
-        const lock = lstatSync(lockPath);
-        if (lock.isFile() && Date.now() - lock.mtimeMs > 30_000)
-          unlinkSync(lockPath);
+        if (envLockDirIsStale(lockDir)) {
+          envLockQuarantine(lockDir, stem, nonce);
+        }
       } catch {
         // Another writer may have released/replaced it; retry normally.
       }
       lockWait();
+      continue;
     }
+    // Publish the owner record atomically inside the new lock dir —
+    // NO-REPLACE: if our dir was quarantined and the path re-taken by a
+    // successor while we were paused, the publish must fail rather than
+    // stamp over the successor's record.
+    let published: boolean;
+    try {
+      published = envLockPublishOwner(lockDir, nonce);
+    } catch {
+      // The tmp write itself failed — drop the lock WE made rather than
+      // hold it unmarked.
+      try {
+        unlinkSync(join(lockDir, `owner.tmp.${process.pid}`));
+      } catch {
+        // best effort
+      }
+      try {
+        rmdirSync(lockDir);
+      } catch {
+        // best effort
+      }
+      return false;
+    }
+    if (!published) {
+      // A successor owns the dir at this path (or it was swapped
+      // mid-publish) — NOT ours to remove. Retry acquisition from the top.
+      lockWait();
+      continue;
+    }
+    acquired = true;
+    break;
   }
   if (!acquired) return false;
   try {
     return operation();
   } finally {
+    // Release = rename to `.rel.<pid>.<nonce>` first, then delete ONLY when
+    // the owner record inside is provably ours — a stolen/replaced lock
+    // holds a successor's record, which we put back instead of deleting.
+    const released = `${stem}.rel.${process.pid}.${nonce}`;
     try {
-      unlinkSync(lockPath);
+      renameSync(lockDir, released);
+      const owner = envLockReadOwner(released);
+      if (owner.state === "marked" && owner.nonce === nonce) {
+        for (const child of readdirSync(released)) {
+          try {
+            unlinkSync(join(released, child));
+          } catch {
+            // best effort
+          }
+        }
+        try {
+          rmdirSync(released);
+        } catch {
+          // best effort
+        }
+      } else {
+        try {
+          lstatSync(lockDir);
+        } catch {
+          try {
+            renameSync(released, lockDir);
+          } catch {
+            // leave it quarantined
+          }
+        }
+      }
     } catch {
-      // Best effort: stale-lock recovery above prevents a permanent wedge.
+      // The lock dir vanished under us (stolen/quarantined) — nothing held.
     }
   }
 };
@@ -403,6 +1022,102 @@ const updatedEnvLines = (
 };
 
 /**
+ * Codes a win32 directory fsync fails with although the rename is durable.
+ * Node/libuv can only open a directory read-only (FILE_FLAG_BACKUP_SEMANTICS),
+ * and FlushFileBuffers needs a GENERIC_WRITE handle, so it returns
+ * ERROR_ACCESS_DENIED, which libuv maps to EPERM (nodejs/node#3879). NTFS
+ * journals the rename's metadata, so there is nothing further to flush.
+ */
+const WIN32_UNSUPPORTED_DIR_FSYNC = new Set(["EPERM", "EISDIR", "EINVAL"]);
+
+/**
+ * Flush the directory entry created by a rename. POSIX failures are always
+ * reported; on win32 only the "directory fsync unsupported" codes are ignored.
+ */
+const fsyncDirectory = (dir: string): void => {
+  const directoryFd = openSync(dir, "r");
+  try {
+    fsyncSync(directoryFd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (
+      process.platform === "win32" &&
+      code !== undefined &&
+      WIN32_UNSUPPORTED_DIR_FSYNC.has(code)
+    )
+      return;
+    throw error;
+  } finally {
+    closeSync(directoryFd);
+  }
+};
+
+/**
+ * Rename-swap `content` onto `targetPath` through a unique same-directory
+ * `0600` temporary file. The caller MUST hold `withEnvFileLock(targetPath)`
+ * and MUST already have accepted the target — the target is re-validated
+ * immediately before the swap so a symlink planted mid-write is still
+ * refused. fsyncs the file and the directory so a crash can't resurrect an
+ * absent or torn write.
+ */
+const replaceFileAtomic0600 = (
+  targetPath: string,
+  content: string,
+): boolean => {
+  const parentDir = dirname(targetPath);
+  const temporaryPath = join(
+    parentDir,
+    `.${basename(targetPath) || "env"}.${randomUUID()}.tmp`,
+  );
+  let temporaryFd: number | null = null;
+  try {
+    temporaryFd = openSync(temporaryPath, "wx", 0o600);
+    writeFileSync(temporaryFd, content, "utf-8");
+    fsyncSync(temporaryFd);
+    closeSync(temporaryFd);
+    temporaryFd = null;
+    // Re-check immediately before replacement to reject a target swapped for
+    // a symlink by another local process while this writer held the lock.
+    if (!isSafeEnvTarget(targetPath)) return false;
+    renameSync(temporaryPath, targetPath);
+    chmodSync(targetPath, 0o600);
+    fsyncDirectory(parentDir);
+    return true;
+  } finally {
+    if (temporaryFd !== null) closeSync(temporaryFd);
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The rename consumed it, or creation failed.
+    }
+  }
+};
+
+/**
+ * Atomically create-or-replace a private `0600` file without following a
+ * pre-existing symlink or other non-regular target (existing targets are
+ * required to be regular files; a symlink — or anything else — is refused
+ * outright rather than written through). The write path shared by the env
+ * upsert and the per-boot local caller token.
+ */
+export const writePrivateFileAtomic = (
+  targetPath: string,
+  content: string,
+): boolean => {
+  try {
+    mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
+    return withEnvFileLock(
+      targetPath,
+      () =>
+        isSafeEnvTarget(targetPath) &&
+        replaceFileAtomic0600(targetPath, content),
+    );
+  } catch {
+    return false;
+  }
+};
+
+/**
  * Atomically upsert env values without following links or losing concurrent
  * updates. Existing targets are required to be regular files and every success
  * leaves a private `0600` file.
@@ -414,8 +1129,7 @@ export const writeEnvFileVars = (
   if (Object.values(updates).some((value) => /[\r\n\0]/.test(value)))
     return false;
   try {
-    const parentDir = dirname(targetPath);
-    mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+    mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
     return withEnvFileLock(targetPath, () => {
       if (!isSafeEnvTarget(targetPath)) return false;
       let existing: string[] = [];
@@ -425,37 +1139,7 @@ export const writeEnvFileVars = (
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
       }
       const content = `${updatedEnvLines(existing, updates).join("\n")}\n`;
-      const temporaryPath = join(
-        parentDir,
-        `.${targetPath.split("/").at(-1) ?? "env"}.${randomUUID()}.tmp`,
-      );
-      let temporaryFd: number | null = null;
-      try {
-        temporaryFd = openSync(temporaryPath, "wx", 0o600);
-        writeFileSync(temporaryFd, content, "utf-8");
-        fsyncSync(temporaryFd);
-        closeSync(temporaryFd);
-        temporaryFd = null;
-        // Re-check immediately before replacement to reject a target swapped for
-        // a symlink by another local process while this writer held the lock.
-        if (!isSafeEnvTarget(targetPath)) return false;
-        renameSync(temporaryPath, targetPath);
-        chmodSync(targetPath, 0o600);
-        const directoryFd = openSync(parentDir, "r");
-        try {
-          fsyncSync(directoryFd);
-        } finally {
-          closeSync(directoryFd);
-        }
-        return true;
-      } finally {
-        if (temporaryFd !== null) closeSync(temporaryFd);
-        try {
-          unlinkSync(temporaryPath);
-        } catch {
-          // The rename consumed it, or creation failed.
-        }
-      }
+      return replaceFileAtomic0600(targetPath, content);
     });
   } catch {
     return false;
@@ -550,9 +1234,23 @@ export const daemonEnv = (): TDaemonEnv => {
   // Precedence: an explicit env var (the installed prod daemon sets it, and a
   // dev-adopted origin persists here via `setCloudOrigin`) wins; then the
   // default.
-  const cloudOrigin = (
+  // Refuse an insecure configured origin (http:// off-loopback, or an
+  // unparseable value): the daemon sends `Bearer <apiKey>` to this origin on
+  // every cloud call and self-updates from it, so honoring cleartext HTTP is
+  // key exfiltration plus a MITM code-exec path. Fall back to the secure
+  // compiled/dev default rather than wedging the process — the key is then
+  // only ever sent over TLS (or to a loopback dev gateway).
+  const configuredOrigin = (
     process.env.OPENLLM_CLOUD_ORIGIN ?? originDefault
   ).replace(/\/+$/, "");
+  let cloudOrigin = configuredOrigin;
+  if (!isSecureOrigin(cloudOrigin)) {
+    logWarn(
+      "env",
+      `refusing insecure OPENLLM_CLOUD_ORIGIN (${configuredOrigin}) — the cloud origin must be https (http is allowed only for 127.0.0.1/localhost); using ${originDefault} instead`,
+    );
+    cloudOrigin = originDefault;
+  }
   cached = {
     apiKey: loadApiKey(),
     cloudOrigin,
@@ -561,6 +1259,21 @@ export const daemonEnv = (): TDaemonEnv => {
     ).replace(/\/+$/, ""),
   };
   return cached;
+};
+
+/** Resolved update-channel inputs; compiled cloud defaults are not explicit. */
+export const daemonUpdateRoute = (): TUpdateRouteConfig => {
+  loadEnvFile();
+  const env = daemonEnv();
+  return {
+    channel: resolveUpdateSetting(
+      process.env.OPENLLM_UPDATE_CHANNEL,
+      undefined,
+    ),
+    gatewayOrigin: env.cloudOrigin,
+    gatewayOriginExplicit:
+      (process.env.OPENLLM_CLOUD_ORIGIN?.trim().length ?? 0) > 0,
+  };
 };
 
 /**
@@ -608,6 +1321,100 @@ export const setApiKey = (key: string | null): void => {
 export const hasApiKey = (): boolean => daemonEnv().apiKey !== null;
 
 /**
+ * Per-boot shared secret for first-party LOCAL callers of `/v1/*` (SP-1).
+ * Minted once per daemon process (rotating on every restart bounds a leaked
+ * token's lifetime to one boot) and persisted `0600` under the state dir, so
+ * every OpenLLM component running as this OS user — the `openllm` CLI, the
+ * vendor-CLI launch envs it writes, the native runtime, and the daemon's own
+ * mux dispatch — can read and present it. Other local users (a different
+ * uid) and anything off-box cannot; a blind cross-site POST cannot guess it.
+ *
+ * The dev daemon gets a sibling file so it never clobbers the installed
+ * daemon's token (same split as `.env` vs `.dev.env`).
+ */
+const LOCAL_CALLER_TOKEN_FILE = "local-caller-token";
+
+/** Where the local caller token is persisted (0600, same-uid readers only). */
+export const localCallerTokenFilePath = (): string =>
+  join(
+    stateDir(),
+    isDevMode() ? `${LOCAL_CALLER_TOKEN_FILE}.dev` : LOCAL_CALLER_TOKEN_FILE,
+  );
+
+let cachedLocalCallerToken: string | null = null;
+
+const persistLocalCallerToken = (token: string, filePath: string): void => {
+  if (!writePrivateFileAtomic(filePath, token)) {
+    logWarn(
+      "env",
+      safeDiagnosticMessage`failed to persist the local caller token`,
+    );
+  }
+};
+
+const pathEntryExists = (path: string): boolean => {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export const localCallerToken = (): string => {
+  const filePath = localCallerTokenFilePath();
+  if (cachedLocalCallerToken !== null) {
+    // The file is the handoff to sibling first-party components — if it
+    // vanished (external cleanup, or a test re-pointed the state dir)
+    // re-persist the SAME token rather than silently diverging. A symlink
+    // standing in its place is never written through: the atomic writer
+    // refuses unsafe targets and the in-memory token stays authoritative.
+    if (!pathEntryExists(filePath)) {
+      persistLocalCallerToken(cachedLocalCallerToken, filePath);
+    }
+    return cachedLocalCallerToken;
+  }
+  const token = randomBytes(32).toString("hex");
+  persistLocalCallerToken(token, filePath);
+  cachedLocalCallerToken = token;
+  return token;
+};
+
+/**
+ * Timing-safe check that `value` equals this daemon's local caller token.
+ * Used by the `/v1/*` caller-auth design: first-party clients present the
+ * token, and `forward.ts` swaps it for the real `sk-llm` key before the
+ * cloud sees it (the token is meaningless upstream).
+ */
+export const isLocalCallerCredential = (value: string): boolean => {
+  const expected = localCallerToken();
+  if (value.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(value), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Timing-safe check that `value` equals this daemon's configured API key —
+ * the second accepted `/v1/*` credential. Vendor CLIs the daemon launches
+ * inherit `OPENLLM_API_KEY` and already present it as their Bearer /
+ * `x-api-key`, so the keyless-device gate must accept it or first-party
+ * inference breaks. Null-safe: a keyless daemon (signed-out device, dev
+ * bootstrap) matches nothing.
+ */
+export const isDaemonApiKeyCredential = (value: string): boolean => {
+  const expected = daemonEnv().apiKey;
+  if (expected === null || value.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(value), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+};
+
+/**
  * Re-point the daemon's cloud origin at runtime (DEV only — gated by the
  * caller in `control.ts`). PERSISTS the choice (so it survives a restart)
  * and updates the in-memory cache so the next bootstrap, usage record, and
@@ -618,6 +1425,15 @@ export const hasApiKey = (): boolean => daemonEnv().apiKey !== null;
 export const setCloudOrigin = (origin: string): void => {
   const trimmed = origin.replace(/\/+$/, "");
   if (trimmed.length === 0) return;
+  // Never persist an origin the daemon must refuse at read time (NET-4):
+  // http:// is accepted only for loopback dev gateways.
+  if (!isSecureOrigin(trimmed)) {
+    logWarn(
+      "env",
+      `refusing to set insecure OPENLLM_CLOUD_ORIGIN (${trimmed}) — the cloud origin must be https (http is allowed only for 127.0.0.1/localhost)`,
+    );
+    return;
+  }
   // Persist into the shared env file (single source; `loadEnvFile` is source-aware
   // in dev), so mirror into process.env too. A failed write is surfaced but
   // non-fatal — the in-memory update below still applies for this process; only

@@ -19,6 +19,7 @@ import type {
 import { normalizeProviderConnection } from "@openllmsh/protocol";
 import { setVerifiedLoginAdmitter } from "./auth-events";
 import { autoUpdateEnabled } from "./auto-update-pref";
+import { requestedPtyBackend } from "./bs-pty";
 import { getCloudState } from "./config";
 import type { TDeadlineBudget } from "./deadline-budget";
 import {
@@ -770,6 +771,7 @@ const computeStatusFreshInner = async (
     // Device chat sessions (feature §2.2): whether this box can host a
     // PTY, and the sessions it currently holds (live/dormant).
     pty_supported: ptySupported(),
+    pty_backend: requestedPtyBackend(),
     sessions: await sessionStatusReport(),
   };
 };

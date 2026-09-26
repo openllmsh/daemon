@@ -5,7 +5,7 @@
  * prefers the user systemd journal when its unit is registered, then falls back
  * to the same state-dir files for from-source and non-systemd installations.
  */
-import { spawn, spawnSync } from "node:child_process";
+
 import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -13,6 +13,10 @@ import {
   daemonStdoutLogFilePath,
   logFilePath,
 } from "./env";
+import {
+  nodeSpawn as spawn,
+  nodeSpawnSync as spawnSync,
+} from "./windows-process";
 
 /** Initial tail length when `-n`/`--lines` isn't given. */
 export const DEFAULT_LOG_LINES = 200;

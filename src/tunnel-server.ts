@@ -32,6 +32,8 @@ import {
   tunnelResponseHeadersFromHttp,
 } from "@openllmsh/protocol";
 import type { TServeTunnel } from "@openllmsh/tunnel/streams";
+import { LOCAL_CALLER_TOKEN_HEADER } from "./cors";
+import { localCallerToken } from "./env";
 import { handleInference } from "./listener";
 import { logWarn } from "./logger";
 import { beginRequest, endRequest } from "./self-update";
@@ -85,6 +87,11 @@ const forwardedHeaders = (open: {
   readonly headers?: TTunnelForwardHeaders;
 }): Headers => {
   const headers = new Headers();
+  // Mux dispatch runs the SAME `/v1/*` path as a loopback client, and that
+  // surface now authenticates callers — stamp THIS daemon's per-boot local
+  // caller token (never the consumer's; the serving daemon owns the request
+  // once it crosses the relay).
+  headers.set(LOCAL_CALLER_TOKEN_HEADER, localCallerToken());
   if (open.headers?.media_persistence === MEDIA_PERSISTENCE_BROWSER)
     headers.set(MEDIA_PERSISTENCE_REQUEST_HEADER, MEDIA_PERSISTENCE_BROWSER);
   headers.set("content-type", open.headers?.content_type ?? "application/json");

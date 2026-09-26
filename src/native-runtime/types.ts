@@ -27,6 +27,7 @@ import type {
   TCooldownReason,
 } from "@openllmsh/protocol";
 import { stateDir } from "../env";
+import { childEnvironment } from "../sandbox/child-policy";
 
 /**
  * The subscription providers served by the native runtime FIRST — `claude_code`
@@ -41,8 +42,9 @@ import { stateDir } from "../env";
  * Two non-obvious requirements make `claude -p` work with the isolated home
  * (see `claude-native.ts` + `cleanNativeSpawnEnv`): NO `--bare` flag (it drops
  * the setting sources that carry the subscription credential → "Not logged
- * in"), and the FULL session env minus auth-poison (macOS keychain access
- * needs the real env, not an `env -i` minimal one).
+ * in"), and a session env that still carries the host-neutral vars the
+ * runtime needs (HOME + PATH + temp + locale — macOS keychain reads resolve
+ * by HOME path; a bare `env -i` spawn starves them).
  */
 export type TNativeRuntimeProvider =
   | "claude_code"
@@ -73,48 +75,197 @@ export const isNativeRuntimeProvider = (
   provider: string,
 ): provider is TNativeRuntimeProvider => NATIVE_PROVIDERS.has(provider);
 
-/** Env-var name prefixes/keys that override a vendor runtime's OWN
- *  subscription credential resolution — dropping them forces the runtime onto
- *  its official login (keychain / auth.json) instead of an ambient API key or
- *  a redirected base URL that would 401 as "Not logged in". */
-const POISON_PREFIX = /^(ANTHROPIC_|OPENAI_)/;
-const POISON_KEYS: ReadonlySet<string> = new Set([
-  "CLAUDE_CODE_API_KEY",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CODEX_API_KEY",
+/**
+ * The ambient env keys a native vendor child may INHERIT — the host-neutral
+ * set a CLI genuinely needs: binary lookup (`PATH`), locale, temp dirs, and
+ * the corporate-egress proxy/CA knobs (without them a vendor runtime cannot
+ * reach its API at all behind a MITM proxy). Everything else stays OUT:
+ *   - daemon keys (`OPENLLM_*`) and the daemon-authority prefixes the
+ *     sandbox shim's `childEnvironment` also strips (`PRIVATE_PLANE_*`,
+ *     `RELAY_*`, `DEVICE_GRANT_*`),
+ *   - vendor auth overrides (`ANTHROPIC_*` / `OPENAI_*` / token keys) that
+ *     Bun's auto-loaded `.env*` or the ambient shell can inject and which
+ *     would override the runtime's OWN subscription credential resolution,
+ *     401-ing as "Not logged in",
+ *   - session/agent authority (`SSH_AUTH_SOCK`, `DBUS_*`, GUI display vars),
+ *   - loader-injection knobs (`LD_*`, `DYLD_*`, `NODE_OPTIONS`).
+ * This is an ALLOWLIST, not a denylist: the leak class is "any key the daemon
+ * or the user's shell adds later" — a denylist only covers keys known today.
+ * Vendor-specific knobs never come through ambient inheritance; they arrive
+ * via the isolated `cliEnv` overlay below (HOME, config dir, TMPDIR, provider
+ * env — see `cli-paths.ts` `SPECS`).
+ */
+const POSIX_AMBIENT_KEYS: ReadonlySet<string> = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "TERM",
+  "COLORTERM",
+  "TERM_PROGRAM",
+  "LANG",
+  "LANGUAGE",
+  "TZ",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+  "REQUESTS_CA_BUNDLE",
+  "CURL_CA_BUNDLE",
+  // Text-encoding hint launchd stamps on every macOS user process.
+  "__CF_USER_TEXT_ENCODING",
 ]);
 
 /**
- * The spawn env for a native vendor runtime: INHERIT the full `process.env`
- * (macOS keychain access needs the real session env — an `env -i`-style
- * minimal env breaks `claude -p`'s credential read), then DROP the auth
- * poison (`ANTHROPIC_*` / `OPENAI_*` / token keys that Bun's auto-loaded
- * `.env*` or the ambient shell can inject and which would override the
- * runtime's subscription login), and finally overlay the isolated CLI env
- * (`cliEnv(...)`: HOME, config-dir, TMPDIR) so the runtime uses the daemon's
- * OWN account state, not the user's interactive one.
+ * Same contract on Windows, where env names are case-INSENSITIVE: the lookup
+ * upper-cases each ambient name before membership-testing, so this list is
+ * upper-case. Includes the system vars a Windows child needs to resolve
+ * system DLLs, its command interpreter, and exec-able suffixes.
+ */
+const WINDOWS_AMBIENT_KEYS: ReadonlySet<string> = new Set([
+  "PATH",
+  "PATHEXT",
+  "COMSPEC",
+  "SYSTEMROOT",
+  "SYSTEMDRIVE",
+  "WINDIR",
+  "OS",
+  "TEMP",
+  "TMP",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "PUBLIC",
+  "ALLUSERSPROFILE",
+  "USERNAME",
+  "USERDOMAIN",
+  "USERDOMAIN_ROAMINGPROFILE",
+  "COMPUTERNAME",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "COMMONPROGRAMFILES",
+  "COMMONPROGRAMFILES(X86)",
+  "COMMONPROGRAMW6432",
+  "PSMODULEPATH",
+  "PROCESSOR_ARCHITECTURE",
+  "PROCESSOR_ARCHITEW6432",
+  "PROCESSOR_IDENTIFIER",
+  "PROCESSOR_LEVEL",
+  "PROCESSOR_REVISION",
+  "NUMBER_OF_PROCESSORS",
+  "LANG",
+  "TZ",
+  "TERM",
+  "COLORTERM",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+]);
+
+/**
+ * TEST-ONLY seam: ambient env keys a test has explicitly registered to inherit
+ * (on top of the allowlist) — the narrow channel for fake-CLI fixture knobs
+ * such as `FAKE_MUSE_LOGIN_MODE` that drive mock vendor binaries in transport
+ * login tests. There is deliberately NO environment trigger: the set is
+ * populated only by calling this function, and it is consulted only while
+ * `NODE_ENV === "test"` (which `bun test` always sets), so nothing about a
+ * production daemon's environment can widen the ambient allowlist. The
+ * `childEnvironment` authority-prefix strip still runs afterwards, so even a
+ * registered `OPENLLM_*` key can never reach the child. Tests must reset with
+ * `setAmbientPassthroughKeysForTests(null)` in `afterEach`.
+ */
+let ambientPassthroughKeysForTests: ReadonlySet<string> | null = null;
+
+/** Only fake-CLI fixture knobs may be passed through; anything else (vendor
+ *  secrets such as `META_API_KEY`, loader or authority variables) is refused
+ *  even in tests. */
+const TEST_PASSTHROUGH_KEY = /^FAKE_[A-Z0-9_]+$/;
+
+export const setAmbientPassthroughKeysForTests = (
+  keys: readonly string[] | null,
+): void => {
+  if (keys !== null) {
+    const bad = keys.filter((key) => !TEST_PASSTHROUGH_KEY.test(key));
+    if (bad.length > 0)
+      throw new Error(
+        `test env passthrough accepts only FAKE_* fixture keys, got: ${bad.join(", ")}`,
+      );
+  }
+  ambientPassthroughKeysForTests = keys === null ? null : new Set(keys);
+};
+
+/** Consulted only under `NODE_ENV === "test"` — fail-closed in production. */
+const testPassthroughAllowed = (key: string): boolean =>
+  process.env.NODE_ENV === "test" &&
+  ambientPassthroughKeysForTests !== null &&
+  ambientPassthroughKeysForTests.has(key);
+
+/** Locale categories (`LC_ALL`, `LC_CTYPE`, …) pass as a family on every
+ *  platform; the rest of the ambient contract is the per-platform set. */
+const ambientKeyAllowed = (key: string, win: boolean): boolean =>
+  key.startsWith("LC_") ||
+  (win ? WINDOWS_AMBIENT_KEYS : POSIX_AMBIENT_KEYS).has(key) ||
+  testPassthroughAllowed(key);
+
+/**
+ * The spawn env for a native vendor runtime: INHERIT ONLY the allowlisted
+ * ambient vars, overlay the isolated CLI env (`cliEnv(...)`: HOME, config-dir,
+ * TMPDIR, provider knobs) so the runtime uses the daemon's OWN account state,
+ * then strip the daemon-authority prefixes (`childEnvironment`:
+ * `OPENLLM_*`/`PRIVATE_PLANE_*`/`RELAY_*`/`DEVICE_GRANT_*`) from the MERGED
+ * map — an ambient OR overlay-sourced `OPENLLM_API_KEY` must never reach the
+ * vendor binary. The `--sandbox-exec` shim re-strips the same prefixes
+ * pre-exec, but the SDK `query()` tool path and unwrapped spawns have no
+ * shim, so the guarantee has to live here.
  */
 export const cleanNativeSpawnEnv = (
   cliEnv: Record<string, string>,
+  ambient: Readonly<Record<string, string | undefined>> = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): Record<string, string> => {
-  const base: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
+  const win = platform === "win32";
+  // Typed as ProcessEnv (Bun's type requires NODE_ENV) so it can be handed to
+  // childEnvironment; every value written below is a defined string.
+  const merged = {} as NodeJS.ProcessEnv;
+  for (const [key, value] of Object.entries(ambient)) {
     if (value === undefined) continue;
-    if (POISON_PREFIX.test(key) || POISON_KEYS.has(key)) continue;
-    base[key] = value;
+    if (!ambientKeyAllowed(win ? key.toUpperCase() : key, win)) continue;
+    merged[key] = value;
   }
-  return {
-    ...base,
-    // Pin the daemon's REAL state dir so any openllm daemon code the child
-    // (or a child's child) runs resolves `~/.openllm` to the real location —
-    // NOT `<isolated HOME>/.openllm`. Without this, a child computing
-    // `stateDir()` under the isolated HOME recursively creates
-    // `<iso home>/.openllm/cli/<provider>/home`. (openllm uses `homedir()`
-    // directly and ignores this — the `--strict-mcp-config`/`--setting-sources
-    // ""` flags keep the openllm MCP from loading on the inference path.)
-    OPENLLM_DAEMON_STATE_DIR: stateDir(),
-    ...cliEnv,
-  };
+  for (const [key, value] of Object.entries(cliEnv)) merged[key] = value;
+  // childEnvironment's `NodeJS.ProcessEnv` values are all strings here — the
+  // delete pass only removes keys.
+  const child = childEnvironment(merged) as Record<string, string>;
+  // Pin the daemon's REAL state dir so any openllm daemon code the child
+  // (or a child's child) runs resolves `~/.openllm` to the real location —
+  // NOT `<isolated HOME>/.openllm`. Without this, a child computing
+  // `stateDir()` under the isolated HOME recursively creates
+  // `<iso home>/.openllm/cli/<provider>/home`. `childEnvironment` strips it
+  // with the rest of `OPENLLM_*`; this is the ONE deliberate, non-secret
+  // knob. (openllm uses `homedir()` directly and ignores this — the
+  // `--strict-mcp-config`/`--setting-sources ""` flags keep the openllm MCP
+  // from loading on the inference path.)
+  child.OPENLLM_DAEMON_STATE_DIR = stateDir();
+  return child;
 };
 
 /**

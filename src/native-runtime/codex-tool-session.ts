@@ -25,6 +25,7 @@
  * protocol `callId` (not positional — unlike the Claude path's earlier bug).
  */
 
+import { randomBytes } from "node:crypto";
 import type { TServerSearchCall } from "@openllmsh/protocol";
 import type {
   TClientTool,
@@ -78,6 +79,8 @@ type THeld = {
    *  the turn into a new message. */
   sawDelta: boolean;
   lastUsed: number;
+  /** Rotated at each pause; call ids alone never authorize disposal. */
+  continuationToken: string | null;
 };
 
 /** Held (paused) turns, indexed by EACH pending tool callId. */
@@ -211,6 +214,7 @@ export const startCodexToolTurn = async (
     usage: undefined,
     sawDelta: false,
     lastUsed: nowMs(),
+    continuationToken: null,
   };
   attachSink(h);
 
@@ -238,6 +242,44 @@ export const startCodexToolTurn = async (
  *  results (e.g. loaded Skill instructions) — the paused `item/tool/call` is
  *  the only channel back into the live turn, so it rides the LAST answer as
  *  an extra `inputText` content item instead of being dropped. */
+/**
+ * Dispose the held codex turn these call ids belong to. Used when a
+ * continuation is REJECTED for a reason that ends the turn for good (the
+ * walker serves the hop through the manual transport), so nobody will answer
+ * the paused `item/tool/call`. Leaving it parked blocks a turn inside the
+ * SHARED app-server process until the idle TTL, so the paused call is answered
+ * with a failure — the same shutdown `evictStale` performs. Returns whether a
+ * session was closed.
+ */
+export const disposeHeldCodexToolSession = (
+  callIds: ReadonlyArray<string>,
+  continuationToken: string | null,
+): boolean => {
+  if (!continuationToken) return false;
+  const closed = new Set<THeld>();
+  for (const id of callIds) {
+    const h = held.get(id);
+    if (
+      h === undefined ||
+      h.continuationToken !== continuationToken ||
+      h.lastUsed + HELD_TTL_MS <= nowMs() ||
+      closed.has(h)
+    )
+      continue;
+    closed.add(h);
+    for (const [, requestId] of h.pending) {
+      h.client.respondToServer(requestId, {
+        contentItems: [{ type: "inputText", text: "(cancelled)" }],
+        success: false,
+      });
+    }
+    h.pending.clear();
+    h.client.removeSink(h.threadId);
+    dropIndex(h);
+  }
+  return closed.size > 0;
+};
+
 export const continueCodexToolTurn = async (
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
   injectedContext: string | null = null,
@@ -351,10 +393,12 @@ const pauseReturn = (
   serverSearchCalls: ReadonlyArray<TServerSearchCall>,
 ): TToolTurnResult => {
   h.lastUsed = nowMs();
+  h.continuationToken = randomBytes(32).toString("base64url");
   return {
     kind: "tool_calls",
     text,
     toolCalls,
+    continuationToken: h.continuationToken,
     ...(h.usage ? { usage: h.usage } : {}),
     ...(serverSearchCalls.length > 0 ? { serverSearchCalls } : {}),
   };

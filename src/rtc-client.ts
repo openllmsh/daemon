@@ -1,10 +1,11 @@
 /**
  * Daemon-side WebRTC data-channel consumer for fleet subscription hops.
  *
- * A fleet daemon offers directly to a peer daemon when that peer advertises
- * `rtc1` and has published its X25519 pubkey. Signaling still rides the relay;
- * once open, mux traffic is direct. The resolver never waits for cold setup:
- * RTC → relay mux → JSON splice, while this module warms RTC for later hops.
+ * A caller with an authorized device-grant source may offer directly to a
+ * peer daemon that advertises `rtc1` and has published its X25519 pubkey.
+ * Fleet wiring currently has no such source, so it uses relay mux. Signaling
+ * rides the relay; once open, mux traffic is direct. Cold setup never blocks
+ * the resolver while this module warms authorized RTC paths for later hops.
  */
 import { randomBytes } from "node:crypto";
 import type {
@@ -28,7 +29,6 @@ import {
   verifyAnswerInner,
   weriftIceServers,
 } from "@openllmsh/tunnel/rtc-auth";
-import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import { preflightIceCandidate } from "@openllmsh/tunnel/rtc-ice";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
@@ -36,6 +36,9 @@ import { RTCPeerConnection } from "werift";
 import type { TEphKeypair } from "./keypair";
 import { generateEphKeypair, openSealedWith, sealTo } from "./keypair";
 import { logDebug, logWarn, safeDiagnosticMessage } from "./logger";
+import { closeRtcPeer } from "./rtc-close";
+import { asRtcDataChannelLike } from "./rtc-data-channel";
+import { rtcCandidateErrors } from "./rtc-udp";
 
 const RTC_SIGNALING_TIMEOUT_MS = 10_000;
 const RTC_ICE_TIMEOUT_MS = 20_000;
@@ -65,6 +68,15 @@ type TRtcClientSession = {
 };
 
 let sendFrame: ((frame: TRelayFrame) => void) | null = null;
+/** A caller may provide an authorized vault grant issuer. Fleet wiring does
+ * not currently have one, so RTC must remain unavailable there. */
+type TRtcGrantRequest = {
+  readonly keyId: string;
+  readonly channelId: string;
+  readonly audience: string;
+};
+type TRtcGrantProvider = (request: TRtcGrantRequest) => Promise<string | null>;
+let grantProvider: TRtcGrantProvider | null = null;
 /** Cloud-served ICE servers from the daemon's own channel handshake, if any. */
 let handshakeIceServers: ReadonlyArray<TIceServer> | null = null;
 const sessionsByKey = new Map<string, TRtcClientSession>();
@@ -76,8 +88,12 @@ const failedUntil = new Map<string, number>();
 export const configureRtcClient = (options: {
   readonly send: (frame: TRelayFrame) => void;
   readonly iceServers?: ReadonlyArray<TIceServer> | null;
+  /** Issues a host/channel-scoped grant through an authorized vault signer.
+   * This module never synthesizes grants itself. */
+  readonly getGrant?: TRtcGrantProvider | null;
 }): void => {
   sendFrame = options.send;
+  grantProvider = options.getGrant ?? null;
   if (options.iceServers !== undefined) {
     handshakeIceServers = options.iceServers;
   }
@@ -97,49 +113,6 @@ const iceServers = (): Array<{
       handshakeIceServers,
     ),
   );
-
-const asRtcDataChannelLike = (dc: RTCDataChannel): TRtcDataChannelLike => ({
-  get readyState() {
-    return dc.readyState;
-  },
-  get bufferedAmount() {
-    return dc.bufferedAmount;
-  },
-  send: (data) => {
-    if (typeof data === "string" || Buffer.isBuffer(data)) {
-      dc.send(data);
-      return;
-    }
-    if (data instanceof ArrayBuffer) {
-      dc.send(Buffer.from(data));
-      return;
-    }
-    dc.send(
-      Buffer.from(
-        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-      ),
-    );
-  },
-  close: () => dc.close(),
-  get onmessage() {
-    return dc.onmessage as TRtcDataChannelLike["onmessage"];
-  },
-  set onmessage(value) {
-    dc.onmessage = value as RTCDataChannel["onmessage"];
-  },
-  get onclose() {
-    return dc.onclose as TRtcDataChannelLike["onclose"];
-  },
-  set onclose(value) {
-    dc.onclose = value as RTCDataChannel["onclose"];
-  },
-  get onerror() {
-    return dc.onerror as TRtcDataChannelLike["onerror"];
-  },
-  set onerror(value) {
-    dc.onerror = value as RTCDataChannel["onerror"];
-  },
-});
 
 const clearTimers = (session: TRtcClientSession): void => {
   if (session.signalingTimer !== null) {
@@ -168,7 +141,7 @@ const closeSession = (session: TRtcClientSession, reason: string): void => {
     // mux already closed
   }
   session.mux = null;
-  void session.pc.close().catch(() => {});
+  void closeRtcPeer(session.pc, session.dc);
   logDebug("rtc-client", "session closed", { keyId: session.keyId, reason });
 };
 
@@ -223,25 +196,27 @@ const mountMux = (session: TRtcClientSession, answerSdp: string): void => {
   });
 };
 
-/** Start a best-effort fleet RTC offer. Cold setup never blocks a request. */
+/** Start a best-effort authorized RTC offer. Cold setup never blocks a request. */
 export const ensureRtcTo = (
   keyId: string,
   options: {
     readonly pubkey: string;
     readonly hasRtc1: boolean;
-    readonly hasSeedgate1: boolean;
   },
-): void => {
+): "started" | "unavailable" | "not_applicable" => {
   if (
     options.pubkey.length === 0 ||
     !options.hasRtc1 ||
-    options.hasSeedgate1 ||
     failureCached(keyId) ||
     sessionsByKey.has(keyId) ||
     sendFrame === null
   ) {
-    return;
+    return "not_applicable";
   }
+  // Fleet daemons have no vault DEK/grant issuer today. Never send legacy v1
+  // or infer authorization from the relay's daemon role; let the caller use
+  // its authenticated relay mux instead.
+  if (grantProvider === null) return "unavailable";
   void beginConnect(keyId, options.pubkey).catch((error: unknown) => {
     logWarn("rtc-client", safeDiagnosticMessage`beginConnect rejected`, {
       keyId,
@@ -249,6 +224,7 @@ export const ensureRtcTo = (
     });
     cacheFailure(keyId);
   });
+  return "started";
 };
 
 const sendIceCandidate = (
@@ -279,7 +255,18 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
   let pc: RTCPeerConnection | null = null;
   let session: TRtcClientSession | null = null;
   try {
-    pc = new RTCPeerConnection({ iceServers: [...iceServers()] });
+    pc = new RTCPeerConnection({
+      iceServers: [...iceServers()],
+      iceFilterCandidatePair: rtcCandidateErrors(() => {
+        if (
+          session === null ||
+          session.closed ||
+          sessionsByChannel.get(session.channelId) !== session
+        )
+          return;
+        markRtcFailure(keyId);
+      }),
+    });
     const dc = pc.createDataChannel("mux", { ordered: true });
     const eph = generateEphKeypair();
     const channelId = crypto.randomUUID();
@@ -369,13 +356,30 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
       return;
     }
     session.fingerprint = fingerprint;
+    const provider = grantProvider;
+    if (provider === null) {
+      closeSession(session, "grant_source_unavailable");
+      return;
+    }
+    const grant = await provider({
+      keyId,
+      channelId,
+      audience: pubkey,
+    });
+    if (session.closed) return;
+    if (grant === null || grant.length === 0) {
+      closeSession(session, "grant_unavailable");
+      return;
+    }
     const proof = sealTo(
       pubkey,
       encodeOfferInner({
-        v: 1,
+        v: 2,
         n: session.nonce,
         fb: fingerprint,
         epk: eph.publicKeyB64,
+        grant,
+        client: "other",
       }),
     );
     sendFrame?.({
@@ -398,7 +402,7 @@ const beginConnect = async (keyId: string, pubkey: string): Promise<void> => {
     }
     cacheFailure(keyId);
     if (pc !== null) {
-      void pc.close().catch(() => {});
+      void closeRtcPeer(pc);
     }
   }
 };

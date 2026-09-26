@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 /**
- * `bun run daemon:dist` — build the daemon for every target and emit a
+ * `bun run daemon:dist` — build the POSIX daemon targets and emit a
  * SELF-CONTAINED installer per target: the real setup installer
  * (`packages/registry/setup/daemon/install.sh`) embedded VERBATIM, with the
  * locally-built, gzipped binary appended (base64). Copy ONE file to any machine
@@ -17,7 +17,7 @@
  * Usage:
  *   bun run daemon:dist                       # all targets, version = package.json
  *   bun run daemon:dist -- --version 1.2.3    # stamp a specific version
- *   bun run daemon:dist -- --target linux-x64-baseline # only wrap one target (still builds all)
+ *   bun run daemon:dist -- --target linux-x64-baseline # only build and wrap one POSIX target
  *
  * Run an emitted installer on a target box (OPENLLM_* names match the real
  * install + the shared .env; both are reused from an existing ~/.openllm/.env
@@ -41,6 +41,8 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { $ } from "bun";
+import type { TDaemonTarget } from "../release-types";
+import { DAEMON_RELEASE_TARGETS } from "../release-types";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url)); // packages/daemon/scripts
 const REPO_ROOT = resolve(SCRIPT_DIR, "..", "..", "..");
@@ -56,16 +58,41 @@ const INSTALL_SH = join(
 );
 const TEMPLATE = join(SCRIPT_DIR, "dist-installer-template.sh");
 
-const ALL_TARGETS = [
-  "darwin-arm64",
-  "darwin-x64-baseline",
-  "linux-x64-baseline",
-  "linux-arm64",
-] as const;
-type TTarget = (typeof ALL_TARGETS)[number];
+// Release targets ∩ POSIX — an explicit filter, NOT an alias of
+// DAEMON_RELEASE_TARGETS: this route builds and wraps binaries on a POSIX
+// host only. Re-adding win32-x64 to the release list must re-enable the
+// Windows release leg without dragging it into this packaging path.
+export const POSIX_DAEMON_TARGETS = DAEMON_RELEASE_TARGETS.filter(
+  (target): target is Exclude<TDaemonTarget, "win32-x64"> =>
+    !target.startsWith("win32"),
+);
+type TTarget = (typeof POSIX_DAEMON_TARGETS)[number];
 
 const isTarget = (t: string): t is TTarget =>
-  (ALL_TARGETS as readonly string[]).includes(t);
+  (POSIX_DAEMON_TARGETS as readonly string[]).includes(t);
+
+export const resolveDistWrapTargets = (
+  onlyTarget: string | undefined,
+): readonly TTarget[] => {
+  if (onlyTarget !== undefined && !isTarget(onlyTarget)) {
+    throw new Error(
+      `unknown --target "${onlyTarget}" (expected one of ${POSIX_DAEMON_TARGETS.join(", ")})`,
+    );
+  }
+  return onlyTarget === undefined ? POSIX_DAEMON_TARGETS : [onlyTarget];
+};
+
+export const daemonDistCompileArgv = (
+  version: string,
+  targets: readonly TTarget[],
+): readonly string[] => [
+  "bun",
+  COMPILE_SCRIPT,
+  "--targets",
+  targets.join(","),
+  "--version",
+  version,
+];
 
 const flagValue = (name: string): string | undefined => {
   const i = process.argv.indexOf(name);
@@ -92,19 +119,12 @@ const main = async (): Promise<void> => {
     );
   }
   const onlyTarget = flagValue("--target");
-  if (onlyTarget !== undefined && !isTarget(onlyTarget)) {
-    throw new Error(
-      `unknown --target "${onlyTarget}" (expected one of ${ALL_TARGETS.join(", ")})`,
-    );
-  }
-  const wrapTargets: readonly TTarget[] = onlyTarget
-    ? [onlyTarget]
-    : [...ALL_TARGETS];
+  const wrapTargets = resolveDistWrapTargets(onlyTarget);
 
-  // Native build via the existing compile script (always all four targets in
-  // parallel — compile.ts has no per-target selection; we just wrap a subset).
+  // Compile exactly the POSIX targets being wrapped. Windows is native-only and
+  // is never an implicit member of this self-host packaging route.
   console.log(`Building daemon binaries (version ${version})…`);
-  await $`bun ${COMPILE_SCRIPT} --version ${version}`.cwd(REPO_ROOT);
+  await $`${daemonDistCompileArgv(version, wrapTargets)}`.cwd(REPO_ROOT);
 
   const template = readFileSync(TEMPLATE, "utf-8");
   // The real installer, minus its shebang (the wrapper supplies its own).
@@ -150,7 +170,7 @@ const main = async (): Promise<void> => {
     `\nEmitted ${wrapTargets.length} self-contained installer(s) → ${DIST_DIR}`,
   );
   console.log(
-    "Run on a target machine (reuses ~/.openllm/.env when present):\n  OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... \\\n    bash openllmd-<target>.install.sh",
+    "Installers are emitted for manual, isolated target-machine validation; this command never runs them.",
   );
 };
 
@@ -164,4 +184,6 @@ const rootPkgVersion = (): string => {
   return pkg.version;
 };
 
-await main();
+if (import.meta.main) {
+  await main();
+}

@@ -63,6 +63,7 @@ import {
 import {
   ensureIsolatedKeychain,
   ensureKeychainReady,
+  ensureVendorKeychainReady,
   grantKeychainToolAccess,
   keychainStoreIdentity,
   observeKeychainReady,
@@ -618,7 +619,16 @@ const authStatusLoggedIn = async (
       // so this shared producer is unconfined on macOS and bounded internally by
       // runCapture. Observer cancellation must not kill another status waiter's
       // probe.
-      const out = await runCaptureResult([bin(), "auth", "status"], env(), {
+      const launchEnv = env();
+      // `claude auth status` reads the keychain on macOS — the same vendor
+      // spawn gate as every other Claude/Cursor exec must pass IMMEDIATELY
+      // before exec, or an unverified store could open the SecurityAgent
+      // dialog (or the real user's chain). A declined gate is INCONCLUSIVE,
+      // never a signed-out verdict — callers gate earlier, this is the last
+      // line of defence.
+      const store = await ensureVendorKeychainReady(launchEnv);
+      if (store.kind !== "present") return { kind: "value", result: null };
+      const out = await runCaptureResult([bin(), "auth", "status"], launchEnv, {
         probe: unwrapKeychainSpawn(PROVIDER),
         timeoutMs: AUTH_STATUS_TIMEOUT_MS,
         producer: "claude-auth-status",

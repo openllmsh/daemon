@@ -1,4 +1,5 @@
 import { logError, logWarn, safeDiagnosticMessage } from "../logger";
+import { spawn as admittedSpawn } from "../windows-process";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
 import type { TReapOutcome } from "./posix";
 import {
@@ -12,6 +13,7 @@ import type { TChildRegistryRecord, TDisposableChildKind } from "./registry";
 import {
   addChildRegistryRecord,
   argvDigest,
+  childProcessIdentityStatus,
   childProcessMatchesRecord,
   currentChildSupervisorInstanceId,
   listChildRegistryRecords,
@@ -345,11 +347,13 @@ export const superviseSpawn = (
   // child dies if the daemon is SIGKILLed (no macOS equivalent — Darwin relies
   // on the process group + launchd cleanup + the boot sweep). Darwin argv is
   // left byte-identical.
+  const selfInvocation =
+    process.platform === "linux" ? daemonSelfInvocation() : null;
   const spawnArgv =
-    process.platform === "linux"
-      ? linuxPdeathsigArgv(argv, daemonSelfInvocation(), process.pid)
-      : argv;
-  const subprocess = Bun.spawn([...spawnArgv], {
+    selfInvocation === null
+      ? argv
+      : linuxPdeathsigArgv(argv, selfInvocation, process.pid);
+  const subprocess = admittedSpawn([...spawnArgv], {
     ...opts,
     // POSIX: lead an independently killable process group (pgid === pid).
     detached: true,
@@ -471,10 +475,12 @@ const terminateStaleRecord = async (
   record: TChildRegistryRecord,
   opts: TTerminateOptions,
 ): Promise<void> => {
-  if (!childProcessMatchesRecord(record)) {
+  const identity = childProcessIdentityStatus(record);
+  if (identity === "dead") {
     removeChildRegistryRecord(record.pid);
     return;
   }
+  if (identity === "unknown") return;
   const outcome = await terminateProcessGroup(
     record.pgid,
     Math.max(0, opts.graceMs ?? DEFAULT_TERMINATE_GRACE_MS),
@@ -491,7 +497,10 @@ const terminateStaleRecord = async (
       },
     );
   }
-  removeChildRegistryRecord(record.pid);
+  // An unavailable final probe is not evidence that the root exited. Keep the
+  // durable record so a later boot can retry without risking a live process.
+  if (childProcessIdentityStatus(record) === "dead")
+    removeChildRegistryRecord(record.pid);
 };
 
 /**

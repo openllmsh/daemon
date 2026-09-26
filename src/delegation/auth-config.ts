@@ -38,9 +38,12 @@
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { superviseSpawn } from "../child-supervisor";
 import type { TCliProvider } from "../cli-paths";
 import { cliBin, cliEnv, cliRoot } from "../cli-paths";
-import { logDebug, logInfo } from "../logger";
+import { localCallerToken } from "../env";
+import { logDebug, logInfo, logWarn } from "../logger";
+import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
@@ -358,6 +361,22 @@ export const filterIdentityHeaders = (
   return out;
 };
 
+/**
+ * The env for a capture child: the shared allowlist builder
+ * ({@link cleanNativeSpawnEnv} — ambient basics only, `OPENLLM_*` daemon
+ * secrets never cross) plus the provider's isolated `cliEnv` and the
+ * recorder overlay. Replaces a raw `{...process.env, …}` merge that handed
+ * the vendor CLI the daemon's full environment, `OPENLLM_API_KEY` included.
+ */
+export const captureChildEnv = (
+  provider: TCliProvider,
+  base: string,
+): Record<string, string> =>
+  cleanNativeSpawnEnv({
+    ...cliEnv(provider),
+    ...CAPTURE[provider].env(base),
+  });
+
 type TCapturedRequest = {
   readonly path: string;
   readonly identityHeaders: Readonly<Record<string, string>>;
@@ -443,51 +462,71 @@ const captureInferenceRequest = async (
 } | null> => {
   const spec = CAPTURE[provider];
   const bin = cliBin(provider);
-  const recorder = startRecorder(spec);
-  const cmdArgv = [...spec.argv(bin, recorder.base)];
-  const spawnArgv =
-    spec.usePty === true
-      ? (ptyScriptArgv(cmdArgv, "/dev/null") ?? cmdArgv)
-      : cmdArgv;
-  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  let recorder: ReturnType<typeof startRecorder>;
   try {
-    // claude's identity capture runs the CLI's `exec`, which reads the isolated
-    // keychain credential; unconfined on macOS for the keychain providers,
-    // confined otherwise — `sandbox/policy.ts`.
-    proc = Bun.spawn(
-      sandboxSpawnArgs(spawnArgv, { probe: unwrapKeychainSpawn(provider) }),
-      {
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-        cwd: tmpdir(),
-        env: {
-          ...process.env,
-          ...cliEnv(provider),
-          ...spec.env(recorder.base),
-        },
-      },
-    );
+    recorder = startRecorder(spec);
   } catch (err) {
-    recorder.stop();
-    logDebug("auth-config", `capture spawn failed for ${provider}`, {
-      err: err instanceof Error ? err.message : String(err),
+    logWarn("auth-config", `capture recorder setup failed for ${provider}`, {
+      err: err instanceof Error ? err.name : "unknown error",
     });
     return null;
   }
-
-  // Resolve as soon as the inference request is captured, OR the CLI exits — a
-  // CLI that errors before issuing its request is never going to send one.
-  const captured = await withTimeout(
-    Promise.race([
-      recorder.first,
-      proc.exited.then(() => null as TCapturedRequest | null),
-    ]),
-    CAPTURE_TIMEOUT_MS,
-    null as TCapturedRequest | null,
-  );
-  proc.kill();
-  recorder.stop();
+  let child: ReturnType<typeof superviseSpawn> | null = null;
+  let captured: TCapturedRequest | null = null;
+  try {
+    const cmdArgv = [...spec.argv(bin, recorder.base)];
+    const spawnArgv =
+      spec.usePty === true
+        ? (ptyScriptArgv(cmdArgv, "/dev/null") ?? cmdArgv)
+        : cmdArgv;
+    // claude's identity capture runs the CLI's `exec`, which reads the isolated
+    // keychain credential; unconfined on macOS for the keychain providers,
+    // confined otherwise — `sandbox/policy.ts`.
+    const admittedArgv = sandboxSpawnArgs(spawnArgv, {
+      probe: unwrapKeychainSpawn(provider),
+    });
+    child = superviseSpawn(admittedArgv, {
+      kind: "vendor-capture",
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      cwd: tmpdir(),
+      env: {
+        ...captureChildEnv(provider, recorder.base),
+        // Added AFTER the allowlist (which strips OPENLLM_*): the per-boot
+        // local caller credential lets a vendor CLI component call this
+        // daemon's /v1 surface without the paired sk-llm key.
+        OPENLLM_LOCAL_TOKEN: localCallerToken(),
+      },
+    });
+    captured = await withTimeout(
+      Promise.race([
+        recorder.first,
+        child.subprocess.exited.then(() => null as TCapturedRequest | null),
+      ]),
+      CAPTURE_TIMEOUT_MS,
+      null as TCapturedRequest | null,
+    );
+  } catch (err) {
+    logWarn("auth-config", `capture command setup failed for ${provider}`, {
+      err: err instanceof Error ? err.name : "unknown error",
+    });
+  } finally {
+    // The child supervisor owns TERM → bounded grace → KILL, including PTY
+    // wrappers and their descendants. Await it before closing the recorder so
+    // every capture completion path reaps the process tree.
+    try {
+      const reap = await child?.terminate({ graceMs: 200, finalReapMs: 800 });
+      if (reap === "reap_unconfirmed") {
+        logWarn(
+          "auth-config",
+          `capture process tree reap unconfirmed for ${provider}`,
+        );
+      }
+    } finally {
+      recorder.stop();
+    }
+  }
 
   if (captured === null) {
     logDebug("auth-config", `capture yielded no request for ${provider}`);

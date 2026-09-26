@@ -10,13 +10,17 @@ import { isDevMode, stateDir } from "../env";
  * `userArgs()` (`process.argv.slice(2)`): dev returns `[bun, script]`, prod
  * returns `[installed]`, so the subcommand always lands at args[0].
  */
-export const daemonSelfInvocation = (): readonly string[] => {
+export const daemonSelfInvocation = (): readonly string[] | null => {
   const sourceRunner = process.argv[1];
-  const fallback =
-    sourceRunner === undefined
+  if (isDevMode()) {
+    return sourceRunner === undefined
       ? [process.execPath]
       : [process.execPath, sourceRunner];
-  if (isDevMode()) return fallback;
+  }
   const installed = join(stateDir(), "bin", "openllmd");
-  return existsSync(installed) ? [installed] : fallback;
+  // A daemon source file may be imported by `bun test` or a tool runner. That
+  // process is not an OpenLLM entrypoint and cannot dispatch the hidden
+  // PDEATHSIG verb. Only wrap children when the installed daemon is present or
+  // explicit dev mode identifies the source runner above.
+  return existsSync(installed) ? [installed] : null;
 };

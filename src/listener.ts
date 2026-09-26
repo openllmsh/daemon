@@ -10,8 +10,11 @@
  * — without a `?__plan=` there is nothing to walk, so it answers 400
  * (there is no legacy "daemon resolves its own chain" path).
  *
- * The daemon binds to 127.0.0.1 and the caller owns the machine, so there
- * is no API-key auth gate here (unlike the cloud handler).
+ * The daemon binds to 127.0.0.1. Caller-side gates still apply: the
+ * request must target loopback, carry no untrusted `Origin` (a browser
+ * always sends one on a cross-site POST), and use a JSON (or media
+ * multipart) body — so a hostile web page's "simple request" can never
+ * run billed inference or steer `?__origin=`/`?__plan=` (SP-1/NET-1).
  */
 
 import type { TContextOverflowStrategy } from "@openllmsh/protocol";
@@ -45,9 +48,17 @@ import {
 } from "./cloud-client";
 import { planCacheEnabled } from "./config";
 import { notePresenceActivity } from "./control-channel";
-import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
+import {
+  corsHeaders,
+  errorJson,
+  isLocalCallerAuthorized,
+  isLoopbackRequestTarget,
+  isPreflight,
+  preflightResponse,
+  requestOriginAllowed,
+} from "./cors";
 import { isSubscriptionSlug } from "./delegation";
-import { passthroughToOrigin } from "./forward";
+import { passthroughToOrigin, signedPlanOrigin } from "./forward";
 import { runImageEditWalker, runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
 import {
@@ -80,6 +91,7 @@ import {
   runResponsesCompact,
   runWalker,
 } from "./walker";
+import { requiresRestrictedWebSearch } from "./web-search-policy";
 
 const parseAnthropicRequest = Schema.decodeUnknownSync(AnthropicRequest);
 const parseOpenAIRequest = Schema.decodeUnknownSync(ChatCompletionRequest);
@@ -114,6 +126,36 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // CORS/PNA preflight — the dashboard fetches this surface cross-origin
   // (HTTPS page → http://127.0.0.1) for subscription models.
   if (isPreflight(req)) return preflightResponse(req);
+
+  // Caller-side gates for the unauthenticated local surface (SP-1). CORS
+  // alone only hides the RESPONSE — a cross-site "simple request"
+  // (text/plain no-cors POST, HTML form) needs no preflight and would
+  // otherwise run billed inference blind. A browser always sends Origin on
+  // such a request, so rejecting non-allowlisted origins + non-loopback
+  // request-targets (DNS rebinding) kills that vector while vendor CLIs
+  // (no Origin header, loopback target) are unaffected.
+  if (!requestOriginAllowed(req) || !isLoopbackRequestTarget(req)) {
+    return withCors(req, errorJson(403, "request origin is not allowed"));
+  }
+
+  // Caller authentication (SP-1 continuation): binding to loopback is NOT a
+  // credential — any local process can omit `Origin` and POST JSON. Every
+  // `/v1/*` call must present EITHER the per-boot local caller token
+  // (`x-openllm-local-token`, `x-api-key`, or `Authorization: Bearer`) OR the
+  // daemon's own API key as Bearer (vendor CLIs are launched with
+  // `OPENLLM_API_KEY` and already present it). Everything else is rejected
+  // before presence bookkeeping, plan lookup, or any billed upstream call.
+  if (!isLocalCallerAuthorized(req)) {
+    return withCors(
+      req,
+      errorJson(
+        401,
+        "unauthorized local caller — present the local caller token or the daemon API key",
+        "authentication_error",
+        "local_caller_unauthorized",
+      ),
+    );
+  }
 
   // A client pointed DIRECTLY at the daemon port is the strongest possible
   // liveness proof — republish presence (throttled, off the response path) so
@@ -170,6 +212,29 @@ export const handleInference = async (req: Request): Promise<Response> => {
   const isMultipart = requestContentType
     .toLowerCase()
     .includes("multipart/form-data");
+
+  // Bodies are JSON on every surface except media uploads (multipart) and
+  // the id-addressed video ops (bodyless). Requiring a JSON content-type up
+  // front refuses the `text/plain` / form-urlencoded bodies a cross-site
+  // "simple request" is limited to — a blind browser POST can then never
+  // reach a walker — instead of JSON-parsing whatever arrived.
+  const contentTypeIsJson = (() => {
+    const base = requestContentType.split(";", 1)[0]?.trim().toLowerCase();
+    return base === "application/json" || base?.endsWith("+json") === true;
+  })();
+  if (
+    !isBodylessVideoOp(videoOperation) &&
+    !isMultipart &&
+    !contentTypeIsJson
+  ) {
+    return withCors(
+      req,
+      errorJson(
+        415,
+        "unsupported content-type — /v1 surfaces accept application/json (multipart/form-data for media uploads)",
+      ),
+    );
+  }
 
   let rawBytes: ArrayBuffer;
   let rawBody: unknown = null;
@@ -303,6 +368,20 @@ export const handleInference = async (req: Request): Promise<Response> => {
       errorJson(
         400,
         err instanceof Error ? err.message : "Invalid request body",
+      ),
+    );
+  }
+
+  // Native search is live and some manual upstreams reject the restriction.
+  // Refuse explicitly instead of dropping it, spawning, or falling back to a
+  // transport with weaker semantics. This is not cache-only search support.
+  if (requiresRestrictedWebSearch(rawBody)) {
+    return withCors(
+      req,
+      errorJson(
+        400,
+        "Cache-only web search (external_web_access=false) is not supported by this daemon; the request was not forwarded.",
+        "unsupported_web_search_policy",
       ),
     );
   }
@@ -719,7 +798,14 @@ export const handleInference = async (req: Request): Promise<Response> => {
     rawBytes,
     planParam,
     pmidsParam,
-    originParam,
+    // `__origin` steers where `Bearer <apiKey>` lands for API-key forwards,
+    // usage records, and media ingest. It is only meaningful when a plan
+    // signing key exists to have verified it — before the first bootstrap
+    // (or on unsigned dev plans) it is caller-supplied text, so it must
+    // never leave the query string (NET-1). Signature verification inside
+    // the walkers is unaffected: a kept origin verifies identically, and a
+    // dropped one only exists where no key could have signed it anyway.
+    originParam: signedPlanOrigin(originParam),
     contextOverflowStrategy,
     sigParam,
     startedAt,

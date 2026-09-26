@@ -35,6 +35,7 @@ import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
 import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
+import { sandboxUnavailableResponse } from "../sandbox/exec";
 import { runClaudeNative } from "./claude-native";
 import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
@@ -237,6 +238,12 @@ export const tryServeNativeRuntime = async (
 ): Promise<TNativeServeOutcome> => {
   if (!isNativeRuntimeProvider(params.provider)) {
     return { declined: `${params.provider} has no native runtime` };
+  }
+  // Windows has no qualified vendor confinement backend yet. A decline here
+  // would select the manual transport, silently changing the requested
+  // execution/credential boundary. Commit an error before any SDK or tool path.
+  if (process.platform === "win32") {
+    return sandboxUnavailableResponse();
   }
   // claude_code ONLY: an Anthropic-native server tool must reach Anthropic
   // byte-verbatim (the manual transport IS the Anthropic wire there), so the

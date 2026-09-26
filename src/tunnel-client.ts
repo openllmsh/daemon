@@ -18,7 +18,7 @@
  */
 
 import type { TTunnelSurface } from "@openllmsh/protocol";
-import { RTC_CAP, SEEDGATE_CAP } from "@openllmsh/protocol";
+import { RTC_CAP } from "@openllmsh/protocol";
 import { tunnelStream } from "@openllmsh/tunnel/streams";
 import { fleetSubscriptionPubkeyFor } from "./config";
 import { getMuxPeerCaps, muxChannelTo } from "./mux-host";
@@ -83,12 +83,9 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
   const peerPubkey = fleetSubscriptionPubkeyFor(args.keyId);
   // Eager RTC: best-effort, never blocks the hop. If the channel is already
   // open we use it; otherwise ensureRtcTo races setup while we try mux.
-  ensureRtcTo(args.keyId, {
+  const rtcAvailability = ensureRtcTo(args.keyId, {
     pubkey: peerPubkey ?? "",
     hasRtc1: peerCaps?.has(RTC_CAP) ?? false,
-    // Fleet daemons cannot mint a browser vault grant; a seed-gated peer must
-    // use relay mux (whose authenticated `consumer:"daemon"` is admitted).
-    hasSeedgate1: peerCaps?.has(SEEDGATE_CAP) ?? false,
   });
 
   // Fleet hop identity rides the stream OPEN so the peer's tunnel-server can
@@ -101,7 +98,10 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
     consumer: "daemon" as const,
   };
 
-  const rtc = getRtcMuxChannel(args.keyId);
+  // Without an authorized grant source, RTC is explicitly unavailable and
+  // the authenticated relay mux remains the transport for this hop.
+  const rtc =
+    rtcAvailability === "unavailable" ? null : getRtcMuxChannel(args.keyId);
   if (rtc !== null) {
     try {
       const result = await tunnelStream(rtc, {

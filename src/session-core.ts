@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "./windows-process";
 /**
  * Transport-neutral device-session state machine.
  *
@@ -8,7 +9,7 @@
 
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import type {
   TDeviceSessionCli,
   TSessionStreamOpenPayload,
@@ -20,19 +21,27 @@ import {
 } from "@openllmsh/protocol";
 import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Terminal } from "@xterm/headless";
+import { ptySupported, requestedPtyBackend, type TPtyBackend } from "./bs-pty";
 import { sessionEnv } from "./cli-paths";
 import { resolveOpenllmCli } from "./cli-self-update";
-import { spawnEnv } from "./delegation/spawn";
 import { loadEnvFile } from "./env";
 import {
   openllmClientIdOf,
   pushDeviceCliResumeArgs,
 } from "./local-sessions/types";
 import { logDebug, logInfo, logWarn } from "./logger";
+import * as nativePtyModule from "./native-pty";
+import {
+  NativePtyNativeError,
+  NativePtyWriteOverflowError,
+} from "./native-pty";
 import { serializeScreenBytes } from "./session-screen";
+import { windowsPtySpawner } from "./windows-pty";
 
-/** Max concurrently-LIVE PTYs in one session-host process. */
-const MAX_LIVE_SESSIONS = 4;
+/** Max concurrently-LIVE PTYs in one session-host process — and, because the
+ *  daemon runs one session per host process, the global live-session cap the
+ *  daemon enforces across all hosts (DSN-2). */
+export const MAX_LIVE_SESSIONS = 4;
 
 /** Retained dead (resumable) session records cap — evict oldest beyond this. */
 const MAX_RETAINED_SESSIONS = 32;
@@ -64,13 +73,6 @@ const EMULATOR_SCROLLBACK_ROWS = 5000;
 // that alternated the canonical size as you typed, so the PTY was re-sized and
 // the passive viewer re-serialized mid-keystroke. The guards were all attempts
 // to tame a signal that should not have been driving size in the first place.
-
-/** Coalescing window for the manual SIGWINCH fan-out. A drag-resize emits many
- *  resize CTRLs per second; the child only needs the final geometry. */
-const WINCH_DEBOUNCE_MS = 40;
-
-/** Refresh the process tree less often than resize events. */
-const WINCH_PROCESS_TREE_REFRESH_MS = 1_000;
 
 /** Detached idle timeout. Zero deliberately restores never-reap behavior. */
 const DEFAULT_SESSION_IDLE_TIMEOUT_MIN = 60;
@@ -104,7 +106,7 @@ export type TPtySpawnArgs = {
   readonly onExit: (exitCode?: number) => void;
 };
 
-export type TPtySpawner = (args: TPtySpawnArgs) => TPtyLike;
+export type TPtySpawner = (args: TPtySpawnArgs) => TPtyLike | Promise<TPtyLike>;
 
 /**
  * Transport-neutral endpoint of a device session. Keeping this structural means
@@ -128,63 +130,60 @@ export type TSessionStream = {
  */
 export const shellSessionArgv = (shellPath: string): readonly string[] => {
   const name = basename(shellPath).toLowerCase();
+  if (name === "powershell.exe" || name === "pwsh.exe")
+    return [shellPath, "-NoLogo", "-NoProfile", "-NoExit"];
+  if (name === "cmd.exe") return [shellPath, "/D", "/Q"];
   if (name === "fish") return [shellPath, "-l"];
   return [shellPath, "-il"];
 };
 
-/** Production spawner over Bun's built-in PTY. */
-const bunPtySpawner: TPtySpawner = (args) => {
-  const terminal = new Bun.Terminal({
-    cols: args.cols,
-    rows: args.rows,
-    name: "xterm-256color",
-    data: (_t, chunk) => args.onData(chunk),
-  });
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn([...args.argv], {
-      cwd: args.cwd,
-      env: spawnEnv(args.env),
-      terminal,
-      // New session + process-group leader so the PTY can become the
-      // controlling tty (TIOCSCTTY). Without this, bash -il prints
-      // "cannot set terminal process group" / "no job control".
-      detached: true,
-    });
-  } catch (err) {
-    // Spawn threw (ENOENT etc.) — the terminal was already created above;
-    // close it so the failed attempt doesn't leak a PTY fd.
-    terminal.close();
-    throw err;
-  }
-  void proc.exited.then((exitCode) => {
-    try {
-      args.onExit(exitCode);
-    } finally {
-      // A throwing exit handler must never leak the PTY fd.
-      terminal.close();
-    }
-  });
-  return {
-    write: (data) => terminal.write(data),
-    resize: (cols, rows) => terminal.resize(cols, rows),
-    kill: (signal = "SIGTERM") => {
-      try {
-        proc.kill(signal);
-      } catch {
-        /* already gone */
-      }
-    },
-    pid: proc.pid,
-  };
-};
+const defaultProductionSpawner = (): TPtySpawner =>
+  process.platform === "win32"
+    ? windowsPtySpawner
+    : nativePtyModule.nativePtySpawner;
 
-let spawner: TPtySpawner = bunPtySpawner;
+/** The production default is native on POSIX; Bun is not a fallback backend. */
+let spawner: TPtySpawner = defaultProductionSpawner();
+/** False when tests inject a fake PTY — production spawners must not run. */
+let productionSpawner = true;
 export const setPtySpawner = (fn: TPtySpawner | null): void => {
-  spawner = fn ?? bunPtySpawner;
+  if (fn === null) {
+    spawner = defaultProductionSpawner();
+    productionSpawner = true;
+    return;
+  }
+  spawner = fn;
+  productionSpawner = false;
 };
 
-export const ptySupported = (): boolean => process.platform !== "win32";
+export { ptySupported } from "./bs-pty";
+
+type TSpawnedPty = { readonly pty: TPtyLike; readonly backend: TPtyBackend };
+
+const spawnedWithBackend = (
+  result: TPtyLike | Promise<TPtyLike>,
+  backend: TPtyBackend,
+): TSpawnedPty | Promise<TSpawnedPty> =>
+  result instanceof Promise
+    ? result.then((pty): TSpawnedPty => ({ pty, backend }))
+    : { pty: result, backend };
+
+const spawnHostPty = (
+  args: TPtySpawnArgs,
+): TSpawnedPty | Promise<TSpawnedPty> => {
+  if (!productionSpawner) return spawnedWithBackend(spawner(args), "bun");
+  if (process.platform === "win32") {
+    if (requestedPtyBackend() !== "conpty")
+      throw new Error("Windows requires the native conpty PTY backend");
+    return spawnedWithBackend(defaultProductionSpawner()(args), "conpty");
+  }
+  if (requestedPtyBackend() !== "native")
+    throw new Error("POSIX requires the native PTY backend");
+  return spawnedWithBackend(defaultProductionSpawner()(args), "native");
+};
+
+/** Reserve capacity and session ids while the worker socket connects. */
+const pendingSpawns = new Set<string>();
 
 // ─── session state ───────────────────────────────────────────────────
 
@@ -211,6 +210,8 @@ export type TSession = {
   /** Vendor resume id when known (cold resume / continue). */
   vendorSessionId: string | null;
   pty: TPtyLike | null; // null = dead (continue-able)
+  /** Host PTY owner for this live spawn. Unused after the PTY dies. */
+  ptyBackend: TPtyBackend;
   scrollback: Uint8Array[];
   scrollbackBytes: number;
   /** Shared source-of-truth screen (the canonical-size emulator). Created
@@ -275,16 +276,97 @@ export const setSessionActivityHook = (hook: (() => void) | null): void => {
   activityHook = hook;
 };
 
+/** A `ps` that never exits cannot hold the activity probe hostage (TMR-2). */
+const ACTIVITY_PROBE_TIMEOUT_MS = 5_000;
+/** Grace between the probe's SIGTERM and its escalated SIGKILL. */
+const ACTIVITY_PROBE_KILL_GRACE_MS = 500;
+
+/** Test seam: shrink the probe deadline so timeout coverage stays fast. */
+let activityProbeTimeoutForTests: number | null = null;
+export const setActivityProbeTimeoutForTests = (ms: number | null): void => {
+  activityProbeTimeoutForTests = ms;
+};
+
 const probeActivity = async (
   rootPids: ReadonlySet<number>,
 ): Promise<Set<number>> => {
   if (activityProbe !== null) return activityProbe(rootPids);
-  const proc = Bun.spawn(["ps", "-Ao", "pid=,ppid=,pcpu="], {
+  const proc = admittedSpawn(["ps", "-Ao", "pid=,ppid=,pcpu="], {
     stdout: "pipe",
     stderr: "ignore",
+    // Bun resolves the command against THIS env's PATH, not process.env —
+    // passing it keeps the lookup honest and pins a stable `ps` locale.
+    env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
   });
-  const text = await new Response(proc.stdout).text();
-  if ((await proc.exited) !== 0) throw new Error("ps exited nonzero");
+  // Two-stage bound: SIGTERM at the probe timeout, SIGKILL after a short
+  // grace, then a hard deadline past which the read is abandoned entirely.
+  // A TERM-ignoring or uninterruptible `ps` must never keep this probe (and
+  // the shared in-flight slot gating every later poll) pending forever.
+  const timeoutMs = activityProbeTimeoutForTests ?? ACTIVITY_PROBE_TIMEOUT_MS;
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill();
+    } catch {
+      // The helper may already have exited.
+    }
+    killTimer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // The helper may already have exited.
+      }
+    }, ACTIVITY_PROBE_KILL_GRACE_MS);
+    killTimer.unref?.();
+  }, timeoutMs);
+  timer.unref?.();
+  const reading = (async () => ({
+    text: await new Response(proc.stdout).text(),
+    code: await proc.exited,
+  }))();
+  // The loser of the deadline race is never awaited: sink its late outcome
+  // so a rejection cannot surface as an unhandled error.
+  void reading.catch(() => {});
+  const hardDeadline = new Promise<"expired">((resolve) => {
+    const hard = setTimeout(
+      () => resolve("expired"),
+      timeoutMs + ACTIVITY_PROBE_KILL_GRACE_MS + 500,
+    );
+    hard.unref?.();
+  });
+  try {
+    const raced = await Promise.race([
+      reading.then((value) => ({ kind: "done" as const, value })),
+      hardDeadline.then((kind) => ({ kind })),
+    ]);
+    if (raced.kind === "expired") {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // The helper may already have exited.
+      }
+      throw new Error("ps activity probe timed out");
+    }
+    // A probe killed at its deadline exits nonzero too — timeout is the
+    // accurate diagnosis, so it wins over the exit-code check.
+    if (timedOut) throw new Error("ps activity probe timed out");
+    if (raced.value.code !== 0) throw new Error("ps exited nonzero");
+    return busyRoots(rootPids, raced.value.text);
+  } finally {
+    clearTimeout(timer);
+    if (killTimer !== null) clearTimeout(killTimer);
+  }
+};
+
+/** Test seam: run the real bounded `ps` probe without registering a session. */
+export const runActivityProbeForTests = probeActivity;
+
+const busyRoots = (
+  rootPids: ReadonlySet<number>,
+  text: string,
+): Set<number> => {
   const rows = text
     .trim()
     .split("\n")
@@ -369,8 +451,21 @@ const reapIdleSession = (session: TSession): void => {
   });
 };
 
+// TMR-2: the session host polls every 15 s. A hung probe must never stack
+// overlapping `ps` processes — concurrent callers share one in-flight scan.
+let activityPollInFlight: Promise<void> | null = null;
+
 /** Poll detached process trees and reap only detached, output-quiet, non-busy sessions. */
-export const pollSessionActivity = async (now = Date.now()): Promise<void> => {
+export const pollSessionActivity = (now = Date.now()): Promise<void> => {
+  if (activityPollInFlight !== null) return activityPollInFlight;
+  const run = pollSessionActivityOnce(now).finally(() => {
+    if (activityPollInFlight === run) activityPollInFlight = null;
+  });
+  activityPollInFlight = run;
+  return run;
+};
+
+const pollSessionActivityOnce = async (now: number): Promise<void> => {
   const dormant = [...sessions.values()].filter(
     (session) => session.pty !== null && !isAttached(session),
   );
@@ -475,7 +570,9 @@ export const deviceSessionsForList = (): ReadonlyArray<{
   }));
 
 const liveCount = (): number =>
-  [...sessions.values()].filter((s) => s.pty !== null).length;
+  [...sessions.values()].filter(
+    (s) => s.pty !== null || pendingSpawns.has(s.id),
+  ).length;
 
 /**
  * Device CLI → `openllm <client>` id. Only clients the openllm CLI hosts
@@ -528,7 +625,17 @@ const argvFor = (
   if (cli === "shell") {
     const shell =
       process.env.SHELL ??
-      (process.platform === "darwin" ? "/bin/zsh" : "/bin/bash");
+      (process.platform === "win32"
+        ? join(
+            process.env.SystemRoot ?? "C:\\Windows",
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+          )
+        : process.platform === "darwin"
+          ? "/bin/zsh"
+          : "/bin/bash");
     if (!existsSync(shell))
       throw new Error(`login shell does not exist: ${shell}`);
     return shellSessionArgv(shell);
@@ -539,7 +646,7 @@ const argvFor = (
   // Preferred path: openllm wrapper when installed. An injected (test) spawner
   // never execs the argv, so it stands in for the missing binary — the real
   // spawner is gated on an installed CLI at the call site.
-  if (bin === null && spawner === bunPtySpawner) {
+  if (bin === null && productionSpawner) {
     // A direct vendor launch would bypass OpenLLM's gateway/catalog/config
     // overlay. Callers reject the missing CLI binary before this can run.
     throw new Error("OpenLLM CLI is not installed");
@@ -738,148 +845,6 @@ const promoteSuccessorPrimary = (session: TSession): void => {
   }
 };
 
-/**
- * Collect a pid and every descendant of it from one `ps` snapshot. Returns an
- * EMPTY set when the root is not present in the snapshot, so a stale pid can
- * never be mistaken for a live process and signalled.
- */
-const processTree = async (rootPid: number): Promise<ReadonlySet<number>> => {
-  const proc = Bun.spawn(["ps", "-Ao", "pid=,ppid="], {
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-  const text = await new Response(proc.stdout).text();
-  if ((await proc.exited) !== 0) return new Set();
-  const children = new Map<number, number[]>();
-  let rootSeen = false;
-  for (const line of text.split("\n")) {
-    const [pidText, parentText] = line.trim().split(/\s+/);
-    const pid = Number(pidText);
-    const ppid = Number(parentText);
-    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
-    if (pid === rootPid) rootSeen = true;
-    const siblings = children.get(ppid);
-    if (siblings === undefined) children.set(ppid, [pid]);
-    else siblings.push(pid);
-  }
-  if (!rootSeen) return new Set();
-  const tree = new Set<number>([rootPid]);
-  const queue = [rootPid];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (current === undefined) continue;
-    for (const child of children.get(current) ?? []) {
-      // A pid cannot be its own ancestor, so `tree` also bounds the walk.
-      if (tree.has(child)) continue;
-      tree.add(child);
-      queue.push(child);
-    }
-  }
-  return tree;
-};
-
-type TWinchProcessTree = {
-  pids: ReadonlySet<number>;
-  refreshedAtMs: number;
-  refresh: Promise<void> | null;
-};
-
-const winchProcessTrees = new Map<string, TWinchProcessTree>();
-
-const refreshWinchProcessTree = (session: TSession): void => {
-  const rootPid = session.pid;
-  if (rootPid === null) return;
-  const cached = winchProcessTrees.get(session.id);
-  if (cached?.refresh !== null && cached !== undefined) return;
-  const tree: TWinchProcessTree = cached ?? {
-    pids: new Set(),
-    refreshedAtMs: 0,
-    refresh: null,
-  };
-  const refresh = processTree(rootPid)
-    .then((pids) => {
-      tree.pids = pids;
-      tree.refreshedAtMs = Date.now();
-      for (const pid of pids) {
-        try {
-          process.kill(pid, "SIGWINCH");
-        } catch {
-          // Raced exit — the remaining tree still gets the signal.
-        }
-      }
-    })
-    .catch(() => {
-      tree.pids = new Set();
-      tree.refreshedAtMs = Date.now();
-    })
-    .finally(() => {
-      tree.refresh = null;
-    });
-  tree.refresh = refresh;
-  winchProcessTrees.set(session.id, tree);
-};
-
-const cachedWinchProcessTree = (session: TSession): ReadonlySet<number> => {
-  const cached = winchProcessTrees.get(session.id);
-  if (
-    cached === undefined ||
-    Date.now() - cached.refreshedAtMs >= WINCH_PROCESS_TREE_REFRESH_MS
-  )
-    refreshWinchProcessTree(session);
-  return cached?.pids ?? new Set();
-};
-
-/**
- * Deliver SIGWINCH to a session's whole process tree after a PTY resize.
- *
- * `Bun.spawn({ terminal })` does NOT make the PTY slave the child's CONTROLLING
- * terminal (`ps` reports `TTY ??`, `SESS 0`), so the kernel's TIOCSWINSZ-driven
- * SIGWINCH — which targets the tty's foreground process group — reaches nobody.
- * `pty.resize()` updates the winsize correctly, but a TUI that only re-measures
- * on SIGWINCH (Ink/Claude Code, codex, …) keeps rendering at its BIRTH size,
- * which is the mid-session "crumbled output" symptom. So we signal it ourselves.
- *
- * The whole TREE, not just the root: the PTY runs `openllm <cli>`, which spawns
- * the vendor CLI as a GRANDCHILD with inherited stdio. And a pid-by-pid walk,
- * not `kill(-pid)`: the child inherits the host's process group, so a negative
- * pid would signal the daemon itself.
- */
-const deliverWinch = (session: TSession): void => {
-  if (session.pid === null || session.pty === null) return;
-  for (const pid of cachedWinchProcessTree(session)) {
-    try {
-      process.kill(pid, "SIGWINCH");
-    } catch {
-      // Raced exit — the remaining tree still gets the signal.
-    }
-  }
-};
-
-/** Pending debounced SIGWINCH fan-outs, keyed by session id. */
-const winchTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-const cancelWinch = (id: string): void => {
-  const timer = winchTimers.get(id);
-  if (timer === undefined) return;
-  clearTimeout(timer);
-  winchTimers.delete(id);
-};
-
-/** Queue a coalesced SIGWINCH fan-out for this session. Only the real Bun PTY
- *  spawner needs it — an injected test spawner owns no OS process tree, and
- *  signalling its synthetic pids could hit unrelated processes. */
-const scheduleWinch = (session: TSession): void => {
-  if (spawner !== bunPtySpawner || !ptySupported()) return;
-  if (session.pid === null || winchTimers.has(session.id)) return;
-  const timer = setTimeout(() => {
-    winchTimers.delete(session.id);
-    const current = sessions.get(session.id);
-    if (current !== undefined) deliverWinch(current);
-  }, WINCH_DEBOUNCE_MS);
-  timer.unref?.();
-  winchTimers.set(session.id, timer);
-};
-
 /** Resize the canonical PTY + shared emulator to the given size and re-sync
  *  every consumer's view against the new canonical size. */
 const applyCanonicalResize = (
@@ -890,8 +855,6 @@ const applyCanonicalResize = (
   session.canonicalCols = cols;
   session.canonicalRows = rows;
   session.pty?.resize(cols, rows);
-  // The winsize ioctl alone does not wake the child — see deliverWinch.
-  if (session.pty !== null) scheduleWinch(session);
   session.emulator?.resize(cols, rows);
 };
 
@@ -947,8 +910,6 @@ const endPty = (
   kill = true,
 ): void => {
   s.lastExitReason = reason;
-  cancelWinch(s.id);
-  winchProcessTrees.delete(s.id);
   if (kill) s.pty?.kill();
   s.pty = null;
   s.pid = null;
@@ -968,7 +929,7 @@ const endPty = (
  *  limit. Live and attached sessions are never evicted. */
 const evictStaleDeadSessions = (): void => {
   const dead = [...sessions.values()]
-    .filter((s) => s.pty === null && !isAttached(s))
+    .filter((s) => s.pty === null && !pendingSpawns.has(s.id) && !isAttached(s))
     .sort((a, b) => a.startedAtMs - b.startedAtMs);
   const excess = dead.length - MAX_RETAINED_SESSIONS;
   for (let i = 0; i < excess; i += 1) {
@@ -988,7 +949,8 @@ export const detachSession = (id: string): void => {
 /** Kill a live device PTY by its OpenLLM session id for the local broker. */
 export const killSession = (id: string): boolean => {
   const session = sessions.get(id);
-  if (session === undefined || session.pty === null) return false;
+  if (session === undefined || (session.pty === null && !pendingSpawns.has(id)))
+    return false;
   endPty(session, "killed");
   logDebug("session", "session closed", { id, reason: "kill" });
   return true;
@@ -997,7 +959,7 @@ export const killSession = (id: string): boolean => {
 /** Kill all local PTYs and close their transport-neutral consumers. */
 export const killAllSessions = (): void => {
   for (const session of sessions.values()) {
-    cancelWinch(session.id);
+    if (pendingSpawns.has(session.id)) session.lastExitReason = "killed";
     if (session.pty !== null) {
       try {
         session.pty.kill();
@@ -1019,9 +981,37 @@ export const killAllSessions = (): void => {
   }
 };
 
+const reportPtyInputFailure = (session: TSession, error: unknown): void => {
+  const overflow = error instanceof NativePtyWriteOverflowError;
+  const nativeError = error instanceof NativePtyNativeError;
+  logWarn("session", overflow ? "pty_input_overflow" : "pty_input_error", {
+    id: session.id,
+    ...(overflow
+      ? {
+          accepted_bytes: error.acceptedBytes,
+          pending_bytes: error.pendingBytes,
+        }
+      : {}),
+    ...(nativeError ? { errno: error.errno } : {}),
+  });
+  endPty(session, "killed");
+  terminalClose(session);
+};
+
+const writePtyInput = (session: TSession, bytes: Uint8Array): void => {
+  const pty = session.pty;
+  if (pty === null) return;
+  try {
+    pty.write(bytes);
+  } catch (error) {
+    reportPtyInputFailure(session, error);
+  }
+};
+
 /** Write input bytes from a transport-neutral session attachment. */
 export const writeSessionInput = (id: string, bytes: Uint8Array): void => {
-  sessions.get(id)?.pty?.write(bytes);
+  const session = sessions.get(id);
+  if (session !== undefined) writePtyInput(session, bytes);
 };
 
 /** Resize the PTY from a transport-neutral session attachment. Authoritative
@@ -1106,10 +1096,10 @@ export type TOpenSessionOptions = {
   readonly onAck: (ack: TSessionOpenAck) => void;
 };
 
-export const openSession = (
+export const openSession = async (
   frame: TSessionOpen,
   options: TOpenSessionOptions,
-): void => {
+): Promise<void> => {
   const { vendorArgs, onSessionReady, onAck } = options;
   const nack = (
     error:
@@ -1163,6 +1153,10 @@ export const openSession = (
     }
     const cli: TDeviceSessionCli = frame.cli;
     const existing = sessions.get(frame.session_id);
+    if (pendingSpawns.has(frame.session_id)) {
+      nack("session_busy");
+      return;
+    }
     if (existing !== undefined && existing.cli !== cli) {
       nack("spawn_failed");
       return;
@@ -1233,7 +1227,7 @@ export const openSession = (
     // Device sessions must launch through the OpenLLM CLI so the gateway,
     // catalog, config, and environment overlay is always applied. Only enforce
     // this for the real spawner — injected test spawners never exec a binary.
-    if (cli !== "shell" && spawner === bunPtySpawner && openllmBin() === null) {
+    if (cli !== "shell" && productionSpawner && openllmBin() === null) {
       nack("cli_not_installed");
       return;
     }
@@ -1254,6 +1248,7 @@ export const openSession = (
       cwd,
       vendorSessionId,
       pty: null,
+      ptyBackend: "native",
       scrollback: [],
       scrollbackBytes: 0,
       emulator: null,
@@ -1278,6 +1273,8 @@ export const openSession = (
     s.vendorSessionId = vendorSessionId;
     if (frame.title !== undefined) s.title = frame.title;
     sessions.set(s.id, s);
+    pendingSpawns.add(s.id);
+    s.lastExitReason = null;
     evictStaleDeadSessions();
 
     try {
@@ -1297,7 +1294,12 @@ export const openSession = (
       });
       const pendingOutput: Uint8Array[] = [];
       let ptyReady = false;
+      let pendingExit: number | null = null;
+      let ownedPty: TPtyLike | null = null;
+      const stillOwnsPty = (): boolean =>
+        sessions.get(s.id) === s && s.pty === ownedPty;
       const onData = (chunk: Uint8Array): void => {
+        if (ptyReady && !stillOwnsPty()) return;
         s.lastOutputAtMs = Date.now();
         // Keep raw scrollback for the no-stream fallback path, and feed the
         // shared emulator that backs per-consumer reflow + attach replay.
@@ -1319,23 +1321,41 @@ export const openSession = (
       });
       s.canonicalCols = frame.cols;
       s.canonicalRows = frame.rows;
-      const pty = spawner({
+      const spawnArgs: TPtySpawnArgs = {
         argv,
         cwd,
-        // Real user HOME + PATH (via spawnEnv). Device markers let the
+        // Real user HOME + PATH (via the PTY allowlist). Device markers let the
         // openllm CLI write host=device into ~/.openllm/run/.../live.json.
         env: deviceSessionEnv(cli, s.id, s.title),
         cols: frame.cols,
         rows: frame.rows,
         onData,
         onExit: (exitCode) => {
+          // A short command can exit while asynchronous startup is settling.
+          // Install the PTY first, then apply its exit instead of reviving it.
+          if (!ptyReady) {
+            pendingExit = typeof exitCode === "number" ? exitCode : 1;
+            return;
+          }
+          if (!stillOwnsPty()) return;
           s.exitCode = typeof exitCode === "number" ? exitCode : null;
           const reason = s.lastExitReason ?? "done";
           endPty(s, reason, false);
           terminalClose(s);
           logDebug("session", "session CLI exited", { id: s.id });
         },
-      });
+      };
+      const result = spawnHostPty(spawnArgs);
+      // Injected and Bun spawners remain synchronous for existing consumers.
+      const spawned = result instanceof Promise ? await result : result;
+      if (sessions.get(s.id) !== s || s.lastExitReason === "killed") {
+        spawned.pty.kill();
+        nack("spawn_failed");
+        return;
+      }
+      const pty = spawned.pty;
+      ownedPty = pty;
+      s.ptyBackend = spawned.backend;
       s.pty = pty;
       s.pid = pty.pid ?? null;
       s.busy = true;
@@ -1355,12 +1375,23 @@ export const openSession = (
       ptyReady = true;
       for (const chunk of pendingOutput) sendOut(s, chunk);
       pendingOutput.length = 0;
-      logDebug("session", "session started", {
+      if (pendingExit !== null) spawnArgs.onExit(pendingExit);
+      logInfo("session", "session started", {
         id: s.id,
         cli,
         mode: frame.mode,
+        pty_backend: s.ptyBackend,
       });
     } catch (err) {
+      // onSpawn/onSessionReady/onAck can throw AFTER the PTY child exists:
+      // kill it before dropping session state or the vendor process outlives
+      // the nack with no owner (DSN-5).
+      try {
+        s.pty?.kill("SIGKILL");
+      } catch {
+        // Already gone; the nack still reports the spawn failure.
+      }
+      s.pty = null;
       s.emulator?.dispose();
       s.emulator = null;
       sessions.delete(s.id);
@@ -1369,6 +1400,8 @@ export const openSession = (
         `session spawn failed: ${err instanceof Error ? err.message : String(err)}`,
       );
       nack("spawn_failed");
+    } finally {
+      pendingSpawns.delete(s.id);
     }
   } catch (err) {
     logWarn(
@@ -1475,7 +1508,7 @@ export const bindSessionStream = (
       // see the note on the primary at the top of this file. A keystroke is not
       // a viewport announcement, and treating it as one made the canonical size
       // alternate between two attached viewers as the user typed.
-      session.pty?.write(bytes);
+      writePtyInput(session, bytes);
     }),
     stream.onCtrl((payload) => {
       if (!session.consumers.has(consumer)) return;
@@ -1513,7 +1546,6 @@ export const bindSessionStream = (
 /** Test-only: reset all session state. */
 export const resetSessionsForTest = (): void => {
   for (const s of sessions.values()) {
-    cancelWinch(s.id);
     s.pty?.kill();
     lifecycleHooks.onEnd(s);
   }

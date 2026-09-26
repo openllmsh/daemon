@@ -1,3 +1,4 @@
+import { spawnSync as admittedSpawnSync } from "../windows-process";
 /**
  * Scan `~/.openllm/run/<client>/<pid>/live.json` for process-live launches.
  *
@@ -51,7 +52,7 @@ const pidAlive = (pid: number): boolean => {
 const commandMap = (pids: ReadonlySet<number>): Map<number, string> | null => {
   if (pids.size === 0) return new Map();
   try {
-    const out = Bun.spawnSync(
+    const out = admittedSpawnSync(
       ["ps", "-o", "pid=,command=", ...[...pids].map((p) => String(p))],
       { stdout: "pipe", stderr: "ignore" },
     );

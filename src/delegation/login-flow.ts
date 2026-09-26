@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Shared, provider-agnostic login-flow scaffolding for the subscription
  * delegates.
@@ -41,7 +42,6 @@ import { sandboxSpawnArgs } from "../sandbox/exec";
 import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
 import {
   DEFAULT_LOGIN_TIMEOUT_MS,
-  mergeSpawnEnv,
   redactUrls,
   spawnCwd,
   spawnEnv,
@@ -887,8 +887,8 @@ export type TStreamLoginOpts<T> = {
   readonly provider: string;
   readonly slot: TLoginSlot;
   readonly argv: ReadonlyArray<string>;
-  /** Override map. Values of `undefined` delete the key from the child env
-   *  (see {@link mergeSpawnEnv}) so ambient secrets like `META_API_KEY` can be
+  /** Overlay onto the allowlisted child env (see {@link spawnEnv}). Values of
+   *  `undefined` delete the key so ambient secrets like `META_API_KEY` can be
    *  stripped. */
   readonly env: Record<string, string | undefined>;
   /** Which fd carries the prompt: codex `login` prints the authorize URL to
@@ -1051,14 +1051,14 @@ export const spawnStreamLogin = async <T>(
     };
   }
   try {
-    proc = Bun.spawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
+    proc = admittedSpawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
       stdin: "ignore",
       // Always pipe BOTH fds: the prompt may be on stdout (device-code) while
       // the `--sandbox-exec` shim writes inner posix_spawn EPERM to stderr.
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(opts.env),
-      env: spawnEnv(opts.env) ?? mergeSpawnEnv(process.env),
+      env: spawnEnv(opts.env),
     });
   } catch (error) {
     opts.slot.end(flow.flowId);

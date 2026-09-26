@@ -16,8 +16,9 @@ import {
   NO_DAEMON_HEADER,
 } from "@openllmsh/protocol";
 import { CLOUD_FETCH_TIMEOUT_MS } from "./cloud-client";
-import { errorJson } from "./cors";
-import { daemonEnv } from "./env";
+import { planSigningKey } from "./config";
+import { errorJson, LOCAL_CALLER_TOKEN_HEADER } from "./cors";
+import { daemonEnv, isLocalCallerCredential, isSecureOrigin } from "./env";
 import { logWarn } from "./logger";
 import {
   classifyOriginThrow,
@@ -25,6 +26,7 @@ import {
   originFailureStatus,
   originFailureType,
 } from "./net-error";
+import { fetchWithBoundedRedirects } from "./upstream-redirect";
 
 /** Bound how long we wait for origin *headers*. The timer is cleared once
  *  headers arrive so a long inference stream is not cut by this budget.
@@ -43,7 +45,7 @@ const headerTimeoutAbort = (): Error => {
   return err;
 };
 
-const fetchOrigin = async (
+const fetchOriginOnce = async (
   target: string,
   init: RequestInit,
   inbound: Request,
@@ -56,7 +58,7 @@ const fetchOrigin = async (
   }, originHeaderTimeoutMs());
   const signal = AbortSignal.any([inbound.signal, headerTimeout.signal]);
   try {
-    const resp = await fetch(target, { ...init, signal });
+    const resp = await fetch(target, { ...init, signal, redirect: "manual" });
     clearTimeout(timer);
     return stripHopByHopResponseHeaders(resp);
   } catch (err) {
@@ -71,6 +73,23 @@ const fetchOrigin = async (
     );
   }
 };
+
+/**
+ * Origin fetches run the daemon's shared manual-redirect policy
+ * (`upstream-redirect.ts`): a cloud-controlled (or signed-`?__origin=`) 30x
+ * must never pull prompts, media, or the `sk-llm` bearer to an arbitrary
+ * origin — only same-origin or canonical-cloud 307/308s are re-issued.
+ */
+const fetchOrigin = async (
+  target: string,
+  init: RequestInit,
+  inbound: Request,
+): Promise<Response> =>
+  fetchWithBoundedRedirects(
+    target,
+    (current) => fetchOriginOnce(current, init, inbound),
+    "forward",
+  );
 
 /**
  * Bun's `fetch` auto-decompresses upstream bodies but may leave the
@@ -102,6 +121,43 @@ const stripHopByHopResponseHeaders = (resp: Response): Response => {
  * the upstream response through (status + body; hop-by-hop encoding
  * headers stripped so Bun's auto-decompression cannot poison clients).
  */
+/**
+ * Is `origin` (a `?__origin=` off a 307, or a signed plan's origin field)
+ * trustworthy enough to receive the user's `sk-llm` bearer? It is honored
+ * only when it COULD have been cloud-signed: a per-user plan-signing key
+ * must exist (no key → the tuple is unverifiable caller-supplied text — the
+ * pre-bootstrap window, where honoring it forwards `Bearer <apiKey>` to
+ * whatever origin the caller names) and it must be a secure origin (a signed
+ * `http://` non-loopback origin would still leak the key in cleartext).
+ * Any other origin resolves to the pinned cloud origin.
+ */
+export const signedPlanOrigin = (
+  origin: string | null | undefined,
+): string | null =>
+  origin !== null &&
+  origin !== undefined &&
+  origin.length > 0 &&
+  planSigningKey() !== null &&
+  isSecureOrigin(origin)
+    ? origin
+    : null;
+
+/**
+ * Remove every loopback-only credential shape from `headers` BEFORE an
+ * upstream fetch: the dedicated local-token header unconditionally, and
+ * `x-api-key` only when it CARRIES the local token (a real `sk-llm` there is
+ * the caller's own key — it keeps its cloud meaning). `Authorization` is
+ * handled by each caller's bearer policy (substitution or fill-in) so a
+ * local-token bearer can still be swapped for the paired key.
+ */
+const stripLocalCredentialHeaders = (headers: Headers): void => {
+  headers.delete(LOCAL_CALLER_TOKEN_HEADER);
+  const apiKey = headers.get("x-api-key");
+  if (apiKey !== null && isLocalCallerCredential(apiKey.trim())) {
+    headers.delete("x-api-key");
+  }
+};
+
 export const forwardToCloud = async (
   inbound: Request,
   bodyBytes: ArrayBuffer,
@@ -114,14 +170,17 @@ export const forwardToCloud = async (
   // for older/unsigned redirects. Drop the inbound query — the only params
   // here are the daemon's own `?__plan=`/`?__sig=`/… (off the 307), which the
   // cloud `/v1` surface never reads (it selects via `x-openllm-pin-model`).
-  const base =
-    origin !== undefined && origin !== null && origin.length > 0
-      ? origin.replace(/\/+$/, "")
-      : daemonEnv().cloudOrigin;
+  const base = (signedPlanOrigin(origin) ?? daemonEnv().cloudOrigin).replace(
+    /\/+$/,
+    "",
+  );
   const target = `${base}${url.pathname}`;
   const headers = new Headers(inbound.headers);
   headers.delete(MEDIA_PERSISTENCE_REQUEST_HEADER);
-  headers.set("authorization", `Bearer ${daemonEnv().apiKey}`);
+  stripLocalCredentialHeaders(headers);
+  const { apiKey } = daemonEnv();
+  if (apiKey !== null) headers.set("authorization", `Bearer ${apiKey}`);
+  else headers.delete("authorization");
   // Lock the cloud to the exact concrete model the local chain picked, so
   // the cloud doesn't re-run its own alias/fallback resolution.
   headers.set("x-openllm-pin-model", pinnedModel);
@@ -178,6 +237,7 @@ export const passthroughToOrigin = async (
   const target = `${daemonEnv().cloudOrigin}${url.pathname}${qs.length > 0 ? `?${qs}` : ""}`;
   const headers = new Headers(inbound.headers);
   headers.delete(MEDIA_PERSISTENCE_REQUEST_HEADER);
+  stripLocalCredentialHeaders(headers);
   if (options?.pinModel !== undefined && options.pinModel.length > 0) {
     headers.set("x-openllm-pin-model", options.pinModel);
   } else {
@@ -187,9 +247,21 @@ export const passthroughToOrigin = async (
     headers.set("content-type", options.contentType);
   }
   const callerAuth = inbound.headers.get("authorization");
-  if (callerAuth === null || callerAuth.length === 0) {
+  // The per-boot local caller token is a loopback-only credential — it
+  // proves the caller is a first-party local client but means nothing to
+  // the cloud. Swap it for the daemon's paired key instead of forwarding it
+  // (same fill-in as an auth-less caller).
+  const callerAuthIsLocalToken =
+    callerAuth?.startsWith("Bearer ") === true &&
+    isLocalCallerCredential(callerAuth.slice("Bearer ".length).trim());
+  if (
+    callerAuth === null ||
+    callerAuth.length === 0 ||
+    callerAuthIsLocalToken
+  ) {
     const { apiKey } = daemonEnv();
     if (apiKey !== null) headers.set("authorization", `Bearer ${apiKey}`);
+    else headers.delete("authorization");
   }
   headers.set(NO_DAEMON_HEADER, "1");
   headers.delete("host");

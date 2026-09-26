@@ -197,8 +197,8 @@ import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TRefreshErrorClass } from "./delegation/refresh";
 import { authReasonCodeForRefreshError } from "./delegation/refresh";
 import type { TProviderDelegate } from "./delegation/types";
-import { stateDir } from "./env";
-import { forwardToCloud } from "./forward";
+import { hasApiKey, isDevMode, stateDir } from "./env";
+import { forwardToCloud, signedPlanOrigin } from "./forward";
 import {
   clearHopCooldown,
   isHopCoolingDown,
@@ -215,8 +215,10 @@ import {
 import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
+import { isSandboxRejectionResponse } from "./sandbox/exec";
 import { isClaudeCodeOriginator, localMethodsForHop } from "./sub-method";
 import { tunnelToPeer } from "./tunnel-client";
+import { fetchWithBoundedRedirects } from "./upstream-redirect";
 import {
   peekUsageForQuotaGate,
   sampleUsageAfterRequest,
@@ -431,7 +433,16 @@ export const verifyPlanSignature = (
  * Verify a signed `(plan, pmids, origin)` tuple against the bootstrap
  * signing key — the ONE check shared by the walker's 403 gate, the
  * listener's plan-cache admission, and the compact passthrough's
- * model-pin trust. True in unsigned dev mode (no key configured).
+ * model-pin trust.
+ *
+ * No signing key means NOTHING is verifiable. The unsigned fallback exists
+ * for two states only: a genuinely keyless box (no `sk-llm` yet — there is
+ * nothing to exfiltrate and unsigned plans are the test/dev posture) and
+ * `OPENLLM_DAEMON_DEV=1` local development. Once the daemon holds an API
+ * key, a missing key is the pre-bootstrap window (offline boot, cloud
+ * outage): an unsigned `?__plan=`/`?__origin=` would then run arbitrary
+ * hops and steer `Bearer <apiKey>` wherever the caller names — fail
+ * closed (NET-1).
  */
 export const planSignatureOk = (
   planParam: string | null,
@@ -441,18 +452,16 @@ export const planSignatureOk = (
   sigParam: string | null,
 ): boolean => {
   const sigKey = planSigningKey();
-  return (
-    sigKey === null ||
-    verifyPlanSignature(
-      daemonPlanSigningPayload(
-        planParam ?? "",
-        pmidsParam ?? "",
-        originParam ?? "",
-        contextOverflowStrategy,
-      ),
-      sigParam,
-      sigKey,
-    )
+  if (sigKey === null) return !hasApiKey() || isDevMode();
+  return verifyPlanSignature(
+    daemonPlanSigningPayload(
+      planParam ?? "",
+      pmidsParam ?? "",
+      originParam ?? "",
+      contextOverflowStrategy,
+    ),
+    sigParam,
+    sigKey,
   );
 };
 
@@ -559,7 +568,14 @@ export const postUpstream = async (
   onTransportFailure?: (failure: TTransportFailure) => void,
 ): Promise<Response | null> => {
   try {
-    return await fetch(url, init);
+    // Vendor credentials + the request body ride this call — redirects are
+    // re-issued only under the shared same-origin/canonical-cloud policy,
+    // never auto-followed to an arbitrary origin.
+    return await fetchWithBoundedRedirects(
+      url,
+      (target) => fetch(target, { ...init, redirect: "manual" }),
+      "walker",
+    );
   } catch (err) {
     onTransportFailure?.(transportFailureFrom(err));
     return null;
@@ -731,7 +747,10 @@ export const report = (
     ...row,
     idempotency_key: row.idempotency_key ?? randomUUID(),
   };
-  void recordRequest(recordedRow, origin);
+  // Usage rows authenticate with `Bearer <apiKey>` — the target must pass
+  // the same signed-origin gate as an API-key forward, or an unsigned
+  // `?__origin=` would exfiltrate the key via the record call (NET-1).
+  void recordRequest(recordedRow, signedPlanOrigin(origin));
   if (
     recordedRow.status !== "success" ||
     !isSubscriptionSlug(recordedRow.provider) ||
@@ -1168,7 +1187,11 @@ const sanitizeErrorLine = (err: unknown, max: number): string => {
 
 const upstreamErrorLine = (err: UpstreamStreamError): string => {
   const { type, message } = upstreamErrorFrom(err);
-  return message.startsWith(type) ? message : `${type}: ${message}`;
+  const detail = message.startsWith(type) ? message : `${type}: ${message}`;
+  // The vendor's `upstreamType` rides into the recorded row as a
+  // parenthesized classifier — the structured channel the usage-error
+  // allowlist parses — while the prose stays free text it strips.
+  return `(${type}) ${detail}`;
 };
 
 /**
@@ -2796,6 +2819,9 @@ const walkPlan = async (
           ),
       });
       if (native instanceof Response) {
+        if (isSandboxRejectionResponse(native)) {
+          return { response: native, servedLocally: true };
+        }
         if (!native.ok) {
           const raw = await native
             .clone()
@@ -3550,12 +3576,18 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
   let resp: Response;
   let text: string;
   try {
-    resp = await fetch(url, {
-      method: "POST",
-      headers: built.headers,
-      body: JSON.stringify(built.body),
-      signal: args.req.signal,
-    });
+    resp = await fetchWithBoundedRedirects(
+      url,
+      (target) =>
+        fetch(target, {
+          method: "POST",
+          headers: built.headers,
+          body: JSON.stringify(built.body),
+          signal: args.req.signal,
+          redirect: "manual",
+        }),
+      "walker",
+    );
     // The body read is INSIDE the try: a mid-body stream error (or the client
     // aborting) rejects here, and a preflight that throws would surface as a
     // 500 — the one thing this handler promises never to do.
@@ -3662,12 +3694,18 @@ export const runResponsesCompact = async (
       : built.body;
   let resp: Response;
   try {
-    resp = await fetch(compactUpstreamUrl(acquired.url), {
-      method: "POST",
-      headers: built.headers,
-      body: JSON.stringify(body),
-      signal: args.req.signal,
-    });
+    resp = await fetchWithBoundedRedirects(
+      compactUpstreamUrl(acquired.url),
+      (target) =>
+        fetch(target, {
+          method: "POST",
+          headers: built.headers,
+          body: JSON.stringify(body),
+          signal: args.req.signal,
+          redirect: "manual",
+        }),
+      "walker",
+    );
   } catch (err) {
     return errorJson(
       502,

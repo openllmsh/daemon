@@ -23,10 +23,12 @@ import {
   symlinkSync,
 } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import type { TCliProvider } from "./cli-paths";
 import {
   cliBin,
+  cliBinForHost,
+  cliBinVariants,
   cliConfigDir,
   cliEnv,
   cliHome,
@@ -75,10 +77,14 @@ const ensureIsolatedDirs = async (provider: TCliProvider): Promise<void> => {
 };
 
 /**
- * Point the isolated CLI path (`cliBin(provider)`) at the host binary via a
- * SYMLINK — never a copy, so the isolated CLI takes no disk space. Replaces any
- * existing link/file at the isolated path so it always tracks the current host
- * binary (e.g. after the user updates their CLI). Writes ONLY into the
+ * Point the isolated CLI path at the host binary via a SYMLINK — never a copy,
+ * so the isolated CLI takes no disk space. The link is created at
+ * `cliBinForHost(provider, hostBin)`: `<root>/<binRel>` on POSIX, and on win32
+ * the same path plus the host's launchable extension (`.exe`/`.cmd`/...) so it
+ * is spawnable. First removes EVERY `cliBinVariants` spelling (on POSIX just
+ * the one path), so no stale link can shadow the new one and `cliBin` then
+ * resolves to it; the link always tracks the current host binary (e.g. after
+ * the user updates their CLI). Writes ONLY into the
  * always-granted state dir (`<stateDir>/cli/<provider>/`); it merely READS the
  * host binary, so it needs no grant on the host CLI's own dir.
  */
@@ -87,9 +93,14 @@ export const linkIsolatedCli = async (
   hostBin: string,
 ): Promise<void> => {
   await ensureIsolatedDirs(provider);
-  const dst = cliBin(provider);
+  const dst = cliBinForHost(provider, hostBin);
   await mkdir(dirname(dst), { recursive: true });
-  await rm(dst, { force: true });
+  // POSIX: the single spelling `dst` (unchanged). win32: every extension
+  // variant, so a stale link (an extensionless one from an older install, or
+  // a `.cmd` link after the host moved to `.exe`) can never shadow `dst`.
+  for (const variant of cliBinVariants(provider)) {
+    await rm(variant, { force: true });
+  }
   symlinkSync(hostBin, dst);
   linkSidecars(dst);
 };
@@ -113,7 +124,14 @@ const linkSidecars = (isolatedBin: string): void => {
     const real = realpathSync(isolatedBin);
     const realDir = dirname(real);
     const isolatedDir = dirname(isolatedBin);
-    const prefix = `${basename(isolatedBin)}-`;
+    // On win32 the link carries the host's extension (`codex.exe`), while a
+    // sidecar is `codex-<name>.exe`: match on the extension-free stem there.
+    const name = basename(isolatedBin);
+    const stem =
+      process.platform === "win32"
+        ? name.slice(0, name.length - extname(name).length)
+        : name;
+    const prefix = `${stem}-`;
     const current = new Set<string>();
     for (const entry of readdirSync(realDir)) {
       if (!entry.startsWith(prefix)) continue;
@@ -169,7 +187,14 @@ const reconcileIsolatedLink = async (
   const host = hostCliCandidates(provider).find((c) => existsSync(c));
   if (host === undefined) return false;
   try {
-    if (realpathSync(bin) === realpathSync(host)) return false;
+    // POSIX: `cliBinForHost` is always `bin`, so this is the realpath compare
+    // alone. win32: also re-link when the link's extension does not match the
+    // host's (stale extensionless link, or a `.cmd` → `.exe` host change).
+    if (
+      bin === cliBinForHost(provider, host) &&
+      realpathSync(bin) === realpathSync(host)
+    )
+      return false;
   } catch {
     // Broken link / unresolvable host — fall through to re-link defensively.
   }
@@ -245,7 +270,7 @@ const probeCliInstallState = async (
   provider: TCliProvider,
 ): Promise<TCliInstallState> => {
   const now = Date.now();
-  const bin = cliBin(provider);
+  let bin = cliBin(provider);
   if (!existsSync(bin)) {
     const host = hostCliCandidates(provider).find((c) => existsSync(c));
     if (host === undefined) {
@@ -257,8 +282,21 @@ const probeCliInstallState = async (
     if (until !== undefined && until <= now) {
       await reconcileIsolatedLink(provider, bin);
       cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+    } else if (process.platform === "win32" && extname(bin) === "") {
+      // An older install left an extensionless link Windows cannot spawn
+      // (only reachable when no launchable variant exists). When the host
+      // binary IS launchable, re-link now (unthrottled, one-off: the new link
+      // carries the extension so this branch stops matching) instead of
+      // reporting version null. An extensionless host stays on the throttle.
+      const host = hostCliCandidates(provider).find((c) => existsSync(c));
+      if (host !== undefined && cliBinForHost(provider, host) !== bin) {
+        await linkIsolatedCli(provider, host);
+      }
     }
   }
+  // Linking may have changed the win32 spelling (extension); re-resolve.
+  // POSIX: the same single path.
+  bin = cliBin(provider);
   if (!existsSync(bin)) {
     return { installed: false, version: null };
   }

@@ -21,6 +21,7 @@
  */
 import { isDevMode } from "./env";
 import { logError, logWarn } from "./logger";
+import { prevBinaryPath, restorePreviousBinary } from "./self-update";
 import { serviceStop } from "./service";
 import {
   clearRtcRun,
@@ -30,6 +31,7 @@ import {
   RTC_CRASH_WINDOW_MS,
   readBootHistory,
   readState,
+  rejectUpdateVersion,
   writeBootHistory,
 } from "./state-file";
 import { DAEMON_VERSION } from "./version";
@@ -41,6 +43,14 @@ export const CRASH_WINDOW_MS = 3 * 60 * 1000;
  *  is rare; the supervisor's backoff stretches a real crash loop to roughly this
  *  rate), but reached quickly once a boot fails persistently. */
 export const CRASH_LIMIT = 10;
+
+/**
+ * How recent a recorded self-update attempt must be for a crash loop to blame
+ * the swap: the loop's own tally window, plus slack for the post-swap request
+ * drain (≤30s) and supervisor relaunch before the first crash. An attempt
+ * older than this is presumed unrelated — the loop gets the normal park path.
+ */
+export const ROLLBACK_WINDOW_MS = CRASH_WINDOW_MS + 2 * 60 * 1000;
 
 /**
  * Pure crash-loop decision. Appends `now` to the prior boot timestamps, drops
@@ -76,6 +86,32 @@ export const guardCrashLoop = (): void => {
   const { recent, park } = shouldPark(readBootHistory(), now);
   writeBootHistory(recent);
   if (!park) return;
+  // Rollback path (TCB-3): when the loop started right after a recorded swap
+  // of THIS binary (`attempt.version === DAEMON_VERSION` means the attempt
+  // produced the executable now crash-looping — a mere failed download names
+  // a version we never ran), restore the `<exec>.prev` backup instead of
+  // parking. The supervisor then relaunches the known-good binary, and the
+  // rejected version is never reinstalled. No `.prev` (or a failed restore)
+  // falls through to the normal park path.
+  const attempt = readState().updateAttempts.daemon;
+  if (
+    attempt !== undefined &&
+    attempt.version === DAEMON_VERSION &&
+    now - attempt.ts <= ROLLBACK_WINDOW_MS &&
+    process.platform !== "win32" &&
+    restorePreviousBinary(process.execPath)
+  ) {
+    rejectUpdateVersion("daemon", attempt.version, attempt.digest ?? "");
+    logError(
+      "boot-guard",
+      `crash loop right after the v${attempt.version} self-update — restored ${prevBinaryPath(process.execPath)}; v${attempt.version} is rejected on this host and will not be reinstalled`,
+    );
+    writeBootHistory([]);
+    // Exit WITHOUT serviceStop: the supervisor relaunches the restored
+    // binary, which either boots healthy (markHealthyBoot clears the window)
+    // or loops again — the next park then finds no `.prev` and parks for real.
+    process.exit(0);
+  }
   logError(
     "boot-guard",
     `crash loop detected — ${recent.length} restarts within ${Math.round(

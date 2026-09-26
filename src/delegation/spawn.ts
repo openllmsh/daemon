@@ -31,9 +31,12 @@ import {
   logWarn,
   safeDiagnosticMessage,
 } from "../logger";
+import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { currentTickId } from "../op-context";
+import { childEnvironment } from "../sandbox/child-policy";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
+import { spawn as admittedSpawn, nodeSpawnSync } from "../windows-process";
 import { redactSensitiveArgv } from "./redact-sensitive-argv";
 
 /**
@@ -58,11 +61,32 @@ export const mergeSpawnEnv = (
   return next;
 };
 
-/** Merge an env map onto the parent env for a spawned isolated CLI. */
+/**
+ * The spawn env for a vendor CLI child — the shared allowlisted ambient env
+ * plus this call's explicit overlay, via {@link cleanNativeSpawnEnv}. NEVER a
+ * merge onto `process.env`: `OPENLLM_API_KEY` and the rest of the daemon env
+ * must not reach the child (the builder's authority-prefix strip covers
+ * overlay-injected secrets too, and its `OPENLLM_DAEMON_STATE_DIR` pin lets
+ * an openllm-code descendant — e.g. the `--sandbox-exec` shim or a nested
+ * `openllmd --version` — resolve the REAL state dir under a child `HOME`
+ * that points at an isolated CLI home). An overlay value of `undefined`
+ * deletes that key from the result (e.g. Muse strips ambient `META_API_KEY`).
+ * `env === undefined` yields the plain allowlisted env — a no-overlay spawn
+ * must still not inherit the daemon env.
+ */
 export const spawnEnv = (
   env: Record<string, string | undefined> | undefined,
-): Record<string, string> | undefined =>
-  env === undefined ? undefined : mergeSpawnEnv(process.env, env);
+): Record<string, string> => {
+  const overlay: Record<string, string> = {};
+  const deletes: string[] = [];
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (value === undefined) deletes.push(key);
+    else overlay[key] = value;
+  }
+  const child = cleanNativeSpawnEnv(overlay);
+  for (const key of deletes) delete child[key];
+  return child;
+};
 
 /**
  * The working directory for a spawned isolated CLI. SECURITY: the daemon runs
@@ -337,7 +361,7 @@ export const runCaptureResult = async (
       stdout: "pipe",
       stderr: "ignore",
       cwd: spawnCwd(env),
-      ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
+      env: spawnEnv(env),
     };
     const child = superviseSpawn(
       sandboxSpawnArgs(command, { probe: opts?.probe }),
@@ -806,7 +830,7 @@ export const spawnLogin = async (
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(env),
-      ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
+      env: spawnEnv(env),
     },
   );
   let terminatePromise: Promise<TReapOutcome> | null = null;
@@ -1331,7 +1355,7 @@ export const spawnLoginPty = async (
         stdout: "ignore",
         stderr: "ignore",
         cwd: spawnCwd(env),
-        ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
+        env: spawnEnv(env),
       },
     );
     const proc = child.subprocess;
@@ -1492,12 +1516,184 @@ export const spawnLoginPty = async (
 };
 
 /**
+ * The env a GUI opener may inherit: only what it needs to reach the user's
+ * desktop session — display/bus sockets, desktop-identity hints, locale —
+ * never the daemon's working env. `OPENLLM_API_KEY` & co. would otherwise
+ * land in EVERY browser process (and whatever it spawns) as a plain
+ * inherited var.
+ */
+const OPENER_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LANGUAGE",
+  "TERM",
+  "COLORTERM",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "TZ",
+  // GUI session reachability.
+  "DISPLAY",
+  "WAYLAND_DISPLAY",
+  "XAUTHORITY",
+  "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR",
+  "XDG_CURRENT_DESKTOP",
+  "XDG_SESSION_DESKTOP",
+  "XDG_SESSION_TYPE",
+  "XDG_CONFIG_HOME",
+  "XDG_CONFIG_DIRS",
+  "XDG_DATA_HOME",
+  "XDG_DATA_DIRS",
+  "DESKTOP_SESSION",
+  "KDE_FULL_SESSION",
+  "GNOME_DESKTOP_SESSION_ID",
+  "XDG_MENU_PREFIX",
+  // xdg-open's generic mode honours the user's preferred browser.
+  "BROWSER",
+]);
+
+/**
+ * Build the opener's env from the ambient one via `OPENER_ENV_KEYS` (plus the
+ * `LC_*` locale family). Pure; the test seam for `openUrl`'s env hygiene.
+ */
+export const browserOpenerEnv = (
+  ambient: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, string> => {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(ambient)) {
+    if (value === undefined) continue;
+    if (!OPENER_ENV_KEYS.has(key) && !key.startsWith("LC_")) continue;
+    env[key] = value;
+  }
+  return env;
+};
+
+/** A random transient-unit suffix — a fixed name would collide when two opens
+ *  race (`systemd-run` rejects a duplicate unit), and hex is always a valid
+ *  unit-name component. */
+const randomUnitSuffix = (): string =>
+  crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+
+/** `--expand-environment=` (which turns OFF `${VAR}`/`$VAR` expansion of the
+ *  command's arguments) exists on systemd-run only since systemd v254. */
+const SYSTEMD_EXPAND_ENV_MIN = 254;
+
+let systemdRunMajorCache: number | null | undefined;
+
+/**
+ * `systemd-run --version` major (e.g. `252`, `254`), or null when systemd-run
+ * is absent or its banner is unparseable. Decides whether a `$`-bearing URL
+ * can be passed with `--expand-environment=no`; treated as "old" when
+ * undetermined (the safe direction — the URL is printed, not expanded into a
+ * different target). Cached: the system version cannot change mid-run. A
+ * minimal env + short timeout keep the probe secret-free and unwedgeable.
+ */
+const systemdRunMajor = (): number | null => {
+  if (systemdRunMajorCache !== undefined) return systemdRunMajorCache;
+  let major: number | null = null;
+  try {
+    // PATH only — a version probe needs nothing else. Typed as ProcessEnv
+    // (Bun's type requires NODE_ENV) for spawnSync; the value is a string.
+    const probeEnv = {} as NodeJS.ProcessEnv;
+    probeEnv.PATH = process.env.PATH ?? "/usr/bin:/bin";
+    const res = nodeSpawnSync("systemd-run", ["--version"], {
+      encoding: "utf8",
+      timeout: 3_000,
+      env: probeEnv,
+    });
+    const match = /^systemd\s+(\d+)/m.exec(res.stdout ?? "");
+    const n = match !== null ? Number.parseInt(match[1] ?? "", 10) : NaN;
+    major = Number.isFinite(n) ? n : null;
+  } catch {
+    major = null;
+  }
+  systemdRunMajorCache = major;
+  return major;
+};
+
+export type TOpenerArgvDeps = {
+  /** `systemd-run --version` major (see {@link systemdRunMajor}); null when
+   *  undetermined, which is treated as pre-254. */
+  readonly systemdVersion?: number | null;
+  /** Ambient env the transient service's `--setenv` list derives from. */
+  readonly env?: Readonly<Record<string, string | undefined>>;
+};
+
+/**
+ * The opener argv for a URL on `os` — or `null` when no SAFE launcher exists.
+ *
+ * On Linux a browser must NEVER be a daemon child: inside the shipped systemd
+ * unit (`NoNewPrivileges=yes` + `RestrictNamespaces=yes`, `service.ts`) a
+ * Chrome/Chromium sandbox cannot create user namespaces and fails or crashes,
+ * and a `systemctl restart` / self-update kills any browser still in the
+ * unit's cgroup mid-login. Under systemd we therefore ask the USER MANAGER to
+ * start `xdg-open` as a transient SERVICE (`systemd-run --user --collect
+ * --quiet --no-block --unit=<random>`) — not a scope: a `systemd-run --scope`
+ * would still make `systemd-run` the browser's parent inside the daemon's
+ * own cgroup/security context. A service is owned by the user manager
+ * (clean prctl/seccomp state, the user's real session cgroup) and survives
+ * a daemon exit or restart; `--no-block` keeps the login flow off the unit's
+ * start job. The service does NOT inherit our env, so the GUI-session
+ * allowlist rides in explicit `--setenv` pairs (all non-secret).
+ *
+ * systemd-run expands `${VAR}`/`$VAR` in the command's arguments unless
+ * `--expand-environment=no` is passed (systemd >= 254). On an older or
+ * undetermined systemd a `$`-bearing URL could be rewritten into a different
+ * target, so it is refused (the caller prints it for a manual open).
+ *
+ * With no systemd manager (`INVOCATION_ID` unset — dev/`nohup` runs) there is
+ * no out-of-unit launcher, so the caller prints the URL instead of spawning
+ * a doomed child. macOS `open` is already out-of-process (it hands the URL to
+ * LaunchServices; the browser is never our child). Windows `start` is a `cmd`
+ * builtin — the empty "" is the required window-title arg and quoting keeps
+ * an OAuth `&` from splitting.
+ */
+export const openerArgv = (
+  url: string,
+  os: NodeJS.Platform = process.platform,
+  underSystemd: boolean = process.env.INVOCATION_ID !== undefined,
+  deps?: TOpenerArgvDeps,
+): string[] | null => {
+  if (os === "darwin") return ["open", url];
+  if (os === "win32") return ["cmd", "/c", "start", "", `"${url}"`];
+  if (os !== "linux" || !underSystemd) return null;
+  const noExpand =
+    deps?.systemdVersion !== null &&
+    deps?.systemdVersion !== undefined &&
+    deps.systemdVersion >= SYSTEMD_EXPAND_ENV_MIN;
+  if (!noExpand && url.includes("$")) return null;
+  const openerEnv = browserOpenerEnv(deps?.env ?? process.env);
+  return [
+    "systemd-run",
+    "--user",
+    "--collect",
+    "--quiet",
+    "--no-block",
+    `--unit=openllm-open-${randomUnitSuffix()}`,
+    ...(noExpand ? ["--expand-environment=no"] : []),
+    ...Object.entries(openerEnv).map(
+      ([key, value]) => `--setenv=${key}=${value}`,
+    ),
+    "--",
+    "xdg-open",
+    url,
+  ];
+};
+
+/**
  * Best-effort open a URL in the user's default browser (macOS `open`, Windows
- * `cmd /c start`, else `xdg-open`). Used by the browser / device-code login
- * flows to bring up the vendor's auth page FROM the daemon — some vendor CLIs
- * print the URL but their own auto-open doesn't reach the user's GUI session
- * when the daemon spawns them (e.g. codex). Never throws; the user can copy the
- * URL from the card.
+ * `cmd /c start`, else a transient `systemd-run --user` SERVICE running
+ * `xdg-open` under systemd — see {@link openerArgv}). Used by the browser /
+ * device-code login flows to bring up the vendor's auth page FROM the daemon
+ * — some vendor CLIs print the URL but their own auto-open doesn't reach the
+ * user's GUI session when the daemon spawns them (e.g. codex). Never throws;
+ * the user can copy the URL from the card, and when no safe launcher exists
+ * the URL is logged.
  */
 export const openUrl = (url: string): void => {
   // Never launch a real browser under the test runner (`bun test` sets
@@ -1505,25 +1701,55 @@ export const openUrl = (url: string): void => {
   // otherwise pop a tab on the developer's machine. Production is unaffected.
   if (process.env.NODE_ENV === "test") return;
   const os = platform();
-  // Windows: `start` is a cmd builtin, so it must run via `cmd /c`; the empty
-  // "" is the (required) window-title arg, and the URL is quoted so `cmd.exe`
-  // doesn't treat an OAuth URL's `&` as a command separator.
-  const argv: string[] =
-    os === "darwin"
-      ? ["open", url]
-      : os === "win32"
-        ? ["cmd", "/c", "start", "", `"${url}"`]
-        : ["xdg-open", url];
+  const underSystemd =
+    os === "linux" && process.env.INVOCATION_ID !== undefined;
+  const argv = openerArgv(url, os, underSystemd, {
+    // Only probe `systemd-run --version` when the systemd path is even
+    // reachable — pointless on macOS/Windows and with no user manager.
+    systemdVersion: underSystemd ? systemdRunMajor() : null,
+    env: process.env,
+  });
+  if (argv === null) {
+    // No safe launcher: no systemd manager, or a pre-254 systemd-run that
+    // would expand `$` in the URL — log the URL for a manual open rather
+    // than spawn a GUI browser as a daemon child.
+    logInfo(
+      "spawn",
+      safeDiagnosticMessage`Browser auto-open is unavailable; open the sign-in URL manually.`,
+      { url },
+    );
+    return;
+  }
   try {
     // Deliberately UNWRAPPED (no `sandboxSpawnArgs`): opening the user's
     // browser is a user-facing action like the session-PTY exemption — the
     // launcher must reach the real GUI session/LaunchServices state, and it
     // takes only the URL string (no filesystem payload to confine).
-    Bun.spawn(argv, {
+    const proc = admittedSpawn(argv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
       cwd: spawnCwd(undefined),
+      // The opener runs the user's browser — daemon secrets must not ride
+      // along. POSIX gets the GUI-session allowlist; Windows keeps its env
+      // (minus the daemon-authority prefixes) since `cmd` depends on more of
+      // the system env than the fixed list models.
+      env:
+        os === "win32"
+          ? childEnvironment(process.env)
+          : browserOpenerEnv(process.env),
+    });
+    // A spawned-but-failed opener (systemd-run rejects, `open` exits nonzero)
+    // is otherwise invisible — surface it so the "no browser opened" report
+    // has a cause. Fire-and-forget: the card already shows the URL.
+    void proc.exited.then((code) => {
+      if (code !== 0) {
+        logWarn("spawn", "Browser opener exited non-zero", {
+          opener: argv[0],
+          code,
+          url,
+        });
+      }
     });
   } catch {
     // best-effort — the user can copy the URL from the card detail

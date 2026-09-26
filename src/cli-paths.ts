@@ -16,13 +16,16 @@
 import {
   accessSync,
   constants,
+  lstatSync,
   readFileSync,
   realpathSync,
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
+import { executableCandidates } from "@openllmsh/protocol/executable-paths";
+import { platformIsolatedHomeEnv, platformTempEnv } from "./cli-platform-env";
 import { stateDir } from "./env";
 import { resolveOnPath } from "./path-utils";
 import { daemonTempDir } from "./sandbox/working-set";
@@ -271,9 +274,81 @@ export const cliRoot = (provider: TCliProvider, home?: string): string =>
 export const cliHome = (provider: TCliProvider, home?: string): string =>
   join(cliRoot(provider, home), "home");
 
-/** Absolute path to the installed isolated binary. */
-export const cliBin = (provider: TCliProvider, home?: string): string =>
+/**
+ * Launchable extensions an isolated link may carry on win32 — the same set
+ * `executableCandidates` lets host discovery return, in its preference order.
+ * Windows decides HOW to launch a file from the name that is spawned (a link
+ * named `codex` pointing at `codex.exe`/`codex.cmd` is "Executable not found"
+ * under Bun 1.4 on Windows 11), so the isolated link must carry the host
+ * binary's own extension to be runnable.
+ */
+const WIN_LAUNCH_EXTS: readonly string[] = [
+  ".exe",
+  ".com",
+  ".cmd",
+  ".bat",
+  ".ps1",
+];
+
+/** The extension-free isolated path (`<root>/<binRel>`); the exact POSIX path. */
+const cliBinBase = (provider: TCliProvider, home?: string): string =>
   join(cliRoot(provider, home), SPECS[provider].binRel);
+
+const lexists = (p: string): boolean => {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Every spelling the isolated link can have on disk, in lookup priority order.
+ * POSIX: exactly `[<root>/<binRel>]`. win32: each launchable extension first,
+ * then the bare path LAST, so a stale extensionless link left by an older
+ * install can never shadow a launchable one.
+ */
+export const cliBinVariants = (
+  provider: TCliProvider,
+  home?: string,
+  platform: NodeJS.Platform = process.platform,
+): string[] => {
+  const base = cliBinBase(provider, home);
+  if (platform !== "win32") return [base];
+  return [...WIN_LAUNCH_EXTS.map((ext) => base + ext), base];
+};
+
+/**
+ * The isolated path `linkIsolatedCli` creates for `hostBin`. POSIX: always
+ * `<root>/<binRel>` (unchanged). win32: `<root>/<binRel><ext>` where `<ext>` is
+ * the host binary's launchable extension (lower-cased), so the link is
+ * spawnable; a host without one keeps the bare path.
+ */
+export const cliBinForHost = (
+  provider: TCliProvider,
+  hostBin: string,
+  home?: string,
+  platform: NodeJS.Platform = process.platform,
+): string => {
+  const base = cliBinBase(provider, home);
+  if (platform !== "win32") return base;
+  const ext = extname(hostBin).toLowerCase();
+  return WIN_LAUNCH_EXTS.includes(ext) ? base + ext : base;
+};
+
+/**
+ * Absolute path to the installed isolated binary — the ONE path every consumer
+ * spawns / probes / grants (cli-install, auth-config, delegate-shared,
+ * native-runtime serve, sandbox working-set). POSIX: `<root>/<binRel>`. win32:
+ * the first variant present on disk (see `cliBinVariants`), else the bare path
+ * (absent, so callers see "not installed" exactly as on POSIX).
+ */
+export const cliBin = (provider: TCliProvider, home?: string): string => {
+  const variants = cliBinVariants(provider, home);
+  if (variants.length === 1) return variants[0] as string;
+  return variants.find(lexists) ?? cliBinBase(provider, home);
+};
 
 /**
  * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
@@ -314,7 +389,9 @@ export const hostCliCandidates = (
   // production; unset there, so host discovery is unchanged.
   if (process.env.OPENLLM_NO_HOST_CLI_DISCOVERY === "1") return [];
   const home = homeOverride ?? homedir();
-  const vendorDefaults = SPECS[provider].hostCandidates(home);
+  const vendorDefaults = SPECS[provider]
+    .hostCandidates(home)
+    .flatMap((p) => executableCandidates(p));
   const out: string[] = [];
   const seen = new Set<string>();
   for (const p of [...vendorDefaults, ...resolveOnPath(SPECS[provider].cmd)]) {
@@ -382,6 +459,7 @@ export const sessionEnv = (): Record<string, string> => {
   return {
     HOME: homedir(),
     TMPDIR: tmp,
+    ...platformTempEnv(tmp),
     TERM: "xterm-256color",
   };
 };
@@ -421,5 +499,9 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
   const config = cliConfigDir(provider);
   // The daemon-owned, sandbox-granted staging dir for `mktemp -d` (see above).
   const tmp = verifiedDaemonTempDir();
-  return SPECS[provider].env({ home, root, config, tmp });
+  return {
+    ...SPECS[provider].env({ home, root, config, tmp }),
+    ...platformIsolatedHomeEnv(home),
+    ...platformTempEnv(tmp),
+  };
 };

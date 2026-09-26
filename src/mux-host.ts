@@ -15,7 +15,11 @@ import { encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import type { TDuplex, TMuxChannel } from "@openllmsh/tunnel/mux";
 import { createChannel } from "@openllmsh/tunnel/mux";
 import { serveStream } from "@openllmsh/tunnel/streams";
-import { enforceSeedGate, getDeviceAccessPubkey } from "./device-access-verify";
+import {
+  enforceSeedGate,
+  getDeviceAccessPubkey,
+  onDeviceAccessAuthorityChange,
+} from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey } from "./keypair";
 import { logInfo, logWarn, safeDiagnosticMessage } from "./logger";
@@ -24,7 +28,9 @@ import { serveMuxRealtime } from "./realtime-handler";
 import type { TSessionStream } from "./session-core";
 import {
   attachSessionHostViaCli,
+  discoverSessionHosts,
   findSessionHost,
+  reserveSessionHostSpawn,
   spawnSessionHostProc,
 } from "./session-host-proc";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
@@ -348,6 +354,7 @@ const registerChannel = (
   channelId: string,
   keyId: string | null,
   side: "consumer" | "daemon",
+  consumer: "browser" | "daemon" = "browser",
 ): TRelayChannel => {
   let muxSink: ((bytes: Uint8Array | null) => void) | null = null;
   let record: TRelayChannel | null = null;
@@ -386,7 +393,7 @@ const registerChannel = (
     channel,
     channelId,
     keyId,
-    consumer: side === "daemon" ? "browser" : null,
+    consumer: side === "daemon" ? consumer : null,
     muxSink,
     sink: null,
     lastActivityAt: Date.now(),
@@ -428,22 +435,45 @@ export const getMuxChannelForTest = (
  * Keep tunnel-server reachable through this single closure so rtc-host does
  * not re-implement admit/serve. Session OPEN binds a PTY via session-host.
  */
+/** Bytes allowed in flight toward one attach pipe before the pair is reset. */
+const SESSION_PIPE_MAX_PENDING_BYTES = 2 * 1024 * 1024;
+
 const pipeSessionStreams = (
   relay: TSessionStream,
   host: TSessionStream,
 ): void => {
   let closed = false;
+  // DSN-1: fire-and-forget host.write() promises would otherwise let input
+  // bytes queue without bound when the attach child stalls.
+  let hostPendingBytes = 0;
   const closeHost = (): void => {
     if (closed) return;
     closed = true;
     host.end();
   };
   relay.onData((bytes) => {
-    void host.write(bytes).catch(() => {
+    if (closed) return;
+    hostPendingBytes += bytes.byteLength;
+    void host
+      .write(bytes)
+      .then(() => {
+        hostPendingBytes = Math.max(0, hostPendingBytes - bytes.byteLength);
+      })
+      .catch(() => {
+        hostPendingBytes = 0;
+        // A pending stdin flush can reject after a clean terminal END. Preserve
+        // that terminal result instead of replacing it with an empty RESET.
+        if (closed) return;
+        closed = true;
+        host.reset();
+        relay.reset();
+      });
+    if (hostPendingBytes > SESSION_PIPE_MAX_PENDING_BYTES) {
+      if (closed) return;
       closed = true;
       host.reset();
-      relay.reset();
-    });
+      relay.reset(encodeJsonPayload({ code: "backpressure_exceeded" }));
+    }
   });
   relay.onCtrl((payload) => host.sendCtrl(payload));
   relay.onReset((payload) => {
@@ -496,21 +526,44 @@ export const serveMuxOnStream = serveStream({
     // Spawn (if needed) then attach via a CLI pipe child. The CLI owns the
     // unix-socket dial; the daemon never opens a session socket itself.
     if (open.mode !== "attach") {
-      const socketPath = await spawnSessionHostProc({
-        id: open.session_id,
-        cli: open.cli,
-        cols: open.cols,
-        rows: open.rows,
-        ...(open.cwd === undefined ? {} : { cwd: open.cwd }),
-        ...(open.title === undefined ? {} : { title: open.title }),
-        ...(open.dangerous === undefined ? {} : { dangerous: open.dangerous }),
-        ...(open.resume_session_id === undefined
-          ? {}
-          : { resume: open.resume_session_id }),
-      });
-      if (socketPath === null) {
-        stream.reset(encodeJsonPayload({ code: "spawn_failed" }));
+      // DSN-2: the 4-session cap lives INSIDE each single-session host, so
+      // without a daemon-side count every spawn always passed. Count live
+      // registry hosts plus reserved in-flight launches before spawning.
+      const liveHosts = await discoverSessionHosts();
+      // Entries whose identity could not be verified stay attachable but
+      // hold a cap slot only while their socket answers a bounded liveness
+      // handshake — a dead host with a reused, unprobeable pid cannot block
+      // every new session forever.
+      const releaseSlot = reserveSessionHostSpawn(
+        liveHosts.filter((host) => host.countsTowardCap).length,
+      );
+      if (releaseSlot === null) {
+        stream.reset(encodeJsonPayload({ code: "overloaded" }));
         return;
+      }
+      try {
+        const socketPath = await spawnSessionHostProc({
+          id: open.session_id,
+          cli: open.cli,
+          cols: open.cols,
+          rows: open.rows,
+          ...(open.cwd === undefined ? {} : { cwd: open.cwd }),
+          ...(open.title === undefined ? {} : { title: open.title }),
+          ...(open.dangerous === undefined
+            ? {}
+            : { dangerous: open.dangerous }),
+          ...(open.resume_session_id === undefined
+            ? {}
+            : { resume: open.resume_session_id }),
+        });
+        if (socketPath === null) {
+          stream.reset(encodeJsonPayload({ code: "spawn_failed" }));
+          return;
+        }
+      } finally {
+        // The spawned host is now discoverable (or the launch failed) — the
+        // reservation's job of covering check→spawn is done either way.
+        releaseSlot();
       }
     } else if ((await findSessionHost(open.session_id)) === null) {
       stream.reset(encodeJsonPayload({ code: "session_not_found" }));
@@ -600,6 +653,18 @@ export const acceptChannel = (frame: {
   }
   const existing = channels.get(frame.channel_id);
   if (existing !== undefined && existing.muxSink !== null) {
+    if (
+      existing.keyId === null &&
+      existing.consumer !== (frame.consumer ?? "browser")
+    ) {
+      send({
+        type: "channel_open_ack",
+        channel_id: frame.channel_id,
+        ok: false,
+        error: "unauthorized",
+      });
+      return;
+    }
     if (existing.keyId !== null) {
       // A consumer-side channel id is OURS — a peer re-opening it is a
       // protocol bug, not a reconnect. Keep the refusal for that narrow case.
@@ -639,7 +704,12 @@ export const acceptChannel = (frame: {
   // got reaped — drop it so the re-open registers fresh below.
   if (existing !== undefined) channels.delete(frame.channel_id);
   if (!admitBySeedGate(frame, send)) return;
-  registerChannel(frame.channel_id, null, "daemon");
+  registerChannel(
+    frame.channel_id,
+    null,
+    "daemon",
+    frame.consumer ?? "browser",
+  );
   logInfo("mux-host", "channel_open accepted", {
     channelId: frame.channel_id,
     consumer: frame.consumer ?? "browser",
@@ -709,3 +779,16 @@ export const resetAllChannels = (): void => {
     record.channel.close("relay_restart");
   }
 };
+
+onDeviceAccessAuthorityChange(() => {
+  for (const record of [...channels.values()]) {
+    if (record.consumer !== "browser") continue;
+    channels.delete(record.channelId);
+    record.sink = null;
+    try {
+      record.channel.close("device_access_changed");
+    } catch {
+      /* already closed */
+    }
+  }
+});

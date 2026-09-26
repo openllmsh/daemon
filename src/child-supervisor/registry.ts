@@ -8,9 +8,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import {
+  processIdentityStatus,
+  processStartIdentity,
+} from "../../../pty-native/session/local-runtime";
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { stateDir } from "../env";
 import { logDebug } from "../logger";
+import {
+  spawn as admittedSpawn,
+  spawnSync as admittedSpawnSync,
+} from "../windows-process";
 import { processGroupExists, signalGroup } from "./posix";
 
 export type TDisposableChildKind =
@@ -65,19 +73,45 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
 };
 
 /** PID-reuse-safe process identity. Mirrors the durable session-host lstart check. */
-export const processStartTime = (pid: number): string | null => {
+export const processStartTime = (pid: number): string | null | undefined => {
+  if (process.platform === "win32") return processStartIdentity(pid);
   try {
-    const output = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (output.exitCode !== 0) return null;
+    const output = admittedSpawnSync(
+      ["ps", "-o", "lstart=", "-p", String(pid)],
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+      },
+    );
+    if (output.exitCode !== 0) {
+      try {
+        process.kill(pid, 0);
+        return undefined;
+      } catch (error) {
+        if (
+          error !== null &&
+          typeof error === "object" &&
+          "code" in error &&
+          (error as { readonly code?: unknown }).code === "ESRCH"
+        )
+          return null;
+        return undefined;
+      }
+    }
     const value = new TextDecoder().decode(output.stdout).trim();
-    return value.length > 0 ? value : null;
+    return value.length > 0 ? value : undefined;
   } catch {
-    return null;
+    return undefined;
   }
 };
+
+export const childProcessIdentityStatus = (
+  record: TChildRegistryRecord,
+): "alive" | "dead" | "unknown" =>
+  processIdentityStatus(record.pid, record.processStartTime, () =>
+    processStartTime(record.pid),
+  );
 
 /**
  * Named budget for the async `ps -o lstart=` helper. Failure to obtain
@@ -108,9 +142,10 @@ export const setProcessStartTimeHelperSpawnForTests = (
 const defaultProcessStartTimeHelperSpawn: TProcessStartTimeHelperSpawn = (
   pid,
 ) =>
-  Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+  admittedSpawn(["ps", "-o", "lstart=", "-p", String(pid)], {
     stdout: "pipe",
     stderr: "ignore",
+    env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
     // Own process group so reap can SIGKILL descendants without touching
     // the daemon group. Test fakes must also set detached: true.
     detached: true,
@@ -168,6 +203,9 @@ const reapStartTimeHelper = async (
 export const readProcessStartTime = async (
   pid: number,
 ): Promise<string | null> => {
+  if (process.platform === "win32") {
+    return processStartIdentity(pid) ?? null;
+  }
   // Owner-created helper budget — never a shared login/logout budget.
   // firstOfBudget only detaches its waiter; this finally releases the helper.
   const budget = createDeadlineBudget(PROCESS_START_TIME_HELPER_TIMEOUT_MS);
@@ -270,4 +308,4 @@ export const listChildRegistryRecords = (): readonly TChildRegistryRecord[] => {
 
 export const childProcessMatchesRecord = (
   record: TChildRegistryRecord,
-): boolean => processStartTime(record.pid) === record.processStartTime;
+): boolean => childProcessIdentityStatus(record) === "alive";

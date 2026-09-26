@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { closeSync, openSync, readSync } from "node:fs";
 import type {
   TCredentialGateMode,
@@ -14,6 +13,7 @@ import {
   sharedEnvFilePath,
   writeEnvFileVars,
 } from "./env";
+import { nodeSpawnSync as spawnSync } from "./windows-process";
 
 export type {
   TCredentialGateMode,

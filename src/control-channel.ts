@@ -32,6 +32,7 @@ import {
 import {
   DeviceLimitExceededError,
   fetchChannel,
+  flushUsageOutbox,
   notifyQuotaStatus,
   notifySessionLost,
 } from "./cloud-client";
@@ -84,6 +85,7 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
+import type { TComputeStatusFreshOptions } from "./status";
 import { computeStatusFresh, setStatusPublishQueueSnapshot } from "./status";
 import type { TStatusPublishTrigger } from "./status-publish-coalesce";
 import { createStatusPublishCoalescer } from "./status-publish-coalesce";
@@ -112,13 +114,33 @@ const optionalArrayChangeKey = (
   joinChangeKeyParts([value === undefined ? "0" : "1", encodedItems]);
 
 /**
+ * A publishable status: the relay carries the snapshot as an opaque blob
+ * (the frame's `status` is `S.Unknown`) and persists it verbatim into
+ * `daemon_status_json`, so a degrade marker rides along additively —
+ * `status_error` is set ONLY on a stale fallback republished past its
+ * failure budget. It never lies inside a typed field (`cloud_state` stays
+ * the real bootstrap verdict) and old daemons simply omit it.
+ */
+export type TPublishableStatus = TDaemonStatus & {
+  readonly status_error?: string;
+};
+
+/**
+ * The ONLY `status_error` value this daemon publishes — a stable public
+ * code watchers/ops can rely on. Internal reasons (`status_compute_failing`
+ * and friends) are logged locally, never sent on the wire or persisted to
+ * `daemon_status_json`.
+ */
+export const STATUS_ERROR_DEGRADED = "status_degraded";
+
+/**
  * Cheap change key: concatenates wire-visible primitives. Nested `usage` /
  * `pending_auth` are small optional blobs; they are stringified individually
  * rather than walking the whole snapshot. Each primitive is JSON-encoded
  * before joining so free-text (`detail`, `title`, `last_exit_reason`, …)
  * cannot collide across `:` / `|` field separators.
  */
-export const statusChangeKey = (status: TDaemonStatus): string => {
+export const statusChangeKey = (status: TPublishableStatus): string => {
   const connections = status.connections
     .map((c) =>
       joinChangeKeyParts([
@@ -185,9 +207,13 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
       status.control_caps,
       (status.control_caps ?? []).join(","),
     ),
+    status.pty_backend ?? "",
     status.pty_supported === undefined ? "" : String(status.pty_supported),
     connections,
     sessions,
+    // The degraded marker must live in the key: a stale→stale+status_error
+    // transition is a REAL change a `skipUnchanged` push must not drop.
+    status.status_error ?? "",
   ].join("\n");
 };
 
@@ -320,14 +346,117 @@ let daemonSessionId: string | null = null;
 /** Null while handshake is pending; false for an older relay welcome. */
 let supportsOrderedStatus: boolean | null = null;
 let statusSeq = 0;
+/** Test seam: replaces `computeStatusFresh` for publish computes. */
+let statusComputeOverride:
+  | ((options?: TComputeStatusFreshOptions) => Promise<TDaemonStatus>)
+  | null = null;
+/** Last successfully computed publishable status — the degrade target when
+ *  the tail of a status compute throws (EC-4). */
+let lastPublishableStatus: TDaemonStatus | null = null;
+/** Stale-fallback budget: a compute streak past EITHER bound stops masking
+ *  the failure — the last-known-good snapshot is republished ONCE marked
+ *  `status_error` so watchers/ops can see the daemon's status compute is
+ *  broken, instead of a forever-fresh-looking stale snapshot. Both bounds
+ *  reset on any successful compute AND per connection generation (a
+ *  reconnect re-proves liveness; a broken compute on a NEW socket is a new
+ *  incident). Module `let`s so tests can shrink the bounds. */
+let statusFallbackMaxFailures = 5;
+let statusFallbackMaxMs = 5 * 60_000;
+let statusComputeFailStreak = 0;
+let statusComputeFirstFailAtMs = 0;
+let statusComputeFailGeneration = -1;
+
+/**
+ * Rate-limited warn for a failed status compute/publish (EC-4). A throwing
+ * contributor used to surface as an unhandledRejection on every
+ * reconnect/welcome — a crash loop driven by one bad session dir.
+ */
+const reportStatusPushFailure = (
+  trigger: TStatusPublishTrigger,
+  err: unknown,
+): void => {
+  const repeatCount = takeRepeatWindow("control-channel:status-push");
+  if (repeatCount === null) return;
+  logWarn("control-channel", "status publish failed", {
+    trigger,
+    err: err instanceof Error ? err.message : String(err),
+    ...(repeatCount > 1 ? { repeat_count: repeatCount } : {}),
+  });
+};
+
+/**
+ * The publish path's status compute. Per-provider reads are already
+ * individually guarded inside `computeStatusFresh`, but its TAIL
+ * (`sessionStatusReport`, `getCliState`, `daemonPort`, `opencodeInstalled`)
+ * is not: one throw used to reject the whole publish, and the unguarded
+ * `void pushStatus()` call sites turned that rejection into a daemon exit
+ * (EC-4). Now: log (rate-limited) and fall back to the last known-good
+ * snapshot — a stale status beats a rejected push — but the fallback is
+ * BOUNDED (max failures / max age, reset per connection generation); past
+ * it the snapshot is republished marked `status_error` so a permanently
+ * broken compute is visible instead of masked forever. Only a FIRST
+ * compute with no fallback propagates, and every push call site catches
+ * that.
+ */
+const computePublishStatus = async (
+  trigger: TStatusPublishTrigger,
+): Promise<TPublishableStatus> => {
+  const compute = statusComputeOverride ?? computeStatusFresh;
+  try {
+    const status = await compute({
+      trigger,
+      ...(trigger === "late-probe" ? { reuseSettledSlugProbes: true } : {}),
+    });
+    lastPublishableStatus = status;
+    statusComputeFailStreak = 0;
+    statusComputeFirstFailAtMs = 0;
+    return status;
+  } catch (err) {
+    reportStatusPushFailure(trigger, err);
+    // A new connection generation starts a fresh streak — a bounded
+    // fallback is per socket, not per process lifetime.
+    if (statusComputeFailGeneration !== connectionGeneration) {
+      statusComputeFailGeneration = connectionGeneration;
+      statusComputeFailStreak = 0;
+      statusComputeFirstFailAtMs = 0;
+    }
+    statusComputeFailStreak += 1;
+    if (statusComputeFirstFailAtMs === 0)
+      statusComputeFirstFailAtMs = Date.now();
+    if (lastPublishableStatus === null) throw err;
+    const fallbackOpen =
+      statusComputeFailStreak <= statusFallbackMaxFailures &&
+      Date.now() - statusComputeFirstFailAtMs <= statusFallbackMaxMs;
+    if (fallbackOpen) return lastPublishableStatus;
+    // Budget exhausted: keep the snapshot flowing (something beats nothing
+    // — EC-4) but stop pretending it is fresh. The additive marker is
+    // pushed once per streak via the change key, and lands in
+    // `daemon_status_json` for ops to see. The wire value is the stable
+    // public code only — the internal reason stays in the local log.
+    const repeat = takeRepeatWindow("control-channel:status-degraded");
+    if (repeat !== null) {
+      logWarn(
+        "control-channel",
+        "status compute degraded past fallback budget",
+        {
+          reason: "status_compute_failing",
+          failures: statusComputeFailStreak,
+          ...(repeat > 1 ? { repeat_count: repeat } : {}),
+        },
+      );
+    }
+    return {
+      ...lastPublishableStatus,
+      status_error: STATUS_ERROR_DEGRADED,
+    };
+  }
+};
+
 const statusPublishCoalescer = createStatusPublishCoalescer({
   now: () => Date.now(),
   epoch: () => connectionGeneration,
   computeFresh: async (trigger) => {
-    const status = await computeStatusFresh({
-      trigger,
-      ...(trigger === "late-probe" ? { reuseSettledSlugProbes: true } : {}),
-    });
+    const status = await computePublishStatus(trigger);
     return { status, fingerprint: statusChangeKey(status) };
   },
   canSend: (jobEpoch) =>
@@ -636,6 +765,69 @@ const pushStatus = async (
     trigger,
   });
 
+/**
+ * Fire-and-forget status push with the rejection guard every caller needs
+ * (EC-4): `pushStatus` rejects when the status compute itself throws, and an
+ * uncaught `void` would surface that as an unhandledRejection → the global
+ * handler exits the daemon. The welcome/auth-sink paths go through here so
+ * one bad status contributor logs (rate-limited) instead of crash-looping
+ * every reconnect.
+ */
+const pushStatusLogged = (
+  active: boolean | undefined,
+  trigger: TStatusPublishTrigger,
+): void => {
+  void pushStatus(active, trigger).catch((err: unknown) => {
+    reportStatusPushFailure(trigger, err);
+  });
+};
+
+/** Test seam: the guarded fire-and-forget push used by the welcome and
+ *  auth-sink call sites — lets a test prove a throwing compute cannot
+ *  escape as an unhandled rejection. */
+export const pushStatusGuardedForTests = (
+  trigger: TStatusPublishTrigger = "welcome",
+): void => {
+  pushStatusLogged(undefined, trigger);
+};
+
+/** Test seam: substitute the publish-path status compute. */
+export const setStatusComputeForTests = (
+  compute:
+    | ((options?: TComputeStatusFreshOptions) => Promise<TDaemonStatus>)
+    | null,
+): void => {
+  statusComputeOverride = compute;
+};
+
+/** Test seam: clear the compute override, the last-known-good fallback and
+ *  the bounded-fallback streak. */
+export const resetStatusPushForTests = (): void => {
+  statusComputeOverride = null;
+  lastPublishableStatus = null;
+  statusComputeFailStreak = 0;
+  statusComputeFirstFailAtMs = 0;
+  statusComputeFailGeneration = -1;
+  statusFallbackMaxFailures = 5;
+  statusFallbackMaxMs = 5 * 60_000;
+};
+
+/** Test seam: run the publish-path compute and inspect the status it would
+ *  publish — lets tests observe the bounded fallback + degraded marker
+ *  without a socket. */
+export const computePublishStatusForTests = (
+  trigger: TStatusPublishTrigger = "watcher",
+): Promise<TPublishableStatus> => computePublishStatus(trigger);
+
+/** Test seam: shrink the stale-fallback bounds so a test need not wait. */
+export const setStatusFallbackBoundsForTests = (
+  maxFailures: number,
+  maxMs: number,
+): void => {
+  statusFallbackMaxFailures = maxFailures;
+  statusFallbackMaxMs = maxMs;
+};
+
 /** Throttle for `notePresenceActivity` — traffic-driven presence refreshes are
  *  a liveness signal, not telemetry, so one per minute is ample (the routing
  *  freshness window is far wider) and an agentic client's burst costs one push. */
@@ -690,7 +882,7 @@ armProbesAfterPong = (): void => {
   startWatcher();
   if (pendingWelcomeStatus) {
     pendingWelcomeStatus = false;
-    void pushStatus(undefined, "welcome");
+    pushStatusLogged(undefined, "welcome");
   }
 };
 
@@ -1087,7 +1279,7 @@ const dispatchFrame = (frame: TRelayFrame): void => {
       statusSeq = 1;
       startMigrationCheck();
       if (probesArmed) {
-        void pushStatus(undefined, "welcome");
+        pushStatusLogged(undefined, "welcome");
       } else {
         pendingWelcomeStatus = true;
       }
@@ -1359,10 +1551,13 @@ export const migrateIfRelayMoved = async (
 /** Start the WebSocket control loop (idempotent). */
 export const startControlChannel = (): void => {
   setStatusPublishQueueSnapshot(() => statusPublishCoalescer.snapshot());
+  // Boot flush of the durable usage outbox (EC-2): rows queued by a previous
+  // run get their delivery pass as soon as the control plane comes up.
+  void flushUsageOutbox();
   setAuthSink({
     emit: emitAuthFrame,
     pushStatus: () => {
-      void pushStatus(undefined, "auth-sink");
+      pushStatusLogged(undefined, "auth-sink");
     },
   });
   if (ws !== null) return;
@@ -1478,18 +1673,24 @@ export const startControlChannel = (): void => {
 export const stopControlChannel = async (): Promise<void> => {
   lastPostedAuthStatus.clear();
   clearAuthGap();
-  if (ws === null) return;
-  stopWatcher();
-  stopMigrationCheck();
-  heartbeat.stop();
-  if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
-  // Tear relay-scoped transports before nulling the socket so in-flight
-  // tunnels/mux/unmounted RTC do not outlive process stop. Mounted RTC is
-  // intentionally kept by resetUnmountedRtcSessions — full process exit
-  // reaps those with the peer connections.
-  resetRelayScopedState();
-  ws.close(); // partysocket: a manual close() disables further reconnection
-  ws = null;
-  setAuthSink(null);
-  setStatusPublishQueueSnapshot(null);
+  if (ws !== null) {
+    stopWatcher();
+    stopMigrationCheck();
+    heartbeat.stop();
+    if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
+    // Tear relay-scoped transports before nulling the socket so in-flight
+    // tunnels/mux/unmounted RTC do not outlive process stop. Mounted RTC is
+    // intentionally kept by resetUnmountedRtcSessions — full process exit
+    // reaps those with the peer connections.
+    resetRelayScopedState();
+    ws.close(); // partysocket: a manual close() disables further reconnection
+    ws = null;
+    setAuthSink(null);
+    setStatusPublishQueueSnapshot(null);
+  }
+  // Bounded final delivery pass for the durable usage outbox (EC-2):
+  // `finishShutdown` awaits this function on SIGTERM/SIGINT, so queued usage
+  // rows get one last ~3 s flush without stalling exit. Whatever remains is
+  // still durable — the next boot's `startControlChannel` flush delivers it.
+  await flushUsageOutbox(3_000);
 };

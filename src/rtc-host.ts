@@ -1,7 +1,7 @@
 /**
  * Daemon-side WebRTC data-channel host (werift responder).
  *
- * Browser creates the offer + data channel; this module answers, seals a
+ * The client creates the offer + data channel; this module answers, seals a
  * DTLS-fingerprint proof under the daemon's long-lived X25519 key, trickles
  * ICE, and once the data channel opens mounts the same mux OPEN dispatcher
  * that the relay-WS path uses ({@link serveMuxOnStream}).
@@ -28,33 +28,65 @@ import {
   sdpFingerprintsMatch,
   weriftIceServers,
 } from "@openllmsh/tunnel/rtc-auth";
-import type { TRtcDataChannelLike } from "@openllmsh/tunnel/rtc-duplex";
 import { rtcDuplex } from "@openllmsh/tunnel/rtc-duplex";
 import { preflightIceCandidate } from "@openllmsh/tunnel/rtc-ice";
 import type { RTCDataChannel, RTCIceCandidate } from "werift";
 import { RTCPeerConnection } from "werift";
-import { enforceRtcSeedGate } from "./device-access-verify";
+import {
+  enforceRtcSeedGate,
+  onDeviceAccessAuthorityChange,
+} from "./device-access-verify";
 import { daemonApiKeyId } from "./env";
 import { daemonPublicKey, openSealed, sealTo } from "./keypair";
 import { logDebug, logWarn, safeDiagnosticMessage } from "./logger";
 import { serveMuxOnStream } from "./mux-host";
-
-/** Bound concurrent RTC sessions per daemon process. */
-const MAX_CONCURRENT_RTC = 8;
+import { maxConcurrentRtc } from "./rtc-cap";
+import { closeRtcPeer } from "./rtc-close";
+import { asRtcDataChannelLike } from "./rtc-data-channel";
+import { rtcCandidateErrors } from "./rtc-udp";
 
 /**
  * Max wait from session insert until the mux mounts on the data channel.
  * Covers a stalled DTLS/ICE handshake after the answer is sent so a half-open
- * session cannot pin a MAX_CONCURRENT_RTC slot forever.
+ * session cannot pin an RTC slot forever.
+ *
+ * Deliberately SHORTER than the offering client's own establishment deadline
+ * (30 s in the off-host harness). While both sat at 30 s, the daemon's
+ * definitive `handshake_failed` nack landed at or after the client had already
+ * given up, so the client reported an opaque timeout and the daemon's own
+ * diagnosis never reached anyone. The margin below is what makes the nack
+ * useful: the client learns the real reason and can retry instead of waiting
+ * out a blank deadline.
  */
-const RTC_HANDSHAKE_TIMEOUT_MS = 30_000;
+const RTC_HANDSHAKE_DEFAULT_TIMEOUT_MS = 20_000;
+const RTC_HANDSHAKE_MAX_TIMEOUT_MS = 120_000;
+
+const rtcHandshakeTimeoutMs = (): number => {
+  const raw = process.env.OPENLLM_RTC_HANDSHAKE_TIMEOUT_MS?.trim();
+  if (raw === undefined || raw === "") return RTC_HANDSHAKE_DEFAULT_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed < 1_000) {
+    logWarn(
+      "rtc-host",
+      "invalid OPENLLM_RTC_HANDSHAKE_TIMEOUT_MS; using default",
+      {
+        timeoutMs: RTC_HANDSHAKE_DEFAULT_TIMEOUT_MS,
+      },
+    );
+    return RTC_HANDSHAKE_DEFAULT_TIMEOUT_MS;
+  }
+  return Math.min(parsed, RTC_HANDSHAKE_MAX_TIMEOUT_MS);
+};
 
 type TRtcSession = {
   readonly channelId: string;
   readonly pc: RTCPeerConnection;
+  dc: RTCDataChannel | null;
   mux: TMuxChannel | null;
   closed: boolean;
   nacked: boolean;
+  /** Insert time; reported as elapsedMs when a handshake fails. */
+  readonly startedAtMs: number;
   handshakeTimer: ReturnType<typeof setTimeout> | null;
 };
 
@@ -93,11 +125,20 @@ const iceServers = (): Array<{
 /** Send a non-silent RTC reject to the offerer so it fails fast instead of
  *  waiting out the signaling/ICE timeout. Best-effort — a racing socket close
  *  just drops it. */
-const sendNack = (channelId: string, reason: TRtcNackReason): void => {
+const sendNack = (
+  channelId: string,
+  reason: TRtcNackReason,
+  cap?: number,
+): void => {
   const send = sendFrame;
   if (send === null) return;
   try {
-    send({ type: "rtc_nack", channel_id: channelId, reason });
+    send({
+      type: "rtc_nack",
+      channel_id: channelId,
+      reason,
+      ...(cap !== undefined ? { cap } : {}),
+    });
   } catch {
     // control socket racing a close
   }
@@ -113,61 +154,17 @@ const failUnmountedHandshake = (
     session.nacked = true;
     sendNack(session.channelId, "handshake_failed");
   }
+  // closeSession() records the reason only at debug level, so at the default
+  // `info` level a pre-mux handshake failure used to leave NO log record at
+  // all — an intermittent establishment failure was indistinguishable from
+  // silence. Warn here with the reason and elapsed time instead.
+  logWarn("rtc-host", "rtc handshake failed before mount", {
+    channelId: session.channelId,
+    reason: closeReason,
+    elapsedMs: Date.now() - session.startedAtMs,
+  });
   closeSession(session.channelId, closeReason);
 };
-
-/**
- * Adapt werift's channel to the thin {@link TRtcDataChannelLike} surface.
- * werift's `send` only accepts `Buffer | string` (not `ArrayBuffer`); the mux
- * always hands a `Uint8Array`, which is a Buffer-view under Bun/Node.
- */
-const asRtcDataChannelLike = (dc: RTCDataChannel): TRtcDataChannelLike => ({
-  get readyState() {
-    return dc.readyState;
-  },
-  get bufferedAmount() {
-    return dc.bufferedAmount;
-  },
-  send: (data) => {
-    if (typeof data === "string") {
-      dc.send(data);
-      return;
-    }
-    if (Buffer.isBuffer(data)) {
-      dc.send(data);
-      return;
-    }
-    if (data instanceof ArrayBuffer) {
-      dc.send(Buffer.from(data));
-      return;
-    }
-    // ArrayBufferView (Uint8Array, …) — copy into a Buffer for werift.
-    dc.send(
-      Buffer.from(
-        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-      ),
-    );
-  },
-  close: () => dc.close(),
-  get onmessage() {
-    return dc.onmessage as TRtcDataChannelLike["onmessage"];
-  },
-  set onmessage(value) {
-    dc.onmessage = value as RTCDataChannel["onmessage"];
-  },
-  get onclose() {
-    return dc.onclose as TRtcDataChannelLike["onclose"];
-  },
-  set onclose(value) {
-    dc.onclose = value as RTCDataChannel["onclose"];
-  },
-  get onerror() {
-    return dc.onerror as TRtcDataChannelLike["onerror"];
-  },
-  set onerror(value) {
-    dc.onerror = value as RTCDataChannel["onerror"];
-  },
-});
 
 const localFingerprint = (pc: RTCPeerConnection): string | null => {
   const sdp = pc.localDescription?.sdp;
@@ -202,7 +199,7 @@ const closeSession = (channelId: string, reason: string): void => {
     // mux already closed
   }
   session.mux = null;
-  void session.pc.close().catch(() => {});
+  void closeRtcPeer(session.pc, session.dc);
   logDebug("rtc-host", "session closed", { channelId, reason });
 };
 
@@ -225,11 +222,18 @@ export const resetAllRtcSessions = (): void => {
   }
 };
 
+onDeviceAccessAuthorityChange(() => {
+  for (const channelId of [...sessions.keys()]) {
+    closeSession(channelId, "device_access_changed");
+  }
+});
+
 const attachDataChannel = (
   session: TRtcSession,
   dc: RTCDataChannel,
   maxPayloadBytes: number,
 ): void => {
+  session.dc = dc;
   const mount = (): void => {
     if (session.closed || session.mux !== null) return;
     clearHandshakeTimer(session);
@@ -262,8 +266,8 @@ const attachDataChannel = (
 };
 
 /**
- * Handle an inbound `rtc_offer`. Rejects silently (no answer) on bad proof /
- * at-cap / duplicate channel_id so a MITM cannot probe.
+ * Handle an inbound `rtc_offer`. Bad inner shapes / fingerprint bindings and
+ * duplicate channel IDs stay silent; admission refusals send an explicit nack.
  */
 export const handleRtcOffer = async (frame: {
   readonly channel_id: string;
@@ -273,8 +277,8 @@ export const handleRtcOffer = async (frame: {
   /**
    * Who offered. The relay stamps this from the authenticated socket role
    * (`daemon` vs `browser`); a self-asserted value is not a trust signal.
-   * Fleet hops skip seedgate — they have no vault DEK (parity with
-   * mux-host `admitBySeedGate`).
+   * Every RTC consumer must supply a v2 device grant, regardless of this role
+   * or the offer-inner client label.
    */
   readonly consumer?: "browser" | "daemon";
 }): Promise<void> => {
@@ -311,7 +315,7 @@ export const handleRtcOffer = async (frame: {
     return;
   }
 
-  // Bind the sealed browser fingerprint to EVERY effective offer SDP
+  // Bind the sealed client fingerprint to EVERY effective offer SDP
   // fingerprint. Reject an absent or conflicting set before setting it remote.
   if (!sdpFingerprintsMatch(frame.sdp, inner.fb)) {
     logWarn("rtc-host", safeDiagnosticMessage`offer fingerprint mismatch`, {
@@ -332,40 +336,33 @@ export const handleRtcOffer = async (frame: {
     sendNack(frame.channel_id, "disabled");
     return;
   }
-  if (sessions.size >= MAX_CONCURRENT_RTC) {
-    logWarn("rtc-host", safeDiagnosticMessage`rtc session cap reached`, {
+  const cap = maxConcurrentRtc();
+  if (sessions.size >= cap) {
+    logWarn("rtc-host", "rtc session cap reached", {
       channelId: frame.channel_id,
-      cap: MAX_CONCURRENT_RTC,
+      cap,
     });
-    sendNack(frame.channel_id, "overloaded");
+    sendNack(frame.channel_id, "overloaded", cap);
     return;
   }
 
-  // Seed-gate: browser consumers need a provisioned pin + v2 grant.
-  // Fleet daemon→daemon hops (`consumer: "daemon"`) have no vault DEK —
-  // skip, matching mux-host. The relay (or an in-process loopback that
-  // stands in for it) stamps this from the authenticated socket role.
-  if (frame.consumer !== "daemon") {
-    const gate = enforceRtcSeedGate(
-      "grant" in inner ? inner.grant : undefined,
-      {
-        keyId: daemonApiKeyId(),
-        cid: frame.channel_id,
-        aud: daemonPublicKey(),
-        offerVersion: inner.v,
-      },
-    );
-    if (gate.mode === "reject") {
-      logWarn("rtc-host", safeDiagnosticMessage`seedgate rejected`, {
-        channelId: frame.channel_id,
-        reason: gate.reason,
-      });
-      // The offer WAS authenticated (sealed proof opened + fb bound) — the
-      // vault is just locked. Nack so the offerer surfaces "unlock to
-      // connect" instead of timing out.
-      sendNack(frame.channel_id, "seedgate");
-      return;
-    }
+  // The v2 grant authenticates every client. Neither transport role nor the
+  // optional client label can bypass the pin, replay or audience checks.
+  const gate = enforceRtcSeedGate("grant" in inner ? inner.grant : undefined, {
+    keyId: daemonApiKeyId(),
+    cid: frame.channel_id,
+    aud: daemonPublicKey(),
+    offerVersion: inner.v,
+  });
+  if (gate.mode === "reject") {
+    logWarn("rtc-host", "seedgate rejected", {
+      channelId: frame.channel_id,
+      reason: gate.reason,
+    });
+    // Sealed proof and fingerprint binding alone do not authenticate a client.
+    // Nack so it can obtain a valid vault grant instead of timing out.
+    sendNack(frame.channel_id, "seedgate");
+    return;
   }
 
   const offerSdpMax = maxMessageSizeFromSdp(frame.sdp);
@@ -386,7 +383,15 @@ export const handleRtcOffer = async (frame: {
 
   let pc: RTCPeerConnection;
   try {
-    pc = new RTCPeerConnection({ iceServers: [...iceServers()] });
+    pc = new RTCPeerConnection({
+      iceServers: [...iceServers()],
+      iceFilterCandidatePair: rtcCandidateErrors(() => {
+        const session = sessions.get(frame.channel_id);
+        if (session === undefined || session.pc !== pc) return;
+        if (session.mux === null) failUnmountedHandshake(session, "udp_failed");
+        else closeSession(frame.channel_id, "udp_failed");
+      }),
+    });
   } catch (err) {
     logWarn(
       "rtc-host",
@@ -402,15 +407,17 @@ export const handleRtcOffer = async (frame: {
   const session: TRtcSession = {
     channelId: frame.channel_id,
     pc,
+    dc: null,
     mux: null,
     closed: false,
     nacked: false,
+    startedAtMs: Date.now(),
     handshakeTimer: null,
   };
   sessions.set(frame.channel_id, session);
   session.handshakeTimer = setTimeout(() => {
     failUnmountedHandshake(session, "handshake_timeout");
-  }, RTC_HANDSHAKE_TIMEOUT_MS);
+  }, rtcHandshakeTimeoutMs());
 
   pc.ondatachannel = (ev) => {
     if (session.closed) return;
@@ -438,6 +445,7 @@ export const handleRtcOffer = async (frame: {
   };
 
   pc.onconnectionstatechange = () => {
+    if (session.closed || sessions.get(session.channelId) !== session) return;
     const state = pc.connectionState;
     if (state === "failed" && session.mux === null) {
       failUnmountedHandshake(session, "pc_failed");

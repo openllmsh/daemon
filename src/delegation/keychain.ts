@@ -4,17 +4,23 @@
  *
  * On macOS, Claude Code stores its OAuth credential in the login Keychain
  * (there is NO file-based override — confirmed via the Claude Code docs).
- * Claude resolves the login keychain by HOME path, so running it with an
- * isolated HOME and no keychain there fails with the system dialog "A
- * keychain cannot be found to store <user>". The fix: give the isolated
- * HOME its OWN login keychain at `<home>/Library/Keychains/login.keychain-db`.
+ * Vendor CLIs resolve their keychain by HOME path: the implicit default is
+ * `<home>/Library/Keychains/login.keychain-db`, and the user-domain search
+ * list + default keychain live in `<home>/Library/Preferences/
+ * com.apple.security.plist` (HOME-scoped — verified on macOS 27: writes under
+ * an isolated HOME land in that HOME's plist, never the user's real one).
  *
- * We deliberately do NOT call `security default-keychain`/`list-keychains`:
- * those mutate the live securityd SESSION search list (not HOME-scoped),
- * which would pollute the user's real keychain environment. Instead we
- * create + unlock the keychain at the HOME-derived path (which Claude
- * finds on its own) and READ it back by EXPLICIT path (the `security` CLI
- * resolves the default via the session, not HOME, so the path is required).
+ * ── File name (macOS 26+ fix) ─────────────────────────────────────────
+ * macOS 26+ REFUSES `unlock-keychain -p ""` on any file named
+ * `login.keychain-db` (exit 51 — the name is special-cased to the account
+ * password; upstream quicksand PR #37, proven on macOS 27). So the isolated
+ * chain lives at `openllm-isolated.keychain-db` and we make it the user-domain
+ * search-list + default keychain of the isolated HOME (`security
+ * list-keychains -d user -s` / `default-keychain -d user -s`, which need
+ * `Library/Preferences` to exist — `security` silently drops the write
+ * otherwise). A legacy `login.keychain-db` under the isolated HOME is
+ * migrated by rename: items and ACLs are preserved, and the name-keyed
+ * refusal stops applying. The user's real login keychain is never touched.
  *
  * ── Readiness gate (2026-08 GUI-prompt fix) ─────────────────────────────
  * The isolated keychain is created empty-password. If that invariant ever
@@ -25,15 +31,25 @@
  * locked chain — which raises a `builtin:unlock-keychain` SecurityAgent GUI
  * dialog every status tick. So `ensureKeychainReady` now RETURNS a tri-state:
  * NOTHING that could prompt (our dump/grant, or the vendor CLI in
- * `claude-code.ts`) runs unless it reports `present` (unlocked THIS call). A
- * genuine empty-password drift self-heals once (rename-aside + recreate); a
- * chain that still can't unlock is negative-cached so it stops re-prompting.
+ * `claude-code.ts`) runs unless it reports `present` (unlocked THIS call AND
+ * the vendor-visible search list/default configured). A genuine
+ * empty-password drift self-heals once (rename-aside + recreate); a chain
+ * that still can't unlock is negative-cached so it stops re-prompting.
  * See docs/plan/2026-08-22-daemon-keychain-gui-prompt-wedge-fix.md.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { mkdir, readdir, rename, rm } from "node:fs/promises";
-import { platform } from "node:os";
+import {
+  existsSync,
+  mkdirSync,
+  opendirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, platform } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { superviseSpawn } from "../child-supervisor";
 import type { TDeadlineBudget } from "../deadline-budget";
@@ -58,20 +74,69 @@ import { redactSensitiveArgv } from "./redact-sensitive-argv";
 import { bindAbort, logIfKilled, spawnCwd } from "./spawn";
 import type { TStoreRead } from "./util";
 
-const MAC = platform() === "darwin";
+let platformOverrideForTests: NodeJS.Platform | null = null;
+const isMac = (): boolean =>
+  (platformOverrideForTests ?? platform()) === "darwin";
+
+/** Override platform detection for deterministic unit tests. */
+export const setKeychainPlatformForTests = (
+  value: NodeJS.Platform | null,
+): void => {
+  platformOverrideForTests = value;
+};
 
 /** Readiness = the shared tri-state: `present` (created + unlocked this call),
  *  `indeterminate` (create/unlock failed or the chain is unusable). Off macOS
  *  there is nothing to gate, so it is always `present`. */
 const READY: TStoreRead<void> = { kind: "present", value: undefined };
 
-const loginKeychainPath = (home: string): string =>
-  join(home, "Library", "Keychains", "login.keychain-db");
+/** The isolated keychain file. MUST NOT end in `login` — on macOS 26+
+ *  `security` special-cases `*login.keychain-db` to the account password, so
+ *  `unlock-keychain -p ""` exits 51 no matter the path (name-keyed, not
+ *  path-keyed; verified on macOS 27). */
+const ISOLATED_KEYCHAIN_NAME = "openllm-isolated.keychain-db";
+const LEGACY_LOGIN_KEYCHAIN_NAME = "login.keychain-db";
+
+const isolatedKeychainPath = (home: string): string =>
+  join(home, "Library", "Keychains", ISOLATED_KEYCHAIN_NAME);
+
+/** Pre-2.8 name. Still readable data — migrated by rename, never read in
+ *  place (its name makes `unlock-keychain -p ""` fail on macOS 26+). */
+const legacyLoginKeychainPath = (home: string): string =>
+  join(home, "Library", "Keychains", LEGACY_LOGIN_KEYCHAIN_NAME);
+
+/** Where `security list-keychains -d user -s` / `default-keychain -d user -s`
+ *  persist for the isolated HOME. `security` writes this only when
+ *  `Library/Preferences` already exists — a missing dir silently drops the
+ *  write while still exiting 0 (verified on macOS 27). */
+const domainPrefsPath = (home: string): string =>
+  join(home, "Library", "Preferences", "com.apple.security.plist");
 
 type TSpawnMode = "ignore" | "pipe";
 
 /** Per-command ceiling; the caller's monotonic budget includes FIFO queue wait. */
 const DEFAULT_SECURITY_SPAWN_TIMEOUT_MS = 4_000;
+
+/** Hard ceiling on `OPENLLM_SECURITY_TIMEOUT_MS`. The env knob tunes the wait
+ *  WITHIN a bound; an effectively-unbounded configured wait lets one wedged
+ *  `security` child stall readiness (and every gated vendor spawn) for as
+ *  long as the env asks. Values above are clamped, with a one-time warning. */
+export const MAX_SECURITY_SPAWN_TIMEOUT_MS = 60_000;
+
+/** One warning per process per condition — an over-cap env value, a corrupt
+ *  marker, or a truncated parked-chain scan would otherwise spam the log on
+ *  every readiness call. Cleared by `resetKeychainStateForTests`. */
+const keychainWarnedOnce = new Set<string>();
+
+const warnKeychainOnce = (
+  key: string,
+  message: string,
+  meta?: Record<string, unknown>,
+): void => {
+  if (keychainWarnedOnce.has(key)) return;
+  keychainWarnedOnce.add(key);
+  logWarn("keychain", message, meta);
+};
 
 /** Do not start a `security` child with less than this remaining — a sliver
  *  spawn just times out and logs. Capped by `securitySpawnTimeoutMs()` so
@@ -80,12 +145,23 @@ const DEFAULT_SECURITY_SPAWN_TIMEOUT_MS = 4_000;
 export const KEYCHAIN_LANE_SPAWN_FLOOR_MS = 400;
 
 /** Per-call so tests can drive `OPENLLM_SECURITY_TIMEOUT_MS`. Finite + positive
- *  or the default. Dump/unlock on a one-cred isolated chain is fast. */
+ *  or the default; above the hard cap it is clamped with a one-time warning so
+ *  a wedged `security` child can never stall readiness for an unbounded wait.
+ *  Dump/unlock on a one-cred isolated chain is fast. */
 const securitySpawnTimeoutMs = (): number => {
   const raw = process.env.OPENLLM_SECURITY_TIMEOUT_MS;
   if (raw === undefined) return DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_SECURITY_SPAWN_TIMEOUT_MS;
+  if (n > MAX_SECURITY_SPAWN_TIMEOUT_MS) {
+    warnKeychainOnce(
+      "security-timeout-clamped",
+      "OPENLLM_SECURITY_TIMEOUT_MS exceeds the hard cap; clamped",
+      { configured_ms: n, clamped_ms: MAX_SECURITY_SPAWN_TIMEOUT_MS },
+    );
+    return MAX_SECURITY_SPAWN_TIMEOUT_MS;
+  }
+  return n;
 };
 
 const laneSpawnFloorMs = (): number =>
@@ -284,7 +360,7 @@ export const withMacosKeychainAccess = async <T>(
   budget?: TDeadlineBudget,
   onSkip?: () => T,
 ): Promise<T> => {
-  if (!MAC) return operation();
+  if (!isMac()) return operation();
   const previous = macosKeychainLane;
   let release = (): void => {};
   const occupied = new Promise<void>((resolve) => {
@@ -312,6 +388,30 @@ export const withMacosKeychainAccess = async <T>(
   } finally {
     release();
   }
+};
+
+/** The ONLY environment `/usr/bin/security` may see. `security` talks to
+ *  securityd and needs nothing of the daemon's env — API keys, cloud
+ *  credentials, proxy settings and `SSH_AUTH_SOCK` must never reach a child
+ *  process that also handles credential material. HOME is forced to the
+ *  isolated home (that is what makes `-d user` writes land in the isolated
+ *  `com.apple.security.plist`), PATH is pinned to system dirs, and only
+ *  TMPDIR, USER/LOGNAME and locale vars pass through. Keep this allowlist
+ *  local to the security lane; a later branch unifies env builders. */
+const SECURITY_ENV_PASSTHROUGH = new Set(["TMPDIR", "USER", "LOGNAME", "LANG"]);
+
+const securitySpawnEnv = (home: string): Record<string, string> => {
+  const env: Record<string, string> = {
+    HOME: home,
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  };
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (SECURITY_ENV_PASSTHROUGH.has(key) || key.startsWith("LC_")) {
+      env[key] = value;
+    }
+  }
+  return env;
 };
 
 const spawnSecurityNow = async (
@@ -343,7 +443,7 @@ const spawnSecurityNow = async (
         stdout: opts.stdout,
         stderr: opts.stderr,
         cwd: spawnCwd({ HOME: home }),
-        env: { ...process.env, HOME: home },
+        env: securitySpawnEnv(home),
       },
     );
     if (securitySpawnSetupHookForTests !== null) {
@@ -727,6 +827,12 @@ const inFlightKeychainReads = new Map<
 // path per process — launchd KeepAlive resets it on restart).
 const healedKeychains = new Set<string>();
 
+// Keychain paths whose user-domain search list + default keychain this
+// process has pointed at the isolated chain. The write persists in the
+// isolated HOME's `com.apple.security.plist`, so one successful configure
+// covers the rest of this process's calls.
+const domainConfigured = new Set<string>();
+
 // First existing-chain unlock logged once per path per process. This is the
 // boot breadcrumb that distinguishes a healthy unlock from a self-heal.
 const initialExistingKeychainUnlocks = new Set<string>();
@@ -838,8 +944,8 @@ export type TKeychainStoreIdentity = {
 };
 
 export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
-  const path = loginKeychainPath(home);
-  if (!MAC) {
+  const path = isolatedKeychainPath(home);
+  if (!isMac()) {
     return {
       path,
       present: false,
@@ -875,10 +981,36 @@ export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
   }
 };
 
-const brokenKeychainCount = async (kc: string): Promise<number> => {
+/** Upper bound on directory entries read on the readiness path. */
+const DIR_SCAN_MAX_ENTRIES = 4096;
+
+/** Read at most `max` entry names from `dir` without materialising the whole
+ *  directory (readdirSync would allocate every name up front). */
+const boundedDirNames = (
+  dir: string,
+  max: number = DIR_SCAN_MAX_ENTRIES,
+): string[] => {
+  const names: string[] = [];
+  const handle = opendirSync(dir);
+  try {
+    for (
+      let entry = handle.readSync();
+      entry !== null;
+      entry = handle.readSync()
+    ) {
+      names.push(entry.name);
+      if (names.length >= max) break;
+    }
+  } finally {
+    handle.closeSync();
+  }
+  return names;
+};
+
+const brokenKeychainCount = (kc: string): number => {
   try {
     const prefix = `${basename(kc)}.broken-`;
-    return (await readdir(dirname(kc))).filter((name) =>
+    return boundedDirNames(dirname(kc)).filter((name) =>
       name.startsWith(prefix),
     ).length;
   } catch {
@@ -898,18 +1030,20 @@ const isOwnedStagingName = (name: string): boolean =>
   name.startsWith(stagingPrefixForPid(process.pid)) &&
   name.endsWith(".keychain-db");
 
-const sweepOwnedStaging = async (dir: string): Promise<void> => {
+const sweepOwnedStaging = (dir: string): void => {
   try {
-    for (const f of await readdir(dir)) {
-      if (isOwnedStagingName(f)) await rm(join(dir, f), { force: true });
+    for (const f of boundedDirNames(dir)) {
+      if (isOwnedStagingName(f)) rmSync(join(dir, f), { force: true });
     }
   } catch {
     // dir unreadable / race — non-fatal
   }
 };
 
-const removeOwnedPath = async (path: string): Promise<void> => {
-  await rm(path, { force: true }).catch(() => {});
+const removeOwnedPath = (path: string): void => {
+  try {
+    rmSync(path, { force: true });
+  } catch {}
 };
 
 type TPreparedStaging = {
@@ -918,18 +1052,18 @@ type TPreparedStaging = {
 };
 
 /** Create + settings + unlock a unique owned staging keychain. Never touches
- *  the final reserved path. Failure removes only this process's staging. */
+ *  the final path. Failure removes only this process's staging. */
 const prepareStagingKeychain = async (
   home: string,
   dir: string,
   signal?: AbortSignal,
 ): Promise<TPreparedStaging | null> => {
   try {
-    await mkdir(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true });
   } catch {
     return null;
   }
-  await sweepOwnedStaging(dir);
+  sweepOwnedStaging(dir);
   const staging = ownedStagingPath(dir);
   const created = await runSecurity(
     ["create-keychain", "-p", "", staging],
@@ -937,7 +1071,7 @@ const prepareStagingKeychain = async (
     signal,
   );
   if (!created) {
-    await removeOwnedPath(staging);
+    removeOwnedPath(staging);
     return null;
   }
   const settings = await runSecurity(
@@ -946,7 +1080,7 @@ const prepareStagingKeychain = async (
     signal,
   );
   if (!settings) {
-    await removeOwnedPath(staging);
+    removeOwnedPath(staging);
     return null;
   }
   const unlocked = await runSecurity(
@@ -955,16 +1089,18 @@ const prepareStagingKeychain = async (
     signal,
   );
   if (!unlocked) {
-    await removeOwnedPath(staging);
+    removeOwnedPath(staging);
     return null;
   }
   return { path: staging, unlocked: true };
 };
 
-/** Create + configure the isolated login keychain at `kc`. macOS `securityd`
- *  REFUSES `create-keychain` at the RESERVED `login.keychain-db` name inside
- *  the $HOME subtree under Seatbelt. Staging is owner-pid unique; settings
- *  must succeed before install. Returns whether `kc` now exists and unlocks. */
+/** Create + configure the isolated keychain at `kc`. Staging keeps a failed
+ *  create from ever leaving a partial file at the final path (and dodges any
+ *  name-sensitive securityd handling — `create-keychain` at the
+ *  `login.keychain-db` name inside $HOME under Seatbelt is refused).
+ *  Staging is owner-pid unique; settings must succeed before install.
+ *  Returns whether `kc` now exists and unlocks. */
 const createIsolatedKeychain = async (
   home: string,
   kc: string,
@@ -974,9 +1110,9 @@ const createIsolatedKeychain = async (
   const prepared = await prepareStagingKeychain(home, dir, signal);
   if (prepared === null) return false;
   try {
-    await rename(prepared.path, kc);
+    renameSync(prepared.path, kc);
   } catch {
-    await removeOwnedPath(prepared.path);
+    removeOwnedPath(prepared.path);
     return existsSync(kc);
   }
   return (
@@ -1014,14 +1150,16 @@ const recreateIsolatedKeychain = async (
   let originalMoved = false;
   try {
     if (existsSync(kc)) {
-      await rename(kc, aside);
+      renameSync(kc, aside);
       originalMoved = true;
     }
-    await rename(prepared.path, kc);
+    renameSync(prepared.path, kc);
   } catch {
-    await removeOwnedPath(prepared.path);
+    removeOwnedPath(prepared.path);
     if (originalMoved && !existsSync(kc)) {
-      await rename(aside, kc).catch(() => {});
+      try {
+        renameSync(aside, kc);
+      } catch {}
     }
     logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
       created: true,
@@ -1035,8 +1173,12 @@ const recreateIsolatedKeychain = async (
     signal,
   );
   if (!unlocked && originalMoved) {
-    await rm(kc, { force: true }).catch(() => {});
-    await rename(aside, kc).catch(() => {});
+    try {
+      rmSync(kc, { force: true });
+    } catch {}
+    try {
+      renameSync(aside, kc);
+    } catch {}
     logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
       created: true,
       unlocked: false,
@@ -1049,6 +1191,523 @@ const recreateIsolatedKeychain = async (
     unlocked,
   });
   return { created: true, unlocked, replaced: true };
+};
+
+/** True only when THIS PROCESS has verified (by read-back) that the isolated
+ *  HOME's user-domain config points at `kc`. The flag is set exclusively by
+ *  `ensureDomainKeychainConfig` after `verifyDomainKeychainConfig` passes —
+ *  neither a `com.apple.security.plist` file merely existing nor a write that
+ *  exited 0 counts as proof. */
+const domainConfiguredFor = (kc: string): boolean => domainConfigured.has(kc);
+
+/** securityd canonicalizes stored paths (e.g. `/tmp/x` is reported back as
+ *  `/private/tmp/x` — verified on macOS 27), so comparisons must normalize
+ *  both sides the same way. */
+const canonKeychainPath = (path: string): string => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+};
+
+/** `list-keychains -d user` / `default-keychain -d user` print one
+ *  `"<path>"` line per entry (or nothing / exit 1 when unset). */
+const parseKeychainPathList = (stdout: string): string[] =>
+  stdout
+    .split("\n")
+    .map((line) => /^\s*"(.+)"\s*$/.exec(line)?.[1])
+    .filter((p): p is string => typeof p === "string");
+
+/** Read back the isolated HOME's user-domain search list and default
+ *  keychain from securityd and require BOTH to name `kc` exactly — the one
+ *  admissible proof of configuration. A stale plist, a half-landed write, or
+ *  config left pointing at some other chain all fail here, which is what
+ *  re-triggers the `-s` writes (or fails readiness closed). */
+const verifyDomainKeychainConfig = async (
+  home: string,
+  kc: string,
+  signal?: AbortSignal,
+): Promise<boolean> => {
+  const expected = canonKeychainPath(kc);
+  const listed = await spawnSecurity(["list-keychains", "-d", "user"], home, {
+    stdout: "pipe",
+    stderr: "ignore",
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (listed.code !== 0) return false;
+  const entries = parseKeychainPathList(listed.stdout);
+  if (entries.length !== 1 || canonKeychainPath(entries[0]) !== expected) {
+    return false;
+  }
+  const defaulted = await spawnSecurity(
+    ["default-keychain", "-d", "user"],
+    home,
+    {
+      stdout: "pipe",
+      stderr: "ignore",
+      ...(signal !== undefined ? { signal } : {}),
+    },
+  );
+  if (defaulted.code !== 0) return false;
+  const defaults = parseKeychainPathList(defaulted.stdout);
+  return defaults.length === 1 && canonKeychainPath(defaults[0]) === expected;
+};
+
+/** Point the isolated HOME's user-domain search list and default keychain at
+ *  `kc`, so a vendor CLI run with `HOME=<home>` reaches it without the
+ *  implicit `login.keychain-db` fallback. The writes are HOME-scoped
+ *  (`com.apple.security.plist` under `home`); `Library/Preferences` must
+ *  exist or `security` exits 0 having written NOTHING — which is exactly why
+ *  a 0 exit is never trusted: every state (persisted or just-written) is
+ *  proven by reading the domain back through the same isolated HOME. */
+const ensureDomainKeychainConfig = async (
+  home: string,
+  kc: string,
+  signal?: AbortSignal,
+): Promise<boolean> => {
+  if (domainConfigured.has(kc)) return true;
+  try {
+    // Sync fs on purpose: callers of `ensureKeychainReady` may await the op
+    // from a resolved-promise poll loop that never yields to the event loop —
+    // an `fs/promises` await here would starve them (and us).
+    mkdirSync(dirname(domainPrefsPath(home)), { recursive: true });
+  } catch {
+    return false;
+  }
+  // A persisted config from an earlier process (or another writer) is proven
+  // only by read-back — verifying first also makes the common already-
+  // configured case write-free.
+  if (await verifyDomainKeychainConfig(home, kc, signal)) {
+    domainConfigured.add(kc);
+    return true;
+  }
+  const listed = await runSecurity(
+    ["list-keychains", "-d", "user", "-s", kc],
+    home,
+    signal,
+  );
+  if (!listed) return false;
+  const defaulted = await runSecurity(
+    ["default-keychain", "-d", "user", "-s", kc],
+    home,
+    signal,
+  );
+  if (!defaulted) return false;
+  // Verify the writes actually landed. `security` exits 0 on a silently
+  // dropped write, so an unverifiable post-write state must fail closed —
+  // never cache a lie.
+  if (await verifyDomainKeychainConfig(home, kc, signal)) {
+    domainConfigured.add(kc);
+    return true;
+  }
+  domainConfigured.delete(kc);
+  logError(
+    "keychain",
+    safeDiagnosticMessage`keychain domain config writes did not verify on read-back`,
+    { keychain: basename(kc) },
+  );
+  return false;
+};
+
+/** Count a chain's items via `dump-keychain` METADATA only — one `class:`
+ *  line per item; secret payloads are never requested or logged. Returns
+ *  null when the chain cannot be unlocked/inspected so the caller fails
+ *  closed. The file's basename must be free of `login.keychain-db` (the
+ *  macOS 26+ name-keyed refusal would force every unlock of it to fail). */
+const keychainItemCount = async (
+  home: string,
+  kcPath: string,
+  signal?: AbortSignal,
+): Promise<number | null> => {
+  const unlocked = await spawnSecurity(
+    ["unlock-keychain", "-p", "", kcPath],
+    home,
+    {
+      stdout: "ignore",
+      stderr: "ignore",
+      ...(signal !== undefined ? { signal } : {}),
+    },
+  );
+  if (unlocked.code !== 0) return null;
+  const dump = await spawnSecurity(["dump-keychain", kcPath], home, {
+    stdout: "pipe",
+    stderr: "ignore",
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (dump.code !== 0) return null;
+  return dump.stdout.split("\n").filter((line) => line.startsWith("class:"))
+    .length;
+};
+
+/** How a legacy-chain resolution ended. `resolved` lets readiness continue;
+ *  a failure carries the indeterminate cause surfaced to callers —
+ *  `keychain_migration_conflict` when BOTH chains hold vendor items (no
+ *  chain may be picked silently), `keychain_migration_failed` for I/O and
+ *  inspection failures. */
+type TLegacyMigration =
+  | { readonly resolved: true }
+  | { readonly resolved: false; readonly cause: string };
+
+const migrationResolved: TLegacyMigration = { resolved: true };
+const migrationFailed = (cause: string): TLegacyMigration => ({
+  resolved: false,
+  cause,
+});
+
+/** Durable record that a legacy-chain migration COMPLETED, kept next to the
+ *  keychains so a parked `*-superseded-*` backup is never mistaken for a
+ *  pending migration again. Without it every readiness call would
+ *  rediscover the parked loser, re-inspect both chains, and park it under a
+ *  NEW superseded name — unbounded re-spawns plus unbounded file growth,
+ *  and a healthy canonical chain could keep failing closed. Only the parked
+ *  paths the marker names are disarmed: an UN-parked `login.keychain-db`,
+ *  and any parked file with no completed-migration record (e.g. left behind
+ *  by a failed inspection's restore), stay pending. */
+const MIGRATION_MARKER_NAME = "openllm-migration.json";
+
+/** A marker bigger than this is corruption, not state: an unbounded
+ *  `readFileSync` on the readiness path would stall the daemon event loop.
+ *  Treated as unreadable — every parked chain stays pending (fail closed). */
+const MIGRATION_MARKER_MAX_BYTES = 64 * 1024;
+
+/** The ONLY file names a completed migration can park — generated at one site
+ *  (`resolveSupersededLegacy` stages `<pid>-<ms>` asides). A `parked` marker
+ *  entry naming anything else is corruption or a forgery; it must never
+ *  disarm a pending legacy chain. */
+const GENERATED_PARKED_NAME =
+  /^openllm-(?:legacy|isolated)-superseded-\d+-\d+\.keychain-db$/;
+
+const migrationMarkerPath = (home: string): string =>
+  join(dirname(legacyLoginKeychainPath(home)), MIGRATION_MARKER_NAME);
+
+/** A `parked` marker entry is trusted only when it names a file the migration
+ *  itself could have generated AND that file still resolves (realpath) inside
+ *  the isolated HOME's Keychains dir — a right-looking string for a missing
+ *  file, a symlink escaping the dir, or a name we never generate can never
+ *  disarm a pending legacy chain (fail closed). Valid entries are
+ *  canonicalised to `dir/name`, the same string the parked finder compares. */
+const validMarkerEntries = (
+  raw: unknown,
+  keychainsDir: string,
+): ReadonlySet<string> => {
+  const trusted = new Set<string>();
+  if (!Array.isArray(raw)) return trusted;
+  let realDir: string;
+  try {
+    realDir = realpathSync(keychainsDir);
+  } catch {
+    return trusted;
+  }
+  // Each candidate costs a realpath syscall — cap the count validated per
+  // read so a fat `parked` array cannot stall the readiness path.
+  // Newest entries last (append order): trust the most recent ones so a
+  // full marker never hides a freshly parked chain.
+  for (const entry of raw.slice(-PARKED_SCAN_MAX_ENTRIES)) {
+    if (typeof entry !== "string") continue;
+    const name = basename(entry);
+    if (!GENERATED_PARKED_NAME.test(name)) continue;
+    try {
+      if (dirname(realpathSync(entry)) !== realDir) continue;
+    } catch {
+      // Missing or unresolvable — the chain it named stays pending.
+      continue;
+    }
+    trusted.add(join(keychainsDir, name));
+  }
+  return trusted;
+};
+
+const readMigrationMarker = (home: string): ReadonlySet<string> => {
+  const keychainsDir = dirname(legacyLoginKeychainPath(home));
+  let parsed: unknown;
+  try {
+    const marker = migrationMarkerPath(home);
+    const size = statSync(marker).size;
+    if (size > MIGRATION_MARKER_MAX_BYTES) {
+      warnKeychainOnce(
+        "migration-marker-oversized",
+        "keychain migration marker exceeds the size cap; treating it as corrupt",
+        { marker_size: size },
+      );
+      return new Set();
+    }
+    parsed = JSON.parse(readFileSync(marker, "utf8"));
+  } catch {
+    // Absent or unreadable — nothing is known-resolved.
+    return new Set();
+  }
+  const raw =
+    parsed !== null && typeof parsed === "object"
+      ? (parsed as { readonly parked?: unknown }).parked
+      : undefined;
+  return validMarkerEntries(raw, keychainsDir);
+};
+
+/** Persist "migration completed" atomically (tmp + rename) so a crash can
+ *  never leave a half-written marker that re-arms a parked chain. Records
+ *  the parked backup's absolute path plus a timestamp — both so exactly
+ *  that file is disarmed and so a human can see what was parked when. A
+ *  write failure only means the parked chain stays resumable next call —
+ *  log and continue; the migration itself already succeeded. Entries the
+ *  reader can no longer validate (renamed, deleted, or never a generated
+ *  `*-superseded-*` name inside the Keychains dir) are dropped here. */
+const recordMigrationCompleted = (
+  home: string,
+  parked: string | null,
+): void => {
+  const known = new Set(readMigrationMarker(home));
+  if (parked !== null) {
+    known.delete(parked);
+    known.add(parked);
+  }
+  // Keep the marker bounded: retain only the newest entries.
+  const kept = [...known].slice(-PARKED_SCAN_MAX_ENTRIES);
+  const marker = migrationMarkerPath(home);
+  const tmp = join(
+    dirname(marker),
+    `.${MIGRATION_MARKER_NAME}.${process.pid}.tmp`,
+  );
+  try {
+    writeFileSync(
+      tmp,
+      `${JSON.stringify({ completedAtMs: Date.now(), parked: kept })}\n`,
+    );
+    renameSync(tmp, marker);
+  } catch {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Best-effort cleanup of the temp file.
+    }
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`could not record the completed keychain migration; the parked chain stays resumable`,
+      { keychain: basename(parked ?? marker) },
+    );
+  }
+};
+
+/** Both legacy `login.keychain-db` and the canonical chain exist. Stage the
+ *  legacy file under a refusal-free aside name, inspect item counts on BOTH
+ *  chains (metadata only), then act on what holds items:
+ *    - legacy-only holds items → promote it to the canonical name (items +
+ *      ACLs preserved) and park the empty canonical as a recoverable backup;
+ *    - canonical-only (or neither) holds items → keep canonical, park the
+ *      empty legacy aside;
+ *    - BOTH hold items → CONFLICT: restore the original layout and fail
+ *      closed. Silently picking either chain would strand the other's
+ *      credentials, so an operator must remove one by hand.
+ *  Every failure restores the original layout and reports the failure cause
+ *  so readiness fails closed instead of stranding data. */
+const resolveSupersededLegacy = async (
+  home: string,
+  kc: string,
+  legacy: string,
+  signal?: AbortSignal,
+): Promise<TLegacyMigration> => {
+  const stamp = `${process.pid}-${Date.now()}`;
+  const dir = dirname(legacy);
+  const legacyAside = join(
+    dir,
+    `openllm-legacy-superseded-${stamp}.keychain-db`,
+  );
+  try {
+    renameSync(legacy, legacyAside);
+  } catch {
+    logError(
+      "keychain",
+      safeDiagnosticMessage`could not stage the legacy login-named isolated keychain for inspection; failing closed`,
+      { keychain: basename(legacy) },
+    );
+    return migrationFailed("keychain_migration_failed");
+  }
+  /** Best-effort restore of the legacy file's original name. It staying
+   *  parked is still recoverable (the path is logged), so a restore failure
+   *  never widens the failure. */
+  const restoreLegacy = (): void => {
+    if (existsSync(legacy) || !existsSync(legacyAside)) return;
+    try {
+      renameSync(legacyAside, legacy);
+    } catch {
+      logWarn(
+        "keychain",
+        safeDiagnosticMessage`legacy keychain remains parked after a failed inspection`,
+        { keychain: basename(legacyAside) },
+      );
+    }
+  };
+  const legacyItems = await keychainItemCount(home, legacyAside, signal);
+  const kcItems = await keychainItemCount(home, kc, signal);
+  if (legacyItems === null || kcItems === null) {
+    restoreLegacy();
+    logError(
+      "keychain",
+      safeDiagnosticMessage`could not inspect both isolated keychains; failing closed rather than guessing which holds credentials`,
+      { keychain: basename(kc), legacy: basename(legacy) },
+    );
+    return migrationFailed("keychain_migration_failed");
+  }
+  if (legacyItems > 0 && kcItems > 0) {
+    // BOTH chains hold vendor items. Picking either silently would strand
+    // the other's credentials, so restore the original layout untouched and
+    // fail closed until an operator removes one chain by hand.
+    restoreLegacy();
+    logError(
+      "keychain",
+      safeDiagnosticMessage`both isolated keychains hold vendor items; refusing to pick one — inspect both keychains and delete one manually, then retry`,
+      {
+        canonical_keychain: kc,
+        legacy_keychain: legacy,
+        canonical_items: kcItems,
+        legacy_items: legacyItems,
+      },
+    );
+    return migrationFailed("keychain_migration_conflict");
+  }
+  if (legacyItems > 0 && kcItems === 0) {
+    // The legacy chain carries the stored credentials — promote it to the
+    // canonical name (preserving items + ACLs, same as a rename migration)
+    // and park the empty canonical chain as the recoverable backup.
+    const kcAside = join(
+      dir,
+      `openllm-isolated-superseded-${stamp}.keychain-db`,
+    );
+    try {
+      renameSync(kc, kcAside);
+      renameSync(legacyAside, kc);
+    } catch {
+      if (!existsSync(kc) && existsSync(kcAside)) {
+        try {
+          renameSync(kcAside, kc);
+        } catch {
+          logError(
+            "keychain",
+            safeDiagnosticMessage`could not restore the canonical isolated keychain after a failed legacy promotion`,
+            { keychain: basename(kcAside) },
+          );
+        }
+      }
+      restoreLegacy();
+      return migrationFailed("keychain_migration_failed");
+    }
+    logInfo("keychain", "kept the legacy chain — it holds the stored items", {
+      kept: "legacy",
+      legacy_items: legacyItems,
+      canonical_aside: basename(kcAside),
+    });
+    recordMigrationCompleted(home, kcAside);
+    return migrationResolved;
+  }
+  logInfo("keychain", "kept the canonical chain; legacy parked as a backup", {
+    kept: "canonical",
+    canonical_items: kcItems,
+    legacy_items: legacyItems,
+    legacy_aside: basename(legacyAside),
+  });
+  recordMigrationCompleted(home, legacyAside);
+  return migrationResolved;
+};
+
+/** Per-scan ceiling on parked-candidate `statSync` calls — a dir holding an
+ *  absurd number of `*-superseded-*` names must not stall the daemon event
+ *  loop on the readiness path. Entries beyond the cap are simply unexamined:
+ *  `readdir` order is arbitrary, so a truncated scan still resolves the
+ *  newest pending chain it did see rather than pretending none exists. */
+const PARKED_SCAN_MAX_ENTRIES = 256;
+
+/** The newest `openllm-legacy-superseded-*.keychain-db` under the isolated
+ *  HOME that is still PENDING migration. A parked file is left behind when a
+ *  both-chains inspection failed AND the original `login.keychain-db` name
+ *  could not be restored — it still holds the credentials, so the next
+ *  readiness call must finish the migration rather than silently run on an
+ *  empty chain. A parked path the completed-migration marker names is a
+ *  resolved backup, never a migration source: without that record the same
+ *  file would be re-staged, re-inspected, and re-parked on EVERY call. */
+const findParkedLegacyKeychain = (home: string): string | null => {
+  const dir = dirname(legacyLoginKeychainPath(home));
+  const resolvedBackups = readMigrationMarker(home);
+  let names: string[];
+  try {
+    names = boundedDirNames(dir);
+  } catch {
+    return null;
+  }
+  let newest: string | null = null;
+  let newestMs = -1;
+  let examined = 0;
+  for (const name of names) {
+    if (
+      !name.startsWith("openllm-legacy-superseded-") ||
+      !name.endsWith(".keychain-db")
+    ) {
+      continue;
+    }
+    const path = join(dir, name);
+    if (resolvedBackups.has(path)) continue;
+    if (examined >= PARKED_SCAN_MAX_ENTRIES) {
+      warnKeychainOnce(
+        "parked-scan-truncated",
+        "parked legacy keychain scan truncated at the entry cap; unexamined entries stay pending",
+        { scanned: examined, cap: PARKED_SCAN_MAX_ENTRIES },
+      );
+      break;
+    }
+    examined++;
+    try {
+      const mtimeMs = statSync(path).mtimeMs;
+      if (mtimeMs > newestMs) {
+        newest = path;
+        newestMs = mtimeMs;
+      }
+    } catch {
+      // A vanished or unreadable entry is not a migration source.
+    }
+  }
+  return newest;
+};
+
+/** Resolve a leftover pre-2.8 `login.keychain-db` under the isolated HOME.
+ *  When the new chain is absent, RENAME the legacy file to it — the macOS 26+
+ *  refusal is keyed on the file NAME, so a rename both preserves every item
+ *  (with its ACLs) and restores empty-password unlock. When both exist,
+ *  inspect both and keep the chain holding the stored items. A parked
+ *  `openllm-legacy-superseded-*` file counts as the legacy chain so an
+ *  interrupted inspection resumes instead of stranding credentials — but
+ *  ONLY while no completed-migration marker names it (a resolved backup is
+ *  never pending again). Every failure reports its cause so the caller
+ *  fails closed: continuing on a fresh EMPTY chain while credentials sit
+ *  unmigrated would be silent credential loss. Never touches the user's
+ *  real login keychain — `home` is always the isolated one. */
+const resolveLegacyKeychain = async (
+  home: string,
+  kc: string,
+  signal?: AbortSignal,
+): Promise<TLegacyMigration> => {
+  let legacy = legacyLoginKeychainPath(home);
+  if (!existsSync(legacy)) {
+    const parked = findParkedLegacyKeychain(home);
+    if (parked === null) return migrationResolved;
+    legacy = parked;
+  }
+  if (!existsSync(kc)) {
+    try {
+      renameSync(legacy, kc);
+      logInfo("keychain", "migrated the legacy login-named isolated keychain", {
+        keychain: basename(kc),
+      });
+      recordMigrationCompleted(home, null);
+      return migrationResolved;
+    } catch {
+      logError(
+        "keychain",
+        safeDiagnosticMessage`legacy login-named isolated keychain could not be migrated; failing closed`,
+        { keychain: basename(legacy) },
+      );
+      return migrationFailed("keychain_migration_failed");
+    }
+  }
+  return await resolveSupersededLegacy(home, kc, legacy, signal);
 };
 
 /** Ensure the isolated login keychain exists and is UNLOCKED for this call,
@@ -1092,6 +1751,18 @@ const ensureKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // Migrate (or disarm) the pre-2.8 login-named chain before probing `kc`.
+  // A failed migration must NOT fall through to create/unlock — the daemon
+  // would front an EMPTY canonical chain while the credentials sit parked in
+  // the legacy file: silent credential loss.
+  const migration = await resolveLegacyKeychain(home, kc, signal);
+  if (!migration.resolved) {
+    if (signal?.aborted === true) {
+      return { kind: "indeterminate", cause: "keychain_wait_aborted" };
+    }
+    logKeychainFailure(kc);
+    return noteTransientFailure(kc, migration.cause);
+  }
   const existedAtStart = existsSync(kc);
   const isInitialExistingUnlock =
     existedAtStart && !initialExistingKeychainUnlocks.has(kc);
@@ -1102,9 +1773,9 @@ const ensureKeychainNow = async (
       return noteTransientFailure(kc, "keychain_create_failed");
     }
   }
-  // Unlock at the FINAL path (securityd keys unlock state by path). Unlocking
-  // the reserved name by explicit path is fine — only `create-keychain` at it
-  // fails. Capture stderr to classify a failure.
+  // Unlock at the FINAL path (securityd keys unlock state by path). The path
+  // never carries a `login`-suffixed name, so the macOS 26+ name-keyed
+  // refusal cannot fire here. Capture stderr to classify a failure.
   const res = await spawnSecurity(["unlock-keychain", "-p", "", kc], home, {
     stdout: "ignore",
     stderr: "pipe",
@@ -1139,7 +1810,7 @@ const ensureKeychainNow = async (
         stderr_excerpt: redactSecurityStderr(res.stderr),
         keychain_mtime_ms: metadata.mtimeMs,
         keychain_size: metadata.size,
-        broken_count: await brokenKeychainCount(kc),
+        broken_count: brokenKeychainCount(kc),
       });
       const outcome = await recreateIsolatedKeychain(home, kc, signal);
       if (outcome.replaced) healedKeychains.add(kc);
@@ -1162,8 +1833,8 @@ export const ensureKeychainReady = async (
   home: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
-  if (!MAC) return READY;
-  const kc = loginKeychainPath(home);
+  if (!isMac()) return READY;
+  const kc = isolatedKeychainPath(home);
   const backoff = transientTimeouts.get(kc);
   if (backoff !== undefined && backoff.nextAtMs > Date.now()) {
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
@@ -1173,7 +1844,7 @@ export const ensureKeychainReady = async (
     if (signal?.aborted === true) {
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
-    if (skipEligible(kc)) {
+    if (skipEligible(kc) && domainConfiguredFor(kc)) {
       keychainCounters.skipped++;
       return READY;
     }
@@ -1182,17 +1853,45 @@ export const ensureKeychainReady = async (
     // Promote (one-shot show-keychain-info) is part of this owner so a
     // mid-unlock joiner cannot skip and two first-callers cannot double-spawn.
     op = (async (): Promise<TStoreRead<void>> => {
-      if (await tryPromoteUnlockSkip(home, kc)) {
-        keychainCounters.skipped++;
-        return READY;
-      }
-      return ensureKeychainNow(home, kc);
+      const ready = await (async (): Promise<TStoreRead<void>> => {
+        if (await tryPromoteUnlockSkip(home, kc)) {
+          keychainCounters.skipped++;
+          return READY;
+        }
+        return ensureKeychainNow(home, kc);
+      })();
+      if (ready.kind !== "present") return ready;
+      // `present` also gates VENDOR spawns — and a vendor CLI resolves the
+      // chain through the isolated HOME's search list + default keychain, not
+      // by path. An unlocked-but-unconfigured chain would land it on the
+      // "A keychain cannot be found" dialog this gate exists to prevent.
+      if (await ensureDomainKeychainConfig(home, kc)) return ready;
+      return noteTransientFailure(kc, "keychain_config_failed");
     })().finally(() => {
       if (inFlightKeychains.get(kc) === op) inFlightKeychains.delete(kc);
     });
     inFlightKeychains.set(kc, op);
   }
   return awaitSharedStoreRead(op, signal, "keychain_wait_aborted");
+};
+
+/** The single gate EVERY macOS Claude/Cursor vendor-CLI spawn must pass
+ *  IMMEDIATELY before exec: the spawn env's isolated HOME must have a
+ *  verified-ready keychain, or the CLI would fall off the isolated search
+ *  list onto the "A keychain cannot be found" dialog — or worse, the real
+ *  user's keychain. Off darwin there is nothing to gate; a spawn env
+ *  without HOME is a test fixture and is left alone. An env HOME equal to
+ *  the daemon's own home means the vendor runs under the REAL user home —
+ *  the isolated-keychain machinery must never touch that, so the gate is
+ *  a no-op there too. */
+export const ensureVendorKeychainReady = async (
+  env: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<TStoreRead<void>> => {
+  const home = env.HOME;
+  if (!isMac() || home === undefined || home.length === 0) return READY;
+  if (home === homedir()) return READY;
+  return ensureKeychainReady(home, signal);
 };
 
 /**
@@ -1216,6 +1915,12 @@ const observeKeychainNow = async (
   });
   if (res.code === 0) {
     observeTransientTimeouts.delete(kc);
+    // Passive `present` can also release a vendor spawn (`claude auth
+    // status`); that needs the isolated HOME's domain config, which only the
+    // active path may write. Report unknown until it does — never prompt.
+    if (!domainConfiguredFor(kc)) {
+      return noteObserveTransientFailure(kc, "keychain_unconfigured");
+    }
     return noteUnlockSuccess(kc);
   }
   noteKeychainIoResult(kc, res);
@@ -1229,8 +1934,8 @@ export const observeKeychainReady = async (
   home: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
-  if (!MAC) return READY;
-  const kc = loginKeychainPath(home);
+  if (!isMac()) return READY;
+  const kc = isolatedKeychainPath(home);
   const backoff = observeTransientTimeouts.get(kc);
   if (backoff !== undefined && backoff.nextAtMs > Date.now()) {
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
@@ -1240,16 +1945,21 @@ export const observeKeychainReady = async (
     if (signal?.aborted === true) {
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
-    if (skipEligible(kc)) {
+    if (skipEligible(kc) && domainConfiguredFor(kc)) {
       keychainCounters.skipped++;
       return READY;
     }
     op = (async (): Promise<TStoreRead<void>> => {
-      if (await tryPromoteUnlockSkip(home, kc)) {
-        keychainCounters.skipped++;
-        return READY;
-      }
-      return observeKeychainNow(home, kc);
+      const ready = await (async (): Promise<TStoreRead<void>> => {
+        if (await tryPromoteUnlockSkip(home, kc)) {
+          keychainCounters.skipped++;
+          return READY;
+        }
+        return observeKeychainNow(home, kc);
+      })();
+      if (ready.kind !== "present") return ready;
+      if (domainConfiguredFor(kc)) return ready;
+      return noteObserveTransientFailure(kc, "keychain_unconfigured");
     })().finally(() => {
       if (inFlightObserveKeychains.get(kc) === op) {
         inFlightObserveKeychains.delete(kc);
@@ -1265,6 +1975,7 @@ export const resetKeychainStateForTests = (): void => {
   inFlightKeychains.clear();
   inFlightObserveKeychains.clear();
   healedKeychains.clear();
+  domainConfigured.clear();
   initialExistingKeychainUnlocks.clear();
   lastKeychainFailureLogMs.clear();
   transientTimeouts.clear();
@@ -1279,6 +1990,7 @@ export const resetKeychainStateForTests = (): void => {
   lastWatcherSnapshot = emptyKeychainCounters();
   securitySpawnSetupHookForTests = null;
   lastSecurityTimerMsForTests = null;
+  keychainWarnedOnce.clear();
 };
 
 /**
@@ -1313,9 +2025,9 @@ const noKeyToPartition = (stderr: string): boolean =>
 export const grantKeychainToolAccess = async (
   home: string,
 ): Promise<boolean> => {
-  if (!MAC) return true;
+  if (!isMac()) return true;
   if ((await ensureKeychainReady(home)).kind !== "present") return false;
-  const kc = loginKeychainPath(home);
+  const kc = isolatedKeychainPath(home);
   const res = await spawnSecurity(
     ["set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", "", kc],
     home,
@@ -1325,7 +2037,7 @@ export const grantKeychainToolAccess = async (
   if (res.code === 0) return true;
   if (noKeyToPartition(res.stderr)) {
     logInfo("keychain", "no key to partition — grant not needed", {
-      keychain_path: loginKeychainPath(home),
+      keychain_path: isolatedKeychainPath(home),
     });
     return true;
   }
@@ -1358,7 +2070,7 @@ export const findKeychainServices = async (
   prefix: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<ReadonlyArray<string>>> => {
-  const kc = loginKeychainPath(home);
+  const kc = isolatedKeychainPath(home);
   const mtimeMs = keychainMtimeMs(kc);
   const cacheKey = `${kc}\0${prefix}`;
   const cached = dumpCache.get(cacheKey);
@@ -1395,7 +2107,7 @@ const readKeychainSecret = async (
   service: string,
   signal?: AbortSignal,
 ): Promise<string | null> => {
-  const kc = loginKeychainPath(home);
+  const kc = isolatedKeychainPath(home);
   const found = await spawnSecurity(
     ["find-generic-password", "-s", service, "-w", kc],
     home,
@@ -1461,8 +2173,8 @@ export const readIsolatedKeychain = async (
   signal?: AbortSignal,
   observeOnly = false,
 ): Promise<TStoreRead<string>> => {
-  if (!MAC) return { kind: "absent" };
-  const key = `${loginKeychainPath(home)}\0${servicePrefix}\0${observeOnly ? "observe" : "mutate"}`;
+  if (!isMac()) return { kind: "absent" };
+  const key = `${isolatedKeychainPath(home)}\0${servicePrefix}\0${observeOnly ? "observe" : "mutate"}`;
   let op = inFlightKeychainReads.get(key);
   if (op === undefined) {
     if (signal?.aborted === true) {

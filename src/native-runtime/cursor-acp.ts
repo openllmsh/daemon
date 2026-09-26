@@ -1,3 +1,4 @@
+import { spawn as admittedSpawn } from "../windows-process";
 /**
  * Cursor ACP bridge — executes a `cursor` hop through the OFFICIAL
  * `cursor-agent acp` runtime (Agent Client Protocol v1). Cursor has NO manual
@@ -53,7 +54,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
-import { spawnCwd } from "../delegation/util";
+import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logInfo, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
@@ -354,7 +355,7 @@ class AcpClient {
     // The ACP bridge reads cursor's isolated macOS keychain credential;
     // securityd denies a Seatbelt-confined caller, so it runs unconfined on
     // macOS (confined on Linux) — `sandbox/policy.ts`.
-    this.proc = Bun.spawn(
+    this.proc = admittedSpawn(
       sandboxSpawnArgs([bin, "acp"], { probe: unwrapKeychainSpawn("cursor") }),
       {
         stdin: "pipe",
@@ -809,6 +810,17 @@ export const runCursorNative = async (
     mcp = null;
   };
 
+  // Gate the vendor spawn on the isolated keychain being VERIFIED ready —
+  // `cursor-agent` resolves its credential through the isolated HOME's
+  // search list; an unverified store is the "A keychain cannot be found"
+  // hang this gate exists to prevent.
+  const store = await ensureVendorKeychainReady(params.env, params.signal);
+  if (store.kind !== "present") {
+    return {
+      kind: "declined",
+      reason: `isolated credential store not ready (${store.kind === "indeterminate" ? store.cause : store.kind})`,
+    };
+  }
   // `client` is created FIRST so the MCP server's onToolCall never closes over
   // it before initialization (a tools/call can only arrive after session/new,
   // which needs `client` — but declaring it first makes that ordering explicit
@@ -1106,6 +1118,10 @@ export const listCursorModelsViaAcp = async (params: {
   readonly env: Record<string, string>;
 }): Promise<ReadonlyArray<{ value: string; name: string | null }> | null> => {
   if (!existsSync(params.bin)) return null;
+  // Same vendor-spawn gate as inference: this ACP client must never run
+  // against an unverified isolated credential store.
+  const store = await ensureVendorKeychainReady(params.env);
+  if (store.kind !== "present") return null;
   const client = new AcpClient(params.bin, params.env, () => {
     // notifications are irrelevant to the model-list probe
   });
@@ -1276,6 +1292,15 @@ export const runCursorNativeImage = async (
     }
   };
 
+  // Same vendor-spawn gate as inference: the image ACP client must never
+  // run against an unverified isolated credential store.
+  const store = await ensureVendorKeychainReady(params.env, params.signal);
+  if (store.kind !== "present") {
+    return {
+      kind: "declined",
+      reason: `isolated credential store not ready (${store.kind === "indeterminate" ? store.cause : store.kind})`,
+    };
+  }
   const client = new AcpClient(
     params.bin,
     params.env,

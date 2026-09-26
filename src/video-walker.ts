@@ -43,6 +43,7 @@ import {
   MediaProviderUnavailableError,
 } from "./media-input-error";
 import { mediaHopAdvances, mediaHttpErrorCode } from "./media-retry";
+import { fetchWithBoundedRedirects } from "./upstream-redirect";
 import type { TWalkArgs } from "./walker";
 import {
   coolHopAfterStaleRefresh,
@@ -388,16 +389,20 @@ const getStatus = async (
 ): Promise<Response | TXaiVideoStatus> => {
   let resp: Response;
   try {
-    resp = await (args.fetchImpl ?? fetch)(
+    const doFetch = args.fetchImpl ?? fetch;
+    resp = await fetchWithBoundedRedirects(
       `${upstream.url}/videos/${encodeURIComponent(payload.u)}`,
-      {
-        method: "GET",
-        headers: upstreamHeaders(upstream.headers),
-        signal: AbortSignal.any([
-          args.req.signal,
-          AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
-        ]),
-      },
+      (target) =>
+        doFetch(target, {
+          method: "GET",
+          redirect: "manual",
+          headers: upstreamHeaders(upstream.headers),
+          signal: AbortSignal.any([
+            args.req.signal,
+            AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
+          ]),
+        }),
+      "video-walker",
     );
   } catch {
     return args.req.signal.aborted
@@ -810,14 +815,20 @@ export const runVideoCancel = async (
   if (payload instanceof Response) return payload;
   const followed = await followVideoJob(args, payload);
   if (!(followed instanceof Response)) {
-    await fetch(`${followed.url}/videos/${encodeURIComponent(payload.u)}`, {
-      method: "DELETE",
-      headers: upstreamHeaders(followed.headers),
-      signal: AbortSignal.any([
-        args.req.signal,
-        AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
-      ]),
-    }).catch(() => {});
+    await fetchWithBoundedRedirects(
+      `${followed.url}/videos/${encodeURIComponent(payload.u)}`,
+      (target) =>
+        fetch(target, {
+          method: "DELETE",
+          redirect: "manual",
+          headers: upstreamHeaders(followed.headers),
+          signal: AbortSignal.any([
+            args.req.signal,
+            AbortSignal.timeout(VIDEO_STATUS_TIMEOUT_MS),
+          ]),
+        }),
+      "video-walker",
+    ).catch(() => {});
   }
   const deleted: TVideoDeleted = {
     id: videoId ?? "",

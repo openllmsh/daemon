@@ -71,6 +71,7 @@ import {
   disconnectedObservation,
   ensureIsolatedKeychain,
   ensureKeychainReady,
+  ensureVendorKeychainReady,
   grantKeychainToolAccess,
   keychainStoreIdentity,
   readIsolatedKeychain,
@@ -852,7 +853,15 @@ export const cursorDelegate: TProviderDelegate = {
   logout: async () => {
     clearCursorStatusObservationCache();
     if ((await cliInstallState(PROVIDER)).installed) {
-      await runCapture([bin(), "logout"], env(), {
+      const launchEnv = env();
+      const store = await ensureVendorKeychainReady(launchEnv);
+      if (store.kind !== "present") {
+        return {
+          ok: false,
+          detail: `credential store not ready (${store.kind === "indeterminate" ? store.cause : store.kind})`,
+        };
+      }
+      await runCapture([bin(), "logout"], launchEnv, {
         probe: unwrapKeychainSpawn(PROVIDER),
       });
     }

@@ -22,7 +22,7 @@
  * refused; install + run the compiled binary (`bun run daemon:dist` then
  * `bun run daemon:dist:install`).
  */
-import { execFileSync } from "node:child_process";
+
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -41,6 +41,13 @@ import {
 import { hardenMacBinary } from "./harden-binary";
 import type { TDaemonHealth } from "./health";
 import { DAEMON_VERSION } from "./version";
+import { nodeExecFileSync as execFileSync } from "./windows-process";
+import {
+  startWindowsService,
+  stopWindowsService,
+  uninstallWindowsService,
+  windowsSupervisor,
+} from "./windows-service";
 
 const LABEL = "sh.openllm.daemon";
 const DEFAULT_PORT = 8787;
@@ -482,6 +489,7 @@ export type TSupervisorInfo = {
 
 /** Capture the daemon supervisor once for callers that need both state and PID. */
 export const supervisorInfo = (): TSupervisorInfo => {
+  if (process.platform === "win32") return windowsSupervisor();
   if (isMac) {
     // `launchctl print` exits non-zero (empty capture) when the label isn't
     // bootstrapped at all.
@@ -562,6 +570,7 @@ const startServiceAfterCredentialGate = (
   }
   hardenMacBinary(binPath); // arm64 SIGKILLs an unsigned binary launchd spawns
   if (isMac) startMac(binPath);
+  else if (process.platform === "win32") startWindowsService(binPath);
   else startLinux(binPath);
   process.stdout.write(
     `openllmd v${DAEMON_VERSION} started in self-restore mode (listening on http://127.0.0.1:${daemonPort()}).\n`,
@@ -585,6 +594,10 @@ export const serviceStart = (): boolean => {
 
 /** Stop the service and disable all self-restore. Idempotent. */
 export const serviceStop = (): void => {
+  if (process.platform === "win32") {
+    stopWindowsService();
+    return;
+  }
   if (isMac) stopMac();
   else stopLinux();
   process.stdout.write("openllmd stopped; self-restore disabled.\n");
@@ -619,6 +632,7 @@ export const serviceRestart = (): boolean => {
  * `openllmd uninstall`.
  */
 export const serviceUninstall = (): string | null => {
+  if (process.platform === "win32") return uninstallWindowsService();
   // 1. Stop + disable self-restore so nothing respawns while we tear down.
   if (isMac) stopMac();
   else stopLinux();
@@ -729,7 +743,12 @@ export const formatStatus = (fields: TStatusFields): string => {
  * Async because of the health probe.
  */
 export const serviceStatus = async (): Promise<void> => {
-  const registered = isMac ? existsSync(plistPath()) : existsSync(unitPath());
+  const registered =
+    process.platform === "win32"
+      ? windowsSupervisor().registered
+      : isMac
+        ? existsSync(plistPath())
+        : existsSync(unitPath());
   const port = daemonPort();
   const supervisor = supervisorState();
   const health = await probeHealth(port);

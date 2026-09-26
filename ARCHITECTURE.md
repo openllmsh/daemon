@@ -103,11 +103,12 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 
 ```
 daemon/
-  index.ts                  re-exports
-  scripts/compile.ts        bun build --compile --minify --bytecode (4 targets; NODE_ENV bake)
+  release-types.ts         DAEMON_TARGETS (5 release keys) + DAEMON_BINARY_SOURCES build-input closure
+  scripts/compile.ts        bun build --compile --minify --bytecode (5 targets; NODE_ENV bake; pty-native C bundled)
   scripts/verify.ts         download each published binary → sha256 → assert == manifest.ts pin (bun run verify)
-  scripts/dist.ts           compile + emit a self-contained installer per target (daemon:dist)
+  scripts/dist.ts           compile + emit a self-contained installer per POSIX target (daemon:dist)
   scripts/dist-install.ts   run an emitted installer by target on this host (daemon:dist:install)
+  scripts/package-windows.ts  package the win32-x64 build (ZIP, receipt with ptyQualification "unavailable-until-phase3")
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
     cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
@@ -154,7 +155,19 @@ daemon/
     config.ts               cached bootstrap snapshot (catalog + fallback config); @openllm/core-free
     forward.ts              forward an API-key hop in a mixed chain to the cloud /v1/*
     mux-host.ts             mux2/rtc1 channel negotiation, media1 capability advertisement, relay duplex ownership, and OPEN dispatch
-    session-core.ts         transport-neutral PTY state machine: fan-out output, merged input, bounded per-consumer queues, and detached-idle reaping
+    bs-pty.ts               production PTY backend selector: `native` on POSIX, `conpty` on Windows
+                            (Phase 3 in-process ConPTY through the native binding; capability reporting
+                            keeps the `unavailable-until-phase3` literal until the P3-3 guest smoke);
+                            every other value fails closed
+    pty-env.ts              workerEnv(): the PTY child env ALLOWLIST (PATH/HOME/TERM/locale + Windows
+                            session vars, never OPENLLM_* wildcards — credentials stay out of the shell)
+                            + nativePtyEnv(): the native-shim launch env, stamping TERM=xterm-256color
+                            and the BS_SESSION / BS_SESSION_ID runtime-session markers
+    native-pty.ts           POSIX native PTY spawner over the bundled pty-native shim (below)
+    windows-pty.ts          Windows PTY spawner — Phase 3: delegates to the native ConPTY binding
+                            (pty-win.c) behind the same TPtySpawnArgs seam; no worker search, no Bun.Terminal
+    session-core.ts         transport-neutral PTY state machine: fan-out output, merged input, bounded
+                            per-consumer queues (CONSUMER_MAX_QUEUED_BYTES), and detached-idle reaping
     session-host.ts         durable session-host registry/status adapter and boot reconciler; never owns a daemon PTY
     session-host-proc/      detached per-session host: owns one durable PTY, scrollback, idle reaping, meta.json, and ctl.sock
     rtc-host.ts             werift RTCPeerConnection answerer: browser or fleet rtc_offer/answer/ice/nack + mux over data channel
@@ -479,8 +492,19 @@ protocol mismatch degrades to slower, never broken.
 
 Current native scope (`nativeRequestOf`): multi-turn TEXT (system +
 user/assistant text) via the CLI resume path; claude_code tool requests take
-the SDK tool path. **Native decline → manual fallback.** Anything the native
-path declines — images, structured output, chatgpt tools (until Codex
+the SDK tool path. The claude_code TOOL path additionally carries ATTACHMENTS
+on the active user turn: `claude-tool-media.ts` reuses wire's Anthropic
+conversion (`anthropicContentBlocksOf`) and hands the SDK a one-message
+streaming input whose ordered image/document blocks the CLI receives verbatim
+(`claude-tool-session.ts`, `sdkPromptOf`). Only the ATTACHING turn is
+projected — prior turns stay in the lossy text transcript, so a re-sent history
+cannot double-attach — and anything the SDK's own `MessageParam` cannot
+represent (audio, an un-admitted image media type, a Files-API reference, new
+media arriving mid tool round) DECLINES explicitly rather than degrading to a
+sentence about an attachment the model never saw. **Native decline → manual
+fallback.** Anything the native
+path declines — text-path images, structured output, chatgpt tool-path
+attachments, chatgpt tools (until Codex
 activates), or ANY pre-commit failure — falls through to the MANUAL transport
 on the SAME hop (`claude_code` → Anthropic Messages with the OAuth bearer,
 `chatgpt` → Codex Responses), so no client workflow is blocked. Auth + refresh
@@ -599,6 +623,61 @@ registry/status adapter and boot reconciler. There is no legacy JSON
 The session PTY spawn remains deliberately outside the per-child sandbox: it
 runs the user's real vendor CLI against the user's real `$HOME`; only its
 standalone host owns lifecycle and transport fan-out.
+
+### Native PTY backend (Phase 2)
+
+Session PTYs no longer ride a Bun-native or worker shim — on POSIX the PTY is
+owned by the **native C shim in `packages/pty-native`** (`pty.c`), a
+header-free POSIX PTY implementation whose SOURCE TEXT is bundled into the
+compiled daemon binary (it is in `DAEMON_BINARY_SOURCES`) and compiled at
+runtime by `cc()` (`ffi.ts`) with one per-target define chosen by
+`cc-options.ts`: `PTY_DARWIN` (arm64/x64) or `PTY_LINUX` (x64/arm64, which
+branches its syscall/ioctl numbers internally on `__x86_64__`/`__aarch64__`).
+Any other target fails closed — unsupported in TS, `#error` in C. A successful
+compile alone does not qualify a target; it must also pass its runtime PTY
+qualification suite (the Phase-2 gate, see the root doc's release-matrix
+section).
+
+The shim is materialized in a `mkdtemp` directory under a dedicated cache
+root — the frozen Phase-3 interface is `OPENLLM_PTY_NATIVE_CACHE_DIR`
+(default `<tmpdir>/openllm-pty-native`, created `0700`). The loader never
+reads `OPENLLM_DAEMON_STATE_DIR`; setting the daemon state-dir override
+(even to its own `~/.openllm` default) cannot break PTY loading. The G4 gate
+still refuses a cache root inside `~/.openllm`, directly or via symlink.
+
+`native-pty.ts` wraps the FFI exports (`ptyCreate`/`ptySetEnv`/`ptySpawn`/
+resize/read/write/wait/kill) in the `TPtyLike` shape `session-core.ts`
+already consumes:
+
+- **Spawn** — `ptySpawn` forks the child onto the new session; a parent-side
+  setup failure after the fork still leaves an owner alive to kill, reap, and
+  destroy the PTY (no orphaned session leaders). Startup has a 12s deadline;
+  final drain gets 1s.
+- **Env** — the child env is the `pty-env.ts` allowlist (`workerEnv`, plus
+  `nativePtyEnv`'s `TERM=xterm-256color` and the `BS_SESSION` / `BS_SESSION_ID`
+  markers). Credentials, loader variables, and daemon state (`OPENLLM_API_KEY`
+  among them) are never inherited — the runtime-session vars a shell genuinely
+  needs (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`,
+  `OPENLLM_DAEMON_STATE_DIR`) are forwarded EXPLICITLY, never by wildcard.
+- **Signals** — signal numbers resolve from the HOST's own
+  `node:os.constants` table (Darwin and Linux differ; a hard-coded Linux table
+  is wrong). Group termination walks the child's process SESSION on Linux
+  (re-checking each member's birth identity before signaling, so a recycled
+  pid is never signalled) and escalates TERM → KILL after 1s. The shim returns
+  a stable lost-child sentinel (`PTY_ECHILD`-class) when `waitpid` finds the
+  child was reaped elsewhere.
+- **Backpressure** — reads use a 64KB buffer with a 1MB per-turn read budget
+  and EAGAIN/EINTR tolerance (poll-based readiness, 4ms tick); downstream,
+  `session-core.ts` bounds each consumer queue at
+  `CONSUMER_MAX_QUEUED_BYTES` (2MB) — a stalled viewer is dropped without
+  affecting the PTY or other consumers.
+
+On Windows the backend resolves to `conpty` and the spawner is the
+in-process route (Phase 3): `windows-pty.ts` → `native-pty.ts` → the pty-win.c
+ConPTY shim behind the frozen PTY_SYMBOLS ABI — no worker search, no
+`Bun.Terminal`. Capability reporting (`ptySupported`) keeps reporting Windows
+PTY unavailable (evidence literal `unavailable-until-phase3`) until the P3-3
+guest smoke re-opens it; non-PTY daemon startup is unaffected either way.
 
 ## Two localhost surfaces
 
@@ -1066,8 +1145,19 @@ auto-links its isolated run-view to whatever the user-run installer lands.
 ## Build + distribution
 
 `scripts/compile.ts` → `bun build --compile --minify --bytecode
---target=bun-<os>-<arch>` for darwin-{arm64,x64} + linux-{x64,arm64} (no
-Windows). Compile-time defaults are injected via `--define` GLOBALS
+--target=bun-<os>-<arch>` for the five release keys in
+`packages/daemon/release-types.ts` (`DAEMON_TARGETS`): darwin-arm64,
+darwin-x64-baseline, linux-x64-baseline, linux-arm64, and win32-x64
+(Windows ships as a ZIP package with PTY qualification
+`unavailable-until-phase3`, not a POSIX shim build). `DAEMON_BINARY_SOURCES`
+in the same file pins the compiled daemon's checked-in input closure —
+`src/`, `install.sh`, `release-types.ts`, `package.json`,
+`scripts/compile.ts`, plus the `protocol`, `tunnel`, `wire`, and
+`pty-native` packages — and the fingerprint derived from it is what release
+receipts and merge gates compare. The release/staging pipeline that consumes
+these targets (receipts, qualification proofs, staging-only aggregation) is
+described in the root [`ARCHITECTURE.md`](../../ARCHITECTURE.md) §5b.
+Compile-time defaults are injected via `--define` GLOBALS
 (`__OPENLLM_CLOUD_ORIGIN_DEFAULT__`, `__OPENLLM_DAEMON_VERSION__`) — those
 are NOT `process.env.*`, so the runtime env read still wins for cloud origin.
 `process.env.NODE_ENV` is the exception: Bun inlines it from the compile
@@ -1125,7 +1215,7 @@ The CLI surface is defined once in `src/commands.ts` (consumed by both
 [`daemon-self-managing-cli.md`](../../docs/proposals/daemon-self-managing-cli.md).
 
 **Local install without a release.** `scripts/dist.ts` (`bun run daemon:dist`)
-compiles all four targets and emits a self-contained installer per target —
+compiles the POSIX targets and emits a self-contained installer per target —
 the real `packages/setup/daemon/install.sh` embedded verbatim with the
 locally-built binary appended, so the produced `openllmd-<target>.install.sh`
 replicates the exact production install flow offline. `scripts/dist-install.ts`
