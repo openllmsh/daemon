@@ -915,17 +915,39 @@ read_env_value() {
 }
 
 write_env_file() {
+  # IMPORTANT — this function runs inside `$(...)` command substitution,
+  # where `set -e` DOES NOT APPLY: a failing command does not abort the
+  # subshell. EVERY fallible step below is therefore guarded explicitly with
+  # `|| die`. A half-written tmp must never reach the rename — a full disk
+  # otherwise drops the API key / device id while the installer exits 0.
+  #
   # The lock is the `<envfile>.lock.d` DIRECTORY of the shared
   # openllm-env-lock/v1 protocol above — the same protocol the daemon's
   # withEnvFileLock (packages/daemon/src/env.ts) and the CLI installer
   # implement, so a crashed holder is recovered (dead or reused pid owner,
-  # or a >10-min ownerless publish) instead of wedging every later install
-  # on "could not acquire config lock" — while a live holder's lock can
-  # never be stolen or deleted mid-write.
+  # or an ownerless publish past the orphan bound) instead of wedging every
+  # later install on "could not acquire config lock" — while a live
+  # holder's lock can never be stolen or deleted mid-write.
+  local current_key current_device current_pty desired_key desired_pty tmp line key
+  # An existing-but-unreadable env file would silently drop every preserved
+  # key — fail loudly instead of merging against an empty read. Checked BEFORE
+  # the lock: a die here must not strand a lock dir the EXIT trap isn't
+  # installed yet to release.
+  [ ! -f "$ENV_FILE" ] || [ -r "$ENV_FILE" ] \
+    || die "cannot read existing config file: $ENV_FILE"
   env_lock_acquire "$ENV_FILE" \
     || die "could not acquire config lock: $ENV_FILE.lock.d (remove it manually if no installer or daemon is running)"
+  # Any exit while the lock is held — die, a set -e failure, Ctrl-C, SIGTERM —
+  # must release the lock AND remove the temp file (it may carry the API key).
+  # A RETURN trap never fires on exit, so cleanup lives on EXIT/INT/TERM.
+  # env_lock_release deletes only a dir that still holds OUR owner record.
+  # `${tmp:-}`: at a normal function return the locals are already out of
+  # scope when this subshell's EXIT trap fires — an unbound $tmp under
+  # set -u would abort the trap before env_lock_release ran.
+  trap 'rm -f "${tmp:-}"; env_lock_release' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  local current_key current_device current_pty desired_key desired_pty tmp line key
   current_key="$(trim_whitespace "$(read_env_value OPENLLM_API_KEY || true)")"
   current_device="$(read_env_value OPENLLM_DEVICE_ID || true)"
   current_pty="$(read_env_value OPENLLM_DAEMON_PTY_SESSIONS || true)"
@@ -945,23 +967,13 @@ write_env_file() {
   esac
 
   tmp="$ENV_FILE.tmp.$$"
-  # Any exit while the lock is held — die, a set -e failure, Ctrl-C, SIGTERM —
-  # must release the lock AND remove the temp file (it may carry the API key).
-  # A RETURN trap never fires on exit, so cleanup lives on EXIT/INT/TERM.
-  # env_lock_release deletes only a dir that still holds OUR owner record.
-  # `${tmp:-}`: at a normal function return the locals are already out of
-  # scope when this subshell's EXIT trap fires — an unbound $tmp under
-  # set -u would abort the trap before env_lock_release ran.
-  trap 'rm -f "${tmp:-}"; env_lock_release' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
   # Tighten umask only for the temp-file creation window (closing the race
   # before `chmod 0600`), then restore it so later installer steps and child
   # processes keep the caller's umask.
   local saved_umask
-  saved_umask="$(umask)"
-  umask 077
-  : > "$tmp"
+  saved_umask="$(umask)" || die "could not read the umask"
+  umask 077 || die "could not tighten the umask"
+  : > "$tmp" || die "could not create temp config file: $tmp"
   # Keep unrelated lines byte-for-byte, but replace every installer-owned key with
   # one canonical occurrence. An ignored invalid persisted key is therefore removed.
   local wrote_origin=0 wrote_port=0 wrote_key=0 wrote_device=0 wrote_pty=0
@@ -970,39 +982,39 @@ write_env_file() {
       key="${line%%=*}"
       case "$key" in
         OPENLLM_CLOUD_ORIGIN)
-          [ "$wrote_origin" = 1 ] || { printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp"; wrote_origin=1; }
+          [ "$wrote_origin" = 1 ] || { printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp" || die "write failed: $tmp"; wrote_origin=1; }
           ;;
         OPENLLM_DAEMON_PORT)
-          [ "$wrote_port" = 1 ] || { printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp"; wrote_port=1; }
+          [ "$wrote_port" = 1 ] || { printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp" || die "write failed: $tmp"; wrote_port=1; }
           ;;
         OPENLLM_API_KEY)
-          if [ -n "$desired_key" ] && [ "$wrote_key" = 0 ]; then printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp"; wrote_key=1; fi
+          if [ -n "$desired_key" ] && [ "$wrote_key" = 0 ]; then printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp" || die "write failed: $tmp"; wrote_key=1; fi
           ;;
         OPENLLM_DEVICE_ID)
-          if [ -n "$current_device" ] && [ "$wrote_device" = 0 ]; then printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"; wrote_device=1; fi
+          if [ -n "$current_device" ] && [ "$wrote_device" = 0 ]; then printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp" || die "write failed: $tmp"; wrote_device=1; fi
           ;;
         OPENLLM_DAEMON_PTY_SESSIONS)
-          if [ -n "$desired_pty" ] && [ "$wrote_pty" = 0 ]; then printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"; wrote_pty=1; fi
+          if [ -n "$desired_pty" ] && [ "$wrote_pty" = 0 ]; then printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp" || die "write failed: $tmp"; wrote_pty=1; fi
           ;;
-        *) printf '%s\n' "$line" >> "$tmp" ;;
+        *) printf '%s\n' "$line" >> "$tmp" || die "write failed: $tmp" ;;
       esac
-    done < "$ENV_FILE"
+    done < "$ENV_FILE" || die "could not read config file: $ENV_FILE"
   fi
-  [ "$wrote_origin" = 1 ] || printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp"
-  [ "$wrote_port" = 1 ] || printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp"
-  [ -z "$desired_key" ] || [ "$wrote_key" = 1 ] || printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp"
-  [ -z "$current_device" ] || [ "$wrote_device" = 1 ] || printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"
-  [ -z "$desired_pty" ] || [ "$wrote_pty" = 1 ] || printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"
-  chmod 0600 "$tmp"
+  [ "$wrote_origin" = 1 ] || printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp" || die "write failed: $tmp"
+  [ "$wrote_port" = 1 ] || printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp" || die "write failed: $tmp"
+  [ -z "$desired_key" ] || [ "$wrote_key" = 1 ] || printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp" || die "write failed: $tmp"
+  [ -z "$current_device" ] || [ "$wrote_device" = 1 ] || printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp" || die "write failed: $tmp"
+  [ -z "$desired_pty" ] || [ "$wrote_pty" = 1 ] || printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp" || die "write failed: $tmp"
+  chmod 0600 "$tmp" || die "could not chmod temp config file: $tmp"
   # Abort with a clear error if the atomic replace fails — never fall through to
   # announce success (or set API_KEY) on a config that was not written. The
   # EXIT trap still cleans up the temp file + lock on that die.
   mv -f "$tmp" "$ENV_FILE" || die "could not write config file: $ENV_FILE"
-  chmod 0600 "$ENV_FILE"
-  umask "$saved_umask"
+  chmod 0600 "$ENV_FILE" || die "could not chmod config file: $ENV_FILE"
+  umask "$saved_umask" || die "could not restore the umask"
   env_lock_release
   # The ONLY stdout line: the resolved key — the caller captures it as API_KEY.
-  printf '%s' "$desired_key"
+  printf '%s' "$desired_key" || die "could not report the API key"
 }
 
 # The whole write runs inside command substitution: the EXIT/INT/TERM traps
@@ -1302,10 +1314,29 @@ fi' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
 if [ -n "$timeout_bin" ]; then
-  # GNU timeout runs the command as its own process-group leader and signals
-  # the GROUP — the `bash -c` wrapper AND the curl|bash pipeline it spawns —
-  # when the deadline hits.
-  "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url"
+  # GNU timeout setpgid's ITSELF as the group leader (the managed child's
+  # pgid IS the timeout pid — verified on GNU coreutils and gtimeout), and
+  # only manages its direct child: a TERM-ignoring (or orphaned) GRANDCHILD
+  # outlives the wrapper with no bound. Run it in the background so the
+  # group id is knowable ($!), but trust `-$twait` only once it PROVES to be
+  # a live group: a timeout that never became a leader (non-GNU, or a stub)
+  # leaves pgid empty — the sweep is then skipped and the EXIT trap keeps
+  # the pidfile (a group we cannot verify is never signalled or declared
+  # dead).
+  "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url" &
+  twait=$!
+  pgid=""
+  for _pgid_try in 1 2 3 4 5; do
+    if kill -0 -- -"$twait" 2>/dev/null; then pgid="$twait"; break; fi
+    kill -0 "$twait" 2>/dev/null || break
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  wait "$twait" 2>/dev/null || true
+  if [ -n "$pgid" ] && kill -0 -- -"$pgid" 2>/dev/null; then
+    kill -TERM -- -"$pgid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- -"$pgid" 2>/dev/null || true
+  fi
 elif [ -n "$setsid_bin" ]; then
   # setsid(1) starts the pipeline as its own session + process-group leader,
   # so the leader pid IS the pgid — `$!` after the pipeline would NOT be it.
@@ -1537,6 +1568,9 @@ OPENLLM_VENDOR_JOB
     # by the awk writer: the first bytes (which show why an install failed)
     # are kept, the rest dropped — a noisy or TERM-ignoring vendor job
     # cannot grow the log without bound (RG-1).
+    # The log writer's stdout AND stderr are redirected away from the
+    # caller: an inherited stderr would keep `ssh … | bash`, `| tee` and CI
+    # captures waiting on this detached process for the job's whole bound.
     env "${vendor_scrub[@]}" PATH="$run_path" \
       bash -c "$job_body" -- \
       "$pidfile" "$timeout_bin" "$job_timeout" "$curl_bin" "$url" "$setsid_bin" "$launchfile" \
@@ -1548,7 +1582,7 @@ OPENLLM_VENDOR_JOB
         next
       }
       { kept += length($0) + 1; print }
-    ' >>"$job_log" &
+    ' >>"$job_log" 2>/dev/null &
     VENDOR_JOBS_STARTED=$((VENDOR_JOBS_STARTED + 1))
   done
   # The shared skip-note log is append-only across runs — keep only its tail
