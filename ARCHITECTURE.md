@@ -103,12 +103,12 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 
 ```
 daemon/
-  release-types.ts         DAEMON_TARGETS (5 release keys) + DAEMON_BINARY_SOURCES build-input closure
-  scripts/compile.ts        bun build --compile --minify --bytecode (5 targets; NODE_ENV bake; pty-native C bundled)
+  release-types.ts         DAEMON_TARGETS (5 keys; 2.8.0 releases the 4 macOS/Linux keys) + DAEMON_BINARY_SOURCES build-input closure
+  scripts/compile.ts        bun build --compile --minify --bytecode (4 release targets in 2.8.0; NODE_ENV bake; src/pty-native C bundled)
   scripts/verify.ts         download each published binary → sha256 → assert == manifest.ts pin (bun run verify)
   scripts/dist.ts           compile + emit a self-contained installer per POSIX target (daemon:dist)
   scripts/dist-install.ts   run an emitted installer by target on this host (daemon:dist:install)
-  scripts/package-windows.ts  package the win32-x64 build (ZIP, receipt with ptyQualification "unavailable-until-phase3")
+  scripts/package-windows.ts  package a win32-x64 build (ZIP). Not used in 2.8.0: Windows releases start in 2.8.1
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
     cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
@@ -1145,15 +1145,15 @@ auto-links its isolated run-view to whatever the user-run installer lands.
 ## Build + distribution
 
 `scripts/compile.ts` → `bun build --compile --minify --bytecode
---target=bun-<os>-<arch>` for the five release keys in
-`packages/daemon/release-types.ts` (`DAEMON_TARGETS`): darwin-arm64,
-darwin-x64-baseline, linux-x64-baseline, linux-arm64, and win32-x64
-(Windows ships as a ZIP package with PTY qualification
-`unavailable-until-phase3`, not a POSIX shim build). `DAEMON_BINARY_SOURCES`
+--target=bun-<os>-<arch>` for the release keys in
+`packages/daemon/release-types.ts`. Version 2.8.0 releases 4 targets:
+darwin-arm64, darwin-x64-baseline, linux-x64-baseline and linux-arm64. The
+win32-x64 code stays in the tree, but 2.8.0 does not build it. Windows releases
+start in 2.8.1. `DAEMON_BINARY_SOURCES`
 in the same file pins the compiled daemon's checked-in input closure —
 `src/`, `install.sh`, `release-types.ts`, `package.json`,
-`scripts/compile.ts`, plus the `protocol`, `tunnel`, `wire`, and
-`pty-native` packages — and the fingerprint derived from it is what release
+`scripts/compile.ts`, plus the `protocol`, `tunnel` and `wire` packages. The
+PTY shim is in `src/pty-native`, so the `src/` entry covers it — and the fingerprint derived from it is what release
 receipts and merge gates compare. The release/staging pipeline that consumes
 these targets (receipts, qualification proofs, staging-only aggregation) is
 described in the root [`ARCHITECTURE.md`](../../ARCHITECTURE.md) §5b.
