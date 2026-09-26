@@ -12,9 +12,11 @@
  *
  * The daemon binds to 127.0.0.1. Caller-side gates still apply: the
  * request must target loopback, carry no untrusted `Origin` (a browser
- * always sends one on a cross-site POST), and use a JSON (or media
- * multipart) body — so a hostile web page's "simple request" can never
- * run billed inference or steer `?__origin=`/`?__plan=` (SP-1/NET-1).
+ * always sends one on a cross-site POST), use a JSON (or media
+ * multipart) body, and present a caller credential — the local caller
+ * token, the paired API key, or the signed `?__plan=` tuple itself on a
+ * cloud 307 — so a hostile web page's "simple request" can never run
+ * billed inference or steer `?__origin=`/`?__plan=` (SP-1/NET-1).
  */
 
 import type { TContextOverflowStrategy } from "@openllmsh/protocol";
@@ -122,6 +124,31 @@ const contextOverflowStrategyParam = (
 ): TContextOverflowStrategy | null =>
   raw === "compact_in_place" ? "compact_in_place" : null;
 
+/**
+ * The redirected caller's credential. The cloud 307s subscription `/v1/*`
+ * calls to this surface with the signed `?__plan=`/`?__sig=` tuple in the
+ * URL, and every mainstream client drops `Authorization` on the
+ * cross-origin hop to loopback — so the signed tuple is the only proof the
+ * caller can still present (FSS-01). It is verified by the SAME
+ * `planSignatureOk` the walker applies again below: a keyed daemon
+ * requires a real `__sig`, while a keyless/dev daemon accepts unsigned
+ * plans exactly as the walker does. A forged or tampered tuple fails
+ * closed — 401 here, 403 downstream.
+ */
+const signedPlanCallerCredential = (url: URL): boolean => {
+  const plan = url.searchParams.get("__plan");
+  if (plan === null) return false;
+  return planSignatureOk(
+    plan,
+    url.searchParams.get("__pmids"),
+    url.searchParams.get("__origin"),
+    contextOverflowStrategyParam(
+      url.searchParams.get("__context_overflow_strategy"),
+    ),
+    url.searchParams.get("__sig"),
+  );
+};
+
 export const handleInference = async (req: Request): Promise<Response> => {
   // CORS/PNA preflight — the dashboard fetches this surface cross-origin
   // (HTTPS page → http://127.0.0.1) for subscription models.
@@ -143,9 +170,14 @@ export const handleInference = async (req: Request): Promise<Response> => {
   // `/v1/*` call must present EITHER the per-boot local caller token
   // (`x-openllm-local-token`, `x-api-key`, or `Authorization: Bearer`) OR the
   // daemon's own API key as Bearer (vendor CLIs are launched with
-  // `OPENLLM_API_KEY` and already present it). Everything else is rejected
-  // before presence bookkeeping, plan lookup, or any billed upstream call.
-  if (!isLocalCallerAuthorized(req)) {
+  // `OPENLLM_API_KEY` and already present it) OR — on the cloud's
+  // same-machine 307 — a signed `?__plan=`/`?__sig=` tuple, the only
+  // credential a redirected Bearer client can still carry (its
+  // `Authorization` was dropped on the cross-origin hop by fetch itself).
+  // Everything else is rejected before presence bookkeeping, plan lookup,
+  // or any billed upstream call.
+  const url = new URL(req.url);
+  if (!isLocalCallerAuthorized(req) && !signedPlanCallerCredential(url)) {
     return withCors(
       req,
       errorJson(
@@ -164,7 +196,6 @@ export const handleInference = async (req: Request): Promise<Response> => {
   notePresenceActivity();
 
   const startedAt = Date.now();
-  const url = new URL(req.url);
   // Codex's own compaction endpoint rides the responses surface but is a
   // verbatim vendor passthrough (`runResponsesCompact`) — no surface
   // schema, no walk.
