@@ -132,6 +132,17 @@ export const guardCrashLoop = (): void => {
 };
 
 /**
+ * How long a boot must survive before it counts as healthy (RT-4): a
+ * self-updated binary can crash well past the listener bind — first
+ * bootstrap tick, control-channel bring-up, RTC init, first request. Clearing
+ * the boot history seconds after listen convicted nothing; hold the tally for
+ * a few minutes so a post-update crash loop still reaches the rollback path.
+ * Must stay comfortably inside {@link ROLLBACK_WINDOW_MS} minus the drain +
+ * relaunch slack so a crash at the boundary still attributes to the swap.
+ */
+export const HEALTHY_BOOT_AFTER_MS = 3 * 60_000;
+
+/**
  * Clears crash-loop history after the daemon reaches a confirmed healthy boot.
  * Keeps transient failures from converting into a sticky parked state.
  */
@@ -143,6 +154,20 @@ export const markHealthyBoot = (): void => {
     // best-effort + never throws
   }
 };
+
+/**
+ * Schedule {@link markHealthyBoot} after {@link HEALTHY_BOOT_AFTER_MS}. The
+ * scheduler is injectable so tests can observe the delay without waiting.
+ * Returns the scheduler's handle (a timer; callers may unref it).
+ */
+export const scheduleHealthyBootMark = (
+  schedule: (fn: () => void, delayMs: number) => unknown = (fn, delayMs) => {
+    const t = setTimeout(fn, delayMs);
+    // Never let this one-shot tally-clear hold a process open.
+    t.unref();
+    return t;
+  },
+): unknown => schedule(() => markHealthyBoot(), HEALTHY_BOOT_AFTER_MS);
 
 /**
  * RTC native-crash circuit breaker — the boot wiring around the pure
