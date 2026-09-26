@@ -83,6 +83,11 @@ const CLI_SWAP_DRAIN_WAIT_MS = 15_000;
 const DOWNLOAD_CONNECT_MS = 60_000;
 const DOWNLOAD_STALL_MS = 60_000;
 const DOWNLOAD_TOTAL_MS = 15 * 60_000;
+// Bound on `reader.cancel()` itself: a wedged stream can leave the cancel
+// promise unsettled forever, which would hang the updater despite the stall
+// bound. The fetch's AbortController is fired first so the socket dies even
+// when cancel never resolves.
+const DOWNLOAD_CANCEL_MS = 5_000;
 /**
  * Hard cap on a downloaded artifact (compressed AND decompressed). The real
  * binaries are ~40 MB gz / ~90 MB raw; 256 MiB leaves headroom while refusing
@@ -219,8 +224,14 @@ export const restorePreviousBinary = (
   try {
     if (!existsSync(prev)) return false;
     if (!(opts?.probe ?? probeRunnablePrev)(prev)) return false;
+    // FSS-18 ordering on the rollback path too: fix the staged copy's xattrs
+    // and fsync them BEFORE the rename, then fsync the directory AFTER it so
+    // the restored dirent is crash-durable. No mutation may follow the dir
+    // fsync.
+    hardenMacBinary(prev);
+    fsyncFileSync(prev);
     renameSync(prev, dest); // prev already carries the original binary's mode
-    hardenMacBinary(dest);
+    fsyncDirBestEffort(dirname(dest));
     return true;
   } catch {
     return false;
@@ -462,10 +473,43 @@ export const probeBinaryVerdict = async (
   }
 };
 
-/** Per-download bounds: stall = no bytes for this long; total = hard cap. */
+/**
+ * Per-download bounds: stall = no bytes for this long; total = hard cap.
+ * `cancelMs` bounds the stream's own `cancel()` promise — a wedged
+ * implementation that never settles must not hang the updater past the
+ * stall/total verdict that fired.
+ */
 export type TDownloadBounds = {
   readonly stallMs?: number;
   readonly totalMs?: number;
+  readonly cancelMs?: number;
+};
+
+/**
+ * Await a stream teardown promise with its own bound (round-3 rework): a
+ * wedged reader can leave `cancel()` unsettled forever, which would hang the
+ * updater past the verdict that fired. After the bound we stop waiting —
+ * `abort` (the fetch's AbortController) has already killed the socket, so no
+ * updater state stays in flight.
+ */
+const teardownBounded = async (
+  pending: Promise<unknown> | undefined,
+  cancelMs: number,
+): Promise<void> => {
+  if (pending === undefined) return;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      pending.catch(() => {
+        // best-effort abort
+      }),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), cancelMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 };
 
 /**
@@ -483,18 +527,17 @@ const readBodyCapped = async (
   maxBytes: number,
   label: string,
   bounds?: TDownloadBounds,
+  abort?: () => void,
 ): Promise<Buffer> => {
   // Hash whatever arrives so an oversize rejection can still be keyed to the
   // exact bytes that failed (a corrected re-publish gets a different prefix
   // and is allowed through — the round-3 version+digest reject key).
   const keyHash = createHash("sha256");
+  const cancelMs = bounds?.cancelMs ?? DOWNLOAD_CANCEL_MS;
   const declared = Number(res.headers.get("content-length") ?? "");
   if (Number.isFinite(declared) && declared > maxBytes) {
-    try {
-      await res.body?.cancel();
-    } catch {
-      // best-effort abort
-    }
+    abort?.();
+    await teardownBounded(res.body?.cancel(), cancelMs);
     throw new DeterministicArtifactError(
       `${label} exceeds the ${maxBytes}-byte cap`,
     );
@@ -514,33 +557,24 @@ const readBodyCapped = async (
     try {
       const read = await Promise.race([reader.read(), stalled]);
       if (read === "stalled") {
-        try {
-          await reader.cancel();
-        } catch {
-          // best-effort abort
-        }
+        abort?.();
+        await teardownBounded(reader.cancel(), cancelMs);
         throw new Error(`${label} stalled — no bytes for ${stallMs}ms`);
       }
       if (read.done) break;
       total += read.value.byteLength;
       keyHash.update(read.value);
       if (total > maxBytes) {
-        try {
-          await reader.cancel();
-        } catch {
-          // best-effort abort
-        }
+        abort?.();
+        await teardownBounded(reader.cancel(), cancelMs);
         throw new DeterministicArtifactError(
           `${label} exceeds the ${maxBytes}-byte cap`,
           keyHash.digest("hex"),
         );
       }
       if (Date.now() > deadline) {
-        try {
-          await reader.cancel();
-        } catch {
-          // best-effort abort
-        }
+        abort?.();
+        await teardownBounded(reader.cancel(), cancelMs);
         throw new Error(`${label} exceeded its ${totalMs}ms total budget`);
       }
       chunks.push(read.value);
@@ -646,12 +680,28 @@ export const fetchBinary = async (
   maxBytes: number = MAX_BINARY_BYTES,
   bounds?: TDownloadBounds & { readonly connectMs?: number },
 ): Promise<Buffer> => {
-  const res = await fetch(url, {
-    redirect: "follow",
-    signal: AbortSignal.timeout(bounds?.connectMs ?? DOWNLOAD_CONNECT_MS),
-  });
+  // The AbortController bounds the connect AND survives into the body read:
+  // `readBodyCapped` fires it when a stall/total verdict must kill the socket
+  // even if the stream's own cancel never settles.
+  const ctrl = new AbortController();
+  const connectTimer = setTimeout(
+    () => ctrl.abort(),
+    bounds?.connectMs ?? DOWNLOAD_CONNECT_MS,
+  );
+  let res: Response;
+  try {
+    res = await fetch(url, { redirect: "follow", signal: ctrl.signal });
+  } finally {
+    clearTimeout(connectTimer);
+  }
   if (!res.ok) throw new Error(`binary download failed: ${res.status}`);
-  const buf = await readBodyCapped(res, maxBytes, "binary download", bounds);
+  const buf = await readBodyCapped(
+    res,
+    maxBytes,
+    "binary download",
+    bounds,
+    () => ctrl.abort(),
+  );
   // The published asset is gzipped (`openllmd-<target>.gz`); decompress when the
   // gzip magic bytes (0x1f 0x8b) are present, tolerating a raw binary too. The
   // sha256 is checked against the DECOMPRESSED bytes (what runs), so the gate is
@@ -677,13 +727,26 @@ export const fetchDigest = async (
   url: string,
   bounds?: TDownloadBounds & { readonly connectMs?: number },
 ): Promise<string> => {
-  const res = await fetch(url, {
-    redirect: "follow",
-    signal: AbortSignal.timeout(bounds?.connectMs ?? DOWNLOAD_CONNECT_MS),
-  });
+  const ctrl = new AbortController();
+  const connectTimer = setTimeout(
+    () => ctrl.abort(),
+    bounds?.connectMs ?? DOWNLOAD_CONNECT_MS,
+  );
+  let res: Response;
+  try {
+    res = await fetch(url, { redirect: "follow", signal: ctrl.signal });
+  } finally {
+    clearTimeout(connectTimer);
+  }
   if (!res.ok) throw new Error(`checksum download failed: ${res.status}`);
   const text = (
-    await readBodyCapped(res, DIGEST_MAX_BYTES, "checksum download", bounds)
+    await readBodyCapped(
+      res,
+      DIGEST_MAX_BYTES,
+      "checksum download",
+      bounds,
+      () => ctrl.abort(),
+    )
   )
     .toString("utf-8")
     .trim();
@@ -822,9 +885,26 @@ export const applyDaemonSelfUpdate = async (args: {
   readonly probeTimeoutMs?: number;
   /** Test seam: tighten the download stall/total/connect bounds. */
   readonly download?: TDownloadBounds & { readonly connectMs?: number };
+  /**
+   * Test seam: observe/override the durability steps (FSS-18). The required
+   * order is harden-staged → fsync file → probe → backup → rename → fsync
+   * dir; a test records the sequence and can make a step throw.
+   */
+  readonly hooks?: {
+    readonly fsyncFile?: (path: string) => void;
+    readonly fsyncDir?: (dir: string) => void;
+    readonly harden?: (path: string) => void;
+    readonly onWarn?: (message: string) => void;
+  };
 }): Promise<TSelfUpdateOutcome> => {
   const { dest, latest, target, origin } = args;
   const maxBytes = args.maxBytes ?? MAX_BINARY_BYTES;
+  const fsyncFile = args.hooks?.fsyncFile ?? fsyncFileSync;
+  const fsyncDir = args.hooks?.fsyncDir ?? fsyncFileSync;
+  const harden = args.hooks?.harden ?? hardenMacBinary;
+  const onWarn =
+    args.hooks?.onWarn ??
+    ((message: string) => logWarn("self-update", message));
   const verdictProbe =
     args.probeVerdict ??
     ((path: string, flag: "--version" | "--self-test") =>
@@ -906,9 +986,15 @@ export const applyDaemonSelfUpdate = async (args: {
     try {
       writeFileSync(tmp, bin, { mode: 0o755 });
       chmodSync(tmp, 0o755); // force mode regardless of umask
+      // Sign/dequarantine the STAGED bytes before the fsync AND before the
+      // probe: the probe must exec the file in its final state (unsigned
+      // arm64 binaries are SIGKILLed on spawn), and the fsync must make that
+      // SAME final state durable — hardening after the fsync would leave the
+      // xattr changes outside the durability point (FSS-18).
+      harden(tmp);
       // FSS-18: fsync the staged bytes BEFORE the rename — the swap is only
       // durable if the file's contents are on stable storage first.
-      fsyncFileSync(tmp);
+      fsyncFile(tmp);
     } catch (err) {
       recordAttempt("daemon", latest, { digest: expected });
       return {
@@ -917,9 +1003,6 @@ export const applyDaemonSelfUpdate = async (args: {
         detail: err instanceof Error ? err.message : String(err),
       };
     }
-    // Sign/dequarantine BEFORE the probe so the staged binary can exec on
-    // Apple Silicon (unsigned arm64 binaries are SIGKILLed on spawn).
-    hardenMacBinary(tmp);
     if (args.probeVersion !== undefined) {
       // Legacy contract (tests): a string is the probe output; null is a
       // completed run that produced no version banner — a deterministic
@@ -991,8 +1074,18 @@ export const applyDaemonSelfUpdate = async (args: {
     renameSync(tmp, dest); // atomic on POSIX; running process keeps old inode
     // FSS-18: fsync the directory so the rename's dirent survives a crash —
     // otherwise power loss could resurrect the old binary (or lose both).
-    fsyncDirBestEffort(dirname(dest));
-    hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
+    // This is the LAST filesystem step: no mutation may follow it. A dir
+    // fsync refusal does not un-swap the binary, but it must not be silent —
+    // the new install is not proven crash-durable.
+    try {
+      fsyncDir(dirname(dest));
+    } catch (err) {
+      onWarn(
+        `post-swap directory fsync failed — v${latest} is installed but not proven crash-durable: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     recordAttempt("daemon", latest, { digest: expected });
     return { kind: "updated" };
   } catch (err) {

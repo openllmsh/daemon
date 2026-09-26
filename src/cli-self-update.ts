@@ -61,7 +61,6 @@ import {
   DeterministicArtifactError,
   fetchBinary,
   fetchDigest,
-  fsyncDirBestEffort,
   fsyncFileSync,
   MAX_BINARY_BYTES,
   manualUpdateRemedy,
@@ -248,9 +247,25 @@ export const applyCliSelfUpdate = async (args: {
   readonly probeTimeoutMs?: number;
   /** Test seam: tighten the download stall/total/connect bounds (NR2-2). */
   readonly download?: TDownloadBounds & { readonly connectMs?: number };
+  /**
+   * Test seam: observe/override the durability steps (FSS-18). The required
+   * order is harden-staged → fsync file → probe → backup → rename → symlink
+   * → fsync dir; a test records the sequence and can make a step throw.
+   */
+  readonly hooks?: {
+    readonly fsyncFile?: (path: string) => void;
+    readonly fsyncDir?: (dir: string) => void;
+    readonly harden?: (path: string) => void;
+    readonly onWarn?: (message: string) => void;
+  };
 }): Promise<TSelfUpdateOutcome> => {
   const { dest, backupOf, latest, target, origin } = args;
   const maxBytes = args.maxBytes ?? MAX_BINARY_BYTES;
+  const fsyncFile = args.hooks?.fsyncFile ?? fsyncFileSync;
+  const fsyncDir = args.hooks?.fsyncDir ?? fsyncFileSync;
+  const harden = args.hooks?.harden ?? hardenMacBinary;
+  const onWarn =
+    args.hooks?.onWarn ?? ((message: string) => logWarn("cli-update", message));
   const verdictProbe =
     args.probeVerdict ??
     ((path: string, flag: "--version" | "--self-test") =>
@@ -329,8 +344,13 @@ export const applyCliSelfUpdate = async (args: {
     try {
       writeFileSync(tmp, bytes, { mode: 0o755 });
       chmodSync(tmp, 0o755); // force mode regardless of umask
+      // Sign/dequarantine the STAGED bytes before the fsync AND before the
+      // probe: the probe must exec the file in its final state, and the fsync
+      // must make that SAME final state durable — hardening after the fsync
+      // would leave the xattr changes outside the durability point (FSS-18).
+      harden(tmp);
       // FSS-18: fsync the staged bytes before the rename lands on `dest`.
-      fsyncFileSync(tmp);
+      fsyncFile(tmp);
     } catch (err) {
       recordAttempt("cli", latest, { digest: expected });
       return {
@@ -339,7 +359,6 @@ export const applyCliSelfUpdate = async (args: {
         detail: err instanceof Error ? err.message : String(err),
       };
     }
-    hardenMacBinary(tmp); // sign before the probe so arm64 can exec it
     // Cross-process swap lock: `openllm self-update` races this converger over
     // the same dest + `.prev`. The lock covers the DECISION too (UP-4): the
     // installed version is re-read inside it so a manual update that landed
@@ -365,6 +384,14 @@ export const applyCliSelfUpdate = async (args: {
           : null;
       if (anchor !== null) {
         const installedVerdict = await verdictProbe(anchor, "--version");
+        if (installedVerdict.kind === "inconclusive") {
+          // The probe never judged the installed file (timeout, drained
+          // child, transient spawn failure) — we cannot prove it is still
+          // the version this converge set out to replace. Overwriting on an
+          // UNPROVEN recheck could clobber a concurrent manual update with
+          // stale bytes, so yield the tick instead.
+          return { kind: "busy" };
+        }
         const installedNow =
           installedVerdict.kind === "ok"
             ? parseProductCliVersion(installedVerdict.out)
@@ -383,6 +410,9 @@ export const applyCliSelfUpdate = async (args: {
           // re-evaluates against the NEW binary.
           return { kind: "busy" };
         }
+        // installedNow === null can only remain after a `failed` verdict —
+        // the installed file provably cannot run, so overwriting it with a
+        // verified binary heals rather than clobbers a working update.
       }
       if (args.probeVersion !== undefined) {
         // Legacy contract (tests): null output = a completed probe with no
@@ -444,9 +474,6 @@ export const applyCliSelfUpdate = async (args: {
         };
       }
       renameSync(tmp, dest); // atomic on POSIX; a running CLI keeps its inode
-      // FSS-18: fsync the directory so the rename's dirent survives a crash.
-      fsyncDirBestEffort(dirname(dest));
-      hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
       if (args.legacySymlink !== undefined) {
         // Replace the old binary file with a transitional symlink so
         // absolute-path callers (old MCP entries, hooks) keep working.
@@ -456,6 +483,19 @@ export const applyCliSelfUpdate = async (args: {
         } catch {
           // best-effort — the new path is authoritative either way
         }
+      }
+      // FSS-18: fsync the directory so the rename's (and compat symlink's)
+      // dirents survive a crash. This is the LAST filesystem step — nothing
+      // may mutate the install dir after it. A refusal does not un-swap the
+      // binary, but it must not be silent.
+      try {
+        fsyncDir(dirname(dest));
+      } catch (err) {
+        onWarn(
+          `post-swap directory fsync failed — openllm CLI v${latest} is installed but not proven crash-durable: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
       recordAttempt("cli", latest, { digest: expected });
       return { kind: "updated" };
@@ -538,9 +578,12 @@ const convergeCli = async (
     // TMPDIR caches the same `null` a crashed binary produces. So: re-probe
     // ONCE with a long bound (a slow-but-healthy binary still proves itself),
     // then restore `.prev` ONLY when a recent attempt record names THIS
-    // artifact — a digest match at any age, or a fresh attempt for the
-    // version we would install. A probe that stays inconclusive NEVER heals
-    // and NEVER rejects: the bytes were not judged.
+    // artifact — a digest match, or an attempt for the version we would
+    // install — AND the attempt is RECENT: an attempt older than
+    // `CLI_HEAL_ATTEMPT_MAX_AGE_MS` cannot explain a binary found broken
+    // today (it ran fine in between, so today's failure has another cause).
+    // A probe that stays inconclusive NEVER heals and NEVER rejects: the
+    // bytes were not judged.
     const second = await probeBinaryVerdict(bin, "--version", {
       timeoutMs: CLI_HEAL_PROBE_TIMEOUT_MS,
     });
@@ -556,9 +599,17 @@ const convergeCli = async (
       let healed = false;
       if (!legacyOnly && provablyBroken && attempt !== undefined) {
         const binDigest = sha256File(bin);
+        // Round-3 rework: BOTH proofs are age-bounded. A digest match proves
+        // WHICH binary the attempt produced, but an attempt from days ago
+        // cannot explain a binary that only broke today — restoring `.prev`
+        // and rejecting on that evidence would downgrade a CLI the attempt
+        // did not break.
+        const attemptFresh =
+          Date.now() - attempt.ts <= CLI_HEAL_ATTEMPT_MAX_AGE_MS;
         // The attempt's recorded artifact digest matches the installed bytes
-        // → the attempt unambiguously describes this binary (any age).
+        // → the attempt unambiguously describes this binary.
         const artifactProven =
+          attemptFresh &&
           binDigest !== null &&
           attempt.digest !== undefined &&
           attempt.digest.length > 0 &&
@@ -566,9 +617,7 @@ const convergeCli = async (
         // Version-only fallback: the attempt is for the version we would
         // install AND is fresh enough to plausibly have produced the binary.
         const recentMatch =
-          binDigest !== null &&
-          attempt.version === latest &&
-          Date.now() - attempt.ts <= CLI_HEAL_ATTEMPT_MAX_AGE_MS;
+          attemptFresh && binDigest !== null && attempt.version === latest;
         if (binDigest !== null && (artifactProven || recentMatch)) {
           // Restore under the SAME swap lock the updater uses, and re-check
           // the digest inside it — a file swapped while we probed is not

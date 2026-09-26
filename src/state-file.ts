@@ -30,6 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { processStartIdentity } from "../../tunnel/session/local-runtime";
 import { stateDir } from "./env";
 
 /** Which converger recorded an update attempt. */
@@ -348,9 +349,16 @@ export const readState = (): TDaemonState => {
 // reachable from an `exit` hook. The CLI carries the mirror copy of this
 // block in `packages/cli/src/self-update.ts` — KEEP THE TWO IN SYNC.
 //
-// The critical section is milliseconds, so a holder whose lock dir predates
-// the reclaim bound is treated as wedged (its pid was reused or it holds a
-// lock acquired under a stepped clock) and stolen.
+// Steal policy (round-3 rework): a PROVEN-LIVE owner — live pid AND matching
+// recorded start identity — is NEVER stolen, however old the dir. A paused
+// holder keeps its lock; the alternative was forced steals that corrupted
+// read-modify-write cycles (lost boot history, rejects, device state). Only a
+// provably-gone owner (dead pid, or a reused pid whose live start identity no
+// longer matches the record) is stolen outright. An owner that can neither be
+// convicted nor proven live (no recorded start, inconclusive probe, or no
+// readable record at all) is UNPROVEN: still held, but reclaimed once the dir
+// has shown no complete owner for STATE_LOCK_RECLAIM_MS — a crash between
+// mkdir and publish can then never wedge every writer forever.
 const STATE_LOCK_DIR_NAME = "state.json.lock.d";
 const STATE_LOCK_OWNER_KIND = "openllm-state-lock/v1";
 const STATE_LOCK_OWNER_FILE = "owner.json";
@@ -361,6 +369,13 @@ const STATE_LOCK_RECLAIM_MS = 10 * 60_000;
 type TStateLockOwner = {
   readonly kind: string;
   readonly pid: number;
+  /**
+   * The owner's process-start identity (`processStartIdentity`). "" means the
+   * owner could not self-probe — liveness alone must not promote such a
+   * record to proven-live: a REUSED pid would otherwise inherit the dead
+   * owner's lock forever.
+   */
+  readonly start: string;
   readonly nonce: string;
 };
 
@@ -400,7 +415,12 @@ const readStateLockOwner = (dir: string): TStateLockOwner | null => {
       typeof parsed.nonce !== "string"
     )
       return null;
-    return { kind: parsed.kind, pid: parsed.pid, nonce: parsed.nonce };
+    return {
+      kind: parsed.kind,
+      pid: parsed.pid,
+      start: typeof parsed.start === "string" ? parsed.start : "",
+      nonce: parsed.nonce,
+    };
   } catch {
     return null;
   }
@@ -413,6 +433,51 @@ const stateLockAgeMs = (dir: string): number => {
   } catch {
     return 0;
   }
+};
+
+/**
+ * This process's start identity, cached — it cannot change. "" when the
+ * self-probe is unavailable: our record then stays UNPROVEN for readers
+ * (reclaimable by age) rather than unverifiable-forever.
+ */
+let ownStateLockStart: string | null = null;
+const myStateLockStart = (): string => {
+  if (ownStateLockStart !== null) return ownStateLockStart;
+  let start: string;
+  try {
+    start = processStartIdentity(process.pid) ?? "";
+  } catch {
+    start = "";
+  }
+  ownStateLockStart = start;
+  return start;
+};
+
+type TStateLockVerdict = "stale" | "proven-live" | "unproven";
+
+/**
+ * Three-way verdict for a recorded owner — mirrors `classifyOwner` in
+ * `packages/tunnel/update-lock.ts`:
+ *   - `proven-live` — the pid is alive AND its live start identity matches
+ *     the record. Never stolen, whatever the dir's age.
+ *   - `stale` — the pid is confirmed dead, or alive but a DIFFERENT process
+ *     (PID reuse: the live identity no longer matches the recorded start).
+ *   - `unproven` — live but unverifiable (empty recorded start, or an
+ *     inconclusive probe). Held; stealable only past the reclaim bound.
+ */
+const classifyStateLockOwner = (owner: TStateLockOwner): TStateLockVerdict => {
+  let start: string | null | undefined;
+  try {
+    start = processStartIdentity(owner.pid);
+  } catch {
+    start = undefined;
+  }
+  if (start === null) return "stale"; // confirmed dead
+  if (typeof start === "string" && start.length > 0) {
+    if (owner.start === "") return "unproven"; // live pid, nothing to compare
+    return start === owner.start ? "proven-live" : "stale"; // PID reuse
+  }
+  return stateLockPidAlive(owner.pid) ? "unproven" : "stale";
 };
 
 /**
@@ -495,10 +560,15 @@ export const acquireStateLock = (opts?: {
   const ours: TStateLockOwner = {
     kind: STATE_LOCK_OWNER_KIND,
     pid: process.pid,
+    start: myStateLockStart(),
     nonce: randomBytes(16).toString("hex"),
   };
   const lockDir = stateLockDir();
   const deadline = Date.now() + waitMs;
+  // Per-call verdict cache: a contested acquire polls every few ms, and one
+  // `ps` identity probe per pass would dominate the wait. An owner record is
+  // immutable per nonce, so one classify per record is enough.
+  const verdicts = new Map<string, TStateLockVerdict>();
   let swept = false;
   for (;;) {
     try {
@@ -510,9 +580,13 @@ export const acquireStateLock = (opts?: {
           JSON.stringify(ours),
         );
       } catch {
-        // best-effort — an unpublished owner is provable by pid liveness
+        // best-effort — an unpublished owner is unproven, still reclaimable
       }
       ourStateLockNonces.add(ours.nonce);
+      // Sweep stale quarantine dirs + dead-pid temps on EVERY clean acquire —
+      // otherwise they are only reaped on a contested acquire and residue
+      // grows without bound (round-3).
+      sweepStateLockResidue();
       return () => {
         ourStateLockNonces.delete(ours.nonce);
         // Move our lock aside FIRST, then verify the quarantined owner is
@@ -528,7 +602,7 @@ export const acquireStateLock = (opts?: {
           try {
             rmSync(quarantine, { recursive: true, force: true });
           } catch {
-            // best-effort — residue is reclaimed by age
+            // best-effort — residue is reclaimed by the sweeps
           }
         } else {
           try {
@@ -537,6 +611,7 @@ export const acquireStateLock = (opts?: {
             // best-effort
           }
         }
+        sweepStateLockResidue();
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
@@ -554,10 +629,29 @@ export const acquireStateLock = (opts?: {
       // prevented this; fail fast instead of deadlocking on ourselves.
       return null;
     }
+    let verdict: TStateLockVerdict;
+    if (owner === null) {
+      verdict = "unproven";
+    } else {
+      const cached = verdicts.get(owner.nonce);
+      if (cached !== undefined) {
+        verdict = cached;
+      } else {
+        verdict = classifyStateLockOwner(owner);
+        verdicts.set(owner.nonce, verdict);
+      }
+    }
+    // NEVER steal a live verified owner — a paused holder keeps its lock
+    // however long the pause. Steal only a provably-gone owner, or a dir that
+    // has shown no complete provable owner past the reclaim bound.
     const wedged = stateLockAgeMs(lockDir) >= STATE_LOCK_RECLAIM_MS;
-    const steal =
-      owner === null ? wedged : wedged || !stateLockPidAlive(owner.pid);
-    if (steal && stealStateLock(lockDir, owner)) continue;
+    if (
+      (verdict === "stale" || (verdict === "unproven" && wedged)) &&
+      stealStateLock(lockDir, owner)
+    ) {
+      verdicts.clear(); // the dir changed hands — old verdicts no longer apply
+      continue;
+    }
     if (Date.now() >= deadline) return null;
     stateLockSleep(STATE_LOCK_POLL_MS);
   }
