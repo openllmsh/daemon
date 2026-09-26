@@ -16,11 +16,12 @@ import { logWarn, safeDiagnosticMessage } from "./logger";
 import { mutateState, readState } from "./state-file";
 
 /**
- * Hard upper bound on nonces retained for the ts window. Sized for a busy
- * multi-surface open rate (~30 grants/s × 120s window ≈ 3600) with headroom;
- * expiry pruning is the primary retention control. When the map is full of
- * still-valid nonces, new grants are rejected (`nonce_overload`) rather than
- * silently dropping replay protection.
+ * Hard upper bound on nonces retained for the ts window. Sized generously for
+ * a busy multi-surface open rate (real grant rates are far below 1/s, so even
+ * the widened 600 s window stays well under the cap); expiry pruning is the
+ * primary retention control. When the map is full of still-valid nonces, new
+ * grants are rejected (`nonce_overload`) rather than silently dropping replay
+ * protection.
  */
 let nonceLruCap = 4096;
 
@@ -212,6 +213,18 @@ export const checkDeviceGrant = (
   }
   const now = Date.now();
   if (Math.abs(now - envelope.ts) > DEVICE_GRANT_TS_WINDOW_MS) {
+    // Surface the measured skew: `stale_ts` rejections mean the viewer's clock
+    // differs from this host's by more than the grant window (TCB-5). The
+    // signed offset lands in the daemon log + doctor observations so support
+    // can see WHICH clock is off and by how much.
+    logWarn(
+      "device-access",
+      safeDiagnosticMessage`device grant rejected: stale_ts (signer/verifier clock skew beyond the grant window)`,
+      {
+        skew_ms: now - envelope.ts,
+        window_ms: DEVICE_GRANT_TS_WINDOW_MS,
+      },
+    );
     return { ok: false, reason: "stale_ts" };
   }
   if (envelope.key_id !== expect.keyId) {
