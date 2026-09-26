@@ -45,6 +45,8 @@ import {
   pendingAuthWire,
 } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { fetchWithBoundedRedirects } from "../upstream-redirect";
+import { USAGE_FETCH_TIMEOUT_MS } from "../usage-cache";
 import { accountHash, nonEmpty } from "./account-id";
 import {
   resolveIdentityHeaders,
@@ -157,13 +159,16 @@ const readClaudePlan = async (
   headers: Readonly<Record<string, string>>,
 ): Promise<string | null> => {
   try {
-    const response = await fetch(
+    const response = await fetchWithBoundedRedirects(
       await resolveProviderUrl(PROVIDER, PROFILE_PATH),
-      {
-        method: "GET",
-        headers,
-        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-      },
+      (target) =>
+        fetch(target, {
+          method: "GET",
+          headers,
+          redirect: "manual",
+          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+        }),
+      "claude-code",
     );
     if (!response.ok) return null;
     const profile = (await response.json()) as TClaudeProfile;
@@ -1079,12 +1084,18 @@ export const claudeCodeDelegate: TProviderDelegate = {
           "anthropic-beta": OAUTH_BETA,
           accept: "application/json",
         };
-        const resp = await fetch(
+        const resp = await fetchWithBoundedRedirects(
           await resolveProviderUrl(PROVIDER, USAGE_PATH),
-          {
-            method: "GET",
-            headers,
-          },
+          (target) =>
+            fetch(target, {
+              method: "GET",
+              headers,
+              redirect: "manual",
+              // A half-open connection must not pin the shared in-flight
+              // usage read (NET-6) — see usage-cache.ts.
+              signal: AbortSignal.timeout(USAGE_FETCH_TIMEOUT_MS),
+            }),
+          "claude-code",
         );
         if (!resp.ok) {
           const reason =

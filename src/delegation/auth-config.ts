@@ -38,6 +38,7 @@
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { superviseSpawn } from "../child-supervisor";
 import type { TCliProvider } from "../cli-paths";
 import { cliBin, cliEnv, cliRoot } from "../cli-paths";
@@ -46,6 +47,7 @@ import { logDebug, logInfo, logWarn } from "../logger";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { fetchWithBoundedRedirects } from "../upstream-redirect";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
 
 /** The persisted shape (all fields optional). */
@@ -118,7 +120,7 @@ const patchConfig = async (
  * matching inference request is captured. `argv` + `env` point the headless CLI
  * at the loopback recorder — see `docs/proposals/delegation-exec-fixtures.md` §2.
  */
-type TCaptureSpec = {
+export type TCaptureSpec = {
   readonly origin: string;
   readonly path: string;
   readonly match: (path: string) => boolean;
@@ -399,7 +401,9 @@ type TRecorder = {
  * identity headers (allowlist-only; see `IDENTITY_ALLOW`). URL-only captures
  * discard the header set.
  */
-const startRecorder = (spec: TCaptureSpec): TRecorder => {
+// Exported for the S3R-1 regression suite — the preamble forward is a
+// credential-bearing upstream call and must ride the bounded-redirect policy.
+export const startRecorder = (spec: TCaptureSpec): TRecorder => {
   let resolveFirst!: (v: TCapturedRequest) => void;
   let captured = false;
   const first = new Promise<TCapturedRequest>((resolve) => {
@@ -426,14 +430,26 @@ const startRecorder = (spec: TCaptureSpec): TRecorder => {
       try {
         const fwd = new Headers(req.headers);
         fwd.delete("host");
-        return await fetch(spec.origin + url.pathname + url.search, {
-          method: req.method,
-          headers: fwd,
-          body:
-            req.method === "GET" || req.method === "HEAD"
-              ? undefined
-              : await req.arrayBuffer(),
-        });
+        // The body is read once into an ArrayBuffer so the bounded-redirect
+        // helper can re-issue it verbatim on a method-preserving hop.
+        const body =
+          req.method === "GET" || req.method === "HEAD"
+            ? undefined
+            : await req.arrayBuffer();
+        // The forwarded request may carry the CLI's own auth headers — never
+        // auto-follow a vendor 30x to a different origin (S3R-1).
+        return await fetchWithBoundedRedirects(
+          spec.origin + url.pathname + url.search,
+          (target) =>
+            fetch(target, {
+              method: req.method,
+              headers: fwd,
+              body,
+              redirect: "manual",
+              signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+            }),
+          "auth-config",
+        );
       } catch {
         return new Response(null, { status: 502 });
       }
