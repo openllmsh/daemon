@@ -46,7 +46,10 @@
  * on every readiness probe and readiness fails closed while the path
  * cannot be proven private: a symlink at an expected path, a dir that is
  * not a dir, or a Keychains dir too large to scan completely all refuse
- * the chain.
+ * the chain. Repair chmods SPELLED paths only — a canonical target is
+ * never chmodded — and every managed dir is lstat'd before the first
+ * chmod, so a symlinked path component refuses the whole repair instead
+ * of redirecting a chmod onto an unproven foreign target.
  */
 import { randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
@@ -1117,30 +1120,48 @@ const canonicalPath = (path: string): string => {
 };
 
 /** Every directory that must be 0700 for the isolated chain to stay
- *  private: `home`, its `Library` children, and — only when `home` lives
- *  under the daemon state dir — the `cli/<provider>` chain and the state
- *  dir itself. A `home` outside the state dir repairs `home` and below
- *  only; foreign ancestors (`/tmp`, `/var`) are never touched. Canonical
- *  forms are listed too so a symlinked component still lands on the real
- *  target. */
-const protectedKeychainDirs = (home: string): string[] => {
-  const dirs = new Set<string>();
-  const canonHome = canonicalPath(home);
-  for (const base of new Set([home, canonHome])) {
-    dirs.add(base);
-    dirs.add(join(base, "Library"));
-    dirs.add(dirname(isolatedKeychainPath(base)));
-    dirs.add(dirname(domainPrefsPath(base)));
-  }
-  const stateRoot = canonicalPath(stateDir());
-  for (let cursor = dirname(canonHome); cursor !== dirname(cursor); ) {
-    if (cursor === stateRoot) {
+ *  private: `home`, its `Library` children, and — only when `home` is
+ *  spelled under the daemon state dir — every ancestor from
+ *  `dirname(home)` up to and including the state dir. A `home` outside the
+ *  state dir repairs `home` and below only; foreign ancestors (`/tmp`,
+ *  `/var`) are never touched.
+ *
+ *  Only SPELLED paths are returned — never canonical (`realpath`) forms.
+ *  A spelled managed dir that turns out to be a symlink is refused by the
+ *  repair pass, so a chmod can never land on an unproven resolved target.
+ *  Returns null when `home` reaches the state dir through a route the
+ *  spelled path does not show (a symlinked component above `home`): the
+ *  intended-path identity cannot be proven, so the caller must refuse
+ *  rather than pick chmod targets it cannot verify. */
+const protectedKeychainDirs = (home: string): string[] | null => {
+  const dirs = new Set<string>([
+    home,
+    join(home, "Library"),
+    dirname(isolatedKeychainPath(home)),
+    dirname(domainPrefsPath(home)),
+  ]);
+  const stateRoot = stateDir();
+  if (home.startsWith(`${stateRoot}/`)) {
+    // The spelled ancestors are the managed chain: each is lstat'd by the
+    // repair pass, so a link between the state dir and `home` refuses the
+    // repair instead of redirecting a chmod onto its target.
+    for (
+      let cursor = dirname(home);
+      cursor === stateRoot || cursor.startsWith(`${stateRoot}/`);
+      cursor = dirname(cursor)
+    ) {
       dirs.add(cursor);
-      break;
+      if (cursor === stateRoot) break;
     }
-    if (!cursor.startsWith(`${stateRoot}/`)) break;
-    dirs.add(cursor);
-    cursor = dirname(cursor);
+    return [...dirs];
+  }
+  // `home` is not spelled under the state dir. When its canonical form is
+  // still inside it, a link above `home` hides the real location — the
+  // spelled ancestors are not ours to verify, so refuse.
+  const canonHome = canonicalPath(home);
+  const canonState = canonicalPath(stateRoot);
+  if (canonHome === canonState || canonHome.startsWith(`${canonState}/`)) {
+    return null;
   }
   return [...dirs];
 };
@@ -1163,19 +1184,26 @@ const repairIsolatedKeychainPermissions = (home: string): boolean => {
   // The real user home is never a valid isolated keychain home. Refuse
   // before any chmod can touch it.
   if (canonicalPath(home) === canonicalPath(homedir())) return false;
+  const dirs = protectedKeychainDirs(home);
+  // `home` reaches the state dir only through a link the spelled path does
+  // not name — the managed set is unverifiable, so touch nothing.
+  if (dirs === null) {
+    warnKeychainOnce(
+      `perm-unsafe:${home}`,
+      "isolated keychain home reaches the state dir through a symlinked route; refusing to use the chain",
+      { keychain_home: home },
+    );
+    return false;
+  }
   let ok = true;
   let changed = 0;
-  // Expected paths that exist but are NOT dirs (a symlink, a stray file).
-  // A spelled path under one resolves through the foreign target — never
-  // chmod or scan through a rejected link.
-  const unsafePrefixes = new Set<string>();
-  const underUnsafePrefix = (path: string): boolean => {
-    for (const prefix of unsafePrefixes) {
-      if (path.startsWith(`${prefix}/`)) return true;
-    }
-    return false;
-  };
-  for (const dir of protectedKeychainDirs(home)) {
+  // Pass 1: lstat EVERY managed dir before the first chmod runs. A symlink
+  // at any managed path means every deeper spelled path resolves through an
+  // unproven foreign target, so one link refuses the whole repair — no dir,
+  // file, or sibling is chmodded at all.
+  const verifiedDirs: { readonly dir: string; readonly st: Stats }[] = [];
+  let linked = false;
+  for (const dir of dirs) {
     let st: Stats;
     try {
       st = lstatSync(dir);
@@ -1183,12 +1211,25 @@ const repairIsolatedKeychainPermissions = (home: string): boolean => {
       if (classifyStatError(err) !== "absent") ok = false;
       continue;
     }
+    if (st.isSymbolicLink()) {
+      linked = true;
+      continue;
+    }
     if (!st.isDirectory()) {
-      unsafePrefixes.add(dir);
       ok = false;
       continue;
     }
-    if (underUnsafePrefix(dir)) continue;
+    verifiedDirs.push({ dir, st });
+  }
+  if (linked) {
+    warnKeychainOnce(
+      `perm-unsafe:${home}`,
+      "isolated keychain path contains a symlinked directory; refusing to use the chain",
+      { keychain_home: home },
+    );
+    return false;
+  }
+  for (const { dir, st } of verifiedDirs) {
     const permBits = st.mode & KEYCHAIN_PERM_MASK;
     // Sticky AND open to group/other is shared space (like `/tmp`): never
     // chmod a dir that is not ours, never let the chain live there.
@@ -1215,7 +1256,6 @@ const repairIsolatedKeychainPermissions = (home: string): boolean => {
     legacyLoginKeychainPath(home),
     domainPrefsPath(home),
   ]) {
-    if (underUnsafePrefix(file)) continue;
     let st: Stats;
     try {
       st = lstatSync(file);
@@ -1235,17 +1275,17 @@ const repairIsolatedKeychainPermissions = (home: string): boolean => {
       ok = false;
     }
   }
-  const keychainsDir = dirname(isolatedKeychainPath(canonicalPath(home)));
+  const keychainsDir = dirname(isolatedKeychainPath(home));
   let dirSt: Stats | null = null;
   try {
     dirSt = lstatSync(keychainsDir);
   } catch (err) {
     if (classifyStatError(err) !== "absent") ok = false;
   }
-  // Scan siblings only when the Keychains dir is a real dir that no
-  // rejected symlink fronts — otherwise the scan (and its chmods) would run
-  // on a foreign target the dir loop already refused.
-  if (dirSt?.isDirectory() && !underUnsafePrefix(keychainsDir)) {
+  // Scan siblings only when the Keychains dir is a real dir — pass 1 proved
+  // every managed path above it link-free, so the spelled dir is the dir the
+  // daemon means.
+  if (dirSt?.isDirectory()) {
     try {
       const scan = boundedDirNames(keychainsDir);
       // A capped scan cannot prove every sibling private — an unprotected
@@ -1294,12 +1334,16 @@ const prepareStagingKeychain = async (
   dir: string,
   signal?: AbortSignal,
 ): Promise<TPreparedStaging | null> => {
+  // FSS-11: refuse to stage a chain on a path that is not private. The
+  // first check runs BEFORE mkdir so a refused path is never created
+  // through (e.g. onto the target of a symlinked component); the second
+  // re-proves the dirs mkdir just materialised.
+  if (!repairIsolatedKeychainPermissions(home)) return null;
   try {
     mkdirSync(dir, { recursive: true, mode: KEYCHAIN_DIR_MODE });
   } catch {
     return null;
   }
-  // FSS-11: refuse to stage a chain on a path that is not private.
   if (!repairIsolatedKeychainPermissions(home)) return null;
   sweepOwnedStaging(dir);
   const staging = ownedStagingPath(dir);
