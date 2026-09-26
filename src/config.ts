@@ -109,16 +109,9 @@ export const refreshBootstrap = (): Promise<boolean> =>
       // Pin the seed-gated device-access verifier when the cloud includes it.
       // Explicit null clears a previous pin (key un-provisioned / wiped).
       // Absent (older cloud) leaves the last-known pin alone so a rolling
-      // deploy cannot silently drop enforcement.
-      // PRIVATE-PLANE OVERRIDE: OPENLLM_DEVICE_ACCESS_PIN pins a local grant
-      // issuer (e.g. the private control plane) and wins over the cloud pin —
-      // applied after the bootstrap write so a cloud refresh cannot clobber it.
-      // Applied even when the bootstrap fetch itself fails (isolated plane).
-      // Empty string disables the override.
-      const pinOverride = process.env.OPENLLM_DEVICE_ACCESS_PIN?.trim();
-      if (pinOverride) {
-        setDeviceAccessPubkey(pinOverride);
-      } else if (snapshot.device_access_pubkey !== undefined) {
+      // deploy cannot silently drop enforcement. The cloud pin is the ONLY
+      // source — a local env override would ignore a cloud-side revocation.
+      if (snapshot.device_access_pubkey !== undefined) {
         setDeviceAccessPubkey(snapshot.device_access_pubkey);
       }
       // Best-effort: publish the durable X25519 pin on every successful
@@ -146,11 +139,6 @@ export const refreshBootstrap = (): Promise<boolean> =>
       if (err instanceof NoApiKeyError) cloudState = "no_key";
       else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
       else cloudState = "unreachable";
-      // PRIVATE-PLANE OVERRIDE: keep the env pin alive even when the plane has
-      // no bootstrap endpoint (isolated private plane) — the seed gate must not
-      // silently unprovision just because cloud bootstrap is unreachable.
-      const bootPin = process.env.OPENLLM_DEVICE_ACCESS_PIN?.trim();
-      if (bootPin) setDeviceAccessPubkey(bootPin);
     }
     return cloudState !== prev;
   });
