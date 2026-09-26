@@ -617,32 +617,52 @@ export const daemonTempDir = (home?: string): string => {
  * root). Absent CLIs contribute nothing (missing seeds skip).
  */
 
+/**
+ * True inside the `bun test` runner. `daemonWorkingSet()` builds grant lists
+ * for INSPECTION far more often than for enforcement — every test file,
+ * `openllmd` subcommand, the doctor — and the vendor-floor pre-creation below
+ * is its one side effect. Inside the test runner `homedir()` is the
+ * developer's real `$HOME`, so the mkdirs pollute it on every `bun test`
+ * (TH-4). `bun test` sets NODE_ENV=test AND runs each test file as `Bun.main`
+ * (`*.test.ts`, `*.e2e.ts`, `*.live.ts`); NODE_ENV alone cannot discriminate —
+ * a spawned `bun -e` child (the fresh-box probe in `daemon-sandbox.test.ts`,
+ * which must still materialize the dirs) inherits it, but its `Bun.main` is
+ * `[eval]`.
+ */
+const underBunTestRunner = (): boolean =>
+  process.env.NODE_ENV === "test" &&
+  /\.(?:test|spec|e2e|live)\.[cm]?[tj]sx?$/.test(Bun.main);
+
 export const vendorExecDirs = (home: string): string[] => {
   // Pre-create the vendor-CLI dirs the daemon EXECS through. REQUIRED on
   // Linux: Landlock can only grant an EXISTING path (`existing()` drops a
   // missing leaf rather than widening the grant to bare $HOME), so a fresh box
   // would leave these ungranted and every vendor spawn would EACCES. macOS
   // Seatbelt grants by pattern, so pre-creating is a harmless no-op there.
-  const floor = [
-    // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
-    // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch>. So
-    // EXEC reads through to downloads/, and BOTH need READ+EXEC. Pre-create
-    // both so the grants land on real leaves (NOT bare ~/.grok — the user's
-    // ~/.grok/auth.json must stay out of the working set).
-    join(home, ".grok", "bin"),
-    join(home, ".grok", "downloads"),
-    // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher and versioned binaries live
-    // under ~/.local, so grant only executable-bearing leaves, never ~/.cursor.
-    join(home, ".local", "bin"),
-    join(home, ".local", "share", "cursor-agent", "versions"),
-    join(home, ".local", "share", "claude"),
-  ];
-  for (const d of floor) {
-    try {
-      mkdirSync(d, { recursive: true });
-    } catch {
-      // best-effort — an ungranted leaf just means that vendor's install falls
-      // back / fails visibly, not a daemon-boot failure.
+  // Never inside a test runner — `home` is then the developer's real `$HOME`
+  // and the mkdirs pollute it on every `bun test` (TH-4).
+  if (!underBunTestRunner()) {
+    const floor = [
+      // grok (x.ai/cli): the daemon EXECS grok via ~/.grok/bin/grok, but that is
+      // only a SYMLINK — the real ELF lives at ~/.grok/downloads/grok-<arch>. So
+      // EXEC reads through to downloads/, and BOTH need READ+EXEC. Pre-create
+      // both so the grants land on real leaves (NOT bare ~/.grok — the user's
+      // ~/.grok/auth.json must stay out of the working set).
+      join(home, ".grok", "bin"),
+      join(home, ".grok", "downloads"),
+      // ⚠️ RESEARCH-UNVERIFIED: Cursor's launcher and versioned binaries live
+      // under ~/.local, so grant only executable-bearing leaves, never ~/.cursor.
+      join(home, ".local", "bin"),
+      join(home, ".local", "share", "cursor-agent", "versions"),
+      join(home, ".local", "share", "claude"),
+    ];
+    for (const d of floor) {
+      try {
+        mkdirSync(d, { recursive: true });
+      } catch {
+        // best-effort — an ungranted leaf just means that vendor's install falls
+        // back / fails visibly, not a daemon-boot failure.
+      }
     }
   }
   const dirs = new Set<string>([
@@ -669,6 +689,13 @@ export const vendorExecDirs = (home: string): string[] => {
     //                         under ~/.grok, left UNgranted).
     join(home, ".grok", "downloads"),
   ]);
+  // Emit only dirs that EXIST. A missing leaf is not just a dead grant — it
+  // makes `existing()` climb to a live ancestor: absent `~/.local/bin` on a box
+  // WITH `~/.local` would grant the whole `~/.local` tree. A vendor whose dir
+  // is missing is not installed, so there is nothing to exec anyway.
+  for (const d of dirs) {
+    if (!existsSync(d)) dirs.delete(d);
+  }
   // DYNAMIC exec-dir resolution — the robustness backstop for the hardcoded
   // floor above. For every provider, FOLLOW the symlink chain of its isolated
   // run-view (`cliBin`, seeded lazily by `cliInstallState`) AND its host
