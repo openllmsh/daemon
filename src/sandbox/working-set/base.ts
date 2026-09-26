@@ -67,12 +67,14 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../../cli-paths";
 import { stateDir } from "../../env";
 import { DAEMON_VERSION } from "../../version";
+import { nodeSpawnSync } from "../../windows-process";
 
 export type TWorkingSet = {
   /** Paths (recursive) the daemon and its children may read AND write. */
@@ -305,7 +307,22 @@ const DAEMON_TMP_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 /** Upper bound on nodes the per-entry newest-mtime walk may visit. */
 const DAEMON_TMP_SWEEP_MAX_NODES = 4096;
 
+/** Bounds on the live-owner probe: `/proc` pids scanned and per-pid fds. */
+const DAEMON_TMP_PROBE_MAX_PIDS = 4096;
+const DAEMON_TMP_PROBE_MAX_FDS = 1024;
+
 let lastTmpSweepAt = 0;
+
+/**
+ * First sweep at which each future-dated top-level entry was observed, keyed
+ * `dev:ino`. A future mtime (vendor-stamped file, clock rollback) must not
+ * grant immortality: the raw scan makes such an entry look fresh at every
+ * sweep, so its age bound runs from FIRST OBSERVED — the entry still keeps
+ * the full {@link DAEMON_TMP_MAX_AGE_MS} grace, then sweeps. Pruned to
+ * entries still present and still future-dated each round.
+ */
+const futureDatedFirstSeen = new Map<string, number>();
+const FUTURE_DATED_TRACK_MAX = 4096;
 
 /**
  * Newest mtime under `path`, following NO symlinks. A directory's own mtime
@@ -339,11 +356,166 @@ const newestMtimeUnder = (path: string, budget: { left: number }): number => {
   return newest;
 };
 
+/** Identity + staleness of one top-level `<tmp>` entry at scan time. */
+type TTmpEntryScan = {
+  readonly dev: number;
+  readonly ino: number;
+  /** Newest subtree mtime, unclamped — may be future-dated or a sentinel. */
+  readonly newest: number;
+};
+
+const scanTmpEntry = (path: string): TTmpEntryScan | null => {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return null;
+  }
+  return {
+    dev: st.dev,
+    ino: st.ino,
+    newest: newestMtimeUnder(path, { left: DAEMON_TMP_SWEEP_MAX_NODES }),
+  };
+};
+
+/**
+ * Stale check shared by the scan pass and the pre-delete re-verify. The
+ * sentinel newest values keep an entry: a raced-away stat or an over-budget
+ * walk is retried next round rather than deleted on a partial picture.
+ */
+const tmpEntryIsStale = (scan: TTmpEntryScan, now: number): boolean => {
+  if (scan.newest === Number.NEGATIVE_INFINITY) return false; // stat failed
+  if (scan.newest === Number.POSITIVE_INFINITY) return false; // budget hit
+  if (scan.newest > now) {
+    // Future-dated: the raw mtimes make it look fresh at EVERY sweep, so the
+    // bound runs from first observed instead of from the mtimes themselves.
+    const key = `${scan.dev}:${scan.ino}`;
+    let first = futureDatedFirstSeen.get(key);
+    if (first === undefined) {
+      first = now;
+      if (futureDatedFirstSeen.size < FUTURE_DATED_TRACK_MAX) {
+        futureDatedFirstSeen.set(key, now);
+      }
+    }
+    return now - first >= DAEMON_TMP_MAX_AGE_MS;
+  }
+  return now - scan.newest >= DAEMON_TMP_MAX_AGE_MS;
+};
+
+/**
+ * Names of `<tmp>` top-level entries a LIVE process still owns — an open fd
+ * or a cwd rooted inside the entry. Mtimes alone cannot see a live child that
+ * holds an old-but-open scratch file, and deletion underneath it breaks the
+ * session (rework finding). Linux reads `/proc` directly; macOS runs a
+ * bounded `lsof`; other platforms report "no owners" (parity with the
+ * pre-probe sweep — never worse). Returns null when ownership cannot be
+ * determined; the caller then removes NOTHING this round.
+ */
+const tmpEntriesInUse = (tmp: string): Set<string> | null => {
+  const owned = new Set<string>();
+  const prefix = `${tmp}/`;
+  const mark = (target: string): void => {
+    const real = target.endsWith(" (deleted)")
+      ? target.slice(0, -" (deleted)".length)
+      : target;
+    if (!real.startsWith(prefix)) return;
+    const top = real.slice(prefix.length).split("/")[0];
+    if (top !== undefined && top.length > 0) owned.add(top);
+  };
+  if (process.platform === "linux") {
+    let pids: string[];
+    try {
+      pids = readdirSync("/proc");
+    } catch {
+      return null;
+    }
+    const selfUid =
+      typeof process.getuid === "function" ? process.getuid() : -1;
+    let scanned = 0;
+    for (const pid of pids) {
+      if (!/^\d+$/.test(pid)) continue;
+      if (++scanned > DAEMON_TMP_PROBE_MAX_PIDS) return null;
+      // Skip pids we cannot inspect: foreign-uid (the kernel hides their fd
+      // table) and same-uid-but-undumpable processes (EACCES on their links).
+      // The daemon's confined children are ordinary same-uid processes —
+      // always fully readable — so skipping the uninspectable keeps the
+      // guarantee that matters (a live vendor child's open tmp file is seen)
+      // without letting one exotic process stall every sweep forever.
+      try {
+        if (statSync(join("/proc", pid)).uid !== selfUid) continue;
+      } catch {
+        continue; // exited between readdir and stat
+      }
+      let links: string[];
+      try {
+        links = [
+          readlinkSync(join("/proc", pid, "cwd")),
+          readlinkSync(join("/proc", pid, "root")),
+        ];
+      } catch {
+        continue; // exited, or fd table not inspectable — see the note above
+      }
+      for (const target of links) mark(target);
+      let fds: string[];
+      try {
+        fds = readdirSync(join("/proc", pid, "fd"));
+      } catch {
+        continue; // exited or uninspectable — same skip rule
+      }
+      if (fds.length > DAEMON_TMP_PROBE_MAX_FDS) continue; // runaway fd leak
+      for (const fd of fds) {
+        try {
+          mark(readlinkSync(join("/proc", pid, "fd", fd)));
+        } catch {
+          // the fd raced away — the process stays scannable via the rest
+        }
+      }
+    }
+    return owned;
+  }
+  if (process.platform === "darwin") {
+    try {
+      const out = nodeSpawnSync("lsof", ["-n", "-P", "-F", "n", "+D", tmp], {
+        encoding: "utf8",
+        timeout: 5000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (out.error !== undefined) return null;
+      if (out.status !== 0 && out.status !== 1) return null;
+      for (const line of (out.stdout ?? "").split("\n")) {
+        if (line.startsWith("n")) mark(line.slice(1));
+      }
+      return owned;
+    } catch {
+      return null;
+    }
+  }
+  return owned; // win32 etc.: no probe — staleness + re-verify still apply
+};
+
+/**
+ * TEST SEAM — runs on each stale candidate inside the scan→delete window, so
+ * a test can recreate/freshen the entry and prove the identity+staleness
+ * re-check drops it. Never set in production.
+ */
+let preRemoveHook: ((path: string) => void) | null = null;
+
+export const setDaemonTmpSweepPreRemoveHookForTests = (
+  fn: ((path: string) => void) | null,
+): void => {
+  preRemoveHook = fn;
+};
+
 /**
  * Remove entries of `<state>/tmp` whose whole subtree is older than
  * {@link DAEMON_TMP_MAX_AGE_MS}. Bounded + best-effort: never throws, never
  * follows symlinks, returns the number of top-level entries removed. Exported
  * for tests; the daemon reaches it via `daemonTempDir`'s hourly throttle.
+ *
+ * Two passes per round: scan for stale entries, then delete each only after
+ * (a) the live-owner probe clears it and (b) a re-scan confirms the same
+ * inode is still stale — so an entry a vendor child freshened, recreated, or
+ * is still holding during the scan→delete window is never removed.
  */
 export const sweepDaemonTempDir = (
   home?: string,
@@ -356,13 +528,37 @@ export const sweepDaemonTempDir = (
   } catch {
     return 0;
   }
-  let removed = 0;
+  const stale: { name: string; scan: TTmpEntryScan }[] = [];
+  const futureSeenKeys = new Set<string>();
   for (const name of entries) {
+    const scan = scanTmpEntry(join(tmp, name));
+    if (scan === null) continue;
+    if (scan.newest > now && scan.newest !== Number.POSITIVE_INFINITY) {
+      futureSeenKeys.add(`${scan.dev}:${scan.ino}`);
+    }
+    if (tmpEntryIsStale(scan, now)) stale.push({ name, scan });
+  }
+  // Drop ledger keys whose entry is gone or no longer future-dated.
+  for (const key of [...futureDatedFirstSeen.keys()]) {
+    if (!futureSeenKeys.has(key)) futureDatedFirstSeen.delete(key);
+  }
+  if (stale.length === 0) return 0;
+  const inUse = tmpEntriesInUse(tmp);
+  if (inUse === null) return 0; // ownership undecidable — keep everything
+  let removed = 0;
+  for (const { name, scan } of stale) {
+    if (inUse.has(name)) continue; // a live child owns this entry
     const path = join(tmp, name);
-    const newest = newestMtimeUnder(path, { left: DAEMON_TMP_SWEEP_MAX_NODES });
-    if (newest === Number.NEGATIVE_INFINITY) continue; // stat failed
-    if (newest === Number.POSITIVE_INFINITY) continue; // walk budget exceeded
-    if (now - newest < DAEMON_TMP_MAX_AGE_MS) continue; // still fresh
+    preRemoveHook?.(path);
+    const recheck = scanTmpEntry(path);
+    if (
+      recheck === null ||
+      recheck.dev !== scan.dev ||
+      recheck.ino !== scan.ino ||
+      !tmpEntryIsStale(recheck, now)
+    ) {
+      continue; // vanished, recreated, or freshened inside the race window
+    }
     try {
       rmSync(path, { recursive: true, force: true });
       removed += 1;
@@ -389,9 +585,14 @@ export const daemonTempDir = (home?: string): string => {
   // Bounded hygiene: `daemonTempDir` is on the spawn path for every vendor CLI
   // and the working-set build, so a throttled call here is the "at daemon
   // start" sweep plus a periodic one for long-running daemons — no timer, no
-  // background task (RG-2).
+  // background task (RG-2). Never inside a `--sandbox-exec` shim: a confined
+  // child sweeping the SHARED `<state>/tmp` races every other live child —
+  // sweep duty is the parent's.
   const now = Date.now();
-  if (now - lastTmpSweepAt >= DAEMON_TMP_SWEEP_INTERVAL_MS) {
+  if (
+    !process.argv.includes("--sandbox-exec") &&
+    now - lastTmpSweepAt >= DAEMON_TMP_SWEEP_INTERVAL_MS
+  ) {
     lastTmpSweepAt = now;
     sweepDaemonTempDir(home, now);
   }
@@ -415,6 +616,7 @@ export const daemonTempDir = (home?: string): string => {
  * `resolveCliExecDirs` (existing dirs only, never $HOME/root/a bare sensitive
  * root). Absent CLIs contribute nothing (missing seeds skip).
  */
+
 export const vendorExecDirs = (home: string): string[] => {
   // Pre-create the vendor-CLI dirs the daemon EXECS through. REQUIRED on
   // Linux: Landlock can only grant an EXISTING path (`existing()` drops a
