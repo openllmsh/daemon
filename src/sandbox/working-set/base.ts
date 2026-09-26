@@ -63,8 +63,10 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -261,6 +263,90 @@ export const resolveCliExecDirs = (seed: string, home: string): string[] => {
 };
 
 /**
+ * Age past which an entry under `<state>/tmp` is swept. Vendor CLIs run with
+ * `TMPDIR` pointed there (`cli-paths.ts` `cliEnv`/`sessionEnv`), and nothing
+ * else cleans it — OS tmp cleaners (systemd-tmpfiles, the macOS periodic job)
+ * do not touch `~/.openllm` — so installer staging dirs, `cursor-agent` logs
+ * and claude scratch would accumulate forever (RG-2). 7 days matches the usual
+ * tmp-reaper cadence: anything a live child still uses is touched far sooner.
+ */
+export const DAEMON_TMP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The sweep runs at most this often per process — once an hour. */
+const DAEMON_TMP_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
+/** Upper bound on nodes the per-entry newest-mtime walk may visit. */
+const DAEMON_TMP_SWEEP_MAX_NODES = 4096;
+
+let lastTmpSweepAt = 0;
+
+/**
+ * Newest mtime under `path`, following NO symlinks. A directory's own mtime
+ * only tracks entries added/removed, not writes INSIDE them, so a dir whose
+ * leaf files are fresh stays live. Returns null when `path` cannot be statted,
+ * and `Infinity` when the walk exceeds the node budget — an oversized tree is
+ * kept rather than risk deleting data a live child is writing.
+ */
+const newestMtimeUnder = (path: string, budget: { left: number }): number => {
+  if (budget.left <= 0) return Number.POSITIVE_INFINITY;
+  budget.left -= 1;
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return Number.NEGATIVE_INFINITY; // raced away — parent decides
+  }
+  if (!st.isDirectory() || st.isSymbolicLink()) return st.mtimeMs;
+  let newest = st.mtimeMs;
+  let children: string[];
+  try {
+    children = readdirSync(path);
+  } catch {
+    return newest;
+  }
+  for (const child of children) {
+    const t = newestMtimeUnder(join(path, child), budget);
+    if (t === Number.POSITIVE_INFINITY) return t;
+    if (t > newest) newest = t;
+  }
+  return newest;
+};
+
+/**
+ * Remove entries of `<state>/tmp` whose whole subtree is older than
+ * {@link DAEMON_TMP_MAX_AGE_MS}. Bounded + best-effort: never throws, never
+ * follows symlinks, returns the number of top-level entries removed. Exported
+ * for tests; the daemon reaches it via `daemonTempDir`'s hourly throttle.
+ */
+export const sweepDaemonTempDir = (
+  home?: string,
+  now: number = Date.now(),
+): number => {
+  const tmp = join(stateDir(home), "tmp");
+  let entries: string[];
+  try {
+    entries = readdirSync(tmp);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of entries) {
+    const path = join(tmp, name);
+    const newest = newestMtimeUnder(path, { left: DAEMON_TMP_SWEEP_MAX_NODES });
+    if (newest === Number.NEGATIVE_INFINITY) continue; // stat failed
+    if (newest === Number.POSITIVE_INFINITY) continue; // walk budget exceeded
+    if (now - newest < DAEMON_TMP_MAX_AGE_MS) continue; // still fresh
+    try {
+      rmSync(path, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // best-effort — a busy or permed entry is retried on the next sweep
+    }
+  }
+  return removed;
+};
+
+/**
  * Get the daemon's temp directory path (under the state dir). Creates it if
  * missing (mode 0o700). Returns the path even if creation fails — callers
  * can handle the failure as needed.
@@ -272,6 +358,15 @@ export const daemonTempDir = (home?: string): string => {
   } catch {
     // Creation failure is non-fatal — the sandbox will still apply, but
     // operations needing temp will fail. Callers can log/handle as needed.
+  }
+  // Bounded hygiene: `daemonTempDir` is on the spawn path for every vendor CLI
+  // and the working-set build, so a throttled call here is the "at daemon
+  // start" sweep plus a periodic one for long-running daemons — no timer, no
+  // background task (RG-2).
+  const now = Date.now();
+  if (now - lastTmpSweepAt >= DAEMON_TMP_SWEEP_INTERVAL_MS) {
+    lastTmpSweepAt = now;
+    sweepDaemonTempDir(home, now);
   }
   return daemonTmp;
 };

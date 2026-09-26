@@ -73,7 +73,9 @@ const DAEMON_STATE_ENTRIES: readonly string[] = [
   "x25519-priv", // the daemon's encryption private key
   "sessions", // remote PTY session state
   "debug", // debug artifacts
+  "tmp", // daemon-owned TMPDIR for spawned vendor CLIs (daemonTempDir)
   "openllmd.log",
+  "openllmd.dev.log", // dev-mode structured log (env.ts logFilePath)
   "openllmd.out.log",
   "openllmd.err.log",
 ];
