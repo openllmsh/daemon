@@ -7,7 +7,7 @@
  * off-box. These helpers feed the LOCAL runner + the local usage panel
  * only.
  */
-import { existsSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
@@ -36,7 +36,7 @@ import { currentTickId } from "../op-context";
 import { childEnvironment } from "../sandbox/child-policy";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
-import { spawn as admittedSpawn, nodeSpawnSync } from "../windows-process";
+import { spawn as admittedSpawn } from "../windows-process";
 import { redactSensitiveArgv } from "./redact-sensitive-argv";
 
 /**
@@ -1579,49 +1579,69 @@ export const browserOpenerEnv = (
 const randomUnitSuffix = (): string =>
   crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 
-/** `--expand-environment=` (which turns OFF `${VAR}`/`$VAR` expansion of the
- *  command's arguments) exists on systemd-run only since systemd v254. */
-const SYSTEMD_EXPAND_ENV_MIN = 254;
-
-let systemdRunMajorCache: number | null | undefined;
-
-/**
- * `systemd-run --version` major (e.g. `252`, `254`), or null when systemd-run
- * is absent or its banner is unparseable. Decides whether a `$`-bearing URL
- * can be passed with `--expand-environment=no`; treated as "old" when
- * undetermined (the safe direction — the URL is printed, not expanded into a
- * different target). Cached: the system version cannot change mid-run. A
- * minimal env + short timeout keep the probe secret-free and unwedgeable.
- */
-const systemdRunMajor = (): number | null => {
-  if (systemdRunMajorCache !== undefined) return systemdRunMajorCache;
-  let major: number | null = null;
-  try {
-    // PATH only — a version probe needs nothing else. Typed as ProcessEnv
-    // (Bun's type requires NODE_ENV) for spawnSync; the value is a string.
-    const probeEnv = {} as NodeJS.ProcessEnv;
-    probeEnv.PATH = process.env.PATH ?? "/usr/bin:/bin";
-    const res = nodeSpawnSync("systemd-run", ["--version"], {
-      encoding: "utf8",
-      timeout: 3_000,
-      env: probeEnv,
-    });
-    const match = /^systemd\s+(\d+)/m.exec(res.stdout ?? "");
-    const n = match !== null ? Number.parseInt(match[1] ?? "", 10) : NaN;
-    major = Number.isFinite(n) ? n : null;
-  } catch {
-    major = null;
-  }
-  systemdRunMajorCache = major;
-  return major;
-};
-
 export type TOpenerArgvDeps = {
-  /** `systemd-run --version` major (see {@link systemdRunMajor}); null when
-   *  undetermined, which is treated as pre-254. */
-  readonly systemdVersion?: number | null;
   /** Ambient env the transient service's `--setenv` list derives from. */
   readonly env?: Readonly<Record<string, string | undefined>>;
+  /** Path of the launcher script {@link writeOpenerScript} produced. The URL
+   *  rides in the script CONTENT (mode 0600 under the daemon's private tmp
+   *  dir), never in argv — `ps`, the transient unit's ExecStart and journald
+   *  would each keep a copy of an argv-carried URL (S4R-1). Required on
+   *  darwin/linux; without it no safe POSIX opener exists. */
+  readonly scriptPath?: string;
+};
+
+/**
+ * Quote `value` as a POSIX single-quoted shell word — embedded `'`, `$`,
+ * backticks and newlines all stay literal inside the quotes (the `'\''` idiom
+ * closes, re-opens and continues the quote). The sign-in URL therefore reaches
+ * the opener byte-for-byte while remaining in file content, not argv.
+ */
+const shSingleQuoted = (value: string): string =>
+  `'${value.replaceAll("'", "'\\''")}'`;
+
+/**
+ * Write the launcher script a POSIX browser-open runs so the URL never sits
+ * in process argv (S4R-1): `rm -f -- "$0"` deletes the script BEFORE `exec`
+ * hands off to the opener, so the sign-in URL persists neither in the
+ * transient unit's metadata / `ps` output nor as a leftover file. Written
+ * 0600 under `dir` — the daemon's private tmp root by default — so only the
+ * daemon's uid can read it for the brief window it exists. Returns the script
+ * path, or null when the write failed (the caller then logs the URL for a
+ * manual open).
+ */
+export const writeOpenerScript = (
+  opener: "open" | "xdg-open",
+  url: string,
+  dir: string = daemonTempDir(),
+): string | null => {
+  try {
+    const path = join(dir, `open-${randomUnitSuffix()}.sh`);
+    writeFileSync(
+      path,
+      `#!/bin/sh\nrm -f -- "$0"\nexec ${opener} ${shSingleQuoted(url)}\n`,
+      { mode: 0o600 },
+    );
+    return path;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Is a systemd USER manager reachable? `INVOCATION_ID` only proves the daemon
+ * itself is supervised — `systemd-run --user` can still fail asynchronously
+ * when no user manager instance is running (e.g. a system-scope service), so
+ * probing it is the actual gate (S4R-2). The manager's private control socket
+ * at `$XDG_RUNTIME_DIR/systemd/private` is exactly what `systemd-run --user`
+ * talks to: absent → the attempt is certainly doomed and the caller prints the
+ * URL instead; present → the manager is up. Pure check, no subprocess.
+ */
+export const systemdUserManagerPresent = (
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean => {
+  const xdg = env.XDG_RUNTIME_DIR;
+  if (typeof xdg !== "string" || xdg.length === 0) return false;
+  return existsSync(join(xdg, "systemd", "private"));
 };
 
 /**
@@ -1641,32 +1661,33 @@ export type TOpenerArgvDeps = {
  * start job. The service does NOT inherit our env, so the GUI-session
  * allowlist rides in explicit `--setenv` pairs (all non-secret).
  *
- * systemd-run expands `${VAR}`/`$VAR` in the command's arguments unless
- * `--expand-environment=no` is passed (systemd >= 254). On an older or
- * undetermined systemd a `$`-bearing URL could be rewritten into a different
- * target, so it is refused (the caller prints it for a manual open).
+ * The URL is never placed on the command line (S4R-1): `ps`, the transient
+ * unit's ExecStart, and journald would each keep a copy. POSIX openers instead
+ * run the 0600 launcher script written by {@link writeOpenerScript}
+ * (`deps.scriptPath`) — it self-deletes and then execs the real opener. Since
+ * no argv element carries the URL, systemd-run's `${VAR}` argument expansion
+ * has nothing to rewrite, on ANY systemd version.
  *
- * With no systemd manager (`INVOCATION_ID` unset — dev/`nohup` runs) there is
- * no out-of-unit launcher, so the caller prints the URL instead of spawning
+ * With no systemd USER manager (see {@link systemdUserManagerPresent}) there
+ * is no out-of-unit launcher, so the caller prints the URL instead of spawning
  * a doomed child. macOS `open` is already out-of-process (it hands the URL to
  * LaunchServices; the browser is never our child). Windows `start` is a `cmd`
  * builtin — the empty "" is the required window-title arg and quoting keeps
- * an OAuth `&` from splitting.
+ * an OAuth `&` from splitting. Windows has no POSIX-sh hand-off and ships no
+ * build in this release, so its argv keeps the URL.
  */
 export const openerArgv = (
   url: string,
   os: NodeJS.Platform = process.platform,
-  underSystemd: boolean = process.env.INVOCATION_ID !== undefined,
+  underSystemd: boolean,
   deps?: TOpenerArgvDeps,
 ): string[] | null => {
-  if (os === "darwin") return ["open", url];
   if (os === "win32") return ["cmd", "/c", "start", "", `"${url}"`];
-  if (os !== "linux" || !underSystemd) return null;
-  const noExpand =
-    deps?.systemdVersion !== null &&
-    deps?.systemdVersion !== undefined &&
-    deps.systemdVersion >= SYSTEMD_EXPAND_ENV_MIN;
-  if (!noExpand && url.includes("$")) return null;
+  if (os !== "darwin" && os !== "linux") return null;
+  if (os === "linux" && !underSystemd) return null;
+  const scriptPath = deps?.scriptPath;
+  if (scriptPath === undefined) return null;
+  if (os === "darwin") return ["/bin/sh", scriptPath];
   const openerEnv = browserOpenerEnv(deps?.env ?? process.env);
   return [
     "systemd-run",
@@ -1675,13 +1696,12 @@ export const openerArgv = (
     "--quiet",
     "--no-block",
     `--unit=openllm-open-${randomUnitSuffix()}`,
-    ...(noExpand ? ["--expand-environment=no"] : []),
     ...Object.entries(openerEnv).map(
       ([key, value]) => `--setenv=${key}=${value}`,
     ),
     "--",
-    "xdg-open",
-    url,
+    "/bin/sh",
+    scriptPath,
   ];
 };
 
@@ -1701,18 +1721,25 @@ export const openUrl = (url: string): void => {
   // otherwise pop a tab on the developer's machine. Production is unaffected.
   if (process.env.NODE_ENV === "test") return;
   const os = platform();
-  const underSystemd =
-    os === "linux" && process.env.INVOCATION_ID !== undefined;
-  const argv = openerArgv(url, os, underSystemd, {
-    // Only probe `systemd-run --version` when the systemd path is even
-    // reachable — pointless on macOS/Windows and with no user manager.
-    systemdVersion: underSystemd ? systemdRunMajor() : null,
+  // Probe the systemd USER MANAGER itself, not INVOCATION_ID (S4R-2): the var
+  // only proves we are supervised, while `systemd-run --user` fails
+  // asynchronously — silently, after this function returns — when no user
+  // manager is running. The socket check is the same endpoint systemd-run
+  // would dial, so it is the honest gate.
+  const userManager = os === "linux" && systemdUserManagerPresent(process.env);
+  // The URL rides in a self-deleting 0600 launcher script, never argv (S4R-1).
+  const scriptPath =
+    os === "darwin" || (os === "linux" && userManager)
+      ? writeOpenerScript(os === "darwin" ? "open" : "xdg-open", url)
+      : null;
+  const argv = openerArgv(url, os, userManager, {
     env: process.env,
+    ...(scriptPath !== null ? { scriptPath } : {}),
   });
   if (argv === null) {
-    // No safe launcher: no systemd manager, or a pre-254 systemd-run that
-    // would expand `$` in the URL — log the URL for a manual open rather
-    // than spawn a GUI browser as a daemon child.
+    // No safe launcher: no systemd user manager, or the script write failed —
+    // log the URL for a manual open rather than spawn a GUI browser as a
+    // daemon child.
     logInfo(
       "spawn",
       safeDiagnosticMessage`Browser auto-open is unavailable; open the sign-in URL manually.`,
@@ -1740,18 +1767,40 @@ export const openUrl = (url: string): void => {
           : browserOpenerEnv(process.env),
     });
     // A spawned-but-failed opener (systemd-run rejects, `open` exits nonzero)
-    // is otherwise invisible — surface it so the "no browser opened" report
-    // has a cause. Fire-and-forget: the card already shows the URL.
+    // is otherwise invisible — surface the manual-open fallback explicitly so
+    // the "no browser opened" report has a cause (S4R-2). Fire-and-forget: the
+    // card already shows the URL.
     void proc.exited.then((code) => {
       if (code !== 0) {
-        logWarn("spawn", "Browser opener exited non-zero", {
-          opener: argv[0],
-          code,
-          url,
-        });
+        // The unit never ran (or the launcher failed) — the script will not
+        // self-delete, so remove it here rather than leave the URL on disk.
+        if (scriptPath !== null) {
+          try {
+            rmSync(scriptPath, { force: true });
+          } catch {
+            // best-effort cleanup — the file sits in the daemon-private tmp
+          }
+        }
+        logWarn(
+          "spawn",
+          "Browser opener exited non-zero — open the sign-in URL manually",
+          { opener: argv[0], code, url },
+        );
       }
     });
   } catch {
-    // best-effort — the user can copy the URL from the card detail
+    if (scriptPath !== null) {
+      try {
+        rmSync(scriptPath, { force: true });
+      } catch {
+        // best-effort cleanup — the file sits in the daemon-private tmp
+      }
+    }
+    // best-effort — the user can copy the URL from the card detail; say so
+    logWarn(
+      "spawn",
+      "Browser opener failed to spawn — open the sign-in URL manually",
+      { url },
+    );
   }
 };
