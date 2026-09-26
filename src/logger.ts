@@ -144,18 +144,34 @@ let appendTail: Promise<void> = Promise.resolve();
  * resurrection left behind dirs holding only `openllmd.log`). `write` marks
  * the dir on every call that finds it present, so the witness covers the
  * dir even when no line was ever appended to it.
+ *
+ * Bounded: the set keeps at most {@link WITNESS_CAP} dirs (LRU — re-witnessing
+ * refreshes a dir's position, and past the cap the oldest entry is evicted).
+ * Repeated `OPENLLM_DAEMON_STATE_DIR` churn inside one process can no longer
+ * grow it without bound; the cap far exceeds any real churn, so a genuinely
+ * removed dir keeps its witness.
  */
+const WITNESS_CAP = 8;
 const appendDirs = new Set<string>();
+
+const witnessDir = (dir: string): void => {
+  appendDirs.delete(dir); // refresh: move to the back when already present
+  appendDirs.add(dir);
+  if (appendDirs.size > WITNESS_CAP) {
+    const oldest = appendDirs.values().next().value;
+    if (oldest !== undefined) appendDirs.delete(oldest);
+  }
+};
 
 const ensureLogDir = (dir: string): boolean => {
   if (existsSync(dir)) {
-    appendDirs.add(dir);
+    witnessDir(dir);
     return true;
   }
   if (appendDirs.has(dir)) return false;
   try {
     mkdirSync(dir, { recursive: true });
-    appendDirs.add(dir);
+    witnessDir(dir);
     return true;
   } catch {
     return false;
@@ -225,11 +241,10 @@ const write = (
 ): void => {
   // TH-6: the state dir was seen and then deleted — teardown beat this line.
   // Drop it entirely; both sinks (the diagnostics spool and the combined log)
-  // live under that dir and must not re-create it — `recordDoctorObservation`
-  // in particular mkdirs the state dir unconditionally, so the observation
-  // must be skipped too, not just the append.
+  // live under that dir and must not re-create it, so the observation is
+  // skipped too, not just the append.
   const dir = stateDir();
-  if (existsSync(dir)) appendDirs.add(dir);
+  if (existsSync(dir)) witnessDir(dir);
   else if (appendDirs.has(dir)) return;
   if (level === "info" || level === "warn" || level === "error") {
     try {
