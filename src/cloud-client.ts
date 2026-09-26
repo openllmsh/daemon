@@ -525,8 +525,16 @@ export const publishIdentity = async (pubkey: string): Promise<void> => {
 //                              not drop ledger rows)
 //   any other 4xx            → terminal reject: drop with a log line
 //   age ≥ 7 days             → drop with a counted warning
+//   stamp > now + 24 h       → anomalous: quarantined, counted, never
+//                              delivered (a clock that stepped back must
+//                              not re-date the row)
 //   row key ≠ current key    → hold: a row is billed only under the key
-//                              that recorded it — never another account
+//                              that recorded it — never another account.
+//                              A row with NO recorded key (pre-fingerprint
+//                              build, or recorded keyless) is unverifiable
+//                              and is held under EVERY key until it ages
+//                              out — "probably the same account" is not
+//                              proof enough to bill on.
 //
 // Retries reuse the row's existing `idempotency_key` — the cloud dedupes
 // on it, so a retried delivery can never double-count.
@@ -592,6 +600,15 @@ const USAGE_OUTBOX_TRIM_TARGET_BYTES = (USAGE_OUTBOX_MAX_BYTES * 3) / 4;
  *  attempt count — an attempt cap lets a long outage burn a row's whole
  *  retry budget in under two hours (RT-6). */
 const USAGE_DELIVERY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** How far `enqueuedAt` may sit in the FUTURE before the stamp is rejected
+ *  as anomalous. Every outbox writer shares the host wall clock, so any
+ *  future stamp means the clock stepped backward after the write — or the
+ *  stamp is corrupt. A small allowance absorbs ordinary backward steps
+ *  (the largest timezone/RTC-localtime flip is ±14 h); a stamp beyond it
+ *  can never prove its age, so the row is quarantined rather than trusted
+ *  — and the stamp is NEVER rewritten to the current time, which used to
+ *  let repeated backward steps renew a row's retention window forever. */
+const USAGE_DELIVERY_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
 /** 4xx statuses that do NOT drop a row: a rate limit, a key mid-rotation
  *  (401/403), a cloud deploy that briefly lacks the route (404) and a
  *  request timeout (408) are transient, so the row is kept like a 5xx.
@@ -621,11 +638,16 @@ type TUsageOutboxEntry = {
   /** Fingerprint of the API key that recorded the row. A row is only ever
    *  delivered under the SAME key, so a re-pair — or a co-tenant daemon
    *  draining a dead owner's segment — can never bill one account's usage
-   *  to another key (RT-5). `null` binds no key: the row was recorded
-   *  keyless, or written by a build that predates fingerprints. */
+   *  to another key (RT-5). `null` marks an UNVERIFIABLE row — recorded
+   *  keyless, or written by a build that predates fingerprints. There is
+   *  no matching key to prove, so it is held under every key until the
+   *  age cap expires it. */
   readonly keyFingerprint: string | null;
-  /** When the row entered the outbox (ms epoch, persisted). Bounds the
-   *  row's lifetime against `USAGE_DELIVERY_MAX_AGE_MS`. */
+  /** When the row entered the outbox (ms epoch). Persisted verbatim — the
+   *  durable age marker. It is never clamped or rewritten (a backward
+   *  clock step must not renew the retention window); a stamp beyond
+   *  `USAGE_DELIVERY_FUTURE_SKEW_MS` in the future is rejected as
+   *  anomalous at delivery time instead. */
   readonly enqueuedAt: number;
   /** Delivery attempts made (persisted each flush pass). Informational
    *  only — the lifetime bound is the age cap, not a count. */
@@ -795,23 +817,27 @@ const parseUsageOutboxLine = (
         typeof rec.origin === "string" && rec.origin.length > 0
           ? rec.origin
           : null,
-      // A missing/invalid fingerprint binds no key (rows written before
-      // fingerprints existed must still deliver to their owner — the key
-      // that recorded them is unknowable after the fact).
+      // A missing/invalid fingerprint marks the row UNVERIFIABLE: the key
+      // that recorded it is unknowable after the fact, so it is held under
+      // every key — never billed to whichever account happens to be paired
+      // when it drains (RT-5).
       keyFingerprint:
         typeof rec.keyFingerprint === "string" && rec.keyFingerprint.length > 0
           ? rec.keyFingerprint
           : null,
       // Rows written before `enqueuedAt` existed borrow the file's mtime:
-      // a row is at least as old as the last write of its segment. A
-      // future stamp is clamped so a wrong clock cannot make a row
-      // immortal.
+      // a row is at least as old as the last write of its segment. The
+      // stamp is kept VERBATIM — clamping a future stamp to Date.now()
+      // rewrote it on every pass, so each backward clock step reset the
+      // retention window and rows could be retained and retried past the
+      // age cap forever. Future-dated stamps are rejected at delivery
+      // time (see USAGE_DELIVERY_FUTURE_SKEW_MS), not here.
       enqueuedAt:
         typeof rec.enqueuedAt === "number" &&
         Number.isFinite(rec.enqueuedAt) &&
         rec.enqueuedAt > 0
-          ? Math.min(Math.floor(rec.enqueuedAt), Date.now())
-          : Math.min(fallbackEnqueuedAt, Date.now()),
+          ? Math.floor(rec.enqueuedAt)
+          : Math.floor(Math.max(0, fallbackEnqueuedAt)),
       attempts:
         typeof rec.attempts === "number" &&
         Number.isFinite(rec.attempts) &&
@@ -1403,13 +1429,14 @@ const deliverUsageOutboxEntry = async (
   // current key carries a DIFFERENT fingerprint — a re-pair, or a
   // co-tenant daemon draining a dead owner's segment — the row must never
   // be POSTed: that would bill one account's usage to another key (RT-5).
-  // The row is held for its own key until the age cap drops it. An unbound
-  // row (`null`) was recorded keyless or predates fingerprints, so it
-  // delivers under whatever key is current. A keyless check is skipped so
-  // the NoApiKeyError path below still reports `abort`.
+  // The row is held for its own key until the age cap drops it. A row
+  // with NO recorded fingerprint is unverifiable — it may belong to a
+  // different account entirely — so it is held under EVERY key, not
+  // delivered under whichever happens to be current. A keyless current
+  // check is skipped so the NoApiKeyError path below still reports
+  // `abort`.
   const currentFingerprint = usageKeyFingerprint(daemonEnv().apiKey);
   if (
-    entry.keyFingerprint !== null &&
     currentFingerprint !== null &&
     entry.keyFingerprint !== currentFingerprint
   ) {
@@ -1503,6 +1530,25 @@ const drainUsageSegment = async (
     if (now >= deadline) {
       stop = "deadline";
       remaining.push(row);
+      continue;
+    }
+    // A stamp further than the skew bound in the future cannot come from
+    // an honest clock — the wall clock is shared by every writer, so it
+    // means a backward step (or corruption) big enough that the row's true
+    // age is unknowable. It can never prove it is inside the retention
+    // window, so it is quarantined (recoverable by ops) and counted —
+    // never delivered on a stamp nobody can trust.
+    if (row.enqueuedAt - now > USAGE_DELIVERY_FUTURE_SKEW_MS) {
+      quarantineUsageOutboxLinesSync([serializeUsageOutboxEntry(row)]);
+      usageOutboxDropped += 1;
+      logWarn(
+        "usage-ledger",
+        "usage record quarantined with an impossible enqueue time",
+        {
+          dropped_total: usageOutboxDropped,
+          idempotency_key: row.row.idempotency_key ?? "",
+        },
+      );
       continue;
     }
     if (now - row.enqueuedAt > USAGE_DELIVERY_MAX_AGE_MS) {
