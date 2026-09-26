@@ -58,6 +58,69 @@ has_command() { command -v "$1" >/dev/null 2>&1; }
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+# --- arguments ---------------------------------------------------------------
+# Private-prerelease path (NR2-3): `--from-file <path>` supplies a LOCAL daemon
+# binary verified against the operator-provided `--sha256 <hex>` digest of
+# THAT file (e.g. `sha256sum openllmd-darwin-arm64`), and
+# `--cli-from-file`/`--cli-sha256` do the same for the CLI binary. When any of
+# these is given NOTHING is downloaded — no manifest, no .sha256, no binary
+# fetch — and components you did not supply are left untouched. All other
+# arguments are rejected so a typo can never silently change an install.
+FROM_FILE=""
+FROM_SHA=""
+CLI_FROM_FILE=""
+CLI_SHA=""
+usage() {
+  cat <<'USAGE'
+Usage: install.sh [options]
+  --from-file <path>     install the openllmd binary from a local file
+  --sha256 <hex>         sha256 digest of the --from-file file (required with it)
+  --cli-from-file <path> install the openllm CLI binary from a local file too
+  --cli-sha256 <hex>     sha256 digest of the --cli-from-file file (required with it)
+  -h, --help             show this text
+USAGE
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from-file)
+      FROM_FILE="${2:-}"
+      [ -n "$FROM_FILE" ] || die "--from-file needs a path"
+      shift 2
+      ;;
+    --from-file=*) FROM_FILE="${1#*=}"; shift ;;
+    --sha256)
+      FROM_SHA="${2:-}"
+      [ -n "$FROM_SHA" ] || die "--sha256 needs a hex digest"
+      shift 2
+      ;;
+    --sha256=*) FROM_SHA="${1#*=}"; shift ;;
+    --cli-from-file)
+      CLI_FROM_FILE="${2:-}"
+      [ -n "$CLI_FROM_FILE" ] || die "--cli-from-file needs a path"
+      shift 2
+      ;;
+    --cli-from-file=*) CLI_FROM_FILE="${1#*=}"; shift ;;
+    --cli-sha256)
+      CLI_SHA="${2:-}"
+      [ -n "$CLI_SHA" ] || die "--cli-sha256 needs a hex digest"
+      shift 2
+      ;;
+    --cli-sha256=*) CLI_SHA="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (supported: --from-file, --sha256, --cli-from-file, --cli-sha256)" ;;
+  esac
+done
+if [ -n "$FROM_FILE" ] || [ -n "$FROM_SHA" ]; then
+  [ -n "$FROM_FILE" ] && [ -n "$FROM_SHA" ] \
+    || die "--from-file and --sha256 must be given together"
+fi
+if [ -n "$CLI_FROM_FILE" ] || [ -n "$CLI_SHA" ]; then
+  [ -n "$CLI_FROM_FILE" ] && [ -n "$CLI_SHA" ] \
+    || die "--cli-from-file and --cli-sha256 must be given together"
+  [ -n "$FROM_FILE" ] \
+    || die "--cli-from-file requires --from-file (this installer must always install the daemon)"
+fi
+
 # Replacement policy: the version advertised by /api/install is the release of
 # record — an advertised PRERELEASE is installable, and a prerelease install may
 # move to a newer stable (or newer prerelease). The only refusal left is a
@@ -86,7 +149,7 @@ installed_version() {
   if [[ "$output" =~ (^|[^[:alnum:].+_-])v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?)([^[:alnum:].+-]|$) ]]; then
     version="${BASH_REMATCH[2]}"
   else
-    die "could not parse installed version at $binary; refusing to overwrite it"
+    die "could not parse a version from $binary; refusing to overwrite"
   fi
   INSTALLED_VERSION="$version"
 }
@@ -731,14 +794,16 @@ case "$(uname -m)" in
 esac
 TARGET="${OS}-${ARCH}"
 
-has_command curl || die "curl is required"
-# --proto/--proto-redir need a curl new enough to know the options (≈7.21):
-# an older system curl fails the FIRST fetch with an opaque option error, so
-# detect support once and fail with the upgrade remedy up front.
-curl "${CURL_SCHEME[@]}" -V >/dev/null 2>&1 \
-  || die "this curl does not support --proto/--proto-redir — upgrade to curl 7.21.0 or newer and re-run"
+if [ -z "$FROM_FILE" ]; then
+  has_command curl || die "curl is required"
+  # --proto/--proto-redir need a curl new enough to know the options (≈7.21):
+  # an older system curl fails the FIRST fetch with an opaque option error, so
+  # detect support once and fail with the upgrade remedy up front.
+  curl "${CURL_SCHEME[@]}" -V >/dev/null 2>&1 \
+    || die "this curl does not support --proto/--proto-redir — upgrade to curl 7.21.0 or newer and re-run"
+fi
 # Checksum verification is mandatory — refuse rather than install unverified
-# bytes.
+# bytes (this is ALSO the --from-file integrity gate).
 if ! has_command shasum && ! has_command sha256sum; then
   die "shasum or sha256sum is required to verify the download"
 fi
@@ -759,28 +824,32 @@ API_KEY=""
 # (allow-listed repo, well-formed digests, a published tag for this target) and
 # fails closed. Hitting it first means a mis-pinned or half-published release is
 # refused BEFORE we download anything. No query parameters.
-echo "Resolving the current OpenLLM release..."
-MANIFEST="$(curl "${CURL_SCHEME[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
-  || die "could not reach $ORIGIN/api/install — check OPENLLM_CLOUD_ORIGIN and your network"
+DAEMON_VERSION=""
+CLI_VERSION=""
+if [ -z "$FROM_FILE" ]; then
+  echo "Resolving the current OpenLLM release..."
+  MANIFEST="$(curl "${CURL_SCHEME[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
+    || die "could not reach $ORIGIN/api/install — check OPENLLM_CLOUD_ORIGIN and your network"
 
-# Extract one "key": "value" string field. The document is small, flat, and
-# machine-generated by us, so a scoped sed is enough — no jq dependency on a
-# fresh machine.
-json_field() {
-  printf '%s' "$MANIFEST" \
-    | tr -d '\n' \
-    | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
-}
+  # Extract one "key": "value" string field. The document is small, flat, and
+  # machine-generated by us, so a scoped sed is enough — no jq dependency on a
+  # fresh machine.
+  json_field() {
+    printf '%s' "$MANIFEST" \
+      | tr -d '\n' \
+      | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+  }
 
-DAEMON_VERSION="$(json_field daemon_version)"
-CLI_VERSION="$(json_field cli_version)"
-[ -n "$DAEMON_VERSION" ] || die "no daemon release is published yet"
-# Whatever /api/install advertises is the release of record — a PRERELEASE is
-# installable too (TCB-1/DR-1), and a prerelease install may move to a newer
-# stable. The only refusal is an actual DOWNGRADE of a managed component.
-refuse_downgrade "$BIN_DIR/openllmd" "$DAEMON_VERSION"
-refuse_downgrade "$BIN_DIR/openllm" "$CLI_VERSION"
-refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
+  DAEMON_VERSION="$(json_field daemon_version)"
+  CLI_VERSION="$(json_field cli_version)"
+  [ -n "$DAEMON_VERSION" ] || die "no daemon release is published yet"
+  # Whatever /api/install advertises is the release of record — a PRERELEASE is
+  # installable too (TCB-1/DR-1), and a prerelease install may move to a newer
+  # stable. The only refusal is an actual DOWNGRADE of a managed component.
+  refuse_downgrade "$BIN_DIR/openllmd" "$DAEMON_VERSION"
+  refuse_downgrade "$BIN_DIR/openllm" "$CLI_VERSION"
+  refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
+fi
 
 mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
 
@@ -790,17 +859,30 @@ mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
 # the same pair the daemon's own self-update verifies against.
 install_component() {
   local name="$1" route="$2" version="$3"
+  local local_file="${4:-}" local_sha="${5:-}"
   local dest="$BIN_DIR/$name"
   local url="$ORIGIN/$route/$TARGET"
   local published installed stamp="$BIN_DIR/.$name.sha256.stamp"
 
-  published="$(curl "${CURL_SCHEME[@]}" -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
-  case "$published" in
-    [0-9a-f]*)
-      [[ "$published" =~ ^[0-9a-f]{64}$ ]] || die "malformed checksum for $name"
-      ;;
-    *) die "no published checksum for $name ($TARGET) — nothing to install" ;;
-  esac
+  if [ -n "$local_file" ]; then
+    # Private-prerelease path: the OPERATOR supplies both the bytes and the
+    # digest — no network fetch of either. The checksum covers the file as
+    # handed to us (a gzipped asset is decompressed after verification,
+    # exactly like the download path).
+    published="$(printf '%s' "$local_sha" | tr '[:upper:]' '[:lower:]')"
+    [[ "$published" =~ ^[0-9a-f]{64}$ ]] \
+      || die "malformed --sha256 digest for $name (expected 64 hex chars)"
+    [ -f "$local_file" ] && [ -r "$local_file" ] \
+      || die "--from-file path is not a readable regular file: $local_file"
+  else
+    published="$(curl "${CURL_SCHEME[@]}" -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
+    case "$published" in
+      [0-9a-f]*)
+        [[ "$published" =~ ^[0-9a-f]{64}$ ]] || die "malformed checksum for $name"
+        ;;
+      *) die "no published checksum for $name ($TARGET) — nothing to install" ;;
+    esac
+  fi
 
   # Skip a tens-of-MB download when what's installed already matches.
   # Developer-ID-signed + notarized binaries keep their published digest on
@@ -825,7 +907,11 @@ install_component() {
     fi
   fi
 
-  echo "Downloading $name ${version:+$version }($TARGET)..."
+  if [ -n "$local_file" ]; then
+    echo "Installing $name from $local_file..."
+  else
+    echo "Downloading $name ${version:+$version }($TARGET)..."
+  fi
   # Stage inside $BIN_DIR: same filesystem as $dest (so the final mv is an
   # atomic rename, not a cross-device copy) and on the roomy root disk — minimal
   # cloud images mount a tiny RAM-backed /tmp where a download this size fails.
@@ -838,25 +924,37 @@ install_component() {
   # exit on EVERY path, including a die here).
   (
     trap 'rm -f "$dl" "$bin"' EXIT
-    if [ -t 2 ]; then
+    local actual
+    if [ -n "$local_file" ]; then
+      cp "$local_file" "$dl" || die "could not stage local binary: $local_file"
+      # The operator's digest covers the FILE as supplied — verify BEFORE any
+      # decompression so the gate is on exactly the bytes they checksummed.
+      actual="$(sha256_of "$dl")"
+      [ -n "$actual" ] || die "could not hash $local_file"
+      if [ "$actual" != "$published" ]; then
+        die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+      fi
+    elif [ -t 2 ]; then
       curl "${CURL_SCHEME[@]}" -fL --progress-bar "$url" -o "$dl" || die "download failed: $url"
     else
       curl "${CURL_SCHEME[@]}" -fsSL "$url" -o "$dl" || die "download failed: $url"
     fi
 
     # Assets are gzipped; the pinned digest is over the DECOMPRESSED binary, so
-    # the integrity gate is independent of gzip's non-determinism.
+    # the integrity gate is independent of gzip's non-determinism. A local
+    # digest was already checked over the supplied file bytes.
     if gzip -t "$dl" >/dev/null 2>&1; then
       gzip -dc "$dl" > "$bin" || die "could not decompress $name"
     else
       mv "$dl" "$bin"
     fi
 
-    local actual
-    actual="$(sha256_of "$bin")"
-    [ -n "$actual" ] || die "could not hash the downloaded $name"
-    if [ "$actual" != "$published" ]; then
-      die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+    if [ -z "$local_file" ]; then
+      actual="$(sha256_of "$bin")"
+      [ -n "$actual" ] || die "could not hash the downloaded $name"
+      if [ "$actual" != "$published" ]; then
+        die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+      fi
     fi
 
     chmod 0755 "$bin"
@@ -876,12 +974,20 @@ install_component() {
     fi
     # Re-probe immediately before replacement in case another installer or
     # operator changed the destination during the download — still only refusing
-    # a true downgrade (a newer installed build over the advertised one).
-    if installed_version "$dest"; then
+    # a true downgrade (a newer installed build over the advertised one). For a
+    # local file there is no advertised release: the staged binary's own
+    # reported version is the reference, so an older build still can't silently
+    # overwrite a newer install.
+    local check_version="$version"
+    if [ -n "$local_file" ]; then
+      installed_version "$bin"
+      check_version="$INSTALLED_VERSION"
+    fi
+    if [ -n "$check_version" ] && installed_version "$dest"; then
       installed="$INSTALLED_VERSION"
-      [ "$(semver_cmp "$installed" "$version")" != "1" ] \
-        || die "installed $name is $installed, newer than the advertised release $version — refusing to downgrade.
-  To force the advertised version, remove $dest and re-run this installer."
+      [ "$(semver_cmp "$installed" "$check_version")" != "1" ] \
+        || die "installed $name is $installed, newer than the install target $check_version — refusing to downgrade.
+  To force this version, remove $dest and re-run this installer."
     fi
     mv -f "$bin" "$dest"
   ) || exit 1
@@ -889,13 +995,17 @@ install_component() {
   INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
 }
 
-install_component openllmd api/daemon/binary "$DAEMON_VERSION"
+install_component openllmd api/daemon/binary "$DAEMON_VERSION" "$FROM_FILE" "$FROM_SHA"
 # The CLI rides the same install: one command gets you both, and the daemon's
 # auto-update loop keeps them both current from here on.
-if [ -n "$CLI_VERSION" ]; then
+if [ -n "$CLI_FROM_FILE" ]; then
+  install_component openllm api/cli/binary "$CLI_VERSION" "$CLI_FROM_FILE" "$CLI_SHA"
+elif [ -n "$CLI_VERSION" ]; then
   install_component openllm api/cli/binary "$CLI_VERSION"
-else
+elif [ -z "$FROM_FILE" ]; then
   echo "  note: no CLI release published yet — skipping openllm"
+else
+  echo "  note: no --cli-from-file given — leaving any installed CLI untouched"
 fi
 
 # The native PTY backend is compiled into the daemon binary in v2.8 (G1), so
