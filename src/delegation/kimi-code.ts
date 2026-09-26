@@ -30,12 +30,24 @@
  *     `X-Msh-Device-Id`.
  *   - Usage: GET https://api.kimi.com/coding/v1/usages.
  */
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
-import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
+import {
+  MODEL_LIST_FETCH_TIMEOUT_MS,
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
@@ -45,6 +57,8 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { fetchWithBoundedRedirects } from "../upstream-redirect";
+import { USAGE_FETCH_TIMEOUT_MS } from "../usage-cache";
 import { accountHashField, jwtClaims, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
@@ -152,13 +166,21 @@ const provisionModelConfig = async (
   base: string,
 ): Promise<boolean> => {
   try {
-    const resp = await fetch(`${base}/models`, {
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        ...(await identityHeaders()),
-        accept: "application/json",
-      },
-    });
+    const identity = await identityHeaders();
+    const resp = await fetchWithBoundedRedirects(
+      `${base}/models`,
+      (target) =>
+        fetch(target, {
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            ...identity,
+            accept: "application/json",
+          },
+          redirect: "manual",
+          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+        }),
+      "kimi-code",
+    );
     if (!resp.ok) return false;
     const body = (await resp.json()) as {
       data?: ReadonlyArray<Record<string, unknown>>;
@@ -233,6 +255,41 @@ const ensureModelConfig = async (accessToken: string): Promise<void> => {
   return provisionInFlight;
 };
 
+// Every `kimi -p` run — the refresh ping AND the auth-config capture — leaves a
+// `sessions/wd_*` directory (~85 KB) under the isolated home, and nothing ever
+// reaps it (RG-5). Only daemon-spawned runs write inside the isolated
+// `KIMI_CODE_HOME`, so the whole `sessions/` dir is our own scratch space.
+// The age floor keeps a still-running child safe: every daemon kimi spawn is
+// bounded well under a minute (refresh 60 s, capture 20 s), so a dir older
+// than this can only belong to a finished run.
+const SESSION_PRUNE_AGE_MS = 5 * 60_000;
+
+/**
+ * Best-effort sweep of `sessions/wd_*` dirs older than
+ * {@link SESSION_PRUNE_AGE_MS} under the isolated Kimi home. Runs after each
+ * native refresh so leftover ping sessions are deleted by the NEXT refresh —
+ * steady state is at most one fresh dir at rest. Never throws.
+ */
+export const pruneKimiSessionDirs = (now: number = Date.now()): void => {
+  const root = join(kimiHome(), "sessions");
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith("wd_")) continue;
+    const dir = join(root, name);
+    try {
+      if (now - statSync(dir).mtimeMs < SESSION_PRUNE_AGE_MS) continue;
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort — a busy dir is retried after the next refresh
+    }
+  }
+};
+
 /**
  * Trigger the kimi CLI's OWN native token refresh: a minimal `kimi -p` inference
  * through the managed (OAuth) provider. The CLI refreshes its token mid-request
@@ -241,18 +298,23 @@ const ensureModelConfig = async (accessToken: string): Promise<void> => {
  * `readToken` from the native `/models` list. Output ignored; bounded.
  */
 const triggerRefresh = async (): Promise<void> => {
-  await spawnRefresh([bin(), "-p", "ping"], env(), {
-    pty: true,
-    readStore: async () => {
-      const tok = storeReadValue(
-        await readJsonStore<TKimiToken>(credentialPath()),
-      );
-      return refreshCredentialSnapshot({
-        accessToken: tok?.access_token,
-        refreshToken: tok?.refresh_token,
-      });
-    },
-  });
+  try {
+    await spawnRefresh([bin(), "-p", "ping"], env(), {
+      pty: true,
+      readStore: async () => {
+        const tok = storeReadValue(
+          await readJsonStore<TKimiToken>(credentialPath()),
+        );
+        return refreshCredentialSnapshot({
+          accessToken: tok?.access_token,
+          refreshToken: tok?.refresh_token,
+        });
+      },
+    });
+  } finally {
+    // A failed ping can still have written a session dir — sweep either way.
+    pruneKimiSessionDirs();
+  }
 };
 
 // Within the leeway window → fire the CLI refresh in the background (still
@@ -431,20 +493,32 @@ const identityHeaders = async (): Promise<Record<string, string>> =>
 // (surface URL+code → background poll). The request (`TDeviceAuth`) + poll
 // (`TDevicePoll`) shapes are the adaptor's generic contract, imported above.
 
-const postForm = async (
+// Exported for the S3R-1 regression suite — the device-OAuth POST is a
+// credential-bearing upstream call and must ride the bounded-redirect policy.
+export const postForm = async (
   path: string,
   params: Record<string, string>,
   headers: Record<string, string>,
 ): Promise<{ status: number; data: Record<string, unknown> }> => {
-  const resp = await fetch(`${OAUTH_HOST}${path}`, {
-    method: "POST",
-    headers: {
-      ...headers,
-      "content-type": "application/x-www-form-urlencoded",
-      accept: "application/json",
-    },
-    body: new URLSearchParams(params).toString(),
-  });
+  // The form body is a plain string, so the bounded-redirect helper can
+  // re-issue it verbatim on a method-preserving same-origin 307/308.
+  const body = new URLSearchParams(params).toString();
+  const resp = await fetchWithBoundedRedirects(
+    `${OAUTH_HOST}${path}`,
+    (target) =>
+      fetch(target, {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-type": "application/x-www-form-urlencoded",
+          accept: "application/json",
+        },
+        body,
+        redirect: "manual",
+        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+      }),
+    "kimi-code",
+  );
   let data: Record<string, unknown> = {};
   try {
     const parsed = (await resp.json()) as unknown;
@@ -849,16 +923,23 @@ export const kimiCodeDelegate: TProviderDelegate = {
       if (cred.kind === "unavailable") return cred;
       const { accessToken, tok } = cred.value;
       try {
-        const resp = await fetch(
+        const identity = await identityHeaders();
+        const resp = await fetchWithBoundedRedirects(
           await resolveProviderUrl(PROVIDER, USAGE_PATH),
-          {
-            method: "GET",
-            headers: {
-              authorization: `Bearer ${accessToken}`,
-              ...(await identityHeaders()),
-              accept: "application/json",
-            },
-          },
+          (target) =>
+            fetch(target, {
+              method: "GET",
+              headers: {
+                authorization: `Bearer ${accessToken}`,
+                ...identity,
+                accept: "application/json",
+              },
+              redirect: "manual",
+              // A half-open connection must not pin the shared in-flight
+              // usage read (NET-6) — see usage-cache.ts.
+              signal: AbortSignal.timeout(USAGE_FETCH_TIMEOUT_MS),
+            }),
+          "kimi-code",
         );
         if (!resp.ok) {
           // Phrase like the Kimi CLI itself (packages/oauth managed-usage):
