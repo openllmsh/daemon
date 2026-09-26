@@ -521,8 +521,12 @@ export const publishIdentity = async (pubkey: string): Promise<void> => {
 //
 //   2xx / 409 / 422          → delivered (409/422 = deduped/never-valid)
 //   5xx / 429 / transport    → retry, exponential backoff + jitter
+//   401 / 403 / 404 / 408    → retry (a key rotation or a cloud deploy must
+//                              not drop ledger rows)
 //   any other 4xx            → terminal reject: drop with a log line
-//   attempts ≥ cap           → drop with a counted warning
+//   age ≥ 7 days             → drop with a counted warning
+//   row key ≠ current key    → hold: a row is billed only under the key
+//                              that recorded it — never another account
 //
 // Retries reuse the row's existing `idempotency_key` — the cloud dedupes
 // on it, so a retried delivery can never double-count.
@@ -583,8 +587,18 @@ const USAGE_OUTBOX_MAX_BYTES = 512 * 1024;
 /** After the cap is hit, trim to 3/4 so a steady stream does not drop a
  *  whole segment on every single append. */
 const USAGE_OUTBOX_TRIM_TARGET_BYTES = (USAGE_OUTBOX_MAX_BYTES * 3) / 4;
-/** Per-row lifetime delivery-attempt cap (persisted across restarts). */
-const USAGE_DELIVERY_MAX_ATTEMPTS = 24;
+/** Per-row lifetime bound: a row is dropped once its persisted
+ *  `enqueuedAt` age passes this limit. Retention is bounded by AGE, not by
+ *  attempt count — an attempt cap lets a long outage burn a row's whole
+ *  retry budget in under two hours (RT-6). */
+const USAGE_DELIVERY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** 4xx statuses that do NOT drop a row: a rate limit, a key mid-rotation
+ *  (401/403), a cloud deploy that briefly lacks the route (404) and a
+ *  request timeout (408) are transient, so the row is kept like a 5xx.
+ *  Every other 4xx is a terminal reject. */
+const USAGE_DELIVERY_KEPT_4XX: ReadonlySet<number> = new Set([
+  401, 403, 404, 408, 429,
+]);
 /** Pass-level exponential backoff while a transient failure keeps the head
  *  row undeliverable, capped + jittered so the fleet never locksteps. */
 const USAGE_RETRY_BASE_MS = 10_000;
@@ -604,8 +618,17 @@ const USAGE_START_TAG_UNKNOWN = "na";
 type TUsageOutboxEntry = {
   readonly row: TDaemonRecordRequest;
   readonly origin: string | null;
-  /** Delivery attempts made (persisted each flush pass — a restart cannot
-   *  reset the lifetime cap). */
+  /** Fingerprint of the API key that recorded the row. A row is only ever
+   *  delivered under the SAME key, so a re-pair — or a co-tenant daemon
+   *  draining a dead owner's segment — can never bill one account's usage
+   *  to another key (RT-5). `null` binds no key: the row was recorded
+   *  keyless, or written by a build that predates fingerprints. */
+  readonly keyFingerprint: string | null;
+  /** When the row entered the outbox (ms epoch, persisted). Bounds the
+   *  row's lifetime against `USAGE_DELIVERY_MAX_AGE_MS`. */
+  readonly enqueuedAt: number;
+  /** Delivery attempts made (persisted each flush pass). Informational
+   *  only — the lifetime bound is the age cap, not a count. */
   attempts: number;
 };
 
@@ -613,6 +636,7 @@ type TUsageDeliverVerdict =
   | { readonly kind: "delivered" }
   | { readonly kind: "drop"; readonly status: number }
   | { readonly kind: "keep" }
+  | { readonly kind: "held" }
   | { readonly kind: "abort" };
 
 /** Why a drain pass stopped early (drives post-pass scheduling). */
@@ -632,6 +656,9 @@ type TUsageOutboxScanEntry = {
    *  carries none (round-2 layout, or an unverifiable writer). */
   readonly startTag: string | null;
   readonly size: number;
+  /** File mtime — the fallback `enqueuedAt` for rows that predate the
+   *  field (a row is at least as old as the last write of its file). */
+  readonly mtimeMs: number;
   readonly claimed: boolean;
 };
 
@@ -650,6 +677,8 @@ let usageOutboxDirty = false;
 let usageOutboxFlushInFlight: Promise<void> | null = null;
 let usageOutboxRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let usageOutboxConsecutiveFailures = 0;
+/** Completed drain passes — a test seam for detecting hot loops. */
+let usageOutboxPassCount = 0;
 /** One-shot guard for the legacy single-file migration. */
 let usageOutboxLegacyChecked = false;
 
@@ -669,6 +698,15 @@ const usageStartTagFromIdentity = (
   typeof identity === "string" && identity.length > 0
     ? createHash("sha256").update(identity).digest("hex").slice(0, 10)
     : USAGE_START_TAG_UNKNOWN;
+
+/** Opaque fingerprint of an API key — `sha256(key)` truncated, never the
+ *  key itself. Recorded on every outbox row so delivery can prove it runs
+ *  under the SAME account the row was recorded for (RT-5). `null` marks a
+ *  keyless record: the row binds no key. */
+const usageKeyFingerprint = (apiKey: string | null): string | null =>
+  apiKey === null
+    ? null
+    : createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
 
 let usageOwnStartTagCache: string | null = null;
 /** This boot's start tag — recorded in every segment we write and every
@@ -719,10 +757,15 @@ const serializeUsageOutboxEntry = (entry: TUsageOutboxEntry): string =>
   JSON.stringify({
     row: entry.row,
     origin: entry.origin,
+    keyFingerprint: entry.keyFingerprint,
+    enqueuedAt: entry.enqueuedAt,
     attempts: entry.attempts,
   });
 
-const parseUsageOutboxLine = (line: string): TUsageOutboxEntry | null => {
+const parseUsageOutboxLine = (
+  line: string,
+  fallbackEnqueuedAt: number,
+): TUsageOutboxEntry | null => {
   try {
     const parsed: unknown = JSON.parse(line);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
@@ -730,6 +773,8 @@ const parseUsageOutboxLine = (line: string): TUsageOutboxEntry | null => {
     const rec = parsed as {
       row?: unknown;
       origin?: unknown;
+      keyFingerprint?: unknown;
+      enqueuedAt?: unknown;
       attempts?: unknown;
     };
     if (
@@ -750,6 +795,23 @@ const parseUsageOutboxLine = (line: string): TUsageOutboxEntry | null => {
         typeof rec.origin === "string" && rec.origin.length > 0
           ? rec.origin
           : null,
+      // A missing/invalid fingerprint binds no key (rows written before
+      // fingerprints existed must still deliver to their owner — the key
+      // that recorded them is unknowable after the fact).
+      keyFingerprint:
+        typeof rec.keyFingerprint === "string" && rec.keyFingerprint.length > 0
+          ? rec.keyFingerprint
+          : null,
+      // Rows written before `enqueuedAt` existed borrow the file's mtime:
+      // a row is at least as old as the last write of its segment. A
+      // future stamp is clamped so a wrong clock cannot make a row
+      // immortal.
+      enqueuedAt:
+        typeof rec.enqueuedAt === "number" &&
+        Number.isFinite(rec.enqueuedAt) &&
+        rec.enqueuedAt > 0
+          ? Math.min(Math.floor(rec.enqueuedAt), Date.now())
+          : Math.min(fallbackEnqueuedAt, Date.now()),
       attempts:
         typeof rec.attempts === "number" &&
         Number.isFinite(rec.attempts) &&
@@ -983,6 +1045,7 @@ const scanUsageOutboxSync = (): TUsageOutboxScanEntry[] => {
       pid,
       startTag,
       size: stat.size,
+      mtimeMs: stat.mtimeMs,
       claimed,
     });
   }
@@ -1091,16 +1154,39 @@ const reclaimStaleUsageClaimsSync = (): void => {
   }
 };
 
-/** Atomic claim: rename wins or returns null — the loser just skips the
- *  segment this pass. The `.claim-<token>` target is unique to this boot,
- *  so the rename cannot land on an existing path. */
-const claimUsageSegmentSync = (entry: TUsageOutboxScanEntry): string | null => {
+/** The result of an atomic claim attempt on one segment. */
+type TUsageClaimResult =
+  | { readonly kind: "claimed"; readonly path: string }
+  | { readonly kind: "gone" }
+  | { readonly kind: "failed" };
+
+/** Atomic claim: rename wins or reports why not. `gone` means the segment
+ *  vanished under us (a racing claim, or the size cap removed it) — the
+ *  loser just skips that segment this pass. `failed` means the rename
+ *  itself was refused (EACCES/EPERM/EROFS on the directory): that is NOT
+ *  a race loss and must not be treated as one — a permanently failing
+ *  claim reported as a clean "skip" used to make the scheduler re-arm a
+ *  zero-delay pass forever (RT-3). The `.claim-<token>` target is unique
+ *  to this boot, so the rename cannot land on an existing path. */
+const claimUsageSegmentSync = (
+  entry: TUsageOutboxScanEntry,
+): TUsageClaimResult => {
   const claimedPath = `${entry.path}.claim-${usageOutboxClaimToken()}`;
   try {
     renameSync(entry.path, claimedPath);
-    return claimedPath;
-  } catch {
-    return null;
+    return { kind: "claimed", path: claimedPath };
+  } catch (err) {
+    if ((err as { code?: string }).code === "ENOENT") {
+      return { kind: "gone" };
+    }
+    const repeat = takeRepeatWindow("usage-ledger:claim");
+    if (repeat !== null) {
+      logWarn("usage-ledger", "usage outbox segment could not be claimed", {
+        err: err instanceof Error ? err.message : String(err),
+        repeat_count: repeat,
+      });
+    }
+    return { kind: "failed" };
   }
 };
 
@@ -1198,7 +1284,10 @@ type TUsageSegmentRead =
  * `error`, NOT folded into an empty list — folding it in used to make the
  * caller delete a fully-loaded claim as if every row had been delivered.
  */
-const readUsageSegmentSync = (path: string): TUsageSegmentRead => {
+const readUsageSegmentSync = (
+  path: string,
+  fallbackEnqueuedAt: number,
+): TUsageSegmentRead => {
   let text: string;
   try {
     text = readFileSync(path, "utf-8");
@@ -1216,7 +1305,7 @@ const readUsageSegmentSync = (path: string): TUsageSegmentRead => {
     const line = lines[index] ?? "";
     const trimmed = line.trim();
     if (trimmed === "") continue;
-    const parsed = parseUsageOutboxLine(trimmed);
+    const parsed = parseUsageOutboxLine(trimmed, fallbackEnqueuedAt);
     if (parsed !== null) {
       entries.push(parsed);
       continue;
@@ -1300,14 +1389,32 @@ const usageOutboxHasClaimableWorkSync = (): boolean =>
 
 /**
  * One delivery attempt for one row. Exactly one attempt per call (attempts
- * are counted + persisted in the segment rewrite so the lifetime cap
- * survives restarts); pacing between attempts is the pass-level backoff.
- * `keep` = transient (5xx/429/network); `abort` = keyless mid-pass — NOT
- * counted against the row, since a key arriving later must still deliver it.
+ * are counted + persisted in the segment rewrite); pacing between attempts
+ * is the pass-level backoff and the row's lifetime bound is its persisted
+ * `enqueuedAt` age. `keep` = transient (5xx/transient 4xx/network);
+ * `held` = the row's recorded key is not the current key — not counted,
+ * never POSTed; `abort` = keyless mid-pass — NOT counted against the row,
+ * since a key arriving later must still deliver it.
  */
 const deliverUsageOutboxEntry = async (
   entry: TUsageOutboxEntry,
 ): Promise<TUsageDeliverVerdict> => {
+  // A row is billed to the account of the key that recorded it. When the
+  // current key carries a DIFFERENT fingerprint — a re-pair, or a
+  // co-tenant daemon draining a dead owner's segment — the row must never
+  // be POSTed: that would bill one account's usage to another key (RT-5).
+  // The row is held for its own key until the age cap drops it. An unbound
+  // row (`null`) was recorded keyless or predates fingerprints, so it
+  // delivers under whatever key is current. A keyless check is skipped so
+  // the NoApiKeyError path below still reports `abort`.
+  const currentFingerprint = usageKeyFingerprint(daemonEnv().apiKey);
+  if (
+    entry.keyFingerprint !== null &&
+    currentFingerprint !== null &&
+    entry.keyFingerprint !== currentFingerprint
+  ) {
+    return { kind: "held" };
+  }
   entry.attempts += 1;
   try {
     const response = await cloudFetch(
@@ -1321,11 +1428,13 @@ const deliverUsageOutboxEntry = async (
     if (response.ok || response.status === 409 || response.status === 422) {
       return { kind: "delivered" };
     }
-    // Terminal rejects drop with a log line; 429 + 5xx stay retryable.
+    // Terminal rejects drop with a log line; 5xx and the transient 4xx
+    // set (401/403/404/408/429 — key rotation, deploy, timeout, rate
+    // limit) stay retryable under the age cap (RT-6).
     if (
       response.status >= 400 &&
       response.status < 500 &&
-      response.status !== 429
+      !USAGE_DELIVERY_KEPT_4XX.has(response.status)
     ) {
       return { kind: "drop", status: response.status };
     }
@@ -1349,6 +1458,10 @@ const usageOutboxRetryDelayMs = (): number => {
  * Drain one claimed segment in row order until it empties, a transient
  * failure stops it (head-of-line: ordering preserved and a down cloud is
  * not hammered once per row), the deadline lands, or the key vanishes.
+ * Rows owed to a different key are held in place without stopping the
+ * drain (a later row may still match). A claim the filesystem refuses is
+ * `claim-failed`, not `skip` — the pass must see it as transient work so
+ * the retry stays on the backoff instead of spinning at zero delay.
  * Finalize: delete the claim when every row verdicted, else rewrite it
  * with only the undelivered rows (updated attempts) and release it back to
  * its segment name.
@@ -1356,10 +1469,20 @@ const usageOutboxRetryDelayMs = (): number => {
 const drainUsageSegment = async (
   entry: TUsageOutboxScanEntry,
   deadline: number,
-): Promise<"drained" | "transient" | "deadline" | "abort" | "skip"> => {
-  const claimedPath = claimUsageSegmentSync(entry);
-  if (claimedPath === null) return "skip";
-  const read = readUsageSegmentSync(claimedPath);
+): Promise<
+  | "drained"
+  | "transient"
+  | "deadline"
+  | "abort"
+  | "skip"
+  | "claim-failed"
+  | "held"
+> => {
+  const claim = claimUsageSegmentSync(entry);
+  if (claim.kind === "gone") return "skip";
+  if (claim.kind === "failed") return "claim-failed";
+  const claimedPath = claim.path;
+  const read = readUsageSegmentSync(claimedPath, entry.mtimeMs);
   if (read.kind === "error") {
     // Unreadable ≠ empty: keep every row — release the claim untouched so
     // the next pass retries the read, and report transient so the retry is
@@ -1370,21 +1493,23 @@ const drainUsageSegment = async (
   const entries = read.entries;
   const remaining: TUsageOutboxEntry[] = [];
   let stop: "drained" | "transient" | "deadline" | "abort" = "drained";
+  let heldAny = false;
   for (const row of entries) {
     if (stop !== "drained") {
       remaining.push(row);
       continue;
     }
-    if (Date.now() >= deadline) {
+    const now = Date.now();
+    if (now >= deadline) {
       stop = "deadline";
       remaining.push(row);
       continue;
     }
-    if (row.attempts >= USAGE_DELIVERY_MAX_ATTEMPTS) {
+    if (now - row.enqueuedAt > USAGE_DELIVERY_MAX_AGE_MS) {
       usageOutboxDropped += 1;
       logWarn(
         "usage-ledger",
-        "usage record dropped after exhausting delivery attempts",
+        "usage record dropped after outliving its retention window",
         {
           dropped_total: usageOutboxDropped,
           idempotency_key: row.row.idempotency_key ?? "",
@@ -1400,6 +1525,14 @@ const drainUsageSegment = async (
     }
     if (verdict.kind === "keep") {
       stop = "transient";
+      remaining.push(row);
+      continue;
+    }
+    if (verdict.kind === "held") {
+      // Owed to a different key — the row stays queued for its own key.
+      // Rows BEHIND it may still match the current key, so the drain
+      // continues instead of stopping head-of-line.
+      heldAny = true;
       remaining.push(row);
       continue;
     }
@@ -1431,7 +1564,9 @@ const drainUsageSegment = async (
     }
     releaseUsageClaimSync(claimedPath);
   }
-  return stop;
+  // `held` reports that rows are still owed but undeliverable under the
+  // current key: not a clean drain, so the pass paces the retry.
+  return stop === "drained" && heldAny ? "held" : stop;
 };
 
 /**
@@ -1457,6 +1592,15 @@ const usageOutboxFlushPass = async (
     if (outcome === "transient") {
       hitTransient = true;
       break;
+    }
+    if (outcome === "claim-failed" || outcome === "held") {
+      // Work remains but this segment could not progress: the FS refused
+      // the claim (RT-3) or its rows belong to another key (RT-5). Later
+      // segments may still drain, so the pass moves on — and the transient
+      // flag paces the retry so a permanent failure can never spin a
+      // zero-delay loop.
+      hitTransient = true;
+      continue;
     }
     if (outcome === "deadline") break;
     if (outcome === "abort") return { transient: false, aborted: true };
@@ -1494,6 +1638,7 @@ const startUsageOutboxPass = (budgetMs?: number): Promise<void> => {
  * nothing: rows simply wait for the next producer kick or the boot flush.
  */
 const finishUsageOutboxPass = (report: TUsagePassReport): void => {
+  usageOutboxPassCount += 1;
   if (report.aborted) return;
   let pending = usageOutboxDirty;
   try {
@@ -1572,6 +1717,8 @@ export const usageOutboxSnapshotForTests = (): {
   readonly dirty: boolean;
   readonly retry_scheduled: boolean;
   readonly in_flight: boolean;
+  readonly consecutive_failures: number;
+  readonly passes: number;
 } => {
   const entries = scanUsageOutboxSync();
   let rows = 0;
@@ -1586,6 +1733,8 @@ export const usageOutboxSnapshotForTests = (): {
     dirty: usageOutboxDirty,
     retry_scheduled: usageOutboxRetryTimer !== null,
     in_flight: usageOutboxFlushInFlight !== null,
+    consecutive_failures: usageOutboxConsecutiveFailures,
+    passes: usageOutboxPassCount,
   };
 };
 
@@ -1599,6 +1748,7 @@ export const resetUsageOutboxForTests = (): void => {
   usageOutboxDropped = 0;
   usageOutboxDirFsyncs = 0;
   usageOutboxConsecutiveFailures = 0;
+  usageOutboxPassCount = 0;
   usageOutboxLegacyChecked = false;
   usageOwnerStateCache.clear();
 };
@@ -1633,6 +1783,8 @@ export const recordRequest = async (
   const entry: TUsageOutboxEntry = {
     row: { ...row, error: sanitizeUsageError(row.error, row.status) },
     origin: origin ?? null,
+    keyFingerprint: usageKeyFingerprint(daemonEnv().apiKey),
+    enqueuedAt: Date.now(),
     attempts: 0,
   };
   try {
