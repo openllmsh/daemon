@@ -1,4 +1,5 @@
-import { spawn as admittedSpawn } from "../windows-process";
+import type { TReapOutcome, TSupervisedChild } from "../child-supervisor";
+import { superviseSpawn } from "../child-supervisor";
 /**
  * Codex native bridge — executes an eligible `chatgpt` hop through the
  * OFFICIAL `codex app-server` JSON-RPC runtime instead of the manual
@@ -40,6 +41,13 @@ import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
 /** Handshake / thread-start RPC budget. */
 const RPC_TIMEOUT_MS = 30_000;
+
+/** Once a turn has committed output, a silent app-server must not pin the
+ *  request forever — a chunk drought past this bound interrupts the turn and
+ *  ends the stream (post-commit, so it cannot re-route). PL-D6. */
+const POST_COMMIT_IDLE_TIMEOUT_MS = 60_000;
+/** Watchdog tick for the post-commit idle check. */
+const IDLE_WATCHDOG_TICK_MS = 1_000;
 
 type TJsonRpcId = number;
 type TInbound = {
@@ -97,6 +105,7 @@ class CodexAppServerClient {
   >();
   private readonly sinks = new Map<string, TThreadSink>();
   private initialized: Promise<void> | null = null;
+  private child: TSupervisedChild | null = null;
   private stdin: { write: (s: string) => void; flush?: () => void } | null =
     null;
 
@@ -108,18 +117,29 @@ class CodexAppServerClient {
   /** Spawn + handshake exactly once per child; respawn after an exit. */
   ensureStarted(): Promise<void> {
     if (this.initialized !== null) return this.initialized;
-    this.initialized = this.start();
-    return this.initialized;
+    const started = this.start();
+    this.initialized = started;
+    // PL-D4: a timed-out/failed handshake must NOT stay cached — the child it
+    // spawned could be alive-but-deaf and would poison every future hop.
+    // start() already killed the process group; here we reset so the NEXT
+    // request respawns instead of replaying the rejection forever.
+    void started.catch(() => {
+      if (this.initialized === started) this.initialized = null;
+    });
+    return started;
   }
 
   private async start(): Promise<void> {
-    const proc = admittedSpawn(sandboxSpawnArgs([this.bin, "app-server"]), {
+    const child = superviseSpawn(sandboxSpawnArgs([this.bin, "app-server"]), {
+      kind: "native-runtime",
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
       cwd: spawnCwd(this.env),
       env: cleanNativeSpawnEnv(this.env),
     });
+    this.child = child;
+    const proc = child.subprocess;
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -127,17 +147,32 @@ class CodexAppServerClient {
     void this.pump(proc.stdout as ReadableStream<Uint8Array>).catch(() => {
       // reader ends on child exit; teardown below handles state
     });
-    void proc.exited.then(() => this.teardown("codex app-server exited"));
-    await this.request("initialize", {
-      clientInfo: {
-        name: "openllmd",
-        title: "OpenLLM Daemon",
-        version: DAEMON_VERSION,
-      },
-      // experimentalApi enables `thread/start.dynamicTools` (the completion
-      // tool-passthrough via `item/tool/call`).
-      capabilities: { experimentalApi: true, requestAttestation: false },
+    // Only the CURRENT child's exit may tear the client down — a stale
+    // child's late `exited` (e.g. after an init-failure kill) must not wipe
+    // a successor's state.
+    void proc.exited.then(() => {
+      if (this.child === child) this.teardown("codex app-server exited");
     });
+    try {
+      await this.request("initialize", {
+        clientInfo: {
+          name: "openllmd",
+          title: "OpenLLM Daemon",
+          version: DAEMON_VERSION,
+        },
+        // experimentalApi enables `thread/start.dynamicTools` (the completion
+        // tool-passthrough via `item/tool/call`).
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      });
+    } catch (error) {
+      // PL-D4: kill the child we just spawned (TERM→KILL the process group,
+      // bounded) — a handshake timeout leaves it alive-but-useless. Detach it
+      // first so its exit doesn't trip the identity-guarded teardown above.
+      this.child = null;
+      this.stdin = null;
+      await child.terminate().catch((): TReapOutcome => "reap_unconfirmed");
+      throw error;
+    }
     this.notify("initialized");
   }
 
@@ -159,6 +194,7 @@ class CodexAppServerClient {
     for (const [, sink] of this.sinks) sink.onCompleted("failed", reason);
     this.sinks.clear();
     this.stdin = null;
+    this.child = null;
     this.initialized = null; // next request respawns
   }
 
@@ -438,6 +474,10 @@ export type TCodexNativeParams = {
   /** Override the pre-commit deadline (default 60s). Tests use a small value to
    *  exercise the timeout→interrupt path without a real 60s wait. */
   readonly precommitMs?: number;
+  /** Override the post-commit idle watchdog (default
+   *  {@link POST_COMMIT_IDLE_TIMEOUT_MS}). Tests use a small value to exercise
+   *  the mid-turn stall → `turn/interrupt` path without a real wait. */
+  readonly postCommitIdleMs?: number;
 };
 
 /** Canonical `reasoning_effort` → app-server effort (same narrowing as the
@@ -538,7 +578,11 @@ export const runCodexNative = async (
   let sawDelta = false;
   let usage: TUsage | undefined;
   let terminal: { status: string; error: string | null } | null = null;
+  // Any sink event (delta/usage/completion) is upstream activity — resets the
+  // post-commit idle watchdog (PL-D6).
+  let lastActivityAt = Date.now();
   const push = (item: TChatCompletionChunk | "end"): void => {
+    lastActivityAt = Date.now();
     queue.push(item);
     wake?.();
     wake = null;
@@ -559,6 +603,7 @@ export const runCodexNative = async (
       push(baseChunk({ role: "assistant", content: text }, null));
     },
     onUsage: (u) => {
+      lastActivityAt = Date.now();
       usage = u;
     },
     // A hosted web search completed inside the turn — ride it on the canonical
@@ -673,6 +718,34 @@ export const runCodexNative = async (
     return { kind: "declined", reason };
   }
 
+  // PL-D6: the committed stream used to wait on `nextItem()` forever — a
+  // silently-stalled app-server (turn committed, then no events AND no
+  // turn/completed) pinned the request while the client-side heartbeat hid
+  // the stall. Watchdog the turn: any sink activity re-arms it; a drought
+  // sends `turn/interrupt` (best-effort — the vendor may already be dead) and
+  // ends the stream as `interrupted` (finish_reason "length").
+  const idleMs = params.postCommitIdleMs ?? POST_COMMIT_IDLE_TIMEOUT_MS;
+  let idleTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    if (Date.now() - lastActivityAt <= idleMs) return;
+    if (idleTimer !== null) {
+      clearInterval(idleTimer);
+      idleTimer = null;
+    }
+    if (turnId !== null) {
+      void client
+        .request("turn/interrupt", { threadId, turnId })
+        .catch(() => undefined);
+    }
+    client.removeSink(threadId);
+    sink.onCompleted("interrupted", "codex app-server idle post-commit");
+  }, IDLE_WATCHDOG_TICK_MS);
+  const stopIdleWatchdog = (): void => {
+    if (idleTimer !== null) {
+      clearInterval(idleTimer);
+      idleTimer = null;
+    }
+  };
+
   const chunks = new ReadableStream<TChatCompletionChunk>({
     start(controller) {
       if (typeof first === "object") controller.enqueue(first);
@@ -681,6 +754,7 @@ export const runCodexNative = async (
     async pull(controller) {
       const next = await nextItem();
       if (next === "end") {
+        stopIdleWatchdog();
         controller.close();
         client.removeSink(threadId);
         return;
@@ -688,6 +762,7 @@ export const runCodexNative = async (
       controller.enqueue(next);
     },
     cancel() {
+      stopIdleWatchdog();
       client.removeSink(threadId);
       abort();
     },

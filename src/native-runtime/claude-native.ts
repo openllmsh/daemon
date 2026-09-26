@@ -1,4 +1,5 @@
-import { spawn as admittedSpawn } from "../windows-process";
+import type { TReapOutcome } from "../child-supervisor";
+import { superviseSpawn } from "../child-supervisor";
 /**
  * Claude native bridge — executes an eligible `claude_code` hop through the
  * OFFICIAL Claude Code runtime instead of exporting its OAuth bearer for a
@@ -31,7 +32,9 @@ import { spawn as admittedSpawn } from "../windows-process";
  * output → the bridge DECLINES and the manual transport serves the hop.
  */
 
-import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { AnthropicStreamEvent } from "@openllmsh/protocol";
 import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
@@ -45,6 +48,7 @@ import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { daemonTempDir } from "../sandbox/working-set";
 import type { TNativeRunResult } from "./types";
 import {
   cleanNativeSpawnEnv,
@@ -141,7 +145,19 @@ export type TClaudeNativeParams = {
   /** Resume this session id (feed only `userText`), or null → fresh session. */
   readonly resumeSessionId: string | null;
   readonly signal: AbortSignal;
+  /** Override the pre-commit deadline (default {@link PRE_COMMIT_TIMEOUT_MS}).
+   *  Tests use a small value to exercise the decline path without a 60s wait. */
+  readonly precommitMs?: number;
+  /** Override the post-commit idle watchdog (default
+   *  {@link POST_COMMIT_IDLE_TIMEOUT_MS}). Tests use a small value to exercise
+   *  the mid-stream stall path without a real wait. */
+  readonly postCommitIdleMs?: number;
 };
+
+/** Once the stream has committed, a silent runtime must not pin the request
+ *  forever — a chunk drought past this bound terminates the child and ends
+ *  the stream (post-commit, so it cannot re-route). */
+export const POST_COMMIT_IDLE_TIMEOUT_MS = 60_000;
 
 /** One NDJSON line of `claude -p --output-format stream-json` output. */
 type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
@@ -166,6 +182,50 @@ export const runClaudeNative = async (
   // and break auth. The load-bearing prep is the SCRUBBED env below —
   // `cleanNativeSpawnEnv` drops `ANTHROPIC_*`/`CLAUDE_CODE_*` auth vars that
   // would otherwise override the subscription credential.
+  //
+  // SP-6: the caller's system prompt must NEVER ride argv — `--system-prompt
+  // <text>` exposes it to any local user via `ps`/`/proc/<pid>/cmdline`.
+  // Stage it in a 0600 file inside the daemon-private 0700 temp dir (which
+  // the confined child CAN read — daemonTempDir is in the sandbox working
+  // set) and pass `--system-prompt-file` instead. The file is removed once
+  // the child exits (every terminal path below removes it earlier if no
+  // child ever ran).
+  let systemPromptFile: string | null = null;
+  const removeSystemPromptFile = (): void => {
+    if (systemPromptFile === null) return;
+    const path = systemPromptFile;
+    systemPromptFile = null;
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // best-effort — 0600 inside a daemon-private 0700 dir leaks nothing
+    }
+  };
+  let promptArgv: string[];
+  try {
+    if (params.resumeSessionId !== null) {
+      promptArgv = ["--resume", params.resumeSessionId];
+    } else if (params.systemText !== null) {
+      systemPromptFile = join(
+        daemonTempDir(),
+        `system-prompt-${randomUUID()}.md`,
+      );
+      writeFileSync(systemPromptFile, params.systemText, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      chmodSync(systemPromptFile, 0o600);
+      promptArgv = ["--system-prompt-file", systemPromptFile];
+    } else {
+      promptArgv = [];
+    }
+  } catch (error) {
+    systemPromptFile = null;
+    return {
+      kind: "declined",
+      reason: `could not stage the system prompt: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
   const argv = [
     params.bin,
     "-p",
@@ -189,11 +249,7 @@ export const runClaudeNative = async (
     // Resume feeds ONLY the delta turn into the persisted session (which
     // already holds prior history + the system prompt). A fresh start applies
     // the system prompt and seeds with `userText`.
-    ...(params.resumeSessionId !== null
-      ? ["--resume", params.resumeSessionId]
-      : params.systemText !== null
-        ? ["--system-prompt", params.systemText]
-        : []),
+    ...promptArgv,
   ];
   // Gate the vendor spawn on the isolated keychain being VERIFIED ready —
   // `claude` resolves its credential through the isolated HOME's search
@@ -201,19 +257,24 @@ export const runClaudeNative = async (
   // found" hang this run exists to avoid.
   const store = await ensureVendorKeychainReady(params.env, params.signal);
   if (store.kind !== "present") {
+    removeSystemPromptFile();
     return {
       kind: "declined",
       reason: `isolated credential store not ready (${store.kind === "indeterminate" ? store.cause : store.kind})`,
     };
   }
-  let proc: ReturnType<typeof Bun.spawn>;
+  let child: ReturnType<typeof superviseSpawn>;
   try {
     // The bridge reads claude's isolated login-keychain credential to serve the
     // request; securityd denies a Seatbelt-confined caller, so it runs
     // unconfined on macOS (confined on Linux) — `sandbox/policy.ts`.
-    proc = admittedSpawn(
+    // superviseSpawn leads an independent process group, so terminate()
+    // TERM→KILLs the WHOLE tree — a launcher-descended grandchild can't
+    // outlive the request (PL-D5).
+    child = superviseSpawn(
       sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
       {
+        kind: "native-runtime",
         stdin: new TextEncoder().encode(params.userText),
         stdout: "pipe",
         stderr: "pipe",
@@ -222,24 +283,66 @@ export const runClaudeNative = async (
       },
     );
   } catch (error) {
+    removeSystemPromptFile();
     return {
       kind: "declined",
       reason: `spawn failed: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
+  const proc = child.subprocess;
+  // The prompt file is needed only while the child parses it at startup; tie
+  // removal to exit so every terminal path (timeout, cancel, error, drain)
+  // cleans it up exactly once.
+  void proc.exited.then(removeSystemPromptFile).catch(() => undefined);
 
-  const kill = (): void => {
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // already exited
+  let terminatePromise: Promise<TReapOutcome> | null = null;
+  const requestTerminate = (): Promise<TReapOutcome> => {
+    // A terminate() throw (an unexpected signalGroup errno) means the reap
+    // could not be confirmed — report it as unconfirmed, never propagate.
+    if (terminatePromise === null) {
+      terminatePromise = child
+        .terminate()
+        .catch((): TReapOutcome => "reap_unconfirmed");
     }
+    return terminatePromise;
+  };
+  const kill = (): void => {
+    void requestTerminate();
   };
   if (params.signal.aborted) {
     kill();
+    await requestTerminate();
     return { kind: "declined", reason: "client aborted" };
   }
   params.signal.addEventListener("abort", kill, { once: true });
+
+  // stderr must be DRAINED for the child's whole life: an unread pipe fills
+  // at ~64KiB and stalls the runtime mid-turn — the previous code only read
+  // it after a pre-commit failure, as an UNBOUNDED `.text()` that could wait
+  // forever on a wedged child. Keep a small TAIL for decline diagnostics.
+  const STDERR_CAPTURE_MAX = 4_096;
+  let stderrBuf = "";
+  {
+    const stderrStream = proc.stderr;
+    if (typeof stderrStream === "object" && stderrStream !== null) {
+      void (async (): Promise<void> => {
+        const dec = new TextDecoder();
+        const reader = stderrStream.getReader();
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) return;
+            stderrBuf += dec.decode(value, { stream: true });
+            if (stderrBuf.length > STDERR_CAPTURE_MAX) {
+              stderrBuf = stderrBuf.slice(-STDERR_CAPTURE_MAX);
+            }
+          }
+        } catch {
+          // pipe closed — nothing left to capture
+        }
+      })();
+    }
+  }
 
   const state = newAnthropicStreamState({
     providerModelId: params.providerModelId,
@@ -390,21 +493,26 @@ export const runClaudeNative = async (
     }
   };
   let precommitTimer: ReturnType<typeof setTimeout> | undefined;
+  const pendingFirst = pump();
+  // Suppress an unhandled rejection when the timeout wins the race — the
+  // decline path below owns the error.
+  void pendingFirst.catch(() => undefined);
   const first = await Promise.race([
-    pump(),
+    pendingFirst,
     new Promise<"timeout">((resolve) => {
       precommitTimer = setTimeout(
         () => resolve("timeout"),
-        PRE_COMMIT_TIMEOUT_MS,
+        params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS,
       );
     }),
   ]);
   clearTimeout(precommitTimer);
   if (first === "timeout" || first.kind === "exit") {
     kill();
-    const stderr = await new Response(proc.stderr as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
+    // Bounded: TERM the group → grace → KILL → final reap. stderr was drained
+    // continuously above, so this await can never block on a full pipe.
+    await requestTerminate();
+    const stderr = stderrBuf;
     const reason =
       first === "timeout"
         ? "claude runtime produced no output before the pre-commit deadline"
@@ -418,6 +526,7 @@ export const runClaudeNative = async (
   }
   if (first.kind === "error") {
     kill();
+    await requestTerminate();
     logError(
       "native-runtime",
       safeDiagnosticMessage`claude hop declined pre-commit`,
@@ -430,13 +539,39 @@ export const runClaudeNative = async (
   const firstMeaningful = first.chunk;
 
   // ── Committed: stream canonical chunks until the result line ────────
+  // Post-commit idle watchdog (PL-D5): the runtime used to be able to go
+  // silent mid-stream forever — every pull raced NOTHING, so the request
+  // hung while the client-side heartbeat hid the stall. Now each pull races
+  // an idle bound; on expiry the child is group-killed and the stream ends.
+  const postCommitIdleMs =
+    params.postCommitIdleMs ?? POST_COMMIT_IDLE_TIMEOUT_MS;
   const chunks = new ReadableStream<TChatCompletionChunk>({
     start(controller) {
       for (const c of buffered) controller.enqueue(c);
       controller.enqueue(firstMeaningful);
     },
     async pull(controller) {
-      const next = await nextChunk();
+      const pending = nextChunk();
+      // Suppress an unhandled rejection when the watchdog wins the race.
+      void pending.catch(() => undefined);
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const next = await Promise.race([
+        pending,
+        new Promise<"idle">((resolve) => {
+          idleTimer = setTimeout(() => resolve("idle"), postCommitIdleMs);
+        }),
+      ]);
+      clearTimeout(idleTimer);
+      if (next === "idle") {
+        logError(
+          "native-runtime",
+          safeDiagnosticMessage`claude stream idle post-commit`,
+          { idleMs: postCommitIdleMs },
+        );
+        controller.close();
+        kill();
+        return;
+      }
       if (next === "end" || typeof next !== "object" || "error" in next) {
         // Post-commit failure can't re-route (commit-on-first-byte): end the
         // stream; the accumulated usage/finish state is whatever arrived.
