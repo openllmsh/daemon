@@ -295,11 +295,15 @@ const terminateTrackedChild = (
     const first = await raceExitOrBudget(tracked.handle, Math.max(0, graceMs));
     let outcome: TReapOutcome;
     if (first === "exited") {
+      // The root exited within grace, but its descendants may still be dying
+      // (just TERMed, or zombies awaiting their new parent). A zero reap
+      // window reported them as reap_unconfirmed within a millisecond; give
+      // the group the same bounded final reap as the timeout path.
       outcome = await terminateProcessGroup(
         tracked.handle.pgid,
         0,
         stillOwned,
-        0,
+        Math.max(0, finalReapMs),
       );
     } else {
       outcome = await terminateProcessGroup(
