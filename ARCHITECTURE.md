@@ -627,7 +627,7 @@ standalone host owns lifecycle and transport fan-out.
 ### Native PTY backend (Phase 2)
 
 Session PTYs no longer ride a Bun-native or worker shim — on POSIX the PTY is
-owned by the **native C shim in `packages/pty-native`** (`pty.c`), a
+owned by the **native C shim in `packages/daemon/src/pty-native`** (`pty.c`), a
 header-free POSIX PTY implementation whose SOURCE TEXT is bundled into the
 compiled daemon binary (it is in `DAEMON_BINARY_SOURCES`) and compiled at
 runtime by `cc()` (`ffi.ts`) with one per-target define chosen by

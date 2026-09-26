@@ -16,7 +16,7 @@
  *     `~/.openllm/bin/openllm` (or the legacy `openllmc` path) is a skip, mirroring the vendor-CLI policy in
  *     `cli-install.ts`. Manual `openllm self-update` also still works — the two
  *     writers serialize through ONE cross-process lock dir
- *     (`updateLockDirFor(dest)`, `packages/protocol/update-lock.ts`) covering
+ *     (`updateLockDirFor(dest)`, `packages/tunnel/update-lock.ts`) covering
  *     probe → backup → rename → legacy-link → attempt marker, so a race can
  *     never leave `.prev` unrelated to the final binary or `state.json`
  *     describing the other update.
@@ -36,12 +36,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { evaluateUpdatePolicy } from "@openllmsh/protocol/update-policy";
 import {
   acquireUpdateLock,
   updateLockDirFor,
-} from "@openllmsh/protocol/update-lock";
-import { evaluateUpdatePolicy } from "@openllmsh/protocol/update-policy";
-import { executableName } from "../../pty-native/session/local-runtime";
+} from "@openllmsh/tunnel/update-lock";
+import { executableName } from "../../tunnel/session/local-runtime";
 import type { TDaemonTarget } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { invalidateMatchingCliVersionOutput } from "./cli-version-cache";

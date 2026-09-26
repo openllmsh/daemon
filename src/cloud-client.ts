@@ -57,7 +57,7 @@ import {
   VideoJobPlanRequest,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
-import { processStartIdentity } from "../../pty-native/session/local-runtime";
+import { processStartIdentity } from "../../tunnel/session/local-runtime";
 import { takeRepeatWindow } from "./doctor-report/repeat";
 import { daemonEnv, deviceId, stateDir } from "./env";
 import { hasIdentityConflict, setIdentityConflict } from "./identity-state";

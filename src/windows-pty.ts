@@ -5,7 +5,7 @@ export { WINDOWS_PTY_KILL_GRACE_MS } from "./bs-pty";
 
 /**
  * Phase 3: the Windows PTY entry is IMPLEMENTED — in-process ConPTY through
- * the same native PTY binding the POSIX backend uses (packages/pty-native
+ * the same native PTY binding the POSIX backend uses (packages/daemon/src/pty-native
  * compiles pty-win.c on win32 against the frozen PTY_SYMBOLS ABI; the loader
  * selected the source at build time). session-core routes win32 here; the
  * spawn delegates to NativePty behind the unchanged `TPtySpawnArgs` seam and

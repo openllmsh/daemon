@@ -11,7 +11,7 @@ import { join } from "node:path";
 import {
   processIdentityStatus,
   processStartIdentity,
-} from "../../../pty-native/session/local-runtime";
+} from "../../../tunnel/session/local-runtime";
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { stateDir } from "../env";
 import { logDebug } from "../logger";

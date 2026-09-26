@@ -41,11 +41,11 @@ import {
   SESSION_HOST_STARTUP_GRACE_MS,
   sessionHostSupported,
   sourceEntrypoint,
-} from "../../../pty-native/session/local-runtime";
+} from "../../../tunnel/session/local-runtime";
 import {
   verifyWindowsSessionDirectory,
   verifyWindowsSessionFile,
-} from "../../../pty-native/session/windows-session-pipe";
+} from "../../../tunnel/session/windows-session-pipe";
 import { requestedPtyBackend } from "../bs-pty";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";

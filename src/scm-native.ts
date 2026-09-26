@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import scmSource from "../../pty-native/scm-win.c" with { type: "text" };
+import scmSource from "./pty-native/scm-win.c" with { type: "text" };
 
 export const SCM_SYMBOLS = {
   scmAbiVersion: { args: [], returns: FFIType.i32 },

@@ -8,17 +8,17 @@ import {
 import { constants as osConstants } from "node:os";
 import { delimiter, isAbsolute, resolve } from "node:path";
 import {
-  ffiPointer,
-  loadPtyBindings,
-  type TPtyNativeBindings,
-} from "../../pty-native";
-import {
   normalizeProcessStartIdentity,
   processStartIdentity,
-} from "../../pty-native/session/local-runtime";
+} from "../../tunnel/session/local-runtime";
 import { WINDOWS_PTY_KILL_GRACE_MS } from "./bs-pty";
 import { logWarn } from "./logger";
 import { nativePtyEnv } from "./pty-env";
+import {
+  ffiPointer,
+  loadPtyBindings,
+  type TPtyNativeBindings,
+} from "./pty-native";
 import type { TPtyLike, TPtySpawnArgs } from "./session-core";
 import {
   spawn as admittedSpawn,
@@ -682,7 +682,7 @@ export class NativePty implements TPtyLike {
         throw new TypeError(`invalid PTY environment key: ${key}`);
     }
     // P3-2: the win32 host compiles the ConPTY shim (pty-win.c) against this
-    // exact ABI (see ../../pty-native), so the same spawn path serves both
+    // exact ABI (see ./pty-native), so the same spawn path serves both
     // platforms — the platform differences live below, not behind a throw.
     const bindings = loadPtyBindings();
     const handle = checkReturn("ptyCreate", bindings.ptyCreate());

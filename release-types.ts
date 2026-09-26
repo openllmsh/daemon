@@ -49,7 +49,6 @@ export const DAEMON_BINARY_SOURCES = [
   "packages/protocol",
   "packages/tunnel",
   "packages/wire",
-  "packages/pty-native",
   "packages/daemon/patches",
   "bun.lock",
   "package.json",

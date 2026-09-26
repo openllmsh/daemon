@@ -82,7 +82,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
 import type { TUpdateRouteConfig } from "@openllmsh/protocol/update-policy";
 import { resolveUpdateSetting } from "@openllmsh/protocol/update-policy";
-import { processStartIdentity } from "../../pty-native/session/local-runtime";
+import { processStartIdentity } from "../../tunnel/session/local-runtime";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
 // both sides only dereference the other's exports lazily inside functions.
 import { logWarn, safeDiagnosticMessage } from "./logger";

@@ -40,12 +40,12 @@ import {
   secureSessionDirectory,
   sessionHostSupported,
   WINDOWS_SESSION_HOST_UNAVAILABLE,
-} from "../../../pty-native/session/local-runtime";
-import type { TWindowsSessionPipeServer } from "../../../pty-native/session/windows-session-pipe";
+} from "../../../tunnel/session/local-runtime";
+import type { TWindowsSessionPipeServer } from "../../../tunnel/session/windows-session-pipe";
 import {
   createWindowsSessionPipeServer,
   verifyWindowsSessionFile,
-} from "../../../pty-native/session/windows-session-pipe";
+} from "../../../tunnel/session/windows-session-pipe";
 import { stateDir } from "../env";
 import { whenAllNativePtysTerminated } from "../native-pty";
 import type { TSessionStream } from "../session-core";
