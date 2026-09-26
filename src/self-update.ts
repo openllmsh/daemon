@@ -27,7 +27,7 @@
  * earns the bounded exponential backoff.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -35,6 +35,7 @@ import {
   existsSync,
   fsyncSync,
   openSync,
+  readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -50,10 +51,12 @@ import { DAEMON_RELEASE } from "../manifest";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
-import { drainDisposableChildren } from "./child-supervisor";
+import type { TSupervisedChild } from "./child-supervisor";
+import { drainDisposableChildren, superviseSpawn } from "./child-supervisor";
+import { spawnCommand } from "./command";
 import { getCloudState } from "./config";
 import { endDaemonApply, tryBeginDaemonApply } from "./delegation/login-flow";
-import { runCapture } from "./delegation/spawn";
+import { spawnCwd, spawnEnv } from "./delegation/spawn";
 import { daemonEnv, daemonUpdateRoute } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
@@ -70,10 +73,16 @@ import { nodeSpawnSync } from "./windows-process";
 // Cap on how long we hold the restart waiting for `/v1` requests to drain.
 const DRAIN_MAX_MS = 30_000;
 const DRAIN_POLL_MS = 250;
-// Abort a stalled binary/checksum download — without this a hung connection
-// would leave `updating = true` for the rest of the process lifetime, blocking
-// every later update attempt.
-const DOWNLOAD_TIMEOUT_MS = 60_000;
+// How long a completed daemon swap waits for an in-flight CLI converge (its
+// probe child must not be drained mid-swap — UP-3).
+const CLI_SWAP_DRAIN_WAIT_MS = 15_000;
+// Download bounds (NR2-2): a hung CONNECTION still dies fast, but a slow link
+// gets generous time. The stall bound kills a download that stops making
+// progress; the total cap bounds worst-case runtime; neither rejects the
+// artifact — a transport failure is transient, only backoff applies (TD-4).
+const DOWNLOAD_CONNECT_MS = 60_000;
+const DOWNLOAD_STALL_MS = 60_000;
+const DOWNLOAD_TOTAL_MS = 15 * 60_000;
 /**
  * Hard cap on a downloaded artifact (compressed AND decompressed). The real
  * binaries are ~40 MB gz / ~90 MB raw; 256 MiB leaves headroom while refusing
@@ -222,15 +231,258 @@ export const restorePreviousBinary = (
 export const manualUpdateRemedy = (origin: string): string =>
   `to update manually, re-run the installer: curl -fsSL ${origin}/install | bash`;
 
+/** Is `pid` a live (or unverifiable, EPERM) process on this host? */
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+// Staging-temp name shapes swept below. Both updater families stage next to
+// the destination binary so a crash mid-update leaves the ~90 MB temp in the
+// install dir (FSS-16/FSS-17) — dead-pid files are orphans and are removed.
+const UPDATE_TEMP_RE =
+  /^\.openllm[cd]?\.(?:update|prev)\.(\d+)(?:\.[^.]*)?\.tmp$/;
+const CLI_NEXT_TEMP_RE = /^\.openllm\.next-(\d+)(?:-.*)?$/;
+
+/**
+ * Remove staging temps left in `dir` by a DEAD updater process (its pid is
+ * encoded in the file name). A live pid's file is never touched — that is
+ * the in-flight download of a concurrent updater. Best-effort; never throws.
+ */
+export const sweepStaleUpdateTemps = (dir: string): void => {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const match = UPDATE_TEMP_RE.exec(entry) ?? CLI_NEXT_TEMP_RE.exec(entry);
+    if (match === null) continue;
+    const pid = Number(match[1]);
+    if (!(pid > 0) || pidAlive(pid)) continue;
+    try {
+      rmSync(join(dir, entry), { force: true });
+    } catch {
+      // best-effort residue cleanup
+    }
+  }
+};
+
+/** fsync one file's bytes to stable storage. Throws on failure. */
+export const fsyncFileSync = (path: string): void => {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/**
+ * fsync a directory so rename dirents survive a crash (FSS-18). Best-effort:
+ * some filesystems refuse directory fsync — never throws.
+ */
+export const fsyncDirBestEffort = (dir: string): void => {
+  try {
+    fsyncFileSync(dir);
+  } catch {
+    // best-effort — e.g. a filesystem without directory fsync
+  }
+};
+
+/**
+ * What one binary probe (`<path> --version` / `--self-test`) proved.
+ *
+ * The three-way split is the load-bearing part of the whole updater
+ * (RT-2/TD-5/UP-2/UP-3/FSS-05):
+ *
+ *  - `ok`           — exit 0 within the bound; `out` is trimmed stdout.
+ *  - `failed`       — DETERMINISTIC artifact failure: nonzero exit, a crash
+ *                     signal (SIGSEGV/SIGBUS/SIGILL/SIGABRT/SIGFPE), output
+ *                     overflow, or a spawn-level refusal (ELOOP/ENOEXEC —
+ *                     re-probing the same bytes can never change it).
+ *  - `inconclusive` — TRANSIENT/environmental: timeout, a non-crash signal
+ *                     (SIGTERM/SIGKILL — e.g. the idle-child drain racing the
+ *                     probe), or an environmental spawn error (ENOENT/EACCES/
+ *                     EAGAIN/EMFILE/ENOMEM/ETXTBSY). NEVER a reason to reject
+ *                     or roll back — the bytes were not judged.
+ */
+export type TBinaryProbeVerdict =
+  | { readonly kind: "ok"; readonly out: string }
+  | { readonly kind: "failed"; readonly detail: string }
+  | { readonly kind: "inconclusive"; readonly detail: string };
+
+const PROBE_CRASH_SIGNALS = new Set([
+  "SIGSEGV",
+  "SIGBUS",
+  "SIGILL",
+  "SIGABRT",
+  "SIGFPE",
+  "SIGSYS",
+  "SIGTRAP",
+]);
+const PROBE_TRANSIENT_SPAWN_CODES = new Set([
+  "EAGAIN",
+  "ENOMEM",
+  "EMFILE",
+  "ENFILE",
+  "EACCES",
+  "EPERM",
+  "ENOENT",
+  "EIO",
+  "ETXTBSY",
+]);
+
+/**
+ * Run `<path> <flag>` once under the child supervisor and classify the
+ * outcome as ok / deterministic-failure / inconclusive (above). The child
+ * runs UNWRAPPED (`kind:"probe"` — a fixed-argv read-only probe, the same
+ * trust class `runCapture` used) and holds a task LEASE for its whole
+ * lifetime (UP-3): a graceful `drainDisposableChildren` spares leased
+ * children, so a daemon restart cannot kill a live update probe — and even
+ * an external kill lands as `inconclusive`, never a rejection.
+ *
+ * `TMPDIR` is repointed at the binary's own directory: the probe must not
+ * depend on a usable system temp (FSS-05) — the staged file already proves
+ * that directory is writable.
+ */
+export const probeBinaryVerdict = async (
+  path: string,
+  flag: "--version" | "--self-test",
+  opts?: { timeoutMs?: number; maxBytes?: number },
+): Promise<TBinaryProbeVerdict> => {
+  const timeoutMs = opts?.timeoutMs ?? VERSION_PROBE_TIMEOUT_MS;
+  const maxBytes = opts?.maxBytes ?? VERSION_PROBE_MAX_BYTES;
+  let child: TSupervisedChild;
+  try {
+    child = superviseSpawn(spawnCommand(process.platform, path, [flag]), {
+      kind: "probe",
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      cwd: spawnCwd(undefined),
+      env: spawnEnv({ TMPDIR: dirname(path) }),
+    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== undefined && PROBE_TRANSIENT_SPAWN_CODES.has(code)) {
+      return {
+        kind: "inconclusive",
+        detail: `probe spawn failed: ${code}`,
+      };
+    }
+    return {
+      kind: "failed",
+      detail: `probe spawn failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  const endTask = child.beginTask();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const run = (async (): Promise<TBinaryProbeVerdict> => {
+    try {
+      const stdout = child.subprocess.stdout;
+      if (
+        stdout === null ||
+        stdout === undefined ||
+        typeof stdout === "number"
+      ) {
+        await child.terminate();
+        return { kind: "inconclusive", detail: "probe stdout was not piped" };
+      }
+      const reader = stdout.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      let overflow = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          overflow = true;
+          break;
+        }
+        chunks.push(value);
+      }
+      await child.subprocess.exited;
+      const signal = child.subprocess.signalCode;
+      if (signal !== null) {
+        return PROBE_CRASH_SIGNALS.has(signal)
+          ? { kind: "failed", detail: `probe crashed on ${signal}` }
+          : { kind: "inconclusive", detail: `probe killed by ${signal}` };
+      }
+      const code = child.subprocess.exitCode;
+      if (code !== 0) {
+        return { kind: "failed", detail: `probe exited ${code}` };
+      }
+      if (overflow) {
+        return { kind: "failed", detail: "probe output overflow" };
+      }
+      return {
+        kind: "ok",
+        out: Buffer.concat(chunks).toString("utf-8").trim(),
+      };
+    } catch (err) {
+      return {
+        kind: "inconclusive",
+        detail: `probe failed to complete: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      };
+    }
+  })();
+  try {
+    const winner = await Promise.race([
+      run,
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      }),
+    ]);
+    if (winner === "timeout") {
+      try {
+        await child.terminate();
+      } catch {
+        // best-effort — the supervisor reaps it regardless
+      }
+      return {
+        kind: "inconclusive",
+        detail: `probe timed out after ${timeoutMs}ms`,
+      };
+    }
+    return winner;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    endTask();
+  }
+};
+
+/** Per-download bounds: stall = no bytes for this long; total = hard cap. */
+export type TDownloadBounds = {
+  readonly stallMs?: number;
+  readonly totalMs?: number;
+};
+
 /**
  * Stream a response body with a hard byte cap — count while reading so an
  * oversized payload is rejected BEFORE it is buffered (content-length is an
  * early hint only; a lying endpoint is still caught by the count).
+ *
+ * NR2-2: the byte cap is joined by a STALL bound (no chunk for `stallMs` →
+ * abort) and a TOTAL cap (`totalMs` elapsed → abort). Both throw plain
+ * `Error`s — transport faults are transient and earn only backoff, never a
+ * permanent artifact rejection (TD-4). Only oversize stays deterministic.
  */
 const readBodyCapped = async (
   res: Response,
   maxBytes: number,
   label: string,
+  bounds?: TDownloadBounds,
 ): Promise<Buffer> => {
   // Hash whatever arrives so an oversize rejection can still be keyed to the
   // exact bytes that failed (a corrected re-publish gets a different prefix
@@ -250,24 +502,51 @@ const readBodyCapped = async (
   if (res.body === null) return Buffer.alloc(0);
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
+  const stallMs = bounds?.stallMs ?? DOWNLOAD_STALL_MS;
+  const totalMs = bounds?.totalMs ?? DOWNLOAD_TOTAL_MS;
+  const deadline = Date.now() + totalMs;
   let total = 0;
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    keyHash.update(value);
-    if (total > maxBytes) {
-      try {
-        await reader.cancel();
-      } catch {
-        // best-effort abort
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    const stalled = new Promise<"stalled">((resolve) => {
+      stallTimer = setTimeout(() => resolve("stalled"), stallMs);
+    });
+    try {
+      const read = await Promise.race([reader.read(), stalled]);
+      if (read === "stalled") {
+        try {
+          await reader.cancel();
+        } catch {
+          // best-effort abort
+        }
+        throw new Error(`${label} stalled — no bytes for ${stallMs}ms`);
       }
-      throw new DeterministicArtifactError(
-        `${label} exceeds the ${maxBytes}-byte cap`,
-        keyHash.digest("hex"),
-      );
+      if (read.done) break;
+      total += read.value.byteLength;
+      keyHash.update(read.value);
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // best-effort abort
+        }
+        throw new DeterministicArtifactError(
+          `${label} exceeds the ${maxBytes}-byte cap`,
+          keyHash.digest("hex"),
+        );
+      }
+      if (Date.now() > deadline) {
+        try {
+          await reader.cancel();
+        } catch {
+          // best-effort abort
+        }
+        throw new Error(`${label} exceeded its ${totalMs}ms total budget`);
+      }
+      chunks.push(read.value);
+    } finally {
+      if (stallTimer !== null) clearTimeout(stallTimer);
     }
-    chunks.push(value);
   }
   return Buffer.concat(chunks);
 };
@@ -365,13 +644,14 @@ export const mayUpdateDaemonVersion = (
 export const fetchBinary = async (
   url: string,
   maxBytes: number = MAX_BINARY_BYTES,
+  bounds?: TDownloadBounds & { readonly connectMs?: number },
 ): Promise<Buffer> => {
   const res = await fetch(url, {
     redirect: "follow",
-    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    signal: AbortSignal.timeout(bounds?.connectMs ?? DOWNLOAD_CONNECT_MS),
   });
   if (!res.ok) throw new Error(`binary download failed: ${res.status}`);
-  const buf = await readBodyCapped(res, maxBytes, "binary download");
+  const buf = await readBodyCapped(res, maxBytes, "binary download", bounds);
   // The published asset is gzipped (`openllmd-<target>.gz`); decompress when the
   // gzip magic bytes (0x1f 0x8b) are present, tolerating a raw binary too. The
   // sha256 is checked against the DECOMPRESSED bytes (what runs), so the gate is
@@ -393,14 +673,17 @@ export const fetchBinary = async (
 
 // The `.sha256` endpoint returns `"<hex>  openllmd-<target>\n"` — take the hex.
 // Shared by the daemon self-updater and the CLI converger (`cli-self-update.ts`).
-export const fetchDigest = async (url: string): Promise<string> => {
+export const fetchDigest = async (
+  url: string,
+  bounds?: TDownloadBounds & { readonly connectMs?: number },
+): Promise<string> => {
   const res = await fetch(url, {
     redirect: "follow",
-    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    signal: AbortSignal.timeout(bounds?.connectMs ?? DOWNLOAD_CONNECT_MS),
   });
   if (!res.ok) throw new Error(`checksum download failed: ${res.status}`);
   const text = (
-    await readBodyCapped(res, DIGEST_MAX_BYTES, "checksum download")
+    await readBodyCapped(res, DIGEST_MAX_BYTES, "checksum download", bounds)
   )
     .toString("utf-8")
     .trim();
@@ -421,6 +704,28 @@ const waitUntilIdle = async (): Promise<void> => {
   const deadline = Date.now() + DRAIN_MAX_MS;
   while (inFlight() > 0 && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, DRAIN_POLL_MS));
+  }
+};
+
+/**
+ * UP-3: the CLI converger's probe+swap must not race the idle drain on a
+ * daemon restart — a probe killed mid-run used to look like a dead binary and
+ * got a good CLI release rejected. The probe itself now holds a supervisor
+ * task lease (the drain spares it), and this wait lets an in-flight swap
+ * region land before we reap anything. Bounded; a wedged converger cannot
+ * hold the restart forever.
+ */
+const waitForCliSwapRegion = async (): Promise<void> => {
+  try {
+    const { cliSwapInFlight } = await import("./cli-self-update");
+    const inFlightSwap = cliSwapInFlight();
+    if (inFlightSwap === null) return;
+    await Promise.race([
+      inFlightSwap,
+      new Promise((resolve) => setTimeout(resolve, CLI_SWAP_DRAIN_WAIT_MS)),
+    ]);
+  } catch {
+    // best-effort — the drain must not be gated on a broken import
   }
 };
 
@@ -466,7 +771,13 @@ export type TSelfUpdateOutcome =
   | { readonly kind: "updated" }
   | {
       readonly kind: "failed";
-      readonly stage: "download" | "checksum" | "write" | "probe" | "rejected";
+      readonly stage:
+        | "download"
+        | "checksum"
+        | "write"
+        | "probe"
+        | "probe-inconclusive"
+        | "rejected";
       readonly detail?: string;
     }
   /**
@@ -498,19 +809,32 @@ export const applyDaemonSelfUpdate = async (args: {
   readonly origin: string;
   readonly maxBytes?: number;
   readonly probeVersion?: (path: string) => Promise<string | null>;
+  /**
+   * Test seam: a full verdict probe (default `probeBinaryVerdict`). Present
+   * so a regression can simulate a kill/timeout — `probeVersion` (string or
+   * null) cannot express "inconclusive".
+   */
+  readonly probeVerdict?: (
+    path: string,
+    flag: "--version" | "--self-test",
+  ) => Promise<TBinaryProbeVerdict>;
+  /** Test seam: shorten the probe bound instead of waiting 10 s. */
+  readonly probeTimeoutMs?: number;
+  /** Test seam: tighten the download stall/total/connect bounds. */
+  readonly download?: TDownloadBounds & { readonly connectMs?: number };
 }): Promise<TSelfUpdateOutcome> => {
   const { dest, latest, target, origin } = args;
   const maxBytes = args.maxBytes ?? MAX_BINARY_BYTES;
-  const probe =
-    args.probeVersion ??
-    ((path: string): Promise<string | null> =>
-      runCapture([path, "--version"], undefined, {
-        kind: "probe",
-        probe: true,
-        timeoutMs: VERSION_PROBE_TIMEOUT_MS,
-        maxBytes: VERSION_PROBE_MAX_BYTES,
-      }));
-  const tmp = join(dirname(dest), `.openllmd.update.${process.pid}.tmp`);
+  const verdictProbe =
+    args.probeVerdict ??
+    ((path: string, flag: "--version" | "--self-test") =>
+      probeBinaryVerdict(path, flag, { timeoutMs: args.probeTimeoutMs }));
+  // FSS-16: unique staging name (UP-1-safe) + sweep temps a dead updater left.
+  sweepStaleUpdateTemps(dirname(dest));
+  const tmp = join(
+    dirname(dest),
+    `.openllmd.update.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+  );
   try {
     const base = `${origin}/api/daemon/binary/${target}`;
     // The tiny digest fetch comes FIRST: the advertised artifact sha256 is
@@ -519,7 +843,7 @@ export const applyDaemonSelfUpdate = async (args: {
     // already proven bad).
     let expected: string;
     try {
-      expected = await fetchDigest(`${base}.sha256`);
+      expected = await fetchDigest(`${base}.sha256`, args.download);
     } catch (err) {
       recordAttempt("daemon", latest, {
         digest:
@@ -552,7 +876,7 @@ export const applyDaemonSelfUpdate = async (args: {
     }
     let bin: Buffer;
     try {
-      bin = await fetchBinary(base, maxBytes);
+      bin = await fetchBinary(base, maxBytes, args.download);
     } catch (err) {
       recordAttempt("daemon", latest, { digest: expected });
       if (err instanceof DeterministicArtifactError) {
@@ -582,6 +906,9 @@ export const applyDaemonSelfUpdate = async (args: {
     try {
       writeFileSync(tmp, bin, { mode: 0o755 });
       chmodSync(tmp, 0o755); // force mode regardless of umask
+      // FSS-18: fsync the staged bytes BEFORE the rename — the swap is only
+      // durable if the file's contents are on stable storage first.
+      fsyncFileSync(tmp);
     } catch (err) {
       recordAttempt("daemon", latest, { digest: expected });
       return {
@@ -593,26 +920,56 @@ export const applyDaemonSelfUpdate = async (args: {
     // Sign/dequarantine BEFORE the probe so the staged binary can exec on
     // Apple Silicon (unsigned arm64 binaries are SIGKILLed on spawn).
     hardenMacBinary(tmp);
-    const out = await probe(tmp);
-    const probed = out?.match(DAEMON_VERSION_OUT)?.[1] ?? null;
-    if (probed !== latest) {
-      // A bad artifact cannot heal by re-downloading the same bytes — it
-      // would loop a ~40 MB download forever. Reject this artifact outright.
-      rejectUpdateVersion("daemon", latest, expected);
-      recordAttempt("daemon", latest, { digest: expected });
-      try {
-        rmSync(tmp, { force: true });
-      } catch {
-        // best-effort temp cleanup
+    if (args.probeVersion !== undefined) {
+      // Legacy contract (tests): a string is the probe output; null is a
+      // completed run that produced no version banner — a deterministic
+      // artifact failure. Timeouts/kills are impossible to express here;
+      // the verdict path below is the production probe.
+      const out = await args.probeVersion(tmp);
+      if (out?.match(DAEMON_VERSION_OUT)?.[1] !== latest) {
+        rejectUpdateVersion("daemon", latest, expected);
+        recordAttempt("daemon", latest, { digest: expected });
+        return {
+          kind: "failed",
+          stage: "probe",
+          detail:
+            out === null
+              ? "binary did not run"
+              : `expected v${latest}, got ${out.trim().slice(0, 200)}`,
+        };
       }
-      return {
-        kind: "failed",
-        stage: "probe",
-        detail:
-          out === null
-            ? "binary did not run"
-            : `expected v${latest}, got ${out.trim().slice(0, 200)}`,
-      };
+    } else {
+      const verdict = await verdictProbe(tmp, "--version");
+      if (verdict.kind === "inconclusive") {
+        // UP-2/TD-5: the probe never judged the bytes (timeout, drain kill,
+        // broken probe environment) — record the try and back off, but do
+        // NOT reject the artifact. A good release must not be convicted by
+        // an unreliable probe.
+        recordAttempt("daemon", latest, { digest: expected });
+        return {
+          kind: "failed",
+          stage: "probe-inconclusive",
+          detail: verdict.detail,
+        };
+      }
+      const probed =
+        verdict.kind === "ok"
+          ? (verdict.out.match(DAEMON_VERSION_OUT)?.[1] ?? null)
+          : null;
+      if (probed !== latest) {
+        // A bad artifact cannot heal by re-downloading the same bytes — it
+        // would loop a ~40 MB download forever. Reject this artifact outright.
+        rejectUpdateVersion("daemon", latest, expected);
+        recordAttempt("daemon", latest, { digest: expected });
+        return {
+          kind: "failed",
+          stage: "probe",
+          detail:
+            verdict.kind === "failed"
+              ? `binary did not run: ${verdict.detail}`
+              : `expected v${latest}, got ${verdict.out.slice(0, 200)}`,
+        };
+      }
     }
     // Keep the working binary next to the new one (`<dest>.prev`) so a
     // post-swap crash loop can roll back (see `boot-guard.ts`). Written via
@@ -623,11 +980,6 @@ export const applyDaemonSelfUpdate = async (args: {
       // Backup failed — do NOT swap without a rollback path (TCB-3): a bad
       // publish would crash-loop with no recovery. Record + back off.
       recordAttempt("daemon", latest, { digest: expected });
-      try {
-        rmSync(tmp, { force: true });
-      } catch {
-        // best-effort temp cleanup
-      }
       return {
         kind: "failed",
         stage: "write",
@@ -637,21 +989,27 @@ export const applyDaemonSelfUpdate = async (args: {
       };
     }
     renameSync(tmp, dest); // atomic on POSIX; running process keeps old inode
+    // FSS-18: fsync the directory so the rename's dirent survives a crash —
+    // otherwise power loss could resurrect the old binary (or lose both).
+    fsyncDirBestEffort(dirname(dest));
     hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
     recordAttempt("daemon", latest, { digest: expected });
     return { kind: "updated" };
   } catch (err) {
     recordAttempt("daemon", latest);
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // best-effort temp cleanup
-    }
     return {
       kind: "failed",
       stage: "write",
       detail: err instanceof Error ? err.message : String(err),
     };
+  } finally {
+    // FSS-16: no staging temp survives ANY exit path — success (renamed away),
+    // probe failure, backup failure, or an unexpected throw mid-pipeline.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // best-effort temp cleanup
+    }
   }
 };
 
@@ -758,6 +1116,10 @@ export const maybeSelfUpdate = async (
           `updated ${DAEMON_VERSION} → ${latest}; restarting when idle`,
         );
         await waitUntilIdle();
+        // UP-3: let a concurrent CLI converge finish its swap region before
+        // the drain — its probe holds a task lease, but its remaining swap
+        // work must still land before this process exits.
+        await waitForCliSwapRegion();
         // The binary has already swapped; bounded cleanup must not prevent the exit
         // that lets launchd/systemd start the replacement daemon.
         await drainDisposableChildren();
@@ -783,6 +1145,14 @@ export const maybeSelfUpdate = async (
         logError(
           "self-update",
           `downloaded v${latest} failed its pre-swap --version check (${outcome.detail ?? "unknown"}) — rejected; ${manualUpdateRemedy(origin)}`,
+          { target, latest },
+        );
+      } else if (outcome.stage === "probe-inconclusive") {
+        // TD-5/UP-2: a transient probe (timeout/kill/env) — attempt recorded,
+        // backoff applied, artifact NOT rejected. Not an error.
+        logWarn(
+          "self-update",
+          `pre-swap probe of v${latest} was inconclusive (${outcome.detail ?? "unknown"}) — backing off without rejecting the artifact`,
           { target, latest },
         );
       } else {
