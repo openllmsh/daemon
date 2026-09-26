@@ -7,8 +7,15 @@
  * off-box. These helpers feed the LOCAL runner + the local usage panel
  * only.
  */
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
+import { connect } from "node:net";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type { TDoctorEventTimings } from "@openllmsh/protocol";
@@ -1584,9 +1591,10 @@ export type TOpenerArgvDeps = {
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Path of the launcher script {@link writeOpenerScript} produced. The URL
    *  rides in the script CONTENT (mode 0600 under the daemon's private tmp
-   *  dir), never in argv — `ps`, the transient unit's ExecStart and journald
-   *  would each keep a copy of an argv-carried URL (S4R-1). Required on
-   *  darwin/linux; without it no safe POSIX opener exists. */
+   *  dir), never in argv — `ps`, the transient unit's ExecStart, journald and
+   *  the Windows process command line would each keep a copy of an
+   *  argv-carried URL (S4R-1). Required on every OS; without it no safe
+   *  opener exists. */
   readonly scriptPath?: string;
 };
 
@@ -1600,27 +1608,137 @@ const shSingleQuoted = (value: string): string =>
   `'${value.replaceAll("'", "'\\''")}'`;
 
 /**
- * Write the launcher script a POSIX browser-open runs so the URL never sits
- * in process argv (S4R-1): `rm -f -- "$0"` deletes the script BEFORE `exec`
- * hands off to the opener, so the sign-in URL persists neither in the
- * transient unit's metadata / `ps` output nor as a leftover file. Written
- * 0600 under `dir` — the daemon's private tmp root by default — so only the
- * daemon's uid can read it for the brief window it exists. Returns the script
- * path, or null when the write failed (the caller then logs the URL for a
- * manual open).
+ * Escape a URL for a `cmd.exe` batch line. `"`, CR and LF become percent
+ * escapes — they could otherwise break out of the quoted argument or split
+ * the line into a second command. Every `%` then doubles: batch expands `%`
+ * even inside double quotes, so a `%20` in an OAuth URL would otherwise lose
+ * bytes to parameter expansion.
+ */
+const cmdQuotedUrl = (url: string): string =>
+  url
+    .replaceAll('"', "%22")
+    .replaceAll("\r", "%0D")
+    .replaceAll("\n", "%0A")
+    .replaceAll("%", "%%");
+
+/** Which launcher file {@link writeOpenerScript} writes. `open`/`xdg-open`
+ *  produce a POSIX `sh` script; `cmd` produces a Windows batch file whose
+ *  `start` builtin opens the URL (cmd has no sh to hand off to). */
+export type TOpenerScriptKind = "open" | "xdg-open" | "cmd";
+
+const openerScriptContent = (kind: TOpenerScriptKind, url: string): string => {
+  if (kind === "cmd") {
+    // `start` returns as soon as the browser launch is queued; the `(goto)`
+    // idiom then ends the batch WITHOUT the "batch file cannot be found"
+    // error a trailing `del "%~f0"` would print, while `&` still runs the
+    // self-delete. CRLF line endings: `goto` misbehaves on LF-only batches.
+    return `@echo off\r\nstart "" "${cmdQuotedUrl(url)}"\r\n(goto) 2>nul & del /f /q "%~f0"\r\n`;
+  }
+  // `rm -f -- "$0"` deletes the script BEFORE `exec` hands off to the opener,
+  // so the sign-in URL persists neither in the transient unit's metadata /
+  // `ps` output nor as a leftover file.
+  return `#!/bin/sh\nrm -f -- "$0"\nexec ${kind} ${shSingleQuoted(url)}\n`;
+};
+
+/** Launcher filenames carry this prefix so a sweep can find exactly the files
+ *  we wrote — nothing else under the daemon tmp dir matches it. */
+const OPENER_SCRIPT_PREFIX = "openllm-open-";
+
+const isOpenerScriptName = (name: string): boolean =>
+  (name.startsWith(OPENER_SCRIPT_PREFIX) &&
+    (name.endsWith(".sh") || name.endsWith(".cmd"))) ||
+  // The launcher's pre-rename `open-*.sh` name — same private dir, same job;
+  // a daemon that ran the older build may still hold one.
+  (name.startsWith("open-") && name.endsWith(".sh"));
+
+/**
+ * A launcher older than this can only come from a queued transient unit that
+ * never ran or a killed opener — `systemd-run` hands the script to the user
+ * manager within seconds, so this bound is generous. Anything fresher belongs
+ * to an open that is still in flight and must be left alone.
+ */
+export const OPENER_SCRIPT_STALE_MS = 10 * 60_000;
+
+/**
+ * Grace window between spawning the opener and the backstop delete. A unit
+ * that runs self-deletes the script long before this; a unit that failed to
+ * start leaves it, and {@link armOpenerScriptCleanup} removes it once this
+ * window passes — bounded residue, never a permanent file.
+ */
+export const OPENER_SCRIPT_GRACE_MS = 120_000;
+
+/**
+ * Remove launcher scripts older than {@link OPENER_SCRIPT_STALE_MS} from `dir`
+ * (bounded stale-launcher cleanup). One directory listing; only files with
+ * the launcher prefix are touched. Never throws — a missed file waits for the
+ * next open's sweep or the armed timer.
+ */
+export const sweepStaleOpenerScripts = (
+  dir: string = daemonTempDir(),
+  now: number = Date.now(),
+): void => {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!isOpenerScriptName(name)) continue;
+    try {
+      if (now - statSync(join(dir, name)).mtimeMs <= OPENER_SCRIPT_STALE_MS)
+        continue;
+      rmSync(join(dir, name), { force: true });
+    } catch {
+      // best-effort — a raced-away or busy file is retried on the next open
+    }
+  }
+};
+
+/**
+ * Schedule the backstop delete of a launcher script (the asynchronous
+ * unit-failure cleanup path). `systemd-run --user --no-block` can exit 0 for
+ * a start job that then fails BEFORE `/bin/sh` runs — the script's
+ * self-delete never executes and the URL-bearing file would sit in daemon
+ * state indefinitely. The unref'd timer removes it after
+ * {@link OPENER_SCRIPT_GRACE_MS}; a unit that did run already self-deleted,
+ * so the delete is then a harmless no-op. Never holds the process open.
+ */
+export const armOpenerScriptCleanup = (
+  scriptPath: string,
+  delayMs: number = OPENER_SCRIPT_GRACE_MS,
+): void => {
+  setTimeout(() => {
+    try {
+      rmSync(scriptPath, { force: true });
+    } catch {
+      // best-effort — the next open's sweep still catches a leftover
+    }
+  }, delayMs).unref();
+};
+
+/**
+ * Write the launcher script a browser-open runs so the URL never sits in
+ * process argv (S4R-1): POSIX gets a self-deleting 0600 `sh` script, Windows
+ * a self-deleting `.cmd` batch — in both cases only the script PATH reaches
+ * argv. Written under `dir` — the daemon's private tmp root by default — so
+ * only the daemon's uid can read it for the brief window it exists, and a
+ * stale-launcher sweep runs first so failed predecessors cannot accumulate.
+ * Returns the script path, or null when the write failed (the caller then
+ * logs the URL for a manual open).
  */
 export const writeOpenerScript = (
-  opener: "open" | "xdg-open",
+  opener: TOpenerScriptKind,
   url: string,
   dir: string = daemonTempDir(),
 ): string | null => {
   try {
-    const path = join(dir, `open-${randomUnitSuffix()}.sh`);
-    writeFileSync(
-      path,
-      `#!/bin/sh\nrm -f -- "$0"\nexec ${opener} ${shSingleQuoted(url)}\n`,
-      { mode: 0o600 },
+    sweepStaleOpenerScripts(dir);
+    const path = join(
+      dir,
+      `${OPENER_SCRIPT_PREFIX}${randomUnitSuffix()}${opener === "cmd" ? ".cmd" : ".sh"}`,
     );
+    writeFileSync(path, openerScriptContent(opener, url), { mode: 0o600 });
     return path;
   } catch {
     return null;
@@ -1628,20 +1746,60 @@ export const writeOpenerScript = (
 };
 
 /**
+ * Bound on the user-manager socket probe. A unix connect completes or refuses
+ * immediately; the timer only guards a pathological kernel stall so a login
+ * can never hang on the check.
+ */
+export const SYSTEMD_PROBE_TIMEOUT_MS = 500;
+
+/** True only when a unix socket at `path` accepts a connection — i.e. a live
+ *  listener, not a stale socket file or a planted regular file. */
+const unixSocketAccepts = (path: string, timeoutMs: number): Promise<boolean> =>
+  new Promise((resolve) => {
+    let socket: ReturnType<typeof connect>;
+    try {
+      // `connect` throws synchronously on a path over the AF_UNIX limit, so a
+      // long XDG_RUNTIME_DIR must yield "unreachable", not a rejection.
+      socket = connect(path);
+    } catch {
+      resolve(false);
+      return;
+    }
+    const finish = (ok: boolean): void => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref();
+    socket.unref();
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+
+/**
  * Is a systemd USER manager reachable? `INVOCATION_ID` only proves the daemon
  * itself is supervised — `systemd-run --user` can still fail asynchronously
  * when no user manager instance is running (e.g. a system-scope service), so
  * probing it is the actual gate (S4R-2). The manager's private control socket
  * at `$XDG_RUNTIME_DIR/systemd/private` is exactly what `systemd-run --user`
- * talks to: absent → the attempt is certainly doomed and the caller prints the
- * URL instead; present → the manager is up. Pure check, no subprocess.
+ * talks to. Pathname existence is NOT proof — a crashed manager leaves a
+ * stale socket file and anything can plant a regular file there — so the path
+ * must stat as a socket AND accept a connection. Refused/timeout → the
+ * attempt is certainly doomed and the caller prints the URL instead.
  */
-export const systemdUserManagerPresent = (
+export const systemdUserManagerPresent = async (
   env: Readonly<Record<string, string | undefined>> = process.env,
-): boolean => {
+): Promise<boolean> => {
   const xdg = env.XDG_RUNTIME_DIR;
   if (typeof xdg !== "string" || xdg.length === 0) return false;
-  return existsSync(join(xdg, "systemd", "private"));
+  const socketPath = join(xdg, "systemd", "private");
+  try {
+    if (!statSync(socketPath).isSocket()) return false;
+  } catch {
+    return false;
+  }
+  return unixSocketAccepts(socketPath, SYSTEMD_PROBE_TIMEOUT_MS);
 };
 
 /**
@@ -1672,20 +1830,27 @@ export const systemdUserManagerPresent = (
  * is no out-of-unit launcher, so the caller prints the URL instead of spawning
  * a doomed child. macOS `open` is already out-of-process (it hands the URL to
  * LaunchServices; the browser is never our child). Windows `start` is a `cmd`
- * builtin — the empty "" is the required window-title arg and quoting keeps
- * an OAuth `&` from splitting. Windows has no POSIX-sh hand-off and ships no
- * build in this release, so its argv keeps the URL.
+ * builtin, so a `.cmd` launcher batch is the no-argv hand-off there —
+ * `cmd /d /c <file>` runs the script and only the script PATH ever sits in
+ * argv. `/d` skips the AutoRun hook; `%`-doubling inside the batch keeps an
+ * OAuth `%20` intact (`cmdQuotedUrl`).
  */
 export const openerArgv = (
-  url: string,
+  // The URL rides in `deps.scriptPath` content, never in argv — the parameter
+  // stays so the call sites and the "no argv element carries it" tests keep
+  // their shape.
+  _url: string,
   os: NodeJS.Platform = process.platform,
   underSystemd: boolean,
   deps?: TOpenerArgvDeps,
 ): string[] | null => {
-  if (os === "win32") return ["cmd", "/c", "start", "", `"${url}"`];
+  const scriptPath = deps?.scriptPath;
+  if (os === "win32") {
+    if (scriptPath === undefined) return null;
+    return ["cmd", "/d", "/c", scriptPath];
+  }
   if (os !== "darwin" && os !== "linux") return null;
   if (os === "linux" && !underSystemd) return null;
-  const scriptPath = deps?.scriptPath;
   if (scriptPath === undefined) return null;
   if (os === "darwin") return ["/bin/sh", scriptPath];
   const openerEnv = browserOpenerEnv(deps?.env ?? process.env);
@@ -1706,31 +1871,28 @@ export const openerArgv = (
 };
 
 /**
- * Best-effort open a URL in the user's default browser (macOS `open`, Windows
- * `cmd /c start`, else a transient `systemd-run --user` SERVICE running
- * `xdg-open` under systemd — see {@link openerArgv}). Used by the browser /
- * device-code login flows to bring up the vendor's auth page FROM the daemon
- * — some vendor CLIs print the URL but their own auto-open doesn't reach the
- * user's GUI session when the daemon spawns them (e.g. codex). Never throws;
- * the user can copy the URL from the card, and when no safe launcher exists
- * the URL is logged.
+ * The async body of {@link openUrl}: probe the manager, write the launcher,
+ * spawn it, arm the backstop cleanup. Never throws — every failure path ends
+ * in the manual-open log.
  */
-export const openUrl = (url: string): void => {
-  // Never launch a real browser under the test runner (`bun test` sets
-  // NODE_ENV=test) — a device/browser login test that reaches this line would
-  // otherwise pop a tab on the developer's machine. Production is unaffected.
-  if (process.env.NODE_ENV === "test") return;
+const openUrlBestEffort = async (url: string): Promise<void> => {
   const os = platform();
   // Probe the systemd USER MANAGER itself, not INVOCATION_ID (S4R-2): the var
   // only proves we are supervised, while `systemd-run --user` fails
   // asynchronously — silently, after this function returns — when no user
-  // manager is running. The socket check is the same endpoint systemd-run
-  // would dial, so it is the honest gate.
-  const userManager = os === "linux" && systemdUserManagerPresent(process.env);
-  // The URL rides in a self-deleting 0600 launcher script, never argv (S4R-1).
+  // manager is running. The probe connects to the same socket systemd-run
+  // would dial, so a stale socket file or a planted regular file still reads
+  // as "no manager" and takes the manual-open fallback.
+  const userManager =
+    os === "linux" && (await systemdUserManagerPresent(process.env));
+  // The URL rides in a self-deleting 0600 launcher script, never argv (S4R-1):
+  // an `sh` script on POSIX, a `.cmd` batch on Windows.
   const scriptPath =
-    os === "darwin" || (os === "linux" && userManager)
-      ? writeOpenerScript(os === "darwin" ? "open" : "xdg-open", url)
+    os === "win32" || os === "darwin" || (os === "linux" && userManager)
+      ? writeOpenerScript(
+          os === "win32" ? "cmd" : os === "darwin" ? "open" : "xdg-open",
+          url,
+        )
       : null;
   const argv = openerArgv(url, os, userManager, {
     env: process.env,
@@ -1766,6 +1928,11 @@ export const openUrl = (url: string): void => {
           ? childEnvironment(process.env)
           : browserOpenerEnv(process.env),
     });
+    // `systemd-run --no-block` can exit 0 for a start job that then fails
+    // BEFORE the script runs — self-delete never executes and the URL-bearing
+    // file would persist indefinitely. The backstop timer removes it after the
+    // grace window; the per-write sweep bounds anything older.
+    if (scriptPath !== null) armOpenerScriptCleanup(scriptPath);
     // A spawned-but-failed opener (systemd-run rejects, `open` exits nonzero)
     // is otherwise invisible — surface the manual-open fallback explicitly so
     // the "no browser opened" report has a cause (S4R-2). Fire-and-forget: the
@@ -1803,4 +1970,24 @@ export const openUrl = (url: string): void => {
       { url },
     );
   }
+};
+
+/**
+ * Best-effort open a URL in the user's default browser — a self-deleting
+ * launcher script run by macOS `open`, Windows `cmd`, or a transient
+ * `systemd-run --user` SERVICE running `xdg-open` under systemd (see
+ * {@link openerArgv}). Used by the browser / device-code login flows to bring
+ * up the vendor's auth page FROM the daemon — some vendor CLIs print the URL
+ * but their own auto-open doesn't reach the user's GUI session when the
+ * daemon spawns them (e.g. codex). Fire-and-forget and never throws: the user
+ * can copy the URL from the card, and when no safe launcher exists the URL is
+ * logged.
+ */
+export const openUrl = (url: string): void => {
+  // Never launch a real browser under the test runner (`bun test` sets
+  // NODE_ENV=test) — a device/browser login test that reaches this line would
+  // otherwise pop a tab on the developer's machine. Production is unaffected.
+  if (process.env.NODE_ENV === "test") return;
+  // The manager probe is async; the login flow does not wait on a browser.
+  void openUrlBestEffort(url).catch(() => {});
 };
