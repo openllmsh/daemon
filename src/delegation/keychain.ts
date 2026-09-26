@@ -36,10 +36,22 @@
  * empty-password drift self-heals once (rename-aside + recreate); a chain
  * that still can't unlock is negative-cached so it stops re-prompting.
  * See docs/plan/2026-08-22-daemon-keychain-gui-prompt-wedge-fix.md.
+ *
+ * ── Path permissions (FSS-11) ─────────────────────────────────────────
+ * The chain's password is "" by design, so the filesystem modes on its path
+ * are the only barrier against another local macOS account copying the
+ * file and opening it. Every dir from the daemon state dir down to
+ * `Library/Keychains` is created 0700 and every file in the Keychains dir
+ * is forced 0600. `repairIsolatedKeychainPermissions` re-checks the modes
+ * on every readiness probe and readiness fails closed while the path
+ * cannot be proven private.
  */
 import { randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   opendirSync,
   readFileSync,
@@ -50,7 +62,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { superviseSpawn } from "../child-supervisor";
 import type { TDeadlineBudget } from "../deadline-budget";
 import {
@@ -59,6 +71,7 @@ import {
   splitReapBudget,
   waitUntilExpired,
 } from "../deadline-budget";
+import { stateDir } from "../env";
 import {
   logDebug,
   logError,
@@ -1046,6 +1059,141 @@ const removeOwnedPath = (path: string): void => {
   } catch {}
 };
 
+// ── FSS-11: path permissions ────────────────────────────────────────────
+// The isolated chain unlocks with password "" by design. The only thing
+// that stops another local account from copying the file and opening it is
+// the filesystem mode on its path. macOS home dirs let the `staff` group
+// traverse them, so every dir from the daemon state dir down to
+// `Library/Keychains` must be 0700 and every file in the Keychains dir must
+// be 0600. Older installs created these with the umask (0755) and never
+// chmodded the file, so the modes are also repaired on every probe.
+
+/** Required mode for every directory on the isolated-keychain path. */
+const KEYCHAIN_DIR_MODE = 0o700;
+/** Required mode for the keychain file and every sibling file in the
+ *  Keychains dir. Parked backups and broken asides hold credentials too. */
+const KEYCHAIN_FILE_MODE = 0o600;
+const KEYCHAIN_PERM_MASK = 0o777;
+const STICKY_BIT = 0o1000;
+
+/** Homes whose permissions were repaired at least once this process. The
+ *  info line is a boot breadcrumb, not a per-call record. */
+const permRepairLogged = new Set<string>();
+
+const logPermRepairOnce = (home: string, changed: number): void => {
+  if (permRepairLogged.has(home)) return;
+  permRepairLogged.add(home);
+  logInfo("keychain", "repaired isolated keychain path permissions", {
+    keychain_home: home,
+    fixed_entries: changed,
+  });
+};
+
+/** `realpathSync` that still resolves the existing prefix when the leaf (or
+ *  several trailing components) does not exist yet. The isolated home and
+ *  the state dir may be absent on a fresh install. */
+const canonicalPath = (path: string): string => {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    if (parent === path) return path;
+    return join(canonicalPath(parent), basename(path));
+  }
+};
+
+/** Every directory that must be 0700 for the isolated chain to stay
+ *  private: `home`, its `Library` children, and — only when `home` lives
+ *  under the daemon state dir — the `cli/<provider>` chain and the state
+ *  dir itself. A `home` outside the state dir repairs `home` and below
+ *  only; foreign ancestors (`/tmp`, `/var`) are never touched. Canonical
+ *  forms are listed too so a symlinked component still lands on the real
+ *  target. */
+const protectedKeychainDirs = (home: string): string[] => {
+  const dirs = new Set<string>();
+  const canonHome = canonicalPath(home);
+  for (const base of new Set([home, canonHome])) {
+    dirs.add(base);
+    dirs.add(join(base, "Library"));
+    dirs.add(dirname(isolatedKeychainPath(base)));
+    dirs.add(dirname(domainPrefsPath(base)));
+  }
+  const stateRoot = canonicalPath(stateDir());
+  for (let cursor = dirname(canonHome); cursor !== dirname(cursor); ) {
+    if (cursor === stateRoot) {
+      dirs.add(cursor);
+      break;
+    }
+    if (!cursor.startsWith(`${stateRoot}/`)) break;
+    dirs.add(cursor);
+    cursor = dirname(cursor);
+  }
+  return [...dirs];
+};
+
+/** Force every existing dir on the keychain path to 0700 and every file in
+ *  the Keychains dir to 0600. Skips absent paths and non-directories, so a
+ *  planted symlink never redirects a chmod onto a foreign target. A sticky
+ *  dir on the path is shared space (like `/tmp`) — the chain must not live
+ *  there, so it fails closed instead of chmodding a dir that is not ours.
+ *  Returns false when the path cannot be proven private; the caller must
+ *  not stage or unlock a credential another account could copy. */
+const repairIsolatedKeychainPermissions = (home: string): boolean => {
+  if (!isAbsolute(home)) return false;
+  // The real user home is never a valid isolated keychain home. Refuse
+  // before any chmod can touch it.
+  if (canonicalPath(home) === canonicalPath(homedir())) return false;
+  let ok = true;
+  let changed = 0;
+  for (const dir of protectedKeychainDirs(home)) {
+    let st: Stats;
+    try {
+      st = lstatSync(dir);
+    } catch (err) {
+      if (classifyStatError(err) !== "absent") ok = false;
+      continue;
+    }
+    if (!st.isDirectory()) continue;
+    if ((st.mode & STICKY_BIT) !== 0) {
+      ok = false;
+      continue;
+    }
+    if ((st.mode & KEYCHAIN_PERM_MASK) === KEYCHAIN_DIR_MODE) continue;
+    try {
+      chmodSync(dir, KEYCHAIN_DIR_MODE);
+      changed++;
+    } catch {
+      ok = false;
+    }
+  }
+  const keychainsDir = dirname(isolatedKeychainPath(canonicalPath(home)));
+  try {
+    for (const name of boundedDirNames(keychainsDir)) {
+      const file = join(keychainsDir, name);
+      try {
+        const st = lstatSync(file);
+        if (!st.isFile()) continue;
+        if ((st.mode & KEYCHAIN_PERM_MASK) === KEYCHAIN_FILE_MODE) continue;
+        chmodSync(file, KEYCHAIN_FILE_MODE);
+        changed++;
+      } catch (err) {
+        if (classifyStatError(err) !== "absent") ok = false;
+      }
+    }
+  } catch (err) {
+    if (classifyStatError(err) !== "absent") ok = false;
+  }
+  if (changed > 0) logPermRepairOnce(home, changed);
+  if (!ok) {
+    warnKeychainOnce(
+      `perm-unsafe:${home}`,
+      "isolated keychain path permissions are unsafe and could not be repaired; refusing to use the chain",
+      { keychain_home: home },
+    );
+  }
+  return ok;
+};
+
 type TPreparedStaging = {
   readonly path: string;
   readonly unlocked: boolean;
@@ -1059,10 +1207,12 @@ const prepareStagingKeychain = async (
   signal?: AbortSignal,
 ): Promise<TPreparedStaging | null> => {
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: KEYCHAIN_DIR_MODE });
   } catch {
     return null;
   }
+  // FSS-11: refuse to stage a chain on a path that is not private.
+  if (!repairIsolatedKeychainPermissions(home)) return null;
   sweepOwnedStaging(dir);
   const staging = ownedStagingPath(dir);
   const created = await runSecurity(
@@ -1115,6 +1265,13 @@ const createIsolatedKeychain = async (
     removeOwnedPath(prepared.path);
     return existsSync(kc);
   }
+  try {
+    // The staging file keeps the mode `create-keychain` gave it. Force 0600 —
+    // the "" password makes a world-readable chain file a credential leak.
+    chmodSync(kc, KEYCHAIN_FILE_MODE);
+  } catch {
+    return false;
+  }
   return (
     existsSync(kc) &&
     (await runSecurity(["unlock-keychain", "-p", "", kc], home, signal))
@@ -1154,6 +1311,7 @@ const recreateIsolatedKeychain = async (
       originalMoved = true;
     }
     renameSync(prepared.path, kc);
+    chmodSync(kc, KEYCHAIN_FILE_MODE);
   } catch {
     removeOwnedPath(prepared.path);
     if (originalMoved && !existsSync(kc)) {
@@ -1271,7 +1429,9 @@ const ensureDomainKeychainConfig = async (
     // Sync fs on purpose: callers of `ensureKeychainReady` may await the op
     // from a resolved-promise poll loop that never yields to the event loop —
     // an `fs/promises` await here would starve them (and us).
-    mkdirSync(dirname(domainPrefsPath(home)), { recursive: true });
+    const prefsDir = dirname(domainPrefsPath(home));
+    mkdirSync(prefsDir, { recursive: true, mode: KEYCHAIN_DIR_MODE });
+    chmodSync(prefsDir, KEYCHAIN_DIR_MODE);
   } catch {
     return false;
   }
@@ -1751,6 +1911,12 @@ const ensureKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // FSS-11: the "" password makes path modes the only barrier to other local
+  // accounts. Repair first and fail closed while the path cannot be proven
+  // private — never stage or unlock a credential another account could copy.
+  if (!repairIsolatedKeychainPermissions(home)) {
+    return noteTransientFailure(kc, "keychain_permissions_unsafe");
+  }
   // Migrate (or disarm) the pre-2.8 login-named chain before probing `kc`.
   // A failed migration must NOT fall through to create/unlock — the daemon
   // would front an EMPTY canonical chain while the credentials sit parked in
@@ -1845,6 +2011,12 @@ export const ensureKeychainReady = async (
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
     if (skipEligible(kc) && domainConfiguredFor(kc)) {
+      // The fast path still enforces FSS-11: a mode regression between probes
+      // must not hand out a chain another account could read.
+      if (!repairIsolatedKeychainPermissions(home)) {
+        invalidateUnlockSkip(kc);
+        return { kind: "indeterminate", cause: "keychain_permissions_unsafe" };
+      }
       keychainCounters.skipped++;
       return READY;
     }
@@ -1861,6 +2033,11 @@ export const ensureKeychainReady = async (
         return ensureKeychainNow(home, kc);
       })();
       if (ready.kind !== "present") return ready;
+      // The promote path bypassed `ensureKeychainNow`'s FSS-11 gate — check
+      // the modes here so no `present` ever stands on an unprotected path.
+      if (!repairIsolatedKeychainPermissions(home)) {
+        return noteTransientFailure(kc, "keychain_permissions_unsafe");
+      }
       // `present` also gates VENDOR spawns — and a vendor CLI resolves the
       // chain through the isolated HOME's search list + default keychain, not
       // by path. An unlocked-but-unconfigured chain would land it on the
@@ -1905,6 +2082,11 @@ const observeKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // FSS-11: repair path modes before even reporting readiness — a present
+  // verdict must never stand on a chain another account could read.
+  if (!repairIsolatedKeychainPermissions(home)) {
+    return noteObserveTransientFailure(kc, "keychain_permissions_unsafe");
+  }
   if (!existsSync(kc)) {
     return { kind: "indeterminate", cause: "keychain_absent" };
   }
@@ -1946,6 +2128,10 @@ export const observeKeychainReady = async (
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
     if (skipEligible(kc) && domainConfiguredFor(kc)) {
+      if (!repairIsolatedKeychainPermissions(home)) {
+        invalidateUnlockSkip(kc);
+        return { kind: "indeterminate", cause: "keychain_permissions_unsafe" };
+      }
       keychainCounters.skipped++;
       return READY;
     }
@@ -1958,6 +2144,9 @@ export const observeKeychainReady = async (
         return observeKeychainNow(home, kc);
       })();
       if (ready.kind !== "present") return ready;
+      if (!repairIsolatedKeychainPermissions(home)) {
+        return noteObserveTransientFailure(kc, "keychain_permissions_unsafe");
+      }
       if (domainConfiguredFor(kc)) return ready;
       return noteObserveTransientFailure(kc, "keychain_unconfigured");
     })().finally(() => {
@@ -1991,6 +2180,7 @@ export const resetKeychainStateForTests = (): void => {
   securitySpawnSetupHookForTests = null;
   lastSecurityTimerMsForTests = null;
   keychainWarnedOnce.clear();
+  permRepairLogged.clear();
 };
 
 /**
