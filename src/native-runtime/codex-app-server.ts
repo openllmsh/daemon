@@ -48,6 +48,11 @@ const RPC_TIMEOUT_MS = 30_000;
 const POST_COMMIT_IDLE_TIMEOUT_MS = 60_000;
 /** Watchdog tick for the post-commit idle check. */
 const IDLE_WATCHDOG_TICK_MS = 1_000;
+/** Bound on waiting for a superseded child's `whenReleased` before a respawn.
+ *  A confirmed reap settles it in ms; an unconfirmed reap stays pending while
+ *  the supervisor keeps watching — respawn must not pin on a wedged group,
+ *  since route() drops the stale pump's stragglers regardless. */
+const RESPAWN_RELEASE_WAIT_MS = 5_000;
 
 type TJsonRpcId = number;
 type TInbound = {
@@ -108,6 +113,10 @@ class CodexAppServerClient {
   private child: TSupervisedChild | null = null;
   private stdin: { write: (s: string) => void; flush?: () => void } | null =
     null;
+  /** Release promise of the most recently superseded child (exit teardown or
+   *  failed-init detach). The next start() waits for it first so the stale
+   *  stdout pump has finished draining before a successor is born. */
+  private supersededRelease: Promise<TReapOutcome> | null = null;
 
   constructor(
     private readonly bin: string,
@@ -130,6 +139,29 @@ class CodexAppServerClient {
   }
 
   private async start(): Promise<void> {
+    // Let a superseded child fully release before respawning: its pump drains
+    // stdout to EOF, and a detached pipe holder (a launcher grandchild outside
+    // the process group) can keep that pipe open and writing INTO this new
+    // generation. The wait is bounded — a group that survives the reap ladder
+    // leaves `whenReleased` pending, and route() drops stragglers anyway.
+    const priorRelease = this.supersededRelease;
+    this.supersededRelease = null;
+    if (priorRelease !== null) {
+      let waitTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          priorRelease,
+          new Promise<"waited">((resolve) => {
+            waitTimer = setTimeout(
+              () => resolve("waited"),
+              RESPAWN_RELEASE_WAIT_MS,
+            );
+          }),
+        ]);
+      } finally {
+        if (waitTimer !== undefined) clearTimeout(waitTimer);
+      }
+    }
     const child = superviseSpawn(sandboxSpawnArgs([this.bin, "app-server"]), {
       kind: "native-runtime",
       stdin: "pipe",
@@ -144,9 +176,15 @@ class CodexAppServerClient {
       write: (s: string) => void;
       flush?: () => void;
     };
-    void this.pump(proc.stdout as ReadableStream<Uint8Array>).catch(() => {
-      // reader ends on child exit; teardown below handles state
-    });
+    // The pump is tagged with ITS child: frames read after a supersession are
+    // a dead generation's buffered tail and must not be routed (route() also
+    // identity-gates; threads persist across respawns, so a stale frame can
+    // carry a LIVE thread id).
+    void this.pump(proc.stdout as ReadableStream<Uint8Array>, child).catch(
+      () => {
+        // reader ends on child exit; teardown below handles state
+      },
+    );
     // Only the CURRENT child's exit may tear the client down — a stale
     // child's late `exited` (e.g. after an init-failure kill) must not wipe
     // a successor's state.
@@ -167,9 +205,12 @@ class CodexAppServerClient {
     } catch (error) {
       // PL-D4: kill the child we just spawned (TERM→KILL the process group,
       // bounded) — a handshake timeout leaves it alive-but-useless. Detach it
-      // first so its exit doesn't trip the identity-guarded teardown above.
+      // first so its exit doesn't trip the identity-guarded teardown above,
+      // and hand its release to the next start() so the stale pump can't
+      // outlive the respawn.
       this.child = null;
       this.stdin = null;
+      this.supersededRelease = child.whenReleased;
       await child.terminate().catch((): TReapOutcome => "reap_unconfirmed");
       throw error;
     }
@@ -177,6 +218,10 @@ class CodexAppServerClient {
   }
 
   private teardown(reason: string): void {
+    // The exiting child's release goes to the next start(): its pump can out-
+    // live the exit while it drains buffered stdout, so respawn first waits
+    // for the supervisor to confirm the group is gone.
+    const superseded = this.child;
     for (const [, entry] of this.pending) entry.reject(new Error(reason));
     this.pending.clear();
     // Active turns die as "failed" completions — surface WHY server-side; the
@@ -195,6 +240,7 @@ class CodexAppServerClient {
     this.sinks.clear();
     this.stdin = null;
     this.child = null;
+    if (superseded !== null) this.supersededRelease = superseded.whenReleased;
     this.initialized = null; // next request respawns
   }
 
@@ -259,13 +305,23 @@ class CodexAppServerClient {
     this.sinks.delete(threadId);
   }
 
-  private async pump(stdout: ReadableStream<Uint8Array>): Promise<void> {
+  private async pump(
+    stdout: ReadableStream<Uint8Array>,
+    child: TSupervisedChild,
+  ): Promise<void> {
     const decoder = new TextDecoder();
     let buffer = "";
     const reader = stdout.getReader();
     for (;;) {
       const { value, done } = await reader.read();
       if (done) return;
+      // Superseded: this read came from a dead generation. Stop draining
+      // rather than route a stale tail — and rather than read forever a pipe
+      // a detached descendant can hold open past the group reap.
+      if (this.child !== child) {
+        await reader.cancel().catch(() => undefined);
+        return;
+      }
       buffer += decoder.decode(value, { stream: true });
       for (;;) {
         const newline = buffer.indexOf("\n");
@@ -274,7 +330,7 @@ class CodexAppServerClient {
         buffer = buffer.slice(newline + 1);
         if (line.length === 0) continue;
         try {
-          this.route(JSON.parse(line) as TInbound);
+          this.route(JSON.parse(line) as TInbound, child);
         } catch {
           // non-JSON stdout noise — skip
         }
@@ -282,7 +338,12 @@ class CodexAppServerClient {
     }
   }
 
-  private route(message: TInbound): void {
+  private route(message: TInbound, child: TSupervisedChild): void {
+    // Only the CURRENT child's frames may touch pending RPCs or sinks — a
+    // superseded child's drained tail can carry a live thread id (threads
+    // persist and are resumed across respawns) and would corrupt the live
+    // turn or write a refusal into the successor's stdin.
+    if (child !== this.child) return;
     // Response to one of our requests.
     if (message.id !== undefined && message.method === undefined) {
       const entry = this.pending.get(message.id);

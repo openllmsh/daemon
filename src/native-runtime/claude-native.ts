@@ -220,7 +220,10 @@ export const runClaudeNative = async (
       promptArgv = [];
     }
   } catch (error) {
-    systemPromptFile = null;
+    // A failure AFTER the write lands (chmod, or any later staging step)
+    // leaves the 0600 prompt file on disk — remove it, never just drop the
+    // path, or repeated failures accumulate prompt copies in the temp dir.
+    removeSystemPromptFile();
     return {
       kind: "declined",
       reason: `could not stage the system prompt: ${error instanceof Error ? error.message : String(error)}`,
