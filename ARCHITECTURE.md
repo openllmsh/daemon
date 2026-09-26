@@ -626,6 +626,9 @@ standalone host owns lifecycle and transport fan-out.
 
 ### Native PTY backend (Phase 2)
 
+For diagrams of the session start, resize and stop paths, and for the
+differences from 2.7.6, read [`docs/pty.md`](docs/pty.md).
+
 Session PTYs no longer ride a Bun-native or worker shim — on POSIX the PTY is
 owned by the **native C shim in `packages/daemon/src/pty-native`** (`pty.c`), a
 header-free POSIX PTY implementation whose SOURCE TEXT is bundled into the
