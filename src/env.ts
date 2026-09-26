@@ -1506,24 +1506,30 @@ const persistLocalCallerToken = (token: string, filePath: string): void => {
   }
 };
 
-const pathEntryExists = (path: string): boolean => {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
 export const localCallerToken = (): string => {
   const filePath = localCallerTokenFilePath();
   if (cachedLocalCallerToken !== null) {
     // The file is the handoff to sibling first-party components — if it
-    // vanished (external cleanup, or a test re-pointed the state dir)
-    // re-persist the SAME token rather than silently diverging. A symlink
-    // standing in its place is never written through: the atomic writer
-    // refuses unsafe targets and the in-memory token stays authoritative.
-    if (!pathEntryExists(filePath)) {
+    // vanished (external cleanup, or a test re-pointed the state dir) OR
+    // still carries a token from a previous boot, re-persist the SAME
+    // in-memory token rather than silently diverging — a stale file 401s
+    // every CLI call for the rest of this boot. A symlink or other
+    // non-regular path standing in its place is never followed or written
+    // through: the atomic writer refuses unsafe targets and the in-memory
+    // token stays authoritative.
+    let rewrite = true;
+    try {
+      const stat = lstatSync(filePath);
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        rewrite =
+          readFileSync(filePath, "utf-8").trim() !== cachedLocalCallerToken;
+      } else {
+        rewrite = false; // non-regular target — leave it, keep ours.
+      }
+    } catch {
+      // absent, or a regular file we could not read — re-persist.
+    }
+    if (rewrite) {
       persistLocalCallerToken(cachedLocalCallerToken, filePath);
     }
     return cachedLocalCallerToken;
