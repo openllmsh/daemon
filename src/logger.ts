@@ -29,7 +29,13 @@
  * Best-effort + self-contained: never throws (a logging failure must not take
  * down the daemon), depends only on `stateDir`, rotates past a size cap.
  */
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+} from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { observeDoctorEvent } from "./doctor-report/engine";
 import type { TSafeDiagnosticMessage } from "./doctor-report/message";
@@ -129,6 +135,33 @@ const rotateIfBig = (file: string): void => {
  */
 let appendTail: Promise<void> = Promise.resolve();
 
+/**
+ * State dirs the logger has witnessed existing. The dir is created lazily on
+ * the FIRST append so a fresh install still gets its log file; but once a dir
+ * has been seen, a later disappearance means it was deliberately removed —
+ * `openllmd uninstall` teardown, or a test's `rmSync` cleanup — and a queued
+ * async append must NOT re-create it to write a single stale line (TH-6: the
+ * resurrection left behind dirs holding only `openllmd.log`). `write` marks
+ * the dir on every call that finds it present, so the witness covers the
+ * dir even when no line was ever appended to it.
+ */
+const appendDirs = new Set<string>();
+
+const ensureLogDir = (dir: string): boolean => {
+  if (existsSync(dir)) {
+    appendDirs.add(dir);
+    return true;
+  }
+  if (appendDirs.has(dir)) return false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    appendDirs.add(dir);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const appendCombined = (line: string, sync: boolean): boolean => {
   // Resolve the destination SYNCHRONOUSLY (at log time), then close over it: a
   // deferred write must land in the state dir that was active when the line was
@@ -141,7 +174,7 @@ const appendCombined = (line: string, sync: boolean): boolean => {
   // failure and force spurious rotation attempts.
   if (sync) {
     try {
-      mkdirSync(dir, { recursive: true });
+      if (!ensureLogDir(dir)) return false;
       rotateIfBig(file);
       appendFileSync(file, line, { mode: 0o600 });
       approxBytes += Buffer.byteLength(line);
@@ -152,7 +185,7 @@ const appendCombined = (line: string, sync: boolean): boolean => {
   }
   appendTail = appendTail.then(async () => {
     try {
-      mkdirSync(dir, { recursive: true });
+      if (!ensureLogDir(dir)) return;
       rotateIfBig(file);
       await appendFile(file, line, { mode: 0o600 });
       approxBytes += Buffer.byteLength(line);
@@ -190,6 +223,14 @@ const write = (
   meta?: Record<string, unknown>,
   observation?: TLogObservation,
 ): void => {
+  // TH-6: the state dir was seen and then deleted — teardown beat this line.
+  // Drop it entirely; both sinks (the diagnostics spool and the combined log)
+  // live under that dir and must not re-create it — `recordDoctorObservation`
+  // in particular mkdirs the state dir unconditionally, so the observation
+  // must be skipped too, not just the append.
+  const dir = stateDir();
+  if (existsSync(dir)) appendDirs.add(dir);
+  else if (appendDirs.has(dir)) return;
   if (level === "info" || level === "warn" || level === "error") {
     try {
       observeDoctorEvent({
