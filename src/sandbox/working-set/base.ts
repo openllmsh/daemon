@@ -112,11 +112,38 @@ export const SENSITIVE_ROOTS = (home: string): readonly string[] => [
   join(home, ".claude"),
 ];
 
-export const existing = (paths: readonly string[]): string[] => {
-  const home = homedir();
+/**
+ * The home the CURRENT working-set build is centred on. `index.ts` runs
+ * `existing()` AFTER `baseWorkingSet`, which records the boundary the
+ * missing-leaf climb must not cross — the `homeOverride` inside the
+ * `--sandbox-exec` shim, NOT `homedir()` (there the child's ISOLATED home; a
+ * leaf missing under the real home would otherwise climb into and grant the
+ * real home recursively). Defaults to `homedir()` so direct `existing()`
+ * callers keep the old behaviour.
+ */
+let existingBoundaryHome = homedir();
+
+export const existing = (
+  paths: readonly string[],
+  homeBoundary?: string,
+): string[] => {
+  const home = homeBoundary ?? existingBoundaryHome;
   const sensitiveRoots = SENSITIVE_ROOTS(home);
   const underSensitiveRoot = (p: string): boolean =>
     sensitiveRoots.some((root) => p.startsWith(`${root}/`));
+  // Boundary a missing leaf must never climb PAST or return: `home` itself,
+  // every ANCESTOR of home, and `/`. The climb previously stopped only at the
+  // exact `homedir()`/`/` parents, so under the `--sandbox-exec` shim — where
+  // the working set is built around the DAEMON's real home (`--home`) while
+  // `homedir()` is the child's isolated home — a missing leaf under the real
+  // home (e.g. `~/.bun/install/cache` on a bun-less box) climbed to the real
+  // home and returned it as the grant, i.e. granted the real `$HOME`
+  // recursively. Ancestors of `home` are likewise never a valid grant
+  // (`/home`, `/Users`).
+  const noGrant = new Set<string>([home, "/"]);
+  for (let a = dirname(home); a !== dirname(a); a = dirname(a)) {
+    noGrant.add(a);
+  }
   return paths.map((p) => {
     // Exact/no-climb for scoped grants beneath a secret-bearing root: a missing
     // leaf is DROPPED (returned unchanged → fails to grant safely), never
@@ -127,12 +154,12 @@ export const existing = (paths: readonly string[]): string[] => {
     let candidate = p;
     while (candidate !== "/" && !existsSync(candidate)) {
       const parent = dirname(candidate);
-      // Stop climbing at home OR root: do NOT return home (or `/`) as the
-      // granted ancestor when the original target didn't exist — that would
-      // widen the grant to the whole home tree or the entire filesystem.
-      // Return the original path instead so callers can pre-create it or handle
-      // the missing grant.
-      if ((parent === home || parent === "/") && candidate !== home) {
+      // Stop climbing at home, an ancestor of home, OR root: do NOT return any
+      // of those as the granted ancestor when the original target didn't exist
+      // — that would widen the grant to the whole home tree, a home parent, or
+      // the entire filesystem. Return the original path instead so callers can
+      // pre-create it or handle the missing grant.
+      if (noGrant.has(parent) && candidate !== home) {
         return p; // original path (non-existent, will fail to grant)
       }
       candidate = parent;
@@ -480,6 +507,10 @@ export const vendorExecDirs = (home: string): string[] => {
  * own slice.
  */
 export const baseWorkingSet = (homeOverride?: string): TWorkingSet => {
+  // `index.ts` runs `existing()` after this builder — record the home the
+  // working set is being built around so the climb boundary is the OVERRIDE
+  // home in the `--sandbox-exec` shim, not the child's isolated `homedir()`.
+  existingBoundaryHome = homeOverride ?? homedir();
   const state = stateDir(homeOverride);
   // Daemon-owned temp directory under the state dir. The unit hardening no
   // longer sets PrivateTmp (removed due to --user unit compatibility issues),
