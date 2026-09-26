@@ -207,6 +207,18 @@ const keepLoginsDecision = (args: readonly string[]): boolean => {
  * Run `openllmd uninstall`. Exits the process (0 on completion, 1 on abort).
  */
 export const runUninstall = (args: readonly string[]): never => {
+  // Mirror the CLI refusal (`packages/cli/src/uninstall-cmd.ts`): under
+  // `OPENLLM_DAEMON_STATE_DIR` the teardown is NOT scoped to the override —
+  // the service registration, PATH symlink and shell completion are
+  // user-wide, and `pruneState` would delete a `.env`/`sessions`/`cli` that a
+  // hostile or mistaken override pointed inside a project dir (FS-9).
+  if (process.env.OPENLLM_DAEMON_STATE_DIR !== undefined) {
+    process.stderr.write(
+      "Refusing uninstall under OPENLLM_DAEMON_STATE_DIR because uninstall also removes the user-wide service registration, PATH link, and shell completion.\n" +
+        "Unset the variable to uninstall the real daemon.\n",
+    );
+    process.exit(1);
+  }
   const keepable = hasLogins();
   if (!confirm(args, keepable)) {
     out("\nAborted — nothing was removed.\n");
