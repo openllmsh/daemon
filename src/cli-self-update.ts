@@ -26,10 +26,11 @@
  *     block the CLI's release of the same tag.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  readFileSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -46,20 +47,28 @@ import type { TDaemonTarget } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { invalidateMatchingCliVersionOutput } from "./cli-version-cache";
 import { getCloudState } from "./config";
-import { cliVersion, runCapture } from "./delegation/spawn";
+import { cliVersion } from "./delegation/spawn";
 import { daemonEnv, daemonUpdateRoute, stateDir } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
-import type { TSelfUpdateOutcome } from "./self-update";
+import type {
+  TBinaryProbeVerdict,
+  TDownloadBounds,
+  TSelfUpdateOutcome,
+} from "./self-update";
 import {
   currentTarget,
   DeterministicArtifactError,
   fetchBinary,
   fetchDigest,
+  fsyncDirBestEffort,
+  fsyncFileSync,
   MAX_BINARY_BYTES,
   manualUpdateRemedy,
   prevBinaryPath,
+  probeBinaryVerdict,
   restorePreviousBinary,
+  sweepStaleUpdateTemps,
   writePrevBinaryAtomic,
 } from "./self-update";
 import {
@@ -122,14 +131,27 @@ const installedCliVersion = async (
 ): Promise<string | null> => {
   const versionOpts =
     opts?.reprobeUnknown === true ? { reprobe: true } : undefined;
-  const out = await cliVersion(bin, undefined, versionOpts);
+  // FSS-05: never let a missing/unwritable system TMPDIR decide whether the
+  // CLI counts as installed — the binary's own directory is the one we can
+  // always write (it holds the staged update during a swap).
+  const probeEnv = { TMPDIR: dirname(bin) };
+  const out = await cliVersion(bin, probeEnv, versionOpts);
   const parsed = parseProductCliVersion(out);
   if (parsed !== null) return parsed;
   if (opts?.reprobeUnknown !== true) return null;
   if (out === null) return null;
   if (!invalidateMatchingCliVersionOutput(bin, out)) return null;
-  const again = await cliVersion(bin, undefined, { reprobe: true });
+  const again = await cliVersion(bin, probeEnv, { reprobe: true });
   return parseProductCliVersion(again);
+};
+
+/** sha256 of an installed binary, or null when it cannot be read. */
+const sha256File = (path: string): string | null => {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
 };
 
 // Re-entrancy guard: a bootstrap tick and a forced dashboard update could both
@@ -165,8 +187,29 @@ export type TMaybeUpdateCliOpts = {
 const CLI_PROBE_TIMEOUT_MS = 10_000;
 const CLI_PROBE_MAX_BYTES = 4_096;
 
+/**
+ * Self-heal bounds (RT-2/TD-5/FSS-04): the SECOND `--version` probe that may
+ * precede a `.prev` restore gets a long leash — a slow first run must still
+ * be able to prove the binary healthy before we touch it. The version-only
+ * fallback path also requires the recorded attempt to be RECENT — an
+ * attempt older than this cannot explain a binary found broken today.
+ */
+const CLI_HEAL_PROBE_TIMEOUT_MS = 60_000;
+const CLI_HEAL_ATTEMPT_MAX_AGE_MS = 10 * 60_000;
+
 /** How long the converger waits on the swap lock before yielding the tick. */
 const CLI_UPDATE_LOCK_WAIT_MS = 30_000;
+
+/**
+ * Set while `applyCliSelfUpdate` holds the swap lock (UP-3): the daemon's
+ * post-swap restart drains disposable children — a probe killed mid-swap used
+ * to look like a dead binary and get a good release rejected. The probe now
+ * holds a task lease, and `maybeSelfUpdate` awaits this marker so the swap
+ * region lands before the drain runs.
+ */
+let cliSwapInFlightRegion: Promise<void> | null = null;
+export const cliSwapInFlight = (): Promise<void> | null =>
+  cliSwapInFlightRegion;
 
 /**
  * Download → verify → probe → backup → swap the installed CLI to `latest`.
@@ -192,36 +235,42 @@ export const applyCliSelfUpdate = async (args: {
   readonly probeVersion?: (path: string) => Promise<string | null>;
   /** Test override for the swap-lock wait window. */
   readonly lockWaitMs?: number;
+  /** The version this converge observed installed when it decided to update.
+   *  UP-4: the lock re-checks it so a manual update that landed during our
+   *  download is never overwritten by stale bytes. */
+  readonly expectedInstalled?: string | null;
+  /** Test seam: full verdict probe for the staged binary (UP-2/UP-3). */
+  readonly probeVerdict?: (
+    path: string,
+    flag: "--version" | "--self-test",
+  ) => Promise<TBinaryProbeVerdict>;
+  /** Test seam: shorten the staged probe bound. */
+  readonly probeTimeoutMs?: number;
+  /** Test seam: tighten the download stall/total/connect bounds (NR2-2). */
+  readonly download?: TDownloadBounds & { readonly connectMs?: number };
 }): Promise<TSelfUpdateOutcome> => {
   const { dest, backupOf, latest, target, origin } = args;
   const maxBytes = args.maxBytes ?? MAX_BINARY_BYTES;
-  const probe =
-    args.probeVersion ??
-    // `--self-test`, NOT `--version` (see the doc comment above): the probe
-    // must prove the staged binary loads its whole command graph, not just
-    // that its pre-lazy-import version print works.
-    ((path: string): Promise<string | null> =>
-      runCapture([path, "--self-test"], undefined, {
-        kind: "probe",
-        probe: true,
-        timeoutMs: CLI_PROBE_TIMEOUT_MS,
+  const verdictProbe =
+    args.probeVerdict ??
+    ((path: string, flag: "--version" | "--self-test") =>
+      probeBinaryVerdict(path, flag, {
+        timeoutMs: args.probeTimeoutMs ?? CLI_PROBE_TIMEOUT_MS,
         maxBytes: CLI_PROBE_MAX_BYTES,
       }));
-  const tmp = join(dirname(dest), `.openllm.update.${process.pid}.tmp`);
-  const cleanupTmp = (): void => {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // best-effort temp cleanup
-    }
-  };
+  // FSS-16/UP-1: unique staging name + sweep temps a dead updater left behind.
+  sweepStaleUpdateTemps(dirname(dest));
+  const tmp = join(
+    dirname(dest),
+    `.openllm.update.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+  );
   try {
     const base = `${origin}/api/cli/binary/${target}`;
     // Digest first — the advertised sha256 is the rejection key, and a
     // rejected artifact must not spend the ~40 MB download again.
     let expected: string;
     try {
-      expected = await fetchDigest(`${base}.sha256`);
+      expected = await fetchDigest(`${base}.sha256`, args.download);
     } catch (err) {
       recordAttempt("cli", latest, {
         digest:
@@ -252,7 +301,7 @@ export const applyCliSelfUpdate = async (args: {
     }
     let bytes: Buffer;
     try {
-      bytes = await fetchBinary(base, maxBytes);
+      bytes = await fetchBinary(base, maxBytes, args.download);
     } catch (err) {
       recordAttempt("cli", latest, { digest: expected });
       if (err instanceof DeterministicArtifactError) {
@@ -280,6 +329,8 @@ export const applyCliSelfUpdate = async (args: {
     try {
       writeFileSync(tmp, bytes, { mode: 0o755 });
       chmodSync(tmp, 0o755); // force mode regardless of umask
+      // FSS-18: fsync the staged bytes before the rename lands on `dest`.
+      fsyncFileSync(tmp);
     } catch (err) {
       recordAttempt("cli", latest, { digest: expected });
       return {
@@ -290,30 +341,93 @@ export const applyCliSelfUpdate = async (args: {
     }
     hardenMacBinary(tmp); // sign before the probe so arm64 can exec it
     // Cross-process swap lock: `openllm self-update` races this converger over
-    // the same dest + `.prev`. Serialize probe → backup → rename → link →
-    // attempt marker so an interleave can't leave a mismatched pair. A held
-    // lock is not a failure — report busy and let the next tick retry.
+    // the same dest + `.prev`. The lock covers the DECISION too (UP-4): the
+    // installed version is re-read inside it so a manual update that landed
+    // during our download is never overwritten by stale bytes.
     const release = await acquireUpdateLock(updateLockDirFor(dest), {
       waitMs: args.lockWaitMs ?? CLI_UPDATE_LOCK_WAIT_MS,
     });
     if (release === null) {
-      cleanupTmp();
       return { kind: "busy" };
     }
+    let markSwapDone: () => void = () => {};
+    cliSwapInFlightRegion = new Promise<void>((resolve) => {
+      markSwapDone = resolve;
+    });
     try {
-      const out = await probe(tmp);
-      if (parseProductCliVersion(out) !== latest) {
-        rejectUpdateVersion("cli", latest, expected);
-        recordAttempt("cli", latest, { digest: expected });
-        cleanupTmp();
-        return {
-          kind: "failed",
-          stage: "probe",
-          detail:
-            out === null
-              ? "binary did not run"
-              : `expected v${latest}, got ${out.trim().slice(0, 200)}`,
-        };
+      // UP-4: re-check what is installed NOW. A manual `openllm self-update`
+      // that finished while we downloaded already landed `latest` — proceed
+      // only when the file is still the one this converge set out to replace.
+      const anchor = existsSync(dest)
+        ? dest
+        : existsSync(backupOf)
+          ? backupOf
+          : null;
+      if (anchor !== null) {
+        const installedVerdict = await verdictProbe(anchor, "--version");
+        const installedNow =
+          installedVerdict.kind === "ok"
+            ? parseProductCliVersion(installedVerdict.out)
+            : null;
+        if (installedNow === latest) {
+          recordAttempt("cli", latest, { digest: expected });
+          return { kind: "updated" };
+        }
+        if (
+          installedNow !== null &&
+          args.expectedInstalled !== undefined &&
+          installedNow !== args.expectedInstalled
+        ) {
+          // The installed file changed under our download — a concurrent
+          // updater owns it now. Nothing is recorded; the next tick
+          // re-evaluates against the NEW binary.
+          return { kind: "busy" };
+        }
+      }
+      if (args.probeVersion !== undefined) {
+        // Legacy contract (tests): null output = a completed probe with no
+        // version banner — a deterministic artifact failure.
+        const out = await args.probeVersion(tmp);
+        if (parseProductCliVersion(out) !== latest) {
+          rejectUpdateVersion("cli", latest, expected);
+          recordAttempt("cli", latest, { digest: expected });
+          return {
+            kind: "failed",
+            stage: "probe",
+            detail:
+              out === null
+                ? "binary did not run"
+                : `expected v${latest}, got ${out.trim().slice(0, 200)}`,
+          };
+        }
+      } else {
+        // `--self-test`, NOT `--version` (see the doc comment above): the
+        // probe must prove the staged binary loads its whole command graph.
+        const verdict = await verdictProbe(tmp, "--self-test");
+        if (verdict.kind === "inconclusive") {
+          // UP-2/TD-5: a timed-out or drain-killed probe never judged the
+          // bytes — record the try, back off, do NOT reject the artifact.
+          recordAttempt("cli", latest, { digest: expected });
+          return {
+            kind: "failed",
+            stage: "probe-inconclusive",
+            detail: verdict.detail,
+          };
+        }
+        const probed =
+          verdict.kind === "ok" ? parseProductCliVersion(verdict.out) : null;
+        if (probed !== latest) {
+          rejectUpdateVersion("cli", latest, expected);
+          recordAttempt("cli", latest, { digest: expected });
+          return {
+            kind: "failed",
+            stage: "probe",
+            detail:
+              verdict.kind === "failed"
+                ? `binary did not run: ${verdict.detail}`
+                : `expected v${latest}, got ${verdict.out.slice(0, 200)}`,
+          };
+        }
       }
       try {
         // Mode-preserving temp + fsync + rename copy — the rollback copy
@@ -321,7 +435,6 @@ export const applyCliSelfUpdate = async (args: {
         writePrevBinaryAtomic(backupOf, prevBinaryPath(dest));
       } catch (err) {
         recordAttempt("cli", latest, { digest: expected });
-        cleanupTmp();
         return {
           kind: "failed",
           stage: "write",
@@ -331,6 +444,8 @@ export const applyCliSelfUpdate = async (args: {
         };
       }
       renameSync(tmp, dest); // atomic on POSIX; a running CLI keeps its inode
+      // FSS-18: fsync the directory so the rename's dirent survives a crash.
+      fsyncDirBestEffort(dirname(dest));
       hardenMacBinary(dest); // dequarantine + ad-hoc sign so arm64 can exec it
       if (args.legacySymlink !== undefined) {
         // Replace the old binary file with a transitional symlink so
@@ -345,16 +460,25 @@ export const applyCliSelfUpdate = async (args: {
       recordAttempt("cli", latest, { digest: expected });
       return { kind: "updated" };
     } finally {
+      cliSwapInFlightRegion = null;
+      markSwapDone();
       release();
     }
   } catch (err) {
     recordAttempt("cli", latest);
-    cleanupTmp();
     return {
       kind: "failed",
       stage: "write",
       detail: err instanceof Error ? err.message : String(err),
     };
+  } finally {
+    // FSS-16: the staging temp never survives an exit path — success renamed
+    // it away, and every failure/throw path reaches here.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // best-effort temp cleanup
+    }
   }
 };
 
@@ -379,54 +503,117 @@ export const maybeUpdateCli = async (
   if (legacyOnly) bin = legacy;
   // The daemon never installs the CLI — absent means skip, not install.
   if (!existsSync(bin)) return;
+  // UP-1: claim this converge BEFORE the first await — the early checks are
+  // all synchronous, so setting the flag here is the only correct point.
+  if (updating) return;
+  updating = true;
+  try {
+    return await convergeCli(latest, opts, bin, legacyOnly, origin);
+  } finally {
+    updating = false;
+  }
+};
+
+/**
+ * The converge body, run under the `updating` flag. Split so the flag can be
+ * set synchronously before ANY await (UP-1).
+ */
+const convergeCli = async (
+  latest: string,
+  opts: TMaybeUpdateCliOpts | undefined,
+  bin: string,
+  legacyOnly: boolean,
+  origin: string,
+): Promise<void> => {
   let current = await installedCliVersion(bin, {
     reprobeUnknown: opts?.reprobeUnknown === true,
   });
   if (current === null) {
     // Self-heal (TCB-3): a converger swap that left a binary which cannot even
-    // report `--version` wedges the CLI forever — this lane would keep skipping
-    // on `current === null`. If a recorded attempt exists and the `.prev`
-    // backup is still there AND still runs, roll back once and pin the bad
-    // version rejected. The restore happens under the SAME swap lock the
-    // updater uses so it can't race a manual `openllm self-update` mid-swap.
-    const attempt = readState().updateAttempts.cli;
-    const healLockDir = updateLockDirFor(cliBinaryPath());
-    const release =
-      !legacyOnly && attempt !== undefined
-        ? await acquireUpdateLock(healLockDir, {
-            waitMs: CLI_UPDATE_LOCK_WAIT_MS,
-          })
-        : null;
-    try {
-      if (
-        !legacyOnly &&
-        attempt !== undefined &&
-        release !== null &&
-        restorePreviousBinary(cliBinaryPath())
-      ) {
-        rejectUpdateVersion("cli", attempt.version, attempt.digest ?? "");
-        logError(
-          "cli-update",
-          `installed openllm CLI could not run after the v${attempt.version} update — restored ${prevBinaryPath(cliBinaryPath())}; v${attempt.version} will not be reinstalled`,
-        );
-        bin = cliBinaryPath();
-        current = await installedCliVersion(bin, { reprobeUnknown: true });
-        if (current === null) {
-          logWarn(
-            "cli-update",
-            safeDiagnosticMessage`restored openllm CLI still did not report a version — skipping`,
+    // report `--version` wedges the CLI forever — this lane would keep
+    // skipping on `current === null`.
+    //
+    // RT-2/TD-5/FSS-04: ONE failed or timed-out probe is NEVER proof of a
+    // dead binary — a slow first run, a drained probe child, or a broken
+    // TMPDIR caches the same `null` a crashed binary produces. So: re-probe
+    // ONCE with a long bound (a slow-but-healthy binary still proves itself),
+    // then restore `.prev` ONLY when a recent attempt record names THIS
+    // artifact — a digest match at any age, or a fresh attempt for the
+    // version we would install. A probe that stays inconclusive NEVER heals
+    // and NEVER rejects: the bytes were not judged.
+    const second = await probeBinaryVerdict(bin, "--version", {
+      timeoutMs: CLI_HEAL_PROBE_TIMEOUT_MS,
+    });
+    if (second.kind === "ok") {
+      current = parseProductCliVersion(second.out);
+      // An exit-0 with an unparseable banner still counts as broken below.
+    }
+    if (current === null) {
+      const provablyBroken =
+        second.kind === "failed" ||
+        (second.kind === "ok" && parseProductCliVersion(second.out) === null);
+      const attempt = readState().updateAttempts.cli;
+      let healed = false;
+      if (!legacyOnly && provablyBroken && attempt !== undefined) {
+        const binDigest = sha256File(bin);
+        // The attempt's recorded artifact digest matches the installed bytes
+        // → the attempt unambiguously describes this binary (any age).
+        const artifactProven =
+          binDigest !== null &&
+          attempt.digest !== undefined &&
+          attempt.digest.length > 0 &&
+          attempt.digest === binDigest;
+        // Version-only fallback: the attempt is for the version we would
+        // install AND is fresh enough to plausibly have produced the binary.
+        const recentMatch =
+          binDigest !== null &&
+          attempt.version === latest &&
+          Date.now() - attempt.ts <= CLI_HEAL_ATTEMPT_MAX_AGE_MS;
+        if (binDigest !== null && (artifactProven || recentMatch)) {
+          // Restore under the SAME swap lock the updater uses, and re-check
+          // the digest inside it — a file swapped while we probed is not
+          // ours to roll back.
+          const release = await acquireUpdateLock(
+            updateLockDirFor(cliBinaryPath()),
+            { waitMs: CLI_UPDATE_LOCK_WAIT_MS },
           );
-          return;
+          if (release !== null) {
+            try {
+              if (
+                sha256File(cliBinaryPath()) === binDigest &&
+                restorePreviousBinary(cliBinaryPath())
+              ) {
+                // Key the reject to the bad bytes — never a blank/version-wide
+                // wildcard (a corrected re-publish must be allowed through).
+                rejectUpdateVersion("cli", attempt.version, binDigest);
+                logError(
+                  "cli-update",
+                  `installed openllm CLI could not run after the v${attempt.version} update — restored ${prevBinaryPath(cliBinaryPath())}; v${attempt.version} will not be reinstalled`,
+                );
+                healed = true;
+              }
+            } finally {
+              release();
+            }
+          }
         }
-      } else {
+      }
+      if (!healed) {
         logWarn(
           "cli-update",
           `installed openllm CLI did not report a version — skipping; ${manualUpdateRemedy(origin)}`,
         );
         return;
       }
-    } finally {
-      release?.();
+      bin = cliBinaryPath();
+      current = await installedCliVersion(bin, { reprobeUnknown: true });
+      if (current === null) {
+        logWarn(
+          "cli-update",
+          safeDiagnosticMessage`restored openllm CLI still did not report a version — skipping`,
+        );
+        return;
+      }
     }
   }
   // A from-source dev link never auto-updates (same guard as both updaters).
@@ -476,7 +663,6 @@ export const maybeUpdateCli = async (
   }
   if (recentlyAttempted("cli", latest)) return;
 
-  updating = true;
   const dest = cliBinaryPath(); // always land on the NEW name
   try {
     const outcome = await applyCliSelfUpdate({
@@ -485,7 +671,8 @@ export const maybeUpdateCli = async (
       latest,
       target,
       origin,
-      ...(legacyOnly ? { legacySymlink: legacy } : {}),
+      expectedInstalled: current,
+      ...(legacyOnly ? { legacySymlink: legacyCliBinaryPath() } : {}),
     });
     if (outcome.kind === "updated") {
       logInfo("cli-update", `updated openllm CLI ${current} → ${latest}`);
@@ -510,6 +697,13 @@ export const maybeUpdateCli = async (
         `downloaded openllm CLI v${latest} failed its pre-swap --self-test check (${outcome.detail ?? "unknown"}) — rejected; ${manualUpdateRemedy(origin)}`,
         { target, latest },
       );
+    } else if (outcome.stage === "probe-inconclusive") {
+      // TD-5/UP-2: transient probe — attempt recorded, artifact NOT rejected.
+      logWarn(
+        "cli-update",
+        `pre-swap probe of openllm CLI v${latest} was inconclusive (${outcome.detail ?? "unknown"}) — backing off without rejecting the artifact`,
+        { target, latest },
+      );
     } else {
       logError("cli-update", outcome.detail ?? outcome.stage, {
         target,
@@ -519,7 +713,5 @@ export const maybeUpdateCli = async (
     }
   } catch (err) {
     logError("cli-update", err, { target, latest });
-  } finally {
-    updating = false; // no exit path here — always allow the next attempt
   }
 };
