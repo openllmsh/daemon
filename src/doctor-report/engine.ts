@@ -22,6 +22,8 @@ import {
   DOCTOR_REPORT_MAX_EVENTS,
   DOCTOR_REPORT_MAX_SPOOL_BYTES,
   DOCTOR_REPORT_PENDING_TTL_MS,
+  DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS,
+  DOCTOR_REPORT_POLICY_SCHEMA_VERSION,
   DOCTOR_REPORT_SCHEMA_VERSION,
   doctorEventHasOutcomeLedger,
   doctorReportingScopeId,
@@ -29,7 +31,6 @@ import {
   parseDoctorReportAck,
   parseDoctorReportEvent,
   parseDoctorReportReject,
-  reportingPolicyAllowsUpload,
   stripDoctorOutcomeLedger,
 } from "@openllmsh/protocol";
 import { InvalidApiKeyError, NoApiKeyError } from "../cloud-client";
@@ -111,6 +112,11 @@ let lastAttemptOutcome: TDoctorUploadAttemptOutcome | null = null;
 let lastAttemptOriginScope: string | null = null;
 let lastAttemptAccountScope: string | null = null;
 let lastAttemptGeneration: string | null = null;
+// Receipt anchor for the CURRENT reporting policy — keyed on
+// (generation, expires_at_ms) so a re-stamped or re-generated policy
+// re-anchors. See DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS (TCB-7).
+let policyAnchorKey: string | null = null;
+let policyAnchoredAtMs = 0;
 
 const cursorPath = (): string => doctorStatePath("doctor-report.cursor.json");
 const pendingPath = (): string => doctorStatePath("doctor-report.pending.json");
@@ -261,6 +267,35 @@ const cursorMatchesScope = (
   cursor.account_scope === scope.accountScope &&
   cursor.generation === scope.generation;
 
+/**
+ * Whether the policy permits an upload NOW, on the LOCAL clock: enabled, the
+ * right schema, and received less than DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS
+ * ago. This replaces the raw `reportingPolicyAllowsUpload` check
+ * (`now < expires_at_ms`) — the cloud stamps `expires_at_ms` on ITS clock, so
+ * comparing it with the daemon clock made uploads fail closed on any
+ * daemon/cloud skew over the TTL and let revoked policies live over-long when
+ * the local clock ran behind (TCB-7).
+ */
+const reportingPolicyLive = (
+  policy: TDaemonReportingPolicy | null,
+  now: number,
+): boolean => {
+  if (
+    policy === null ||
+    policy.enabled !== true ||
+    policy.schema_version !== DOCTOR_REPORT_POLICY_SCHEMA_VERSION
+  ) {
+    policyAnchorKey = null;
+    return false;
+  }
+  const key = `${policy.generation}:${policy.expires_at_ms}`;
+  if (key !== policyAnchorKey) {
+    policyAnchorKey = key;
+    policyAnchoredAtMs = now;
+  }
+  return now - policyAnchoredAtMs < DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS;
+};
+
 type TUploadEligibility =
   | { readonly allowed: true }
   | { readonly allowed: false; readonly blocker: TDoctorUploadBlocker };
@@ -274,7 +309,7 @@ const resolveUploadEligibility = (): TUploadEligibility => {
   if (scope.policy === null || scope.policy.enabled === false) {
     return { allowed: false, blocker: "inactive_policy" };
   }
-  if (!reportingPolicyAllowsUpload(scope.policy, clock())) {
+  if (!reportingPolicyLive(scope.policy, clock())) {
     return { allowed: false, blocker: "expired_policy" };
   }
   if (localDisableSticky()) return { allowed: false, blocker: "local_opt_out" };
@@ -892,7 +927,7 @@ export const reportingStatus = (): TDoctorReportingStatus => {
   const scope = reportingScope();
   const pref = readLocalPreference();
   const cursor = readCursor();
-  const policyOn = reportingPolicyAllowsUpload(scope.policy, clock());
+  const policyOn = reportingPolicyLive(scope.policy, clock());
   const eligibility = resolveUploadEligibility();
   const cursorInScope =
     cursor !== null && cursorMatchesScope(cursor, scope) ? cursor : null;
@@ -952,7 +987,7 @@ export const onBootstrapReportingPolicy = (
     discardReportingWindow();
     return;
   }
-  if (!reportingPolicyAllowsUpload(scope.policy, clock())) return;
+  if (!reportingPolicyLive(scope.policy, clock())) return;
   if (revokedAtPolicyRevision !== null && revision <= revokedAtPolicyRevision) {
     return;
   }
@@ -985,5 +1020,7 @@ export const resetDoctorEngineForTests = (): void => {
   notifyObservation = null;
   clock = (): number => Date.now();
   clearAttemptMemory();
+  policyAnchorKey = null;
+  policyAnchoredAtMs = 0;
   resetDoctorRepeatForTests();
 };
