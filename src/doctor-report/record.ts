@@ -3,7 +3,7 @@
  * never raw message/meta/stack/argv. Stamp daemon_version at write time.
  */
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync, statSync } from "node:fs";
 import type {
   TDoctorEventTimings,
   TDoctorOutcomeLedger,
@@ -52,6 +52,17 @@ export const diagnosticsLogPath = (): string =>
   doctorStatePath(DIAGNOSTICS_BASENAME);
 
 export const diagnosticsRotatedPath = (): string => `${diagnosticsLogPath()}.1`;
+
+/**
+ * Whether a doctor-report write may touch the filesystem. The doctor state dir
+ * IS the daemon state dir (`files.ts`), which daemon boot creates — never a
+ * diagnostic writer. When it is missing at write time, the process outlived an
+ * uninstall/teardown and a late write would resurrect the dir holding only a
+ * diagnostics file (TH-6 residual — the same post-teardown drop the logger
+ * applies). A missing dir therefore drops the write rather than creating it.
+ */
+export const doctorStateDirWritable = (): boolean =>
+  existsSync(doctorStateDir());
 
 const rotateIfBig = (file: string): void => {
   if (seededFor !== file) {
@@ -110,7 +121,7 @@ export const recordDoctorObservation = (
   }
   const line = `${JSON.stringify(parsed)}\n`;
   try {
-    mkdirSync(doctorStateDir(), { recursive: true, mode: 0o700 });
+    if (!doctorStateDirWritable()) return parsed;
     const file = diagnosticsLogPath();
     rotateIfBig(file);
     appendFileSync(file, line, { mode: 0o600 });

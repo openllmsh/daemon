@@ -48,6 +48,7 @@ import type { TDoctorObservationInput } from "./record";
 import {
   diagnosticsLogPath,
   diagnosticsRotatedPath,
+  doctorStateDirWritable,
   recordDoctorObservation,
 } from "./record";
 import { resetDoctorRepeatForTests } from "./repeat";
@@ -196,7 +197,11 @@ const readCursor = (): TCursor | null => {
   }
 };
 
+// TH-6 residual: `atomicWriteText` mkdirs the state dir unconditionally, so a
+// late cursor/pending write after uninstall would resurrect it. Both guards
+// drop the write when the dir is gone (see `doctorStateDirWritable`).
 const writeCursor = (cursor: TCursor): boolean =>
+  doctorStateDirWritable() &&
   atomicWriteText(cursorPath(), `${JSON.stringify(cursor)}\n`);
 
 const readPending = (): TPending | null => {
@@ -213,6 +218,7 @@ const readPending = (): TPending | null => {
 const writePending = (pending: TPending): boolean => {
   const body = `${JSON.stringify(pending)}\n`;
   if (Buffer.byteLength(body) > DOCTOR_REPORT_MAX_SPOOL_BYTES) return false;
+  if (!doctorStateDirWritable()) return false;
   return atomicWriteText(pendingPath(), body);
 };
 
