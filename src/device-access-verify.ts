@@ -9,6 +9,7 @@
 import { createPublicKey, verify as nodeVerify } from "node:crypto";
 import {
   buildDeviceGrantMessage,
+  DEVICE_GRANT_NONCE_CAP,
   DEVICE_GRANT_TS_WINDOW_MS,
   decodeDeviceGrant,
 } from "@openllmsh/tunnel";
@@ -23,7 +24,7 @@ import { mutateState, readState } from "./state-file";
  * grants are rejected (`nonce_overload`) rather than silently dropping replay
  * protection.
  */
-let nonceLruCap = 4096;
+let nonceLruCap = DEVICE_GRANT_NONCE_CAP;
 
 /** Module-level nonce LRU — expire after the grant ts window; hard-cap above. */
 const nonceOrder: string[] = [];
@@ -99,9 +100,9 @@ export const clearDeviceGrantNoncesForTest = (): void => {
   nonceSeen.clear();
 };
 
-/** Test-only: override the nonce map capacity (null restores default 4096). */
+/** Test-only: override the nonce map capacity (null restores the default). */
 export const setNonceLruCapForTest = (cap: number | null): void => {
-  nonceLruCap = cap ?? 4096;
+  nonceLruCap = cap ?? DEVICE_GRANT_NONCE_CAP;
 };
 
 /**
