@@ -161,11 +161,45 @@ const appendDirs = new Set<string>();
 
 /**
  * Tombstones: dirs whose witness left {@link appendDirs} (LRU eviction) or
- * that were observed missing after being witnessed. NEVER evicted — a queued
- * append consults this set before any mkdir, so a removed state dir stays
- * refused however many roots churned through the witness cache since.
+ * that were observed missing after being witnessed. A queued append consults
+ * this set before any mkdir, so a removed state dir stays refused however
+ * many roots churned through the witness cache since.
+ *
+ * Bounded (rework-5): the set is an insertion-ordered LRU capped at
+ * {@link removedTombstoneCap} — 8× the witness cap, so realistic state-dir
+ * churn (one root per process) never reaches it, but a pathological churn
+ * loop cannot grow the set without bound. Eviction drops the OLDEST
+ * tombstone: the dir it named stayed missing through 64 later removals, so
+ * the residual risk — a still-queued append for that exact dir arriving
+ * after 64 distinct teardowns — is orders of magnitude beyond any real
+ * usage. Tombstones for dirs that exist again are shed on re-witness, so
+ * the set only ever holds still-missing roots.
  */
+let removedTombstoneCap = 64;
 const removedDirs = new Set<string>();
+
+const tombstoneRemovedDir = (dir: string): void => {
+  removedDirs.delete(dir); // refresh: most recently proven-removed last
+  removedDirs.add(dir);
+  if (removedDirs.size > removedTombstoneCap) {
+    const oldest = removedDirs.values().next().value;
+    if (oldest !== undefined) removedDirs.delete(oldest);
+  }
+};
+
+/** Test-only: shrink the tombstone cap so a small fixture exercises the LRU
+ *  bound (`null` restores the default); and read the current set size. Setting
+ *  a cap also trims the existing set so the bound holds immediately. */
+export const setLoggerRemovedDirCapForTests = (cap: number | null): void => {
+  removedTombstoneCap = cap ?? 64;
+  while (removedDirs.size > removedTombstoneCap) {
+    const oldest = removedDirs.values().next().value;
+    if (oldest === undefined) break;
+    removedDirs.delete(oldest);
+  }
+};
+
+export const loggerRemovedDirCountForTests = (): number => removedDirs.size;
 
 const witnessDir = (dir: string): void => {
   appendDirs.delete(dir); // refresh: move to the back when already present
@@ -179,7 +213,7 @@ const witnessDir = (dir: string): void => {
       // exists the next write simply re-witnesses it (and clears the
       // tombstone); once it is gone, queued appends keep refusing to
       // resurrect it — the whole point of the witness.
-      removedDirs.add(oldest);
+      tombstoneRemovedDir(oldest);
     }
   }
 };
@@ -190,7 +224,7 @@ const ensureLogDir = (dir: string): boolean => {
     return true;
   }
   if (appendDirs.has(dir) || removedDirs.has(dir)) {
-    removedDirs.add(dir); // keep the refusal sticky through later churn
+    tombstoneRemovedDir(dir); // keep the refusal sticky through later churn
     return false;
   }
   try {
@@ -270,7 +304,7 @@ const write = (
   const dir = stateDir();
   if (existsSync(dir)) witnessDir(dir);
   else if (appendDirs.has(dir) || removedDirs.has(dir)) {
-    removedDirs.add(dir); // witnessed/gone roots stay refused past eviction
+    tombstoneRemovedDir(dir); // witnessed/gone roots stay refused past eviction
     return;
   }
   if (level === "info" || level === "warn" || level === "error") {
