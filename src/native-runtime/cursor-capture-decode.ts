@@ -262,8 +262,14 @@ export const decompressConnectEnvelopePayload = (
   try {
     // Copy into a fresh Buffer — gunzipSync rejects SharedArrayBuffer views
     // from some stream paths without an explicit copy.
-    inflated = gunzipSync(Buffer.from(payload));
+    inflated = gunzipSync(Buffer.from(payload), { maxOutputLength: maxBytes });
   } catch (err) {
+    if (err instanceof RangeError) {
+      throw new CursorCaptureDecodeError(
+        "connect_compression_too_large",
+        `decompressed Connect envelope exceeds ${maxBytes} bytes`,
+      );
+    }
     throw new CursorCaptureDecodeError(
       "connect_compression_invalid",
       `gzip decompress failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -708,7 +714,7 @@ export const decodeBidiRequestId = (
 };
 
 const hexToBytes = (hex: string): Uint8Array | null => {
-  if (hex.length % 2 !== 0) return null;
+  if (hex.length % 2 !== 0 || /[^0-9a-f]/i.test(hex)) return null;
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i += 1) {
     const byteStr = hex.slice(i * 2, i * 2 + 2);
@@ -2785,21 +2791,49 @@ export const chunksStreamFromCursorConnectResponseBody = (
 ): ReadableStream<TChatCompletionChunk> => {
   const created = Math.floor(Date.now() / 1000);
   const id = `cursor-capture-${created}`;
+  // CodeRabbit round 5: `reader` used to be declared INSIDE `start()`, so
+  // the underlying source's own `cancel()` callback (invoked when the
+  // CONSUMER of this stream cancels it — a separate signal from
+  // `args.signal`) had no way to reach it at all and was a no-op. A
+  // consumer cancel then left a pending `reader.read()` on the real
+  // upstream body dangling — never unblocked, never released — until the
+  // underlying connection happened to close on its own. Declared here,
+  // above both `start` and `cancel`, so both can act on the SAME reader.
+  const reader = body.getReader();
+  const cancelReader = (reason: unknown): void => {
+    try {
+      // `.cancel()` returns a promise; a caller/consumer cancel is fire-
+      // and-forget from this source's perspective — never await it here,
+      // and never let a rejection from an already-cancelled/errored reader
+      // propagate as an unhandled rejection.
+      void reader.cancel(reason).catch(() => undefined);
+    } catch {
+      // ignore — reader may already be released/cancelled
+    }
+  };
   return new ReadableStream<TChatCompletionChunk>({
     async start(controller) {
       if (args.signal?.aborted) {
-        controller.error(
+        const reason =
           args.signal.reason instanceof Error
             ? args.signal.reason
-            : new Error("aborted"),
-        );
+            : new Error("aborted");
+        cancelReader(reason);
+        controller.error(reason);
         return;
       }
       const onAbort = (): void => {
-        controller.error(new Error("aborted"));
+        const reason =
+          args.signal?.reason instanceof Error
+            ? args.signal.reason
+            : new Error("aborted");
+        // Unblock a genuinely pending `reader.read()` immediately — never
+        // leave it dangling on the real upstream body — and error the
+        // outer stream with the SAME reason, not a generic re-wrap.
+        cancelReader(reason);
+        controller.error(reason);
       };
       args.signal?.addEventListener("abort", onAbort, { once: true });
-      const reader = body.getReader();
       let pending = new Uint8Array(0);
       let toolIndex = 0;
       const toolIndexByCallId = new Map<string, number>();
@@ -3102,8 +3136,15 @@ export const chunksStreamFromCursorConnectResponseBody = (
         }
       }
     },
-    cancel() {
-      // Caller cancelled — abort is linked by the capture runner.
+    cancel(reason) {
+      // CodeRabbit round 5: the CONSUMER cancelling this stream is a
+      // separate signal from `args.signal` aborting — it must ALSO unblock
+      // a pending `reader.read()` on the real upstream body, never leave it
+      // dangling. `start()`'s own `finally` still releases the lock once
+      // that pending read settles.
+      cancelReader(
+        reason instanceof Error ? reason : new Error("consumer cancelled"),
+      );
     },
   });
 };
