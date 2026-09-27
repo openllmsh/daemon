@@ -178,8 +178,16 @@ export const spawnEnvLeased = (
  * Idempotent — safe to call after the exit watcher already removed it.
  */
 export const discardMintedTmpDir = (leased: TSpawnEnvLeased): void => {
-  if (leased.tmpDir !== null) removeTreeDeferred(leased.tmpDir);
+  if (leased.tmpDir === null) return;
+  // A dir bound to a child belongs to that child's exit watcher. Deleting it
+  // here would pull the scratch dir from under a child that is still running
+  // (an abandoned or not-yet-reaped child), rework-8.
+  if (boundMintedTmpDirs.has(leased.tmpDir)) return;
+  removeTreeDeferred(leased.tmpDir);
 };
+
+/** Minted dirs whose removal belongs to a child's exit watcher. */
+const boundMintedTmpDirs = new Set<string>();
 
 /**
  * Tie a minted `run-*` dir to the supervised child it was minted for. Two
@@ -203,7 +211,11 @@ export const bindMintedTmpToChild = (
 ): void => {
   const dir = leased.tmpDir;
   if (dir === null) return;
-  const sweep = (): void => removeTreeDeferred(dir);
+  boundMintedTmpDirs.add(dir);
+  const sweep = (): void => {
+    boundMintedTmpDirs.delete(dir);
+    removeTreeDeferred(dir);
+  };
   void proc.exited.then(sweep, sweep);
   if (typeof proc.pid === "number") {
     leaseMintedTmpToChild(dir, proc.pid, sessionId);
@@ -519,6 +531,9 @@ export const runCaptureResult = async (
   // Minted before the try so the finally can discard the dir on EVERY path
   // that never reaches a live child (argv/env setup or the spawn itself).
   const leased = spawnEnvLeased(env);
+  // Set once a child exists: an error after that point must stop the child
+  // (its exit watcher then removes the minted dir), rework-8.
+  let spawned: { terminate: () => Promise<unknown> } | null = null;
   try {
     const setupStartedAtMs = performance.now();
     const command = spawnCommand(
@@ -538,6 +553,7 @@ export const runCaptureResult = async (
       sandboxSpawnArgs(command, { probe: opts?.probe }),
       spawnOptions,
     );
+    spawned = child;
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
@@ -792,10 +808,13 @@ export const runCaptureResult = async (
       budget.release();
     }
   } catch {
+    // A throw after spawn (stdout read, budget setup) must not leave the
+    // child running with its scratch dir deleted under it.
+    if (spawned !== null) await spawned.terminate().catch(() => undefined);
     return { kind: "failed" };
   } finally {
-    // No-op once the exit watcher already removed the dir; the actual cleanup
-    // for every path that never reached a live child.
+    // Removes the dir only when no child was bound to it (setup or spawn
+    // failed); a bound dir is removed by the child's exit watcher.
     discardMintedTmpDir(leased);
   }
 };
