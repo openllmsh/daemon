@@ -875,6 +875,31 @@ const advanceTmpTreeDelete = (
       } catch {
         // already closed
       }
+      // The root frame is the bottom of the stack — its EOF means the whole
+      // tree walked. Only NOW may the gating lease be consumed: eaten early
+      // it would be gone while retries still run, and an abandoned delete
+      // would leave an UNLEASED remnant no sweep ever removes (rework-7 /
+      // RG-2). Instead it is unlinked immediately before the root rmdir and
+      // restored when that rmdir fails, so the remnant always keeps its
+      // provable owner.
+      const isRoot = del.frames.length === 1;
+      const leasePath = join(top.path, TMP_LEASE_FILE);
+      let leaseBackup: Buffer | null = null;
+      if (isRoot) {
+        try {
+          leaseBackup = readFileSync(leasePath);
+        } catch {
+          leaseBackup = null;
+        }
+        if (leaseBackup !== null) {
+          try {
+            unlinkSync(leasePath);
+            del.consumedLease = true;
+          } catch {
+            // raced or unwritable — the rmdir below reports the remnant
+          }
+        }
+      }
       del.frames.pop();
       try {
         rmdirSync(top.path);
@@ -883,6 +908,19 @@ const advanceTmpTreeDelete = (
         // dir and retry rather than dropping a half-deleted frame. The same
         // budgets bound the retry; a lease revived meanwhile re-verifies the
         // entry before any next round touches it.
+        if (leaseBackup !== null) {
+          // The lease went down for a rmdir that failed — put the proof
+          // back so the remnant stays owned. `wx` never clobbers a lease a
+          // racing owner rewrote in between.
+          try {
+            writeFileSync(leasePath, leaseBackup, {
+              mode: 0o600,
+              flag: "wx",
+            });
+          } catch {
+            // recreated by someone else or unwritable — leave it
+          }
+        }
         del.failures += 1;
         try {
           del.frames.push({ path: top.path, dir: opendirSync(top.path) });
@@ -910,14 +948,13 @@ const advanceTmpTreeDelete = (
         }
       }
     } else {
+      // The gating lease at the tree root is skipped here — it is consumed
+      // only at frame EOF, immediately before the root rmdir (see above).
+      if (top === del.frames[0] && entry.name === TMP_LEASE_FILE) {
+        continue;
+      }
       try {
         unlinkSync(child);
-        // The gating lease lives only at the tree root: remember when THIS
-        // delete consumed it so the mid-delete re-verify can tell "we ate
-        // the proof" from "someone else removed it" (fail-closed).
-        if (top === del.frames[0] && entry.name === TMP_LEASE_FILE) {
-          del.consumedLease = true;
-        }
       } catch {
         // raced perms — frame EOF still completes; parent rmdir reports it
       }
@@ -1173,10 +1210,7 @@ export const sweepDaemonTempDir = (
     // it here starts a FRESH freshness walk that burns the whole round node
     // budget, leaving the pending delete zero nodes to advance — a huge
     // tree would starve forever behind its own re-walk (rework-3 resume).
-    if (
-      pendingTmpTreeDelete !== null &&
-      pendingTmpTreeDelete.path === path
-    ) {
+    if (pendingTmpTreeDelete !== null && pendingTmpTreeDelete.path === path) {
       continue;
     }
     const scan = scanTmpEntry(path);
@@ -1509,10 +1543,7 @@ export const mintDaemonTmpDir = (
     return null;
   }
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const dir = join(
-      rootReal,
-      `${prefix}-${randomBytes(4).toString("hex")}`,
-    );
+    const dir = join(rootReal, `${prefix}-${randomBytes(4).toString("hex")}`);
     try {
       mkdirSync(dir, { mode: 0o700 });
       return dir;
