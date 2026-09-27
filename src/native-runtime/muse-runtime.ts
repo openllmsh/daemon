@@ -1737,19 +1737,25 @@ export const runMuseNative = async (
     async pull(controller) {
       const next = await nextItem();
       if (next === "end") {
-        controller.close();
+        // The bounded join must finish BEFORE the reader sees EOF — a close
+        // ahead of it would let the caller tear down while the turn root and
+        // overlay still exist.
         await cleanupBounded();
+        controller.close();
         return;
       }
       if (typeof next === "object" && next !== null && "error" in next) {
-        controller.error(next.error);
         await cleanupBounded();
+        controller.error(next.error);
         return;
       }
       controller.enqueue(next);
     },
     cancel() {
       abort();
+      // Surface the cleanup promise: `stream.cancel()` resolves only after
+      // the turn dirs are gone (bounded), never instantly.
+      return cleanupBounded();
     },
   });
   return { kind: "committed", chunks, sessionId: () => null };
