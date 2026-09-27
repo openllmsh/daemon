@@ -323,7 +323,13 @@ env_lock_pid_alive() {
   # "08" is invalid octal to [[ -gt ]] but decimal pid 8 to the daemon's
   # Number() — validate digits, convert through 10#, compare in decimal [ ].
   [[ "$1" =~ ^[0-9]+$ ]] || return 1
-  local pid=$((10#$1))
+  local pid=$((10#$1)) stat state
+  if [ -r "/proc/$pid/stat" ]; then
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    stat="${stat##*) }"
+    read -r state _ <<< "$stat"
+    [ "$state" = "Z" ] && return 1
+  fi
   [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null
 }
 
@@ -1788,7 +1794,17 @@ if [ -n "$timeout_bin" ]; then
     kill -0 "$twait" 2>/dev/null || break
     sleep 0.1 2>/dev/null || sleep 1
   done
-  wait "$twait" 2>/dev/null || true
+  timeout_rc=0
+  wait "$twait" 2>/dev/null || timeout_rc=$?
+  # The timeout leader pid is always known. If the group was too short-lived
+  # for the observation loop, use that pid as the candidate and prove the
+  # group is gone before the EXIT trap drops the owner record.
+  # A successful short-lived stub may never have created a process group at
+  # all. Only timeout's terminating status authorizes the leader-pid fallback;
+  # an unverified successful wrapper keeps its owner record for a later sweep.
+  if [ -z "$pgid" ] && { [ "$timeout_rc" -eq 124 ] || [ "$timeout_rc" -eq 137 ]; }; then
+    pgid="$twait"
+  fi
   if [ -n "$pgid" ] && kill -0 -- -"$pgid" 2>/dev/null; then
     kill -TERM -- -"$pgid" 2>/dev/null || true
     sleep 1
