@@ -27,6 +27,7 @@
  * earns the bounded exponential backoff.
  */
 
+import { dlopen, FFIType } from "bun:ffi";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -147,21 +148,12 @@ export const writePrevBinaryAtomic = (
     copyFileSync(src, tmp);
     const fd = openSync(tmp, "r");
     try {
-      fsyncSync(fd);
+      fsyncFdSync(fd);
     } finally {
       closeSync(fd);
     }
     renameSync(tmp, prev);
-    try {
-      const dirFd = openSync(dirname(prev), "r");
-      try {
-        fsyncSync(dirFd);
-      } finally {
-        closeSync(dirFd);
-      }
-    } catch {
-      // best-effort dir durability — the file fsync above already holds
-    }
+    fsyncDirBestEffort(dirname(prev));
   } catch (err) {
     try {
       rmSync(tmp, { force: true });
@@ -284,23 +276,94 @@ export const sweepStaleUpdateTemps = (dir: string): void => {
   }
 };
 
-/** fsync one file's bytes to stable storage. Throws on failure. */
-export const fsyncFileSync = (path: string): void => {
+/**
+ * macOS `fcntl(fd, F_FULLFSYNC)` — <fcntl.h> command 51. Darwin's fsync(2)
+ * only hands bytes to the drive's write cache; F_FULLFSYNC is the barrier
+ * that lands them on stable storage, which is the crash durability FSS-18
+ * requires. Bound lazily out of libSystem; the `fullSync` seam on
+ * {@link fsyncFdSync} exercises the darwin branch off-mac.
+ */
+const DARWIN_F_FULLFSYNC = 51;
+
+/** The bound `fcntl(fd, F_FULLFSYNC, 0)` call, or null when it cannot load. */
+type TDarwinFullSync = (fd: number) => number;
+
+let cachedDarwinFullSync: TDarwinFullSync | null | undefined;
+
+const loadDarwinFullSync = (): TDarwinFullSync | null => {
+  if (cachedDarwinFullSync !== undefined) return cachedDarwinFullSync;
+  try {
+    const lib = dlopen("/usr/lib/libSystem.B.dylib", {
+      fcntl: {
+        // fcntl is variadic; F_FULLFSYNC ignores the third argument.
+        args: [FFIType.i32, FFIType.i32, FFIType.i32],
+        returns: FFIType.i32,
+      },
+    });
+    const fcntl = lib.symbols.fcntl;
+    cachedDarwinFullSync = (fd) => fcntl(fd, DARWIN_F_FULLFSYNC, 0);
+  } catch {
+    cachedDarwinFullSync = null;
+  }
+  return cachedDarwinFullSync;
+};
+
+/**
+ * Flush an open descriptor to stable storage (FSS-18). Darwin needs
+ * fcntl(F_FULLFSYNC): a plain fsync(2) can leave the bytes in the drive's
+ * volatile write cache, so a power loss after the swap could still
+ * resurrect the old binary or lose both. An unavailable or refused
+ * F_FULLFSYNC falls back to fsync(2) — a weaker barrier, never a new
+ * failure mode. Throws only on a real fsync failure.
+ *
+ * `platform`/`fullSync` are the test seam for the darwin branch: pass
+ * `"darwin"` with a recording stub to observe the F_FULLFSYNC call, or
+ * `null` to simulate a missing symbol. `undefined` binds real libc.
+ */
+export const fsyncFdSync = (
+  fd: number,
+  platform: NodeJS.Platform = process.platform,
+  fullSync: TDarwinFullSync | null | undefined = undefined,
+): void => {
+  if (platform === "darwin") {
+    const fcntl = fullSync === undefined ? loadDarwinFullSync() : fullSync;
+    if (fcntl !== null) {
+      try {
+        if (fcntl(fd) === 0) return;
+      } catch {
+        // refused/faulted — fsync(2) below is still a real barrier
+      }
+    }
+  }
+  fsyncSync(fd);
+};
+
+/** fsync one file's bytes to stable storage (FSS-18). Throws on failure. */
+export const fsyncFileSync = (
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+  fullSync?: TDarwinFullSync | null,
+): void => {
   const fd = openSync(path, "r");
   try {
-    fsyncSync(fd);
+    fsyncFdSync(fd, platform, fullSync);
   } finally {
     closeSync(fd);
   }
 };
 
 /**
- * fsync a directory so rename dirents survive a crash (FSS-18). Best-effort:
- * some filesystems refuse directory fsync — never throws.
+ * fsync a directory so rename dirents survive a crash (FSS-18) — on darwin
+ * the same F_FULLFSYNC barrier applies to the dir fd. Best-effort: some
+ * filesystems refuse directory fsync — never throws.
  */
-export const fsyncDirBestEffort = (dir: string): void => {
+export const fsyncDirBestEffort = (
+  dir: string,
+  platform: NodeJS.Platform = process.platform,
+  fullSync?: TDarwinFullSync | null,
+): void => {
   try {
-    fsyncFileSync(dir);
+    fsyncFileSync(dir, platform, fullSync);
   } catch {
     // best-effort — e.g. a filesystem without directory fsync
   }
