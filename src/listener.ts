@@ -48,7 +48,7 @@ import {
   fetchVideoJobPlan,
   MediaDefaultPlanError,
 } from "./cloud-client";
-import { planCacheEnabled } from "./config";
+import { planCacheEnabled, planSigningKey } from "./config";
 import { notePresenceActivity } from "./control-channel";
 import {
   corsHeaders,
@@ -129,15 +129,19 @@ const contextOverflowStrategyParam = (
  * calls to this surface with the signed `?__plan=`/`?__sig=` tuple in the
  * URL, and every mainstream client drops `Authorization` on the
  * cross-origin hop to loopback — so the signed tuple is the only proof the
- * caller can still present (FSS-01). It is verified by the SAME
- * `planSignatureOk` the walker applies again below: a keyed daemon
- * requires a real `__sig`, while a keyless/dev daemon accepts unsigned
- * plans exactly as the walker does. A forged or tampered tuple fails
- * closed — 401 here, 403 downstream.
+ * caller can still present (FSS-01). It counts as a CREDENTIAL only when an
+ * HMAC was really verified against the bootstrap plan-signing key. The
+ * walker's unsigned fallback (`!hasApiKey() || isDevMode()`, walker.ts)
+ * must NOT open this gate: on a keyless (onboarding / signed-out) or dev
+ * daemon any local user could otherwise pass SP-1 with a bare
+ * `?__plan=` and run the victim's vendor CLIs (round-3 audit P1). Cloud
+ * 307s for paired users always carry a real `__sig`, so FSS-01 is
+ * unaffected. A forged or tampered tuple fails closed — 401 here.
  */
 const signedPlanCallerCredential = (url: URL): boolean => {
   const plan = url.searchParams.get("__plan");
   if (plan === null) return false;
+  if (planSigningKey() === null) return false;
   return planSignatureOk(
     plan,
     url.searchParams.get("__pmids"),
