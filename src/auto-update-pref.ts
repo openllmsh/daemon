@@ -20,11 +20,38 @@ import { logWarn, safeDiagnosticMessage } from "./logger";
 /** The env-file key the preference lives under. */
 const AUTO_UPDATE_KEY = "OPENLLM_DAEMON_AUTO_UPDATE";
 
+/**
+ * The accepted preference words, compared case-insensitively after a trim.
+ * `1`/`0` stay canonical; `true`/`false`, `yes`/`no`, and `on`/`off` cover
+ * the usual forms (TCB-4). Anything else is unrecognized: the caller keeps
+ * the safe default (ON).
+ */
+const TRUE_WORDS = new Set(["1", "true", "yes", "on"]);
+const FALSE_WORDS = new Set(["0", "false", "no", "off"]);
+
+/**
+ * Values already warned about, deduplicated per normalized value and capped:
+ * the preference is read on every self-update check and status push, so an
+ * unrecognized value warns ONCE — not on every tick — and the cap keeps an
+ * env file rewritten with fresh junk from growing the set without bound.
+ */
+const WARNED_VALUES_MAX = 16;
+const warnedValues = new Set<string>();
+
 /** Parse a flag value to bool; null when unrecognized/absent. */
 const parseFlag = (raw: string | undefined): boolean | null => {
-  const v = raw?.trim();
-  if (v === "1" || v === "true") return true;
-  if (v === "0" || v === "false") return false;
+  const v = raw?.trim().toLowerCase();
+  if (v === undefined || v === "") return null;
+  if (TRUE_WORDS.has(v)) return true;
+  if (FALSE_WORDS.has(v)) return false;
+  if (!warnedValues.has(v) && warnedValues.size < WARNED_VALUES_MAX) {
+    warnedValues.add(v);
+    logWarn(
+      "auto-update",
+      safeDiagnosticMessage`unrecognized OPENLLM_DAEMON_AUTO_UPDATE value — the default (on) applies`,
+      { value: v.slice(0, 64) },
+    );
+  }
   return null;
 };
 
