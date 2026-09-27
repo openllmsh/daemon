@@ -455,6 +455,14 @@ export const encodeProtoInt32 = (field: number, value: number): Uint8Array => {
   return Uint8Array.from(out);
 };
 
+/** Encode a keyed fixed64 (wire type 1) field — 8 raw little-endian bytes. */
+const encodeKeyedFixed64 = (field: number, bytes: Uint8Array): Uint8Array => {
+  const out: number[] = [];
+  encodeKey(field, 1, out);
+  for (const b of bytes) out.push(b);
+  return Uint8Array.from(out);
+};
+
 export const concatBytes = (parts: ReadonlyArray<Uint8Array>): Uint8Array => {
   const total = parts.reduce((n, p) => n + p.byteLength, 0);
   const out = new Uint8Array(total);
@@ -1003,6 +1011,157 @@ export const encodeNativeShellToolStartedUpdate = (
   return encodeProtoBytes(2, started);
 };
 
+// ── `google.protobuf.Value` / `Struct` / `ListValue` decode (bounded) ──────
+//
+// Verified native schema for `agent.v1.McpArgs`: name(1), args(2,
+// map<string, google.protobuf.Value>), tool_call_id(3), provider_identifier(4),
+// tool_name(5), smart_mode_approval(6), approval_only(7, bool), skip_approval(8,
+// bool), server_identifier(9). `google.protobuf.Value`'s oneof: null_value(1,
+// enum/varint), number_value(2, double/fixed64), string_value(3),
+// bool_value(4, varint), struct_value(5, Struct), list_value(6, ListValue).
+// `Struct.fields` (1) and `McpArgs.args` (2) are both `map<string, Value>` —
+// wire-identical repeated MapEntry submessages (key=1 string, value=2 Value).
+//
+// Recursive, but bounded on BOTH depth and total decoded node count so a
+// hostile/corrupt struct can't exhaust memory or the call stack. Never
+// silently maps a non-finite double to `null` — that would be
+// indistinguishable from a genuine `null_value` the caller might act on;
+// instead it fails closed. Object keys (including `__proto__` /
+// `constructor`) are assembled via `Object.fromEntries`, which defines OWN
+// properties rather than going through `[[Set]]` — a key literally named
+// `__proto__` can never mutate the resulting object's prototype this way.
+
+export type TCursorMcpJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | ReadonlyArray<TCursorMcpJsonValue>
+  | { readonly [key: string]: TCursorMcpJsonValue };
+
+const MCP_VALUE_MAX_DEPTH = 8;
+const MCP_VALUE_MAX_NODES = 2_000;
+
+type TMcpDecodeBudget = { nodes: number };
+
+const bumpMcpDecodeBudget = (budget: TMcpDecodeBudget): void => {
+  budget.nodes += 1;
+  if (budget.nodes > MCP_VALUE_MAX_NODES) {
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      `mcp args exceed ${MCP_VALUE_MAX_NODES} decoded value nodes`,
+    );
+  }
+};
+
+/** Read an 8-byte little-endian IEEE754 double from a fixed64 wire field. */
+const readFixed64Double = (bytes: Uint8Array): number => {
+  if (bytes.byteLength !== 8) {
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      `mcp arg number_value has ${bytes.byteLength} bytes, expected 8`,
+    );
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return view.getFloat64(0, true);
+};
+
+/**
+ * Decode one `google.protobuf.Value` message. `depth` counts Value→Struct /
+ * Value→ListValue nesting (not raw protobuf recursion) so a legitimately
+ * flat but wide map never trips the depth bound.
+ */
+const decodeCursorMcpValue = (
+  bytes: Uint8Array,
+  budget: TMcpDecodeBudget,
+  depth: number,
+): TCursorMcpJsonValue => {
+  bumpMcpDecodeBudget(budget);
+  if (depth > MCP_VALUE_MAX_DEPTH) {
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      `mcp arg value nesting exceeds ${MCP_VALUE_MAX_DEPTH} levels`,
+    );
+  }
+  const fields = parseProtoFields(bytes);
+  for (const f of fields) {
+    if (f.field === 1 && f.wire === 0) return null; // NullValue
+    if (f.field === 2 && f.wire === 1) {
+      const num = readFixed64Double(f.bytes);
+      if (!Number.isFinite(num)) {
+        // Never silently coerce to null/0 — a non-finite double is a wire
+        // violation for JSON-shaped Value, not a legitimate "no value".
+        throw new CursorCaptureDecodeError(
+          "invalid_protobuf",
+          "mcp arg number_value is not finite (NaN/Infinity)",
+        );
+      }
+      return num;
+    }
+    if (f.field === 3 && f.wire === 2) return textDecoder.decode(f.bytes);
+    if (f.field === 4 && f.wire === 0) return f.varint !== 0;
+    if (f.field === 5 && f.wire === 2) {
+      return decodeCursorMcpStruct(f.bytes, budget, depth + 1);
+    }
+    if (f.field === 6 && f.wire === 2) {
+      return decodeCursorMcpListValue(f.bytes, budget, depth + 1);
+    }
+  }
+  // Unset oneof (or an unrecognized case) — Value's own default is null.
+  return null;
+};
+
+/** Decode one `Value`-valued map (`Struct.fields` or `McpArgs.args`). */
+const decodeCursorMcpValueMap = (
+  fields: ReadonlyArray<TProtoField>,
+  entryField: number,
+  budget: TMcpDecodeBudget,
+  depth: number,
+): { readonly [key: string]: TCursorMcpJsonValue } => {
+  const entries: Array<readonly [string, TCursorMcpJsonValue]> = [];
+  for (const f of fields) {
+    if (f.field !== entryField || f.wire !== 2) continue;
+    bumpMcpDecodeBudget(budget);
+    const entryFields = parseProtoFields(f.bytes);
+    const key = protoStringField(entryFields, 1);
+    if (key === null) continue; // malformed map entry — skip, don't fabricate a key
+    const valueBytes = protoMessageField(entryFields, 2);
+    entries.push([
+      key,
+      valueBytes !== null
+        ? decodeCursorMcpValue(valueBytes, budget, depth)
+        : null,
+    ]);
+  }
+  // `Object.fromEntries` defines each entry as an own property directly —
+  // never through `[[Set]]` — so a key literally named `__proto__` or
+  // `constructor` lands as an ordinary own property, never a prototype
+  // mutation.
+  return Object.fromEntries(entries);
+};
+
+const decodeCursorMcpStruct = (
+  bytes: Uint8Array,
+  budget: TMcpDecodeBudget,
+  depth: number,
+): { readonly [key: string]: TCursorMcpJsonValue } =>
+  decodeCursorMcpValueMap(parseProtoFields(bytes), 1, budget, depth);
+
+const decodeCursorMcpListValue = (
+  bytes: Uint8Array,
+  budget: TMcpDecodeBudget,
+  depth: number,
+): ReadonlyArray<TCursorMcpJsonValue> => {
+  const fields = parseProtoFields(bytes);
+  const out: TCursorMcpJsonValue[] = [];
+  for (const f of fields) {
+    if (f.field !== 1 || f.wire !== 2) continue;
+    bumpMcpDecodeBudget(budget);
+    out.push(decodeCursorMcpValue(f.bytes, budget, depth));
+  }
+  return out;
+};
+
 const parseMcpArgs = (
   bytes: Uint8Array,
 ): {
@@ -1261,12 +1420,18 @@ export const decodeCursorMcpArgs = (
   const toolName = protoStringField(fields, 5) ?? name;
   const providerIdentifier = protoStringField(fields, 4);
   const serverIdentifier = protoStringField(fields, 9);
+  // `args` (field 2) is `map<string, google.protobuf.Value>` — decode it for
+  // real via the bounded recursive Value decoder (never a hardcoded "{}").
+  // Values are never logged raw anywhere in this module; only the resulting
+  // JSON-shaped structure is ever handed to the caller as its OpenAI-style
+  // `arguments` string, exactly as the caller would present any other tool
+  // call's arguments.
+  const budget: TMcpDecodeBudget = { nodes: 0 };
+  const argsObj = decodeCursorMcpValueMap(fields, 2, budget, 1);
   return {
     callId: toolCallId,
     name: toolName || name || "mcp_tool",
-    // Opaque protobuf map values are not flattened into JSON here — avoids
-    // leaking tool argument content into logs while still naming the call.
-    argumentsText: "{}",
+    argumentsText: JSON.stringify(argsObj),
     providerIdentifier,
     serverIdentifier,
   };
@@ -1334,15 +1499,79 @@ export const encodeExecServerMessage = (args: {
   return concatBytes(parts);
 };
 
+/**
+ * Hermetic fixture encoder for one `google.protobuf.Value`, mirroring the
+ * real oneof: null_value(1), number_value(2, fixed64 double), string_value(3),
+ * bool_value(4), struct_value(5), list_value(6).
+ */
+export type TCursorMcpFixtureValue =
+  | null
+  | boolean
+  | number
+  | string
+  | ReadonlyArray<TCursorMcpFixtureValue>
+  | { readonly [key: string]: TCursorMcpFixtureValue };
+
+export const encodeMcpFixtureValue = (
+  value: TCursorMcpFixtureValue,
+): Uint8Array => {
+  if (value === null) return encodeProtoInt32(1, 0);
+  if (typeof value === "boolean") {
+    return encodeProtoInt32(4, value ? 1 : 0);
+  }
+  if (typeof value === "number") {
+    const buf = new ArrayBuffer(8);
+    new DataView(buf).setFloat64(0, value, true);
+    return encodeKeyedFixed64(2, new Uint8Array(buf));
+  }
+  if (typeof value === "string") return encodeProtoString(3, value);
+  if (Array.isArray(value)) {
+    return encodeProtoBytes(
+      6,
+      concatBytes(
+        value.map((v) => encodeProtoBytes(1, encodeMcpFixtureValue(v))),
+      ),
+    );
+  }
+  // Struct: repeated MapEntry { key(1) string, value(2) Value } at field 1.
+  const entries = Object.entries(
+    value as { readonly [key: string]: TCursorMcpFixtureValue },
+  );
+  const structBytes = concatBytes(
+    entries.map(([k, v]) =>
+      encodeProtoBytes(
+        1,
+        concatBytes([
+          encodeProtoString(1, k),
+          encodeProtoBytes(2, encodeMcpFixtureValue(v)),
+        ]),
+      ),
+    ),
+  );
+  return encodeProtoBytes(5, structBytes);
+};
+
 export const encodeMcpArgsMessage = (args: {
   readonly name: string;
   readonly toolCallId: string;
   readonly toolName?: string;
   readonly providerIdentifier?: string;
   readonly serverIdentifier?: string;
+  readonly args?: { readonly [key: string]: TCursorMcpFixtureValue };
 }): Uint8Array =>
   concatBytes([
     encodeProtoString(1, args.name),
+    ...(args.args !== undefined
+      ? Object.entries(args.args).map(([k, v]) =>
+          encodeProtoBytes(
+            2,
+            concatBytes([
+              encodeProtoString(1, k),
+              encodeProtoBytes(2, encodeMcpFixtureValue(v)),
+            ]),
+          ),
+        )
+      : []),
     encodeProtoString(3, args.toolCallId),
     ...(args.providerIdentifier !== undefined
       ? [encodeProtoString(4, args.providerIdentifier)]

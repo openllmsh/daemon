@@ -1516,6 +1516,161 @@ export const runCursorNativeCapture = async (
         toolIndex += 1;
         return next;
       };
+      // Only tool NAMES the caller itself registered for this turn may ever
+      // be handed off as a successful `exec_server_message.mcp_args` — an
+      // unregistered name still fails closed via `cursorExecServerFailure`,
+      // never a generic/blanket approval.
+      const registeredToolNames = new Set(
+        (params.tools ?? []).map((tool) => tool.name),
+      );
+      // `InteractionUpdate.partial_tool_call` / `tool_call_started` can
+      // stream a call's arguments incrementally as raw, possibly-INCOMPLETE
+      // JSON fragments (fine on its own — the caller reconstructs by
+      // concatenation). But the SAME call id can also later receive an
+      // AUTHORITATIVE, complete `exec_server_message.mcp_args` map (live
+      // retest #37's shape). The two must never both reach the caller:
+      // streaming the partial fragments AND THEN the full map would either
+      // corrupt the concatenated JSON, or — the sharper bug — silently
+      // WITHHOLDING the full map (as an earlier fix here mistakenly did)
+      // would leave the caller with only a truncated partial fragment
+      // treated as a successful, complete tool call.
+      //
+      // Fix: buffer partial argument text per call id here WITHOUT ever
+      // yielding it to the caller. Only once (a) an authoritative
+      // `mcp_args` arrives for that id, emit ONE complete tool_calls delta
+      // with the real decoded arguments — the buffered partial is simply
+      // discarded, since the authoritative source is strictly better; or
+      // (b) the turn ends with no authoritative `mcp_args` ever arriving
+      // for a buffered call, flush its buffered text once as a best-effort
+      // delta (preserves the ordinary MCP-tool-only flow, which has no
+      // second exchange at all).
+      // Bound both the number of distinct buffered calls and the total
+      // buffered text — a hostile/corrupt stream that keeps sending partial
+      // fragments with no authoritative resolution and no terminal must not
+      // be able to grow this buffer without limit.
+      const MAX_PENDING_MCP_TOOL_CALLS = 32;
+      const MAX_PENDING_MCP_ARGS_BYTES = 64 * 1024;
+      let pendingMcpArgsBytes = 0;
+      const pendingMcpToolCalls = new Map<
+        string,
+        { readonly name: string; readonly index: number; argsText: string }
+      >();
+      const bufferMcpToolCallUpdate = (
+        callId: string,
+        name: string,
+        argsTextDelta: string,
+      ): void => {
+        const existing = pendingMcpToolCalls.get(callId);
+        if (
+          existing === undefined &&
+          pendingMcpToolCalls.size >= MAX_PENDING_MCP_TOOL_CALLS
+        ) {
+          throw new CursorCaptureDecodeError(
+            "invalid_protobuf",
+            `pending MCP tool call count exceeds ${MAX_PENDING_MCP_TOOL_CALLS}`,
+          );
+        }
+        pendingMcpArgsBytes += argsTextDelta.length;
+        if (pendingMcpArgsBytes > MAX_PENDING_MCP_ARGS_BYTES) {
+          throw new CursorCaptureDecodeError(
+            "invalid_protobuf",
+            `pending MCP tool call argument bytes exceed ${MAX_PENDING_MCP_ARGS_BYTES}`,
+          );
+        }
+        if (existing !== undefined) {
+          existing.argsText += argsTextDelta;
+          return;
+        }
+        pendingMcpToolCalls.set(callId, {
+          name,
+          index: ensureToolIndex(callId),
+          argsText: argsTextDelta,
+        });
+      };
+      /**
+       * Flush every still-pending (never authoritatively resolved) MCP tool
+       * call — called ONLY at a genuine turn terminal, never mid-turn. Live
+       * retest #38 review: this previously yielded each pending entry's raw
+       * `name`/`argsText` completely unvalidated — an unregistered name, or
+       * argument text that never finished as a complete JSON object (e.g. a
+       * lone `{"token":` fragment when no authoritative `mcp_args` ever
+       * arrived before the terminal), could reach the caller as an
+       * apparently-successful tool call. Fix: validate EVERY pending entry
+       * — registered name AND parses as one complete JSON value — BEFORE
+       * yielding ANY of them. A single invalid entry fails the whole flush
+       * closed (never a partial success, never a fabricated `"{}"`
+       * stand-in); only once every pending entry is verified valid does any
+       * of them get yielded, and each yields its own real, already-complete
+       * buffered JSON text unchanged.
+       */
+      function* flushPendingMcpToolCalls(): Generator<TChatCompletionChunk> {
+        if (pendingMcpToolCalls.size === 0) return;
+        const verified: Array<{
+          readonly callId: string;
+          readonly name: string;
+          readonly index: number;
+          readonly argsText: string;
+        }> = [];
+        for (const [callId, pending] of pendingMcpToolCalls) {
+          if (!registeredToolNames.has(pending.name)) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_tool_intent",
+              `pending MCP tool call ${callId} name is not in the caller's registered tools`,
+            );
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(pending.argsText);
+          } catch {
+            throw new CursorCaptureDecodeError(
+              "invalid_protobuf",
+              `pending MCP tool call ${callId} arguments never completed as valid JSON`,
+            );
+          }
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            Array.isArray(parsed)
+          ) {
+            throw new CursorCaptureDecodeError(
+              "invalid_protobuf",
+              `pending MCP tool call ${callId} arguments did not decode to a JSON object`,
+            );
+          }
+          verified.push({
+            callId,
+            name: pending.name,
+            index: pending.index,
+            argsText: pending.argsText,
+          });
+        }
+        for (const entry of verified) {
+          yield {
+            ...baseChunk(),
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: entry.index,
+                      id: entry.callId,
+                      type: "function",
+                      function: {
+                        name: entry.name,
+                        arguments: entry.argsText,
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          };
+        }
+        pendingMcpToolCalls.clear();
+        pendingMcpArgsBytes = 0;
+      }
       const baseChunk = (): Pick<
         TChatCompletionChunk,
         "id" | "object" | "created" | "model"
@@ -1563,6 +1718,11 @@ export const runCursorNativeCapture = async (
                 // benign, not a failure — matches the official client.
                 phase = "done";
                 teardownBuilderOnTerminal();
+                // Genuine turn terminal reached with no authoritative
+                // `mcp_args` ever arriving for some buffered call(s) — flush
+                // their buffered text once, as a whole, rather than
+                // silently dropping them.
+                yield* flushPendingMcpToolCalls();
                 yield {
                   ...baseChunk(),
                   choices: [
@@ -1634,6 +1794,7 @@ export const runCursorNativeCapture = async (
                 phase = "done";
                 teardownBuilderOnTerminal();
                 if (sawModelOutput) {
+                  yield* flushPendingMcpToolCalls();
                   yield {
                     ...baseChunk(),
                     choices: [
@@ -1700,6 +1861,7 @@ export const runCursorNativeCapture = async (
                 turnEndedSeen = true;
                 phase = "done";
                 teardownBuilderOnTerminal();
+                yield* flushPendingMcpToolCalls();
                 yield {
                   ...baseChunk(),
                   choices: [
@@ -1727,6 +1889,72 @@ export const runCursorNativeCapture = async (
               }
               if (decoded.kind === "exec_server") {
                 execFramesSeen += 1;
+                if (
+                  decoded.classification === "caller_mcp_tool" &&
+                  decoded.mcp !== null &&
+                  registeredToolNames.has(decoded.mcp.name)
+                ) {
+                  // Verified native schema: `exec_server_message.mcp_args`
+                  // handing a tool call to the CALLER is a real, complete
+                  // exchange — not an error condition. Emit the tool_calls
+                  // delta (with the fully decoded, real arguments — never
+                  // fabricated), then a genuine successful `tool_calls`
+                  // terminal, and gracefully tear the builder down. Never
+                  // forward mcp_args into the builder, never execute the
+                  // tool natively — execution is entirely the caller's own
+                  // responsibility once it receives this response. Only a
+                  // NAME the caller itself registered for this turn may take
+                  // this path; anything else still falls through to the
+                  // fail-closed `cursorExecServerFailure` below.
+                  const intent = decoded.mcp;
+                  const callId = intent.callId || `exec-${decoded.id ?? 0}`;
+                  const index = ensureToolIndex(callId);
+                  // This is the AUTHORITATIVE source — it always wins.
+                  // Discard any buffered partial fragments for this call id
+                  // (never emitted to the caller in the first place — see
+                  // `pendingMcpToolCalls`) and emit the real, COMPLETE
+                  // decoded arguments exactly once. Never withhold this: a
+                  // caller receiving only a truncated partial fragment as a
+                  // "complete" tool call, with no real arguments ever
+                  // following, is the exact fabricated-success failure mode
+                  // this must avoid.
+                  pendingMcpToolCalls.delete(callId);
+                  yield {
+                    ...baseChunk(),
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {
+                          tool_calls: [
+                            {
+                              index,
+                              id: callId,
+                              type: "function",
+                              function: {
+                                name: intent.name,
+                                arguments: intent.argumentsText,
+                              },
+                            },
+                          ],
+                        },
+                        finish_reason: null,
+                      },
+                    ],
+                  };
+                  phase = "done";
+                  teardownBuilderOnTerminal();
+                  yield {
+                    ...baseChunk(),
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason: "tool_calls",
+                      },
+                    ],
+                  };
+                  return;
+                }
                 throw cursorExecServerFailure({
                   id: decoded.id,
                   execId: decoded.execId,
@@ -1827,33 +2055,18 @@ export const runCursorNativeCapture = async (
                 modelFramesSeen += 1;
                 phase = "model_stream";
                 const intent = decoded.intent;
-                const index = ensureToolIndex(intent.callId);
                 const argsDelta =
                   decoded.kind === "mcp_tool_partial"
                     ? decoded.argsTextDelta
                     : "";
-                yield {
-                  ...baseChunk(),
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        tool_calls: [
-                          {
-                            index,
-                            id: intent.callId,
-                            type: "function",
-                            function: {
-                              name: intent.name,
-                              arguments: argsDelta,
-                            },
-                          },
-                        ],
-                      },
-                      finish_reason: null,
-                    },
-                  ],
-                };
+                // Buffer WITHOUT emitting — never yield a partial/possibly
+                // truncated argument fragment to the caller. See
+                // `pendingMcpToolCalls` above: an authoritative
+                // `exec_server_message.mcp_args` (if one arrives for this
+                // call id) replaces this buffered text entirely; otherwise
+                // it is flushed once, as a whole, at the genuine turn
+                // terminal.
+                bufferMcpToolCallUpdate(intent.callId, intent.name, argsDelta);
               } else if (decoded.kind === "heartbeat") {
                 heartbeatFramesSeen += 1;
               } else if (decoded.kind === "native_tool") {
