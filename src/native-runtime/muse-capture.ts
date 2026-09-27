@@ -72,6 +72,7 @@ import {
   defaultMuseHostFactory,
   MUSE_APPROVAL_MODE,
   MUSE_SERVE_SAFETY_ARGS,
+  museTurnDeclineReason,
   openMuseHostWithTimeout,
   wrapMuseServeSpawn,
 } from "./muse-runtime";
@@ -913,10 +914,13 @@ const remapMuseToolCallsInChunk = (
 export const mapMuseCaptureChunkToolNames = (
   chunks: ReadableStream<TChatCompletionChunk>,
   nameMap: TMuseToolNameMap,
-): ReadableStream<TChatCompletionChunk> =>
-  new ReadableStream<TChatCompletionChunk>({
+): ReadableStream<TChatCompletionChunk> => {
+  // Acquired once, up front, so `cancel()` can reach the SAME locked reader —
+  // `chunks.cancel()` on a stream that already has an active reader (the one
+  // `start()` acquires) rejects with "Cannot cancel a locked ReadableStream".
+  const reader = chunks.getReader();
+  return new ReadableStream<TChatCompletionChunk>({
     async start(controller) {
-      const reader = chunks.getReader();
       try {
         for (;;) {
           const { value, done } = await reader.read();
@@ -931,9 +935,10 @@ export const mapMuseCaptureChunkToolNames = (
       }
     },
     cancel(reason) {
-      void chunks.cancel(reason);
+      void reader.cancel(reason).catch(() => {});
     },
   });
+};
 
 /** Narrow fetch seam for hermetic stubs — not the full `typeof fetch` surface. */
 export type TMuseCaptureFetch = (
@@ -1045,6 +1050,13 @@ export const runMuseNativeCapture = async (
   let mcpStop: (() => void) | null = null;
   let hostClose: (() => Promise<void>) | null = null;
   let captureOwnership: "none" | "accepted" | "uncertain" = "none";
+  /**
+   * Set when the native Muse turn ends BEFORE any capture envelope was ever
+   * offered — preserves the real native failure (e.g. authRequired, launch
+   * failure) instead of letting `runCapturedDispatch`'s `takeCaptured()` sit
+   * out the full capture timeout for an envelope that will never arrive.
+   */
+  let turnEndedBeforeCaptureReason: string | null = null;
 
   const disposeAll = async (): Promise<void> => {
     handle.dispose();
@@ -1129,17 +1141,47 @@ export const runMuseNativeCapture = async (
 
     const turn = await session.sendUserTurn(params.parts);
 
+    // If the native turn ends (completed/cancelled/failed) BEFORE any capture
+    // envelope was ever offered, cancel the capture wait immediately instead
+    // of leaving `runCapturedDispatch` blocked on `takeCaptured()` for the
+    // full capture timeout (e.g. an authRequired/launch failure that never
+    // even attempts the Meta HTTP call). `session.cancel()` is a no-op once a
+    // terminal outcome already exists (captured/dispatched/failed), so this
+    // never disturbs an already-captured or already-dispatched exchange.
+    const abortCaptureOnEarlyTurnEnd = turn.completed
+      .then((outcome) => {
+        if (handle.session.captured() !== null) return;
+        turnEndedBeforeCaptureReason = museTurnDeclineReason(outcome);
+        handle.session.cancel(
+          `muse turn ended before capture: ${turnEndedBeforeCaptureReason}`,
+        );
+      })
+      .catch(() => {
+        // turn.completed rejecting is not this watcher's concern — the
+        // dispatch/settlement paths below handle their own failures.
+      });
+
     const sender = createMuseCapturedDispatchSender({
       session: handle.session,
       fetchImpl: params.fetchImpl,
     });
-    const dispatched = await runCapturedDispatch({
-      session: handle.session,
-      sender,
-      signal: params.signal,
-      suppressReason:
-        "muse original external send suppressed; daemon owns the exchange",
-    });
+    let dispatched: Awaited<ReturnType<typeof runCapturedDispatch>>;
+    try {
+      dispatched = await runCapturedDispatch({
+        session: handle.session,
+        sender,
+        signal: params.signal,
+        suppressReason:
+          "muse original external send suppressed; daemon owns the exchange",
+      });
+    } catch (dispatchError) {
+      if (turnEndedBeforeCaptureReason !== null) {
+        throw new Error(turnEndedBeforeCaptureReason);
+      }
+      throw dispatchError;
+    } finally {
+      void abortCaptureOnEarlyTurnEnd;
+    }
     captureOwnership = dispatched.response.ok ? "accepted" : "uncertain";
 
     // Builder settlement: cancel + authoritative terminal. Do NOT treat process

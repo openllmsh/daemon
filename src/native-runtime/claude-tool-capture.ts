@@ -813,10 +813,13 @@ const remapToolCallsInChunk = (
 export const mapClaudeCaptureChunkToolNames = (
   chunks: ReadableStream<TChatCompletionChunk>,
   nameMap: TClaudeToolNameMap,
-): ReadableStream<TChatCompletionChunk> =>
-  new ReadableStream<TChatCompletionChunk>({
+): ReadableStream<TChatCompletionChunk> => {
+  // Acquired once, up front, so `cancel()` can reach the SAME locked reader —
+  // `chunks.cancel()` on a stream that already has an active reader (the one
+  // `start()` acquires) rejects with "Cannot cancel a locked ReadableStream".
+  const reader = chunks.getReader();
+  return new ReadableStream<TChatCompletionChunk>({
     async start(controller) {
-      const reader = chunks.getReader();
       try {
         for (;;) {
           const { value, done } = await reader.read();
@@ -831,9 +834,10 @@ export const mapClaudeCaptureChunkToolNames = (
       }
     },
     cancel(reason) {
-      void chunks.cancel(reason);
+      void reader.cancel(reason).catch(() => {});
     },
   });
+};
 
 export type TClaudeToolCaptureDiagnostics = {
   readonly textSettlement:
