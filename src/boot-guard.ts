@@ -93,15 +93,16 @@ export const guardCrashLoop = (): void => {
   // parking. The supervisor then relaunches the known-good binary, and the
   // rejected version is never reinstalled. No `.prev` (or a failed restore)
   // falls through to the normal park path.
+  // Save the rejection before rollback. Park if the write fails.
   const attempt = readState().updateAttempts.daemon;
   if (
     attempt !== undefined &&
     attempt.version === DAEMON_VERSION &&
     now - attempt.ts <= ROLLBACK_WINDOW_MS &&
     process.platform !== "win32" &&
+    rejectUpdateVersion("daemon", attempt.version, attempt.digest ?? "") &&
     restorePreviousBinary(process.execPath)
   ) {
-    rejectUpdateVersion("daemon", attempt.version, attempt.digest ?? "");
     logError(
       "boot-guard",
       `crash loop right after the v${attempt.version} self-update — restored ${prevBinaryPath(process.execPath)}; v${attempt.version} is rejected on this host and will not be reinstalled`,

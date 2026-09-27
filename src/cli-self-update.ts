@@ -17,7 +17,7 @@
  *     `cli-install.ts`. Manual `openllm self-update` also still works — the two
  *     writers serialize through ONE cross-process lock dir
  *     (`updateLockDirFor(dest)`, `packages/tunnel/update-lock.ts`) covering
- *     probe → backup → rename → legacy-link → attempt marker, so a race can
+ *     probe → backup → attempt marker → rename → legacy-link, so a race can
  *     never leave `.prev` unrelated to the final binary or `state.json`
  *     describing the other update.
  *   - Its own attempt SLOT (`cli`) in the shared `state.json` so a daemon
@@ -332,8 +332,7 @@ export const applyCliSelfUpdate = async (args: {
     }
     const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== expected) {
-      // Mis-published artifact: deterministic — reject permanently.
-      rejectUpdateVersion("cli", latest, expected);
+      // These bytes do not identify the published artifact. Retry after backoff.
       recordAttempt("cli", latest, { digest: expected });
       return {
         kind: "failed",
@@ -390,7 +389,12 @@ export const applyCliSelfUpdate = async (args: {
           // the version this converge set out to replace. Overwriting on an
           // UNPROVEN recheck could clobber a concurrent manual update with
           // stale bytes, so yield the tick instead.
-          return { kind: "busy" };
+          recordAttempt("cli", latest, { digest: expected });
+          return {
+            kind: "failed",
+            stage: "probe-inconclusive",
+            detail: installedVerdict.detail,
+          };
         }
         const installedNow =
           installedVerdict.kind === "ok"
@@ -473,6 +477,13 @@ export const applyCliSelfUpdate = async (args: {
           }`,
         };
       }
+      if (!recordAttempt("cli", latest, { digest: expected })) {
+        return {
+          kind: "failed",
+          stage: "write",
+          detail: "failed to persist update attempt before swap",
+        };
+      }
       renameSync(tmp, dest); // atomic on POSIX; a running CLI keeps its inode
       if (args.legacySymlink !== undefined) {
         // Replace the old binary file with a transitional symlink so
@@ -497,7 +508,6 @@ export const applyCliSelfUpdate = async (args: {
           }`,
         );
       }
-      recordAttempt("cli", latest, { digest: expected });
       return { kind: "updated" };
     } finally {
       cliSwapInFlightRegion = null;
