@@ -35,9 +35,7 @@ const nonceSeen = new Map<string, { ts: number; storedMono: number }>();
 /** TEST SEAM — monotonic clock for nonce retention. Never set in production. */
 let monoImpl: () => number = () => performance.now();
 
-export const setDeviceGrantMonoForTests = (
-  fn: (() => number) | null,
-): void => {
+export const setDeviceGrantMonoForTests = (fn: (() => number) | null): void => {
   monoImpl = fn ?? (() => performance.now());
 };
 
