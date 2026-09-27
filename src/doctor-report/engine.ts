@@ -401,7 +401,10 @@ export const daemonServerNowMs = (): number | null => {
   const age = now - serverClockOffsetAtMs;
   // Any rollback (also one that stays above the measurement) drops the
   // offset until the next receipt re-measures it.
-  if (age < 0 || now + CLOCK_ROLLBACK_TOLERANCE_MS < serverClockHighWaterMs) {
+  if (
+    age < -CLOCK_ROLLBACK_TOLERANCE_MS ||
+    now + CLOCK_ROLLBACK_TOLERANCE_MS < serverClockHighWaterMs
+  ) {
     serverClockOffsetMs = null;
     return null;
   }
@@ -463,8 +466,13 @@ const reportingPolicyLive = (
     policyClockHighWaterMs = now;
   }
   if (rollbackLatchedFor === key) return false;
-  const elapsed = now - policyAnchoredAtMs;
-  if (elapsed < 0 || now + CLOCK_ROLLBACK_TOLERANCE_MS < policyClockHighWaterMs) {
+  // Small backward steps (NTP slew, timer jitter) inside the tolerance are
+  // not a rollback, also right after the anchor (rework-8).
+  const elapsed = Math.max(0, now - policyAnchoredAtMs);
+  if (
+    now - policyAnchoredAtMs < -CLOCK_ROLLBACK_TOLERANCE_MS ||
+    now + CLOCK_ROLLBACK_TOLERANCE_MS < policyClockHighWaterMs
+  ) {
     serverClockOffsetMs = null;
     rollbackLatchedFor = key;
     persistRollbackLatch(key);
