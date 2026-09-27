@@ -1651,22 +1651,47 @@ job_dir_age() {
 # dead or unreadable dir is residue — swept whole, never partly deleted.
 for parked in "$pidfile".parked-*; do
   [ -d "$parked" ] || continue
-  prec="$(cat "$parked/owner" 2>/dev/null || true)"
-  if [ -n "$prec" ] && job_owner_live "$prec"; then
-    if mkdir "$lockd" 2>/dev/null; then
-      # Restore the live record through a tmp + no-replace publish, then
-      # delete the parked copy ONLY once the live name carries the full
-      # record byte-for-byte. A failed read or a noclobber race must never
-      # leave an empty/foreign owner file standing while the only good
-      # record is deleted — the next installer would start a duplicate job.
-      if cat "$parked/owner" > "$lockd/owner.tmp.$$" 2>/dev/null \
+  if ! prec="$(cat "$parked/owner" 2>/dev/null)"; then
+    printf 'vendor lock recovery: cannot read %s; keeping the parked lock and not starting a second job\n' \
+      "$parked/owner" >&2
+    exit 0
+  fi
+  if [ -z "$prec" ]; then
+    printf 'vendor lock recovery: empty %s; keeping the parked lock and not starting a second job\n' \
+      "$parked/owner" >&2
+    exit 0
+  fi
+  if job_owner_live "$prec"; then
+    if ! mkdir "$lockd" 2>/dev/null; then
+      printf 'vendor lock recovery: live parked owner cannot reclaim %s; not starting a second job\n' \
+        "$parked" >&2
+      exit 0
+    fi
+    parked_lock_ino="$(job_dir_ino "$lockd")"
+    if [ -z "$parked_lock_ino" ]; then
+      printf 'vendor lock recovery: cannot prove the new lock inode for %s; keeping the parked lock\n' \
+        "$parked" >&2
+      exit 0
+    fi
+    if
+      cat "$parked/owner" > "$lockd/owner.tmp.$$" 2>/dev/null \
+        && [ -s "$lockd/owner.tmp.$$" ] \
         && [ "$(cat "$lockd/owner.tmp.$$" 2>/dev/null || true)" = "$prec" ] \
         && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
           || (set -C; cat "$lockd/owner.tmp.$$" > "$ownerfile") 2>/dev/null; } \
-        && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$prec" ]; then
-        rm -rf "$parked" 2>/dev/null || true
-      fi
+        && [ -s "$ownerfile" ] \
+        && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$prec" ]
+    then
+      rm -rf "$parked" 2>/dev/null || true
       rm -f "$lockd/owner.tmp.$$" 2>/dev/null
+    else
+      rm -f "$lockd/owner.tmp.$$" 2>/dev/null || true
+      if [ "$(job_dir_ino "$lockd")" = "$parked_lock_ino" ]; then
+        rmdir "$lockd" 2>/dev/null || true
+      fi
+      printf 'vendor lock recovery: could not restore %s; keeping the parked lock and not starting a second job\n' \
+        "$parked" >&2
+      exit 0
     fi
     continue
   fi
@@ -1688,7 +1713,9 @@ for _try in 1 2 3; do
     # successor's claim, and an unproven dir is never ours to rmdir.
     lock_ino="$(job_dir_ino "$lockd")"
     if [ -z "$lock_ino" ]; then
-      break
+      printf 'vendor lock: cannot prove the new lock inode for %s; leaving it empty\n' \
+        "$lockd" >&2
+      exit 0
     fi
     if printf '%s\n' "$myrec" > "$lockd/owner.tmp.$$" 2>/dev/null \
       && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
