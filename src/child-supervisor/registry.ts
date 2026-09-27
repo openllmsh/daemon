@@ -79,6 +79,16 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
  * `ps` through node:child_process, which bypasses the admission seam and the
  * loader-boundary allowlist; the macmini PTY suite caught that regression.
  */
+/** ESRCH from kill(pid, 0) proves the pid is gone; anything else is unknown. */
+const livenessFallback = (pid: number): null | undefined => {
+  try {
+    process.kill(pid, 0);
+    return undefined;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? null : undefined;
+  }
+};
+
 const darwinPsStartTime = (pid: number): string | null | undefined => {
   try {
     const output = admittedSpawnSync(
@@ -92,20 +102,13 @@ const darwinPsStartTime = (pid: number): string | null | undefined => {
         timeout: 1500,
       },
     );
-    if (output.exitCode !== 0) {
-      try {
-        process.kill(pid, 0);
-        return undefined;
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code === "ESRCH"
-          ? null
-          : undefined;
-      }
-    }
+    if (output.exitCode !== 0) return livenessFallback(pid);
     const value = new TextDecoder().decode(output.stdout).trim();
     return value.length > 0 ? value : undefined;
   } catch {
-    return undefined;
+    // ps could not start at all (e.g. not on PATH): still prove a dead pid
+    // dead instead of reporting every record as unknown (review P2).
+    return livenessFallback(pid);
   }
 };
 
