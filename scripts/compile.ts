@@ -38,6 +38,7 @@ import { gzipSync } from "node:zlib";
 import { $ } from "bun";
 import type { TDaemonTarget } from "../release-types";
 import {
+  assertDarwinSafeBunRuntime,
   BUN_TARGET_TO_DAEMON_TARGET,
   DAEMON_COMPILE_TARGET,
   DAEMON_RELEASE_TARGETS,
@@ -270,6 +271,13 @@ const buildOne = async (
   target: string | null,
   cloudOrigin: string,
 ): Promise<string> => {
+  // MAC-2 guard on EVERY compile path (the runbook's bare compile included,
+  // round-3 audit P2): a broken Bun darwin runtime yields binaries macOS 27
+  // SIGKILLs at exec. A host build on a Mac counts as a darwin target.
+  assertDarwinSafeBunRuntime(
+    [target ?? (process.platform === "darwin" ? "darwin-host" : "")],
+    Bun.version,
+  );
   const outfile =
     target === null
       ? `${OUT_DIR}/openllmd${process.platform === "win32" ? ".exe" : ""}`
