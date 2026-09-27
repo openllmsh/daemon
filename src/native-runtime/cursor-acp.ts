@@ -1352,18 +1352,37 @@ export const runCursorNativeCapture = async (
       ),
     ]);
     if (raced.kind === "acp_declined") {
-      // No dispatch was ever attempted — nothing touched upstream.
+      // No dispatch was ever attempted — nothing touched upstream. Save
+      // ownership BEFORE disposing (dispose tears down the session this
+      // reads from), then release the bridge's socket/temp-file resources
+      // and signal the builder abort — every other return path here does
+      // both; this early-decline race must too, not just skip cleanup
+      // because nothing was ever dispatched.
+      const ownership = captureOwnershipFromSession(bridge.session);
+      builderAbort.abort();
+      try {
+        await bridge.dispose();
+      } catch {
+        // ignore — best-effort cleanup
+      }
       return {
         ...raced.result,
-        captureOwnership: captureOwnershipFromSession(bridge.session),
+        captureOwnership: ownership,
       };
     }
     if (raced.kind === "acp_error") {
+      const ownership = captureOwnershipFromSession(bridge.session);
+      builderAbort.abort();
+      try {
+        await bridge.dispose();
+      } catch {
+        // ignore — best-effort cleanup
+      }
       return {
         kind: "declined",
         reason:
           raced.err instanceof Error ? raced.err.message : String(raced.err),
-        captureOwnership: captureOwnershipFromSession(bridge.session),
+        captureOwnership: ownership,
       };
     }
     // `acp_settled_other` (acpPromise resolved "committed" — unexpected in
@@ -1644,6 +1663,9 @@ export const runCursorNativeCapture = async (
             argsText: pending.argsText,
           });
         }
+        // Stable index order — explicit, not relied on implicitly from Map
+        // insertion order.
+        verified.sort((a, b) => a.index - b.index);
         for (const entry of verified) {
           yield {
             ...baseChunk(),
@@ -1908,41 +1930,44 @@ export const runCursorNativeCapture = async (
                   // fail-closed `cursorExecServerFailure` below.
                   const intent = decoded.mcp;
                   const callId = intent.callId || `exec-${decoded.id ?? 0}`;
-                  const index = ensureToolIndex(callId);
-                  // This is the AUTHORITATIVE source — it always wins.
-                  // Discard any buffered partial fragments for this call id
-                  // (never emitted to the caller in the first place — see
-                  // `pendingMcpToolCalls`) and emit the real, COMPLETE
-                  // decoded arguments exactly once. Never withhold this: a
-                  // caller receiving only a truncated partial fragment as a
-                  // "complete" tool call, with no real arguments ever
-                  // following, is the exact fabricated-success failure mode
-                  // this must avoid.
-                  pendingMcpToolCalls.delete(callId);
-                  yield {
-                    ...baseChunk(),
-                    choices: [
-                      {
-                        index: 0,
-                        delta: {
-                          tool_calls: [
-                            {
-                              index,
-                              id: callId,
-                              type: "function",
-                              function: {
-                                name: intent.name,
-                                arguments: intent.argumentsText,
-                              },
-                            },
-                          ],
-                        },
-                        finish_reason: null,
-                      },
-                    ],
-                  };
+                  // Independent-review fix: this branch used to emit ONLY
+                  // this one call id then return immediately — silently
+                  // dropping any OTHER tool call already declared in
+                  // parallel via `mcp_tool_partial`/`mcp_tool_started`
+                  // (buffered in `pendingMcpToolCalls`) that hadn't yet
+                  // received its own authoritative exchange. A turn ending
+                  // in `finish_reason: "tool_calls"` implies ALL of this
+                  // turn's tool calls are included — reporting only a
+                  // subset is a silent-loss bug, not a valid partial
+                  // success.
+                  //
+                  // Fix: this authoritative map always overrides this call
+                  // id's own buffered entry (never the reverse), then EVERY
+                  // still-pending call — this one included — is validated
+                  // and emitted together via the same all-or-nothing
+                  // `flushPendingMcpToolCalls` path used at the natural
+                  // turn terminal: every entry must be a registered name
+                  // with complete, valid JSON before ANY of them is
+                  // yielded; one incomplete/unregistered OTHER call fails
+                  // the whole turn closed rather than reporting a partial
+                  // batch success.
+                  if (
+                    !pendingMcpToolCalls.has(callId) &&
+                    pendingMcpToolCalls.size >= MAX_PENDING_MCP_TOOL_CALLS
+                  ) {
+                    throw new CursorCaptureDecodeError(
+                      "invalid_protobuf",
+                      `pending MCP tool call count exceeds ${MAX_PENDING_MCP_TOOL_CALLS}`,
+                    );
+                  }
+                  pendingMcpToolCalls.set(callId, {
+                    name: intent.name,
+                    index: ensureToolIndex(callId),
+                    argsText: intent.argumentsText,
+                  });
                   phase = "done";
                   teardownBuilderOnTerminal();
+                  yield* flushPendingMcpToolCalls();
                   yield {
                     ...baseChunk(),
                     choices: [

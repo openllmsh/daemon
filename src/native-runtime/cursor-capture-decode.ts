@@ -1170,14 +1170,26 @@ const parseMcpArgs = (
   readonly toolName: string;
   readonly providerIdentifier: string | null;
   readonly serverIdentifier: string | null;
+  /**
+   * The real `args` map (field 2) decoded via the same bounded Value
+   * decoder as `decodeCursorMcpArgs`, when present and non-empty — `null`
+   * when absent/empty. Verified native schema: a `tool_call_started`
+   * update's own nested `McpArgs` can already carry a COMPLETE args map
+   * (not just name/id), so a caller should prefer this over buffering an
+   * empty placeholder and waiting on separate partial-delta text.
+   */
+  readonly argsText: string | null;
 } => {
   const fields = parseProtoFields(bytes);
+  const budget: TMcpDecodeBudget = { nodes: 0 };
+  const argsObj = decodeCursorMcpValueMap(fields, 2, budget, 1);
   return {
     name: protoStringField(fields, 1) ?? "",
     toolCallId: protoStringField(fields, 3) ?? "",
     toolName: protoStringField(fields, 5) ?? protoStringField(fields, 1) ?? "",
     providerIdentifier: protoStringField(fields, 4),
     serverIdentifier: protoStringField(fields, 9),
+    argsText: Object.keys(argsObj).length > 0 ? JSON.stringify(argsObj) : null,
   };
 };
 
@@ -1302,7 +1314,10 @@ export const decodeInteractionUpdate = (
       intent: {
         callId: tool.args.toolCallId || callId,
         name: tool.args.toolName || tool.args.name,
-        argumentsText: "",
+        // Prefer a COMPLETE args map already present on `started` (verified
+        // native schema) over an empty placeholder — exactly "" only when
+        // the nested McpArgs truly carries no args field.
+        argumentsText: tool.args.argsText ?? "",
         providerIdentifier: tool.args.providerIdentifier,
         serverIdentifier: tool.args.serverIdentifier,
       },
