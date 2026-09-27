@@ -447,37 +447,43 @@ capture blocker).
 **Bridge request capture (`bridge-capture` sub-method).** Cloud
 `ACTIVE_SUB_METHOD` may select `bridge-capture` (global or
 `provider:bridge-capture`). Serve activates only **ready** paths declared in
-the capability table — Claude/Codex/Muse text + first-turn tools today; Cursor
-is not yet declared ready (still awaiting actual native proof — the last live
-attempt returned `CAPTURE_OK` at exactly the caller-abort boundary — a false
-success, not a pass — and a separate run hard-timed out with no result;
-cancellation + native-terminal detection repair is active. No native
-compressed-envelope proof exists: a scratch localhost probe used a prohibited
-TLS bypass and only local server logs, and its findings are retracted. Muse capture uses overlay
-`settings.endpoint_transport` + Responses decode; history under Muse capture
-is cold text via `museRequestOf` (not MSP role inject). See `sub-method.ts`,
-`bridge-request-capture-readiness.ts`, and `docs/plan/bridge-request-capture/`
-(live-validation.md has current measured status per provider — this is a
-live-in-progress feature, not a readiness promise). Capture turns force cold
-construction + full-history seed (`captureAwareTextBuilderPlan` /
-`historyTurnsFromCanonicalMessages` + `captureAwareHistoryBuilderPlan`) and
-never publish a warm resume handle. Under capture, tool turns route through
-`serveCapturedToolTurn` (`runClaudeToolCapture` /
-`runCodexCapturedToolTurn`) — never the ordinary held SDK / app-server
-execution path. Claude multi-turn tool continuation is **live-proven** via
-`sdk_session_resume`: the daemon writes an owned synthetic session JSONL under
-the isolated `CLAUDE_CONFIG_DIR` (assistant `tool_use` + caller `tool_result`)
-and resumes it through the Agent SDK — a direct `AsyncIterable<SDKUserMessage>`
-with a forged assistant-role message is rejected by the real CLI, so this
-on-disk resume is the only proven path. Codex multi-turn tool continuation is
-also **live-proven** via `thread/inject_items` (real builder/auth/sender; the
-validation run set an explicit `codexStructuredInjectProven` override, which
-is now the production default following that proof). Neither Claude nor Codex continuation
-carries a warm-session or cache-ID stability claim: cached-token counts are
-single observations. Reasoning/thinking-block history is still refused rather
-than invented on both providers; Cursor capture is not serve-activated at all.
-Accepted/uncertain capture ownership terminates the entire walk (no second
-send).
+the capability table — Claude/Codex/Muse/Cursor text + first-turn tools + a
+tool-result follow-up have each now passed real authenticated live smoke (see
+`docs/plan/bridge-request-capture/live-validation.md` for the current measured
+status, validation results, review status, and remaining coverage limits;
+selection does not certify every scenario). Muse capture uses overlay `settings.endpoint_transport` +
+Responses decode; history under Muse capture is cold text via `museRequestOf`
+(not MSP role inject). Cursor multi-turn history is likewise the existing
+cold-text rendered transcript (`cursor-request.ts`) — not native structured
+continuation — over the HTTP/2 Connect path; Cursor's HTTP/1 duplex/BidiAppend
+path has not been live-checked, and a native tool-call execution failure fails
+closed rather than retrying or relabeling. A scratch localhost probe used
+during the Cursor investigation applied a prohibited TLS bypass and relied
+only on local server logs; its "zero egress" claim is retracted and none of
+the live results above depend on it — do not read Cursor's Connect-path
+results as native compressed-envelope proof beyond what was captured through
+the production path. See `sub-method.ts`,
+`bridge-request-capture-readiness.ts`, and `docs/plan/bridge-request-capture/`.
+Capture turns force cold construction + full-history seed
+(`captureAwareTextBuilderPlan` / `historyTurnsFromCanonicalMessages` +
+`captureAwareHistoryBuilderPlan`) and never publish a warm resume handle.
+Under capture, tool turns route through `serveCapturedToolTurn`
+(`runClaudeToolCapture` / `runCodexCapturedToolTurn`) — never the ordinary
+held SDK / app-server execution path. Claude multi-turn tool continuation is
+**live-proven** via `sdk_session_resume`: the daemon writes an owned synthetic
+session JSONL under the isolated `CLAUDE_CONFIG_DIR` (assistant `tool_use` +
+caller `tool_result`) and resumes it through the Agent SDK — a direct
+`AsyncIterable<SDKUserMessage>` with a forged assistant-role message is
+rejected by the real CLI, so this on-disk resume is the only proven path, and
+reasoning/thinking-block history remains explicitly refused rather than
+invented. Codex multi-turn tool continuation is also **live-proven** via
+`thread/inject_items` (real builder/auth/sender; the validation run set an
+explicit `codexStructuredInjectProven` override, which is now the production
+default following that proof). Neither Claude's nor Codex's continuation
+carries a warm-session or cache-ID stability claim, and no number in the live
+report is a statistical or speedup claim — every measurement is a single
+observation. Accepted/uncertain capture ownership terminates the entire walk
+(no second send).
 
 **Claude tool-passthrough (`claude-tool-session.ts` + `claude-tool-serve.ts`).**
 A tool-bearing `claude_code` request (client function tools present) is served
