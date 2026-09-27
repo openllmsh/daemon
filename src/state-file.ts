@@ -30,7 +30,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { processStartIdentity } from "../../tunnel/session/local-runtime";
+import {
+  processIdentityStatus,
+  processStartIdentity,
+} from "../../tunnel/session/local-runtime";
 import { stateDir } from "./env";
 
 /** Which converger recorded an update attempt. */
@@ -466,16 +469,29 @@ type TStateLockVerdict = "stale" | "proven-live" | "unproven";
  *     inconclusive probe). Held; stealable only past the reclaim bound.
  */
 const classifyStateLockOwner = (owner: TStateLockOwner): TStateLockVerdict => {
-  let start: string | null | undefined;
-  try {
-    start = processStartIdentity(owner.pid);
-  } catch {
-    start = undefined;
-  }
-  if (start === null) return "stale"; // confirmed dead
-  if (typeof start === "string" && start.length > 0) {
-    if (owner.start === "") return "unproven"; // live pid, nothing to compare
-    return start === owner.start ? "proven-live" : "stale"; // PID reuse
+  if (owner.start !== "") {
+    // Compare through `processIdentityStatus`, never raw string equality:
+    // it normalizes `ps lstart` whitespace, so a record written in padded
+    // (legacy) form still matches its live owner — a raw `===` would
+    // convict it as PID reuse and steal a live lock. The shared reader is
+    // also where the clock-independent Linux identity lands (a wall-clock
+    // step must never make a live owner look dead).
+    const status = processIdentityStatus(owner.pid, owner.start);
+    if (status === "alive") return "proven-live";
+    if (status === "dead") return "stale"; // dead pid, or a reused one
+    // "unknown" — the probe could not judge; fall through to liveness.
+  } else {
+    // No recorded start to compare: the raw probe is only a dead/alive
+    // oracle here (null = confirmed dead). A LIVE pid with nothing to
+    // compare stays UNPROVEN — never promoted on liveness alone, or a
+    // reused pid would inherit the dead owner's lock forever.
+    let probe: string | null | undefined;
+    try {
+      probe = processStartIdentity(owner.pid);
+    } catch {
+      probe = undefined;
+    }
+    if (probe === null) return "stale";
   }
   return stateLockPidAlive(owner.pid) ? "unproven" : "stale";
 };
