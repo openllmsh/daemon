@@ -168,13 +168,15 @@ export const spawnHeadlessLogin = async (
     budget.release();
     throw error;
   }
-  opts?.onSpawned?.(child);
+  // Bind BEFORE the caller hook: a throwing onSpawned must not leave the
+  // minted dir unbound (rework-8).
   bindMintedTmpToChild(
     leased,
     child.subprocess,
     "headless-login",
     child.whenReleased,
   );
+  opts?.onSpawned?.(child);
 
   const proc = child.subprocess;
   let terminatePromise: Promise<TReapOutcome> | null = null;
