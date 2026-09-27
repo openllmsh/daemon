@@ -46,6 +46,7 @@ import {
   verifyWindowsSessionDirectory,
   verifyWindowsSessionFile,
 } from "../../../tunnel/session/windows-session-pipe";
+import type { TPtyBackend } from "../bs-pty";
 import { requestedPtyBackend } from "../bs-pty";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";
@@ -72,6 +73,15 @@ const SPAWN_SOCKET_TIMEOUT_MS = 2_000;
 // SH-3); leave a small process/socket margin for the host sibling. Only the
 // fake `bun` test backend keeps the short wait.
 const LONG_SPAWN_SOCKET_TIMEOUT_MS = 15_000;
+/**
+ * SH-3: the socket-publish wait per PTY backend. Every real backend gets
+ * the long wait — a ConPTY first-compile on Windows can run ~12 s, so the
+ * old 2 s bound killed the host mid-startup and orphaned the vendor
+ * process. Only the `bun` fake backend (a test label `requestedPtyBackend`
+ * never resolves to in production) keeps the short bound.
+ */
+export const spawnSocketTimeoutMsForBackend = (backend: TPtyBackend): number =>
+  backend === "bun" ? SPAWN_SOCKET_TIMEOUT_MS : LONG_SPAWN_SOCKET_TIMEOUT_MS;
 /** Per-pid `ps` identity read. Expiry is unknown, never dead. */
 const PROCESS_IDENTITY_TIMEOUT_MS = process.platform === "win32" ? 1500 : 250;
 const DISCOVERY_CONCURRENCY = 4;
@@ -726,13 +736,7 @@ const waitForSessionHostSocket = async (id: string): Promise<string | null> => {
   const socketPath = sessionHostSocketPath(id);
   const timeoutMs =
     spawnHarnessForTests?.socketTimeoutMs ??
-    // SH-3: every real backend gets the long wait — a ConPTY first-compile on
-    // Windows can run ~12 s, so 2 s killed the host mid-startup and orphaned
-    // the vendor process. Only the `bun` fake backend stays on the short
-    // bound (and production `requestedPtyBackend()` never resolves to it).
-    (requestedPtyBackend() === "bun"
-      ? SPAWN_SOCKET_TIMEOUT_MS
-      : LONG_SPAWN_SOCKET_TIMEOUT_MS);
+    spawnSocketTimeoutMsForBackend(requestedPtyBackend());
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (socketPresent(socketPath)) return socketPath;
