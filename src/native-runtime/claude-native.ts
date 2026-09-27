@@ -33,7 +33,14 @@ import { superviseSpawn } from "../child-supervisor";
  */
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { AnthropicStreamEvent } from "@openllmsh/protocol";
@@ -159,6 +166,57 @@ export type TClaudeNativeParams = {
  *  the stream (post-commit, so it cannot re-route). */
 export const POST_COMMIT_IDLE_TIMEOUT_MS = 60_000;
 
+/** Staged system-prompt files ride this exact name shape inside the
+ *  daemon-private temp dir. The sweep below matches on it — nothing else in
+ *  the dir is touched. */
+const SYSTEM_PROMPT_FILE_PREFIX = "system-prompt-";
+const SYSTEM_PROMPT_FILE_SUFFIX = ".md";
+
+/** A staged file older than this can only be residue of a DEAD daemon: a
+ *  live run removes its file when the child exits, and the staging-to-parse
+ *  window is seconds. The bound also keeps the sweep from racing a
+ *  co-started daemon still inside its own spawn window. */
+const STALE_SYSTEM_PROMPT_AGE_MS = 60_000;
+
+/** Files this process staged and has not removed yet. The sweep never
+ *  deletes a live in-flight prompt. */
+const liveSystemPromptFiles = new Set<string>();
+
+/** Delete staged prompt files left on disk by a daemon that died mid-turn
+ *  (SIGKILL, crash, power loss — the exited-path cleanup never ran).
+ *  Bounded: one readdir of the daemon-private temp dir plus an lstat per
+ *  matching name — no recursion, no link follows. Ownership-safe: only our
+ *  own prefix/suffix shape, only regular files, only entries older than the
+ *  stale bound and not live in this process. Best-effort: a failure leaves
+ *  the residue for the next call's sweep and never blocks the run. */
+const sweepStaleSystemPromptFiles = (): void => {
+  const dir = daemonTempDir();
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const staleBefore = Date.now() - STALE_SYSTEM_PROMPT_AGE_MS;
+  for (const name of names) {
+    if (
+      !name.startsWith(SYSTEM_PROMPT_FILE_PREFIX) ||
+      !name.endsWith(SYSTEM_PROMPT_FILE_SUFFIX)
+    ) {
+      continue;
+    }
+    const path = join(dir, name);
+    if (liveSystemPromptFiles.has(path)) continue;
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.mtimeMs >= staleBefore) continue;
+      rmSync(path, { force: true });
+    } catch {
+      // best-effort — residue stays for the next sweep
+    }
+  }
+};
+
 /** One NDJSON line of `claude -p --output-format stream-json` output. */
 type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
   readonly type?: unknown;
@@ -172,6 +230,10 @@ type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
 export const runClaudeNative = async (
   params: TClaudeNativeParams,
 ): Promise<TNativeRunResult> => {
+  // A daemon that died mid-turn (SIGKILL, crash, power loss) never ran its
+  // exited-path cleanup — its staged prompt files persist at rest and pile
+  // up across crashes. Sweep them before this run stages a new one.
+  sweepStaleSystemPromptFiles();
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "claude CLI not installed" };
   }
@@ -195,10 +257,12 @@ export const runClaudeNative = async (
     if (systemPromptFile === null) return;
     const path = systemPromptFile;
     systemPromptFile = null;
+    liveSystemPromptFiles.delete(path);
     try {
       rmSync(path, { force: true });
     } catch {
-      // best-effort — 0600 inside a daemon-private 0700 dir leaks nothing
+      // best-effort — 0600 inside a daemon-private 0700 dir leaks nothing;
+      // the stale sweep collects a missed file.
     }
   };
   let promptArgv: string[];
@@ -208,13 +272,14 @@ export const runClaudeNative = async (
     } else if (params.systemText !== null) {
       systemPromptFile = join(
         daemonTempDir(),
-        `system-prompt-${randomUUID()}.md`,
+        `${SYSTEM_PROMPT_FILE_PREFIX}${randomUUID()}${SYSTEM_PROMPT_FILE_SUFFIX}`,
       );
       writeFileSync(systemPromptFile, params.systemText, {
         encoding: "utf8",
         mode: 0o600,
       });
       chmodSync(systemPromptFile, 0o600);
+      liveSystemPromptFiles.add(systemPromptFile);
       promptArgv = ["--system-prompt-file", systemPromptFile];
     } else {
       promptArgv = [];
