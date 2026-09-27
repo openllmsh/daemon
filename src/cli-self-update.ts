@@ -332,7 +332,8 @@ export const applyCliSelfUpdate = async (args: {
     }
     const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== expected) {
-      // These bytes do not identify the published artifact. Retry after backoff.
+      // A complete body with the wrong checksum rejects this artifact.
+      rejectUpdateVersion("cli", latest, expected);
       recordAttempt("cli", latest, { digest: expected });
       return {
         kind: "failed",
@@ -389,12 +390,7 @@ export const applyCliSelfUpdate = async (args: {
           // the version this converge set out to replace. Overwriting on an
           // UNPROVEN recheck could clobber a concurrent manual update with
           // stale bytes, so yield the tick instead.
-          recordAttempt("cli", latest, { digest: expected });
-          return {
-            kind: "failed",
-            stage: "probe-inconclusive",
-            detail: installedVerdict.detail,
-          };
+          return { kind: "busy" };
         }
         const installedNow =
           installedVerdict.kind === "ok"

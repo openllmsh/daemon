@@ -33,6 +33,7 @@ import {
   readState,
   rejectUpdateVersion,
   writeBootHistory,
+  writeRollbackRejection,
 } from "./state-file";
 import { DAEMON_VERSION } from "./version";
 
@@ -93,14 +94,20 @@ export const guardCrashLoop = (): void => {
   // parking. The supervisor then relaunches the known-good binary, and the
   // rejected version is never reinstalled. No `.prev` (or a failed restore)
   // falls through to the normal park path.
-  // Save the rejection before rollback. Park if the write fails.
+  // Save the rejection before rollback. Use the binary directory if state fails.
+  // Park only if neither location can keep the rejection.
   const attempt = readState().updateAttempts.daemon;
   if (
     attempt !== undefined &&
     attempt.version === DAEMON_VERSION &&
     now - attempt.ts <= ROLLBACK_WINDOW_MS &&
     process.platform !== "win32" &&
-    rejectUpdateVersion("daemon", attempt.version, attempt.digest ?? "") &&
+    (rejectUpdateVersion("daemon", attempt.version, attempt.digest ?? "") ||
+      writeRollbackRejection(
+        process.execPath,
+        attempt.version,
+        attempt.digest ?? "",
+      )) &&
     restorePreviousBinary(process.execPath)
   ) {
     logError(

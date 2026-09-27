@@ -22,7 +22,8 @@
  *
  * A failed health check rejects the artifact on this host. Size limits,
  * invalid compression, and malformed digests also cause rejection.
- * Transport failures and checksum mismatches cause a delay before retry.
+ * Complete bodies with checksum mismatches also cause rejection.
+ * Transport failures cause a delay before retry.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -571,6 +572,14 @@ const readBodyCapped = async (
     }
   }
   if (total === 0) throw new Error(`${label} returned an empty body`);
+  if (
+    res.headers.has("content-length") &&
+    Number.isSafeInteger(declared) &&
+    declared >= 0 &&
+    total !== declared
+  ) {
+    throw new Error(`${label} length differs from Content-Length`);
+  }
   return Buffer.concat(chunks);
 };
 
@@ -699,9 +708,6 @@ export const fetchBinary = async (
     try {
       return Buffer.from(gunzipSync(buf, { maxOutputLength: maxBytes }));
     } catch (err) {
-      if (err instanceof Error && "code" in err && err.code === "Z_BUF_ERROR") {
-        throw new Error("binary download was truncated", { cause: err });
-      }
       throw new DeterministicArtifactError(
         `binary decompression failed: ${
           err instanceof Error ? err.message : String(err)
@@ -935,7 +941,7 @@ export const applyDaemonSelfUpdate = async (args: {
         detail: err instanceof Error ? err.message : String(err),
       };
     }
-    if (isUpdateRejected("daemon", latest, expected)) {
+    if (isUpdateRejected("daemon", latest, expected, dest)) {
       // The currently advertised artifact is already proven bad on this
       // host — do not spend the ~40 MB download again. A corrected
       // re-publish advertises a DIFFERENT digest and passes this gate.
@@ -965,7 +971,8 @@ export const applyDaemonSelfUpdate = async (args: {
     }
     const actual = createHash("sha256").update(bin).digest("hex");
     if (actual !== expected) {
-      // These bytes do not identify the published artifact. Retry after backoff.
+      // A complete body with the wrong checksum rejects this artifact.
+      rejectUpdateVersion("daemon", latest, expected);
       recordAttempt("daemon", latest, { digest: expected });
       return {
         kind: "failed",

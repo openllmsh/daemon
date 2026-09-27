@@ -33,7 +33,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   processIdentityStatus,
   processStartIdentity,
@@ -177,7 +177,7 @@ export type TDaemonState = {
   readonly rtcCrashesVersion?: string | null;
   /**
    * Published artifacts a converger must never install again: a downloaded
-   * artifact that failed a deterministic check (size cap,
+   * artifact that failed a deterministic check (checksum, size cap,
    * decompression, malformed digest) or the pre-swap health probe, or a
    * version that crash-looped right after a swap (rolled back by
    * `boot-guard.ts`). Keyed by version + ARTIFACT DIGEST — a corrected
@@ -956,6 +956,53 @@ const rejectionMatches = (
   entry.version === version &&
   (entry.digest === "" || (digest !== undefined && entry.digest === digest));
 
+/** Keep the latest rollback rejection beside the installed binary. */
+export const rollbackRejectionPath = (binary: string): string =>
+  `${binary}.rollback-rejected.json`;
+
+/** Save the rejection without the state file or its lock. */
+export const writeRollbackRejection = (
+  binary: string,
+  version: string,
+  digest: string,
+): boolean => {
+  const path = rollbackRejectionPath(binary);
+  const tmp = join(
+    dirname(path),
+    `.openllmd.update.${process.pid}.rollback-rejected.tmp`,
+  );
+  try {
+    writeFileSync(tmp, JSON.stringify({ version, digest }), { mode: 0o600 });
+    fsyncFileSync(tmp);
+    renameSync(tmp, path);
+    if (process.platform !== "win32") fsyncFileSync(dirname(path));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // The update sweeper removes this temp after the process exits.
+    }
+  }
+};
+
+const isRollbackRejected = (
+  binary: string,
+  version: string,
+  digest: string | undefined,
+): boolean => {
+  try {
+    const entry = coerceRejectedEntry(
+      JSON.parse(readFileSync(rollbackRejectionPath(binary), "utf8")),
+    );
+    return entry !== null && rejectionMatches(entry, version, digest);
+  } catch {
+    return false;
+  }
+};
+
 /**
  * True when `slot`'s converger must never install `version`'s artifact
  * `digest` again — persisted rejection OR its in-memory mirror (a state-write
@@ -967,7 +1014,11 @@ export const isUpdateRejected = (
   slot: TUpdateSlot,
   version: string,
   digest?: string,
+  binary: string = process.execPath,
 ): boolean => {
+  if (slot === "daemon" && isRollbackRejected(binary, version, digest)) {
+    return true;
+  }
   if (
     (readState().rejectedUpdates?.[slot] ?? []).some((e) =>
       rejectionMatches(e, version, digest),
@@ -983,7 +1034,7 @@ export const isUpdateRejected = (
 
 /**
  * Mark `version`'s artifact `digest` as never-installable on this host for
- * `slot`'s product — deterministic artifact failure (size/
+ * `slot`'s product — deterministic artifact failure (checksum/size/
  * decompression), a bad binary proven by the pre-swap probe, or a post-swap
  * crash loop. `digest` is the manifest-advertised sha256; pass "" when the
  * artifact identity was never captured (rejects the version regardless of
