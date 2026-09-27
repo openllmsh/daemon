@@ -7,7 +7,7 @@ import { spawn as admittedSpawn } from "./windows-process";
  * or call openSession; this module never imports relay frame types.
  */
 
-import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type {
@@ -35,7 +35,11 @@ import {
   NativePtyNativeError,
   NativePtyWriteOverflowError,
 } from "./native-pty";
-import { leaseDaemonTmpDir, mintDaemonTmpDir } from "./sandbox/working-set";
+import {
+  leaseDaemonTmpDirDetached,
+  mintDaemonTmpDir,
+  removeTreeDeferred,
+} from "./sandbox/working-set";
 import { serializeScreenBytes } from "./session-screen";
 import { windowsPtySpawner } from "./windows-pty";
 
@@ -243,6 +247,10 @@ export type TSession = {
   busy: boolean;
   title: string | null;
   pid: number | null;
+  /** Per-spawn scratch dir under `<state>/tmp` (RG-2). Set when the daemon
+   *  minted one for THIS pty; cleared + deferred-deleted at every PTY end so
+   *  a later spawn's lease never re-opens a stale path. */
+  tmpDir: string | null;
   /** Daemon-minted monotonically increasing value for successful opens. */
   generation: number;
   /** Terminal state retained so a later attach can explain why it cannot resume. */
@@ -964,6 +972,13 @@ const endPty = (
   if (kill) s.pty?.kill();
   s.pty = null;
   s.pid = null;
+  // The PTY's scratch dir dies with it — deleted incrementally off this path
+  // (a big scratch tree must not stall the close). Unleased/dead-leased by
+  // now, so any remnant is the sweep's to finish.
+  if (s.tmpDir !== null) {
+    removeTreeDeferred(s.tmpDir);
+    s.tmpDir = null;
+  }
   // Release the scrollback ring — a dead session can't be attached, so its
   // buffered output is dead weight until the row itself is evicted.
   s.scrollback.length = 0;
@@ -985,7 +1000,13 @@ const evictStaleDeadSessions = (): void => {
   const excess = dead.length - MAX_RETAINED_SESSIONS;
   for (let i = 0; i < excess; i += 1) {
     const victim = dead[i];
-    if (victim !== undefined) sessions.delete(victim.id);
+    if (victim !== undefined) {
+      if (victim.tmpDir !== null) {
+        removeTreeDeferred(victim.tmpDir);
+        victim.tmpDir = null;
+      }
+      sessions.delete(victim.id);
+    }
   }
 };
 
@@ -1019,6 +1040,10 @@ export const killAllSessions = (): void => {
       }
       session.pty = null;
       session.pid = null;
+    }
+    if (session.tmpDir !== null) {
+      removeTreeDeferred(session.tmpDir);
+      session.tmpDir = null;
     }
     for (const consumer of [...session.consumers]) {
       session.consumers.delete(consumer);
@@ -1330,6 +1355,7 @@ export const openSession = async (
       busy: true,
       title: frame.title ?? null,
       pid: null,
+      tmpDir: null,
       generation: 0,
       lastExitReason: null,
       exitCode: null,
@@ -1347,20 +1373,27 @@ export const openSession = async (
 
     // Per-session scratch under `<state>/tmp`: the device PTY runs
     // deliberately unsandboxed, so unlike a confined vendor child no shim
-    // exists to self-lease — the daemon mints the dir now and writes the
-    // lease once the child pid is known (RG-2). `null` keeps the shared root.
-    // Injected test spawners never mint (no real child → no filesystem
-    // fixture to manage).
+    // exists to self-lease — the daemon mints the dir now and leases it
+    // ASYNC once the child pid is known (rework-5: no synchronous `ps` on
+    // the PTY request path). `null` keeps the shared root. Injected test
+    // spawners never mint (no real child → no filesystem fixture to manage).
+    // Tracked on the session so EVERY end path — natural exit, kill,
+    // killAll, reset — drops it, not just the spawn-failure paths.
     const sessionTmpDir = productionSpawner
       ? (mintDaemonTmpDir() ?? undefined)
       : undefined;
-    const dropSessionTmp = (): void => {
-      if (sessionTmpDir === undefined) return;
-      try {
-        rmSync(sessionTmpDir, { recursive: true, force: true });
-      } catch {
-        // best-effort — the sweep's orphan window owns whatever remains
+    if (sessionTmpDir !== undefined) {
+      // A reused row could hold a stale mint from a spawn that never ended —
+      // drop it before overwriting.
+      if (s.tmpDir !== null && s.tmpDir !== sessionTmpDir) {
+        removeTreeDeferred(s.tmpDir);
       }
+      s.tmpDir = sessionTmpDir;
+    }
+    const dropSessionTmp = (): void => {
+      if (s.tmpDir === null) return;
+      removeTreeDeferred(s.tmpDir);
+      s.tmpDir = null;
     };
     try {
       const argv = argvFor(
@@ -1444,12 +1477,15 @@ export const openSession = async (
       s.ptyBackend = spawned.backend;
       s.pty = pty;
       s.pid = pty.pid ?? null;
-      // Bind the minted scratch dir to the real child: the sweep's lease
-      // check (pid + start identity) now answers this PTY's ownership
-      // directly — a live PTY keeps its dir; a dead one ages out under the
-      // lease grace instead of the long orphan window.
-      if (sessionTmpDir !== undefined && s.pid !== null) {
-        leaseDaemonTmpDir(sessionTmpDir, s.pid);
+      // Bind the minted scratch dir to its owner WITHOUT blocking this path:
+      // the `ps` identity probe runs as an async child (rework-5 — the old
+      // synchronous `spawnSync` could stall every PTY open for ~1.5 s). A
+      // PTY with no pid is leased to the DAEMON + session id instead of
+      // staying unleased forever, and a session that ends before the probe
+      // resolves skips the write (`stillOwnsPty` fails once endPty clears
+      // `s.pty`).
+      if (s.tmpDir !== null) {
+        leaseDaemonTmpDirDetached(s.tmpDir, s.pid, s.id, stillOwnsPty);
       }
       s.busy = true;
       s.lastBusyAtMs = Date.now();
@@ -1641,6 +1677,10 @@ export const bindSessionStream = (
 export const resetSessionsForTest = (): void => {
   for (const s of sessions.values()) {
     s.pty?.kill();
+    if (s.tmpDir !== null) {
+      removeTreeDeferred(s.tmpDir);
+      s.tmpDir = null;
+    }
     lifecycleHooks.onEnd(s);
   }
   sessions.clear();

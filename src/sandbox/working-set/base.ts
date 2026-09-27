@@ -69,7 +69,8 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
-  rmSync,
+  rmdirSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -78,11 +79,14 @@ import type { TProcessStartIdentityReader } from "../../../../tunnel/session/loc
 import {
   normalizeProcessStartIdentity,
   processIdentityStatus,
+  processStartCommand,
   processStartIdentity,
 } from "../../../../tunnel/session/local-runtime";
 import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../../cli-paths";
 import { stateDir } from "../../env";
+import { logInfo, safeDiagnosticMessage } from "../../logger";
 import { DAEMON_VERSION } from "../../version";
+import { nodeSpawn as spawn } from "../../windows-process";
 
 export type TWorkingSet = {
   /** Paths (recursive) the daemon and its children may read AND write. */
@@ -300,17 +304,16 @@ export const resolveCliExecDirs = (seed: string, home: string): string[] => {
 };
 
 /**
- * Orphan window for entries under `<state>/tmp` that carry no child lease.
- * Vendor CLIs run with `TMPDIR` pointed at the root (`cli-paths.ts`
- * `cliEnv`/`sessionEnv`), and a CONFINED child additionally gets its own
- * leased subdir minted by the `--sandbox-exec` shim (see `daemonTempDir`).
- * Nothing else cleans the root — OS tmp cleaners (systemd-tmpfiles, the
- * macOS periodic job) do not touch `~/.openllm` — so installer staging dirs,
- * `cursor-agent` logs and claude scratch would accumulate forever (RG-2). An
- * unleased entry has no provable owner, so the window is deliberately long:
- * anything a live child still uses is rewritten far sooner, and an idle
- * writer only loses scratch that has been stale for a full day — the same
- * exposure an OS tmp reaper gives.
+ * Report-age threshold for UNLEASED entries under `<state>/tmp`. An unleased
+ * entry is NEVER swept automatically (rework 5): the 24 h orphan rule used to
+ * delete it, which could remove a live device-session PTY scratch dir whose
+ * lease write failed, and the persistent `no-browser` shim dir that
+ * `headless-login` caches for the process lifetime (grok P2). Every daemon
+ * mint is now leased at creation (async — see {@link leaseDaemonTmpDirDetached}),
+ * and anything else without a provable dead owner is only counted and
+ * reported to the doctor report — a conservative leak, never data loss.
+ * The constant still bounds how old an unleased entry is before the report
+ * counts it as "aged" rather than fresh.
  */
 export const DAEMON_TMP_ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -468,64 +471,116 @@ const readTmpLease = (dir: string): TTmpLease | null => {
 };
 
 /**
- * Newest mtime under `path`, following NO symlinks. A directory's own mtime
- * only tracks entries added/removed, not writes INSIDE them, so a dir whose
- * leaf files are fresh stays live. Iterates each level with `opendirSync`
- * under the shared node budget — never a whole-listing `readdirSync` — so a
- * huge leak tree cannot balloon memory. Returns `-Infinity` when `path`
- * cannot be statted and `+Infinity` when the walk exceeds the node budget OR
- * the round's wall-clock `deadline`: both keep the entry rather than delete
- * on a partial picture.
+ * Resumable mtime walk for ONE top-level `<state>/tmp` entry. The recursive
+ * `newestMtimeUnder` used to throw the traversal away on budget exhaustion
+ * and report the tree undecidable — a large staging dir then restarted at its
+ * own mtime every round and was never reaped (rework-3 starvation). The walk
+ * now keeps its `opendirSync` stack in {@link pendingTmpEntryWalk}, pauses on
+ * the node/time budget, and RESUMES next round, so every walk makes forward
+ * progress until the tree is decided.
  */
-const newestMtimeUnder = (
-  path: string,
-  budget: { left: number },
-  deadline: number,
-): number => {
-  if (budget.left <= 0) return Number.POSITIVE_INFINITY;
-  budget.left -= 1;
-  let st: ReturnType<typeof lstatSync>;
-  try {
-    st = lstatSync(path);
-  } catch {
-    return Number.NEGATIVE_INFINITY; // raced away — parent decides
-  }
-  if (!st.isDirectory() || st.isSymbolicLink()) return st.mtimeMs;
-  let newest = st.mtimeMs;
-  let dir: Dir;
-  try {
-    dir = opendirSync(path);
-  } catch {
-    return newest;
-  }
-  try {
-    for (;;) {
-      // The wall-clock budget also applies INSIDE the walk: a tree that
-      // outlives the round deadline is undecidable — kept, never deleted on
-      // a partial picture (grok rework: the budget used to bind only the
-      // space BETWEEN top-level entries, so one deep tree could stall the
-      // daemon far past 250 ms).
-      if (budget.left <= 0 || sweepNow() > deadline) {
-        return Number.POSITIVE_INFINITY;
-      }
-      const child = dir.readSync();
-      if (child === null) break;
-      const t = newestMtimeUnder(join(path, child.name), budget, deadline);
-      if (t === Number.POSITIVE_INFINITY) return t;
-      if (t > newest) newest = t;
-    }
-  } catch {
-    // Mid-listing read error: a partial picture is still usable — the mtimes
-    // already seen stand, matching the "unreadable child contributes its own
-    // mtime" behaviour of a failed `opendirSync`.
-  } finally {
+type TMtimeFrame = { readonly path: string; readonly dir: Dir };
+
+type TMtimeWalk = {
+  /** Top-level entry name this walk belongs to — resumes only on a match. */
+  readonly name: string;
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
+  /** Newest mtime seen so far; starts at the entry's own. */
+  newest: number;
+  readonly frames: TMtimeFrame[];
+};
+
+let pendingTmpEntryWalk: TMtimeWalk | null = null;
+
+const abortTmpEntryWalk = (): void => {
+  if (pendingTmpEntryWalk === null) return;
+  for (const { dir } of pendingTmpEntryWalk.frames) {
     try {
       dir.closeSync();
     } catch {
       // already closed
     }
   }
-  return newest;
+  pendingTmpEntryWalk = null;
+};
+
+/** Start a walk anchored at the entry's own mtime (the scan already paid the
+ *  lstat). Non-directories finish instantly — the frames list stays empty. */
+const openTmpEntryWalk = (
+  name: string,
+  path: string,
+  scan: TTmpEntryScan,
+): TMtimeWalk => {
+  const walk: TMtimeWalk = {
+    name,
+    path,
+    dev: scan.dev,
+    ino: scan.ino,
+    newest: scan.mtimeMs,
+    frames: [],
+  };
+  if (scan.isDir) {
+    try {
+      walk.frames.push({ path, dir: opendirSync(path) });
+    } catch {
+      // Unreadable dir — the entry's own mtime stands.
+    }
+  }
+  return walk;
+};
+
+/**
+ * Consume up to `budget` nodes or `deadline` of wall-clock from the walk.
+ * `true` = the tree is fully walked and `walk.newest` is authoritative;
+ * `false` = paused — the same walk resumes next round (callers park the
+ * listing cursor on the entry so classification never races ahead of the
+ * walk). A mid-listing read error FINISHES that frame: the freshest provable
+ * mtime stands and the unseen tail simply cannot extend it.
+ */
+const advanceTmpEntryWalk = (
+  walk: TMtimeWalk,
+  budget: { left: number },
+  deadline: number,
+): boolean => {
+  for (;;) {
+    const top = walk.frames[walk.frames.length - 1];
+    if (top === undefined) return true;
+    if (budget.left <= 0 || sweepNow() > deadline) return false;
+    budget.left -= 1;
+    let entry: ReturnType<Dir["readSync"]>;
+    try {
+      entry = top.dir.readSync();
+    } catch {
+      entry = null; // dead handle mid-walk — finish the frame
+    }
+    if (entry === null) {
+      try {
+        top.dir.closeSync();
+      } catch {
+        // already closed
+      }
+      walk.frames.pop();
+      continue;
+    }
+    const child = join(top.path, entry.name);
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(child);
+    } catch {
+      continue; // raced away mid-listing — contributes nothing
+    }
+    if (st.mtimeMs > walk.newest) walk.newest = st.mtimeMs;
+    // lstat (never stat) — a symlinked dir is a leaf by its own mtime.
+    if (st.isDirectory() && !st.isSymbolicLink()) {
+      try {
+        walk.frames.push({ path: child, dir: opendirSync(child) });
+      } catch {
+        // Unreadable subdir — its own mtime is already counted.
+      }
+    }
+  }
 };
 
 /** Identity of one top-level `<tmp>` entry at scan time. */
@@ -534,6 +589,8 @@ type TTmpEntryScan = {
   readonly ino: number;
   /** Kernel creation stamp; 0 when the filesystem does not report one. */
   readonly birthMs: number;
+  /** The entry's own mtime — the resumable walk's starting anchor. */
+  readonly mtimeMs: number;
   /** A real directory — the only shape that can carry a lease. */
   readonly isDir: boolean;
   /** Valid lease inside a directory entry, else null. */
@@ -552,41 +609,22 @@ const scanTmpEntry = (path: string): TTmpEntryScan | null => {
     dev: st.dev,
     ino: st.ino,
     birthMs: st.birthtimeMs,
+    mtimeMs: st.mtimeMs,
     isDir,
     lease: isDir ? readTmpLease(path) : null,
   };
 };
 
 /**
- * Entry age in ms, or `-Infinity` when the mtime walk could not decide (a
- * raced-away stat or an over-budget tree is retried next round, never
- * deleted on a partial picture). Future-dated mtimes cannot extend an
- * entry's life: the anchor falls back to the kernel birth time, then to the
- * process's first sweep.
+ * Entry age in ms from a COMPLETED walk's newest mtime. Future-dated mtimes
+ * cannot extend an entry's life: the anchor falls back to the kernel birth
+ * time, then to the process's first sweep.
  */
-const tmpEntryAgeMs = (
+const tmpAgeFromNewest = (
   scan: TTmpEntryScan,
-  path: string,
+  newest: number,
   now: number,
-  budget: { left: number },
-  deadline: number,
 ): number => {
-  // Per-entry ceiling inside the shared round budget: one runaway tree costs
-  // at most DAEMON_TMP_SWEEP_MAX_NODES — it is kept as undecidable, but it
-  // cannot burn the whole round's node allowance for its siblings.
-  const entryCap = Math.min(
-    budget.left,
-    tmpSweepBudgetForTests?.entryNodes ?? DAEMON_TMP_SWEEP_MAX_NODES,
-  );
-  const entryBudget = { left: entryCap };
-  const newest = newestMtimeUnder(path, entryBudget, deadline);
-  budget.left -= entryCap - entryBudget.left;
-  if (
-    newest === Number.NEGATIVE_INFINITY ||
-    newest === Number.POSITIVE_INFINITY
-  ) {
-    return Number.NEGATIVE_INFINITY;
-  }
   if (newest > now) {
     const anchor =
       scan.birthMs > 0 && scan.birthMs <= now
@@ -671,37 +709,24 @@ const registryChildPids = (home?: string): Set<number> | null => {
 };
 
 /**
- * Delete check shared by the scan pass and the pre-delete re-verify. A leased
- * dir dies only when its owner is provably gone — a child still in the daemon
- * registry is never swept whatever the lease says, `alive`/`unknown` identity
- * keeps the dir, and a `dead` owner still gets the lease grace (an orphaned
- * descendant may keep writing; fresh mtimes hold it). An unleased entry dies
- * only past the long orphan window.
+ * Cheap delete gate shared by the scan pass and the pre-delete re-verify —
+ * everything decidable WITHOUT the tree walk. A leased dir dies only when its
+ * owner is provably gone: a child still in the daemon registry is never swept
+ * whatever the lease says, and `alive`/`unknown` identity keeps the dir
+ * (`unknown` fails closed — an unreadable `ps` must never prove death). An
+ * UNLEASED entry is never deletable at all (rework-5): it is counted and
+ * reported, and only explicit owner cleanup or a human may remove it.
  */
-const tmpEntryDeletable = (
-  path: string,
+const tmpLeaseDeadForSweep = (
   scan: TTmpEntryScan,
-  now: number,
   registryPids: ReadonlySet<number> | null,
-  budget: { left: number },
-  deadline: number,
 ): boolean => {
-  if (scan.lease !== null) {
-    // A `null` registry means the listing was truncated or unreadable — a
-    // registered pid may look absent, so keep every leased dir this round
-    // rather than delete a live child's scratch on bad data.
-    if (registryPids === null || registryPids.has(scan.lease.pid)) {
-      return false;
-    }
-    if (tmpLeaseStatus(scan.lease) !== "dead") return false;
-    return (
-      tmpEntryAgeMs(scan, path, now, budget, deadline) >=
-      DAEMON_TMP_LEASE_GRACE_MS
-    );
-  }
-  return (
-    tmpEntryAgeMs(scan, path, now, budget, deadline) >= DAEMON_TMP_ORPHAN_AGE_MS
-  );
+  if (scan.lease === null) return false;
+  // A `null` registry means the listing was truncated or unreadable — a
+  // registered pid may look absent, so keep every leased dir this round
+  // rather than delete a live child's scratch on bad data.
+  if (registryPids === null || registryPids.has(scan.lease.pid)) return false;
+  return tmpLeaseStatus(scan.lease) === "dead";
 };
 
 /**
@@ -715,6 +740,223 @@ export const setDaemonTmpSweepPreRemoveHookForTests = (
   fn: ((path: string) => void) | null,
 ): void => {
   preRemoveHook = fn;
+};
+
+/**
+ * Resumable depth-first tree delete. `rmSync(path, { recursive: true })`
+ * removed a whole stale tree in one synchronous call — a 100k-file leak could
+ * stall the daemon event loop for seconds inside a maintenance tick (rework-3
+ * P1). The delete now runs the SAME opendir stack as the mtime walk: each
+ * round unlinks/rmdirs up to the shared node+time budgets, keeps its frames,
+ * and finishes in a later round. Post-order: a dir is removed only after its
+ * handle hits EOF — a writer racing mid-delete can leave a non-empty dir;
+ * its `rmdirSync` fails quietly and the remnant is retried (or kept forever
+ * if the entry revived — the re-verify gates that).
+ */
+type TDeleteFrame = { readonly path: string; readonly dir: Dir };
+
+/** A dir whose `rmdirSync` fails (racing writer, perms) is re-opened and
+ *  retried — bounded per delete so a permanently-undeletable remnant cannot
+ *  starve the queue behind {@link pendingTmpTreeDelete} forever. */
+const TMP_TREE_DELETE_MAX_FAILURES = 32;
+
+type TTreeDelete = {
+  /** Absolute path of the tree root being deleted. */
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
+  readonly frames: TDeleteFrame[];
+  /** Cumulative failed rmdir/re-open attempts; past the cap the delete
+   *  abandons and the remnant is re-judged as an entry next pass. */
+  failures: number;
+  /** True once THIS delete unlinked the root's `.openllm-lease.json`. The
+   *  mid-delete re-verify treats a missing lease as still-provable only on
+   *  this flag — a lease that vanished any other way stays fail-closed. */
+  consumedLease: boolean;
+};
+
+/** The one in-flight sweep delete — serialized so a huge tree cannot hide
+ *  behind an unbounded queue of deletes, and capped by the same budgets. */
+let pendingTmpTreeDelete: TTreeDelete | null = null;
+
+const closeDeleteFrames = (frames: readonly TDeleteFrame[]): void => {
+  for (const { dir } of frames) {
+    try {
+      dir.closeSync();
+    } catch {
+      // already closed
+    }
+  }
+};
+
+/**
+ * Open a tree delete on `path`, or `null` when there is nothing left to
+ * walk. When `dev`/`ino` are given (a scan→delete re-verify), the CURRENT
+ * inode must still be the scanned one — a swapped entry is left alone, so a
+ * vendor file recreated inside the window is never unlinked under the stale
+ * verdict. Non-directories (incl. symlinks) are unlinked in place; an
+ * unreadable or vanished entry yields `null`.
+ */
+const openTmpTreeDelete = (
+  path: string,
+  dev?: number,
+  ino?: number,
+): TTreeDelete | null => {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return null; // already gone
+  }
+  if (
+    dev !== undefined &&
+    ino !== undefined &&
+    (st.dev !== dev || st.ino !== ino)
+  ) {
+    return null; // recreated mid-window — not ours to remove
+  }
+  if (!st.isDirectory() || st.isSymbolicLink()) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // gone or busy — fine either way
+    }
+    return null;
+  }
+  try {
+    return {
+      path,
+      dev: st.dev,
+      ino: st.ino,
+      frames: [{ path, dir: opendirSync(path) }],
+      failures: 0,
+      consumedLease: false,
+    };
+  } catch {
+    return null; // cannot list — leave it for the next round
+  }
+};
+
+const abortTmpTreeDelete = (): void => {
+  if (pendingTmpTreeDelete === null) return;
+  closeDeleteFrames(pendingTmpTreeDelete.frames);
+  pendingTmpTreeDelete = null;
+};
+
+/**
+ * Consume up to `budget` nodes or `deadline` of wall-clock deleting the tree.
+ * `"done"` = the root `rmdirSync` ran and nothing is left; `"paused"` = the
+ * budget or deadline ran out mid-tree — the same delete resumes next round;
+ * `"abandoned"` = too many rmdir/re-open failures — the remnant is left for
+ * the next pass to re-judge (a revived lease keeps it outright). Entries
+ * that vanish mid-delete are skipped inside their frame.
+ */
+const advanceTmpTreeDelete = (
+  del: TTreeDelete,
+  budget: { left: number },
+  deadline: number,
+  now: () => number = sweepNow,
+): "done" | "paused" | "abandoned" => {
+  for (;;) {
+    const top = del.frames[del.frames.length - 1];
+    if (top === undefined) return "done";
+    if (del.failures >= TMP_TREE_DELETE_MAX_FAILURES) return "abandoned";
+    if (budget.left <= 0 || now() > deadline) return "paused";
+    budget.left -= 1;
+    let entry: ReturnType<Dir["readSync"]>;
+    try {
+      entry = top.dir.readSync();
+    } catch {
+      entry = null; // dead handle — treat the frame as finished
+    }
+    if (entry === null) {
+      try {
+        top.dir.closeSync();
+      } catch {
+        // already closed
+      }
+      del.frames.pop();
+      try {
+        rmdirSync(top.path);
+      } catch {
+        // Non-empty remnant (a racing writer) or raced perms — re-open the
+        // dir and retry rather than dropping a half-deleted frame. The same
+        // budgets bound the retry; a lease revived meanwhile re-verifies the
+        // entry before any next round touches it.
+        del.failures += 1;
+        try {
+          del.frames.push({ path: top.path, dir: opendirSync(top.path) });
+        } catch {
+          // cannot re-list — remnant stays; the next scan re-judges it
+        }
+      }
+      continue;
+    }
+    const child = join(top.path, entry.name);
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(child);
+    } catch {
+      continue; // raced away mid-delete
+    }
+    if (st.isDirectory() && !st.isSymbolicLink()) {
+      try {
+        del.frames.push({ path: child, dir: opendirSync(child) });
+      } catch {
+        try {
+          rmdirSync(child);
+        } catch {
+          // non-empty or unreadable — retried next round
+        }
+      }
+    } else {
+      try {
+        unlinkSync(child);
+        // The gating lease lives only at the tree root: remember when THIS
+        // delete consumed it so the mid-delete re-verify can tell "we ate
+        // the proof" from "someone else removed it" (fail-closed).
+        if (top === del.frames[0] && entry.name === TMP_LEASE_FILE) {
+          del.consumedLease = true;
+        }
+      } catch {
+        // raced perms — frame EOF still completes; parent rmdir reports it
+      }
+    }
+  }
+};
+
+/** Per-sweep-pass counters for the unleased/removed report. A "pass" is one
+ *  complete listing of the tmp root — opened when the listing handle is
+ *  (re)opened, emitted when the cursor hits EOF. Only a pass that saw
+ *  something reportable logs, so quiet sweeps never spam the event stream. */
+const tmpSweepPass = { listed: 0, unleased: 0, aged: 0, removed: 0 };
+
+const resetTmpSweepPass = (): void => {
+  tmpSweepPass.listed = 0;
+  tmpSweepPass.unleased = 0;
+  tmpSweepPass.aged = 0;
+  tmpSweepPass.removed = 0;
+};
+
+/** Report one completed pass to the doctor-report event stream (the daemon's
+ *  `logInfo` observer feeds `observeDoctorEvent`). Unleased entries are only
+ *  ever COUNTED here — rework-5 forbids deleting what no lease owns. */
+const reportTmpSweepPass = (): void => {
+  const { listed, unleased, aged, removed } = tmpSweepPass;
+  resetTmpSweepPass();
+  if (unleased === 0 && removed === 0) return;
+  try {
+    // A trusted literal keeps the doctor event's message meaningful (plain
+    // strings are sanitized to a generic notice for privacy); the counts ride
+    // in `meta` on the local log line.
+    logInfo(
+      "tmp-sweep",
+      safeDiagnosticMessage`daemon tmp sweep pass completed - unleased entries retained, counts in meta`,
+      { listed, unleased, aged, removed },
+    );
+  } catch {
+    // Reporting must never take the sweep down.
+  }
 };
 
 /**
@@ -742,14 +984,22 @@ export const setDaemonTmpSweepBudgetForTests = (
  * TEST SEAM — per-call counters from the last {@link sweepDaemonTempDir}
  * round: `listed` is how many top-level names were read off the directory
  * handle (the incremental-listing bound the rework requires), `scanned` how
- * many were statted, `probed` how many paid for the delete re-verify, and
+ * many were statted, `unleased` how many carried no lease (counted+kept —
+ * never deleted), `probed` how many paid for the delete re-verify, and
  * `removed` the removal count.
  */
-let lastTmpSweepStats = { listed: 0, scanned: 0, probed: 0, removed: 0 };
+let lastTmpSweepStats = {
+  listed: 0,
+  scanned: 0,
+  unleased: 0,
+  probed: 0,
+  removed: 0,
+};
 
 export const getDaemonTmpSweepStatsForTests = (): {
   readonly listed: number;
   readonly scanned: number;
+  readonly unleased: number;
   readonly probed: number;
   readonly removed: number;
 } => ({ ...lastTmpSweepStats });
@@ -764,18 +1014,23 @@ export const daemonTmpSweepListingOpenForTests = (): boolean =>
 
 /**
  * Bounded sweep of `<state>/tmp`. Bounded + best-effort: never throws, never
- * follows symlinks, returns the number of top-level entries removed. Exported
- * for tests; the daemon reaches it via the timer `daemonTempDir` schedules —
- * never inside a request or on the spawn path.
+ * follows symlinks, returns the number of top-level entries whose removal
+ * completed this round. Exported for tests; the daemon reaches it via the
+ * timer `daemonTempDir` schedules — never inside a request or on the spawn
+ * path.
  *
  * Per round: list a bounded slice of top-level entries off the persistent
  * `Dir` handle (coverage resumes where the last round stopped — a full pass
  * visits every extant entry once, so no listing is materialized and nothing
  * is sorted), classify each by its lease + subtree freshness, then delete a
- * bounded number of candidates. Every delete first re-verifies the entry —
- * same inode, still deletable by a FRESH lease read + identity probe — so a
- * child that revived or re-leased its dir inside the scan→delete window is
- * never swept under.
+ * bounded number of candidates. UNLEASED entries are never deleted — only
+ * counted and reported at pass end (rework-5). A leased entry is deleted
+ * only when its owner is provably dead (registry miss + `processIdentityStatus`
+ * `"dead"` — `"unknown"` keeps it) AND the completed resumable mtime walk
+ * shows no writes inside the lease grace. Every delete first re-verifies the
+ * entry — same inode, still deletable by a FRESH lease read + identity
+ * probe — so a child that revived or re-leased its dir inside the
+ * scan→delete window is never swept under.
  *
  * The tmp ROOT must be a real directory: a symlinked `<state>/tmp` would
  * steer the listing+rm below into an unrelated tree.
@@ -802,6 +1057,10 @@ export const sweepDaemonTempDir = (
     // deleted dir is not held open until process exit (grok rework).
     if (!st.isDirectory() || st.isSymbolicLink()) {
       closeTmpSweepListing();
+      abortTmpEntryWalk();
+      abortTmpTreeDelete();
+      pendingTmpEntry = null;
+      resetTmpSweepPass();
       return 0;
     }
     // Canonical root for every check below — entry paths and the lease
@@ -812,6 +1071,10 @@ export const sweepDaemonTempDir = (
     rootIno = st.ino;
   } catch {
     closeTmpSweepListing();
+    abortTmpEntryWalk();
+    abortTmpTreeDelete();
+    pendingTmpEntry = null;
+    resetTmpSweepPass();
     return 0;
   }
   // win32 is out of scope for this release's sweep (WINDOWS-2.8.1).
@@ -823,16 +1086,26 @@ export const sweepDaemonTempDir = (
     tmpSweepBudgetForTests?.deletes ?? DAEMON_TMP_SWEEP_MAX_DELETES;
   const roundNodes =
     tmpSweepBudgetForTests?.nodes ?? DAEMON_TMP_SWEEP_ROUND_NODES;
+  const entryNodes =
+    tmpSweepBudgetForTests?.entryNodes ?? DAEMON_TMP_SWEEP_MAX_NODES;
   const roundMs = tmpSweepBudgetForTests?.ms ?? DAEMON_TMP_SWEEP_ROUND_MS;
   const deadline = sweepNow() + roundMs;
   const budget = { left: roundNodes };
-  lastTmpSweepStats = { listed: 0, scanned: 0, probed: 0, removed: 0 };
+  lastTmpSweepStats = {
+    listed: 0,
+    scanned: 0,
+    unleased: 0,
+    probed: 0,
+    removed: 0,
+  };
 
   const registryPids = registryChildPids(home);
 
   // (Re)open the listing handle when the root changed — a different state dir
   // (fresh test fixture), a renamed root, or a deleted+recreated tmp dir at
-  // the same path (dev/ino mismatch — the old handle reads a dead inode).
+  // the same path (dev/ino mismatch — the old handle reads a dead inode). A
+  // root change also ends the pass and invalidates any parked walk/delete:
+  // both point at paths under the OLD root.
   if (
     tmpSweepListing !== null &&
     (tmpSweepListing.root !== root ||
@@ -840,6 +1113,10 @@ export const sweepDaemonTempDir = (
       tmpSweepListing.ino !== rootIno)
   ) {
     closeTmpSweepListing();
+    abortTmpEntryWalk();
+    abortTmpTreeDelete();
+    pendingTmpEntry = null;
+    resetTmpSweepPass();
   }
   if (tmpSweepListing === null) {
     try {
@@ -849,6 +1126,7 @@ export const sweepDaemonTempDir = (
         ino: rootIno,
         dir: opendirSync(root),
       };
+      resetTmpSweepPass();
     } catch {
       closeTmpSweepListing();
       return 0;
@@ -865,6 +1143,7 @@ export const sweepDaemonTempDir = (
   const stale: { name: string; path: string; scan: TTmpEntryScan }[] = [];
   let cycleComplete = false;
   let listed = 0;
+  let removed = 0;
   while (listed < entryCap && stale.length < deleteCap) {
     if (listed > 0 && (sweepNow() > deadline || budget.left <= 0)) break;
     let entryName: string | null;
@@ -887,26 +1166,88 @@ export const sweepDaemonTempDir = (
     }
     listed += 1;
     lastTmpSweepStats.listed += 1;
+    tmpSweepPass.listed += 1;
     const path = join(root, entryName);
     const scan = scanTmpEntry(path);
     lastTmpSweepStats.scanned += 1;
     if (scan === null) continue;
-    if (tmpEntryDeletable(path, scan, now, registryPids, budget, deadline)) {
+    if (scan.lease === null) {
+      // UNLEASED — never auto-deleted (rework-5). Count it for the pass
+      // report; a fresh mint whose lease write is still in flight looks the
+      // same, so nothing here is ever removed.
+      tmpSweepPass.unleased += 1;
+      lastTmpSweepStats.unleased += 1;
+      if (
+        pendingTmpEntryWalk !== null &&
+        pendingTmpEntryWalk.name === entryName
+      ) {
+        abortTmpEntryWalk(); // lease vanished under a parked walk
+      }
+      if (
+        tmpAgeFromNewest(scan, scan.mtimeMs, now) >= DAEMON_TMP_ORPHAN_AGE_MS
+      ) {
+        tmpSweepPass.aged += 1;
+      }
+      continue;
+    }
+    // A parked walk belongs to exactly one entry; the cursor cannot pass it
+    // (the entry re-parks as pendingTmpEntry), so a different name here can
+    // only mean its entry vanished or recreated — drop the stale frames.
+    if (
+      pendingTmpEntryWalk !== null &&
+      pendingTmpEntryWalk.name !== entryName
+    ) {
+      abortTmpEntryWalk();
+    }
+    if (!tmpLeaseDeadForSweep(scan, registryPids)) {
+      if (pendingTmpEntryWalk !== null) abortTmpEntryWalk(); // revived lease
+      continue;
+    }
+    // Dead lease → full-tree freshness decides. The walk is resumable: an
+    // over-budget tree parks the cursor on THIS entry and finishes over the
+    // next rounds instead of restarting forever.
+    if (pendingTmpEntryWalk === null) {
+      pendingTmpEntryWalk = openTmpEntryWalk(entryName, path, scan);
+    } else if (
+      pendingTmpEntryWalk.dev !== scan.dev ||
+      pendingTmpEntryWalk.ino !== scan.ino
+    ) {
+      abortTmpEntryWalk();
+      pendingTmpEntryWalk = openTmpEntryWalk(entryName, path, scan);
+    }
+    // Per-round walk ceiling inside the shared budget — one round charges at
+    // most `entryNodes` against the walk, and progress persists across rounds.
+    const walkSlice = Math.min(budget.left, entryNodes);
+    const walkBudget = { left: walkSlice };
+    const done = advanceTmpEntryWalk(pendingTmpEntryWalk, walkBudget, deadline);
+    budget.left -= walkSlice - walkBudget.left;
+    if (!done) {
+      // Paused mid-tree — park the cursor ON this entry so the walk resumes
+      // exactly here next round.
+      pendingTmpEntry = entryName;
+      break;
+    }
+    const newest = pendingTmpEntryWalk.newest;
+    pendingTmpEntryWalk = null;
+    if (tmpAgeFromNewest(scan, newest, now) >= DAEMON_TMP_LEASE_GRACE_MS) {
       stale.push({ name: entryName, path, scan });
     }
   }
   if (cycleComplete) {
     closeTmpSweepListing();
-  } else {
+    reportTmpSweepPass();
+  } else if (pendingTmpEntry === null) {
     // Tail read: a budget break leaves the cursor mid-listing, so check EOF
     // now — an exhausted listing closes the pass THIS round (the next round
     // would otherwise spend itself just re-opening and re-seeking). A live
     // entry is parked in `pendingTmpEntry`: already consumed off the cursor,
-    // it must not be skipped — it is classified first next round.
+    // it must not be skipped — it is classified first next round. A parked
+    // entry (walk mid-tree) already holds the cursor — no tail read.
     try {
       const tail = tmpSweepListing?.dir.readSync() ?? null;
       if (tail === null) {
         closeTmpSweepListing();
+        reportTmpSweepPass();
       } else {
         pendingTmpEntry = tail.name;
       }
@@ -915,13 +1256,51 @@ export const sweepDaemonTempDir = (
     }
   }
 
-  if (stale.length === 0) return 0;
-  // The delete phase gets its own budget slice: a scan that consumed the
-  // shared deadline must not leave a round doing zero delete work.
+  // The delete phase gets its own deadline slice: a scan that consumed the
+  // shared deadline must not leave a round doing zero delete work. It shares
+  // the remaining node budget — both are per-round caps on total work.
   const deleteDeadline = sweepNow() + roundMs;
-  let removed = 0;
   let probed = 0;
+  const finishPendingDelete = (): void => {
+    if (pendingTmpTreeDelete === null) return;
+    const recheck = scanTmpEntry(pendingTmpTreeDelete.path);
+    if (recheck === null) {
+      // Entry vanished mid-delete (someone else finished it) — count it.
+      abortTmpTreeDelete();
+      removed += 1;
+      tmpSweepPass.removed += 1;
+      return;
+    }
+    const sameInode =
+      recheck.dev === pendingTmpTreeDelete.dev &&
+      recheck.ino === pendingTmpTreeDelete.ino;
+    // A lease read as dead at scan time may already be GONE — unlinked by
+    // this very delete as ordinary tree content. Only OUR own consumption
+    // keeps the verdict; a lease that vanished any other way stays
+    // fail-closed (the entry reads unleased, and unleased is never deleted).
+    const stillDead =
+      tmpLeaseDeadForSweep(recheck, registryPids) ||
+      (pendingTmpTreeDelete.consumedLease && recheck.lease === null);
+    if (!sameInode || !stillDead) {
+      abortTmpTreeDelete(); // recreated or revived — keep the remnant
+      return;
+    }
+    const out = advanceTmpTreeDelete(
+      pendingTmpTreeDelete,
+      budget,
+      deleteDeadline,
+    );
+    if (out === "done") {
+      pendingTmpTreeDelete = null;
+      removed += 1;
+      tmpSweepPass.removed += 1;
+    } else if (out === "abandoned") {
+      abortTmpTreeDelete(); // remnant stays — re-judged as an entry next pass
+    }
+  };
+  finishPendingDelete();
   for (const { path, scan } of stale) {
+    if (pendingTmpTreeDelete !== null) break; // one tree at a time
     if (probed >= deleteCap) break;
     if (probed > 0 && sweepNow() > deleteDeadline) break;
     probed += 1;
@@ -932,22 +1311,38 @@ export const sweepDaemonTempDir = (
       recheck === null ||
       recheck.dev !== scan.dev ||
       recheck.ino !== scan.ino ||
-      !tmpEntryDeletable(
-        path,
-        recheck,
-        now,
-        registryPids,
-        { left: DAEMON_TMP_SWEEP_MAX_NODES },
-        deleteDeadline,
-      )
+      !tmpLeaseDeadForSweep(recheck, registryPids)
     ) {
-      continue; // vanished, recreated, freshened, or re-leased mid-window
+      continue; // vanished, recreated, or revived mid-window
     }
-    try {
-      rmSync(path, { recursive: true, force: true });
+    // Second freshness gate at delete time: a burst of writes INSIDE the
+    // scan→delete window re-anchors the tree. The walk just done proves the
+    // old state; this cheap own-mtime+lease check is the floor — a dir that
+    // freshened at the top is kept.
+    if (
+      tmpAgeFromNewest(recheck, recheck.mtimeMs, now) <
+      DAEMON_TMP_LEASE_GRACE_MS
+    ) {
+      continue;
+    }
+    const del = openTmpTreeDelete(path, scan.dev, scan.ino);
+    if (del === null) {
+      // Gone (vanished or unlinked in place) counts; a swapped inode or a
+      // failed unlink leaves a live entry — kept, not counted.
+      if (!existsSync(path)) {
+        removed += 1;
+        tmpSweepPass.removed += 1;
+      }
+      continue;
+    }
+    pendingTmpTreeDelete = del;
+    const out = advanceTmpTreeDelete(del, budget, deleteDeadline);
+    if (out === "done") {
+      pendingTmpTreeDelete = null;
       removed += 1;
-    } catch {
-      // best-effort — a busy or permed entry is retried on the next sweep
+      tmpSweepPass.removed += 1;
+    } else if (out === "abandoned") {
+      abortTmpTreeDelete(); // remnant stays — re-judged next pass
     }
   }
   lastTmpSweepStats.removed = removed;
@@ -998,8 +1393,9 @@ const mintShimChildTmpDir = (tmpRoot: string): void => {
   // Manage only the daemon's own layout: TMPDIR pinned at the tmp root. A
   // TMPDIR pointing elsewhere is a caller's choice — leave it alone.
   if (envReal !== rootReal) return;
-  // No provable identity → no lease: the dir would be swept as an orphan
-  // anyway, so minting is pointless without one.
+  // No provable identity → no lease: an unleased mint would be counted as an
+  // orphan forever (unleased entries are never swept), so minting is
+  // pointless without one.
   const identity = processStartIdentity(process.pid);
   if (identity === undefined || identity === null) return;
   const lease = `${JSON.stringify({
@@ -1092,8 +1488,9 @@ export const daemonTempDir = (home?: string): string => {
  * to self-lease (see `mintShimChildTmpDir` for the confined path). Returns
  * the minted dir (mode 0o700), or `null` when the root is unusable — callers
  * then keep the shared root. The dir is UNLEASED until
- * {@link leaseDaemonTmpDir} lands the child pid: until then the sweep treats
- * it as an ordinary orphan candidate — never as live-child scratch.
+ * {@link leaseDaemonTmpDirDetached} lands an owner identity off the request
+ * path: until then the sweep counts it as an unleased entry — reported,
+ * never deleted.
  */
 export const mintDaemonTmpDir = (home?: string): string | null => {
   let rootReal: string;
@@ -1139,6 +1536,243 @@ export const leaseDaemonTmpDir = (dir: string, pid: number): boolean => {
   } catch {
     return false;
   }
+};
+
+/** Write a lease payload inside a minted dir. `sid` ties a daemon-owned lease
+ *  to the session that minted it — pure forensics; the sweep only reads
+ *  pid + startIdentity. */
+const writeTmpLeaseFile = (
+  dir: string,
+  pid: number,
+  startIdentity: string,
+  sessionId?: string,
+): boolean => {
+  try {
+    writeFileSync(
+      join(dir, TMP_LEASE_FILE),
+      `${JSON.stringify({
+        v: 1,
+        pid,
+        startIdentity,
+        ...(sessionId === undefined ? {} : { sid: sessionId }),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Async probe result — the same contract as `processStartIdentity`:
+ *  string identity, `null` = confirmed dead, `undefined` = cannot determine. */
+export type TDaemonTmpIdentityProbe = (
+  pid: number,
+  done: (identity: string | null | undefined) => void,
+) => void;
+
+/**
+ * TEST SEAM — replace the async identity probe {@link leaseDaemonTmpDirDetached}
+ * runs, so a test can assert the lease outcome (and the daemon fallback)
+ * deterministically without a real `ps` child. Never set in production.
+ */
+let identityProbeForTests: TDaemonTmpIdentityProbe | null = null;
+
+export const setDaemonTmpIdentityProbeForTests = (
+  probe: TDaemonTmpIdentityProbe | null,
+): void => {
+  identityProbeForTests = probe;
+};
+
+/** Cheap "is the pid even there" answer for when `ps` itself cannot answer:
+ *  ESRCH → confirmed dead (`null`), anything else → `undefined` (unknown —
+ *  never a guess at the identity). */
+const posixPidAlive = (pid: number): null | undefined => {
+  try {
+    process.kill(pid, 0);
+    return undefined;
+  } catch (error) {
+    const code = (error as { readonly code?: unknown })?.code;
+    return code === "ESRCH" ? null : undefined;
+  }
+};
+
+/** Bound on one async `ps` probe — past it the child is SIGKILLed and the
+ *  identity degrades to the pid-alive check. */
+const TMP_IDENTITY_PROBE_MS = 1500;
+
+/**
+ * `processStartIdentity` without the `spawnSync`: same `ps -o lstart=` probe,
+ * but the child wait happens in the kernel — the daemon event loop is NEVER
+ * blocked on a PTY-open request path (rework-5). On timeout the probe is
+ * SIGKILLed and the result degrades to the pid-alive check — `undefined`
+ * (unknown) keeps the caller's fallback, never a wrong lease.
+ */
+const probeProcessIdentityAsync = (
+  pid: number,
+  done: (identity: string | null | undefined) => void,
+): void => {
+  if (identityProbeForTests !== null) {
+    identityProbeForTests(pid, done);
+    return;
+  }
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    done(undefined);
+    return;
+  }
+  if (process.platform === "win32") {
+    // Win32 identity is read in-process through FFI — no helper to wait on —
+    // but it still runs OFF the caller's tick so every caller sees the same
+    // async shape.
+    setImmediate(() => {
+      let value: string | null | undefined;
+      try {
+        value = processStartIdentity(pid);
+      } catch {
+        value = undefined;
+      }
+      done(value);
+    });
+    return;
+  }
+  let cmd: string[];
+  try {
+    cmd = processStartCommand(pid);
+  } catch {
+    done(undefined);
+    return;
+  }
+  const [bin, ...args] = cmd;
+  if (bin === undefined) {
+    done(undefined);
+    return;
+  }
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(bin, args, {
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+      env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+    });
+  } catch {
+    done(posixPidAlive(pid));
+    return;
+  }
+  let settled = false;
+  let out = "";
+  child.stdout?.on("data", (chunk: Buffer | string) => {
+    out += chunk;
+  });
+  const timer = setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+  }, TMP_IDENTITY_PROBE_MS);
+  timer.unref();
+  const finish = (value: string | null | undefined): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    done(value);
+  };
+  child.on("error", () => finish(posixPidAlive(pid)));
+  child.on("close", (code) => {
+    if (code === 0) {
+      const value = normalizeProcessStartIdentity(out);
+      finish(value.length > 0 ? value : undefined);
+      return;
+    }
+    finish(posixPidAlive(pid));
+  });
+};
+
+/**
+ * Lease a dir minted by {@link mintDaemonTmpDir} WITHOUT blocking the request
+ * path: the identity probe is an async `ps` child (never `spawnSync`), so the
+ * caller returns immediately and the lease lands on a later turn. `pid` is
+ * the PTY/child pid; `null` (or an unresolvable identity) leases the dir to
+ * the DAEMON itself with `sessionId` recorded — a PTY with no pid still has a
+ * provable owner, so the sweep can reap its scratch once the daemon dies
+ * rather than leaking it unleased forever. `stillActive` (optional) lets the
+ * caller cancel a lease write when the session already closed.
+ */
+export const leaseDaemonTmpDirDetached = (
+  dir: string,
+  pid: number | null,
+  sessionId: string,
+  stillActive?: () => boolean,
+): void => {
+  const active = stillActive ?? ((): boolean => true);
+  const leaseToDaemon = (): void => {
+    probeProcessIdentityAsync(process.pid, (identity) => {
+      if (!active()) return;
+      if (typeof identity === "string" && identity.length > 0) {
+        writeTmpLeaseFile(dir, process.pid, identity, sessionId);
+      }
+      // else: leave unleased — the pass report counts it and the session's
+      // own cleanup deletes it on close.
+    });
+  };
+  if (pid === null || !Number.isSafeInteger(pid) || pid <= 0) {
+    leaseToDaemon();
+    return;
+  }
+  probeProcessIdentityAsync(pid, (identity) => {
+    if (!active()) return;
+    if (typeof identity === "string" && identity.length > 0) {
+      writeTmpLeaseFile(dir, pid, identity, sessionId);
+      return;
+    }
+    // Dead-or-unknown child identity — a daemon-owned lease still gives the
+    // dir a provable owner for the sweep.
+    leaseToDaemon();
+  });
+};
+
+/** Nodes unlinked per event-loop turn for a deferred delete — one turn stays
+ *  under a few ms even on a huge tree. */
+const DEFERRED_DELETE_TURN_NODES = 512;
+const DEFERRED_DELETE_TURN_MS = 4;
+
+/**
+ * Remove a directory tree OFF the caller's synchronous path: the delete runs
+ * the same bounded opendir stack as the sweep, spread over `setImmediate`
+ * turns (~512 nodes / ≤4 ms each). Used for session-temp cleanup, where the
+ * PTY scratch may be large but the close path must not stall the loop.
+ * Fire-and-forget, never throws — remnants from racing writers are the
+ * sweep's problem (the dir is unleased/leased-dead by then anyway).
+ */
+export const removeTreeDeferred = (path: string): void => {
+  let del: TTreeDelete | null;
+  try {
+    del = openTmpTreeDelete(path);
+  } catch {
+    return;
+  }
+  if (del === null) return;
+  const step = (): void => {
+    if (del === null) return;
+    let out: "done" | "paused" | "abandoned" = "paused";
+    try {
+      out = advanceTmpTreeDelete(
+        del,
+        { left: DEFERRED_DELETE_TURN_NODES },
+        performance.now() + DEFERRED_DELETE_TURN_MS,
+        () => performance.now(),
+      );
+    } catch {
+      out = "done"; // maintenance must never take the daemon down
+    }
+    if (out !== "paused") {
+      closeDeleteFrames(del.frames);
+      del = null;
+      return;
+    }
+    setImmediate(step);
+  };
+  setImmediate(step);
 };
 
 /**

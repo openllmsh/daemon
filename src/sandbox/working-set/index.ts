@@ -34,11 +34,13 @@ import { browserChatLayer } from "./browser-chat";
 import { fleetLayer } from "./fleet";
 import { vendorCliTunnelLayer } from "./vendor-cli-tunnel";
 
-export type { TWorkingSet } from "./base";
+export type { TDaemonTmpIdentityProbe, TWorkingSet } from "./base";
 export {
   daemonTempDir,
   leaseDaemonTmpDir,
+  leaseDaemonTmpDirDetached,
   mintDaemonTmpDir,
+  removeTreeDeferred,
   resolveCliExecDirs,
 } from "./base";
 
