@@ -29,7 +29,17 @@ let nonceLruCap = DEVICE_GRANT_NONCE_CAP;
 
 /** Module-level nonce LRU — expire after the grant ts window; hard-cap above. */
 const nonceOrder: string[] = [];
-const nonceSeen = new Map<string, number>();
+/** nonce -> envelope ts and the monotonic time it was stored. */
+const nonceSeen = new Map<string, { ts: number; storedMono: number }>();
+
+/** TEST SEAM — monotonic clock for nonce retention. Never set in production. */
+let monoImpl: () => number = () => performance.now();
+
+export const setDeviceGrantMonoForTests = (
+  fn: (() => number) | null,
+): void => {
+  monoImpl = fn ?? (() => performance.now());
+};
 
 /** TEST SEAM — replace the verifier's local clock reading so nonce-expiry
  *  arithmetic can be exercised across the acceptance window without real
@@ -149,24 +159,27 @@ export const verifyDeviceGrantNode = (
 const NONCE_RETENTION_MS = 2 * DEVICE_GRANT_TS_WINDOW_MS;
 
 /**
- * Drop nonces whose envelope can no longer be accepted. The map stores the
- * envelope `ts`, not a precomputed expiry: the decision uses the anchors as
- * they are NOW (the server offset can change after acceptance, rework-8).
- * A nonce is dropped only when the local AND the server anchor are both
- * more than NONCE_RETENTION_MS past its `ts`. Scans the full order because
- * `ts` is not insertion-order monotonic.
+ * Drop nonces whose envelope can no longer be accepted. A nonce is dropped
+ * only when ALL three hold:
+ *   - it was stored at least NONCE_RETENTION_MS ago on the MONOTONIC clock
+ *     (a wall-clock step forward cannot age it early, rework-8);
+ *   - the local anchor is more than NONCE_RETENTION_MS past its `ts`;
+ *   - the server anchor, as it is NOW (the offset can be refreshed after
+ *     acceptance), is null or more than NONCE_RETENTION_MS past its `ts`.
+ * Scans the full order because `ts` is not insertion-order monotonic.
  */
 const pruneExpiredNonces = (now: number, serverNow: number | null): void => {
   if (nonceOrder.length === 0) return;
+  const mono = monoImpl();
   const kept: string[] = [];
   for (const n of nonceOrder) {
-    const ts = nonceSeen.get(n);
-    const liveLocal = ts !== undefined && now <= ts + NONCE_RETENTION_MS;
+    const entry = nonceSeen.get(n);
+    if (entry === undefined) continue;
+    const young = mono - entry.storedMono < NONCE_RETENTION_MS;
+    const liveLocal = now <= entry.ts + NONCE_RETENTION_MS;
     const liveServer =
-      ts !== undefined &&
-      serverNow !== null &&
-      serverNow <= ts + NONCE_RETENTION_MS;
-    if (liveLocal || liveServer) {
+      serverNow !== null && serverNow <= entry.ts + NONCE_RETENTION_MS;
+    if (young || liveLocal || liveServer) {
       kept.push(n);
       continue;
     }
@@ -197,7 +210,7 @@ const rememberNonce = (n: string, envelopeTs: number): boolean => {
     );
     return false;
   }
-  nonceSeen.set(n, envelopeTs);
+  nonceSeen.set(n, { ts: envelopeTs, storedMono: monoImpl() });
   nonceOrder.push(n);
   return true;
 };
