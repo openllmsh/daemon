@@ -157,6 +157,15 @@ export type TStartCodexToolTurnParams = {
   readonly systemText: string | null;
   readonly reasoningEffort: string | null;
   readonly userText: string;
+  /**
+   * When true (serve selected `bridge-capture`), use the isolated capture
+   * tool path instead of the shared warm app-server tool loop. Capture
+   * returns daemon-owned chunks via {@link runCodexCapturedToolTurn}; this
+   * helper declines with an explicit reason so the serve integrator can
+   * switch to the capture entry point (or map chunks → tool_calls) without
+   * accidentally executing `item/tool/call` on the builder.
+   */
+  readonly bridgeCapture?: boolean;
 };
 
 /** Start a NEW tool-bearing Codex turn. */
@@ -164,6 +173,17 @@ export const startCodexToolTurn = async (
   params: TStartCodexToolTurnParams,
 ): Promise<TToolTurnResult> => {
   evictStale();
+  if (params.bridgeCapture === true) {
+    // Capture tool turns are not the held `item/tool/call` loop — serve must
+    // call `runCodexCapturedToolTurn` and decode daemon-owned chunks. Refuse
+    // here so a half-wired bridgeCapture flag cannot silently fall through
+    // to the warm execution boundary.
+    return {
+      kind: "declined",
+      reason:
+        "codex bridge-capture tool turns require runCodexCapturedToolTurn (not the held item/tool/call loop)",
+    };
+  }
   // Hosted search (thread config, always-on) and a client-executed
   // `web_search` function are mutually exclusive on one turn — drop the
   // client copy so it can't shadow the provider-owned tool. An empty

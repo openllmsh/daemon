@@ -3,16 +3,25 @@
  *
  * Keeps existing inbound adapters + `runCodexNative` routing. When the
  * selected sub-method is `bridge-capture` for chatgpt, an ISOLATED
- * `codex app-server` child is spawned with the established redirect keys:
+ * `codex app-server` child is spawned with:
  *
  *   -c chatgpt_base_url=<loopback>/backend-api
- *   -c openai_base_url=<loopback>/backend-api/codex
+ *   -c openai_base_url=<loopback>/openllm-capture/codex
  *
- * The loopback receiver captures the vendor-built `/responses` exchange
- * (HTTP POST or WebSocket — transport is preserved, never forced), suppresses
- * any original external send (no preamble forward / no egress), hands the
- * immutable envelope to the daemon for a single dispatch, and settles the
- * builder via `turn/interrupt` + authoritative `turn/completed`.
+ * The openai path deliberately does NOT end in `/backend-api/codex`, so
+ * `supports_codex_backend_routes` is false and WorkspaceRouting cannot rewrite
+ * the Responses authority off loopback (openai/codex rust-v0.156.0). Preamble
+ * still uses `/backend-api` and is forwarded to chatgpt.com with application
+ * JSON semantics preserved. Bun `fetch` may decompress control responses while
+ * leaving stale `content-encoding`/`content-length`; the receiver reframes
+ * those headers around the decoded body before serving (inference envelopes
+ * never take this path). `/wham/accounts/check` vendor-selected
+ * `workspace_backend_origin` values are recorded in request-private memory
+ * (never logged) and restored as the daemon dispatch origin. Dispatch never
+ * hardcodes production chatgpt.com when a constrained backend was selected.
+ * Scheme mapping for WS is `http→ws` / `https→wss`. Inference is never
+ * forwarded from the receiver; the daemon dispatches once and settles via
+ * `turn/interrupt` + authoritative `turn/completed`.
  *
  * Warm `thread/inject_items` continuation is intentionally NOT claimed here:
  * schema existence is established offline, but interrupt→inject→next-turn
@@ -44,20 +53,89 @@ import type {
 } from "./request-capture";
 import {
   createRequestCaptureSession,
+  DEFAULT_MAX_BODY_BYTES,
   headersInitFromCaptured,
   preserveCapturedHeaders,
   requestFromCapturedEnvelope,
   runCapturedDispatch,
 } from "./request-capture";
+import { requireCaptureTerminalFinishReason } from "./request-capture-output";
 import type { TNativeRunResult } from "./types";
 import { PRE_COMMIT_TIMEOUT_MS } from "./types";
 
-/** External origin the daemon may dispatch to (production ChatGPT backend). */
+/** Default production ChatGPT origin (fallback only when routing is unconstrained). */
 export const CODEX_CAPTURE_EXTERNAL_ORIGIN = "https://chatgpt.com";
 
-/** Canonical Responses URL the vendor intends under ChatGPT auth. */
-export const CODEX_CAPTURE_EXTERNAL_RESPONSES_URL =
-  "https://chatgpt.com/backend-api/codex/responses";
+/** Canonical Responses path under ChatGPT auth (never the local capture prefix). */
+export const CODEX_CAPTURE_EXTERNAL_RESPONSES_PATH =
+  "/backend-api/codex/responses";
+
+/** Canonical Responses URL on the default production origin. */
+export const CODEX_CAPTURE_EXTERNAL_RESPONSES_URL = `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${CODEX_CAPTURE_EXTERNAL_RESPONSES_PATH}`;
+
+/**
+ * Local-only openai_base_url path prefix. MUST NOT end with `/backend-api/codex`
+ * — `ModelProviderInfo::supports_codex_backend_routes` (openai/codex
+ * rust-v0.156.0) is true iff the openai provider base ends with that suffix.
+ *
+ * Call sites gated by that flag (same tag):
+ *   - `model-provider/src/provider.rs` — WorkspaceRouting / authority rewrite
+ *     (the reason we avoid the suffix)
+ *   - `core/src/client.rs` `responses_headers` — model-specific Codex header
+ *     bundle when `uses_codex_backend` (skipped when flag false)
+ *   - `core/src/client.rs` `set_guardian_metadata` — may omit
+ *     `guardian_credits_requested` (skipped when flag false)
+ *   - `core/src/session/token_budget.rs` — experimental context / token-budget
+ *     eligibility (skipped when flag false)
+ *
+ * ChatGPT auth, bearer headers, and Responses body construction still follow
+ * `uses_codex_backend` (does NOT require this flag). Capture still expects
+ * `/wham/accounts/check` via `chatgpt_base_url` preamble (account bootstrap /
+ * `read_account`); empty route memory is NOT treated as unconstrained.
+ */
+export const CODEX_CAPTURE_OPENAI_PATH_PREFIX = "/openllm-capture/codex";
+
+/** Sentinel stored when accounts/check reports literal `NO_CONSTRAINT`. */
+export const CODEX_CAPTURE_UNCONSTRAINED_BACKEND = "NO_CONSTRAINT";
+
+/** Exact hosts + dotted suffixes trusted as ChatGPT workspace backends. */
+const TRUSTED_CHATGPT_HOSTS = new Set([
+  "chatgpt.com",
+  "chat.openai.com",
+  "chatgpt-staging.com",
+]);
+
+export const isTrustedChatgptBackendHost = (host: string): boolean => {
+  const h = host.toLowerCase();
+  if (TRUSTED_CHATGPT_HOSTS.has(h)) return true;
+  return (
+    h.endsWith(".chatgpt.com") ||
+    h.endsWith(".chat.openai.com") ||
+    h.endsWith(".chatgpt-staging.com")
+  );
+};
+
+/**
+ * Validate a vendor-selected workspace backend origin for dispatch.
+ * HTTPS only; host must be a trusted ChatGPT family name. Returns the
+ * normalized `origin` string or null (fail closed — never log the value).
+ */
+export const trustedChatgptBackendOriginOf = (
+  raw: string | null | undefined,
+): string | null => {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed === "NO_CONSTRAINT") return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "https:") return null;
+    if (url.username !== "" || url.password !== "") return null;
+    if (!isTrustedChatgptBackendHost(url.hostname)) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+};
 
 const ChatGptStreamEventSchema: Schema.Schema<TChatGptStreamEvent> =
   Schema.Record({ key: Schema.String, value: Schema.Unknown });
@@ -70,15 +148,18 @@ export type TCodexCaptureRedirectArgs = {
 };
 
 /**
- * Build the existing redirect recipe for `codex app-server` (same keys the
- * `codex exec` capture path already uses in `delegation/auth-config.ts`).
+ * Redirect recipe for isolated capture app-server:
+ *   - `chatgpt_base_url` → loopback `/backend-api` (preamble, incl. accounts/check)
+ *   - `openai_base_url` → loopback {@link CODEX_CAPTURE_OPENAI_PATH_PREFIX}
+ *     so workspace routing does NOT engage (base does not end in
+ *     `/backend-api/codex`).
  */
 export const codexCaptureRedirectArgs = (
   loopbackBase: string,
 ): TCodexCaptureRedirectArgs => {
   const base = loopbackBase.replace(/\/+$/, "");
   const chatgptBaseUrl = `${base}/backend-api`;
-  const openaiBaseUrl = `${base}/backend-api/codex`;
+  const openaiBaseUrl = `${base}${CODEX_CAPTURE_OPENAI_PATH_PREFIX}`;
   return {
     chatgptBaseUrl,
     openaiBaseUrl,
@@ -91,26 +172,283 @@ export const codexCaptureRedirectArgs = (
   };
 };
 
+/** Trusted static origins + admission for validated discovered backends. */
 export const codexCaptureDestinationPolicy = (opts?: {
   readonly allowLoopback?: boolean;
 }): TCaptureDestinationPolicy => ({
-  allowedOrigins: new Set([CODEX_CAPTURE_EXTERNAL_ORIGIN]),
+  allowedOrigins: new Set([
+    CODEX_CAPTURE_EXTERNAL_ORIGIN,
+    "https://chat.openai.com",
+    "https://chatgpt-staging.com",
+  ]),
   allowLoopback: opts?.allowLoopback === true,
+  allowUrl: (url: URL): boolean =>
+    url.protocol === "https:" && isTrustedChatgptBackendHost(url.hostname),
 });
 
-/** Match the inference call only — preamble paths are stubbed locally. */
+/** Match the inference call only. */
 export const isCodexCaptureInferencePath = (pathname: string): boolean =>
   pathname.endsWith("/responses");
 
 /**
- * Remap a loopback-observed URL back to the external chatgpt.com authority
- * while preserving path + query. Application headers/body are untouched.
+ * Non-inference traffic that hit the isolated redirect listener.
+ * Forwarded to chatgpt.com (auth/body preserved). Inference is never
+ * forwarded from the receiver.
+ */
+export const isCodexCapturePreamblePath = (pathname: string): boolean =>
+  !isCodexCaptureInferencePath(pathname);
+
+const isWorkspaceAccountsCheckPath = (pathname: string): boolean =>
+  pathname.endsWith("/wham/accounts/check");
+
+/** Methods we will forward for a recognized preamble path. */
+const isCodexCapturePreambleMethod = (method: string): boolean => {
+  const m = method.toUpperCase();
+  return m === "GET" || m === "HEAD" || m === "POST" || m === "OPTIONS";
+};
+
+/**
+ * Request-private memory of vendor-selected workspace backends discovered via
+ * forwarded `/wham/accounts/check` (or hermetic injection). Never logged.
+ *
+ * Empty memory is NOT unconstrained — real ChatGPT OAuth must have an
+ * authoritative route (constrained https origin or explicit `NO_CONSTRAINT`)
+ * before dispatch. Unconstrained maps to Production
+ * {@link CODEX_CAPTURE_EXTERNAL_ORIGIN} because native `resolve_routing` with
+ * `NO_CONSTRAINT` and default `ChatGptEnvironment::Production` chatgpt_base_url
+ * (`https://chatgpt.com/backend-api`) yields that origin (openai/codex
+ * rust-v0.156.0).
+ */
+export type TCodexWorkspaceRouteMemory = {
+  /** Record routes from an accounts/check JSON body (pass-through; no mutation). */
+  recordFromAccountsCheckBody(body: unknown): void;
+  /**
+   * Hermetic/tests: mark one account as explicitly unconstrained
+   * (`workspace_backend_origin = NO_CONSTRAINT`). Not a silent global default.
+   */
+  recordUnconstrained(accountId: string): void;
+  /** Resolve dispatch origin from captured inference headers; fail closed. */
+  resolveDispatchOrigin(headers: ReadonlyArray<TCapturedHeaderPair>):
+    | {
+        readonly ok: true;
+        readonly origin: string;
+      }
+    | {
+        readonly ok: false;
+        readonly reason: string;
+      };
+  /** Test/helper: constrained account routes retained. */
+  constrainedSize(): number;
+  /** Test/helper: unconstrained account ids retained. */
+  unconstrainedSize(): number;
+  /** Test/helper: constrained origin for one account id. */
+  originOf(accountId: string): string | undefined;
+  /** Test/helper: whether account was recorded unconstrained. */
+  isUnconstrained(accountId: string): boolean;
+};
+
+export const createCodexWorkspaceRouteMemory =
+  (): TCodexWorkspaceRouteMemory => {
+    const constrained = new Map<string, string>();
+    const unconstrained = new Set<string>();
+
+    const remember = (accountId: string, rawOrigin: unknown): void => {
+      if (typeof accountId !== "string" || accountId.length === 0) return;
+      if (typeof rawOrigin !== "string") return;
+      const trimmed = rawOrigin.trim();
+      if (trimmed === CODEX_CAPTURE_UNCONSTRAINED_BACKEND) {
+        unconstrained.add(accountId);
+        constrained.delete(accountId);
+        return;
+      }
+      const origin = trustedChatgptBackendOriginOf(trimmed);
+      if (origin === null) return;
+      constrained.set(accountId, origin);
+      unconstrained.delete(accountId);
+    };
+
+    return {
+      recordFromAccountsCheckBody(body: unknown): void {
+        if (
+          typeof body !== "object" ||
+          body === null ||
+          !("accounts" in body)
+        ) {
+          return;
+        }
+        const accounts = (body as { accounts: unknown }).accounts;
+        if (Array.isArray(accounts)) {
+          for (const entry of accounts) {
+            if (typeof entry !== "object" || entry === null) continue;
+            const id =
+              typeof (entry as { id?: unknown }).id === "string"
+                ? (entry as { id: string }).id
+                : typeof (entry as { account_id?: unknown }).account_id ===
+                    "string"
+                  ? (entry as { account_id: string }).account_id
+                  : null;
+            if (id === null) continue;
+            remember(
+              id,
+              (entry as { workspace_backend_origin?: unknown })
+                .workspace_backend_origin,
+            );
+          }
+          return;
+        }
+        if (typeof accounts === "object" && accounts !== null) {
+          for (const [id, value] of Object.entries(accounts)) {
+            if (typeof value !== "object" || value === null) continue;
+            const account =
+              "account" in value &&
+              typeof (value as { account: unknown }).account === "object" &&
+              (value as { account: unknown }).account !== null
+                ? (value as { account: Record<string, unknown> }).account
+                : (value as Record<string, unknown>);
+            const accountId =
+              typeof account.account_id === "string"
+                ? account.account_id
+                : typeof account.id === "string"
+                  ? account.id
+                  : id;
+            remember(accountId, account.workspace_backend_origin);
+          }
+        }
+      },
+
+      recordUnconstrained(accountId: string): void {
+        if (accountId.length === 0) return;
+        unconstrained.add(accountId);
+        constrained.delete(accountId);
+      },
+
+      resolveDispatchOrigin(headers) {
+        let accountId: string | null = null;
+        for (const [name, value] of headers) {
+          if (name.toLowerCase() === "chatgpt-account-id" && value.length > 0) {
+            accountId = value;
+            break;
+          }
+        }
+
+        const hasAny = constrained.size > 0 || unconstrained.size > 0;
+        if (!hasAny) {
+          return {
+            ok: false,
+            reason:
+              "codex capture: no authoritative workspace route recorded (empty discovery is not unconstrained)",
+          };
+        }
+
+        if (accountId !== null) {
+          if (unconstrained.has(accountId)) {
+            // Native resolve_routing(NO_CONSTRAINT) + Production chatgpt_base_url
+            // → https://chatgpt.com origin (ChatGptEnvironment::Production).
+            return { ok: true, origin: CODEX_CAPTURE_EXTERNAL_ORIGIN };
+          }
+          const origin = constrained.get(accountId);
+          if (origin === undefined) {
+            return {
+              ok: false,
+              reason:
+                "codex capture: ChatGPT-Account-Id has no recorded workspace backend origin",
+            };
+          }
+          return { ok: true, origin };
+        }
+
+        // No account header: only succeed when every recorded account agrees.
+        if (constrained.size === 0 && unconstrained.size > 0) {
+          return { ok: true, origin: CODEX_CAPTURE_EXTERNAL_ORIGIN };
+        }
+        if (unconstrained.size > 0 && constrained.size > 0) {
+          return {
+            ok: false,
+            reason:
+              "codex capture: mixed constrained/unconstrained backends; ChatGPT-Account-Id required",
+          };
+        }
+        const unique = new Set(constrained.values());
+        if (unique.size === 1) {
+          const origin = unique.values().next().value;
+          if (typeof origin === "string") return { ok: true, origin };
+        }
+        return {
+          ok: false,
+          reason:
+            "codex capture: multiple workspace backends recorded; ChatGPT-Account-Id required",
+        };
+      },
+
+      constrainedSize: (): number => constrained.size,
+      unconstrainedSize: (): number => unconstrained.size,
+      originOf: (accountId: string): string | undefined =>
+        constrained.get(accountId),
+      isUnconstrained: (accountId: string): boolean =>
+        unconstrained.has(accountId),
+    };
+  };
+
+/**
+ * Build the external Responses URL for daemon dispatch from a captured
+ * loopback observation + a validated vendor backend origin. Always uses the
+ * canonical `/backend-api/codex/responses` path — the local
+ * {@link CODEX_CAPTURE_OPENAI_PATH_PREFIX} is capture plumbing only.
  */
 export const remapCodexObservedUrlToExternal = (
   observedUrl: string,
+  backendOrigin: string = CODEX_CAPTURE_EXTERNAL_ORIGIN,
 ): string => {
-  const url = new URL(observedUrl);
-  return `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${url.pathname}${url.search}`;
+  const observed = new URL(observedUrl);
+  const origin = new URL(backendOrigin).origin;
+  return `${origin}${CODEX_CAPTURE_EXTERNAL_RESPONSES_PATH}${observed.search}`;
+};
+
+/**
+ * Bun `fetch` decompresses gzip/br/deflate response bodies but can leave the
+ * upstream `content-encoding` (and compressed `content-length`) intact on the
+ * returned `Response`. Relaying that object through `Bun.serve` makes a raw
+ * HTTP client (e.g. reqwest) see `content-encoding: gzip` with an already-
+ * decoded body → gunzip "incorrect header check".
+ *
+ * Rebuild around the decoded body and drop stale framing headers. Application
+ * JSON bytes/semantics are unchanged. Captured inference envelopes never use
+ * this helper.
+ */
+export const reframeFetchedControlResponse = async (
+  response: Response,
+): Promise<Response> => {
+  const headers = new Headers(response.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
+  const body = await response.arrayBuffer();
+  headers.set("content-length", String(body.byteLength));
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+};
+
+/**
+ * Record workspace routes from a forwarded accounts/check Response via
+ * `clone().json()` (decoded JSON semantics). The Response returned to native
+ * is separately reframed by {@link reframeFetchedControlResponse}.
+ */
+const recordWorkspaceRoutesFromResponse = async (
+  response: Response,
+  routes: TCodexWorkspaceRouteMemory,
+): Promise<void> => {
+  if (!response.ok) return;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("json")) return;
+  try {
+    const parsed: unknown = await response.clone().json();
+    routes.recordFromAccountsCheckBody(parsed);
+  } catch {
+    // Unparsable — leave memory unchanged; dispatch may fail closed later.
+  }
 };
 
 const localSettlementHttpResponse = (): Response =>
@@ -121,7 +459,46 @@ type TWsCaptureData = {
   readonly observedUrl: string;
   bodyChunks: Uint8Array[];
   offered: boolean;
+  warmupSkipped: number;
 };
+
+/**
+ * openai/codex rust-v0.156.0 WebSocket prewarm is a v2 `response.create` with
+ * `generate: false` (core/src/client.rs) — connection setup, not inference.
+ * Capturing the first WS frame would steal the prewarm and miss the real turn.
+ */
+export const isCodexResponsesWebsocketWarmupPayload = (
+  bytes: Uint8Array,
+): boolean => {
+  try {
+    const text = new TextDecoder().decode(bytes);
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null) return false;
+    const record = parsed as Record<string, unknown>;
+    // Payload may be the create object itself or wrapped.
+    if (record.generate === false) return true;
+    const nested = record.response_create ?? record.responseCreate ?? record;
+    if (
+      typeof nested === "object" &&
+      nested !== null &&
+      (nested as { generate?: unknown }).generate === false
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+};
+
+/** PATH/METHOD only — never bodies/headers/auth. */
+export type TCodexCaptureObservedRequest = {
+  readonly method: string;
+  readonly pathname: string;
+  readonly kind: "inference" | "preamble" | "other";
+};
+
+export type TCodexCapturePreambleMode = "forward" | "stub-204";
 
 export type TCodexCaptureReceiver = {
   readonly baseUrl: string;
@@ -129,32 +506,87 @@ export type TCodexCaptureReceiver = {
   /** Count of `/responses` offers accepted into the session (0 or 1). */
   readonly capturedCount: () => number;
   /**
-   * Count of times the receiver would have forwarded off-box. Always 0 by
-   * construction — non-inference traffic is stubbed locally.
+   * Count of times the receiver would have forwarded the ORIGINAL INFERENCE
+   * request off-box. Always 0 by construction — `/responses` is captured and
+   * daemon-dispatched, never forwarded from the receiver. Do NOT use this to
+   * prove "zero chatgpt.com egress overall"; preamble forwarding is separate.
    */
   readonly originalExternalSendCount: () => number;
+  /**
+   * Recognized non-inference ChatGPT preamble requests the receiver forwarded
+   * to chatgpt.com (only under `preamble: "forward"`). Distinct from
+   * {@link originalExternalSendCount}.
+   */
+  readonly preambleForwardCount: () => number;
   /** Extra `/responses` attempts after the first capture (WS→HTTP fallback). */
   readonly suppressedRetryCount: () => number;
+  /** WS `generate:false` prewarm frames skipped before inference capture. */
+  readonly warmupSkippedCount: () => number;
+  /** Metadata-only request log (PATH/METHOD) for diagnostics/tests. */
+  readonly observedRequests: () => ReadonlyArray<TCodexCaptureObservedRequest>;
+  /** Request-private vendor workspace route memory (no secrets logged). */
+  readonly workspaceRoutes: TCodexWorkspaceRouteMemory;
 };
 
 export type TStartCodexCaptureReceiverOptions = {
   readonly session: TRequestCaptureSession;
   readonly signal?: AbortSignal;
+  /**
+   * Non-inference handling for traffic that already hit this loopback
+   * listener. Default `forward` matches `delegation/auth-config.ts` (forward
+   * every non-`/responses` request to chatgpt.com). `stub-204` is for
+   * hermetic negative tests that model starvation.
+   */
+  readonly preamble?: TCodexCapturePreambleMode;
+  /**
+   * Fetch used when forwarding preamble. Hermetic tests inject a loopback
+   * stand-in; production uses real `fetch` to chatgpt.com.
+   */
+  readonly preambleFetch?: (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => Promise<Response>;
+  /** Optional pre-built route memory (tests); default creates a fresh one. */
+  readonly workspaceRoutes?: TCodexWorkspaceRouteMemory;
 };
 
 /**
  * Loopback HTTP + WebSocket receiver. Captures the first `/responses`
- * inference offer (either transport), settles the builder locally, and NEVER
- * forwards to chatgpt.com. Subsequent `/responses` attempts (e.g. WS→HTTP
- * fallback after a captured WS offer) receive the same local settlement
- * without a second `captureSend` / daemon dispatch.
+ * inference offer (either transport) and settles it locally. Non-inference
+ * preamble is forwarded to chatgpt.com (default) with auth/body preserved —
+ * `/responses` itself is NEVER forwarded. Accounts/check bodies are passed
+ * through unchanged while original workspace backends are recorded for
+ * dispatch restoration. Subsequent `/responses` attempts receive the same
+ * local settlement without a second `captureSend`.
  */
 export const startCodexCaptureReceiver = (
   opts: TStartCodexCaptureReceiverOptions,
 ): TCodexCaptureReceiver => {
   let capturedCount = 0;
   let suppressedRetryCount = 0;
+  let preambleForwardCount = 0;
+  let warmupSkippedCount = 0;
   let builderSettlement: TBuilderSettlement | null = null;
+  const observed: TCodexCaptureObservedRequest[] = [];
+  const preambleMode: TCodexCapturePreambleMode = opts.preamble ?? "forward";
+  const preambleFetch = opts.preambleFetch ?? fetch;
+  const workspaceRoutes =
+    opts.workspaceRoutes ?? createCodexWorkspaceRouteMemory();
+
+  const classify = (pathname: string): TCodexCaptureObservedRequest["kind"] => {
+    if (isCodexCaptureInferencePath(pathname)) return "inference";
+    if (isCodexCapturePreamblePath(pathname)) return "preamble";
+    return "other";
+  };
+
+  const noteObserved = (req: Request): void => {
+    const url = new URL(req.url);
+    observed.push({
+      method: req.method.toUpperCase(),
+      pathname: url.pathname,
+      kind: classify(url.pathname),
+    });
+  };
 
   const offerEnvelope = async (
     envelope: TCapturedRequestEnvelope,
@@ -174,21 +606,74 @@ export const startCodexCaptureReceiver = (
     return settlement;
   };
 
+  const resolveExternalUrl = (
+    observedUrl: string,
+    headers: ReadonlyArray<TCapturedHeaderPair>,
+  ): string => {
+    const resolved = workspaceRoutes.resolveDispatchOrigin(headers);
+    if (!resolved.ok) {
+      throw new Error(resolved.reason);
+    }
+    return remapCodexObservedUrlToExternal(observedUrl, resolved.origin);
+  };
+
   const offerFromHttp = async (req: Request): Promise<Response> => {
     const observedUrl = req.url;
     const headers = preserveCapturedHeaders(req.headers);
     const bodyBuf = await req.arrayBuffer();
     const body = bodyBuf.byteLength === 0 ? null : new Uint8Array(bodyBuf);
+    let externalUrl: string;
+    try {
+      externalUrl = resolveExternalUrl(observedUrl, headers);
+    } catch (err) {
+      return new Response(
+        err instanceof Error ? err.message : "workspace route unresolved",
+        { status: 502 },
+      );
+    }
     await offerEnvelope({
       transport: "http",
       method: req.method,
       observedUrl,
-      externalUrl: remapCodexObservedUrlToExternal(observedUrl),
+      externalUrl,
       headers,
       body,
       framing: null,
     });
     return localSettlementHttpResponse();
+  };
+
+  const forwardPreamble = async (req: Request): Promise<Response> => {
+    const url = new URL(req.url);
+    // Trusted destination only — remap to chatgpt.com, preserve path/query and
+    // the vendor-built application headers/body (auth included). Strip Host so
+    // fetch sets it for the external origin.
+    const fwd = new Headers(req.headers);
+    fwd.delete("host");
+    preambleForwardCount += 1;
+    const recordRoutes = isWorkspaceAccountsCheckPath(url.pathname);
+    try {
+      const response = await preambleFetch(
+        `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${url.pathname}${url.search}`,
+        {
+          method: req.method,
+          headers: fwd,
+          body:
+            req.method === "GET" || req.method === "HEAD"
+              ? undefined
+              : await req.arrayBuffer(),
+          signal: opts.signal,
+        },
+      );
+      // Route memory reads decoded JSON via clone(); then reframe so Bun's
+      // fetch decompression cannot leave stale content-encoding for reqwest.
+      if (recordRoutes) {
+        await recordWorkspaceRoutesFromResponse(response, workspaceRoutes);
+      }
+      return await reframeFetchedControlResponse(response);
+    } catch {
+      return new Response(null, { status: 502 });
+    }
   };
 
   const server = Bun.serve<TWsCaptureData>({
@@ -199,17 +684,19 @@ export const startCodexCaptureReceiver = (
         return new Response(null, { status: 499 });
       }
       const url = new URL(req.url);
-      const inference = isCodexCaptureInferencePath(url.pathname);
+      const kind = classify(url.pathname);
+      noteObserved(req);
       const wantsUpgrade =
         req.headers.get("upgrade")?.toLowerCase() === "websocket";
 
-      if (inference && wantsUpgrade) {
+      if (kind === "inference" && wantsUpgrade) {
         const upgraded = srv.upgrade(req, {
           data: {
             headers: preserveCapturedHeaders(req.headers),
             observedUrl: req.url,
             bodyChunks: [],
             offered: false,
+            warmupSkipped: 0,
           },
         });
         return upgraded
@@ -217,45 +704,75 @@ export const startCodexCaptureReceiver = (
           : new Response("websocket upgrade failed", { status: 400 });
       }
 
-      if (inference) {
+      if (kind === "inference") {
         return offerFromHttp(req);
       }
 
-      // Preamble / non-inference: local stub ONLY — never forward off-box.
+      // Recognized preamble: forward to chatgpt.com (default) or stub for the
+      // hermetic negative case. Unknown non-inference paths: local stub ONLY —
+      // never open unbounded egress for arbitrary unmatched requests.
+      if (
+        kind === "preamble" &&
+        preambleMode === "forward" &&
+        isCodexCapturePreambleMethod(req.method) &&
+        !wantsUpgrade
+      ) {
+        return forwardPreamble(req);
+      }
       return new Response(null, { status: 204 });
     },
     websocket: {
       message(ws, message): void {
         if (ws.data.offered) return;
-        const chunk =
-          typeof message === "string"
-            ? new TextEncoder().encode(message)
-            : message instanceof Uint8Array
-              ? message
-              : new Uint8Array(message);
-        ws.data.bodyChunks.push(chunk);
-        // Offer on the first data frame — Responses WS carries the request
-        // payload as the initial client message. Further frames (if any) are
-        // ignored for capture; the daemon owns the exchange after this.
+        // Preserve the ORIGINAL WS opcode native sent (text vs binary) — the
+        // dispatch sender must resend with the same opcode, never coerce to
+        // binary. openai/codex Responses WS almost certainly speaks JSON text
+        // frames; sending as binary is a plausible cause of upstream silence.
+        const isText = typeof message === "string";
+        const chunk = isText
+          ? new TextEncoder().encode(message)
+          : message instanceof Uint8Array
+            ? message
+            : new Uint8Array(message);
+        // Skip v2 WS prewarm (`generate: false`) — keep the socket open for the
+        // real inference frame (openai/codex core/src/client.rs).
+        if (isCodexResponsesWebsocketWarmupPayload(chunk)) {
+          ws.data.warmupSkipped += 1;
+          warmupSkippedCount += 1;
+          return;
+        }
+        ws.data.bodyChunks = [chunk];
         ws.data.offered = true;
-        const total = ws.data.bodyChunks.reduce((n, c) => n + c.byteLength, 0);
-        const body = new Uint8Array(total);
-        let offset = 0;
-        for (const c of ws.data.bodyChunks) {
-          body.set(c, offset);
-          offset += c.byteLength;
+        const body = chunk;
+        let externalUrl: string;
+        try {
+          externalUrl = resolveExternalUrl(
+            ws.data.observedUrl,
+            ws.data.headers,
+          );
+        } catch {
+          try {
+            ws.close(1011, "workspace-route-unresolved");
+          } catch {
+            // ignore
+          }
+          return;
         }
         void offerEnvelope({
           transport: "websocket",
           method: "GET",
           observedUrl: ws.data.observedUrl,
-          externalUrl: remapCodexObservedUrlToExternal(ws.data.observedUrl),
+          externalUrl,
           headers: ws.data.headers,
           body,
           framing: {
             entries: {
               protocol: "responses-websocket",
               upgrade: true,
+              wsOpcode: isText ? "text" : "binary",
+              ...(ws.data.warmupSkipped > 0
+                ? { warmupSkipped: ws.data.warmupSkipped }
+                : {}),
             },
           },
         }).finally(() => {
@@ -268,8 +785,8 @@ export const startCodexCaptureReceiver = (
         });
       },
       close(ws): void {
-        // Upgrade-without-body (failed WS before payload): leave the session
-        // open so an HTTP fallback can still offer once.
+        // Upgrade-without-body / prewarm-only: leave the session open so an
+        // HTTP fallback can still offer once.
         if (!ws.data.offered && ws.data.bodyChunks.length === 0) return;
       },
     },
@@ -297,20 +814,51 @@ export const startCodexCaptureReceiver = (
     baseUrl,
     stop,
     capturedCount: (): number => capturedCount,
+    // Inference is never forwarded from this receiver.
     originalExternalSendCount: (): number => 0,
+    preambleForwardCount: (): number => preambleForwardCount,
+    workspaceRoutes,
     suppressedRetryCount: (): number => suppressedRetryCount,
+    warmupSkippedCount: (): number => warmupSkippedCount,
+    observedRequests: (): ReadonlyArray<TCodexCaptureObservedRequest> => [
+      ...observed,
+    ],
   };
 };
 
-const concatBytes = (chunks: readonly Uint8Array[]): Uint8Array => {
-  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.byteLength;
-  }
-  return out;
+/**
+ * True when ONE upstream WS/SSE frame's text is (or contains) a Responses
+ * terminal event. Checked per-frame — never against a running concatenation
+ * of every frame received so far, which would make the wait loop O(n²) over
+ * the exchange and would blur frame boundaries (`{}{}` back-to-back frames
+ * mis-split by a boundary-losing regex/newline scan).
+ */
+export const codexWsFrameHasTerminal = (frameText: string): boolean => {
+  if (frameText.length === 0) return false;
+  return (
+    /"type"\s*:\s*"response\.(completed|done|failed|incomplete)"/.test(
+      frameText,
+    ) || /\bresponse\.(completed|done|failed|incomplete)\b/.test(frameText)
+  );
+};
+
+/**
+ * Wrap discrete upstream WS frames as SSE for the shared Responses decoder.
+ * Each frame becomes exactly one `data: …` event — frame boundaries are
+ * preserved because they were never concatenated. Callers must already have
+ * verified a terminal frame exists; this never invents a completed turn.
+ */
+export const wrapCodexWsFramesAsSse = (
+  frames: ReadonlyArray<string>,
+): Uint8Array => {
+  const events = frames
+    .map((frame) => frame.trim())
+    .filter((frame) => frame.length > 0)
+    .map((frame) =>
+      frame.startsWith("data:") ? `${frame}\n\n` : `data: ${frame}\n\n`,
+    )
+    .join("");
+  return new TextEncoder().encode(`${events}data: [DONE]\n\n`);
 };
 
 /**
@@ -320,10 +868,18 @@ const concatBytes = (chunks: readonly Uint8Array[]): Uint8Array => {
  * open, and wraps inbound text frames as an SSE-shaped Response body so the
  * existing Responses decoder can run when the upstream speaks SSE-over-WS
  * or plain JSON event frames.
+ *
+ * Abort / peer-close without a Responses terminal (`response.completed` /
+ * `failed` / …) throws — never returns an empty 200/`[DONE]` success. After
+ * `markUpstreamAccepted`, that throw preserves accepted/uncertain ownership
+ * via `runCapturedDispatch` (no silent zero-token success).
  */
 export const createCodexCapturedDispatchSender = (args: {
   readonly session: TRequestCaptureSession;
-  readonly fetchImpl?: typeof fetch;
+  readonly fetchImpl?: (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => Promise<Response>;
 }): ((
   request: Request,
   envelope: TCapturedRequestEnvelope,
@@ -332,7 +888,19 @@ export const createCodexCapturedDispatchSender = (args: {
   const fetchImpl = args.fetchImpl ?? fetch;
   return async (request, envelope, signal): Promise<Response> => {
     if (envelope.transport === "http") {
-      return await fetchImpl(request, { signal });
+      const response = await fetchImpl(request, { signal });
+      // Buffer immediately. On a successful dispatch `session.complete` does
+      // NOT abort `session.signal` (only cancel/fail/uncertain-accept do —
+      // see `finishTerminal` in request-capture.ts), and `markDispatchStarted`
+      // detaches the pre-capture budget so it can't fire mid-dispatch either.
+      // Buffering here is still correct: `signal` is still the caller's own
+      // abort (e.g. client disconnect), which SHOULD cut a live body read.
+      const buffered = new Uint8Array(await response.arrayBuffer());
+      return new Response(buffered, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
     }
 
     if (envelope.transport !== "websocket") {
@@ -369,9 +937,23 @@ export const createCodexCapturedDispatchSender = (args: {
     });
     ws.binaryType = "arraybuffer";
 
-    const inbound: Uint8Array[] = [];
+    // Discrete inbound frames — each pushed exactly once, never concatenated
+    // before a terminal check. Avoids O(n²) full-buffer rescans and preserves
+    // frame boundaries (`{}{}` back-to-back frames stay two events, not one
+    // ambiguously-split string).
+    //
+    // Buffered whole (not yet streamed to the daemon decoder — a follow-up
+    // can make this genuinely streaming); bounded at the same
+    // `DEFAULT_MAX_BODY_BYTES` cap the HTTP capture path already enforces on
+    // a captured body, so an upstream that never terminates cannot grow this
+    // buffer unbounded.
+    const frames: string[] = [];
+    let bufferedBytes = 0;
+    let terminalSeen = false;
+    let overBudget = false;
     let wake: (() => void) | null = null;
     let closed = false;
+    let aborted = false;
     let openErr: Error | null = null;
 
     const wait = (): Promise<void> =>
@@ -384,24 +966,68 @@ export const createCodexCapturedDispatchSender = (args: {
       wake = null;
     };
 
+    // `opened` must settle even if the server never answers the upgrade and
+    // the caller aborts first — otherwise `await opened` hangs forever with
+    // no "open" and no "error" event ever firing.
     const opened = new Promise<void>((resolve, reject) => {
-      ws.addEventListener("open", () => {
-        args.session.markUpstreamAccepted();
-        resolve();
-      });
-      ws.addEventListener("error", () => {
-        openErr = new Error("codex capture websocket failed before open");
-        reject(openErr);
-      });
+      let settled = false;
+      const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        ws.removeEventListener("open", onOpen);
+        ws.removeEventListener("error", onErrBeforeOpen);
+        signal.removeEventListener("abort", onAbortBeforeOpen);
+        fn();
+      };
+      const onOpen = (): void =>
+        finish(() => {
+          args.session.markUpstreamAccepted();
+          resolve();
+        });
+      const onErrBeforeOpen = (): void =>
+        finish(() => {
+          openErr = new Error("codex capture websocket failed before open");
+          reject(openErr);
+        });
+      const onAbortBeforeOpen = (): void =>
+        finish(() => {
+          reject(new Error("codex capture websocket aborted before open"));
+        });
+      ws.addEventListener("open", onOpen, { once: true });
+      ws.addEventListener("error", onErrBeforeOpen, { once: true });
+      signal.addEventListener("abort", onAbortBeforeOpen, { once: true });
+      if (signal.aborted) onAbortBeforeOpen();
     });
 
     ws.addEventListener("message", (ev) => {
-      if (typeof ev.data === "string") {
-        inbound.push(new TextEncoder().encode(ev.data));
-      } else if (ev.data instanceof ArrayBuffer) {
-        inbound.push(new Uint8Array(ev.data));
-      } else if (ev.data instanceof Uint8Array) {
-        inbound.push(ev.data);
+      if (overBudget) return;
+      // Decode as UTF-8 text regardless of the inbound opcode — Responses WS
+      // frames are JSON either way; only the RESEND opcode (below) must match
+      // what native originally sent.
+      const frame =
+        typeof ev.data === "string"
+          ? ev.data
+          : new TextDecoder().decode(
+              ev.data instanceof ArrayBuffer
+                ? new Uint8Array(ev.data)
+                : ev.data instanceof Uint8Array
+                  ? ev.data
+                  : new Uint8Array(0),
+            );
+      bufferedBytes += frame.length;
+      if (bufferedBytes > DEFAULT_MAX_BODY_BYTES) {
+        overBudget = true;
+        try {
+          ws.close(1009, "codex capture response exceeds max buffered size");
+        } catch {
+          // ignore
+        }
+        notify();
+        return;
+      }
+      frames.push(frame);
+      if (!terminalSeen && codexWsFrameHasTerminal(frame)) {
+        terminalSeen = true;
       }
       notify();
     });
@@ -415,44 +1041,60 @@ export const createCodexCapturedDispatchSender = (args: {
     });
 
     const onAbort = (): void => {
+      aborted = true;
       try {
         ws.close();
       } catch {
         // ignore
       }
+      // Force the wait loop to observe the abort even with no pending
+      // message/close event queued.
+      notify();
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
 
     try {
       await opened;
       if (envelope.body !== null && envelope.body.byteLength > 0) {
-        ws.send(new Uint8Array(envelope.body));
+        // Resend with the ORIGINAL opcode native used — never coerce text to
+        // binary or vice versa. `framing.entries.wsOpcode` is set by the
+        // receiver from the actual inbound frame type.
+        const wsOpcode = envelope.framing?.entries.wsOpcode;
+        if (wsOpcode === "binary") {
+          ws.send(new Uint8Array(envelope.body));
+        } else {
+          // Default to text (the documented/expected Responses WS framing)
+          // when framing metadata is absent (e.g. hermetic fixtures built
+          // before this field existed).
+          ws.send(new TextDecoder().decode(envelope.body));
+        }
       }
 
-      // Collect until the peer closes (fake upstream finishes the turn).
-      while (!closed) {
+      // Collect until a terminal frame arrives, the buffer cap trips, or the
+      // peer closes / caller aborts. Do NOT treat abort or empty close as a
+      // completed turn (live attempt-24 empty 200/[DONE]).
+      while (!closed && !aborted && !terminalSeen && !overBudget) {
         await wait();
       }
 
-      const bytes = concatBytes(inbound);
-      // Present as text/event-stream when the payload already looks like SSE;
-      // otherwise wrap each JSON object line as `data: …` so the shared
-      // Responses decoder can run. Exact native WS framing remains a live
-      // validation gap — hermetic fakes speak JSON/SSE-compatible frames.
-      const text = new TextDecoder().decode(bytes);
-      const looksSse = text.includes("data:");
-      const sseBody = looksSse
-        ? bytes
-        : new TextEncoder().encode(
-            `${text
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter((line) => line.length > 0)
-              .map((line) => `data: ${line}\n\n`)
-              .join("")}data: [DONE]\n\n`,
-          );
+      if (overBudget) {
+        throw new Error(
+          `codex capture websocket response exceeded ${DEFAULT_MAX_BODY_BYTES} buffered bytes before response.completed`,
+        );
+      }
+      if (aborted || signal.aborted) {
+        throw new Error(
+          "codex capture websocket aborted before response.completed",
+        );
+      }
+      if (!terminalSeen) {
+        throw new Error(
+          "codex capture websocket closed without response.completed",
+        );
+      }
 
-      return new Response(new Uint8Array(sseBody), {
+      return new Response(new Uint8Array(wrapCodexWsFramesAsSse(frames)), {
         status: 200,
         headers: {
           "content-type": "text/event-stream",
@@ -469,7 +1111,7 @@ export const createCodexCapturedDispatchSender = (args: {
   };
 };
 
-const decodeCodexUpstreamResponse = (
+export const decodeCodexUpstreamResponse = (
   response: Response,
   providerModelId: string,
 ): ReadableStream<TChatCompletionChunk> => {
@@ -514,12 +1156,38 @@ export const settleCodexCaptureTurn = async (args: {
       onAgentMessage: (text: string) => void;
       onUsage: (usage: unknown) => void;
       onCompleted: (status: string, errorMessage: string | null) => void;
+      onToolCall?: (
+        requestId: number,
+        callId: string,
+        tool: string,
+        args: unknown,
+      ) => void;
+      onRetryError?: (
+        message: string,
+        info: {
+          readonly willRetry: true;
+          readonly codexErrorInfo: unknown;
+          readonly additionalDetails: string | null;
+        },
+      ) => void;
     }): void;
     removeSink(threadId: string): void;
+    respondToServer?(id: number, result: unknown): void;
   };
   readonly threadId: string;
   readonly turnId: string | null;
   readonly timeoutMs?: number;
+  /**
+   * Optional: keep refusing builder `item/tool/call` while awaiting the
+   * interrupt terminal. `addSink` replaces any prior sink, so callers that
+   * already attached an onToolCall must pass it here or lose it.
+   */
+  readonly onToolCall?: (
+    requestId: number,
+    callId: string,
+    tool: string,
+    args: unknown,
+  ) => void;
 }): Promise<{ readonly status: string; readonly error: string | null }> => {
   let status = "interrupted";
   let error: string | null = null;
@@ -527,6 +1195,28 @@ export const settleCodexCaptureTurn = async (args: {
   const finished = new Promise<void>((resolve) => {
     done = resolve;
   });
+
+  const refuseToolCall = (
+    requestId: number,
+    callId: string,
+    tool: string,
+    toolArgs: unknown,
+  ): void => {
+    if (args.onToolCall !== undefined) {
+      args.onToolCall(requestId, callId, tool, toolArgs);
+      return;
+    }
+    // Default capture settlement: never execute builder tools.
+    args.client.respondToServer?.(requestId, {
+      contentItems: [
+        {
+          type: "inputText",
+          text: "(capture: tool execution suppressed during settle)",
+        },
+      ],
+      success: false,
+    });
+  };
 
   args.client.addSink({
     threadId: args.threadId,
@@ -538,6 +1228,7 @@ export const settleCodexCaptureTurn = async (args: {
       error = e;
       done();
     },
+    onToolCall: refuseToolCall,
   });
 
   if (args.turnId !== null) {
@@ -562,6 +1253,56 @@ export const settleCodexCaptureTurn = async (args: {
   return { status, error };
 };
 
+/** Safe metadata-only snapshot (PATH/METHOD; no query/headers/body/auth). */
+export type TCodexCaptureDiagnostics = {
+  readonly phase: string;
+  readonly threadId: string | null;
+  readonly turnId: string | null;
+  readonly observed: ReadonlyArray<TCodexCaptureObservedRequest>;
+  readonly capturedCount: number;
+  readonly preambleForwardCount: number;
+  readonly originalExternalSendCount: number;
+  readonly turnTerminal: {
+    readonly status: string;
+    readonly error: string | null;
+  } | null;
+  /**
+   * Last non-terminal stream/retry notification (`willRetry: true`), e.g.
+   * "Reconnecting... 2/5". Distinct from {@link turnTerminal}.
+   */
+  readonly lastRetryError: string | null;
+};
+
+export const formatCodexCaptureDiagnostics = (
+  diag: TCodexCaptureDiagnostics,
+): string => {
+  const observed =
+    diag.observed.length === 0
+      ? "none"
+      : diag.observed
+          .map((r) => `${r.method} ${r.pathname} (${r.kind})`)
+          .join("; ");
+  const terminal =
+    diag.turnTerminal === null
+      ? "none"
+      : `${diag.turnTerminal.status}${
+          diag.turnTerminal.error !== null && diag.turnTerminal.error.length > 0
+            ? `: ${diag.turnTerminal.error}`
+            : ""
+        }`;
+  return [
+    `phase=${diag.phase}`,
+    `thread=${diag.threadId ?? "none"}`,
+    `turn=${diag.turnId ?? "none"}`,
+    `observed=[${observed}]`,
+    `captured=${diag.capturedCount}`,
+    `preambleForwards=${diag.preambleForwardCount}`,
+    `inferenceExternal=${diag.originalExternalSendCount}`,
+    `nativeTerminal=${terminal}`,
+    `lastRetry=${diag.lastRetryError ?? "none"}`,
+  ].join(" ");
+};
+
 /**
  * Isolated capture text route: vendor constructs the authenticated envelope
  * against loopback; daemon dispatches once; builder is interrupted locally;
@@ -569,9 +1310,21 @@ export const settleCodexCaptureTurn = async (args: {
  *
  * Callers enter this only when the selected sub-method is `bridge-capture`
  * and readiness admits chatgpt ({@link runCodexNative} with `bridgeCapture`).
+ *
+ * The capture wait is raced against the builder's native `turn/completed` /
+ * `error` so a real client failure is not swallowed as a generic 60s timeout.
+ * Declined reasons include metadata-only diagnostics (PATH/METHOD counts).
  */
+export type TCodexCaptureTextTurnParams = TCodexNativeParams & {
+  /**
+   * Hermetic/tests only. Production omits — routes come from forwarded
+   * `/wham/accounts/check`. Empty memory fails closed.
+   */
+  readonly captureWorkspaceRoutes?: TCodexWorkspaceRouteMemory;
+};
+
 export const runCodexCapturedTextTurn = async (
-  params: TCodexNativeParams,
+  params: TCodexCaptureTextTurnParams,
 ): Promise<TNativeRunResult> => {
   const session = createRequestCaptureSession({
     destinationPolicy: codexCaptureDestinationPolicy({
@@ -589,15 +1342,39 @@ export const runCodexCapturedTextTurn = async (
   const receiver = startCodexCaptureReceiver({
     session,
     signal: params.signal,
+    ...(params.captureWorkspaceRoutes !== undefined
+      ? { workspaceRoutes: params.captureWorkspaceRoutes }
+      : {}),
   });
   const redirects = codexCaptureRedirectArgs(receiver.baseUrl);
   const client = createIsolatedCodexAppServerClient(params.bin, params.env, {
     spawnArgvExtra: redirects.argv,
   });
 
+  let phase = "initialize";
   let threadId: string | null = null;
   let turnId: string | null = null;
   let captureOwnership: "none" | "accepted" | "uncertain" = "none";
+  let turnTerminal: { status: string; error: string | null } | null = null;
+  let lastRetryError: string | null = null;
+
+  const snapshot = (): TCodexCaptureDiagnostics => ({
+    phase,
+    threadId,
+    turnId,
+    observed: receiver.observedRequests(),
+    capturedCount: receiver.capturedCount(),
+    preambleForwardCount: receiver.preambleForwardCount(),
+    originalExternalSendCount: receiver.originalExternalSendCount(),
+    turnTerminal,
+    lastRetryError,
+  });
+
+  const decline = (reason: string): TNativeRunResult => ({
+    kind: "declined",
+    reason: `${reason} | ${formatCodexCaptureDiagnostics(snapshot())}`,
+    ...(captureOwnership !== "none" ? { captureOwnership } : {}),
+  });
 
   const disposeAll = (): void => {
     try {
@@ -610,6 +1387,7 @@ export const runCodexCapturedTextTurn = async (
   };
 
   try {
+    phase = "initialize";
     await client.ensureStarted();
     const startParams = codexBaseStartParams(
       params.providerModelId,
@@ -617,18 +1395,63 @@ export const runCodexCapturedTextTurn = async (
     );
     // Capture path always starts a FRESH isolated thread — do not resume the
     // shared warm map's thread ids (history injection unproven).
+    phase = "thread-start";
     const opened = (await client.request("thread/start", startParams)) as {
       thread?: { id?: string };
     };
     if (typeof opened.thread?.id !== "string") {
       disposeAll();
-      return {
-        kind: "declined",
-        reason: "codex capture thread/start returned no thread id",
-      };
+      return decline("codex capture thread/start returned no thread id");
     }
     threadId = opened.thread.id;
 
+    // Attach BEFORE turn/start so an early native failure is not lost while we
+    // wait for capture. If the turn ends with zero captures, fail the capture
+    // session immediately (do not wait for the generic PRE_COMMIT timeout).
+    client.addSink({
+      threadId,
+      onDelta: () => {},
+      onAgentMessage: () => {},
+      onUsage: () => {},
+      onRetryError: (message, info) => {
+        // Non-terminal. Record for diagnostics; do NOT end the capture wait.
+        lastRetryError = info.additionalDetails
+          ? `${message} (${info.additionalDetails})`
+          : message;
+      },
+      onCompleted: (status, errorMessage) => {
+        turnTerminal = { status, error: errorMessage };
+        if (receiver.capturedCount() > 0 || session.dispatchStarted()) {
+          return;
+        }
+        const detail =
+          errorMessage !== null && errorMessage.length > 0
+            ? `${status}: ${errorMessage}`
+            : status;
+        try {
+          session.complete({
+            kind: "failed",
+            reason: `codex turn ended before capture (${detail})`,
+            usage: { kind: "none" },
+          });
+        } catch {
+          // session may already be terminal/disposed
+        }
+      },
+      onToolCall: (requestId) => {
+        client.respondToServer?.(requestId, {
+          contentItems: [
+            {
+              type: "inputText",
+              text: "(capture: tool execution suppressed before settle)",
+            },
+          ],
+          success: false,
+        });
+      },
+    });
+
+    phase = "turn-start";
     const effort = effortOf(params.reasoningEffort);
     const turn = (await client.request("turn/start", {
       threadId,
@@ -642,9 +1465,10 @@ export const runCodexCapturedTextTurn = async (
         await settleCodexCaptureTurn({ client, threadId, turnId });
       }
       disposeAll();
-      return { kind: "declined", reason: "client aborted" };
+      return decline("client aborted");
     }
 
+    phase = "awaiting-capture";
     const sender = createCodexCapturedDispatchSender({ session });
     const dispatched = await runCapturedDispatch({
       session,
@@ -654,18 +1478,31 @@ export const runCodexCapturedTextTurn = async (
         "codex original external send suppressed; daemon owns the exchange",
     });
     captureOwnership = "accepted";
+    phase = "dispatched";
     // Builder settlement: interrupt + authoritative terminal. Do NOT treat
-    // process kill as proof of graceful reuse.
+    // process kill as proof of graceful reuse. Re-attach sink via settle —
+    // addSink replaces the early-watch sink.
     const terminal = await settleCodexCaptureTurn({
       client,
       threadId,
       turnId,
     });
+    turnTerminal = { status: terminal.status, error: terminal.error };
+    phase = "settled";
 
-    const chunks = decodeCodexUpstreamResponse(
+    const rawChunks = decodeCodexUpstreamResponse(
       dispatched.response,
       params.providerModelId,
     );
+    // Capture-only guard: on HTTP, a clean upstream EOF with no observed
+    // terminal `finish_reason` (dropped connection, truncated body after a
+    // 200) must not silently become an empty "success" — see
+    // request-capture-output.ts and the live attempt-24 WS analogue (already
+    // guarded at the WS sender via `codexWsFrameHasTerminal` /
+    // `terminalSeen`). This is the HTTP-transport counterpart of that same
+    // failure class. WS dispatch never reaches this wrapper twice — its own
+    // guard already ran inside the sender before this Response existed.
+    const chunks = requireCaptureTerminalFinishReason(rawChunks);
 
     // Capture the thread id for sessionId(); the isolated client is disposed
     // after the stream cancels/closes.
@@ -692,24 +1529,24 @@ export const runCodexCapturedTextTurn = async (
       },
     });
 
-    // Surface interrupt status only as diagnostics — the caller stream is the
-    // daemon-owned upstream decode, not the builder's (empty) view.
-    void terminal;
-
     return {
       kind: "committed",
       chunks: stream,
       sessionId: () => capturedThreadId,
     };
   } catch (error) {
+    phase = "failed";
     if (threadId !== null) {
       try {
-        await settleCodexCaptureTurn({
+        const settled = await settleCodexCaptureTurn({
           client,
           threadId,
           turnId,
           timeoutMs: 1_000,
         });
+        if (turnTerminal === null) {
+          turnTerminal = { status: settled.status, error: settled.error };
+        }
       } catch {
         // best-effort
       }
@@ -717,12 +1554,9 @@ export const runCodexCapturedTextTurn = async (
     if (captureOwnership === "none" && session.dispatchStarted()) {
       captureOwnership = session.upstreamAccepted() ? "accepted" : "uncertain";
     }
+    const base = error instanceof Error ? error.message : String(error);
     disposeAll();
-    return {
-      kind: "declined",
-      reason: error instanceof Error ? error.message : String(error),
-      ...(captureOwnership !== "none" ? { captureOwnership } : {}),
-    };
+    return decline(base);
   }
 };
 

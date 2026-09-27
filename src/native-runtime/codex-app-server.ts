@@ -86,6 +86,22 @@ type TThreadSink = {
    *  `item.type: "webSearch"`) — the provider ran it; we only report it so
    *  client wires can re-encode the lifecycle (Claude Code counts these). */
   onWebSearch?: (call: TServerSearchCall) => void;
+  /**
+   * Non-terminal stream/retry error (`error` notification with
+   * `willRetry: true`). `openai/codex` (`rust-v0.156.0`
+   * `app-server/.../bespoke_event_handling.rs`) emits these for
+   * `EventMsg::StreamError` ("Reconnecting... N/M") WITHOUT ending the turn;
+   * only `willRetry: false` / `turn/completed` are terminals. Optional — sinks
+   * that only care about terminals can omit this.
+   */
+  onRetryError?: (
+    message: string,
+    info: {
+      readonly willRetry: true;
+      readonly codexErrorInfo: unknown;
+      readonly additionalDetails: string | null;
+    },
+  ) => void;
 };
 
 export type TCodexAppServerClientOptions = {
@@ -362,7 +378,12 @@ class CodexAppServerClient {
             readonly status?: string;
             readonly error?: { readonly message?: string } | null;
           };
-          readonly error?: { readonly message?: string };
+          readonly error?: {
+            readonly message?: string;
+            readonly codexErrorInfo?: unknown;
+            readonly additionalDetails?: string | null;
+          };
+          readonly willRetry?: boolean;
         }
       | undefined;
     const threadId = params?.threadId;
@@ -434,9 +455,26 @@ class CodexAppServerClient {
           params?.turn?.error?.message ?? null,
         );
         return;
-      case "error":
-        sink.onCompleted("failed", params?.error?.message ?? "codex error");
+      case "error": {
+        // Preserve retry-vs-terminal. StreamError → ErrorNotification with
+        // willRetry:true ("Reconnecting... N/M") is NOT a turn terminal
+        // (bespoke_event_handling.rs EventMsg::StreamError). Treating it as
+        // onCompleted("failed") races capture and swallows the real cause.
+        const message = params?.error?.message ?? "codex error";
+        if (params?.willRetry === true) {
+          sink.onRetryError?.(message, {
+            willRetry: true,
+            codexErrorInfo: params.error?.codexErrorInfo ?? null,
+            additionalDetails:
+              typeof params.error?.additionalDetails === "string"
+                ? params.error.additionalDetails
+                : null,
+          });
+          return;
+        }
+        sink.onCompleted("failed", message);
         return;
+      }
       default:
         return;
     }
