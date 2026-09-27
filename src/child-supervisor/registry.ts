@@ -16,7 +16,10 @@ import {
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { stateDir } from "../env";
 import { logDebug } from "../logger";
-import { spawn as admittedSpawn } from "../windows-process";
+import {
+  spawn as admittedSpawn,
+  spawnSync as admittedSpawnSync,
+} from "../windows-process";
 import { processGroupExists, signalGroup } from "./posix";
 
 export type TDisposableChildKind =
@@ -70,18 +73,65 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
   );
 };
 
-/** Use the shared process identity for new records. */
-export const processStartTime = processStartIdentity;
+/**
+ * darwin start identity through the daemon's ADMITTED spawn path (the same
+ * `ps -o lstart=` probe as before XS-2). The shared local-runtime reader runs
+ * `ps` through node:child_process, which bypasses the admission seam and the
+ * loader-boundary allowlist; the macmini PTY suite caught that regression.
+ */
+const darwinPsStartTime = (pid: number): string | null | undefined => {
+  try {
+    const output = admittedSpawnSync(
+      ["ps", "-o", "lstart=", "-p", String(pid)],
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+      },
+    );
+    if (output.exitCode !== 0) {
+      try {
+        process.kill(pid, 0);
+        return undefined;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH"
+          ? null
+          : undefined;
+      }
+    }
+    const value = new TextDecoder().decode(output.stdout).trim();
+    return value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Start identity for new records. Linux: the shared in-process /proc
+ * identity (XS-2, no subprocess). darwin: the admitted `ps` probe. Windows:
+ * the shared identity.
+ */
+export const processStartTime = (pid: number): string | null | undefined =>
+  process.platform === "darwin"
+    ? darwinPsStartTime(pid)
+    : processStartIdentity(pid);
 
 export const childProcessIdentityStatus = (
   record: TChildRegistryRecord,
 ): "alive" | "dead" | "unknown" =>
-  processIdentityStatus(
-    record.pid,
-    record.processStartTime,
-    processStartIdentity,
-    legacyProcessStartIdentity,
-  );
+  process.platform === "darwin"
+    ? processIdentityStatus(
+        record.pid,
+        record.processStartTime,
+        darwinPsStartTime,
+        darwinPsStartTime,
+      )
+    : processIdentityStatus(
+        record.pid,
+        record.processStartTime,
+        processStartIdentity,
+        legacyProcessStartIdentity,
+      );
 
 /**
  * Named budget for the async `ps -o lstart=` helper. Failure to obtain
