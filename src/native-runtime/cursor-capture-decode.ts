@@ -154,6 +154,8 @@ export type TCursorDecodedInteraction =
       readonly messageCase: string;
       readonly execSubtype: string | null;
       readonly execClass: TCursorExecClass | null;
+      /** Bounded field-tag metadata (never payload) — see {@link describeProtoFieldTags}. */
+      readonly tags: string;
     }
   | {
       readonly kind: "exec_server";
@@ -527,6 +529,25 @@ const protoIntField = (
     if (f.field === field && f.wire === 0 && f.varint !== null) return f.varint;
   }
   return null;
+};
+
+/**
+ * Bounded, metadata-only summary of a decoded message's top-level protobuf
+ * field tags — field number + wire type ONLY, never the field's bytes/value.
+ * Exists so an unhandled/unknown message (a new oneof case the decoder
+ * doesn't yet classify) can be diagnosed from its shape alone — never by
+ * logging payload/args/content. Capped to avoid unbounded diagnostic strings
+ * on a pathological or hostile message.
+ */
+const MAX_DESCRIBED_FIELDS = 16;
+export const describeProtoFieldTags = (
+  fields: ReadonlyArray<TProtoField>,
+): string => {
+  const tags = fields
+    .slice(0, MAX_DESCRIBED_FIELDS)
+    .map((f) => `${f.field}:wire${f.wire}`);
+  const suffix = fields.length > MAX_DESCRIBED_FIELDS ? ",…" : "";
+  return `tags=[${tags.join(",")}${suffix}]`;
 };
 
 // ── BidiService wire shapes (HTTP/1 RunSSE companion RPC) ──────────────────
@@ -950,7 +971,13 @@ export const decodeInteractionUpdate = (
   if (protoMessageField(fields, 5) !== null) {
     return { kind: "ignored", reason: "thinking_completed" };
   }
-  return { kind: "ignored", reason: "unhandled_interaction_update" };
+  // Bounded, metadata-only (tag + wire type, never value/bytes) so a real
+  // native terminal/other signal riding an oneof case we don't yet classify
+  // can be identified from its shape alone, without another live capture.
+  return {
+    kind: "ignored",
+    reason: `unhandled_interaction_update ${describeProtoFieldTags(fields)}`,
+  };
 };
 
 /**
@@ -1455,20 +1482,24 @@ export const decodeAgentServerMessage = (
       mcp: decoded.mcp,
     };
   }
-  if (protoMessageField(fields, 5) !== null) {
+  const execServerControl = protoMessageField(fields, 5);
+  if (execServerControl !== null) {
     return {
       kind: "requires_duplex",
       messageCase: "exec_server_control_message",
       execSubtype: "abort",
       execClass: "protocol_control",
+      tags: describeProtoFieldTags(parseProtoFields(execServerControl)),
     };
   }
-  if (protoMessageField(fields, 7) !== null) {
+  const interactionQuery = protoMessageField(fields, 7);
+  if (interactionQuery !== null) {
     return {
       kind: "requires_duplex",
       messageCase: "interaction_query",
       execSubtype: null,
       execClass: "protocol_control",
+      tags: describeProtoFieldTags(parseProtoFields(interactionQuery)),
     };
   }
   if (protoMessageField(fields, 3) !== null) {
@@ -1477,7 +1508,10 @@ export const decodeAgentServerMessage = (
   if (protoMessageField(fields, 4) !== null) {
     return { kind: "ignored", reason: "kv_server_message" };
   }
-  return { kind: "ignored", reason: "empty_or_unknown_server_message" };
+  return {
+    kind: "ignored",
+    reason: `empty_or_unknown_server_message ${describeProtoFieldTags(fields)}`,
+  };
 };
 
 /**
@@ -1738,7 +1772,7 @@ export const chunksFromCursorConnectResponseBytes = (
       case "requires_duplex": {
         throw new CursorCaptureDecodeError(
           "requires_duplex_bridge",
-          `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active`,
+          `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active (${decoded.tags})`,
           {
             execSubtype: decoded.execSubtype,
             execClass: decoded.execClass,
@@ -2029,7 +2063,7 @@ export const chunksFromCursorConnectResponseBytesTolerant = (
       case "requires_duplex": {
         blocked = {
           code: "requires_duplex_bridge",
-          message: `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active`,
+          message: `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active (${decoded.tags})`,
           toolCallId: null,
         };
         break;
@@ -2280,7 +2314,7 @@ export const chunksStreamFromCursorConnectResponseBody = (
           case "requires_duplex":
             throw new CursorCaptureDecodeError(
               "requires_duplex_bridge",
-              `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active`,
+              `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active (${decoded.tags})`,
               {
                 execSubtype: decoded.execSubtype,
                 execClass: decoded.execClass,

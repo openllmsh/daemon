@@ -1395,6 +1395,20 @@ export const runCursorNativeCapture = async (
       let execFramesSeen = 0;
       let modelFramesSeen = 0;
       let endStreamFramesSeen = 0;
+      // Per-kind counters for frames that carry no model output — added so a
+      // frame-count mismatch (e.g. live retest #32's 36 total frames vs the
+      // 9 accounted for by exec/model/endStream) can be attributed to a
+      // specific decoded kind without another live capture. Metadata-only:
+      // counts and bounded reason/tag strings, never prompts/args/payload.
+      let heartbeatFramesSeen = 0;
+      let ignoredFramesSeen = 0;
+      let requiresDuplexFramesSeen = 0;
+      let nativeToolFramesSeen = 0;
+      // Bounded, deduplicated inventory of `ignored`-kind reasons (each
+      // already carries only bounded field-tag metadata — see
+      // `describeProtoFieldTags` — never payload/value).
+      const MAX_TRACKED_IGNORED_REASONS = 8;
+      const ignoredReasonsSeen: string[] = [];
       // `InteractionUpdate.turn_ended` (field 14) is the real native
       // turn-completion marker the official client relies on — it is
       // authoritative independent of the Connect transport `endStream`
@@ -1403,7 +1417,7 @@ export const runCursorNativeCapture = async (
       // after terminal agent stream" behavior) rather than a failure.
       let turnEndedSeen = false;
       const diagSnapshot = (): string =>
-        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged}`;
+        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} heartbeat=${heartbeatFramesSeen} ignored=${ignoredFramesSeen} requiresDuplex=${requiresDuplexFramesSeen} nativeTool=${nativeToolFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged} ignoredReasons=[${ignoredReasonsSeen.join(";")}]`;
       const onAbortDuringPeel = (): void => {
         try {
           reader.cancel().catch(() => undefined);
@@ -1621,6 +1635,27 @@ export const runCursorNativeCapture = async (
                   mcp: decoded.mcp,
                 });
               }
+              if (decoded.kind === "requires_duplex") {
+                // Independent-review fix: the H2 duplex path previously had
+                // no branch for this case (unlike the HTTP1 decode paths),
+                // so an `AgentServerMessage.interaction_query` (field 7) or
+                // `exec_server_control_message` (field 5) was silently
+                // dropped by falling through the if-chain, leaving the loop
+                // to just `read()` again forever — a real message the daemon
+                // has no safe response for, hanging until the caller's
+                // abort deadline. Fail closed immediately instead, with
+                // bounded messageCase/subtype/tag metadata only (never
+                // payload) so the exact unhandled case is diagnosable.
+                requiresDuplexFramesSeen += 1;
+                throw new CursorCaptureDecodeError(
+                  "requires_duplex_bridge",
+                  `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active (${decoded.tags}; ${diagSnapshot()})`,
+                  {
+                    execSubtype: decoded.execSubtype,
+                    execClass: decoded.execClass,
+                  },
+                );
+              }
               if (decoded.kind === "text_delta" && decoded.text.length > 0) {
                 sawModelOutput = true;
                 modelFramesSeen += 1;
@@ -1687,6 +1722,21 @@ export const runCursorNativeCapture = async (
                     },
                   ],
                 };
+              } else if (decoded.kind === "heartbeat") {
+                heartbeatFramesSeen += 1;
+              } else if (decoded.kind === "native_tool") {
+                // Metadata-only count — never relabels/forwards the native
+                // tool intent; production still fails closed elsewhere if
+                // the caller ever needs to act on it.
+                nativeToolFramesSeen += 1;
+              } else if (decoded.kind === "ignored") {
+                ignoredFramesSeen += 1;
+                if (
+                  ignoredReasonsSeen.length < MAX_TRACKED_IGNORED_REASONS &&
+                  !ignoredReasonsSeen.includes(decoded.reason)
+                ) {
+                  ignoredReasonsSeen.push(decoded.reason);
+                }
               }
               if (sawModelOutput) {
                 // Cancel builder once model output begins — never feed it back.
