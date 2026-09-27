@@ -440,8 +440,11 @@ export const sessionWorkspace = (sessionId: string): string =>
  * `OPENLLM_DEVICE_SESSION_ID` on top for live.json indexing. Provider-agnostic
  * — every device CLI (incl. opencode) gets the same real-HOME + daemon TMPDIR.
  *
- * `daemonTempDir` must succeed — a missing temp root would leave vendor CLIs
- * writing under an unusable TMPDIR and surface as opaque spawn failures.
+ * `sessionTmp` is the per-session subdir minted by `mintDaemonTmpDir` — the
+ * PTY gets its own sweep-accountable scratch instead of the shared unleased
+ * root (RG-2). Absent a minted dir, `daemonTempDir` must succeed — a missing
+ * temp root would leave vendor CLIs writing under an unusable TMPDIR and
+ * surface as opaque spawn failures.
  */
 const verifiedDaemonTempDir = (): string => {
   const tmp = daemonTempDir();
@@ -454,8 +457,8 @@ const verifiedDaemonTempDir = (): string => {
   throw new Error(`daemon temp dir missing: ${tmp}`);
 };
 
-export const sessionEnv = (): Record<string, string> => {
-  const tmp = verifiedDaemonTempDir();
+export const sessionEnv = (sessionTmp?: string): Record<string, string> => {
+  const tmp = sessionTmp ?? verifiedDaemonTempDir();
   return {
     HOME: homedir(),
     TMPDIR: tmp,

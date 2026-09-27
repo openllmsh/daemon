@@ -7,7 +7,7 @@ import { spawn as admittedSpawn } from "./windows-process";
  * or call openSession; this module never imports relay frame types.
  */
 
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type {
@@ -35,6 +35,7 @@ import {
   NativePtyNativeError,
   NativePtyWriteOverflowError,
 } from "./native-pty";
+import { leaseDaemonTmpDir, mintDaemonTmpDir } from "./sandbox/working-set";
 import { serializeScreenBytes } from "./session-screen";
 import { windowsPtySpawner } from "./windows-pty";
 
@@ -686,13 +687,16 @@ export const resolveSessionCwd = (requested: string | undefined): string => {
 };
 
 /** Env for a device PTY: real HOME + device-session markers for live.json.
- *  Provider-agnostic — every device CLI (incl. opencode) shares one env. */
+ *  Provider-agnostic — every device CLI (incl. opencode) shares one env.
+ *  `sessionTmp` is the PTY's own leased scratch under `<state>/tmp` (RG-2);
+ *  absent one, `sessionEnv` pins the shared daemon tmp root. */
 const deviceSessionEnv = (
   _cli: TDeviceSessionCli,
   openllmSessionId: string,
   title: string | null,
+  sessionTmp?: string,
 ): Record<string, string> => {
-  const base = sessionEnv();
+  const base = sessionEnv(sessionTmp);
   return {
     ...base,
     OPENLLM_DEVICE_SESSION_ID: openllmSessionId,
@@ -1277,6 +1281,23 @@ export const openSession = async (
     s.lastExitReason = null;
     evictStaleDeadSessions();
 
+    // Per-session scratch under `<state>/tmp`: the device PTY runs
+    // deliberately unsandboxed, so unlike a confined vendor child no shim
+    // exists to self-lease — the daemon mints the dir now and writes the
+    // lease once the child pid is known (RG-2). `null` keeps the shared root.
+    // Injected test spawners never mint (no real child → no filesystem
+    // fixture to manage).
+    const sessionTmpDir = productionSpawner
+      ? (mintDaemonTmpDir() ?? undefined)
+      : undefined;
+    const dropSessionTmp = (): void => {
+      if (sessionTmpDir === undefined) return;
+      try {
+        rmSync(sessionTmpDir, { recursive: true, force: true });
+      } catch {
+        // best-effort — the sweep's orphan window owns whatever remains
+      }
+    };
     try {
       const argv = argvFor(
         cli,
@@ -1326,7 +1347,7 @@ export const openSession = async (
         cwd,
         // Real user HOME + PATH (via the PTY allowlist). Device markers let the
         // openllm CLI write host=device into ~/.openllm/run/.../live.json.
-        env: deviceSessionEnv(cli, s.id, s.title),
+        env: deviceSessionEnv(cli, s.id, s.title, sessionTmpDir),
         cols: frame.cols,
         rows: frame.rows,
         onData,
@@ -1350,6 +1371,7 @@ export const openSession = async (
       const spawned = result instanceof Promise ? await result : result;
       if (sessions.get(s.id) !== s || s.lastExitReason === "killed") {
         spawned.pty.kill();
+        dropSessionTmp();
         nack("spawn_failed");
         return;
       }
@@ -1358,6 +1380,13 @@ export const openSession = async (
       s.ptyBackend = spawned.backend;
       s.pty = pty;
       s.pid = pty.pid ?? null;
+      // Bind the minted scratch dir to the real child: the sweep's lease
+      // check (pid + start identity) now answers this PTY's ownership
+      // directly — a live PTY keeps its dir; a dead one ages out under the
+      // lease grace instead of the long orphan window.
+      if (sessionTmpDir !== undefined && s.pid !== null) {
+        leaseDaemonTmpDir(sessionTmpDir, s.pid);
+      }
       s.busy = true;
       s.lastBusyAtMs = Date.now();
       s.detachedAtMs = null;
@@ -1391,6 +1420,7 @@ export const openSession = async (
       } catch {
         // Already gone; the nack still reports the spawn failure.
       }
+      dropSessionTmp();
       s.pty = null;
       s.emulator?.dispose();
       s.emulator = null;

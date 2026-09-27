@@ -75,6 +75,16 @@ export const atomicWriteText = (path: string, contents: string): boolean => {
     } catch {
       // ignore
     }
+    // The write landed inside the daemon state dir — re-pin that dir to
+    // 0o700 too (it carries credentials and session state; a looser mode
+    // left by an older bug or a manual fix must not persist past a write
+    // that proves the dir is live). Best-effort: a chmod failure never
+    // fails the write itself.
+    try {
+      chmodSync(dirname(path), 0o700);
+    } catch {
+      // ignore
+    }
     return true;
   } catch {
     return false;

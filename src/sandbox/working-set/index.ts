@@ -35,7 +35,12 @@ import { fleetLayer } from "./fleet";
 import { vendorCliTunnelLayer } from "./vendor-cli-tunnel";
 
 export type { TWorkingSet } from "./base";
-export { daemonTempDir, resolveCliExecDirs } from "./base";
+export {
+  daemonTempDir,
+  leaseDaemonTmpDir,
+  mintDaemonTmpDir,
+  resolveCliExecDirs,
+} from "./base";
 
 /** The four sub-process sandbox layers M2's `--sub` bootstrap selects between. */
 export type TWorkingSetLayer =

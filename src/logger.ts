@@ -148,18 +148,39 @@ let appendTail: Promise<void> = Promise.resolve();
  * Bounded: the set keeps at most {@link WITNESS_CAP} dirs (LRU — re-witnessing
  * refreshes a dir's position, and past the cap the oldest entry is evicted).
  * Repeated `OPENLLM_DAEMON_STATE_DIR` churn inside one process can no longer
- * grow it without bound; the cap far exceeds any real churn, so a genuinely
- * removed dir keeps its witness.
+ * grow it without bound.
+ *
+ * Eviction must never drop the teardown signal itself: every evicted witness
+ * moves into {@link removedDirs}, an UNBOUNDED tombstone set a witnessed dir
+ * can only leave by being seen to exist again. Without it, churning past
+ * `WITNESS_CAP` distinct state roots would let a late queued append mistake a
+ * deliberately removed dir for a never-created one and resurrect it.
  */
 const WITNESS_CAP = 8;
 const appendDirs = new Set<string>();
 
+/**
+ * Tombstones: dirs whose witness left {@link appendDirs} (LRU eviction) or
+ * that were observed missing after being witnessed. NEVER evicted — a queued
+ * append consults this set before any mkdir, so a removed state dir stays
+ * refused however many roots churned through the witness cache since.
+ */
+const removedDirs = new Set<string>();
+
 const witnessDir = (dir: string): void => {
   appendDirs.delete(dir); // refresh: move to the back when already present
   appendDirs.add(dir);
+  removedDirs.delete(dir); // observed existing — any stale tombstone is wrong
   if (appendDirs.size > WITNESS_CAP) {
     const oldest = appendDirs.values().next().value;
-    if (oldest !== undefined) appendDirs.delete(oldest);
+    if (oldest !== undefined) {
+      appendDirs.delete(oldest);
+      // Tombstone the evicted witness unconditionally: while the dir still
+      // exists the next write simply re-witnesses it (and clears the
+      // tombstone); once it is gone, queued appends keep refusing to
+      // resurrect it — the whole point of the witness.
+      removedDirs.add(oldest);
+    }
   }
 };
 
@@ -168,7 +189,10 @@ const ensureLogDir = (dir: string): boolean => {
     witnessDir(dir);
     return true;
   }
-  if (appendDirs.has(dir)) return false;
+  if (appendDirs.has(dir) || removedDirs.has(dir)) {
+    removedDirs.add(dir); // keep the refusal sticky through later churn
+    return false;
+  }
   try {
     mkdirSync(dir, { recursive: true });
     witnessDir(dir);
@@ -245,7 +269,10 @@ const write = (
   // skipped too, not just the append.
   const dir = stateDir();
   if (existsSync(dir)) witnessDir(dir);
-  else if (appendDirs.has(dir)) return;
+  else if (appendDirs.has(dir) || removedDirs.has(dir)) {
+    removedDirs.add(dir); // witnessed/gone roots stay refused past eviction
+    return;
+  }
   if (level === "info" || level === "warn" || level === "error") {
     try {
       observeDoctorEvent({
