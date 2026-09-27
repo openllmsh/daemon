@@ -237,7 +237,8 @@ export const bindMintedTmpToChild = (
 
 /** Poll bound for the registry record carrying the child's identity. */
 const CHILD_LEASE_POLL_MS = 1000;
-const CHILD_LEASE_POLL_STEP_MS = 25;
+// Few reads: each one loads the whole child registry synchronously (rework-8).
+const CHILD_LEASE_POLL_STEP_MS = 250;
 
 /**
  * Re-lease a minted run dir to the spawned child's pid + start identity —

@@ -377,6 +377,10 @@ const anchorPolicyReceipt = (
     serverClockOffsetMs = impliedOffset;
     serverClockOffsetAtMs = now;
     serverClockHighWaterMs = now;
+  } else {
+    // An absurd offset from the NEW receipt must not leave the previous one
+    // in force (rework-8): no anchor is better than a stale one.
+    serverClockOffsetMs = null;
   }
 };
 
@@ -401,7 +405,10 @@ export const daemonServerNowMs = (): number | null => {
     serverClockOffsetMs = null;
     return null;
   }
-  if (age >= DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS) return null;
+  if (age >= DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS) {
+    serverClockOffsetMs = null;
+    return null;
+  }
   if (now > serverClockHighWaterMs) serverClockHighWaterMs = now;
   return now + serverClockOffsetMs;
 };
