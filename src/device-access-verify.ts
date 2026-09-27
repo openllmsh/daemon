@@ -141,16 +141,32 @@ export const verifyDeviceGrantNode = (
 };
 
 /**
- * Drop expired nonces. Scans the full order because retention is based on
- * envelope.ts (which may be future-dated within the acceptance window), so
- * expiry is no longer insertion-order monotonic.
+ * Retention margin past the acceptance window. A nonce is kept until BOTH
+ * anchors are this far past `ts`, so a later refresh of the server offset
+ * must move the server clock back by more than one full window before a
+ * pruned grant could verify again.
  */
-const pruneExpiredNonces = (now: number): void => {
+const NONCE_RETENTION_MS = 2 * DEVICE_GRANT_TS_WINDOW_MS;
+
+/**
+ * Drop nonces whose envelope can no longer be accepted. The map stores the
+ * envelope `ts`, not a precomputed expiry: the decision uses the anchors as
+ * they are NOW (the server offset can change after acceptance, rework-8).
+ * A nonce is dropped only when the local AND the server anchor are both
+ * more than NONCE_RETENTION_MS past its `ts`. Scans the full order because
+ * `ts` is not insertion-order monotonic.
+ */
+const pruneExpiredNonces = (now: number, serverNow: number | null): void => {
   if (nonceOrder.length === 0) return;
   const kept: string[] = [];
   for (const n of nonceOrder) {
-    const exp = nonceSeen.get(n);
-    if (exp !== undefined && exp >= now) {
+    const ts = nonceSeen.get(n);
+    const liveLocal = ts !== undefined && now <= ts + NONCE_RETENTION_MS;
+    const liveServer =
+      ts !== undefined &&
+      serverNow !== null &&
+      serverNow <= ts + NONCE_RETENTION_MS;
+    if (liveLocal || liveServer) {
       kept.push(n);
       continue;
     }
@@ -161,30 +177,15 @@ const pruneExpiredNonces = (now: number): void => {
 };
 
 /**
- * Remember a verified nonce until its envelope can no longer be accepted.
- * Retention is the LAST local-clock instant either anchor admits `ts`:
- *   - the LOCAL anchor accepts while `now <= ts + WINDOW`;
- *   - the SERVER anchor accepts while `serverNow <= ts + WINDOW`, which in
- *     local time is `now + (ts + WINDOW - serverNow)` (assuming the receipt
- *     offset holds until the next bootstrap refreshes it).
- * `max(...) + WINDOW` alone is NOT enough (rework-7): a grant accepted
- * through the server anchor while the local clock runs AHEAD and the
- * envelope is future-dated vs the server keeps `now + WINDOW` — but the
- * server still admits that `ts` until `serverNow` reaches `ts + WINDOW`,
- * up to a full window later, so a replay verifies AGAIN after the nonce
- * was pruned.
+ * Remember a verified nonce. The map keeps the envelope `ts`; see
+ * `pruneExpiredNonces` for when it is dropped.
  *
- * Callers MUST `pruneExpiredNonces(now)` before invoking this so capacity
+ * Callers MUST `pruneExpiredNonces(now, serverNow)` before invoking this so capacity
  * checks see a fresh map. Returns false when the map is already full of
  * still-valid nonces — callers must reject with a distinct overload reason
  * rather than silently drop replay protection by evicting unexpired entries.
  */
-const rememberNonce = (
-  n: string,
-  envelopeTs: number,
-  now: number,
-  serverNow: number | null,
-): boolean => {
+const rememberNonce = (n: string, envelopeTs: number): boolean => {
   if (nonceSeen.has(n)) return false;
   if (nonceOrder.length >= nonceLruCap) {
     logWarn(
@@ -196,12 +197,7 @@ const rememberNonce = (
     );
     return false;
   }
-  const localAnchorEnd = envelopeTs + DEVICE_GRANT_TS_WINDOW_MS;
-  const serverAnchorEnd =
-    serverNow === null
-      ? Number.NEGATIVE_INFINITY
-      : now + envelopeTs + DEVICE_GRANT_TS_WINDOW_MS - serverNow;
-  nonceSeen.set(n, Math.max(now, localAnchorEnd, serverAnchorEnd));
+  nonceSeen.set(n, envelopeTs);
   nonceOrder.push(n);
   return true;
 };
@@ -335,13 +331,13 @@ export const checkDeviceGrant = (
   }
   // Nonce check AFTER identity checks so a wrong-key/cid grant cannot
   // burn a legitimate nonce the browser may still retry with.
-  pruneExpiredNonces(now);
+  pruneExpiredNonces(now, serverNow);
   if (nonceSeen.has(envelope.n)) {
     return { ok: false, reason: "replayed_nonce" };
   }
   // Signature verified — only then admit the nonce. Full map of still-valid
   // nonces rejects rather than evicting (replay protection must not degrade).
-  if (!rememberNonce(envelope.n, envelope.ts, now, serverNow)) {
+  if (!rememberNonce(envelope.n, envelope.ts)) {
     return { ok: false, reason: "nonce_overload" };
   }
   return { ok: true };
