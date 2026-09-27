@@ -884,7 +884,7 @@ const killOrphanedSessionHost = async (
       if (verdict === "foreign" || verdict === "unknown" || verdict === "dead")
         return;
       try {
-        admittedSpawnSync(
+        const killed = admittedSpawnSync(
           [
             "taskkill",
             "/pid",
@@ -894,7 +894,9 @@ const killOrphanedSessionHost = async (
           ],
           { stdout: "ignore", stderr: "ignore", timeout: 5_000 },
         );
-        return;
+        if (killed.exitCode === 0) return;
+        // taskkill ran but failed — the tree may have survived, so fall
+        // through to the direct child kill rather than claiming done.
       } catch {
         // taskkill missing/failed — fall through to the direct child kill
       }
