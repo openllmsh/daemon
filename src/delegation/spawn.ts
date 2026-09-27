@@ -1745,6 +1745,17 @@ export const writeOpenerScript = (
   }
 };
 
+// Startup sweep. The unref'd backstop timer in {@link armOpenerScriptCleanup}
+// dies with the process: a daemon killed or crashed inside
+// `OPENER_SCRIPT_GRACE_MS` leaves the URL-bearing launcher on disk forever,
+// and failed opens accumulate. This module loads at process start in every
+// binary that can spawn an opener (the daemon pulls it in eagerly —
+// `daemon-runtime` → `self-update` → `spawn`), so sweeping here bounds the
+// residue to one restart instead of relying only on the next open's sweep.
+// The stale-age floor keeps a fresh in-flight launcher of a second live
+// daemon (dev + prod share the state dir) untouched.
+sweepStaleOpenerScripts();
+
 /**
  * Bound on the user-manager socket probe. A unix connect completes or refuses
  * immediately; the timer only guards a pathological kernel stall so a login
