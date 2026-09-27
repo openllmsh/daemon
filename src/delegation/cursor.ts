@@ -35,6 +35,7 @@ import {
   pendingAuthDetail,
 } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { fetchWithBoundedRedirects } from "../upstream-redirect";
 import { accountHashField, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
@@ -721,19 +722,22 @@ export const cursorDelegate: TProviderDelegate = {
       if (cred.kind === "unavailable") return cred;
       const stored = cred.value;
       try {
+        const dashboardFetch = async (path: string): Promise<Response> =>
+          fetchWithBoundedRedirects(
+            await resolveProviderUrl(PROVIDER, path),
+            (target) =>
+              fetch(target, {
+                method: "POST",
+                headers: dashboardHeaders(stored.accessToken),
+                body: "{}",
+                redirect: "manual",
+                signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+              }),
+            "cursor",
+          );
         const [usage, plan] = await Promise.all([
-          fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
-            method: "POST",
-            headers: dashboardHeaders(stored.accessToken),
-            body: "{}",
-            signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-          }),
-          fetch(await resolveProviderUrl(PROVIDER, PLAN_PATH), {
-            method: "POST",
-            headers: dashboardHeaders(stored.accessToken),
-            body: "{}",
-            signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-          }),
+          dashboardFetch(USAGE_PATH),
+          dashboardFetch(PLAN_PATH),
         ]);
         if (!usage.ok || !plan.ok) {
           const failed = !usage.ok ? usage : plan;

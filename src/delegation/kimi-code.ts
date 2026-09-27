@@ -35,7 +35,11 @@ import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
-import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
+import {
+  MODEL_LIST_FETCH_TIMEOUT_MS,
+  QUOTA_REJECT_PERCENT,
+  QUOTA_WARN_PERCENT,
+} from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
@@ -45,8 +49,14 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { fetchWithBoundedRedirects } from "../upstream-redirect";
+import { USAGE_FETCH_TIMEOUT_MS } from "../usage-cache";
 import { accountHashField, jwtClaims, nonEmpty } from "./account-id";
-import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
+import {
+  pruneKimiSessionDirs,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import {
   cachedCliSemver,
@@ -152,13 +162,21 @@ const provisionModelConfig = async (
   base: string,
 ): Promise<boolean> => {
   try {
-    const resp = await fetch(`${base}/models`, {
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        ...(await identityHeaders()),
-        accept: "application/json",
-      },
-    });
+    const identity = await identityHeaders();
+    const resp = await fetchWithBoundedRedirects(
+      `${base}/models`,
+      (target) =>
+        fetch(target, {
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            ...identity,
+            accept: "application/json",
+          },
+          redirect: "manual",
+          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+        }),
+      "kimi-code",
+    );
     if (!resp.ok) return false;
     const body = (await resp.json()) as {
       data?: ReadonlyArray<Record<string, unknown>>;
@@ -241,18 +259,23 @@ const ensureModelConfig = async (accessToken: string): Promise<void> => {
  * `readToken` from the native `/models` list. Output ignored; bounded.
  */
 const triggerRefresh = async (): Promise<void> => {
-  await spawnRefresh([bin(), "-p", "ping"], env(), {
-    pty: true,
-    readStore: async () => {
-      const tok = storeReadValue(
-        await readJsonStore<TKimiToken>(credentialPath()),
-      );
-      return refreshCredentialSnapshot({
-        accessToken: tok?.access_token,
-        refreshToken: tok?.refresh_token,
-      });
-    },
-  });
+  try {
+    await spawnRefresh([bin(), "-p", "ping"], env(), {
+      pty: true,
+      readStore: async () => {
+        const tok = storeReadValue(
+          await readJsonStore<TKimiToken>(credentialPath()),
+        );
+        return refreshCredentialSnapshot({
+          accessToken: tok?.access_token,
+          refreshToken: tok?.refresh_token,
+        });
+      },
+    });
+  } finally {
+    // A failed ping can still have written a session dir — sweep either way.
+    pruneKimiSessionDirs();
+  }
 };
 
 // Within the leeway window → fire the CLI refresh in the background (still
@@ -431,20 +454,32 @@ const identityHeaders = async (): Promise<Record<string, string>> =>
 // (surface URL+code → background poll). The request (`TDeviceAuth`) + poll
 // (`TDevicePoll`) shapes are the adaptor's generic contract, imported above.
 
-const postForm = async (
+// Exported for the S3R-1 regression suite — the device-OAuth POST is a
+// credential-bearing upstream call and must ride the bounded-redirect policy.
+export const postForm = async (
   path: string,
   params: Record<string, string>,
   headers: Record<string, string>,
 ): Promise<{ status: number; data: Record<string, unknown> }> => {
-  const resp = await fetch(`${OAUTH_HOST}${path}`, {
-    method: "POST",
-    headers: {
-      ...headers,
-      "content-type": "application/x-www-form-urlencoded",
-      accept: "application/json",
-    },
-    body: new URLSearchParams(params).toString(),
-  });
+  // The form body is a plain string, so the bounded-redirect helper can
+  // re-issue it verbatim on a method-preserving same-origin 307/308.
+  const body = new URLSearchParams(params).toString();
+  const resp = await fetchWithBoundedRedirects(
+    `${OAUTH_HOST}${path}`,
+    (target) =>
+      fetch(target, {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-type": "application/x-www-form-urlencoded",
+          accept: "application/json",
+        },
+        body,
+        redirect: "manual",
+        signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+      }),
+    "kimi-code",
+  );
   let data: Record<string, unknown> = {};
   try {
     const parsed = (await resp.json()) as unknown;
@@ -849,16 +884,23 @@ export const kimiCodeDelegate: TProviderDelegate = {
       if (cred.kind === "unavailable") return cred;
       const { accessToken, tok } = cred.value;
       try {
-        const resp = await fetch(
+        const identity = await identityHeaders();
+        const resp = await fetchWithBoundedRedirects(
           await resolveProviderUrl(PROVIDER, USAGE_PATH),
-          {
-            method: "GET",
-            headers: {
-              authorization: `Bearer ${accessToken}`,
-              ...(await identityHeaders()),
-              accept: "application/json",
-            },
-          },
+          (target) =>
+            fetch(target, {
+              method: "GET",
+              headers: {
+                authorization: `Bearer ${accessToken}`,
+                ...identity,
+                accept: "application/json",
+              },
+              redirect: "manual",
+              // A half-open connection must not pin the shared in-flight
+              // usage read (NET-6) — see usage-cache.ts.
+              signal: AbortSignal.timeout(USAGE_FETCH_TIMEOUT_MS),
+            }),
+          "kimi-code",
         );
         if (!resp.ok) {
           // Phrase like the Kimi CLI itself (packages/oauth managed-usage):
