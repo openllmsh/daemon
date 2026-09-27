@@ -9,16 +9,14 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import {
+  legacyProcessStartIdentity,
   processIdentityStatus,
   processStartIdentity,
 } from "../../../tunnel/session/local-runtime";
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { stateDir } from "../env";
 import { logDebug } from "../logger";
-import {
-  spawn as admittedSpawn,
-  spawnSync as admittedSpawnSync,
-} from "../windows-process";
+import { spawn as admittedSpawn } from "../windows-process";
 import { processGroupExists, signalGroup } from "./posix";
 
 export type TDisposableChildKind =
@@ -72,45 +70,17 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
   );
 };
 
-/** PID-reuse-safe process identity. Mirrors the durable session-host lstart check. */
-export const processStartTime = (pid: number): string | null | undefined => {
-  if (process.platform === "win32") return processStartIdentity(pid);
-  try {
-    const output = admittedSpawnSync(
-      ["ps", "-o", "lstart=", "-p", String(pid)],
-      {
-        stdout: "pipe",
-        stderr: "ignore",
-        env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
-      },
-    );
-    if (output.exitCode !== 0) {
-      try {
-        process.kill(pid, 0);
-        return undefined;
-      } catch (error) {
-        if (
-          error !== null &&
-          typeof error === "object" &&
-          "code" in error &&
-          (error as { readonly code?: unknown }).code === "ESRCH"
-        )
-          return null;
-        return undefined;
-      }
-    }
-    const value = new TextDecoder().decode(output.stdout).trim();
-    return value.length > 0 ? value : undefined;
-  } catch {
-    return undefined;
-  }
-};
+/** Use the shared process identity for new records. */
+export const processStartTime = processStartIdentity;
 
 export const childProcessIdentityStatus = (
   record: TChildRegistryRecord,
 ): "alive" | "dead" | "unknown" =>
-  processIdentityStatus(record.pid, record.processStartTime, () =>
-    processStartTime(record.pid),
+  processIdentityStatus(
+    record.pid,
+    record.processStartTime,
+    processStartIdentity,
+    legacyProcessStartIdentity,
   );
 
 /**
@@ -185,25 +155,21 @@ const reapStartTimeHelper = async (
 };
 
 /**
- * Async twin of {@link processStartTime}, for the spawn HOT PATH.
- *
- * `Bun.spawnSync(["ps", …])` is a synchronous fork/exec/wait that BLOCKS the
- * single JS thread. `superviseSpawn` used to call it inline on every spawn, and
- * a status sweep fans out five `--version` probes at once — so a slow process
- * table stalled the event loop and starved unrelated async work (the all-provider
- * status-timeout symptom). This variant reads the same `lstart` via a
- * non-blocking `Bun.spawn`, so the identity read no longer pauses the loop.
- *
- * The helper has an owned terminate path: a hung `ps` must not leak unbounded.
- * A miss (timeout/failure) returns null and MUST NOT imply the child is reaped.
- *
- * The synchronous {@link processStartTime} stays for the ONE-TIME boot identity
- * and the boot-sweep `childProcessMatchesRecord`, neither of which is hot.
+ * Read Linux and Windows identities without a subprocess.
+ * On macOS, use an async ps helper with a time limit.
+ * A failed read returns null. It does not prove that the child has exited.
  */
 export const readProcessStartTime = async (
   pid: number,
 ): Promise<string | null> => {
   if (process.platform === "win32") {
+    return processStartIdentity(pid) ?? null;
+  }
+  // An injected helper lets Linux tests exercise the macOS timeout path.
+  if (
+    process.platform === "linux" &&
+    processStartTimeHelperSpawnForTests === null
+  ) {
     return processStartIdentity(pid) ?? null;
   }
   // Owner-created helper budget — never a shared login/logout budget.
