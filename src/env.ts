@@ -1407,14 +1407,26 @@ export const envFileValue = (
  * Persist a new API key (set from the dashboard) into the env file (`0600`) and
  * update the in-memory cache so the next cloud call uses it immediately. Pass
  * `null`/empty to clear it. The env file is the single source.
+ *
+ * Returns false when the durable write failed — reported to the caller so a
+ * failed persist is never silent (EC-5). In that case the in-memory state is
+ * left untouched: a key that was not persisted must not be used, or a restart
+ * would quietly drop it.
  */
-export const setApiKey = (key: string | null): void => {
+export const setApiKey = (key: string | null): boolean => {
   const trimmed = key?.trim() ?? "";
-  writeEnvFileVars({ OPENLLM_API_KEY: trimmed });
+  if (!writeEnvFileVars({ OPENLLM_API_KEY: trimmed })) {
+    logWarn(
+      "env",
+      safeDiagnosticMessage`failed to persist OPENLLM_API_KEY to the env file`,
+    );
+    return false;
+  }
   process.env.OPENLLM_API_KEY = trimmed;
   // Refresh the cache in place so callers don't need to re-resolve env.
   const current = daemonEnv();
   cached = { ...current, apiKey: trimmed.length > 0 ? trimmed : null };
+  return true;
 };
 
 export const hasApiKey = (): boolean => daemonEnv().apiKey !== null;

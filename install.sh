@@ -125,6 +125,11 @@ fi
 # record — an advertised PRERELEASE is installable, and a prerelease install may
 # move to a newer stable (or newer prerelease). The only refusal left is a
 # DOWNGRADE: an installed build strictly newer than the advertised release.
+# The --version probe bound (DR-7): TERM after PROBE_TIMEOUT_S, then KILL after
+# PROBE_KILL_GRACE_S more, so a binary that ignores TERM can never hang the
+# installer.
+PROBE_TIMEOUT_S=10
+PROBE_KILL_GRACE_S=2
 installed_version() {
   local binary="$1" output version probe_file pid watchdog status
   [ -x "$binary" ] || return 1
@@ -132,11 +137,16 @@ installed_version() {
   "$binary" --version >"$probe_file" 2>/dev/null &
   pid=$!
   (
-    sleep 3 &
-    local timer=$!
     trap 'kill "$timer" 2>/dev/null || true; exit 0' TERM INT
+    sleep "$PROBE_TIMEOUT_S" &
+    local timer=$!
     wait "$timer"
-    kill "$pid" 2>/dev/null || true
+    # The probe outlived its bound: TERM, then KILL after the grace window.
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep "$PROBE_KILL_GRACE_S" &
+    timer=$!
+    wait "$timer"
+    kill -KILL "$pid" 2>/dev/null || true
   ) &
   watchdog=$!
   if wait "$pid"; then status=0; else status=$?; fi
@@ -145,7 +155,8 @@ installed_version() {
   output="$(cat "$probe_file" 2>/dev/null || true)"
   rm -f "$probe_file"
   [ "$status" -eq 0 ] \
-    || die "version probe timed out or failed at $binary; refusing to overwrite it"
+    || die "version probe timed out or failed at $binary; refusing to overwrite it.
+  To repair by hand: move the binary aside ('mv \"$binary\" \"$binary.bak\"') and re-run this installer."
   if [[ "$output" =~ (^|[^[:alnum:].+_-])v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?)([^[:alnum:].+-]|$) ]]; then
     version="${BASH_REMATCH[2]}"
   else
@@ -1009,6 +1020,11 @@ if [ "$INSECURE_DEV_ORIGIN" = 1 ]; then
 else
   CURL_SCHEME=(--proto "=https" --proto-redir "=https")
 fi
+# And bound every call (NET-7): a stalled TCP connection must never hang the
+# installer. The manifest, the digest fetches and the capability probe are
+# tiny, so they get the short bound; binary downloads get the long one.
+CURL_META=(--connect-timeout 10 --max-time 60)
+CURL_GET=(--connect-timeout 10 --max-time 300)
 case "$INSTALL_MODE" in
   install|update) ;;
   *) die "OPENLLM_INSTALL_MODE must be 'install' or 'update'" ;;
@@ -1030,7 +1046,7 @@ if [ -z "$FROM_FILE" ]; then
   # --proto/--proto-redir need a curl new enough to know the options (≈7.21):
   # an older system curl fails the FIRST fetch with an opaque option error, so
   # detect support once and fail with the upgrade remedy up front.
-  curl "${CURL_SCHEME[@]}" -V >/dev/null 2>&1 \
+  curl "${CURL_SCHEME[@]}" "${CURL_META[@]}" -V >/dev/null 2>&1 \
     || die "this curl does not support --proto/--proto-redir — upgrade to curl 7.21.0 or newer and re-run"
 fi
 # Checksum verification is mandatory — refuse rather than install unverified
@@ -1059,7 +1075,7 @@ DAEMON_VERSION=""
 CLI_VERSION=""
 if [ -z "$FROM_FILE" ]; then
   echo "Resolving the current OpenLLM release..."
-  MANIFEST="$(curl "${CURL_SCHEME[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
+  MANIFEST="$(curl "${CURL_SCHEME[@]}" "${CURL_META[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
     || die "could not reach $ORIGIN/api/install — check OPENLLM_CLOUD_ORIGIN and your network"
 
   # Extract one "key": "value" string field. The document is small, flat, and
@@ -1106,7 +1122,7 @@ install_component() {
     [ -f "$local_file" ] && [ -r "$local_file" ] \
       || die "--from-file path is not a readable regular file: $local_file"
   else
-    published="$(curl "${CURL_SCHEME[@]}" -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
+    published="$(curl "${CURL_SCHEME[@]}" "${CURL_META[@]}" -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
     case "$published" in
       [0-9a-f]*)
         [[ "$published" =~ ^[0-9a-f]{64}$ ]] || die "malformed checksum for $name"
@@ -1169,9 +1185,9 @@ install_component() {
         die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
       fi
     elif [ -t 2 ]; then
-      curl "${CURL_SCHEME[@]}" -fL --progress-bar "$url" -o "$dl" || die "download failed: $url"
+      curl "${CURL_SCHEME[@]}" "${CURL_GET[@]}" -fL --progress-bar "$url" -o "$dl" || die "download failed: $url"
     else
-      curl "${CURL_SCHEME[@]}" -fsSL "$url" -o "$dl" || die "download failed: $url"
+      curl "${CURL_SCHEME[@]}" "${CURL_GET[@]}" -fsSL "$url" -o "$dl" || die "download failed: $url"
     fi
 
     # Assets are gzipped; the pinned digest is over the DECOMPRESSED binary, so
@@ -1249,12 +1265,27 @@ fi
 # Re-read under the same exclusive `$ENV_FILE.lock` protocol as the daemon's
 # writeEnvFileVars. Never rebuild this file from a pre-download snapshot: a daemon
 # can mint a device id or update credentials while binaries are downloading.
+# First match wins; the value is trimmed. For OPENLLM_API_KEY only, ONE layer of surrounding quotes
+# is stripped — the same KEY="value" / KEY='value' parsing env_file_value (and
+# packages/cli/src/env.ts) applies, so a quoted persisted key is read as the
+# credential every runtime actually sees (FS-7).
 read_env_value() {
-  local wanted="$1" line key
+  local wanted="$1" line key value
   [ -f "$ENV_FILE" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     key="${line%%=*}"
-    [ "$key" = "$wanted" ] && { printf '%s' "${line#*=}"; return 0; }
+    [ "$key" = "$wanted" ] || continue
+    value="$(trim_whitespace "${line#*=}")"
+    # Only the API key is judged and rewritten in canonical form. Every other
+    # key is copied exactly as written: the daemon's parser keeps quote
+    # characters, so stripping them here would change OPENLLM_DEVICE_ID or
+    # flip OPENLLM_DAEMON_PTY_SESSIONS on the next installer run.
+    if [ "$wanted" = "OPENLLM_API_KEY" ]; then
+      value="${value#[\"\']}"
+      value="${value%[\"\']}"
+    fi
+    printf '%s' "$value"
+    return 0
   done < "$ENV_FILE"
 }
 
@@ -1300,6 +1331,10 @@ write_env_file() {
   else
     desired_key="$current_key"
     if [ -n "$desired_key" ] && ! is_usable_api_key "$desired_key"; then
+      # The value is not a key we can use — but it is still the user's line.
+      # Keep it in the file (below) and only skip the daemon start; NEVER
+      # silently drop a credential the user may repair or that a different
+      # runtime may still parse (FS-7).
       echo "Ignoring the persisted API key because its format is invalid; OpenLLM will install without starting the daemon." >&2
       desired_key=""
     fi
@@ -1319,7 +1354,8 @@ write_env_file() {
   umask 077 || die "could not tighten the umask"
   : > "$tmp" || die "could not create temp config file: $tmp"
   # Keep unrelated lines byte-for-byte, but replace every installer-owned key with
-  # one canonical occurrence. An ignored invalid persisted key is therefore removed.
+  # one canonical occurrence. A key line with no desired value is kept verbatim —
+  # dropping it would silently delete a credential the user may repair (FS-7).
   local wrote_origin=0 wrote_port=0 wrote_key=0 wrote_device=0 wrote_pty=0
   if [ -f "$ENV_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1332,7 +1368,13 @@ write_env_file() {
           [ "$wrote_port" = 1 ] || { printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp" || die "write failed: $tmp"; wrote_port=1; }
           ;;
         OPENLLM_API_KEY)
-          if [ -n "$desired_key" ] && [ "$wrote_key" = 0 ]; then printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp" || die "write failed: $tmp"; wrote_key=1; fi
+          if [ -n "$desired_key" ]; then
+            [ "$wrote_key" = 1 ] || { printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp" || die "write failed: $tmp"; wrote_key=1; }
+          else
+            # No usable key to write — keep the existing line verbatim rather
+            # than dropping the user's credential (FS-7).
+            printf '%s\n' "$line" >> "$tmp" || die "write failed: $tmp"
+          fi
           ;;
         OPENLLM_DEVICE_ID)
           if [ -n "$current_device" ] && [ "$wrote_device" = 0 ]; then printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp" || die "write failed: $tmp"; wrote_device=1; fi
