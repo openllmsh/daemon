@@ -44,6 +44,8 @@ import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { runClaudeTextCapture } from "./claude-capture";
+import type { TCapturedDispatchSender } from "./request-capture";
 import type { TNativeRunResult } from "./types";
 import {
   cleanNativeSpawnEnv,
@@ -140,6 +142,22 @@ export type TClaudeNativeParams = {
   /** Resume this session id (feed only `userText`), or null → fresh session. */
   readonly resumeSessionId: string | null;
   readonly signal: AbortSignal;
+  /**
+   * Optional request-capture decoration (W2 text path). When set (serve passes
+   * this for selected sub-method `bridge-capture` on ready providers) the CLI
+   * builds the Messages envelope against a private loopback; the daemon
+   * dispatches that envelope once and decodes the true response. Tool capture
+   * is unproven; tool-bearing traffic must keep the existing SDK bridge.
+   *
+   * Hermetic tests MUST inject `sender` (mock upstream). A production enable
+   * without `sender` uses `fetch` against the captured external URL.
+   */
+  readonly requestCapture?: {
+    readonly sender?: TCapturedDispatchSender;
+    readonly allowLoopbackDestinations?: boolean;
+    readonly captureTimeoutMs?: number;
+    readonly maxBodyBytes?: number;
+  };
 };
 
 /** One NDJSON line of `claude -p --output-format stream-json` output. */
@@ -152,12 +170,31 @@ type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
   readonly session_id?: unknown;
 };
 
+const defaultCaptureSender: TCapturedDispatchSender = async (
+  request,
+  _envelope,
+  signal,
+): Promise<Response> => fetch(request, { signal });
+
 export const runClaudeNative = async (
   params: TClaudeNativeParams,
 ): Promise<TNativeRunResult> => {
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "claude CLI not installed" };
   }
+
+  if (params.requestCapture !== undefined) {
+    const { run } = await runClaudeTextCapture({
+      ...params,
+      captureSender: params.requestCapture?.sender ?? defaultCaptureSender,
+      allowLoopbackDestinations:
+        params.requestCapture?.allowLoopbackDestinations,
+      captureTimeoutMs: params.requestCapture?.captureTimeoutMs,
+      maxBodyBytes: params.requestCapture?.maxBodyBytes,
+    });
+    return run;
+  }
+
   // NB: the bridge deliberately does NOT unlock or re-partition the isolated
   // keychain. `claude` reads its OWN keychain item (resolved from the isolated
   // HOME), and the daemon's status watcher already keeps that keychain

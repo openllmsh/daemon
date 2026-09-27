@@ -58,6 +58,8 @@ import { logInfo, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
+import type { TCursorCaptureBridge } from "./cursor-capture";
+import { settleCursorCaptureViaAcpCancel } from "./cursor-capture";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
 import {
   cleanupCursorImageProjectDir,
@@ -82,6 +84,37 @@ import type { TCursorImage, TCursorTool } from "./cursor-request";
 import { acpPromptBlocks, extractJsonObject } from "./cursor-request";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+
+export type {
+  TCursorCaptureBridge,
+  TCursorCaptureChildEnv,
+} from "./cursor-capture";
+export {
+  buildCursorCaptureChildEnv,
+  CURSOR_AGENT_DEFAULT_ORIGIN,
+  classifyCursorOutboundRequest,
+  cursorCaptureDestinationPolicy,
+  isCursorAgentServiceInferencePath,
+  isCursorBridgeRequestCaptureEnabled,
+  materializeCursorCapturePreload,
+  openCursorCaptureBridge,
+  settleCursorCaptureViaAcpCancel,
+} from "./cursor-capture";
+
+/**
+ * Merge a capture bridge's child env into an AcpClient spawn env.
+ * No-op when bridge is null — today's path unchanged.
+ */
+export const applyCursorCaptureBridgeEnv = (
+  env: Record<string, string>,
+  bridge: TCursorCaptureBridge | null,
+): Record<string, string> => {
+  if (bridge === null) return env;
+  return {
+    ...env,
+    ...bridge.childEnv,
+  };
+};
 
 /** Handshake RPC budget (initialize / authenticate / session/new). */
 const RPC_TIMEOUT_MS = 30_000;
@@ -722,6 +755,13 @@ export type TCursorNativeParams = {
   readonly turnTimeoutMs?: number;
   /** Test override for handshake RPC timeout. */
   readonly rpcTimeoutMs?: number;
+  /**
+   * Optional request-capture bridge (default off / omit). When set, the child
+   * spawn receives the preload + IPC env. Capture does NOT decode Connect
+   * responses into OpenAI chunks — see cursor-capture.ts integration blocker.
+   * Omitting this preserves today's ACP path exactly.
+   */
+  readonly captureBridge?: TCursorCaptureBridge | null;
 };
 
 /**
@@ -813,12 +853,15 @@ export const runCursorNative = async (
   // it before initialization (a tools/call can only arrive after session/new,
   // which needs `client` — but declaring it first makes that ordering explicit
   // rather than relying on it).
+  const captureBridge = params.captureBridge ?? null;
+  const spawnEnv = applyCursorCaptureBridgeEnv(params.env, captureBridge);
+
   let client: AcpClient;
   try {
     mark("spawn_started_ms");
     client = new AcpClient(
       params.bin,
-      params.env,
+      spawnEnv,
       (method, p) => {
         if (method !== "session/update" || ended) return;
         const notif = p as
@@ -834,6 +877,58 @@ export const runCursorNative = async (
     );
   } catch (error) {
     return setupDecline(error, params.signal);
+  }
+
+  // When a capture bridge is attached, the vendor Connect send is suppressed.
+  // Settle locally via ACP session/cancel — never feed a fabricated model
+  // stream. Connect→chunk decode is an explicit integration blocker; without
+  // it this path cannot commit OpenAI chunks from the captured upstream.
+  //
+  // Offers can race ahead of session/new. Queue ACP cancel until sessionId is
+  // acknowledged so settlement is not permanently skipped.
+  let pendingCaptureCancel: {
+    readonly method: string;
+    readonly externalUrl: string;
+  } | null = null;
+  const runCaptureAcpCancel = (args: {
+    readonly method: string;
+    readonly externalUrl: string;
+  }): void => {
+    settleCursorCaptureViaAcpCancel({
+      settlement: {
+        kind: "suppressed",
+        reason: `captured ${args.method} ${args.externalUrl}`,
+      },
+      cancelSession: () => {
+        if (sessionId !== null) client.cancelAndDispose(sessionId);
+      },
+    });
+  };
+  if (captureBridge !== null) {
+    void captureBridge
+      .waitForOffer()
+      .then((envelope) => {
+        mark("capture_offered_ms");
+        captureBridge.settleChild({
+          kind: "suppressed",
+          reason:
+            "original AgentService send suppressed; daemon owns the envelope",
+        });
+        if (sessionId !== null) {
+          runCaptureAcpCancel({
+            method: envelope.method,
+            externalUrl: envelope.externalUrl,
+          });
+        } else {
+          pendingCaptureCancel = {
+            method: envelope.method,
+            externalUrl: envelope.externalUrl,
+          };
+        }
+      })
+      .catch(() => {
+        // Timeout / cancel / dispose — cleanup path owns the rest.
+      });
   }
 
   const report = (
@@ -861,6 +956,9 @@ export const runCursorNative = async (
     if (cancel && sessionId !== null) client.cancelAndDispose(sessionId);
     else client.dispose();
     stopMcp();
+    if (captureBridge !== null) {
+      void captureBridge.dispose();
+    }
   };
   const abort = (): void => {
     failStream(new DOMException("client aborted", "AbortError"));
@@ -947,6 +1045,11 @@ export const runCursorNative = async (
   }
   sessionId = sid;
   mark("session_ready_ms");
+  if (pendingCaptureCancel !== null) {
+    const pending = pendingCaptureCancel;
+    pendingCaptureCancel = null;
+    runCaptureAcpCancel(pending);
+  }
   if (observationTicket !== null) {
     observeCursorNativeModelsFromSession({
       ticket: observationTicket,

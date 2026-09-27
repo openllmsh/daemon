@@ -316,6 +316,13 @@ export type TNativeRunResult =
       readonly kind: "declined";
       readonly reason: string;
       readonly cooldownReason?: TCooldownReason;
+      /**
+       * Capture send ownership when a bridge-capture attempt already touched
+       * upstream. `accepted` / `uncertain` MUST be terminal for the hop —
+       * walker must not fall through to handrolled or fleet (no second send).
+       * Absent / `none` = pre-send decline; existing fallback policy applies.
+       */
+      readonly captureOwnership?: "none" | "accepted" | "uncertain";
     };
 
 export type TNativeTerminalResult =

@@ -4,6 +4,9 @@
  * which one does this hop use?".
  *
  * `bridge` = the native vendor-runtime path (`native-runtime/`);
+ * `bridge-capture` = the same native path with vendor-built request capture
+ * (daemon owns the one upstream exchange — see
+ * `docs/plan/bridge-request-capture/`);
  * `handrolled` = the walker's manual upstream-HTTP transport. The cloud
  * publishes a preference in the bootstrap snapshot
  * (`config.ts#activeSubMethod` + per-provider
@@ -17,10 +20,15 @@
  *     : methods[0];               // provider default (array-index-0)
  *
  * The walker samples the selection ONCE per hop, before local execution:
- * `handrolled` never probes or spawns the bridge; `bridge` keeps the
- * pre-commit decline → manual fallback on the same hop. See
- * `docs/proposals/active-sub-method.md` +
+ * `handrolled` never probes or spawns the bridge; `bridge` /
+ * `bridge-capture` keep the pre-commit decline → manual fallback on the
+ * same hop when declared. See `docs/proposals/active-sub-method.md` +
  * `docs/proposals/sub-method-simplified-execution.md`.
+ *
+ * `bridge-capture` is declared only for providers with a serve-activated
+ * capture route today (Claude/Codex text). Cursor/Muse keep `bridge` only —
+ * a `cursor:bridge-capture` override still parses cloud-side but capability
+ * normalization falls back to `methods[0]` (`bridge`).
  */
 
 import type {
@@ -44,17 +52,19 @@ export type TSubMethodCapability = {
 export const SUB_METHOD_CAPABILITIES: Readonly<
   Record<TSubscriptionProviderSlug, TSubMethodCapability>
 > = {
-  claude_code: { methods: ["bridge", "handrolled"] },
-  chatgpt: { methods: ["bridge", "handrolled"] },
+  claude_code: { methods: ["bridge", "bridge-capture", "handrolled"] },
+  chatgpt: { methods: ["bridge", "bridge-capture", "handrolled"] },
   kimi_code: { methods: ["handrolled"] },
   grok: { methods: ["handrolled"] },
   // Cursor's ONLY inference transport is the ACP bridge (`cursor-agent acp`,
   // native-runtime/cursor-acp.ts) — there is no manual HTTP path (no
   // UPSTREAM_WIRE entry), so it is BRIDGE-ONLY: a bridge decline advances the
-  // plan instead of falling to a manual transport.
+  // plan instead of falling to a manual transport. Capture is not declared
+  // until a Connect→chunk decoder exists (capability normalization).
   cursor: { methods: ["bridge"] },
   // Muse Code is likewise BRIDGE-ONLY — official `muse serve` / SDK only; no
-  // handrolled Meta Model API path on the subscription slug.
+  // handrolled Meta Model API path on the subscription slug. Capture is not
+  // declared until a serve-compatible plaintext request seam exists.
   muse: { methods: ["bridge"] },
 };
 
@@ -84,10 +94,10 @@ export const isClaudeCodeOriginator = (headers: Headers): boolean =>
  * transport forwards the genuine client's own request — verbatim
  * Anthropic wire, its own identity headers — on the CLI's own
  * credential, which IS the official-client flow the subscription terms
- * describe. Spawning the bridge there would nest a SECOND Claude Code
- * runtime around a request the real one already produced: slower
- * (process spawn + stream-json re-encode), lossier, and no more
- * compliant.
+ * describe. Spawning the bridge (or bridge-capture) there would nest a
+ * SECOND Claude Code runtime around a request the real one already
+ * produced: slower (process spawn + stream-json re-encode), lossier, and
+ * no more compliant.
  */
 export const selectSubMethod = (
   provider: string,
@@ -111,14 +121,20 @@ export const selectSubMethod = (
  * already owned by {@link selectSubMethod} / the non-CC claude_code rule.
  *
  * Walker uses this instead of hard-coding per-slug branches:
- *   - `["bridge"]`            — bridge-only (cursor), or non-CC claude_code
- *                               (handrolled would spoof Claude Code identity)
- *   - `["handrolled"]`        — handrolled preference, or CC originator
+ *   - `["bridge"]` / `["bridge-capture"]`
+ *       — bridge-only (cursor/muse), or non-CC claude_code (handrolled would
+ *         spoof Claude Code identity)
+ *   - `["handrolled"]` — handrolled preference, or CC originator
  *                               (selectSubMethod forces handrolled)
- *   - `["bridge","handrolled"]` — bridge preference with handrolled fallback
+ *   - `["bridge","handrolled"]` / `["bridge-capture","handrolled"]`
+ *       — bridge(-capture) preference with handrolled fallback
  *
  * Empty only for an unknown provider with no declared methods (walker then
  * treats local serve as exhausted and tries the fleet tunnel).
+ *
+ * After upstream acceptance on a capture path, the walker must NOT retry the
+ * same hop via another method (uncertain_accept → no second send). Pre-accept
+ * declines may still fall through to handrolled when listed.
  */
 export const localMethodsForHop = (
   provider: string,
@@ -127,8 +143,11 @@ export const localMethodsForHop = (
 ): readonly TSubMethod[] => {
   // Non-CC claude_code: never attempt handrolled on this box (would require
   // spoofing a "You are Claude Code" identity the client never sent). Bridge
-  // only; fleet covers a peer that can serve under its own policy.
+  // / bridge-capture only; fleet covers a peer that can serve under its own
+  // policy.
   if (provider === "claude_code" && originator?.isClaudeCode !== true) {
+    const selected = selectSubMethod(provider, requested, originator);
+    if (selected === "bridge-capture") return ["bridge-capture"];
     return ["bridge"];
   }
 
@@ -140,6 +159,12 @@ export const localMethodsForHop = (
 
   const selected = selectSubMethod(provider, requested, originator);
   if (selected === "handrolled") return ["handrolled"];
+  if (selected === "bridge-capture") {
+    if (capability.methods.includes("handrolled")) {
+      return ["bridge-capture", "handrolled"];
+    }
+    return ["bridge-capture"];
+  }
   // Bridge selected (preference or default): try bridge first; fall through
   // to handrolled on the same hop when the capability table declares it.
   if (capability.methods.includes("handrolled")) {
@@ -147,3 +172,18 @@ export const localMethodsForHop = (
   }
   return ["bridge"];
 };
+
+/** Whether the capability table declares a serve-activated capture route. */
+export const providerDeclaresBridgeCapture = (provider: string): boolean => {
+  const capability =
+    SUB_METHOD_CAPABILITIES[provider as TSubscriptionProviderSlug];
+  return capability?.methods.includes("bridge-capture") === true;
+};
+
+/** Native vendor-runtime methods the walker may enter via `tryServeNativeRuntime`. */
+export const isNativeBridgeMethod = (method: TSubMethod): boolean =>
+  method === "bridge" || method === "bridge-capture";
+
+export const methodsIncludeNativeBridge = (
+  methods: readonly TSubMethod[],
+): boolean => methods.some(isNativeBridgeMethod);

@@ -430,23 +430,30 @@ delegate. The native bridges:
   Usage maps from `thread/tokenUsage/updated` (`total`; cached input stays a
   SUBSET of `tokens_in`).
 
-**Multi-turn via session resume (`session-store.ts`).** OpenLLM is a
-STATELESS gateway (the client resends the full history every request); the
-native runtimes are STATEFUL agents that only accept the NEW turn. The
-session store bridges them the way T3 does: it correlates a conversation to
-a provider session and feeds only the delta. Correlation is content-derived
-(the gateway carries no session id) — the conversation is keyed by a hash of
-its "consumed prefix" (system + turns up to and including the last assistant
-turn); the DELTA (the new user turn after it) is fed to the resumed session
+**Multi-turn via session resume (`session-store.ts`).**
+OpenLLM is a STATELESS gateway (the client resends the full history every
+request); the native runtimes are STATEFUL agents that only accept the NEW
+turn. The session store bridges them: it correlates a conversation to a
+provider session by a content-derived prefix hash (`deriveConversation`) and
+feeds only the delta. The DELTA is fed to the resumed session
 (`claude -p --resume <session_id>` / `thread/resume` + `turn/start`). After
-the runtime answers, the store re-keys the session under `hash(prefix +
-delta + response)` so the NEXT request — which carries exactly those messages
-plus its own new user turn — matches and resumes. First turn / unmatched
-history (daemon restart, client compaction) starts fresh; an unmatched
-mid-conversation join renders the transcript as a lossy seed. State is
-daemon-resident (the resume files/threads are daemon-local); in-memory LRU +
-TTL, per-conversation lock. Verified live: a follow-up recalled a codeword
-set in turn 1 while only the new question was fed.
+the runtime answers, the store re-keys under
+`nextPrefixHash(... assistant)`. State is daemon-resident (in-memory LRU +
+TTL, per-key lock). Known limitation: independent identical-prefix
+conversations can overwrite each other's vendor-session mapping — see
+`docs/plan/bridge-request-capture/session-continuity.md` (deferred; not a
+capture blocker).
+
+**Bridge request capture (`bridge-capture` sub-method).** Cloud
+`ACTIVE_SUB_METHOD` may select `bridge-capture` (global or
+`provider:bridge-capture`). Serve activates only **ready** paths declared in
+the capability table (Claude/Codex text today); Cursor/Muse omit the method
+and keep today's bridges — see `sub-method.ts`,
+`bridge-request-capture-readiness.ts`, and
+`docs/plan/bridge-request-capture/`. Capture turns force cold construction +
+full-history `renderSeed` (`captureAwareTextBuilderPlan`) and never publish a
+warm resume handle, because the builder did not observe the true assistant
+reply.
 
 **Claude tool-passthrough (`claude-tool-session.ts` + `claude-tool-serve.ts`).**
 A tool-bearing `claude_code` request (client function tools present) is served

@@ -88,6 +88,20 @@ type TThreadSink = {
   onWebSearch?: (call: TServerSearchCall) => void;
 };
 
+export type TCodexAppServerClientOptions = {
+  /**
+   * Extra argv inserted after `app-server` (e.g. `-c chatgpt_base_url=…`).
+   * Used by the bridge-request-capture path; the shared warm client passes none.
+   */
+  readonly spawnArgvExtra?: readonly string[];
+  /**
+   * When true, this client is NOT registered in the process-wide warm map and
+   * callers are expected to {@link CodexAppServerClient.dispose} it. Capture
+   * builders must be isolated from the shared app-server.
+   */
+  readonly isolated?: boolean;
+};
+
 class CodexAppServerClient {
   private nextId: TJsonRpcId = 1;
   private readonly pending = new Map<
@@ -98,11 +112,19 @@ class CodexAppServerClient {
   private initialized: Promise<void> | null = null;
   private stdin: { write: (s: string) => void; flush?: () => void } | null =
     null;
+  private proc: ReturnType<typeof Bun.spawn> | null = null;
+  private readonly spawnArgvExtra: readonly string[];
+  /** True when created via {@link createIsolatedCodexAppServerClient}. */
+  readonly isolated: boolean;
 
   constructor(
     private readonly bin: string,
     private readonly env: Record<string, string>,
-  ) {}
+    options: TCodexAppServerClientOptions = {},
+  ) {
+    this.spawnArgvExtra = options.spawnArgvExtra ?? [];
+    this.isolated = options.isolated === true;
+  }
 
   /** Spawn + handshake exactly once per child; respawn after an exit. */
   ensureStarted(): Promise<void> {
@@ -111,14 +133,33 @@ class CodexAppServerClient {
     return this.initialized;
   }
 
+  /**
+   * Kill the child and reject in-flight RPCs. Required for isolated capture
+   * builders; safe but unusual for the shared warm client.
+   */
+  dispose(): void {
+    const proc = this.proc;
+    this.proc = null;
+    try {
+      proc?.kill();
+    } catch {
+      // already exited
+    }
+    this.teardown("codex app-server disposed");
+  }
+
   private async start(): Promise<void> {
-    const proc = Bun.spawn(sandboxSpawnArgs([this.bin, "app-server"]), {
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "ignore",
-      cwd: spawnCwd(this.env),
-      env: cleanNativeSpawnEnv(this.env),
-    });
+    const proc = Bun.spawn(
+      sandboxSpawnArgs([this.bin, "app-server", ...this.spawnArgvExtra]),
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "ignore",
+        cwd: spawnCwd(this.env),
+        env: cleanNativeSpawnEnv(this.env),
+      },
+    );
+    this.proc = proc;
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -126,7 +167,10 @@ class CodexAppServerClient {
     void this.pump(proc.stdout as ReadableStream<Uint8Array>).catch(() => {
       // reader ends on child exit; teardown below handles state
     });
-    void proc.exited.then(() => this.teardown("codex app-server exited"));
+    void proc.exited.then(() => {
+      if (this.proc === proc) this.proc = null;
+      this.teardown("codex app-server exited");
+    });
     await this.request("initialize", {
       clientInfo: {
         name: "openllmd",
@@ -158,7 +202,7 @@ class CodexAppServerClient {
     for (const [, sink] of this.sinks) sink.onCompleted("failed", reason);
     this.sinks.clear();
     this.stdin = null;
-    this.initialized = null; // next request respawns
+    this.initialized = null; // next request respawns (shared warm client only)
   }
 
   private send(message: Record<string, unknown>): void {
@@ -416,6 +460,19 @@ export const clientFor = (
   return created;
 };
 
+/**
+ * Fresh app-server child that is NOT shared with {@link clientFor}. Capture
+ * builders must use this so `turn/interrupt` cannot disturb unrelated warm
+ * threads, and so `-c chatgpt_base_url` / `-c openai_base_url` redirects apply
+ * only to the experimental child.
+ */
+export const createIsolatedCodexAppServerClient = (
+  bin: string,
+  env: Record<string, string>,
+  options: Omit<TCodexAppServerClientOptions, "isolated"> = {},
+): CodexAppServerClient =>
+  new CodexAppServerClient(bin, env, { ...options, isolated: true });
+
 export type TCodexNativeParams = {
   /** Absolute path to the isolated codex binary (`cliBin("chatgpt")`). */
   readonly bin: string;
@@ -437,6 +494,11 @@ export type TCodexNativeParams = {
   /** Override the pre-commit deadline (default 60s). Tests use a small value to
    *  exercise the timeout→interrupt path without a real 60s wait. */
   readonly precommitMs?: number;
+  /**
+   * When true (serve selected sub-method `bridge-capture` + readiness), run the
+   * isolated capture text path instead of the warm shared app-server bridge.
+   */
+  readonly bridgeCapture?: boolean;
 };
 
 /** Canonical `reasoning_effort` → app-server effort (same narrowing as the
@@ -480,6 +542,12 @@ export const runCodexNative = async (
 ): Promise<TNativeRunResult> => {
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "codex CLI not installed" };
+  }
+  // bridge-capture sub-method (W4). Dynamic import keeps the warm path free of
+  // a hard cycle with `codex-capture.ts`.
+  if (params.bridgeCapture === true) {
+    const { runCodexCapturedTextTurn } = await import("./codex-capture");
+    return await runCodexCapturedTextTurn(params);
   }
   const client = clientFor(params.bin, params.env);
   let threadId: string;

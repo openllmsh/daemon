@@ -1,0 +1,705 @@
+/**
+ * Child-scoped Cursor AgentService request-capture preload (CommonJS).
+ *
+ * Loaded ONLY via per-child `NODE_OPTIONS=--require <this-file>` when serve
+ * activates a ready `bridge-capture` route for cursor (capability table
+ * currently omits it). Never install this as an ambient/global preload.
+ *
+ * Why not fetch-only: installed `@anysphere/agent-cli-runtime` (snapshot
+ * 2026.07.23-e383d2b) drives `agent.v1.AgentService` through
+ * `@connectrpc/connect-node@1.6.1`, which uses Node `http`/`https` (HTTP/1.1
+ * RunSSE) and `http2` session `.request` (HTTP/2 Run). A fetch monkey-patch
+ * misses those send paths.
+ *
+ * Captures: AgentService Run / RunSSE / RunPoll only (inference). Leaves
+ * NameAgent / model discovery / auth / dashboard alone. Native
+ * `file_service*.node` HTTP/2 sync is outside this JS hook by design.
+ *
+ * Env (request-private; parent sets these on the experimental child only):
+ *   OPENLLM_CURSOR_CAPTURE_SOCK   — unix socket path (0600 parent listener)
+ *   OPENLLM_CURSOR_CAPTURE_TOKEN  — bearer for every IPC frame
+ *   OPENLLM_CURSOR_CAPTURE_EXTERNAL_ORIGIN — optional origin rewrite target
+ *     when the observed URL was relocated (otherwise observed === external)
+ *
+ * IPC: newline-delimited JSON. Bodies travel as base64. No TLS disable. No
+ * credential logging.
+ */
+"use strict";
+
+const http = require("node:http");
+const https = require("node:https");
+const http2 = require("node:http2");
+const net = require("node:net");
+const { EventEmitter } = require("node:events");
+const { randomUUID } = require("node:crypto");
+
+const SOCK = process.env.OPENLLM_CURSOR_CAPTURE_SOCK;
+const TOKEN = process.env.OPENLLM_CURSOR_CAPTURE_TOKEN;
+const EXTERNAL_ORIGIN = process.env.OPENLLM_CURSOR_CAPTURE_EXTERNAL_ORIGIN;
+
+const ENABLED =
+  typeof SOCK === "string" &&
+  SOCK.length > 0 &&
+  typeof TOKEN === "string" &&
+  TOKEN.length > 0;
+
+/** @type {null | { write: (s: string) => void, end: () => void, destroyed: boolean }} */
+let ipc = null;
+/** @type {Map<string, { settle: (msg: any) => void }>} */
+const pending = new Map();
+let captureOffered = false;
+
+const AGENT_SERVICE_PATH_RE =
+  /\/agent\.v1\.AgentService\/(Run|RunSSE|RunPoll)(?:\?|$)/;
+
+const CONNECT_CONTENT_TYPE_RE =
+  /(?:^|;\s*)application\/connect\+(?:proto|json)(?:\s|;|$)/i;
+
+const markLoaded = () => {
+  // Reachability marker for hermetic tests / doctor — never contains secrets.
+  process.env.OPENLLM_CURSOR_CAPTURE_PRELOAD_LOADED = "1";
+};
+
+const connectIpc = () => {
+  if (!ENABLED || ipc !== null) return;
+  const socket = net.createConnection(SOCK);
+  let buffer = "";
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const nl = buffer.indexOf("\n");
+      if (nl < 0) break;
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line.length === 0) continue;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (
+        msg &&
+        typeof msg === "object" &&
+        msg.type === "settle" &&
+        typeof msg.id === "string"
+      ) {
+        const waiter = pending.get(msg.id);
+        if (waiter) {
+          pending.delete(msg.id);
+          waiter.settle(msg);
+        }
+      }
+    }
+  });
+  socket.on("error", () => {
+    // Parent gone — pending captures fail locally.
+    for (const [id, waiter] of pending) {
+      pending.delete(id);
+      waiter.settle({
+        type: "settle",
+        id,
+        settlement: { kind: "failed", reason: "capture ipc error" },
+      });
+    }
+  });
+  ipc = {
+    destroyed: false,
+    write(s) {
+      if (this.destroyed) return;
+      try {
+        socket.write(s);
+      } catch {
+        this.destroyed = true;
+      }
+    },
+    end() {
+      this.destroyed = true;
+      try {
+        socket.end();
+      } catch {
+        // ignore
+      }
+    },
+  };
+};
+
+/**
+ * @param {string} pathWithQuery
+ * @param {Record<string, unknown> | undefined} headers
+ */
+const isAgentInferenceRequest = (pathWithQuery, headers) => {
+  if (!AGENT_SERVICE_PATH_RE.test(pathWithQuery)) return false;
+  // Prefer Connect content-types when present; path match alone is enough for
+  // AgentService Run* (Connect always sets one of these).
+  if (headers && typeof headers === "object") {
+    const ct =
+      headers["content-type"] ??
+      headers["Content-Type"] ??
+      headers[http2.constants.HTTP2_HEADER_CONTENT_TYPE];
+    if (
+      typeof ct === "string" &&
+      ct.length > 0 &&
+      !CONNECT_CONTENT_TYPE_RE.test(ct)
+    ) {
+      // Non-connect body on an AgentService Run path is unexpected; still
+      // capture (opaque frames) — classification is by service method.
+    }
+  }
+  return true;
+};
+
+/**
+ * @param {string} observedUrl
+ */
+const externalUrlOf = (observedUrl) => {
+  if (typeof EXTERNAL_ORIGIN !== "string" || EXTERNAL_ORIGIN.length === 0) {
+    return observedUrl;
+  }
+  try {
+    const observed = new URL(observedUrl);
+    const external = new URL(EXTERNAL_ORIGIN);
+    external.pathname = observed.pathname;
+    external.search = observed.search;
+    external.hash = observed.hash;
+    return external.toString();
+  } catch {
+    return observedUrl;
+  }
+};
+
+/**
+ * @param {Array<[string, string]>} pairs
+ * @param {Uint8Array | null} body
+ * @param {"http" | "http2"} wire
+ * @param {string} method
+ * @param {string} observedUrl
+ * @param {Record<string, string | number | boolean | null>} framing
+ * @returns {Promise<{ kind: string, reason: string }>}
+ */
+const offerCapture = (pairs, body, wire, method, observedUrl, framing) => {
+  connectIpc();
+  if (ipc === null) {
+    return Promise.resolve({
+      kind: "failed",
+      reason: "capture ipc unavailable",
+    });
+  }
+  if (captureOffered) {
+    return Promise.resolve({
+      kind: "failed",
+      reason: "duplicate_capture",
+    });
+  }
+  captureOffered = true;
+  const id = randomUUID();
+  const bodyBase64 =
+    body === null || body.byteLength === 0
+      ? null
+      : Buffer.from(body).toString("base64");
+  const payload = {
+    type: "capture",
+    token: TOKEN,
+    id,
+    transport: "connect",
+    wire,
+    method,
+    observedUrl,
+    externalUrl: externalUrlOf(observedUrl),
+    headers: pairs,
+    bodyBase64,
+    framing,
+  };
+  return new Promise((resolve) => {
+    pending.set(id, {
+      settle(msg) {
+        const settlement = msg.settlement ?? {
+          kind: "failed",
+          reason: "missing settlement",
+        };
+        // Drop the IPC socket so the child event loop can exit after the
+        // suppressed request errors — a lingering connection held tests open.
+        try {
+          ipc?.end();
+        } catch {
+          // ignore
+        }
+        resolve({
+          kind:
+            typeof settlement.kind === "string" ? settlement.kind : "failed",
+          reason:
+            typeof settlement.reason === "string"
+              ? settlement.reason
+              : "capture settled",
+        });
+      },
+    });
+    ipc.write(`${JSON.stringify(payload)}\n`);
+  });
+};
+
+/** @param {NodeJS.Dict<string | string[] | undefined> | Array<[string,string]> | undefined} headers */
+const headerPairsFromNode = (headers) => {
+  /** @type {Array<[string, string]>} */
+  const out = [];
+  if (headers === undefined || headers === null) return out;
+  if (Array.isArray(headers)) {
+    for (const entry of headers) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      if (typeof entry[0] === "string" && typeof entry[1] === "string") {
+        out.push([entry[0], entry[1]]);
+      }
+    }
+    return out;
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) out.push([name, String(item)]);
+    } else {
+      out.push([name, String(value)]);
+    }
+  }
+  return out;
+};
+
+/**
+ * @param {string | URL | object} input
+ * @param {object | undefined} options
+ */
+const normalizeHttpArgs = (input, options) => {
+  if (typeof input === "string" || input instanceof URL) {
+    const url = new URL(String(input));
+    const opts = options && typeof options === "object" ? { ...options } : {};
+    return { url, options: opts };
+  }
+  if (input && typeof input === "object") {
+    const opts = { ...input };
+    const path = typeof opts.path === "string" ? opts.path : "/";
+    const host =
+      typeof opts.hostname === "string"
+        ? opts.hostname
+        : typeof opts.host === "string"
+          ? opts.host.split(":")[0]
+          : "localhost";
+    const protocol =
+      typeof opts.protocol === "string" ? opts.protocol : "http:";
+    const port =
+      opts.port !== undefined && opts.port !== null ? `:${opts.port}` : "";
+    const url = new URL(`${protocol}//${host}${port}${path}`);
+    return { url, options: opts };
+  }
+  return { url: new URL("http://localhost/"), options: {} };
+};
+
+/**
+ * Fake HTTP/1 ClientRequest: buffers the body, never opens a socket to the
+ * destination, offers the capture, then errors after local settlement.
+ */
+class CapturedHttp1Request extends EventEmitter {
+  /**
+   * @param {URL} url
+   * @param {object} options
+   */
+  constructor(url, options) {
+    super();
+    this.method =
+      typeof options.method === "string" ? options.method.toUpperCase() : "GET";
+    this.path = `${url.pathname}${url.search}`;
+    this.host = url.host;
+    this.protocol = url.protocol;
+    this.headers = options.headers ?? {};
+    this.writableEnded = false;
+    this.destroyed = false;
+    /** @type {Buffer[]} */
+    this._chunks = [];
+    this._offered = false;
+
+    // connect-node waits for 'socket' before writing the body. Present an
+    // already-open socket so sinkRequest proceeds without a real connect.
+    process.nextTick(() => {
+      if (this.destroyed) return;
+      this.emit("socket", { readyState: "open" });
+    });
+  }
+
+  flushHeaders() {
+    // Headers are part of the capture; no network flush.
+  }
+
+  /**
+   * @param {any} chunk
+   * @param {any} encoding
+   * @param {any} cb
+   */
+  write(chunk, encoding, cb) {
+    if (typeof encoding === "function") {
+      cb = encoding;
+    }
+    if (chunk !== undefined && chunk !== null && chunk !== "") {
+      this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    if (typeof cb === "function") process.nextTick(cb);
+    return true;
+  }
+
+  /**
+   * @param {any} chunk
+   * @param {any} encoding
+   * @param {any} cb
+   */
+  end(chunk, encoding, cb) {
+    if (typeof chunk === "function") {
+      cb = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      cb = encoding;
+    }
+    if (chunk !== undefined && chunk !== null && chunk !== "") {
+      this.write(chunk);
+    }
+    this.writableEnded = true;
+    if (typeof cb === "function") process.nextTick(cb);
+    void this._finish();
+    return this;
+  }
+
+  /**
+   * @param {Error | undefined} err
+   */
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    if (err) this.emit("error", err);
+    this.emit("close");
+    return this;
+  }
+
+  async _finish() {
+    if (this._offered || this.destroyed) return;
+    this._offered = true;
+    const body = this._chunks.length === 0 ? null : Buffer.concat(this._chunks);
+    const observedUrl = `${this.protocol}//${this.host}${this.path}`;
+    const pairs = headerPairsFromNode(this.headers);
+    // Ensure Host is present for HTTP/1 captures (Node often sets it later).
+    if (!pairs.some(([n]) => n.toLowerCase() === "host")) {
+      pairs.push(["Host", this.host]);
+    }
+    const settlement = await offerCapture(
+      pairs,
+      body,
+      "http",
+      this.method,
+      observedUrl,
+      {
+        httpVersion: "1.1",
+        agentService: true,
+        suppressed: true,
+      },
+    );
+    if (this.destroyed) return;
+    const err = new Error(
+      `openllm cursor capture suppressed original send (${settlement.kind}: ${settlement.reason})`,
+    );
+    /** @type {any} */ (err).code = "OPENLLM_CURSOR_CAPTURE_SUPPRESSED";
+    this.destroy(err);
+  }
+}
+
+/**
+ * Fake HTTP/2 stream: buffers DATA frames, never writes to the real session.
+ */
+class CapturedHttp2Stream extends EventEmitter {
+  /**
+   * @param {Array<[string,string]>} pairs
+   * @param {string} method
+   * @param {string} observedUrl
+   * @param {Record<string, string | number | boolean | null>} framing
+   */
+  constructor(pairs, method, observedUrl, framing) {
+    super();
+    this.closed = false;
+    this.destroyed = false;
+    this.writableEnded = false;
+    this.rstCode = undefined;
+    this._pairs = pairs;
+    this._method = method;
+    this._observedUrl = observedUrl;
+    this._framing = framing;
+    /** @type {Buffer[]} */
+    this._chunks = [];
+    this._offered = false;
+  }
+
+  /**
+   * @param {any} chunk
+   * @param {any} encoding
+   * @param {any} cb
+   */
+  write(chunk, encoding, cb) {
+    if (typeof encoding === "function") {
+      cb = encoding;
+    }
+    if (chunk !== undefined && chunk !== null && chunk !== "") {
+      this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    if (typeof cb === "function") process.nextTick(cb);
+    return true;
+  }
+
+  /**
+   * @param {any} chunk
+   * @param {any} encoding
+   * @param {any} cb
+   */
+  end(chunk, encoding, cb) {
+    if (typeof chunk === "function") {
+      cb = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      cb = encoding;
+    }
+    if (chunk !== undefined && chunk !== null && chunk !== "") {
+      this.write(chunk);
+    }
+    this.writableEnded = true;
+    if (typeof cb === "function") process.nextTick(cb);
+    void this._finish();
+    return this;
+  }
+
+  /**
+   * @param {number} code
+   * @param {() => void} [cb]
+   */
+  close(code, cb) {
+    this.closed = true;
+    this.rstCode = code;
+    if (typeof cb === "function") process.nextTick(cb);
+    this.emit("close");
+  }
+
+  /**
+   * @param {Error | undefined} err
+   */
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    this.closed = true;
+    if (err) this.emit("error", err);
+    this.emit("close");
+    return this;
+  }
+
+  async _finish() {
+    if (this._offered || this.destroyed) return;
+    this._offered = true;
+    const body = this._chunks.length === 0 ? null : Buffer.concat(this._chunks);
+    const settlement = await offerCapture(
+      this._pairs,
+      body,
+      "http2",
+      this._method,
+      this._observedUrl,
+      this._framing,
+    );
+    if (this.destroyed) return;
+    const err = new Error(
+      `openllm cursor capture suppressed original send (${settlement.kind}: ${settlement.reason})`,
+    );
+    /** @type {any} */ (err).code = "OPENLLM_CURSOR_CAPTURE_SUPPRESSED";
+    this.destroy(err);
+  }
+
+  [Symbol.asyncIterator]() {
+    const self = this;
+    return {
+      async next() {
+        // No response bytes — wait until destroy/close then end.
+        await new Promise((resolve) => {
+          if (self.closed || self.destroyed) resolve(undefined);
+          else self.once("close", () => resolve(undefined));
+        });
+        return { done: true, value: undefined };
+      },
+      async throw(e) {
+        self.destroy(e instanceof Error ? e : new Error(String(e)));
+        throw e;
+      },
+    };
+  }
+}
+
+const patchHttp1 = () => {
+  /**
+   * @param {typeof http.request} orig
+   * @param {"http:" | "https:"} defaultProtocol
+   */
+  const wrap = (orig, defaultProtocol) =>
+    function patchedRequest(...args) {
+      const input = args[0];
+      let opts = args[1];
+      let cb = args[2];
+      if (typeof opts === "function") {
+        cb = opts;
+        opts = undefined;
+      }
+      const { url, options: normalized } = normalizeHttpArgs(input, opts);
+      if (!url.protocol) url.protocol = defaultProtocol;
+      const pathWithQuery = `${url.pathname}${url.search}`;
+      if (!isAgentInferenceRequest(pathWithQuery, normalized.headers)) {
+        return orig.apply(this, args);
+      }
+      const req = new CapturedHttp1Request(url, {
+        ...normalized,
+        method: normalized.method,
+        headers: normalized.headers,
+      });
+      if (typeof cb === "function") {
+        // Never emits a successful response — settlement destroys with error.
+        req.on("response", cb);
+      }
+      return req;
+    };
+
+  http.request = wrap(http.request, "http:");
+  https.request = wrap(https.request, "https:");
+};
+
+const patchHttp2 = () => {
+  const origConnect = http2.connect;
+  http2.connect = function patchedConnect(...args) {
+    const authority = args[0];
+    const session = origConnect.apply(this, args);
+    patchSession(session, authority);
+    return session;
+  };
+
+  /**
+   * @param {import('node:http2').ClientHttp2Session} session
+   * @param {string | URL} authority
+   */
+  function patchSession(session, authority) {
+    if (/** @type {any} */ (session).__openllmCursorCapturePatched) return;
+    /** @type {any} */ (session).__openllmCursorCapturePatched = true;
+    const origRequest = session.request.bind(session);
+    session.request = function patchedSessionRequest(headers, options) {
+      const hdrs = headers && typeof headers === "object" ? headers : {};
+      const pathRaw =
+        hdrs[http2.constants.HTTP2_HEADER_PATH] ?? hdrs[":path"] ?? "/";
+      const path = Array.isArray(pathRaw) ? pathRaw[0] : String(pathRaw);
+      const methodRaw =
+        hdrs[http2.constants.HTTP2_HEADER_METHOD] ?? hdrs[":method"] ?? "GET";
+      const method = String(
+        Array.isArray(methodRaw) ? methodRaw[0] : methodRaw,
+      ).toUpperCase();
+      if (!isAgentInferenceRequest(path, hdrs)) {
+        return origRequest(headers, options);
+      }
+      const schemeRaw =
+        hdrs[http2.constants.HTTP2_HEADER_SCHEME] ?? hdrs[":scheme"];
+      const authorityRaw =
+        hdrs[http2.constants.HTTP2_HEADER_AUTHORITY] ??
+        hdrs[":authority"] ??
+        String(authority);
+      const scheme = String(
+        Array.isArray(schemeRaw) ? schemeRaw[0] : (schemeRaw ?? "https"),
+      );
+      const auth = String(
+        Array.isArray(authorityRaw) ? authorityRaw[0] : authorityRaw,
+      );
+      const observedUrl = `${scheme}://${auth}${path}`;
+      const pairs = headerPairsFromNode(hdrs);
+      // Preserve pseudoheaders explicitly (application envelope includes them
+      // for Connect-over-HTTP/2).
+      const has = (name) =>
+        pairs.some(([n]) => n.toLowerCase() === name.toLowerCase());
+      if (!has(":method")) pairs.unshift([":method", method]);
+      if (!has(":path")) pairs.unshift([":path", path]);
+      if (!has(":authority")) pairs.unshift([":authority", auth]);
+      if (!has(":scheme")) pairs.unshift([":scheme", scheme]);
+      return new CapturedHttp2Stream(pairs, method, observedUrl, {
+        httpVersion: "2",
+        agentService: true,
+        suppressed: true,
+        authority: auth,
+      });
+    };
+  }
+};
+
+const patchFetch = () => {
+  if (typeof globalThis.fetch !== "function") return;
+  const origFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = async function patchedFetch(input, init) {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input && typeof input === "object" && "url" in input
+            ? String(/** @type {any} */ (input).url)
+            : String(input);
+    let pathWithQuery = "/";
+    try {
+      const u = new URL(url);
+      pathWithQuery = `${u.pathname}${u.search}`;
+    } catch {
+      return origFetch(input, init);
+    }
+    const headersInit = init?.headers;
+    const headerObj =
+      headersInit === undefined
+        ? undefined
+        : headersInit instanceof Headers
+          ? Object.fromEntries(headersInit.entries())
+          : Array.isArray(headersInit)
+            ? Object.fromEntries(headersInit)
+            : { ...headersInit };
+    if (!isAgentInferenceRequest(pathWithQuery, headerObj)) {
+      return origFetch(input, init);
+    }
+    /** @type {Buffer | null} */
+    let body = null;
+    if (init?.body !== undefined && init.body !== null) {
+      if (typeof init.body === "string") body = Buffer.from(init.body);
+      else if (init.body instanceof Uint8Array) body = Buffer.from(init.body);
+      else if (init.body instanceof ArrayBuffer)
+        body = Buffer.from(new Uint8Array(init.body));
+      else {
+        // Streaming fetch bodies are uncommon for Connect unary/server-stream
+        // setup here; refuse to tee unknown streams to the network.
+        body = Buffer.from([]);
+      }
+    }
+    const method =
+      typeof init?.method === "string" ? init.method.toUpperCase() : "GET";
+    const pairs = headerPairsFromNode(headerObj);
+    const settlement = await offerCapture(pairs, body, "http", method, url, {
+      httpVersion: "fetch",
+      agentService: true,
+      suppressed: true,
+    });
+    throw Object.assign(
+      new Error(
+        `openllm cursor capture suppressed original send (${settlement.kind}: ${settlement.reason})`,
+      ),
+      { code: "OPENLLM_CURSOR_CAPTURE_SUPPRESSED" },
+    );
+  };
+};
+
+if (ENABLED) {
+  markLoaded();
+  patchHttp1();
+  patchHttp2();
+  patchFetch();
+}
+
+module.exports = {
+  // Test/introspection surface (not used by Cursor).
+  isAgentInferenceRequest,
+  AGENT_SERVICE_PATH_RE,
+  ENABLED,
+};

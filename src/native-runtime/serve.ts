@@ -35,6 +35,10 @@ import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
 import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
+import {
+  bridgeRequestCaptureReadiness,
+  shouldActivateBridgeRequestCapture,
+} from "./bridge-request-capture-readiness";
 import { runClaudeNative } from "./claude-native";
 import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
@@ -44,10 +48,10 @@ import { cursorRequestOf, jsonInstruction } from "./cursor-request";
 import { museRequestOf } from "./muse-request";
 import { runMuseNative } from "./muse-runtime";
 import {
+  captureAwareTextBuilderPlan,
   deriveConversation,
   NativeSessionStore,
   nextPrefixHash,
-  renderSeed,
 } from "./session-store";
 import type {
   TNativeRunResult,
@@ -102,6 +106,9 @@ const toolContinuationIdentity = (): TToolContinuationIdentity => {
  * vendor-side session memory), and we currently have no visibility into how
  * often it fires. These counters answer that before we invest in a
  * persistent-session redesign.
+ *
+ * Bridge-capture forces cold + seed (`captureAwareTextBuilderPlan`) because
+ * the builder never saw the true assistant reply — warm resume would be wrong.
  *
  *   - `firstTurn`  — no prior assistant turn; a fresh session is CORRECT.
  *   - `resumeHit`  — prior history AND the prefix matched → delta-only feed.
@@ -186,13 +193,24 @@ export type TNativeServeOutcome =
   | {
       readonly declined: string;
       readonly cooldownReason?: TCooldownReason;
+      readonly captureOwnership?: "none" | "accepted" | "uncertain";
     };
 
 const declinedOutcome = (
   declined: string,
   cooldownReason?: TCooldownReason,
-): { readonly declined: string; readonly cooldownReason?: TCooldownReason } =>
-  cooldownReason === undefined ? { declined } : { declined, cooldownReason };
+  captureOwnership?: "none" | "accepted" | "uncertain",
+): {
+  readonly declined: string;
+  readonly cooldownReason?: TCooldownReason;
+  readonly captureOwnership?: "none" | "accepted" | "uncertain";
+} => ({
+  declined,
+  ...(cooldownReason !== undefined ? { cooldownReason } : {}),
+  ...(captureOwnership !== undefined && captureOwnership !== "none"
+    ? { captureOwnership }
+    : {}),
+});
 
 export type TNativeServeParams = {
   readonly provider: string;
@@ -203,6 +221,13 @@ export type TNativeServeParams = {
   readonly wantsStream: boolean;
   /** Opaque continuation capability echoed by a client after a tool pause. */
   readonly continuationToken?: string | null;
+  /**
+   * True when this hop's selected sub-method is `bridge-capture` (from
+   * `ACTIVE_SUB_METHOD` via capability selection). Serve activates capture
+   * only when readiness also admits the provider — there is no separate
+   * capture env flag.
+   */
+  readonly bridgeCapture?: boolean;
   /** Catalog-gated client-output repair, resolved by the walker. */
   readonly stripSubagentIsolation: boolean;
   readonly signal: AbortSignal;
@@ -344,51 +369,78 @@ export const tryServeNativeRuntime = async (
     };
   }
 
+  // Text path is Claude/Codex only (cursor/muse returned above).
+  const textProvider: "claude_code" | "chatgpt" =
+    params.provider === "chatgpt" ? "chatgpt" : "claude_code";
   // Correlate to a persisted session and compute the delta turn to feed.
-  const store = stores[params.provider];
+  const store = stores[textProvider];
+  const captureActive = shouldActivateBridgeRequestCapture(
+    textProvider,
+    params.bridgeCapture === true,
+  );
   const { prefixHash, deltaText, hasPrior } = deriveConversation(
     params.providerModelId,
     req.systemText,
     req.turns,
   );
-  if (deltaText.length === 0) return { declined: "no user turn to answer" };
+  if (deltaText.length === 0) {
+    return { declined: "no user turn to answer" };
+  }
   const lease = await store.lease(prefixHash);
   const resumeId = lease.sessionId; // null → fresh session
-  // Resume feeds ONLY the delta. A fresh session with unmatched prior history
-  // renders the transcript as a seed (lossy fallback); a true first turn feeds
-  // the delta (which is all the user text) directly.
-  const userText =
-    resumeId !== null
-      ? deltaText
-      : hasPrior
-        ? renderSeed(req.turns, deltaText)
-        : deltaText;
+  // Capture builders never saw true assistant output — force cold + seed.
+  // Today's non-capture path still resumes: delta-only feed on hit, seed on miss.
+  const feed = captureAwareTextBuilderPlan({
+    captureActive,
+    resumeId,
+    hasPrior,
+    deltaText,
+    systemText: req.systemText,
+    turns: req.turns,
+  });
+  const userText = feed.userText;
+  const systemText = feed.systemText;
+  const builderResumeId = feed.builderResumeId;
   // Instrumentation: which of the three correlation outcomes this turn took.
-  // `hasPrior && resumeId === null` is the expensive `renderSeed` fallback.
+  // `hasPrior && builderResumeId === null` is the expensive `renderSeed` fallback
+  // (includes capture-forced cold starts).
   recordResumeOutcome(
-    params.provider,
-    resumeId !== null ? "resumeHit" : hasPrior ? "resumeMiss" : "firstTurn",
+    textProvider,
+    builderResumeId !== null
+      ? "resumeHit"
+      : hasPrior
+        ? "resumeMiss"
+        : "firstTurn",
     req.turns.length,
-    resumeId === null && hasPrior ? userText.length : 0,
+    builderResumeId === null && hasPrior ? userText.length : 0,
   );
-  // A resumed session already carries the system prompt; only a fresh start
-  // applies it.
-  const systemText = resumeId !== null ? null : req.systemText;
 
-  const bin = overrides?.bin ?? cliBin(params.provider);
-  const env = overrides?.env ?? cliEnv(params.provider);
+  const bin = overrides?.bin ?? cliBin(textProvider);
+  const env = overrides?.env ?? cliEnv(textProvider);
+  // Capture activates only when the hop selected `bridge-capture` AND readiness
+  // admits the provider. Serve does not inject a capture sender here
+  // (production uses real fetch to the captured external URL). Hermetic suites
+  // inject `requestCapture.sender` on the runner.
+  if (captureActive) {
+    logDebug("native-runtime", "bridge request capture active", {
+      provider: textProvider,
+      readiness: bridgeRequestCaptureReadiness(textProvider).mode,
+      coldBuilder: true,
+    });
+  }
   let run: TNativeRunResult;
   try {
     run =
-      params.provider === "claude_code"
+      textProvider === "claude_code"
         ? await runClaudeNative({
             bin,
             env,
             providerModelId: params.providerModelId,
             systemText,
             userText,
-            resumeSessionId: resumeId,
+            resumeSessionId: builderResumeId,
             signal: params.signal,
+            ...(captureActive ? { requestCapture: {} } : {}),
           })
         : await runCodexNative({
             bin,
@@ -396,9 +448,10 @@ export const tryServeNativeRuntime = async (
             providerModelId: params.providerModelId,
             systemText,
             userText,
-            resumeThreadId: resumeId,
+            resumeThreadId: builderResumeId,
             reasoningEffort: params.canonical.reasoning_effort ?? null,
             signal: params.signal,
+            bridgeCapture: captureActive,
           });
   } catch (error) {
     lease.abandon();
@@ -408,13 +461,18 @@ export const tryServeNativeRuntime = async (
   }
   if (run.kind === "declined") {
     lease.abandon();
-    return declinedOutcome(run.reason, run.cooldownReason);
+    return declinedOutcome(
+      run.reason,
+      run.cooldownReason,
+      run.captureOwnership,
+    );
   }
 
   const committed = run;
   // After the response is accumulated, record tokens AND advance the session:
-  // re-key it under `hash(inbound turns + assistant response)` so the NEXT
-  // request resumes it. On accumulation failure, abandon (next turn re-seeds).
+  // re-key under `hash(inbound turns + assistant response)` so the NEXT
+  // request resumes it. Capture must not publish a resume handle — the builder
+  // never incorporated the true assistant reply into vendor session state.
   const settle = (
     resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
   ): void => {
@@ -426,7 +484,7 @@ export const tryServeNativeRuntime = async (
         req.turns,
         textOf(resp),
       ),
-      committed.sessionId(),
+      feed.publishResumeSession ? committed.sessionId() : null,
     );
   };
   const fail = (err: unknown): void => {
@@ -465,12 +523,16 @@ export const tryServeNativeRuntime = async (
     );
   } catch (err) {
     fail(err);
-    return errorJson(
-      502,
+    const reason =
       partialUsageFrom(err) === null
         ? "native runtime stream ended before output"
-        : "native runtime stream failed after output began",
-    );
+        : "native runtime stream failed after output began";
+    // Capture already dispatched upstream — surface as a capture-owned decline
+    // so the walker cannot handroll/fleet/advance to another provider.
+    if (captureActive) {
+      return declinedOutcome(reason, undefined, "accepted");
+    }
+    return errorJson(502, reason);
   }
   settle(canonical);
   return deliverJsonResponse(
@@ -496,6 +558,16 @@ const serveCursorHop = async (
     readonly env?: Record<string, string>;
   },
 ): Promise<TNativeServeOutcome> => {
+  // Cursor does not declare `bridge-capture` in the capability table. Even if a
+  // caller somehow sets bridgeCapture, Connect→chunk decode is unproven — never
+  // pass `captureBridge` here. Keep today's ACP bridge intact.
+  if (params.bridgeCapture === true) {
+    const readiness = bridgeRequestCaptureReadiness("cursor");
+    logDebug("native-runtime", "cursor bridge request capture not activated", {
+      ready: readiness.ready,
+      reason: readiness.reason,
+    });
+  }
   const req = cursorRequestOf(params.canonical);
   if (req.promptText.length === 0 && req.images.length === 0) {
     return { declined: "no user turn to answer" };
@@ -513,6 +585,7 @@ const serveCursorHop = async (
         ? jsonInstruction(req.jsonMode, req.jsonSchema)
         : null,
     signal: params.signal,
+    // Explicitly omit captureBridge — unchanged ACP path.
   });
   if (run.kind === "declined") {
     return declinedOutcome(run.reason, run.cooldownReason);
@@ -579,6 +652,15 @@ const serveMuseHop = async (
     readonly env?: Record<string, string>;
   },
 ): Promise<TNativeServeOutcome> => {
+  // Muse does not declare `bridge-capture`. Never allocate capture decoration
+  // on the serve path — keep the existing MSP bridge only.
+  if (params.bridgeCapture === true) {
+    logDebug("native-runtime", "muse bridge request capture ignored", {
+      reason:
+        "muse request capture unsupported; capability table omits bridge-capture; existing MSP serve bridge retained",
+    });
+  }
+
   const req = museRequestOf(params.canonical);
   if (!req.ok) {
     return { declined: req.reason };
@@ -650,6 +732,11 @@ const serveMuseHop = async (
   );
 };
 
+export {
+  bridgeRequestCaptureReadiness,
+  bridgeRequestCaptureReadinessTable,
+  shouldActivateBridgeRequestCapture,
+} from "./bridge-request-capture-readiness";
 export type { TChatCompletionChunk };
 /** Re-exported for the walker + tests. */
 export { isNativeRuntimeProvider, nativeRequestOf };
