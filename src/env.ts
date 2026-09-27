@@ -83,6 +83,10 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
 import type { TUpdateRouteConfig } from "@openllmsh/protocol/update-policy";
 import { resolveUpdateSetting } from "@openllmsh/protocol/update-policy";
+import {
+  acquireDirLockSync,
+  envDirLockCodec,
+} from "../../tunnel/session/dir-lock";
 import type {
   TProcessIdentity,
   TProcessStartIdentityReader,
@@ -1391,101 +1395,26 @@ const withEnvFileLock = (
 ): boolean => {
   const stem = `${targetPath}.lock`;
   const lockDir = `${stem}.d`;
-  const parentDir = dirname(targetPath);
-  const baseName = basename(targetPath);
   const nonce = randomUUID().replace(/-/g, "");
-  const deadline = Date.now() + (waitMs ?? envLockWaitMs());
-  let sweeps = 0;
-  let attempts = 0;
-  let acquired = false;
-  // Bounded cleanup once per acquire so quarantined residue cannot linger
-  // until the next contested acquire (identical trigger on the bash side).
-  envLockSweepQuarantine(parentDir, baseName);
-  // The first attempt ALWAYS runs — a caller may pass a sub-cycle bound.
-  while (attempts === 0 || Date.now() < deadline) {
-    attempts += 1;
-    if (envLockLegacyHeld(stem, nonce)) {
-      lockWait();
-      continue;
-    }
-    try {
-      mkdirSync(lockDir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-      sweeps += 1;
-      if (sweeps % 25 === 0) envLockSweepQuarantine(parentDir, baseName);
-      try {
-        if (envLockDirIsStale(lockDir)) {
-          envLockSteal(lockDir, stem, nonce);
-        }
-      } catch {
-        // Another writer may have released/replaced it; retry normally.
-      }
-      lockWait();
-      continue;
-    }
-    // Publish the owner record atomically inside the new lock dir —
-    // NO-REPLACE: if our dir was quarantined and the path re-taken by a
-    // successor while we were paused, the publish must fail rather than
-    // stamp over the successor's record. The inode pinned right after our
-    // `mkdir` binds the publish to OUR generation (a fresh unmarked dir is
-    // immovable: never stale, and a release only moves a dir that reads as
-    // its own).
-    const expectedIno = envLockDirIno(lockDir);
-    if (expectedIno === undefined) {
-      // Never publish into a dir whose generation we cannot prove — a
-      // swap can neither be confirmed nor excluded, and a blind publish
-      // could stamp into a successor's claim. Never rmdir either: the
-      // name may already sit on a dir that is not ours. The stale-lock
-      // path re-judges whatever is actually there on the next pass.
-      lockWait();
-      continue;
-    }
-    let published: boolean;
-    envLockPublishGapForTests?.(lockDir);
-    try {
-      published = envLockPublishOwner(lockDir, nonce, expectedIno);
-    } catch {
-      // The tmp write itself failed — drop the lock WE made rather than
-      // hold it unmarked, but ONLY while the path still proves OUR
-      // generation. An inode that no longer matches (or can no longer be
-      // read) means a successor may own this dir now — nothing inside it is
-      // ours to remove and the stale-lock path owns its cleanup.
-      let ours = false;
-      try {
-        ours =
-          expectedIno !== undefined && lstatSync(lockDir).ino === expectedIno;
-      } catch {
-        ours = false;
-      }
-      if (ours) {
-        try {
-          unlinkSync(join(lockDir, `owner.tmp.${process.pid}`));
-        } catch {
-          // best effort
-        }
-        try {
-          rmdirSync(lockDir);
-        } catch {
-          // best effort
-        }
-      }
-      return false;
-    }
-    if (!published) {
-      // A successor owns the dir at this path (or it was swapped
-      // mid-publish) — NOT ours to remove. Retry acquisition from the top.
-      lockWait();
-      continue;
-    }
-    acquired = true;
-    break;
-  }
-  if (!acquired) return false;
+  const release = acquireDirLockSync(lockDir, envDirLockCodec, {
+    waitMs: waitMs ?? envLockWaitMs(),
+    reclaimMs: envLockStaleMs(),
+    pollMs: 10,
+    inode: envLockDirIno,
+    startIdentity: envLockStartIdentity,
+    legacyStartIdentity: envLockStartIdentity,
+    isStale: envLockDirIsStale,
+    removeOnUnprovenInode: false,
+    legacyHeld: (deadline): boolean => envLockLegacyHeld(stem, nonce),
+    onStep: (step, path): void => {
+      if (step === "before-publish") envLockPublishGapForTests?.(path);
+    },
+  });
+  if (release === null) return false;
   try {
     return operation();
   } finally {
-    envLockReleaseDir(lockDir, nonce);
+    release();
   }
 };
 
