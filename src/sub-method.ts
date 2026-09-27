@@ -26,9 +26,9 @@
  * `docs/proposals/sub-method-simplified-execution.md`.
  *
  * `bridge-capture` is declared only for providers with a serve-activated
- * capture route today (Claude/Codex text). Cursor/Muse keep `bridge` only —
- * a `cursor:bridge-capture` override still parses cloud-side but capability
- * normalization falls back to `methods[0]` (`bridge`).
+ * capture route today (Claude/Codex text + first-turn tools). Cursor/Muse keep
+ * `bridge` only — a `cursor:bridge-capture` override still parses cloud-side
+ * but capability normalization falls back to `methods[0]` (`bridge`).
  */
 
 import type {
@@ -59,13 +59,14 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
   // Cursor's ONLY inference transport is the ACP bridge (`cursor-agent acp`,
   // native-runtime/cursor-acp.ts) — there is no manual HTTP path (no
   // UPSTREAM_WIRE entry), so it is BRIDGE-ONLY: a bridge decline advances the
-  // plan instead of falling to a manual transport. Capture is not declared
-  // until a Connect→chunk decoder exists (capability normalization).
-  cursor: { methods: ["bridge"] },
-  // Muse Code is likewise BRIDGE-ONLY — official `muse serve` / SDK only; no
-  // handrolled Meta Model API path on the subscription slug. Capture is not
-  // declared until a serve-compatible plaintext request seam exists.
-  muse: { methods: ["bridge"] },
+  // plan instead of falling to a manual transport. bridge-capture = official
+  // RunSSE+BidiAppend transaction via runCursorNativeCapture (HTTP/2 duplex
+  // fail-closed post-accept with captureOwnership accepted/uncertain).
+  cursor: { methods: ["bridge", "bridge-capture"] },
+  // Muse Code: MSP bridge by default. bridge-capture activates
+  // settings.endpoint_transport plaintext redirect (Keychain-free durable
+  // auth proven 2026-09-27). No handrolled Meta Model API path.
+  muse: { methods: ["bridge", "bridge-capture"] },
 };
 
 /**
