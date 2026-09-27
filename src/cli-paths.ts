@@ -495,6 +495,12 @@ export const cliConfigDir = (provider: TCliProvider): string =>
  * installer stages under `$HOME`, already granted.) Pinning `TMPDIR` at the
  * granted daemon temp dir keeps every isolated spawn's temp inside the
  * working set, so the install lands the binary on a remote/sandboxed box too.
+ *
+ * The shared root is a BASELINE only: `delegation/spawn.ts` `spawnEnvLeased`
+ * re-points `TMPDIR` at a per-run leased subdir at every supervised spawn
+ * (RG-2 rework-6), and a confined `--sandbox-exec` child re-points it again
+ * at its own `child-<pid>` mint. The pin survives here so envs handed to a
+ * spawn path that never mints still land inside the granted working set.
  */
 export const cliEnv = (provider: TCliProvider): Record<string, string> => {
   const home = cliHome(provider);

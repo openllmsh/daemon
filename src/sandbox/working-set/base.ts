@@ -1168,6 +1168,17 @@ export const sweepDaemonTempDir = (
     lastTmpSweepStats.listed += 1;
     tmpSweepPass.listed += 1;
     const path = join(root, entryName);
+    // An entry already mid-delete is OWNED by the delete phase —
+    // `finishPendingDelete` re-verifies and resumes it below. Re-classifying
+    // it here starts a FRESH freshness walk that burns the whole round node
+    // budget, leaving the pending delete zero nodes to advance — a huge
+    // tree would starve forever behind its own re-walk (rework-3 resume).
+    if (
+      pendingTmpTreeDelete !== null &&
+      pendingTmpTreeDelete.path === path
+    ) {
+      continue;
+    }
     const scan = scanTmpEntry(path);
     lastTmpSweepStats.scanned += 1;
     if (scan === null) continue;
@@ -1367,15 +1378,20 @@ let shimTmpDirMinted = false;
 
 /**
  * Inside the `--sandbox-exec` shim only: give THIS confined vendor child its
- * own temp dir under `<state>/tmp` and record its lease there. The shim is a
- * daemon re-exec that runs this code before spawning the vendor tail; the
- * daemon pinned `TMPDIR` at the shared tmp root (`cliEnv`/`sessionEnv`), so
- * the shim mints `child-<pid>-<rand>`, writes the lease file, and re-points
- * `process.env.TMPDIR` — `childEnvironment(process.env)` then hands the tail
- * the per-child dir. The lease's pid is the registered supervised pid, which
+ * own temp dir under `<state>/tmp`. The shim is a daemon re-exec that runs
+ * this code before spawning the vendor tail; the daemon pinned `TMPDIR` at
+ * the shared tmp root (`cliEnv`/`sessionEnv`), so the shim mints
+ * `child-<pid>-<rand>` and re-points `process.env.TMPDIR` —
+ * `childEnvironment(process.env)` then hands the tail the per-child dir. The
+ * mint is synchronous (one `mkdir`); the LEASE is written asynchronously by
+ * {@link leaseDaemonTmpDirDetached} — a `spawnSync ps` identity read on this
+ * path stalled every vendor launch up to 1.5 s before the tail even spawned
+ * (rework-6). Until the lease lands the dir is UNLEASED — counted by the
+ * sweep, never deleted — so a slow or failed probe is a conservative leak,
+ * never data loss. The lease's pid is the registered supervised pid, which
  * the sweep's registry + `processIdentityStatus` checks answer directly — no
  * `/proc` fd scans, no `lsof`. On any failure the child keeps the shared
- * root; its entries fall under the orphan window.
+ * root; its entries fall under the orphan report.
  */
 const mintShimChildTmpDir = (tmpRoot: string): void => {
   if (shimTmpDirMinted) return;
@@ -1393,16 +1409,6 @@ const mintShimChildTmpDir = (tmpRoot: string): void => {
   // Manage only the daemon's own layout: TMPDIR pinned at the tmp root. A
   // TMPDIR pointing elsewhere is a caller's choice — leave it alone.
   if (envReal !== rootReal) return;
-  // No provable identity → no lease: an unleased mint would be counted as an
-  // orphan forever (unleased entries are never swept), so minting is
-  // pointless without one.
-  const identity = processStartIdentity(process.pid);
-  if (identity === undefined || identity === null) return;
-  const lease = `${JSON.stringify({
-    v: 1,
-    pid: process.pid,
-    startIdentity: normalizeProcessStartIdentity(identity),
-  })}\n`;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const dir = join(
       rootReal,
@@ -1410,16 +1416,14 @@ const mintShimChildTmpDir = (tmpRoot: string): void => {
     );
     try {
       mkdirSync(dir, { mode: 0o700 });
+      process.env.TMPDIR = dir;
     } catch {
       continue; // name collision or root trouble — try a fresh suffix
     }
-    try {
-      writeFileSync(join(dir, TMP_LEASE_FILE), lease, { mode: 0o600 });
-      process.env.TMPDIR = dir;
-    } catch {
-      // Lease write failed — leave the dir unleased; the orphan window owns
-      // it and the child keeps the shared root.
-    }
+    // Identity read OFF the launch path: the probe child was spawned while
+    // the shim is still unconfined (the working set grants `<state>/tmp`
+    // read-write, so the deferred lease write also lands under confinement).
+    leaseDaemonTmpDirDetached(dir, process.pid, "shim");
     return;
   }
 };
@@ -1485,14 +1489,19 @@ export const daemonTempDir = (home?: string): string => {
 /**
  * Mint a daemon-owned subdir under `<state>/tmp` for a NON-shim daemon child
  * — a device-session PTY, which is deliberately unsandboxed so no shim exists
- * to self-lease (see `mintShimChildTmpDir` for the confined path). Returns
+ * to self-lease (see `mintShimChildTmpDir` for the confined path), or a
+ * per-run vendor spawn dir (`delegation/spawn.ts` `spawnEnvLeased`). Returns
  * the minted dir (mode 0o700), or `null` when the root is unusable — callers
  * then keep the shared root. The dir is UNLEASED until
  * {@link leaseDaemonTmpDirDetached} lands an owner identity off the request
  * path: until then the sweep counts it as an unleased entry — reported,
- * never deleted.
+ * never deleted. `prefix` namespaces the mint (`pty-` sessions, `run-`
+ * vendor spawns) purely for forensics — the sweep reads only the lease.
  */
-export const mintDaemonTmpDir = (home?: string): string | null => {
+export const mintDaemonTmpDir = (
+  home?: string,
+  prefix: string = "pty",
+): string | null => {
   let rootReal: string;
   try {
     rootReal = realpathSync(daemonTempDir(home));
@@ -1500,7 +1509,10 @@ export const mintDaemonTmpDir = (home?: string): string | null => {
     return null;
   }
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const dir = join(rootReal, `pty-${randomBytes(4).toString("hex")}`);
+    const dir = join(
+      rootReal,
+      `${prefix}-${randomBytes(4).toString("hex")}`,
+    );
     try {
       mkdirSync(dir, { mode: 0o700 });
       return dir;
@@ -1563,6 +1575,34 @@ const writeTmpLeaseFile = (
     return false;
   }
 };
+
+/** Whether a minted daemon tmp dir already carries a parseable lease file —
+ *  lets a deferred fallback lease skip the write rather than clobber a
+ *  child-pid lease that landed first (rework-6 / RG-2). */
+export const daemonTmpDirLeased = (dir: string): boolean =>
+  readTmpLease(dir) !== null;
+
+/**
+ * Write a lease when the caller ALREADY holds the owner's resolved start
+ * identity — e.g. the child-registry record `superviseSpawn` resolved async
+ * post-spawn. Reusing that identity means a spawn path pays ZERO extra `ps`
+ * subprocesses for leasing (rework-6): each probe is a real child the
+ * daemon has to fork, and spawn-sequence tests record them. Same file
+ * shape and normalization as {@link leaseDaemonTmpDirDetached}.
+ */
+export const leaseDaemonTmpDirWithIdentity = (
+  dir: string,
+  pid: number,
+  startIdentity: string,
+  sessionId?: string,
+): boolean =>
+  startIdentity.length > 0 &&
+  writeTmpLeaseFile(
+    dir,
+    pid,
+    normalizeProcessStartIdentity(startIdentity),
+    sessionId,
+  );
 
 /** Async probe result — the same contract as `processStartIdentity`:
  *  string identity, `null` = confirmed dead, `undefined` = cannot determine. */
@@ -1689,6 +1729,36 @@ const probeProcessIdentityAsync = (
 };
 
 /**
+ * The daemon's OWN start identity, resolved once and reused for every
+ * daemon-owned fallback lease: the daemon fallback would otherwise spend a
+ * fresh `ps` subprocess per minted dir — on probe-heavy sweeps that doubles
+ * the child count, and every `Bun.spawn` is visible to spawn-sequence test
+ * spies (rework-6). `null` = not yet resolved; a failed probe stays `null`
+ * so the next fallback retries. The {@link identityProbeForTests} seam
+ * bypasses the cache entirely so tests keep per-call control.
+ */
+let daemonSelfIdentity: string | null = null;
+
+const probeDaemonSelfIdentity = (
+  done: (identity: string | null | undefined) => void,
+): void => {
+  if (identityProbeForTests === null && daemonSelfIdentity !== null) {
+    done(daemonSelfIdentity);
+    return;
+  }
+  probeProcessIdentityAsync(process.pid, (identity) => {
+    if (
+      identityProbeForTests === null &&
+      typeof identity === "string" &&
+      identity.length > 0
+    ) {
+      daemonSelfIdentity = identity;
+    }
+    done(identity);
+  });
+};
+
+/**
  * Lease a dir minted by {@link mintDaemonTmpDir} WITHOUT blocking the request
  * path: the identity probe is an async `ps` child (never `spawnSync`), so the
  * caller returns immediately and the lease lands on a later turn. `pid` is
@@ -1706,7 +1776,7 @@ export const leaseDaemonTmpDirDetached = (
 ): void => {
   const active = stillActive ?? ((): boolean => true);
   const leaseToDaemon = (): void => {
-    probeProcessIdentityAsync(process.pid, (identity) => {
+    probeDaemonSelfIdentity((identity) => {
       if (!active()) return;
       if (typeof identity === "string" && identity.length > 0) {
         writeTmpLeaseFile(dir, process.pid, identity, sessionId);

@@ -13,6 +13,7 @@ import {
   openSync,
   readdirSync,
   readSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -23,7 +24,7 @@ import { platform } from "node:os";
 import { join } from "node:path";
 import type { TDoctorEventTimings } from "@openllmsh/protocol";
 import type { TReapOutcome, TSuperviseSpawnOptions } from "../child-supervisor";
-import { superviseSpawn } from "../child-supervisor";
+import { listChildRegistryRecords, superviseSpawn } from "../child-supervisor";
 import type { TCliVersionOpts } from "../cli-version-cache";
 import { cachedCliVersion } from "../cli-version-cache";
 import { spawnCommand } from "../command";
@@ -41,11 +42,18 @@ import {
   logWarn,
   safeDiagnosticMessage,
 } from "../logger";
+import { stateDir } from "../env";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { currentTickId } from "../op-context";
 import { childEnvironment } from "../sandbox/child-policy";
 import { sandboxSpawnArgs } from "../sandbox/exec";
-import { daemonTempDir } from "../sandbox/working-set";
+import {
+  daemonTempDir,
+  daemonTmpDirLeased,
+  leaseDaemonTmpDirDetached,
+  leaseDaemonTmpDirWithIdentity,
+  mintDaemonTmpDir,
+} from "../sandbox/working-set";
 import { spawn as admittedSpawn } from "../windows-process";
 import { redactSensitiveArgv } from "./redact-sensitive-argv";
 
@@ -86,7 +94,39 @@ export const mergeSpawnEnv = (
  */
 export const spawnEnv = (
   env: Record<string, string | undefined> | undefined,
-): Record<string, string> => {
+): Record<string, string> => spawnEnvLeased(env, "spawn-env").env;
+
+export type TSpawnEnvLeased = {
+  readonly env: Record<string, string>;
+  /**
+   * Per-run temp dir minted for this spawn under `<state>/tmp`, or `null`
+   * when the child's `TMPDIR` did not point at the shared daemon tmp root
+   * (a caller-pinned TMPDIR elsewhere is respected untouched).
+   */
+  readonly tmpDir: string | null;
+};
+
+/**
+ * {@link spawnEnv} plus RG-2 (rework-6) per-run temp isolation: when the
+ * resolved child env still points `TMPDIR` at the SHARED `<state>/tmp` root
+ * (`cliEnv`/`sessionEnv` pin it there because installers need a granted temp
+ * location), every spawn — wrapped or `probe` — gets its own `run-<rand>`
+ * subdir instead of writing scratch into the root it would share with every
+ * other vendor child and the sweep could never attribute.
+ *
+ * Leasing matches the PTY pattern: a DAEMON-owned fallback lease is started
+ * immediately (the `ps` identity read is async — it never delays the launch)
+ * so the dir is provably owned even if the caller never upgrades it; callers
+ * that hold the supervised child pass its pid to
+ * {@link leaseDaemonTmpDirDetached} post-spawn so the sweep can reap the dir
+ * once the child is dead past the lease grace. The fallback skips its own
+ * write when the child lease landed first. A `TMPDIR` pointing anywhere
+ * else is a caller's choice — left alone, nothing minted.
+ */
+export const spawnEnvLeased = (
+  env: Record<string, string | undefined> | undefined,
+  label: string,
+): TSpawnEnvLeased => {
   const overlay: Record<string, string> = {};
   const deletes: string[] = [];
   for (const [key, value] of Object.entries(env ?? {})) {
@@ -95,7 +135,75 @@ export const spawnEnv = (
   }
   const child = cleanNativeSpawnEnv(overlay);
   for (const key of deletes) delete child[key];
-  return child;
+  const tmpdir = child.TMPDIR;
+  if (tmpdir === undefined || tmpdir.length === 0) {
+    return { env: child, tmpDir: null };
+  }
+  let pinned: string;
+  let root: string;
+  try {
+    pinned = realpathSync(tmpdir);
+    root = realpathSync(join(stateDir(), "tmp"));
+  } catch {
+    return { env: child, tmpDir: null };
+  }
+  if (pinned !== root) return { env: child, tmpDir: null };
+  const minted = mintDaemonTmpDir(undefined, "run");
+  if (minted === null) return { env: child, tmpDir: null };
+  child.TMPDIR = minted;
+  leaseDaemonTmpDirDetached(
+    minted,
+    null,
+    label,
+    () => !daemonTmpDirLeased(minted),
+  );
+  return { env: child, tmpDir: minted };
+};
+
+/** Poll bound for the registry record carrying the child's identity. */
+const CHILD_LEASE_POLL_MS = 1000;
+const CHILD_LEASE_POLL_STEP_MS = 25;
+
+/**
+ * Re-lease a minted run dir to the spawned child's pid + start identity —
+ * WITHOUT spending a second `ps` subprocess: `superviseSpawn` already
+ * resolves that identity into the daemon child registry off the spawn hot
+ * path, so the upgrade polls that record and copies it into the lease
+ * (rework-6 — a `ps` per spawn is a real forked child, and spawn-sequence
+ * tests record them). Detached and best-effort: a fast child can exit
+ * before its record lands (the supervisor deliberately skips a record for
+ * an already-exited pid), in which case the daemon fallback lease written
+ * at mint time stays the provable owner and the sweep reaps the dir once
+ * the daemon dies.
+ */
+export const leaseMintedTmpToChild = (
+  dir: string,
+  pid: number,
+  sessionId: string,
+): void => {
+  void (async () => {
+    for (
+      let waited = 0;
+      waited < CHILD_LEASE_POLL_MS;
+      waited += CHILD_LEASE_POLL_STEP_MS
+    ) {
+      const record = listChildRegistryRecords().find((r) => r.pid === pid);
+      if (record !== undefined) {
+        leaseDaemonTmpDirWithIdentity(
+          dir,
+          pid,
+          record.processStartTime,
+          sessionId,
+        );
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, CHILD_LEASE_POLL_STEP_MS);
+      });
+    }
+  })().catch(() => {
+    // Lease upgrades are best-effort — the daemon fallback lease remains.
+  });
 };
 
 /**
@@ -365,13 +473,14 @@ export const runCaptureResult = async (
       argv[0] ?? "",
       argv.slice(1),
     );
+    const leased = spawnEnvLeased(env, "capture");
     const spawnOptions: TSuperviseSpawnOptions = {
       kind: opts?.kind ?? (opts?.probe === true ? "probe" : "vendor-capture"),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
       cwd: spawnCwd(env),
-      env: spawnEnv(env),
+      env: leased.env,
     };
     const child = superviseSpawn(
       sandboxSpawnArgs(command, { probe: opts?.probe }),
@@ -380,6 +489,11 @@ export const runCaptureResult = async (
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
+    // Upgrade the minted tmp dir's lease to the real child — async, off the
+    // spawn path. After the child dies the sweep reaps the dir past grace.
+    if (leased.tmpDir !== null && typeof proc.pid === "number") {
+      leaseMintedTmpToChild(leased.tmpDir, proc.pid, "capture");
+    }
     if (opts?.producer !== undefined) {
       logDebug("spawn", "native auth child started", {
         producer: opts.producer,
@@ -832,6 +946,7 @@ export const spawnLogin = async (
     parentBudget?.child(timeoutMs) ??
     createDeadlineBudget(timeoutMs, loginOpts?.signal);
   const remainingAtSpawn = budget.remainingMs();
+  const leased = spawnEnvLeased(env, "login");
   const child = superviseSpawn(
     sandboxSpawnArgs(argv, { probe: loginOpts?.probe }),
     {
@@ -840,7 +955,7 @@ export const spawnLogin = async (
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(env),
-      env: spawnEnv(env),
+      env: leased.env,
     },
   );
   let terminatePromise: Promise<TReapOutcome> | null = null;
@@ -854,6 +969,11 @@ export const spawnLogin = async (
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
+    // Upgrade the minted tmp dir's lease to the real child — async, off the
+    // spawn path. After the child dies the sweep reaps the dir past grace.
+    if (leased.tmpDir !== null && typeof proc.pid === "number") {
+      leaseMintedTmpToChild(leased.tmpDir, proc.pid, "login");
+    }
     const stamp = spawnStamp(proc);
     const unbindEarlyAbort = bindAbort(loginOpts?.signal, () => {
       void requestTerminate();
@@ -1340,8 +1460,9 @@ export const spawnLoginPty = async (
     return noChildResult(true);
   }
 
+  const leased = spawnEnvLeased(env, "login-pty");
   const tsFile = join(
-    daemonTempDir(),
+    leased.tmpDir ?? daemonTempDir(),
     `openllmd-pty-${process.pid}-${Date.now().toString(36)}.log`,
   );
   await Bun.write(tsFile, "");
@@ -1365,10 +1486,15 @@ export const spawnLoginPty = async (
         stdout: "ignore",
         stderr: "ignore",
         cwd: spawnCwd(env),
-        env: spawnEnv(env),
+        env: leased.env,
       },
     );
     const proc = child.subprocess;
+    // Upgrade the minted tmp dir's lease to the real child — async, off the
+    // spawn path. After the child dies the sweep reaps the dir past grace.
+    if (leased.tmpDir !== null && typeof proc.pid === "number") {
+      leaseMintedTmpToChild(leased.tmpDir, proc.pid, "login-pty");
+    }
     const stamp = spawnStamp(proc);
     const spawnedAtMs = performance.now();
     let terminatePromise: Promise<TReapOutcome> | null = null;

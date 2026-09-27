@@ -153,8 +153,13 @@ const pruneExpiredNonces = (now: number): void => {
 
 /**
  * Remember a verified nonce until its envelope can no longer be accepted.
- * Retention is `envelopeTs + WINDOW` so a future-dated grant (still inside
- * the acceptance window) cannot be replayed after a premature prune.
+ * Retention is `max(localNow, envelopeTs, serverNow) + WINDOW`: the envelope
+ * anchor alone is NOT enough — a grant accepted through the SERVER anchor
+ * while the local clock runs far ahead stores `envelopeTs + WINDOW`, already
+ * past on the local clock, so the next `pruneExpiredNonces` drops it and a
+ * replay of the same signed grant verifies AGAIN inside the server window
+ * (rework-6 P1). Grounding expiry in the verifier's own acceptance time keeps
+ * the nonce alive for a full window after EITHER anchor admits the grant.
  *
  * Callers MUST `pruneExpiredNonces(now)` before invoking this so capacity
  * checks see a fresh map. Returns false when the map is already full of
@@ -164,7 +169,8 @@ const pruneExpiredNonces = (now: number): void => {
 const rememberNonce = (
   n: string,
   envelopeTs: number,
-  _now: number,
+  now: number,
+  serverNow: number | null,
 ): boolean => {
   if (nonceSeen.has(n)) return false;
   if (nonceOrder.length >= nonceLruCap) {
@@ -177,7 +183,10 @@ const rememberNonce = (
     );
     return false;
   }
-  nonceSeen.set(n, envelopeTs + DEVICE_GRANT_TS_WINDOW_MS);
+  nonceSeen.set(
+    n,
+    Math.max(now, envelopeTs, serverNow ?? 0) + DEVICE_GRANT_TS_WINDOW_MS,
+  );
   nonceOrder.push(n);
   return true;
 };
@@ -273,8 +282,10 @@ export const checkDeviceGrant = (
   // the cloud are the two clocks a correct viewer is plausibly synced to.
   // Reject only when BOTH anchors say stale; a skewed daemon clock can no
   // longer fail valid grants on its own.
+  // The server anchor is read once — the skew branch and the nonce retention
+  // both key off the same acceptance-time reading.
+  const serverNow = daemonServerNowMs();
   if (Math.abs(localSkewMs) > DEVICE_GRANT_TS_WINDOW_MS) {
-    const serverNow = daemonServerNowMs();
     const serverSkewMs = serverNow === null ? null : serverNow - envelope.ts;
     if (
       serverSkewMs === null ||
@@ -315,7 +326,7 @@ export const checkDeviceGrant = (
   }
   // Signature verified — only then admit the nonce. Full map of still-valid
   // nonces rejects rather than evicting (replay protection must not degrade).
-  if (!rememberNonce(envelope.n, envelope.ts, now)) {
+  if (!rememberNonce(envelope.n, envelope.ts, now, serverNow)) {
     return { ok: false, reason: "nonce_overload" };
   }
   return { ok: true };

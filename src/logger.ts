@@ -32,7 +32,6 @@
 import {
   appendFileSync,
   existsSync,
-  mkdirSync,
   renameSync,
   statSync,
 } from "node:fs";
@@ -136,105 +135,24 @@ const rotateIfBig = (file: string): void => {
 let appendTail: Promise<void> = Promise.resolve();
 
 /**
- * State dirs the logger has witnessed existing. The dir is created lazily on
- * the FIRST append so a fresh install still gets its log file; but once a dir
- * has been seen, a later disappearance means it was deliberately removed —
- * `openllmd uninstall` teardown, or a test's `rmSync` cleanup — and a queued
- * async append must NOT re-create it to write a single stale line (TH-6: the
- * resurrection left behind dirs holding only `openllmd.log`). `write` marks
- * the dir on every call that finds it present, so the witness covers the
- * dir even when no line was ever appended to it.
+ * Whether the state dir exists at write time. The logger NEVER creates it:
+ * `mkdirSync` in the append path was the TH-6 resurrection vector — a state
+ * dir removed mid-process (uninstall teardown, a test's `rmSync` cleanup)
+ * got re-created by a late queued line, leaving a dir holding only
+ * `openllmd.log`. Bounded witness/tombstone sets could not fix this: past the
+ * bound an evicted tombstone let the same append mistake a deliberately
+ * removed dir for a never-created one (rework-6). Dropping the write whenever
+ * the dir is missing needs NO remembered state at all — the existence check
+ * at write time IS the deletion proof, and it cannot be evicted.
  *
- * Bounded: the set keeps at most {@link WITNESS_CAP} dirs (LRU — re-witnessing
- * refreshes a dir's position, and past the cap the oldest entry is evicted).
- * Repeated `OPENLLM_DAEMON_STATE_DIR` churn inside one process can no longer
- * grow it without bound.
- *
- * Eviction must never drop the teardown signal itself: every evicted witness
- * moves into {@link removedDirs}, an UNBOUNDED tombstone set a witnessed dir
- * can only leave by being seen to exist again. Without it, churning past
- * `WITNESS_CAP` distinct state roots would let a late queued append mistake a
- * deliberately removed dir for a never-created one and resurrect it.
+ * Boot ordering is unaffected: daemon state creation (`state-file.ts`
+ * `mkdirSync(stateDir())`, the lock dir, the env file) precedes anything that
+ * logs durably, so a live daemon always finds the dir present; a line emitted
+ * in the narrow window before that is dropped, which is consistent with
+ * logging's best-effort contract and strictly better than creating a state
+ * root the teardown just removed.
  */
-const WITNESS_CAP = 8;
-const appendDirs = new Set<string>();
-
-/**
- * Tombstones: dirs whose witness left {@link appendDirs} (LRU eviction) or
- * that were observed missing after being witnessed. A queued append consults
- * this set before any mkdir, so a removed state dir stays refused however
- * many roots churned through the witness cache since.
- *
- * Bounded (rework-5): the set is an insertion-ordered LRU capped at
- * {@link removedTombstoneCap} — 8× the witness cap, so realistic state-dir
- * churn (one root per process) never reaches it, but a pathological churn
- * loop cannot grow the set without bound. Eviction drops the OLDEST
- * tombstone: the dir it named stayed missing through 64 later removals, so
- * the residual risk — a still-queued append for that exact dir arriving
- * after 64 distinct teardowns — is orders of magnitude beyond any real
- * usage. Tombstones for dirs that exist again are shed on re-witness, so
- * the set only ever holds still-missing roots.
- */
-let removedTombstoneCap = 64;
-const removedDirs = new Set<string>();
-
-const tombstoneRemovedDir = (dir: string): void => {
-  removedDirs.delete(dir); // refresh: most recently proven-removed last
-  removedDirs.add(dir);
-  if (removedDirs.size > removedTombstoneCap) {
-    const oldest = removedDirs.values().next().value;
-    if (oldest !== undefined) removedDirs.delete(oldest);
-  }
-};
-
-/** Test-only: shrink the tombstone cap so a small fixture exercises the LRU
- *  bound (`null` restores the default); and read the current set size. Setting
- *  a cap also trims the existing set so the bound holds immediately. */
-export const setLoggerRemovedDirCapForTests = (cap: number | null): void => {
-  removedTombstoneCap = cap ?? 64;
-  while (removedDirs.size > removedTombstoneCap) {
-    const oldest = removedDirs.values().next().value;
-    if (oldest === undefined) break;
-    removedDirs.delete(oldest);
-  }
-};
-
-export const loggerRemovedDirCountForTests = (): number => removedDirs.size;
-
-const witnessDir = (dir: string): void => {
-  appendDirs.delete(dir); // refresh: move to the back when already present
-  appendDirs.add(dir);
-  removedDirs.delete(dir); // observed existing — any stale tombstone is wrong
-  if (appendDirs.size > WITNESS_CAP) {
-    const oldest = appendDirs.values().next().value;
-    if (oldest !== undefined) {
-      appendDirs.delete(oldest);
-      // Tombstone the evicted witness unconditionally: while the dir still
-      // exists the next write simply re-witnesses it (and clears the
-      // tombstone); once it is gone, queued appends keep refusing to
-      // resurrect it — the whole point of the witness.
-      tombstoneRemovedDir(oldest);
-    }
-  }
-};
-
-const ensureLogDir = (dir: string): boolean => {
-  if (existsSync(dir)) {
-    witnessDir(dir);
-    return true;
-  }
-  if (appendDirs.has(dir) || removedDirs.has(dir)) {
-    tombstoneRemovedDir(dir); // keep the refusal sticky through later churn
-    return false;
-  }
-  try {
-    mkdirSync(dir, { recursive: true });
-    witnessDir(dir);
-    return true;
-  } catch {
-    return false;
-  }
-};
+const ensureLogDir = (dir: string): boolean => existsSync(dir);
 
 const appendCombined = (line: string, sync: boolean): boolean => {
   // Resolve the destination SYNCHRONOUSLY (at log time), then close over it: a
@@ -297,16 +215,13 @@ const write = (
   meta?: Record<string, unknown>,
   observation?: TLogObservation,
 ): void => {
-  // TH-6: the state dir was seen and then deleted — teardown beat this line.
-  // Drop it entirely; both sinks (the diagnostics spool and the combined log)
-  // live under that dir and must not re-create it, so the observation is
-  // skipped too, not just the append.
+  // TH-6: the state dir is gone — teardown beat this line. Drop it entirely;
+  // both sinks (the diagnostics spool and the combined log) live under that
+  // dir and must not re-create it, so the observation is skipped too, not
+  // just the append. No remembered tombstone: the existence check at write
+  // time is the whole guard (rework-6).
   const dir = stateDir();
-  if (existsSync(dir)) witnessDir(dir);
-  else if (appendDirs.has(dir) || removedDirs.has(dir)) {
-    tombstoneRemovedDir(dir); // witnessed/gone roots stay refused past eviction
-    return;
-  }
+  if (!existsSync(dir)) return;
   if (level === "info" || level === "warn" || level === "error") {
     try {
       observeDoctorEvent({

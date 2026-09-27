@@ -37,8 +37,10 @@ import { vendorCliTunnelLayer } from "./vendor-cli-tunnel";
 export type { TDaemonTmpIdentityProbe, TWorkingSet } from "./base";
 export {
   daemonTempDir,
+  daemonTmpDirLeased,
   leaseDaemonTmpDir,
   leaseDaemonTmpDirDetached,
+  leaseDaemonTmpDirWithIdentity,
   mintDaemonTmpDir,
   removeTreeDeferred,
   resolveCliExecDirs,

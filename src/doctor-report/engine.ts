@@ -120,6 +120,16 @@ let lastAttemptGeneration: string | null = null;
 // DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS (TCB-7).
 let policyAnchorKey: string | null = null;
 let policyAnchoredAtMs = 0;
+// Rollback latch for the CURRENT anchor — keyed on the same
+// (generation, expires_at_ms) pair. Once a negative elapsed is observed the
+// receipt window is DEAD for that anchor: a local clock that later passes the
+// old anchor must NOT revive it, because elapsed measured across a wound-back
+// clock is no longer a trustworthy "time since receipt" (rework-6 / TCB-7).
+// Only a fresh accepted receipt — which re-anchors under
+// `anchorPolicyReceipt` — clears the latch. The latch is also persisted so a
+// restart cannot shed it in the window before the first receipt arrives.
+let rollbackLatchedFor: string | null = null;
+let rollbackLatchLoaded = false;
 // Cloud→local clock offset estimated at each accepted policy receipt: the
 // cloud stamps `expires_at_ms` ≈ its-now + DOCTOR_REPORTING_POLICY_TTL_MS, so
 // `expires_at_ms − TTL − localNow` approximates `cloudNow − localNow` at
@@ -130,6 +140,46 @@ let serverClockOffsetMs: number | null = null;
 
 const cursorPath = (): string => doctorStatePath("doctor-report.cursor.json");
 const pendingPath = (): string => doctorStatePath("doctor-report.pending.json");
+const rollbackLatchPath = (): string =>
+  doctorStatePath("doctor-report.rollback-latch.json");
+
+/**
+ * Persisted rollback latch — `{v, key}` where `key` is the anchored
+ * (generation, expires_at_ms) pair whose receipt window was invalidated by a
+ * clock rollback. Loaded lazily once per process; a stale file naming an
+ * anchor that is no longer current is inert (the compare is exact-match), and
+ * a fresh accepted receipt removes it. Writes use the same no-create atomic
+ * mode as the cursor: a removed state dir drops the write, never resurrects.
+ */
+const persistRollbackLatch = (key: string): void => {
+  atomicWriteText(rollbackLatchPath(), `${JSON.stringify({ v: 1, key })}\n`);
+};
+
+const clearRollbackLatch = (): void => {
+  rollbackLatchedFor = null;
+  removeFile(rollbackLatchPath());
+};
+
+const loadRollbackLatch = (): void => {
+  if (rollbackLatchLoaded) return;
+  rollbackLatchLoaded = true;
+  const raw = readTextFile(rollbackLatchPath());
+  if (raw === null) return;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "key" in parsed &&
+      typeof (parsed as { key: unknown }).key === "string"
+    ) {
+      rollbackLatchedFor = (parsed as { key: string }).key;
+    }
+  } catch {
+    // A corrupt latch file is inert — no latch is the safe side only when
+    // the anchor itself is also gone, which a fresh receipt re-establishes.
+  }
+};
 
 export const setDoctorEngineClockForTests = (
   fn: (() => number) | null,
@@ -291,13 +341,22 @@ const cursorMatchesScope = (
 const MAX_SERVER_CLOCK_OFFSET_MS = 24 * 60 * 60 * 1000;
 
 /** Re-anchor the receipt window on an ACCEPTED policy receipt and refresh the
- *  server-clock offset estimate in the same step. */
+ *  server-clock offset estimate in the same step. A receipt is also the ONLY
+ *  way out of a rollback latch: the re-anchored window is measured from THIS
+ *  observed receipt, so the wound-back clock history that invalidated the old
+ *  anchor no longer matters. */
 const anchorPolicyReceipt = (
   policy: TDaemonReportingPolicy,
   now: number,
 ): void => {
   policyAnchorKey = `${policy.generation}:${policy.expires_at_ms}`;
   policyAnchoredAtMs = now;
+  if (
+    rollbackLatchedFor !== null ||
+    readTextFile(rollbackLatchPath()) !== null
+  ) {
+    clearRollbackLatch();
+  }
   const impliedOffset =
     policy.expires_at_ms - DOCTOR_REPORTING_POLICY_TTL_MS - now;
   if (Math.abs(impliedOffset) <= MAX_SERVER_CLOCK_OFFSET_MS) {
@@ -332,9 +391,13 @@ export const setDaemonServerClockOffsetForTests = (
  *
  * Elapsed is measured receipt-relative on the daemon's clock; a NEGATIVE
  * elapsed (clock rolled back below the anchor — NTP step-back, manual set)
- * fails CLOSED: the window can no longer be trusted, so the policy is treated
- * as expired rather than letting a wound-back clock keep it live (rework-5).
- * A fresh accepted receipt re-anchors and ends the outage.
+ * fails CLOSED AND LATCHES (rework-6 / TCB-7): the window is dead for this
+ * anchor no matter where the clock later lands, because advancing back past
+ * the old anchor does not restore a trustworthy "time since receipt" — it
+ * just walks forward along the SAME wound-back clock. Only a fresh accepted
+ * receipt (`anchorPolicyReceipt`) clears the latch and ends the outage. The
+ * latch is persisted so a restart in the dead window cannot shed it before
+ * the next receipt arrives.
  */
 const reportingPolicyLive = (
   policy: TDaemonReportingPolicy | null,
@@ -348,6 +411,7 @@ const reportingPolicyLive = (
     policyAnchorKey = null;
     return false;
   }
+  loadRollbackLatch();
   const key = `${policy.generation}:${policy.expires_at_ms}`;
   if (key !== policyAnchorKey) {
     // First sight of a policy that arrived without a bootstrap callback
@@ -355,8 +419,14 @@ const reportingPolicyLive = (
     policyAnchorKey = key;
     policyAnchoredAtMs = now;
   }
+  if (rollbackLatchedFor === key) return false;
   const elapsed = now - policyAnchoredAtMs;
-  return elapsed >= 0 && elapsed < DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS;
+  if (elapsed < 0) {
+    rollbackLatchedFor = key;
+    persistRollbackLatch(key);
+    return false;
+  }
+  return elapsed < DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS;
 };
 
 type TUploadEligibility =
@@ -1095,6 +1165,8 @@ export const resetDoctorEngineForTests = (): void => {
   clearAttemptMemory();
   policyAnchorKey = null;
   policyAnchoredAtMs = 0;
+  rollbackLatchedFor = null;
+  rollbackLatchLoaded = false;
   serverClockOffsetMs = null;
   resetDoctorRepeatForTests();
 };
