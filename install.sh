@@ -1640,8 +1640,19 @@ for parked in "$pidfile".parked-*; do
   prec="$(cat "$parked/owner" 2>/dev/null || true)"
   if [ -n "$prec" ] && job_owner_live "$prec"; then
     if mkdir "$lockd" 2>/dev/null; then
-      ( set -C; cat "$parked/owner" > "$ownerfile" ) 2>/dev/null || true
-      [ -f "$ownerfile" ] && rm -rf "$parked" 2>/dev/null || true
+      # Restore the live record through a tmp + no-replace publish, then
+      # delete the parked copy ONLY once the live name carries the full
+      # record byte-for-byte. A failed read or a noclobber race must never
+      # leave an empty/foreign owner file standing while the only good
+      # record is deleted — the next installer would start a duplicate job.
+      if cat "$parked/owner" > "$lockd/owner.tmp.$$" 2>/dev/null \
+        && [ "$(cat "$lockd/owner.tmp.$$" 2>/dev/null || true)" = "$prec" ] \
+        && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
+          || (set -C; cat "$lockd/owner.tmp.$$" > "$ownerfile") 2>/dev/null; } \
+        && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$prec" ]; then
+        rm -rf "$parked" 2>/dev/null || true
+      fi
+      rm -f "$lockd/owner.tmp.$$" 2>/dev/null
     fi
     continue
   fi
