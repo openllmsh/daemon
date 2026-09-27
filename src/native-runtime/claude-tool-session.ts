@@ -54,7 +54,10 @@ const DRIVE_TIMEOUT_MS = 120_000;
  *  milliseconds; this only bounds a pathological unpaired block so it can't
  *  wait out the whole drive deadline. */
 const FIRE_SETTLE_MS = 2_000;
-const MCP_PREFIX = "mcp__openllm__";
+/** MCP server name prefix the Agent SDK applies to in-process tools. */
+export const CLAUDE_MCP_TOOL_PREFIX = "mcp__openllm__";
+/** @deprecated Prefer {@link CLAUDE_MCP_TOOL_PREFIX}. */
+const MCP_PREFIX = CLAUDE_MCP_TOOL_PREFIX;
 const DEFAULT_CONTINUATION_IDENTITY: TToolContinuationIdentity = {
   subject: "local",
   ownerDaemonKey: "local",
@@ -62,7 +65,10 @@ const DEFAULT_CONTINUATION_IDENTITY: TToolContinuationIdentity = {
   secret: randomUUID(),
 };
 
-const sanitize = (name: string): string => name.replace(/[^a-zA-Z0-9_-]/g, "_");
+/** Sanitize a caller tool name for MCP registration (Agent SDK constraint). */
+export const sanitizeClaudeMcpToolName = (name: string): string =>
+  name.replace(/[^a-zA-Z0-9_-]/g, "_");
+const sanitize = sanitizeClaudeMcpToolName;
 const nowMs = (): number => Date.now();
 
 /** SDK assistant-message usage (Anthropic `BetaUsage`) → the daemon token row,

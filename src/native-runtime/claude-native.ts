@@ -146,8 +146,8 @@ export type TClaudeNativeParams = {
    * Optional request-capture decoration (W2 text path). When set (serve passes
    * this for selected sub-method `bridge-capture` on ready providers) the CLI
    * builds the Messages envelope against a private loopback; the daemon
-   * dispatches that envelope once and decodes the true response. Tool capture
-   * is unproven; tool-bearing traffic must keep the existing SDK bridge.
+   * dispatches that envelope once and decodes the true response. Tool-bearing
+   * capture is owned by `serve.ts` → `runClaudeToolCapture` (not this runner).
    *
    * Hermetic tests MUST inject `sender` (mock upstream). A production enable
    * without `sender` uses `fetch` against the captured external URL.

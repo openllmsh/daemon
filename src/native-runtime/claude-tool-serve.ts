@@ -66,7 +66,8 @@ const plainText = (
     .join("");
 };
 
-const clientToolsOf = (
+/** Map OpenAI-shaped client tools onto the native tool-session / capture shape. */
+export const clientToolsOf = (
   canonical: TChatCompletionRequest,
 ): ReadonlyArray<TClientTool> =>
   (canonical.tools ?? []).map((t) => ({

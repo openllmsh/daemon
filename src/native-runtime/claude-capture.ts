@@ -21,8 +21,11 @@
  * documented SDK `interrupt()` on the tool/Agent-SDK path when that path is
  * later proven; do not treat this text settlement as that proof.
  *
- * Tool capture is **not** proven here. Keep `claude-tool-session.ts` on today's
- * bridge path and surface {@link CLAUDE_TOOL_CAPTURE_STATUS}.
+ * Tool capture lives in `claude-tool-capture.ts` (inert MCP schemas + daemon-
+ * owned tool_use decode). This module stays the text `-p` loopback path;
+ * {@link CLAUDE_TOOL_CAPTURE_STATUS} mirrors the tool adapter's proven label so
+ * existing diagnostics keep a single constant. Serve wiring is out of scope
+ * here — keep today's SDK bridge until the integrator routes tool turns.
  *
  * Default off via `request-capture-config.ts`. This module does not edit
  * `serve.ts` / `walker.ts` / shared capture files / session-store.
@@ -41,6 +44,8 @@ import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import type { TClaudeToolCaptureStatus } from "./claude-tool-capture-status";
+import { CLAUDE_TOOL_CAPTURE_STATUS } from "./claude-tool-capture-status";
 import type {
   TBuilderSettlement,
   TCaptureDestinationPolicy,
@@ -55,12 +60,16 @@ import {
   preserveCapturedHeaders,
   runCapturedDispatch,
 } from "./request-capture";
+import { requireCaptureTerminalFinishReason } from "./request-capture-output";
 import type { TNativeRunResult } from "./types";
 import {
   cleanNativeSpawnEnv,
   PRE_COMMIT_TIMEOUT_MS,
   unsupportedNativeControl,
 } from "./types";
+
+export type { TClaudeToolCaptureStatus } from "./claude-tool-capture-status";
+export { CLAUDE_TOOL_CAPTURE_STATUS } from "./claude-tool-capture-status";
 
 /** Trusted Anthropic Messages origin — dispatch target, never the loopback host. */
 export const CLAUDE_CAPTURE_TRUSTED_ORIGIN = new URL(
@@ -70,16 +79,6 @@ export const CLAUDE_CAPTURE_TRUSTED_ORIGIN = new URL(
 /** Default external Messages URL the daemon dispatches to. */
 export const CLAUDE_CAPTURE_EXTERNAL_MESSAGES_URL =
   defaultUpstreamUrl("claude_code");
-
-/**
- * Tool capture is unproven on this branch. Callers must keep the existing
- * SDK/tool bridge (`claude-tool-session.ts`) when tools are present.
- */
-export const CLAUDE_TOOL_CAPTURE_STATUS = {
-  proven: false,
-  label:
-    "tool capture unproven — preserve existing SDK/tool bridge path; text-only capture only",
-} as const;
 
 /**
  * Local settlement of the text `-p` builder. `unproven_text_settlement` means
@@ -94,7 +93,7 @@ export type TClaudeTextSettlementKind =
 
 export type TClaudeCaptureDiagnostics = {
   readonly textSettlement: TClaudeTextSettlementKind | null;
-  readonly toolCapture: typeof CLAUDE_TOOL_CAPTURE_STATUS;
+  readonly toolCapture: TClaudeToolCaptureStatus;
   readonly daemonDispatchCount: number;
   /** Preamble requests forwarded to the real vendor — must stay 0. */
   readonly preambleExternalForwards: 0;
@@ -151,10 +150,24 @@ export type TClaudeCaptureLoopback = {
 };
 
 /**
+ * Optional gate for `/v1/messages` posts. Text capture omits this (first
+ * Messages POST is the inference). Tool capture supplies a classifier so
+ * SDK auxiliary traffic (session-title generation, etc.) is settled locally
+ * and never becomes the daemon-owned envelope.
+ */
+export type TClaudeCaptureInferenceGate = (args: {
+  readonly envelope: TCapturedRequestEnvelope;
+}) =>
+  | { readonly action: "capture" }
+  | { readonly action: "settle_auxiliary"; readonly reason: string };
+
+/**
  * Private loopback recorder for Claude Messages capture.
  *
  * Inference (`…/v1/messages`): full headers+body → `session.captureSend`, then
- * a local settlement status (never the true upstream body).
+ * a local settlement status (never the true upstream body) — unless
+ * {@link TClaudeCaptureInferenceGate} classifies the POST as auxiliary, in
+ * which case it is settled locally with HTTP 204 and never offered.
  *
  * Preamble / other paths: synthetic local JSON 200. Never forwards to the
  * trusted origin (no authorization leak onto the public network).
@@ -162,6 +175,8 @@ export type TClaudeCaptureLoopback = {
 export const startClaudeCaptureLoopback = (args: {
   readonly session: TRequestCaptureSession;
   readonly onSettlement?: (kind: TClaudeTextSettlementKind) => void;
+  readonly inferenceGate?: TClaudeCaptureInferenceGate;
+  readonly onAuxiliarySettled?: (reason: string) => void;
 }): TClaudeCaptureLoopback => {
   const server = Bun.serve({
     port: 0,
@@ -193,6 +208,16 @@ export const startClaudeCaptureLoopback = (args: {
         body,
         framing: null,
       };
+
+      if (args.inferenceGate !== undefined) {
+        const decision = args.inferenceGate({ envelope });
+        if (decision.action === "settle_auxiliary") {
+          args.onAuxiliarySettled?.(decision.reason);
+          // Local ownership transfer only — never forward aux to the vendor and
+          // never install it as the capture envelope.
+          return new Response(null, { status: 204 });
+        }
+      }
 
       try {
         const settlement = await args.session.captureSend(envelope);
@@ -282,6 +307,16 @@ export const chunksFromCapturedAnthropicResponse = (
   return decodeAnthropicEventStream(body, { providerModelId });
 };
 
+/**
+ * Called ONLY after `runCapturedDispatch` already succeeded (single call
+ * site, post-dispatch) — every decline returned here MUST carry
+ * `captureOwnership: "accepted"` so the walker never retries/handrolls/
+ * fleets for a hop whose upstream send already landed. This includes a
+ * `reader.read()` rejection from {@link requireCaptureTerminalFinishReason}
+ * (clean EOF with no terminal `finish_reason`) — that rejection must be
+ * translated here, never allowed to propagate out of this function (its
+ * callers do not wrap it in try/catch and would otherwise lose ownership).
+ */
 const commitFromChunkStream = async (args: {
   readonly chunks: ReadableStream<TChatCompletionChunk>;
   readonly signal: AbortSignal;
@@ -297,8 +332,19 @@ const commitFromChunkStream = async (args: {
     | { kind: "error"; reason: string }
   > => {
     for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return { kind: "exit" };
+      let read: { value: TChatCompletionChunk; done: false } | { done: true };
+      try {
+        read = await reader.read();
+      } catch (err) {
+        return {
+          kind: "error",
+          reason: `claude capture upstream stream failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        };
+      }
+      if (read.done) return { kind: "exit" };
+      const value = read.value;
       if (isMeaningfulChunk(value)) {
         if (isRefusalChunk(value)) {
           return {
@@ -334,12 +380,17 @@ const commitFromChunkStream = async (args: {
         first === "timeout"
           ? "claude capture produced no output before the pre-commit deadline"
           : "claude capture upstream ended before producing output",
+      captureOwnership: "accepted",
     };
   }
   if (first.kind === "error") {
     args.kill();
     void reader.cancel().catch(() => undefined);
-    return { kind: "declined", reason: first.reason };
+    return {
+      kind: "declined",
+      reason: first.reason,
+      captureOwnership: "accepted",
+    };
   }
 
   const firstMeaningful = first.chunk;
@@ -542,10 +593,20 @@ export const runClaudeTextCapture = async (
     };
   }
 
-  const chunks = chunksFromCapturedAnthropicResponse(
+  const rawChunks = chunksFromCapturedAnthropicResponse(
     dispatchResult.response,
     params.providerModelId,
   );
+  // Capture-only guard: a clean upstream EOF with no observed terminal
+  // finish_reason (dropped connection, truncated body after 200) must not
+  // silently become a synthesized "stop" — see request-capture-output.ts.
+  // Must wrap the RAW decoded Anthropic SSE stream, not a client-wire
+  // re-encoding: `chunksToMessagesSseBytes` has its own EOF-without-
+  // finish_reason synthesis (a real limitation for ordinary non-capture
+  // streams) that only ever sees a clean `done` — making this stream
+  // reject instead routes it into that re-encoder's error branch, not its
+  // synthesis branch.
+  const chunks = requireCaptureTerminalFinishReason(rawChunks);
   const run = await commitFromChunkStream({
     chunks,
     signal: params.signal,
@@ -577,8 +638,11 @@ export const runClaudeTextCapture = async (
   }
 
   // Defer session/loopback teardown until the committed SSE body is fully
-  // consumed. Disposing here would abort the shared capture signal and truncate
-  // a still-live upstream Response body mid-stream.
+  // consumed. `dispose()` aborts the capture session signal; doing that while
+  // a fetch body is still open truncates decode (same class of failure as the
+  // old `complete(dispatched)` → linkAbort race fixed in request-capture).
+  // Builder child exit after local HTTP 204 is ownership transfer only — it is
+  // not a signal to abort the daemon-owned upstream body.
   const committedChunks = run.chunks;
   let lifetimeReader: ReadableStreamDefaultReader<TChatCompletionChunk> | null =
     null;
@@ -650,6 +714,27 @@ export type TClaudeCaptureAdapterInput = {
    * loopback listen, CLI spawn, or upstream attempt.
    */
   readonly canonical?: TChatCompletionRequest;
+  /**
+   * Non-empty → tool capture via dynamic import of `claude-tool-capture.ts`
+   * (avoids a static import cycle). Hermetic suites MUST pass
+   * `toolCapture.builder` (fixture); default fixture builder never spawns a
+   * real Claude binary.
+   */
+  readonly tools?: ReadonlyArray<{
+    readonly name: string;
+    readonly description?: string;
+    readonly parameters?: Record<string, unknown>;
+  }>;
+  readonly toolCapture?: {
+    readonly historyTurns?: ReadonlyArray<import("./types").TNativeHistoryTurn>;
+    readonly deltaText?: string;
+    readonly hasPrior?: boolean;
+    readonly historyFeed?:
+      | "fixture_messages"
+      | "sdk_unproven"
+      | "sdk_session_resume";
+    readonly builder?: import("./claude-tool-capture").TClaudeToolCaptureBuilder;
+  };
   readonly capture: {
     readonly sender: TCapturedDispatchSender;
     readonly allowLoopbackDestinations?: boolean;
@@ -659,8 +744,9 @@ export type TClaudeCaptureAdapterInput = {
 };
 
 /**
- * Integration entry: control gate + text capture. Tool-bearing requests must
- * not call this — {@link CLAUDE_TOOL_CAPTURE_STATUS}.
+ * Integration entry: control gate + text or tool capture. Explicit capture
+ * with tools does NOT silently fall back to the ordinary held-query bridge —
+ * unsupported history/controls decline with a clear reason.
  */
 export const runClaudeCaptureAdapter = async (
   input: TClaudeCaptureAdapterInput,
@@ -679,6 +765,48 @@ export const runClaudeCaptureAdapter = async (
       };
     }
   }
+
+  if (input.tools !== undefined && input.tools.length > 0) {
+    const { runClaudeToolCapture, CLAUDE_TOOL_CAPTURE_STATUS: toolStatus } =
+      await import("./claude-tool-capture");
+    // Production defaults: official SDK builder + sdk_session_resume.
+    // Hermetic suites MUST inject fixture builder + fixture_messages explicitly
+    // so ordinary tests never spawn the real CLI / Keychain.
+    const toolResult = await runClaudeToolCapture({
+      bin: input.native.bin,
+      env: input.native.env,
+      providerModelId: input.native.providerModelId,
+      systemText: input.native.systemText,
+      tools: input.tools,
+      historyTurns: input.toolCapture?.historyTurns ?? [],
+      deltaText: input.toolCapture?.deltaText ?? input.native.userText,
+      hasPrior: input.toolCapture?.hasPrior ?? false,
+      signal: input.native.signal,
+      captureSender: input.capture.sender,
+      historyFeed: input.toolCapture?.historyFeed ?? "sdk_session_resume",
+      ...(input.toolCapture?.builder !== undefined
+        ? { builder: input.toolCapture.builder }
+        : {}),
+      allowLoopbackDestinations: input.capture.allowLoopbackDestinations,
+      captureTimeoutMs: input.capture.captureTimeoutMs,
+      maxBodyBytes: input.capture.maxBodyBytes,
+      canonical: input.canonical,
+    });
+    return {
+      run: toolResult.run,
+      diagnostics: {
+        textSettlement:
+          toolResult.diagnostics.textSettlement === "interrupted"
+            ? "unproven_text_settlement"
+            : toolResult.diagnostics.textSettlement,
+        toolCapture: toolStatus,
+        daemonDispatchCount: toolResult.diagnostics.daemonDispatchCount,
+        preambleExternalForwards: 0,
+        capturedEnvelope: toolResult.diagnostics.capturedEnvelope,
+      },
+    };
+  }
+
   return runClaudeTextCapture({
     ...input.native,
     captureSender: input.capture.sender,
