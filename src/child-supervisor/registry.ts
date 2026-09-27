@@ -87,6 +87,9 @@ const darwinPsStartTime = (pid: number): string | null | undefined => {
         stdout: "pipe",
         stderr: "ignore",
         env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+        // A stalled ps must not block the daemon (review P2): same bound as
+        // the shared reader. A timeout gives a null exit code → "unknown".
+        timeout: 1500,
       },
     );
     if (output.exitCode !== 0) {
