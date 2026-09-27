@@ -197,9 +197,11 @@ const readCursor = (): TCursor | null => {
   }
 };
 
-// TH-6 residual: `atomicWriteText` mkdirs the state dir unconditionally, so a
-// late cursor/pending write after uninstall would resurrect it. Both guards
-// drop the write when the dir is gone (see `doctorStateDirWritable`).
+// TH-6: a late cursor/pending write after uninstall must not resurrect the
+// state dir. Two layers: `doctorStateDirWritable` skips the write when the
+// dir is already gone, and `atomicWriteText` is no-create — even if teardown
+// lands between the check and the open, the tmp-file open fails ENOENT rather
+// than recreating the dir (see files.ts).
 const writeCursor = (cursor: TCursor): boolean =>
   doctorStateDirWritable() &&
   atomicWriteText(cursorPath(), `${JSON.stringify(cursor)}\n`);

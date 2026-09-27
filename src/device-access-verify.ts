@@ -197,8 +197,48 @@ export type TCheckDeviceGrantResult =
   | { readonly ok: false; readonly reason: string };
 
 /**
- * Full grant check: decode → rebuild message → ts window → nonce →
- * key_id/cid/aud → signature against the pinned pubkey.
+ * Min interval between `stale_ts` diagnostics. A signed-but-stale grant is
+ * exceptional (real signer, wrong clock) and the warn carries the measured
+ * skew for support — but a burst of skewed retries, or replays of a captured
+ * grant past its window, must not stamp one disk line per request. The first
+ * stale grant logs; repeats land at most once a minute and carry the
+ * suppressed count.
+ */
+const STALE_TS_WARN_MIN_INTERVAL_MS = 60_000;
+let lastStaleTsWarnAt = Number.NEGATIVE_INFINITY;
+let staleTsWarnSuppressed = 0;
+
+const warnStaleTs = (skewMs: number): void => {
+  const now = Date.now();
+  if (now - lastStaleTsWarnAt < STALE_TS_WARN_MIN_INTERVAL_MS) {
+    staleTsWarnSuppressed += 1;
+    return;
+  }
+  lastStaleTsWarnAt = now;
+  logWarn(
+    "device-access",
+    safeDiagnosticMessage`device grant rejected: stale_ts (signer/verifier clock skew beyond the grant window)`,
+    {
+      skew_ms: skewMs,
+      window_ms: DEVICE_GRANT_TS_WINDOW_MS,
+      suppressed: staleTsWarnSuppressed,
+    },
+  );
+  staleTsWarnSuppressed = 0;
+};
+
+/** Test-only: reset the stale_ts warn throttle between cases. */
+export const resetStaleTsDiagnosticsForTest = (): void => {
+  lastStaleTsWarnAt = Number.NEGATIVE_INFINITY;
+  staleTsWarnSuppressed = 0;
+};
+
+/**
+ * Full grant check: decode → signature against the pinned pubkey → ts
+ * window → key_id/cid/aud → nonce. The signature runs FIRST — before any
+ * field check that can write a log line — so an unauthenticated request
+ * carrying a crafted old ts dies at `bad_sig` instead of reaching the
+ * stale_ts diagnostic (request-driven log/doctor-write amplification).
  */
 export const checkDeviceGrant = (
   envelopeB64: string,
@@ -212,20 +252,25 @@ export const checkDeviceGrant = (
   if (envelope === null) {
     return { ok: false, reason: "malformed" };
   }
+  const msg = buildDeviceGrantMessage({
+    v: envelope.v,
+    n: envelope.n,
+    ts: envelope.ts,
+    key_id: envelope.key_id,
+    cid: envelope.cid,
+    aud: envelope.aud,
+  });
+  if (!verifyDeviceGrantNode(pinned, msg, envelope.sig)) {
+    return { ok: false, reason: "bad_sig" };
+  }
   const now = Date.now();
   if (Math.abs(now - envelope.ts) > DEVICE_GRANT_TS_WINDOW_MS) {
     // Surface the measured skew: `stale_ts` rejections mean the viewer's clock
     // differs from this host's by more than the grant window (TCB-5). The
     // signed offset lands in the daemon log + doctor observations so support
-    // can see WHICH clock is off and by how much.
-    logWarn(
-      "device-access",
-      safeDiagnosticMessage`device grant rejected: stale_ts (signer/verifier clock skew beyond the grant window)`,
-      {
-        skew_ms: now - envelope.ts,
-        window_ms: DEVICE_GRANT_TS_WINDOW_MS,
-      },
-    );
+    // can see WHICH clock is off and by how much — signature-verified only,
+    // and rate-limited (see `warnStaleTs`).
+    warnStaleTs(now - envelope.ts);
     return { ok: false, reason: "stale_ts" };
   }
   if (envelope.key_id !== expect.keyId) {
@@ -247,22 +292,10 @@ export const checkDeviceGrant = (
     }
   }
   // Nonce check AFTER identity checks so a wrong-key/cid grant cannot
-  // burn a legitimate nonce the browser may still retry with. Only
-  // remember the nonce once the signature also verifies.
+  // burn a legitimate nonce the browser may still retry with.
   pruneExpiredNonces(now);
   if (nonceSeen.has(envelope.n)) {
     return { ok: false, reason: "replayed_nonce" };
-  }
-  const msg = buildDeviceGrantMessage({
-    v: envelope.v,
-    n: envelope.n,
-    ts: envelope.ts,
-    key_id: envelope.key_id,
-    cid: envelope.cid,
-    aud: envelope.aud,
-  });
-  if (!verifyDeviceGrantNode(pinned, msg, envelope.sig)) {
-    return { ok: false, reason: "bad_sig" };
   }
   // Signature verified — only then admit the nonce. Full map of still-valid
   // nonces rejects rather than evicting (replay protection must not degrade).

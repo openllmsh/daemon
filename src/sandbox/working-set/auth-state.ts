@@ -17,42 +17,48 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { cliConfigDir } from "../../cli-paths";
 import type { TWorkingSet } from "./base";
-import { vendorExecDirs } from "./base";
+import { underBunTestRunner, vendorExecDirs } from "./base";
 
 /**
  * The `auth-state` layer's unique working set (pre-normalization — `index.ts`
  * runs `existing()`).
  */
 export const authStateLayer = (home: string): TWorkingSet => {
-  // Pre-create claude's XDG STATE + CACHE dirs the isolated claude WRITES at run
-  // time. REQUIRED on Linux: Landlock can only grant an EXISTING path
-  // (`existing()` drops a missing leaf rather than widening onto bare $HOME), so
-  // a fresh box would leave these ungranted. macOS is a harmless no-op.
-  // Muse's isolated auth store is `$XDG_CONFIG_HOME/muse` →
-  // `<cliHome("muse")>/.config/muse` (auth.json). Pre-create that leaf so a
-  // future decomposed `<state>/cli` grant can address it; today the whole
-  // state dir already covers it.
-  for (const d of [
-    join(home, ".local", "state", "claude"),
-    join(home, ".cache", "claude"),
-    cliConfigDir("muse"),
-  ]) {
-    try {
-      mkdirSync(d, { recursive: true });
-    } catch {
-      // best-effort — an ungranted leaf just fails that vendor's run visibly.
-    }
-  }
-  // bun's global install cache — the RW half of the split ~/.bun grant. Only
-  // pre-create it when bun IS installed: absent bun means the plugin install
-  // fails its own `command -v bun` check, and fabricating ~/.bun on a bun-less
-  // box would be pure noise.
+  // bun's global install cache — the RW half of the split ~/.bun grant.
   const bunCache = join(home, ".bun", "install", "cache");
-  if (existsSync(join(home, ".bun"))) {
-    try {
-      mkdirSync(bunCache, { recursive: true });
-    } catch {
-      // best-effort — see the claude-dir loop above.
+  // Pre-create the XDG/vendor dirs the isolated tools WRITE at run time.
+  // REQUIRED on Linux: Landlock can only grant an EXISTING path (`existing()`
+  // drops a missing leaf rather than widening onto bare $HOME), so a fresh
+  // box would leave these ungranted. macOS is a harmless no-op. Never inside
+  // a test runner — `daemonWorkingSet()` defaults `home` to the developer's
+  // real `homedir()`, so the mkdirs pollute it on every `bun test` (TH-4):
+  // `~/.local/state/claude`, `~/.cache/claude`, `~/.bun/install/cache` and the
+  // muse config leaf under the state dir.
+  if (!underBunTestRunner()) {
+    for (const d of [
+      join(home, ".local", "state", "claude"),
+      join(home, ".cache", "claude"),
+      // Muse's isolated auth store is `$XDG_CONFIG_HOME/muse` →
+      // `<cliHome("muse")>/.config/muse` (auth.json). Pre-create that leaf so a
+      // future decomposed `<state>/cli` grant can address it; today the whole
+      // state dir already covers it.
+      cliConfigDir("muse"),
+    ]) {
+      try {
+        mkdirSync(d, { recursive: true });
+      } catch {
+        // best-effort — an ungranted leaf just fails that vendor's run visibly.
+      }
+    }
+    // Only pre-create the bun cache when bun IS installed: absent bun means
+    // the plugin install fails its own `command -v bun` check, and
+    // fabricating ~/.bun on a bun-less box would be pure noise.
+    if (existsSync(join(home, ".bun"))) {
+      try {
+        mkdirSync(bunCache, { recursive: true });
+      } catch {
+        // best-effort — see the claude-dir loop above.
+      }
     }
   }
   const readWrite = new Set<string>([
