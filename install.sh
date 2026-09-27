@@ -753,8 +753,16 @@ env_lock_acquire() {
     if ! env_lock_legacy_held "$stem"; then
       if mkdir "$lockdir" 2>/dev/null; then
         # Pin the generation we created so the publish veto detects a
-        # quarantine+path-reuse, not only an in-place steal marker.
+        # quarantine+path-reuse, not only an in-place steal marker. When
+        # the inode cannot be captured, publish NOTHING and remove NOTHING:
+        # a blind publish could stamp into a successor's claim, and an
+        # unproven dir is never ours to rmdir — the staleness pass below
+        # re-judges what is actually at the name.
         ino="$(env_lock_path_ino "$lockdir")"
+        if [ -z "$ino" ]; then
+          sleep 0.01 2>/dev/null || sleep 1
+          continue
+        fi
         env_lock_publish_owner "$lockdir" "$ino"
         pub_rc=$?
         if [ "$pub_rc" = 0 ]; then
@@ -1650,8 +1658,13 @@ for _try in 1 2 3; do
   if mkdir "$lockd" 2>/dev/null; then
     # Pin the generation we created: the post-publish verify detects a
     # steal + successor-re-claim swap (identical inode guard to the
-    # env-lock's expectedIno).
+    # env-lock's expectedIno). When the inode cannot be captured, publish
+    # NOTHING and remove NOTHING — a blind record could stamp into a
+    # successor's claim, and an unproven dir is never ours to rmdir.
     lock_ino="$(job_dir_ino "$lockd")"
+    if [ -z "$lock_ino" ]; then
+      break
+    fi
     if printf '%s\n' "$myrec" > "$lockd/owner.tmp.$$" 2>/dev/null \
       && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
         || (set -C; cat "$lockd/owner.tmp.$$" > "$ownerfile") 2>/dev/null; }
@@ -1660,9 +1673,13 @@ for _try in 1 2 3; do
       # The dir at the name must still be OUR generation AND carry OUR
       # record — a swap mid-publish means a successor owns this claim.
       now_ino="$(job_dir_ino "$lockd")"
-      if { [ -z "$lock_ino" ] || [ "$now_ino" = "$lock_ino" ]; } \
+      if [ -n "$now_ino" ] && [ "$now_ino" = "$lock_ino" ] \
         && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
         published=1
+      elif [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
+        # A stray record of ours wherever it landed is still ours to drop —
+        # it would only make a successor's fresh claim look owned.
+        rm -f "$ownerfile" 2>/dev/null || true
       fi
       break
     fi
@@ -1670,7 +1687,7 @@ for _try in 1 2 3; do
     # The tmp write itself failed — drop the dir WE made, only while the
     # inode still proves OUR generation (a swapped dir is a successor's).
     now_ino="$(job_dir_ino "$lockd")"
-    if [ -n "$lock_ino" ] && [ "$now_ino" = "$lock_ino" ]; then
+    if [ -n "$now_ino" ] && [ "$now_ino" = "$lock_ino" ]; then
       rmdir "$lockd" 2>/dev/null || true
     fi
     break
