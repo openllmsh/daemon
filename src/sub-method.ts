@@ -25,10 +25,11 @@
  * same hop when declared. See `docs/proposals/active-sub-method.md` +
  * `docs/proposals/sub-method-simplified-execution.md`.
  *
- * `bridge-capture` is declared only for providers with a serve-activated
- * capture route today (Claude/Codex text + first-turn tools). Cursor/Muse keep
- * `bridge` only — a `cursor:bridge-capture` override still parses cloud-side
- * but capability normalization falls back to `methods[0]` (`bridge`).
+ * `bridge-capture` is declared for Claude/Codex native request capture,
+ * Cursor's ACP/Connect capture, and Muse's native endpoint-transport capture.
+ * Declaration enables selection; it does not certify every live scenario.
+ * Only providers without that declaration normalize a capture override to
+ * `methods[0]`; see the capture live-validation report for tested coverage.
  */
 
 import type {
@@ -44,9 +45,9 @@ export type TSubMethodCapability = {
 /**
  * The initial capability matrix (active-sub-method.md §initial capability
  * matrix). `bridge` is declared exactly for the native-runtime providers
- * (`isNativeRuntimeProvider`); kimi_code + grok are handrolled-only; cursor is
- * the one BRIDGE-ONLY provider (ACP has no manual HTTP transport to fall back
- * to). The table ⇔ native-runtime lockstep is machine-checked in
+ * (`isNativeRuntimeProvider`); kimi_code + grok are handrolled-only, while
+ * Cursor and Muse support native bridge variants without a handrolled fallback.
+ * The table ⇔ native-runtime lockstep is machine-checked in
  * `tests/transport/sub-method.test.ts`.
  */
 export const SUB_METHOD_CAPABILITIES: Readonly<
