@@ -186,6 +186,19 @@ export const discardMintedTmpDir = (leased: TSpawnEnvLeased): void => {
   removeTreeDeferred(leased.tmpDir);
 };
 
+/**
+ * Remove a minted dir only after `released` settles (the child and its
+ * process tree are gone). Used where the dir must outlive the function that
+ * spawned the child, for example a timed-out PTY login (rework-8).
+ */
+export const discardMintedTmpDirAfter = (
+  leased: TSpawnEnvLeased,
+  released: Promise<unknown>,
+): void => {
+  const discard = (): void => discardMintedTmpDir(leased);
+  void released.then(discard, discard);
+};
+
 /** Minted dirs whose removal belongs to a child's exit watcher. */
 const boundMintedTmpDirs = new Set<string>();
 
@@ -1543,6 +1556,9 @@ export const spawnLoginPty = async (
   }
 
   const leased = spawnEnvLeased(env);
+  // Set once the PTY child exists: the minted dir must outlive the child's
+  // whole process tree, not only this function (rework-8).
+  let released: Promise<unknown> | null = null;
 
   // Wrap the WHOLE `script(1)` argv — the PTY wrapper and the vendor CLI it
   // runs are one confined tree.
@@ -1573,6 +1589,7 @@ export const spawnLoginPty = async (
       },
     );
     const proc = child.subprocess;
+    released = Promise.allSettled([proc.exited, child.whenReleased]);
     // Lease upgrade only — NOT the exit watcher: the typescript lives inside
     // the minted dir and is read once more after the child exits, so removal
     // must wait for the function's own cleanup (the finally below removes the
@@ -1732,9 +1749,11 @@ export const spawnLoginPty = async (
       ...stamp,
     };
   } finally {
-    // Covers the typescript write and the spawn itself failing post-mint —
-    // a no-op once the exit watcher already removed the dir.
-    discardMintedTmpDir(leased);
+    // No child: remove the dir now. A child: remove it only after the child
+    // and its process tree are released; a timed-out or abandoned child can
+    // still be writing into it (rework-8).
+    if (released === null) discardMintedTmpDir(leased);
+    else discardMintedTmpDirAfter(leased, released);
     budget.release();
   }
 };
