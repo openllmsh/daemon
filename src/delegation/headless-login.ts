@@ -169,7 +169,12 @@ export const spawnHeadlessLogin = async (
     throw error;
   }
   opts?.onSpawned?.(child);
-  bindMintedTmpToChild(leased, child.subprocess, "headless-login");
+  bindMintedTmpToChild(
+    leased,
+    child.subprocess,
+    "headless-login",
+    child.whenReleased,
+  );
 
   const proc = child.subprocess;
   let terminatePromise: Promise<TReapOutcome> | null = null;

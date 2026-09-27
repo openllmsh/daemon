@@ -1124,7 +1124,7 @@ export const spawnStreamLogin = async <T>(
   const proc = supervised.subprocess;
   // Lease the run dir to the real child + remove it on exit — deterministic
   // even if the child dies before its registry identity lands.
-  bindMintedTmpToChild(leased, proc, "login-flow");
+  bindMintedTmpToChild(leased, proc, "login-flow", supervised.whenReleased);
   emitLoginStarted(flow);
   // A cancel that raced `slot.start` must still kill the just-spawned child.
   if (opts.slot.wasCancelled()) void requestTerminate();

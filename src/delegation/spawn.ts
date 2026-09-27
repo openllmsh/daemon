@@ -221,6 +221,7 @@ export const bindMintedTmpToChild = (
     readonly exited: Promise<number>;
   },
   sessionId: string,
+  released?: Promise<unknown>,
 ): void => {
   const dir = leased.tmpDir;
   if (dir === null) return;
@@ -229,7 +230,9 @@ export const bindMintedTmpToChild = (
     boundMintedTmpDirs.delete(dir);
     removeTreeDeferred(dir);
   };
-  void proc.exited.then(sweep, sweep);
+  // Wait for the supervisor's process-tree release too: the wrapper can exit
+  // while descendants still use the dir (rework-8).
+  void Promise.allSettled([proc.exited, released]).then(sweep);
   if (typeof proc.pid === "number") {
     leaseMintedTmpToChild(dir, proc.pid, sessionId);
   }
@@ -574,7 +577,7 @@ export const runCaptureResult = async (
     // Tie the minted tmp dir to the real child — the lease upgrade is async
     // off the spawn path, and the exit watcher removes the dir outright when
     // the child dies (rework-7 / RG-2).
-    bindMintedTmpToChild(leased, proc, "capture");
+    bindMintedTmpToChild(leased, proc, "capture", child.whenReleased);
     if (opts?.producer !== undefined) {
       logDebug("spawn", "native auth child started", {
         producer: opts.producer,
@@ -1069,7 +1072,7 @@ export const spawnLogin = async (
     // Tie the minted tmp dir to the real child — the lease upgrade is async
     // off the spawn path, and the exit watcher removes the dir outright when
     // the child dies (rework-7 / RG-2).
-    bindMintedTmpToChild(leased, proc, "login");
+    bindMintedTmpToChild(leased, proc, "login", child.whenReleased);
     const stamp = spawnStamp(proc);
     const unbindEarlyAbort = bindAbort(loginOpts?.signal, () => {
       void requestTerminate();
