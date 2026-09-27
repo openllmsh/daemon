@@ -485,7 +485,7 @@ export const startRecorder = (spec: TCaptureSpec): TRecorder => {
             : await req.arrayBuffer();
         // The forwarded request may carry the CLI's own auth headers — never
         // auto-follow a vendor 30x to a different origin (S3R-1).
-        return await fetchWithBoundedRedirects(
+        const resp = await fetchWithBoundedRedirects(
           spec.origin + url.pathname + url.search,
           (target) =>
             fetch(target, {
@@ -497,6 +497,27 @@ export const startRecorder = (spec: TCaptureSpec): TRecorder => {
             }),
           "auth-config",
         );
+        // A redirect the bounded policy refused to re-issue still carries its
+        // `Location`. Handing that response to the CLI verbatim would let the
+        // CLI's own HTTP client auto-follow it — re-sending the
+        // credential-bearing request to an arbitrary origin, which is the
+        // exact leak S3R-1 closes daemon-side. Answer a plain 502 instead: the
+        // preamble fails and the capture falls back to the stored/default URL.
+        if (
+          resp.status >= 300 &&
+          resp.status < 400 &&
+          resp.headers.get("location") !== null
+        ) {
+          logWarn(
+            "auth-config",
+            `refused to relay an upstream ${resp.status} to the CLI`,
+            { status: resp.status },
+          );
+          // Drain so the connection stays reusable.
+          await resp.arrayBuffer().catch(() => undefined);
+          return new Response(null, { status: 502 });
+        }
+        return resp;
       } catch {
         return new Response(null, { status: 502 });
       }
