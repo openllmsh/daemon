@@ -228,20 +228,28 @@ refuse_downgrade() {
 #
 #   kind=openllm-env-lock/v1 pid=<pid> start=<start identity> nonce=<hex>
 #
-# `start` is the owner's `ps -o lstart=` identity under LC_ALL=C TZ=UTC
-# with whitespace collapsed to single spaces — the same value the daemon's
-# `processStartIdentity` reads. It distinguishes a LIVE-but-reused pid from
-# the real owner (PID reuse). `-` records an owner that could not read its
-# own identity.
+# `start` is the owner's canonical start identity, the same value the
+# daemon's `processStartIdentity` reads: on Linux the boot-scoped
+# `boot:<boot_id>:<starttime ticks>` pair (built from
+# /proc/sys/kernel/random/boot_id and field 22 of /proc/<pid>/stat, parsed
+# after the last ') ' of the comm field); on macOS the `ps -o lstart=` text
+# under LC_ALL=C TZ=UTC, whitespace collapsed to single spaces. It
+# distinguishes a LIVE-but-reused pid from the real owner (PID reuse).
+# Records written by older builds can carry the `ps lstart` text — a
+# live-pid record in the other format is re-probed in the record's own
+# format before it can convict — or `-` (an owner that could not read its
+# own identity). `-` is never written by this build.
 #
 # A held lock is STALE only when its marked owner names a dead pid, or a
 # live pid whose current start identity differs. A dir with no, unreadable
 # or unmarked owner is HELD — but only inside a short "unproven" bound
 # (OPENLLM_ENV_LOCK_ORPHAN_SECS, default 30 s): past it an ownerless dir
-# (a holder killed between `mkdir` and publish) is reclaimed. The same
-# bound caps a marked owner whose start is `-` (never provable) and the
-# legacy `.env.lock` FILE — an unprovable identity must not wedge the lock
-# for the full stale window.
+# (a holder killed between `mkdir` and publish) is reclaimed. A marked
+# owner whose start is `-` can never be proven, so a live pid still holds
+# it for the full stale window — a transient probe failure on the owner's
+# side must never make a live lock reclaimable in seconds. The orphan bound
+# still caps the legacy `.env.lock` FILE — an unprovable identity must not
+# wedge the lock for the full stale window.
 #
 # Reclaim is MARK-FIRST. A contender that judges the dir stale drops a
 # `steal.<pid>.<nonce>` marker INSIDE it (noclobber create), re-judges the
@@ -320,14 +328,66 @@ env_lock_pid_alive() {
 }
 
 # `ps -o lstart=` under the fixed locale/timezone the daemon's
-# processStartIdentity uses, whitespace collapsed to single spaces.
-env_lock_start_identity() {
+# legacyProcessStartIdentity uses, whitespace collapsed to single spaces.
+# This is the identity format records written by OLDER builds carry — used
+# to re-probe a live pid in a record's own format before it can convict.
+env_lock_legacy_start_identity() {
   local out
   out="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || out=""
   out="$(printf '%s' "$out" | tr -s '[:space:]' ' ')"
   out="${out# }"
   out="${out% }"
   printf '%s' "$out"
+}
+
+# True when $1 is a post-RT-1 `boot:<boot_id>:<ticks>` start identity —
+# the same shape the daemon's BOOT_IDENTITY_RE accepts.
+env_lock_is_boot_identity() {
+  local re='^boot:[0-9a-f-]{36}:[0-9]+$'
+  [[ "$1" =~ $re ]]
+}
+
+# Collapse whitespace exactly like the daemon's normalizeProcessStartIdentity
+# (`value.trim().split(/\s+/).join(" ")`) so a padded legacy record still
+# compares equal.
+env_lock_normalize_identity() {
+  local out
+  out="$(printf '%s' "$1" | tr -s '[:space:]' ' ')"
+  out="${out# }"
+  out="${out% }"
+  printf '%s' "$out"
+}
+
+# The canonical start identity — the value the daemon's processStartIdentity
+# reads for the same pid. On Linux that is `boot:<boot_id>:<ticks>`: the
+# kernel boot id (both sides lowercased) plus /proc/<pid>/stat field 22 in
+# USER_HZ ticks — parsed AFTER the last ") " because comm can hold spaces or
+# a ')'. On macOS and other POSIX the `ps lstart` text above. Empty means
+# unknown or dead — never a guess.
+env_lock_start_identity() {
+  local pid="$1" boot stat rest ticks
+  if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    boot="$(printf '%s' "$boot" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    local re='^[0-9a-f-]{36}$'
+    [[ "$boot" =~ $re ]] || return 0
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    [ -n "$stat" ] || return 0
+    # Fields are numbered from the pid: dropping "<pid> (<comm>) " leaves
+    # field 3 as index 0 — the daemon reads starttime (field 22) as index
+    # 19. `${stat##*) }` cuts through the LAST ") " (comm can hold a ')');
+    # a stat with no ") " at all degrades to `slice(1)` exactly like the
+    # daemon's `lastIndexOf(") ")` fallback.
+    rest="${stat##*) }"
+    [ "$rest" = "$stat" ] && rest="${stat:1}"
+    local -a f
+    read -r -a f <<< "$rest"
+    ticks="${f[19]:-}"
+    [[ "$ticks" =~ ^[0-9]+$ && "$ticks" =~ [1-9] ]] || return 0
+    printf 'boot:%s:%s' "$boot" "$((10#$ticks))"
+    return 0
+  fi
+  env_lock_legacy_start_identity "$pid"
 }
 
 # Read <dir>/owner into ENV_LOCK_OWNER_{STATE,PID,START,NONCE}. STATE is
@@ -405,23 +465,41 @@ env_lock_path_ino() {
 # mtime used for the age terms (the steal re-check — our own `steal.*`
 # marker create already bumped the dir's mtime).
 env_lock_is_stale_dir() {
-  local dir="$1" as_of="${2:-}" current age
+  local dir="$1" as_of="${2:-}" current bridged recorded age
   env_lock_read_owner "$dir"
   age="$(env_lock_dir_age_secs "$dir" "$as_of")"
   if [ "$ENV_LOCK_OWNER_STATE" = "marked" ]; then
     env_lock_pid_alive "$ENV_LOCK_OWNER_PID" || return 0
-    if [ "$ENV_LOCK_OWNER_START" = "-" ]; then
-      # The start identity can never be proven ("-"): the lock is held only
-      # inside the same bounded window an ownerless dir gets — past it a
-      # live-but-unidentifiable pid no longer wedges the lock.
-      { [ "$age" -ge 0 ] && [ "$age" -ge "$ENV_LOCK_ORPHAN_SECS" ]; }
+    # The daemon normalizes the recorded identity before comparing —
+    # same collapse here so a padded legacy record still matches.
+    recorded="$(env_lock_normalize_identity "$ENV_LOCK_OWNER_START")"
+    if [ "$recorded" = "-" ]; then
+      # The start identity can never be proven ("-": written only by
+      # builds that latched a failed probe — this build never writes it):
+      # the live pid holds for the full CONSERVATIVE stale window, never
+      # the orphan bound — a transient probe failure on the owner's side
+      # must not make a live lock reclaimable in seconds.
+      { [ "$age" -ge 0 ] && [ "$age" -ge "$ENV_LOCK_STALE_SECS" ]; }
       return
     fi
     current="$(env_lock_start_identity "$ENV_LOCK_OWNER_PID")"
-    # PID reuse is proven ONLY by a live-but-different identity; anything
-    # unreadable keeps the lock held.
-    [ -n "$current" ] && [ "$current" != "$ENV_LOCK_OWNER_START" ]
-    return
+    if [ -z "$current" ]; then
+      # The probe could not answer: re-check liveness — a dead pid is
+      # stale, a live-but-unreadable identity stays held.
+      if env_lock_pid_alive "$ENV_LOCK_OWNER_PID"; then return 1; else return 0; fi
+    fi
+    [ "$current" = "$recorded" ] && return 1
+    # Same-format mismatch is proven PID reuse. A MIXED format pair is the
+    # boundary case (XS-1): a record written in the legacy `ps lstart`
+    # format by an older installer or daemon must be re-probed in its own
+    # format before a live pid can convict it.
+    env_lock_is_boot_identity "$current" || return 0
+    env_lock_is_boot_identity "$recorded" && return 0
+    bridged="$(env_lock_legacy_start_identity "$ENV_LOCK_OWNER_PID")"
+    if [ -z "$bridged" ]; then
+      if env_lock_pid_alive "$ENV_LOCK_OWNER_PID"; then return 1; else return 0; fi
+    fi
+    if [ "$bridged" = "$recorded" ]; then return 1; else return 0; fi
   fi
   # Unmarked: HELD unless past the short unproven bound AND still without
   # a complete owner — and never while a parseable pid in it is still
@@ -520,8 +598,21 @@ env_lock_legacy_resolve() {
     if [ "$age" -lt 0 ] || [ "$age" -lt "$ENV_LOCK_ORPHAN_SECS" ]; then
       if ln "$q" "$legacy" 2>/dev/null; then
         rm -f "$q" 2>/dev/null || true
-      elif (set -C; cat "$q" > "$legacy") 2>/dev/null; then
-        rm -f "$q" 2>/dev/null || true
+      elif (set -C; : > "$legacy") 2>/dev/null; then
+        # We claimed the name (noclobber create) — fill it and verify
+        # before consuming the captured record: a short write must not
+        # delete it. A mismatched file can only be OUR partial write —
+        # drop it and keep the quarantine for a later pass.
+        local l_sz q_sz
+        cat "$q" >> "$legacy" 2>/dev/null || true
+        l_sz="$(stat -c %s "$legacy" 2>/dev/null || stat -f %z "$legacy" 2>/dev/null || true)"
+        q_sz="$(stat -c %s "$q" 2>/dev/null || stat -f %z "$q" 2>/dev/null || true)"
+        if [ -n "$q_sz" ] && [ "$q_sz" = "$l_sz" ] \
+          && [ "$(cat "$legacy" 2>/dev/null)" = "$(cat "$q" 2>/dev/null)" ]; then
+          rm -f "$q" 2>/dev/null || true
+        else
+          rm -f "$legacy" 2>/dev/null || true
+        fi
       elif [ -e "$legacy" ] || [ -L "$legacy" ]; then
         # A successor holds the path — the captured copy is obsolete.
         rm -f "$q" 2>/dev/null || true
@@ -585,7 +676,19 @@ env_lock_legacy_held() {
 env_lock_publish_owner() {
   local lockdir="$1" want_ino="${2:-}" start stolen same_gen marker now_ino
   start="$(env_lock_start_identity "$$")"
-  [ -n "$start" ] || start="-"
+  if [ -z "$start" ]; then
+    # A live owner MUST carry a provable start identity — `start=-` made a
+    # held lock reclaimable by a third writer while the owner was still
+    # alive (a transient probe failure used to be written as `-`). A failed
+    # probe publishes NOTHING: drop the dir WE made — only while it is
+    # still our generation — and report a retryable failure so the acquire
+    # loop re-probes from the top.
+    if [ -n "$want_ino" ] \
+      && [ "$(env_lock_path_ino "$lockdir")" = "$want_ino" ]; then
+      rmdir "$lockdir" 2>/dev/null || true
+    fi
+    return 1
+  fi
   printf 'kind=openllm-env-lock/v1 pid=%s start=%s nonce=%s\n' \
     "$$" "$start" "$ENV_LOCK_NONCE" > "$lockdir/owner.tmp.$$" 2>/dev/null \
     || return 2
@@ -683,16 +786,56 @@ env_lock_acquire() {
 # silently replace a successor's just-`mkdir`'d (still empty) dir that
 # landed in the check->move gap; `mkdir` is the atomic no-replace claim —
 # a re-taken path leaves the captured dir parked for the sweep. On a
-# successful claim each regular file is copied back verbatim, then the
-# quarantine is drained.
+# successful claim each regular file is copied VERIFIED — a noclobber
+# create, then a byte-and-size compare against the source — and the
+# quarantined source is deleted only after EVERY copy lands whole: a
+# failed or partial copy rolls the fresh dir back to empty and keeps the
+# captured dir intact for a later pass — the only valid owner record is
+# never destroyed by an incomplete restore.
 env_lock_restore_dir() {
-  local rel="$1" lockdir="$2" child
+  local rel="$1" lockdir="$2" child base dst ok=1 l_sz q_sz
+  # "$@" accumulates the basenames this pass copied — arbitrary foreign
+  # names (spaces, glob chars) cannot split or glob inside "$@".
+  set --
   mkdir "$lockdir" 2>/dev/null || return 0
   for child in "$rel"/*; do
     [ -f "$child" ] || continue
-    cat "$child" > "$lockdir/${child##*/}" 2>/dev/null || true
+    base="${child##*/}"
+    dst="$lockdir/$base"
+    # Noclobber-claim the destination name FIRST (set -C create), then fill
+    # it — the claim distinguishes "a file THIS pass made" from a foreign
+    # entry that landed first, which is never removed below. The fill uses
+    # `>>` so a foreign swap can never be truncated by us.
+    if (set -C; : > "$dst") 2>/dev/null; then
+      cat "$child" >> "$dst" 2>/dev/null || true
+      l_sz="$(stat -c %s "$dst" 2>/dev/null || stat -f %z "$dst" 2>/dev/null || true)"
+      q_sz="$(stat -c %s "$child" 2>/dev/null || stat -f %z "$child" 2>/dev/null || true)"
+      if [ -n "$q_sz" ] && [ "$q_sz" = "$l_sz" ] \
+        && [ "$(cat "$child" 2>/dev/null)" = "$(cat "$dst" 2>/dev/null)" ]; then
+        set -- "$@" "$base"
+        continue
+      fi
+      # The copy failed or mis-verified: remove the file THIS pass made,
+      # then abort — the quarantined source is preserved for a later pass.
+      rm -f "$dst" 2>/dev/null || true
+    fi
+    ok=0
+    break
   done
-  for child in "$rel"/*; do rm -f "$child" 2>/dev/null || true; done
+  if [ "$ok" = 1 ]; then
+    # Flush the copied dir best-effort (no portable fsync exists in sh):
+    # `sync` covers the file payloads where it is available.
+    command -v sync >/dev/null 2>&1 && sync 2>/dev/null || true
+  else
+    # Roll the fresh dir back to its claimed-empty state — only the files
+    # this pass copied — then drop the dir itself.
+    for base in "$@"; do rm -f "$lockdir/$base" 2>/dev/null || true; done
+    rmdir "$lockdir" 2>/dev/null || true
+    return 0
+  fi
+  for base in "$@"; do rm -f "$rel/$base" 2>/dev/null || true; done
+  # Any entry that survived (non-regular or foreign residue) keeps the
+  # quarantine parked for the sweep instead of being lost.
   rmdir "$rel" 2>/dev/null || true
   return 0
 }
@@ -1423,8 +1566,9 @@ provision_clis() {
   job_body="$(cat <<'OPENLLM_VENDOR_JOB'
 pidfile="$1"; timeout_bin="$2"; job_timeout="$3"; curl_bin="$4"; url="$5"; setsid_bin="$6"; launchfile="$7"
 # The pidfile holds "<job leader pid> <start identity>" so a re-run can tell
-# a live job from a stale — or PID-REUSED — owner (same lstart identity the
-# env-file lock uses). It is published ATOMICALLY (temp + no-replace ln) only now that
+# a live job from a stale — or PID-REUSED — owner (the legacy `ps lstart`
+# identity format — see below; NOT the env-lock boot-scoped format).
+# It is published ATOMICALLY (temp + no-replace ln) only now that
 # the job's real identity is known — the parent's fresh launch marker covers
 # the spawn-to-publish gap, so a second installer sees "launch in progress"
 # rather than a dead placeholder. The marker is dropped once the pidfile is
@@ -1432,6 +1576,10 @@ pidfile="$1"; timeout_bin="$2"; job_timeout="$3"; curl_bin="$4"; url="$5"; setsi
 # CONFIRMED gone (the EXIT trap below re-probes after the reap poll — and
 # NEVER when the pgid is unknown, e.g. the timeout branch or a ps failure:
 # an unverifiable group leaves the pid+start record for a re-run to reap).
+# The pidfile start identity uses the `ps lstart` format deliberately: this
+# job body is a standalone `bash -c` that cannot reach the lock block's
+# boot-scoped reader, and the records are internal to this installer — never
+# compared against env-lock `owner` records.
 job_start="$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ 2>/dev/null | tr -s '[:space:]' ' ')"
 job_start="${job_start# }"; job_start="${job_start% }"
 # "<pid> <start>" record → live? (pid alive and, when both are known, the
@@ -1606,7 +1754,10 @@ OPENLLM_VENDOR_JOB
 )"
   local job_dir="$OPENLLM_DIR/cli-install"
   local spec name cmd dest url pidfile job_log launchfile launch_age in_progress owner owner_pid owner_start owner_live owner_start_now self_start
-  self_start="$(env_lock_start_identity "$$")"
+  # The vendor pidfile/launchfile records use the legacy `ps lstart` format
+  # — the detached job body writes its own record with inline `ps`, so the
+  # comparisons below must probe in that same format.
+  self_start="$(env_lock_legacy_start_identity "$$")"
   [ -n "$self_start" ] || self_start="-"
   # Publish residue: a job SIGKILLed between the pidfile tmp write and the
   # mv leaves `<cmd>.pid.tmp.<pid>` behind — bounded growth across repeated
@@ -1658,8 +1809,8 @@ OPENLLM_VENDOR_JOB
     # parent-written placeholder pidfile: the LAUNCH marker is created
     # O_EXCL here before the job is spawned, and the JOB publishes the
     # pidfile itself (temp + no-replace ln) once its real "<pid> <start identity>" is
-    # known. A live pidfile owner (PID-reuse-safe via the same lstart check
-    # as the env-file lock) or a launch marker with a LIVE launcher means
+    # known. A live pidfile owner (PID-reuse-safe via the recorded lstart
+    # identity vs a fresh lstart probe) or a launch marker with a LIVE launcher means
     # "in progress" — covering the spawn-to-publish gap where the first
     # installer may already have exited; stale leftovers are reclaimed.
     owner="$(cat "$pidfile" 2>/dev/null || true)"
@@ -1670,7 +1821,7 @@ OPENLLM_VENDOR_JOB
     if [[ "$owner_pid" =~ ^[0-9]+$ ]] && env_lock_pid_alive "$owner_pid"; then
       owner_live=1
       if [ -n "$owner_start" ] && [ "$owner_start" != "-" ]; then
-        owner_start_now="$(env_lock_start_identity "$owner_pid")"
+        owner_start_now="$(env_lock_legacy_start_identity "$owner_pid")"
         if [ -n "$owner_start_now" ] && [ "$owner_start_now" != "$owner_start" ]; then
           owner_live=0
         fi
@@ -1698,7 +1849,7 @@ OPENLLM_VENDOR_JOB
         if env_lock_pid_alive "$owner_pid"; then
           owner_live=1
           if [ -n "$owner_start" ] && [ "$owner_start" != "-" ]; then
-            owner_start_now="$(env_lock_start_identity "$owner_pid")"
+            owner_start_now="$(env_lock_legacy_start_identity "$owner_pid")"
             if [ -n "$owner_start_now" ] && [ "$owner_start_now" != "$owner_start" ]; then
               owner_live=0
             fi
