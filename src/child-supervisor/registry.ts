@@ -16,7 +16,10 @@ import {
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { stateDir } from "../env";
 import { logDebug } from "../logger";
-import { spawn as admittedSpawn } from "../windows-process";
+import {
+  spawn as admittedSpawn,
+  spawnSync as admittedSpawnSync,
+} from "../windows-process";
 import { processGroupExists, signalGroup } from "./posix";
 
 export type TDisposableChildKind =
@@ -70,18 +73,71 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
   );
 };
 
-/** Use the shared process identity for new records. */
-export const processStartTime = processStartIdentity;
+/**
+ * darwin start identity through the daemon's ADMITTED spawn path (the same
+ * `ps -o lstart=` probe as before XS-2). The shared local-runtime reader runs
+ * `ps` through node:child_process, which bypasses the admission seam and the
+ * loader-boundary allowlist; the macmini PTY suite caught that regression.
+ */
+/** ESRCH from kill(pid, 0) proves the pid is gone; anything else is unknown. */
+const livenessFallback = (pid: number): null | undefined => {
+  try {
+    process.kill(pid, 0);
+    return undefined;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? null : undefined;
+  }
+};
+
+const darwinPsStartTime = (pid: number): string | null | undefined => {
+  try {
+    const output = admittedSpawnSync(
+      ["ps", "-o", "lstart=", "-p", String(pid)],
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+        // A stalled ps must not block the daemon (review P2): same bound as
+        // the shared reader. A timeout gives a null exit code → "unknown".
+        timeout: 1500,
+      },
+    );
+    if (output.exitCode !== 0) return livenessFallback(pid);
+    const value = new TextDecoder().decode(output.stdout).trim();
+    return value.length > 0 ? value : undefined;
+  } catch {
+    // ps could not start at all (e.g. not on PATH): still prove a dead pid
+    // dead instead of reporting every record as unknown (review P2).
+    return livenessFallback(pid);
+  }
+};
+
+/**
+ * Start identity for new records. Linux: the shared in-process /proc
+ * identity (XS-2, no subprocess). darwin: the admitted `ps` probe. Windows:
+ * the shared identity.
+ */
+export const processStartTime = (pid: number): string | null | undefined =>
+  process.platform === "darwin"
+    ? darwinPsStartTime(pid)
+    : processStartIdentity(pid);
 
 export const childProcessIdentityStatus = (
   record: TChildRegistryRecord,
 ): "alive" | "dead" | "unknown" =>
-  processIdentityStatus(
-    record.pid,
-    record.processStartTime,
-    processStartIdentity,
-    legacyProcessStartIdentity,
-  );
+  process.platform === "darwin"
+    ? processIdentityStatus(
+        record.pid,
+        record.processStartTime,
+        darwinPsStartTime,
+        darwinPsStartTime,
+      )
+    : processIdentityStatus(
+        record.pid,
+        record.processStartTime,
+        processStartIdentity,
+        legacyProcessStartIdentity,
+      );
 
 /**
  * Named budget for the async `ps -o lstart=` helper. Failure to obtain
