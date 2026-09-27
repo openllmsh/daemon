@@ -99,13 +99,6 @@ export const MUSE_SERVE_SAFETY_ARGS = [
 export const MUSE_RPC_TIMEOUT_MS = 30_000;
 
 /**
- * Bound on the cleanup join at stream end. Turn cancel + host close + dir
- * removal must finish before the run is torn down, but a wedged vendor host
- * cannot be allowed to stall the end path forever.
- */
-const MUSE_CLEANUP_TIMEOUT_MS = 5_000;
-
-/**
  * Selected host approval mode (official closed `ApprovalMode` enum).
  *
  * `onRequest` is the product candidate after live probes showed
@@ -1363,38 +1356,8 @@ export const runMuseNative = async (
     }
   };
 
-  /**
-   * At most one cleanup runs at a time. A caller that arrives mid-run joins
-   * the in-flight cleanup instead of racing a second cancel/close/rm over the
-   * same resources; once it settles the next caller starts a fresh run so
-   * resources created afterwards are still collected.
-   */
-  let cleanupInFlight: Promise<void> | null = null;
-  const cleanupJoined = (): Promise<void> => {
-    if (cleanupInFlight !== null) return cleanupInFlight;
-    const run = cleanup().finally(() => {
-      if (cleanupInFlight === run) cleanupInFlight = null;
-    });
-    cleanupInFlight = run;
-    return run;
-  };
-  const cleanupBounded = async (): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        cleanupJoined(),
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, MUSE_CLEANUP_TIMEOUT_MS);
-          timer.unref?.();
-        }),
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-
   const abort = (): void => {
-    void cleanupJoined();
+    void cleanup();
     if (ended) return;
     if (turn.sawOutput()) {
       noteFirstOutputSuccess();
@@ -1507,7 +1470,7 @@ export const runMuseNative = async (
     );
     if (params.signal.aborted) {
       emitMusePhaseTimings(phaseMarks, "aborted");
-      await cleanupBounded();
+      await cleanup();
       return { kind: "declined", reason: "client aborted" };
     }
     activeTurn = await withTimeout(
@@ -1521,7 +1484,7 @@ export const runMuseNative = async (
       phaseMarks,
       params.signal.aborted ? "aborted" : "declined",
     );
-    await cleanupBounded();
+    await cleanup();
     return setupDecline(error, params.signal);
   }
 
@@ -1613,7 +1576,7 @@ export const runMuseNative = async (
         emitMusePhaseTimings(phaseMarks, "failure");
         ended = true;
         push({ error: new Error(reason) });
-        void cleanupJoined();
+        void cleanup();
         return;
       }
       const acknowledgedSuccess =
@@ -1632,19 +1595,19 @@ export const runMuseNative = async (
             `muse turn ended without acknowledged success (${parts.join("/")})`,
           ),
         );
-        void cleanupJoined();
+        void cleanup();
         return;
       }
       noteFirstOutputSuccess();
       endWith(turn.finish(terminal ?? "completed"));
-      void cleanupJoined();
+      void cleanup();
     } catch (error: unknown) {
       // Do not join item/delta pumps here. `completed` already rejected, so a
       // hung iterator (or one that ignores cancel) would stall failStream
       // forever. Pumps are already observed via the void .catch above; cancel
       // via cleanup and surface the host error immediately.
       if (ended) {
-        void cleanupJoined();
+        void cleanup();
         return;
       }
       const folded = session?.lastUsage();
@@ -1666,7 +1629,7 @@ export const runMuseNative = async (
         ended = true;
         push({ error: err });
       }
-      void cleanupJoined();
+      void cleanup();
     }
   })();
 
@@ -1713,7 +1676,7 @@ export const runMuseNative = async (
           ? "aborted"
           : "failure",
     );
-    await cleanupBounded();
+    await cleanup();
     const reason =
       first === "timeout"
         ? "muse SDK produced no output before the pre-commit deadline"
@@ -1737,25 +1700,19 @@ export const runMuseNative = async (
     async pull(controller) {
       const next = await nextItem();
       if (next === "end") {
-        // The bounded join must finish BEFORE the reader sees EOF — a close
-        // ahead of it would let the caller tear down while the turn root and
-        // overlay still exist.
-        await cleanupBounded();
         controller.close();
+        await cleanup();
         return;
       }
       if (typeof next === "object" && next !== null && "error" in next) {
-        await cleanupBounded();
         controller.error(next.error);
+        await cleanup();
         return;
       }
       controller.enqueue(next);
     },
     cancel() {
       abort();
-      // Surface the cleanup promise: `stream.cancel()` resolves only after
-      // the turn dirs are gone (bounded), never instantly.
-      return cleanupBounded();
     },
   });
   return { kind: "committed", chunks, sessionId: () => null };
