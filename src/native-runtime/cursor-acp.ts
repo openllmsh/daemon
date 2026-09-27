@@ -58,8 +58,28 @@ import { logInfo, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
-import type { TCursorCaptureBridge } from "./cursor-capture";
-import { settleCursorCaptureViaAcpCancel } from "./cursor-capture";
+import type {
+  TCursorCaptureBridge,
+  TCursorTransactionSender,
+} from "./cursor-capture";
+import {
+  CursorCaptureDecodeError,
+  chunksStreamFromCursorConnectResponseBody,
+  defaultCursorCaptureSender,
+  forwardCursorRequestContextThroughBuilder,
+  isCursorHttp2Envelope,
+  openCursorCaptureBridge,
+  openCursorCapturedHttp2Session,
+  runCursorCapturedTransaction,
+  settleCursorCaptureViaAcpCancel,
+} from "./cursor-capture";
+import {
+  cursorExecServerFailure,
+  decodeAgentServerMessage,
+  encodeConnectEnvelope,
+  resolveConnectEnvelopePayload,
+  takeConnectEnvelopes,
+} from "./cursor-capture-decode";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
 import {
   cleanupCursorImageProjectDir,
@@ -83,7 +103,11 @@ import {
 import type { TCursorImage, TCursorTool } from "./cursor-request";
 import { acpPromptBlocks, extractJsonObject } from "./cursor-request";
 import type { TNativeRunResult } from "./types";
-import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+import {
+  captureOwnershipFromSession,
+  cleanNativeSpawnEnv,
+  PRE_COMMIT_TIMEOUT_MS,
+} from "./types";
 
 export type {
   TCursorCaptureBridge,
@@ -92,12 +116,21 @@ export type {
 export {
   buildCursorCaptureChildEnv,
   CURSOR_AGENT_DEFAULT_ORIGIN,
+  CURSOR_AGENT_STATIC_ORIGINS,
+  CURSOR_DYNAMIC_AGENT_HOST_RE,
   classifyCursorOutboundRequest,
   cursorCaptureDestinationPolicy,
+  defaultCursorCaptureSender,
   isCursorAgentServiceInferencePath,
   isCursorBridgeRequestCaptureEnabled,
+  isCursorHttp2Envelope,
+  isCursorOwnedHostname,
+  isOfficialCursorAgentCaptureUrl,
   materializeCursorCapturePreload,
   openCursorCaptureBridge,
+  runCursorCapturedTransaction,
+  sendCursorCapturedEnvelope,
+  sendCursorCapturedHttp2,
   settleCursorCaptureViaAcpCancel,
 } from "./cursor-capture";
 
@@ -757,11 +790,16 @@ export type TCursorNativeParams = {
   readonly rpcTimeoutMs?: number;
   /**
    * Optional request-capture bridge (default off / omit). When set, the child
-   * spawn receives the preload + IPC env. Capture does NOT decode Connect
-   * responses into OpenAI chunks — see cursor-capture.ts integration blocker.
-   * Omitting this preserves today's ACP path exactly.
+   * spawn receives the preload + IPC env. Omitting this preserves today's ACP
+   * path exactly.
    */
   readonly captureBridge?: TCursorCaptureBridge | null;
+  /**
+   * When true with `captureBridge`, serve owns waitForTransaction / dispatch /
+   * settle / dispose. ACP only injects the preload env and must NOT cancel the
+   * builder before companions are collected or dispose the bridge.
+   */
+  readonly serveOwnedCapture?: boolean;
 };
 
 /**
@@ -879,13 +917,12 @@ export const runCursorNative = async (
     return setupDecline(error, params.signal);
   }
 
-  // When a capture bridge is attached, the vendor Connect send is suppressed.
-  // Settle locally via ACP session/cancel — never feed a fabricated model
-  // stream. Connect→chunk decode is an explicit integration blocker; without
-  // it this path cannot commit OpenAI chunks from the captured upstream.
-  //
-  // Offers can race ahead of session/new. Queue ACP cancel until sessionId is
-  // acknowledged so settlement is not permanently skipped.
+  // Capture bridge: serve-owned mode only injects preload env — serve runs
+  // waitForTransaction → dispatch → settle after the final BidiAppend is
+  // buffered so the ACP builder is not cancelled mid-construction. Legacy
+  // auto mode (tests without serve) still waits then settles/cancels locally.
+  // Never feed the true model stream back into the vendor child.
+  const serveOwnedCapture = params.serveOwnedCapture === true;
   let pendingCaptureCancel: {
     readonly method: string;
     readonly externalUrl: string;
@@ -904,25 +941,25 @@ export const runCursorNative = async (
       },
     });
   };
-  if (captureBridge !== null) {
+  if (captureBridge !== null && !serveOwnedCapture) {
     void captureBridge
-      .waitForOffer()
-      .then((envelope) => {
+      .waitForTransaction()
+      .then((tx) => {
         mark("capture_offered_ms");
         captureBridge.settleChild({
           kind: "suppressed",
           reason:
-            "original AgentService send suppressed; daemon owns the envelope",
+            "original AgentService + BidiAppend sends suppressed; daemon owns the transaction",
         });
         if (sessionId !== null) {
           runCaptureAcpCancel({
-            method: envelope.method,
-            externalUrl: envelope.externalUrl,
+            method: tx.primary.method,
+            externalUrl: tx.primary.externalUrl,
           });
         } else {
           pendingCaptureCancel = {
-            method: envelope.method,
-            externalUrl: envelope.externalUrl,
+            method: tx.primary.method,
+            externalUrl: tx.primary.externalUrl,
           };
         }
       })
@@ -956,7 +993,9 @@ export const runCursorNative = async (
     if (cancel && sessionId !== null) client.cancelAndDispose(sessionId);
     else client.dispose();
     stopMcp();
-    if (captureBridge !== null) {
+    // Serve-owned capture disposes the bridge after the daemon response stream
+    // completes — ACP must not tear it down while companions may still arrive.
+    if (captureBridge !== null && !serveOwnedCapture) {
       void captureBridge.dispose();
     }
   };
@@ -1195,6 +1234,740 @@ export const runCursorNative = async (
   });
   // Cold sessions in v1 — never record a resumable id (see module header).
   return { kind: "committed", chunks, sessionId: () => null };
+};
+
+export type TCursorNativeCaptureParams = {
+  readonly bin: string;
+  readonly env: Record<string, string>;
+  readonly providerModelId: string;
+  readonly systemText: string | null;
+  readonly userText: string;
+  readonly images?: ReadonlyArray<TCursorImage>;
+  readonly tools?: ReadonlyArray<TCursorTool>;
+  readonly jsonInstructionText?: string | null;
+  readonly signal: AbortSignal;
+  readonly precommitMs?: number;
+  readonly idleMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly rpcTimeoutMs?: number;
+  /**
+   * Production omits → {@link defaultCursorCaptureSender} (HTTP/2 via
+   * `node:http2`, HTTP/1 via fetch). Injected senders are tests only.
+   */
+  readonly sender?: TCursorTransactionSender;
+  /**
+   * Hermetic tests may inject a fake ACP runner that still goes through the
+   * capture preload / Connect offer path. Production omits → {@link runCursorNative}.
+   */
+  readonly runAcp?: (params: TCursorNativeParams) => Promise<TNativeRunResult>;
+};
+
+/**
+ * Official Cursor bridge-capture runner: spawn the vendor ACP builder with the
+ * capture preload, collect the opaque RunSSE + BidiAppend transaction (builder
+ * not cancelled until companions are buffered), dispatch each exact RPC once,
+ * stream Connect→chunks to the CALLER, then settle/cancel the builder locally.
+ * Never feeds the true model stream back into ACP.
+ */
+export const runCursorNativeCapture = async (
+  params: TCursorNativeCaptureParams,
+): Promise<TNativeRunResult> => {
+  if (!existsSync(params.bin)) {
+    return { kind: "declined", reason: "cursor-agent CLI not installed" };
+  }
+  if (params.signal.aborted) {
+    return { kind: "declined", reason: "client aborted" };
+  }
+
+  const bridge = await openCursorCaptureBridge({
+    signal: params.signal,
+    captureTimeoutMs: params.precommitMs ?? 60_000,
+  });
+  const builderAbort = new AbortController();
+  const builderSignal = AbortSignal.any([params.signal, builderAbort.signal]);
+  const runAcp = params.runAcp ?? runCursorNative;
+  // Always decorate env here so injected hermetic `runAcp` implementations
+  // still receive the preload + IPC socket (they may not call
+  // applyCursorCaptureBridgeEnv themselves).
+  const captureEnv = applyCursorCaptureBridgeEnv(params.env, bridge);
+  const acpPromise = runAcp({
+    bin: params.bin,
+    env: captureEnv,
+    providerModelId: params.providerModelId,
+    systemText: params.systemText,
+    userText: params.userText,
+    images: params.images,
+    tools: params.tools,
+    jsonInstructionText: params.jsonInstructionText,
+    signal: builderSignal,
+    precommitMs: params.precommitMs,
+    idleMs: params.idleMs,
+    turnTimeoutMs: params.turnTimeoutMs,
+    rpcTimeoutMs: params.rpcTimeoutMs,
+    captureBridge: bridge,
+    serveOwnedCapture: true,
+  });
+  void acpPromise.catch(() => {});
+
+  let dispatchStarted = false;
+  try {
+    const tx = await bridge.waitForTransaction({
+      quietMs: 75,
+      maxWaitMs: Math.min(params.precommitMs ?? 60_000, 30_000),
+    });
+
+    const captureId = bridge.lastCaptureId();
+    dispatchStarted = true;
+
+    let ownershipAtAccept: ReturnType<typeof captureOwnershipFromSession>;
+
+    if (isCursorHttp2Envelope(tx.primary) && params.sender === undefined) {
+      // Production H2 path: keep builder alive for allowlisted request_context.
+      if (captureId === null) {
+        throw new Error("missing primary capture id for duplex bridge");
+      }
+      // Rebind as a non-null local — the async generator below closes over
+      // this across an `await`, and TS does not retain the `!== null`
+      // narrowing of the outer `const` through that closure boundary.
+      const nonNullCaptureId: string = captureId;
+      bridge.session.markDispatchStarted();
+      // Open the REAL upstream H2 session BEFORE settling the child as
+      // duplex_bridge, so the negotiated `connect-content-encoding` (if any)
+      // is known and can be mirrored onto the synthetic response headers the
+      // builder's own Connect client sees. Settling first (as before) meant
+      // the builder's client learned no encoding, so a later COMPRESSED
+      // injected frame had no algorithm to decode with — a silent hang, not
+      // an error (retest #26 root cause).
+      const http2 = await openCursorCapturedHttp2Session(
+        tx.primary,
+        params.signal,
+      );
+      bridge.session.markUpstreamAccepted();
+      ownershipAtAccept = captureOwnershipFromSession(bridge.session);
+      if (http2.response.body === null) {
+        http2.close();
+        builderAbort.abort();
+        await bridge.dispose();
+        return {
+          kind: "declined",
+          reason: "cursor capture upstream returned an empty body",
+          captureOwnership: ownershipAtAccept,
+        };
+      }
+      const connectContentEncoding = http2.response.headers.get(
+        "connect-content-encoding",
+      );
+      bridge.settleChild({
+        kind: "duplex_bridge",
+        reason:
+          "HTTP/2 capture open for allowlisted request_context duplex; daemon owns inference",
+        connectContentEncoding,
+      });
+      // Peel leading Connect envelopes; bridge request_context_args, then
+      // decode remaining envelopes INCREMENTALLY (never buffer-then-decode —
+      // that made the ONLY way to finish the turn "wait for the H2 socket to
+      // close", and this long-lived native stream does not close on its own
+      // after model output ends). The Connect `endStream` envelope (spec:
+      // "the final Enveloped-Message... must appear last") is the ONE
+      // genuine native completion marker; plain reader EOF without ever
+      // seeing it — whether from a real close or from OUR OWN
+      // `reader.cancel()` on caller abort resolving a pending read with
+      // `{done:true}` — must never be treated as success. That exact
+      // cancel()-masks-as-clean-EOF race produced retest #30's fabricated
+      // `finish_reason:"stop"`/0-token completion at the caller's abort
+      // deadline: the check for `params.signal.aborted` ran only BEFORE each
+      // `reader.read()` call, never immediately after one resolved, so an
+      // abort that fired while blocked inside `read()` was indistinguishable
+      // from a real clean close.
+      const reader = http2.response.body.getReader();
+      let pending = new Uint8Array(0);
+      let contextBridged = false;
+      let sawModelOutput = false;
+      // Metadata-only diagnostics (never payload/args/content) so a stuck
+      // phase is identifiable from the decline reason alone.
+      let phase:
+        | "awaiting_first_frame"
+        | "context_handshake"
+        | "post_context_wait"
+        | "model_stream"
+        | "done" = "awaiting_first_frame";
+      let framesSeen = 0;
+      let execFramesSeen = 0;
+      let modelFramesSeen = 0;
+      let endStreamFramesSeen = 0;
+      // `InteractionUpdate.turn_ended` (field 14) is the real native
+      // turn-completion marker the official client relies on — it is
+      // authoritative independent of the Connect transport `endStream`
+      // envelope. Once observed, a subsequent transport close/reset is
+      // benign (mirrors the official client's own "Ignoring transport close
+      // after terminal agent stream" behavior) rather than a failure.
+      let turnEndedSeen = false;
+      const diagSnapshot = (): string =>
+        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged}`;
+      const onAbortDuringPeel = (): void => {
+        try {
+          reader.cancel().catch(() => undefined);
+        } catch {
+          // ignore
+        }
+      };
+      params.signal.addEventListener("abort", onAbortDuringPeel, {
+        once: true,
+      });
+
+      const createdAt = Math.floor(Date.now() / 1000);
+      const chunkId = `cursor-capture-${createdAt}`;
+      let toolIndex = 0;
+      const toolIndexByCallId = new Map<string, number>();
+      const ensureToolIndex = (callId: string): number => {
+        const existing = toolIndexByCallId.get(callId);
+        if (existing !== undefined) return existing;
+        const next = toolIndex;
+        toolIndexByCallId.set(callId, next);
+        toolIndex += 1;
+        return next;
+      };
+      const baseChunk = (): Pick<
+        TChatCompletionChunk,
+        "id" | "object" | "created" | "model"
+      > => ({
+        id: chunkId,
+        object: "chat.completion.chunk",
+        created: createdAt,
+        model: params.providerModelId,
+      });
+
+      // Async generator: yields ONE canonical chunk at a time as real
+      // Connect envelopes decode, stopping ONLY on a genuine `endStream`
+      // marker (throwing on abort / protocol error / missing terminal — NEVER
+      // synthesizing a finish chunk from a plain closed/cancelled reader).
+      async function* stepChunks(): AsyncGenerator<TChatCompletionChunk> {
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (params.signal.aborted) {
+              throw new DOMException(
+                `client aborted (${diagSnapshot()})`,
+                "AbortError",
+              );
+            }
+            if (done) {
+              if (turnEndedSeen) {
+                // A real native turn_ended marker already arrived; the
+                // transport closing afterward (no Connect endStream) is
+                // benign, not a failure — matches the official client.
+                phase = "done";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason:
+                        toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+                    },
+                  ],
+                };
+                return;
+              }
+              throw new Error(
+                `cursor capture upstream closed without a terminal Connect end-stream marker or turn_ended (${diagSnapshot()})`,
+              );
+            }
+            const next = new Uint8Array(pending.byteLength + value.byteLength);
+            next.set(pending, 0);
+            next.set(value, pending.byteLength);
+            const taken = takeConnectEnvelopes(next);
+            pending = new Uint8Array(taken.rest);
+            for (const env of taken.envelopes) {
+              framesSeen += 1;
+              if (env.endStream) {
+                endStreamFramesSeen += 1;
+                const trailerPayload = resolveConnectEnvelopePayload(
+                  env,
+                  connectContentEncoding,
+                );
+                const raw = new TextDecoder().decode(trailerPayload);
+                if (raw.length > 0 && raw !== "{}") {
+                  let parsed: unknown;
+                  try {
+                    parsed = JSON.parse(raw);
+                  } catch {
+                    throw new CursorCaptureDecodeError(
+                      "connect_end_stream_error",
+                      `invalid Connect end-stream JSON (${diagSnapshot()})`,
+                    );
+                  }
+                  if (
+                    typeof parsed === "object" &&
+                    parsed !== null &&
+                    "error" in parsed &&
+                    (parsed as { error?: unknown }).error != null
+                  ) {
+                    const errVal = (parsed as { error: unknown }).error;
+                    const msg =
+                      typeof errVal === "object" &&
+                      errVal !== null &&
+                      typeof (errVal as { message?: unknown }).message ===
+                        "string"
+                        ? (errVal as { message: string }).message
+                        : JSON.stringify(errVal);
+                    throw new CursorCaptureDecodeError(
+                      "connect_end_stream_error",
+                      msg,
+                    );
+                  }
+                }
+                // Genuine native completion marker — finish now. Do not wait
+                // for the socket to close; per Connect spec this is always
+                // the last message on the stream.
+                phase = "done";
+                if (sawModelOutput) {
+                  yield {
+                    ...baseChunk(),
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason:
+                          toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+                      },
+                    ],
+                  };
+                }
+                return;
+              }
+              // Inspect a decompressed COPY only; never mutate `env.payload`.
+              const inspectPayload = resolveConnectEnvelopePayload(
+                env,
+                connectContentEncoding,
+              );
+              const decoded = decodeAgentServerMessage(inspectPayload);
+              if (
+                decoded.kind === "exec_server" &&
+                decoded.subtype === "request_context_args"
+              ) {
+                execFramesSeen += 1;
+                phase = "context_handshake";
+                if (contextBridged) {
+                  throw new CursorCaptureDecodeError(
+                    "requires_duplex_bridge",
+                    `unexpected second request_context_args (${diagSnapshot()})`,
+                    {
+                      execSubtype: decoded.subtype,
+                      execClass: decoded.classification,
+                    },
+                  );
+                }
+                // Forward the EXACT original envelope (preserve compression
+                // flag + bytes) into the builder — never a re-encoded/
+                // rewritten copy of the control frame.
+                await forwardCursorRequestContextThroughBuilder({
+                  captureBridge: bridge,
+                  captureId: nonNullCaptureId,
+                  http2,
+                  serverExecEnvelope: encodeConnectEnvelope(
+                    env.payload,
+                    env.flags,
+                  ),
+                  connectContentEncoding,
+                  signal: params.signal,
+                });
+                contextBridged = true;
+                phase = "post_context_wait";
+                continue;
+              }
+              if (decoded.kind === "turn_ended") {
+                // The real native turn-completion marker
+                // (`InteractionUpdate.turn_ended`, field 14) — authoritative
+                // independent of Connect transport `endStream`. Finish now;
+                // do not keep waiting on the socket (the official client
+                // itself stops here and treats any later transport
+                // close/error as benign).
+                turnEndedSeen = true;
+                phase = "done";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason:
+                        toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+                    },
+                  ],
+                  ...(decoded.inputTokens !== null ||
+                  decoded.outputTokens !== null
+                    ? {
+                        usage: {
+                          prompt_tokens: decoded.inputTokens ?? 0,
+                          completion_tokens: decoded.outputTokens ?? 0,
+                          total_tokens:
+                            (decoded.inputTokens ?? 0) +
+                            (decoded.outputTokens ?? 0),
+                        },
+                      }
+                    : {}),
+                };
+                return;
+              }
+              if (decoded.kind === "exec_server") {
+                execFramesSeen += 1;
+                throw cursorExecServerFailure({
+                  id: decoded.id,
+                  execId: decoded.execId,
+                  subtype: decoded.subtype,
+                  classification: decoded.classification,
+                  mcp: decoded.mcp,
+                });
+              }
+              if (decoded.kind === "text_delta" && decoded.text.length > 0) {
+                sawModelOutput = true;
+                modelFramesSeen += 1;
+                phase = "model_stream";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: decoded.text },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+              } else if (
+                decoded.kind === "thinking_delta" &&
+                decoded.text.length > 0
+              ) {
+                sawModelOutput = true;
+                modelFramesSeen += 1;
+                phase = "model_stream";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { reasoning_content: decoded.text },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+              } else if (
+                decoded.kind === "mcp_tool_partial" ||
+                decoded.kind === "mcp_tool_started"
+              ) {
+                sawModelOutput = true;
+                modelFramesSeen += 1;
+                phase = "model_stream";
+                const intent = decoded.intent;
+                const index = ensureToolIndex(intent.callId);
+                const argsDelta =
+                  decoded.kind === "mcp_tool_partial"
+                    ? decoded.argsTextDelta
+                    : "";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        tool_calls: [
+                          {
+                            index,
+                            id: intent.callId,
+                            type: "function",
+                            function: {
+                              name: intent.name,
+                              arguments: argsDelta,
+                            },
+                          },
+                        ],
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+              }
+              if (sawModelOutput) {
+                // Cancel builder once model output begins — never feed it back.
+                bridge.closeDuplexInject(nonNullCaptureId);
+                settleCursorCaptureViaAcpCancel({
+                  settlement: {
+                    kind: "suppressed",
+                    reason:
+                      "request_context complete; daemon owns model stream",
+                  },
+                  cancelSession: () => {
+                    builderAbort.abort();
+                  },
+                });
+              }
+            }
+          }
+        } finally {
+          params.signal.removeEventListener("abort", onAbortDuringPeel);
+        }
+      }
+
+      const iterator = stepChunks();
+      const precommitMs = params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS;
+      let precommitTimer: ReturnType<typeof setTimeout> | undefined;
+      const first = await Promise.race([
+        iterator.next().then(
+          (r) =>
+            r.done
+              ? ({ kind: "exit" } as const)
+              : ({ kind: "meaningful", chunk: r.value } as const),
+          (err: unknown) => ({ kind: "error", err }) as const,
+        ),
+        new Promise<{ kind: "timeout" }>((resolve) => {
+          precommitTimer = setTimeout(
+            () => resolve({ kind: "timeout" }),
+            precommitMs,
+          );
+        }),
+      ]);
+      clearTimeout(precommitTimer);
+
+      if (first.kind !== "meaningful") {
+        try {
+          await iterator.return(undefined);
+        } catch {
+          // ignore
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore
+        }
+        bridge.closeDuplexInject(captureId);
+        builderAbort.abort();
+        await bridge.dispose();
+        http2.close();
+        if (first.kind === "timeout") {
+          return {
+            kind: "declined",
+            reason: `cursor capture produced no output before the pre-commit deadline (${diagSnapshot()})`,
+            captureOwnership: ownershipAtAccept,
+          };
+        }
+        if (first.kind === "exit") {
+          return {
+            kind: "declined",
+            reason: contextBridged
+              ? "cursor capture completed request_context but produced no model output"
+              : "cursor capture produced no output",
+            captureOwnership: ownershipAtAccept,
+          };
+        }
+        // first.kind === "error"
+        const err = first.err;
+        const isAbort =
+          params.signal.aborted ||
+          (err instanceof Error && err.name === "AbortError");
+        return {
+          kind: "declined",
+          reason: err instanceof Error ? err.message : String(err),
+          captureOwnership: isAbort
+            ? ownershipAtAccept === "none"
+              ? "accepted"
+              : ownershipAtAccept
+            : ownershipAtAccept,
+        };
+      }
+
+      const firstChunk = first.chunk;
+      const out = new ReadableStream<TChatCompletionChunk>({
+        start(controller) {
+          controller.enqueue(firstChunk);
+        },
+        async pull(controller) {
+          let step: IteratorResult<TChatCompletionChunk>;
+          try {
+            step = await iterator.next();
+          } catch (err) {
+            controller.error(
+              err instanceof Error ? err : new Error(String(err)),
+            );
+            try {
+              reader.releaseLock();
+            } catch {
+              // ignore
+            }
+            http2.close();
+            builderAbort.abort();
+            void bridge.dispose();
+            return;
+          }
+          if (step.done) {
+            controller.close();
+            try {
+              reader.releaseLock();
+            } catch {
+              // ignore
+            }
+            http2.close();
+            void bridge.dispose();
+            return;
+          }
+          controller.enqueue(step.value);
+        },
+        cancel() {
+          void iterator.return(undefined).catch(() => undefined);
+          try {
+            reader.releaseLock();
+          } catch {
+            // ignore
+          }
+          http2.close();
+          builderAbort.abort();
+          void bridge.dispose();
+        },
+      });
+      return {
+        kind: "committed",
+        chunks: out,
+        sessionId: () => null,
+      };
+    }
+
+    // HTTP/1 (and injected sender) path — existing single-shot dispatch.
+    const sender = params.sender ?? defaultCursorCaptureSender;
+    const dispatched = await runCursorCapturedTransaction({
+      session: bridge.session,
+      transaction: tx,
+      sender,
+      signal: params.signal,
+    });
+    bridge.settleChild({
+      kind: "suppressed",
+      reason:
+        "original AgentService + BidiAppend sends suppressed; daemon owns the transaction",
+    });
+    settleCursorCaptureViaAcpCancel({
+      settlement: {
+        kind: "suppressed",
+        reason: `captured ${tx.primary.method} ${tx.primary.externalUrl}`,
+      },
+      cancelSession: () => {
+        builderAbort.abort();
+      },
+    });
+
+    if (dispatched.response.body === null) {
+      const ownership = captureOwnershipFromSession(bridge.session);
+      await bridge.dispose();
+      return {
+        kind: "declined",
+        reason: "cursor capture upstream returned an empty body",
+        captureOwnership: ownership,
+      };
+    }
+
+    ownershipAtAccept = captureOwnershipFromSession(bridge.session);
+    const decodeStream = chunksStreamFromCursorConnectResponseBody(
+      dispatched.response.body,
+      { providerModelId: params.providerModelId, signal: params.signal },
+    );
+    const reader = decodeStream.getReader();
+    let first: TChatCompletionChunk | null = null;
+    try {
+      const { value, done } = await reader.read();
+      if (!done && value !== undefined) first = value;
+    } catch (err) {
+      builderAbort.abort();
+      await bridge.dispose();
+      if (
+        err instanceof CursorCaptureDecodeError &&
+        (err.code === "requires_duplex_bridge" ||
+          err.code === "requires_request_context_duplex" ||
+          err.code === "unsupported_native_tool_intent" ||
+          err.code === "unsupported_native_exec" ||
+          err.code === "caller_mcp_tool_cancel")
+      ) {
+        return {
+          kind: "declined",
+          reason: err.message,
+          // Upstream already accepted — never fall through to another provider.
+          captureOwnership:
+            ownershipAtAccept === "none" ? "accepted" : ownershipAtAccept,
+        };
+      }
+      return {
+        kind: "declined",
+        reason: err instanceof Error ? err.message : String(err),
+        captureOwnership: ownershipAtAccept,
+      };
+    }
+    if (first === null) {
+      builderAbort.abort();
+      await bridge.dispose();
+      return {
+        kind: "declined",
+        reason: "cursor capture produced no output",
+        captureOwnership: ownershipAtAccept,
+      };
+    }
+
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      builderAbort.abort();
+      void bridge.dispose();
+    };
+
+    const out = new ReadableStream<TChatCompletionChunk>({
+      start(controller) {
+        controller.enqueue(first);
+      },
+      async pull(controller) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) {
+            controller.close();
+            release();
+            return;
+          }
+          controller.enqueue(value);
+        } catch (err) {
+          release();
+          controller.error(err instanceof Error ? err : new Error(String(err)));
+        }
+      },
+      cancel() {
+        void reader.cancel();
+        release();
+      },
+    });
+
+    return {
+      kind: "committed",
+      chunks: out,
+      sessionId: () => null,
+    };
+  } catch (err) {
+    builderAbort.abort();
+    const ownership = captureOwnershipFromSession(bridge.session);
+    try {
+      await bridge.dispose();
+    } catch {
+      // ignore
+    }
+    void acpPromise;
+    if (dispatchStarted && ownership === "none") {
+      return {
+        kind: "declined",
+        reason: err instanceof Error ? err.message : String(err),
+        captureOwnership: "uncertain",
+      };
+    }
+    return {
+      kind: "declined",
+      reason: err instanceof Error ? err.message : String(err),
+      captureOwnership: ownership === "none" ? undefined : ownership,
+    };
+  }
 };
 
 /**

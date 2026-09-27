@@ -1,0 +1,2457 @@
+/**
+ * Cursor AgentService Connect → canonical chat-chunk decoder.
+ *
+ * Wire facts are taken from the local `@anysphere/agent-cli-runtime`
+ * snapshot `2026.07.23-e383d2b` (bundled `@connectrpc/connect-node@1.6.1` +
+ * generated `agent.v1` protobuf). This module does NOT import Cursor's
+ * runtime and does NOT spawn `cursor-agent`.
+ *
+ * ## Service shape (artifact)
+ *
+ * `agent.v1.AgentService`:
+ *   - `Run`     — BiDiStreaming (`AgentClientMessage` ↔ `AgentServerMessage`)
+ *   - `RunSSE`  — ServerStreaming (HTTP/1 remap of Run; request is often only
+ *                 `aiserver.v1.BidiRequestId`, with `AgentClientMessage` bytes
+ *                 appended via `aiserver.v1.BidiService/BidiAppend`)
+ *   - `RunPoll` — ServerStreaming (poll wrapper; not the primary ACP path)
+ *
+ * Response messages of interest are `AgentServerMessage.interaction_update`
+ * (`text_delta`, `thinking_delta`, MCP `partial_tool_call` /
+ * `tool_call_started`, `token_delta`). `exec_server_message` /
+ * `interaction_query` require client→server duplex follow-ups — decode
+ * refuses those rather than silently pretending a unary POST completed the
+ * turn.
+ *
+ * ## Activation
+ *
+ * Capability / serve still omit `bridge-capture` for cursor. Integrators must
+ * flip the capability table only after wiring this decoder + duplex policy.
+ */
+
+import { gunzipSync, gzipSync } from "node:zlib";
+import type { TChatCompletionChunk } from "@openllmsh/protocol";
+
+/** Connect envelope flag: payload is end-stream JSON (trailers / error). */
+export const CONNECT_FLAG_END_STREAM = 0x02;
+/**
+ * Connect envelope flag: payload is compressed with the algorithm named by
+ * the stream's `connect-content-encoding` header (per-message; typically gzip).
+ * @see https://connectrpc.com/docs/protocol/
+ */
+export const CONNECT_FLAG_COMPRESSED = 0x01;
+
+/** Hard cap on a single decompressed Connect envelope payload. */
+export const CONNECT_COMPRESS_MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024;
+
+export const CURSOR_BIDI_APPEND_PATH_RE =
+  /\/aiserver\.v1\.BidiService\/BidiAppend(?:\?|$)/;
+
+export type TCursorAgentServiceMethod = "Run" | "RunSSE" | "RunPoll";
+
+export type TCursorConnectEnvelope = {
+  readonly flags: number;
+  readonly payload: Uint8Array;
+  readonly endStream: boolean;
+  readonly compressed: boolean;
+};
+
+export type TCursorDecodeFailureCode =
+  | "compressed_envelope_unsupported"
+  | "connect_compression_invalid"
+  | "connect_compression_too_large"
+  | "truncated_connect_frame"
+  | "connect_end_stream_error"
+  | "requires_duplex_bridge"
+  /** Server asked for RequestContextArgs — BiDi reply required; no fabricated context. */
+  | "requires_request_context_duplex"
+  | "unsupported_native_tool_intent"
+  /** ExecServerMessage native/filesystem/shell (or similar) — never execute. */
+  | "unsupported_native_exec"
+  /** ExecServerMessage mcp_args surfaced as caller tool_calls; do not execute locally. */
+  | "caller_mcp_tool_cancel"
+  | "invalid_protobuf";
+
+export type TCursorExecClass =
+  | "protocol_control"
+  | "caller_mcp_tool"
+  | "native_exec"
+  | "unknown";
+
+export class CursorCaptureDecodeError extends Error {
+  readonly code: TCursorDecodeFailureCode;
+  /** ExecServerMessage oneof case / interaction_query case — never args content. */
+  readonly execSubtype: string | null;
+  readonly execClass: TCursorExecClass | null;
+  constructor(
+    code: TCursorDecodeFailureCode,
+    message: string,
+    opts?: {
+      readonly execSubtype?: string | null;
+      readonly execClass?: TCursorExecClass | null;
+    },
+  ) {
+    super(message);
+    this.name = "CursorCaptureDecodeError";
+    this.code = code;
+    this.execSubtype = opts?.execSubtype ?? null;
+    this.execClass = opts?.execClass ?? null;
+  }
+}
+
+/**
+ * Proven surface vs remaining blockers for Cursor Connect decode / duplex.
+ */
+export const CURSOR_CAPTURE_DECODE_STATUS = {
+  interactionUpdateDecode: "proven_hermetic" as const,
+  http1RunSseRequestCompleteness: "transaction_adapter" as const,
+  /**
+   * ExecServerMessage oneof subtypes are classified (protocol vs MCP vs native).
+   * Native exec is rejected; MCP maps to caller tool_calls then cancel.
+   * `request_context_args` is a real pre-inference BiDi control — not implemented
+   * as a fabricated RequestContextSuccess (would invent workspace context).
+   */
+  duplexExecBridge: "subtype_classified_fail_closed" as const,
+  /**
+   * Pre-inference `request_context_args` is forwarded to the live builder; its
+   * native RequestContextResult is intercepted and sent upstream unchanged.
+   */
+  requestContextDuplex: "builder_forward_allowlisted" as const,
+  capabilityFlip: "serve_wired" as const,
+} as const;
+
+export type TCursorMcpToolIntent = {
+  readonly callId: string;
+  readonly name: string;
+  readonly argumentsText: string;
+  readonly providerIdentifier: string | null;
+  readonly serverIdentifier: string | null;
+};
+
+export type TCursorDecodedInteraction =
+  | { readonly kind: "text_delta"; readonly text: string }
+  | { readonly kind: "thinking_delta"; readonly text: string }
+  | {
+      readonly kind: "mcp_tool_partial";
+      readonly intent: TCursorMcpToolIntent;
+      readonly argsTextDelta: string;
+    }
+  | {
+      readonly kind: "mcp_tool_started";
+      readonly intent: TCursorMcpToolIntent;
+    }
+  | { readonly kind: "token_delta"; readonly tokens: number }
+  | { readonly kind: "heartbeat" }
+  | {
+      readonly kind: "turn_ended";
+      readonly inputTokens: number | null;
+      readonly outputTokens: number | null;
+      readonly cacheReadTokens: number | null;
+      readonly cacheWriteTokens: number | null;
+      readonly reasoningTokens: number | null;
+    }
+  | {
+      readonly kind: "requires_duplex";
+      readonly messageCase: string;
+      readonly execSubtype: string | null;
+      readonly execClass: TCursorExecClass | null;
+    }
+  | {
+      readonly kind: "exec_server";
+      readonly classification: TCursorExecClass;
+      readonly subtype: string;
+      readonly id: number | null;
+      readonly execId: string | null;
+      readonly mcp: TCursorMcpToolIntent | null;
+    }
+  | {
+      readonly kind: "native_tool";
+      readonly toolCase: string;
+      readonly callId: string;
+    }
+  | { readonly kind: "ignored"; readonly reason: string };
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+export const cursorAgentServiceMethodOfPath = (
+  pathWithQuery: string,
+): TCursorAgentServiceMethod | null => {
+  const m = pathWithQuery.match(
+    /\/agent\.v1\.AgentService\/(Run|RunSSE|RunPoll)(?:\?|$)/,
+  );
+  if (m === null || m[1] === undefined) return null;
+  return m[1] as TCursorAgentServiceMethod;
+};
+
+export const isCursorBidiAppendPath = (pathWithQuery: string): boolean =>
+  CURSOR_BIDI_APPEND_PATH_RE.test(pathWithQuery);
+
+/** Encode one Connect envelope (uncompressed unless flags include COMPRESSED). */
+export const encodeConnectEnvelope = (
+  payload: Uint8Array,
+  flags = 0,
+): Uint8Array => {
+  const out = new Uint8Array(5 + payload.byteLength);
+  out[0] = flags & 0xff;
+  const len = payload.byteLength;
+  out[1] = (len >>> 24) & 0xff;
+  out[2] = (len >>> 16) & 0xff;
+  out[3] = (len >>> 8) & 0xff;
+  out[4] = len & 0xff;
+  out.set(payload, 5);
+  return out;
+};
+
+/**
+ * Normalize a `connect-content-encoding` header value. Returns null for
+ * missing/identity; throws for unsupported algorithms when required.
+ */
+export const normalizeConnectContentEncoding = (
+  raw: string | null | undefined,
+): "gzip" | null => {
+  if (raw === undefined || raw === null) return null;
+  const enc = raw.trim().toLowerCase();
+  if (enc.length === 0 || enc === "identity") return null;
+  // Streaming may list multiple; honor the first token.
+  const first = enc.split(",", 1)[0]?.trim() ?? enc;
+  if (first === "gzip" || first === "x-gzip") return "gzip";
+  throw new CursorCaptureDecodeError(
+    "compressed_envelope_unsupported",
+    `unsupported connect-content-encoding ${JSON.stringify(first)} (only gzip is negotiated)`,
+  );
+};
+
+/**
+ * Decompress a single Connect envelope payload. Does not mutate `payload`.
+ * Bounded by {@link CONNECT_COMPRESS_MAX_DECOMPRESSED_BYTES}.
+ */
+export const decompressConnectEnvelopePayload = (
+  payload: Uint8Array,
+  encoding: string,
+  maxBytes: number = CONNECT_COMPRESS_MAX_DECOMPRESSED_BYTES,
+): Uint8Array => {
+  const normalized = normalizeConnectContentEncoding(encoding);
+  if (normalized === null) {
+    throw new CursorCaptureDecodeError(
+      "connect_compression_invalid",
+      "Connect envelope COMPRESSED flag set but connect-content-encoding is missing/identity",
+    );
+  }
+  if (normalized !== "gzip") {
+    throw new CursorCaptureDecodeError(
+      "compressed_envelope_unsupported",
+      `unsupported connect compression ${normalized}`,
+    );
+  }
+  let inflated: Buffer;
+  try {
+    // Copy into a fresh Buffer — gunzipSync rejects SharedArrayBuffer views
+    // from some stream paths without an explicit copy.
+    inflated = gunzipSync(Buffer.from(payload));
+  } catch (err) {
+    throw new CursorCaptureDecodeError(
+      "connect_compression_invalid",
+      `gzip decompress failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (inflated.byteLength > maxBytes) {
+    throw new CursorCaptureDecodeError(
+      "connect_compression_too_large",
+      `decompressed Connect envelope exceeds ${maxBytes} bytes`,
+    );
+  }
+  return new Uint8Array(inflated);
+};
+
+/**
+ * Return the protobuf/JSON bytes to inspect for an envelope. If compressed,
+ * returns a decompressed COPY — the original envelope payload is unchanged.
+ * End-stream envelopes are never compressed in practice; still honor the flag.
+ */
+export const resolveConnectEnvelopePayload = (
+  env: TCursorConnectEnvelope,
+  connectContentEncoding: string | null | undefined,
+): Uint8Array => {
+  if (!env.compressed) return env.payload;
+  if (
+    connectContentEncoding === undefined ||
+    connectContentEncoding === null ||
+    connectContentEncoding.trim().length === 0
+  ) {
+    throw new CursorCaptureDecodeError(
+      "connect_compression_invalid",
+      "compressed Connect envelope without connect-content-encoding",
+    );
+  }
+  return decompressConnectEnvelopePayload(env.payload, connectContentEncoding);
+};
+
+/** Hermetic fixture: gzip-compress payload and set COMPRESSED flag. */
+export const encodeConnectEnvelopeGzip = (payload: Uint8Array): Uint8Array => {
+  const compressed = gzipSync(Buffer.from(payload));
+  return encodeConnectEnvelope(
+    new Uint8Array(compressed),
+    CONNECT_FLAG_COMPRESSED,
+  );
+};
+
+export const encodeConnectEndStream = (
+  body: Readonly<Record<string, unknown>> = {},
+): Uint8Array =>
+  encodeConnectEnvelope(
+    textEncoder.encode(JSON.stringify(body)),
+    CONNECT_FLAG_END_STREAM,
+  );
+
+/**
+ * Pull complete Connect envelopes from a byte buffer. Returns parsed envelopes
+ * and the unconsumed tail (partial frame).
+ */
+export const takeConnectEnvelopes = (
+  buffer: Uint8Array,
+): {
+  readonly envelopes: ReadonlyArray<TCursorConnectEnvelope>;
+  readonly rest: Uint8Array;
+} => {
+  const envelopes: TCursorConnectEnvelope[] = [];
+  let offset = 0;
+  while (offset + 5 <= buffer.byteLength) {
+    const flags = buffer[offset] ?? 0;
+    const length =
+      ((buffer[offset + 1] ?? 0) << 24) |
+      ((buffer[offset + 2] ?? 0) << 16) |
+      ((buffer[offset + 3] ?? 0) << 8) |
+      (buffer[offset + 4] ?? 0);
+    if (offset + 5 + length > buffer.byteLength) break;
+    const payload = buffer.subarray(offset + 5, offset + 5 + length);
+    envelopes.push({
+      flags,
+      payload,
+      endStream: (flags & CONNECT_FLAG_END_STREAM) !== 0,
+      compressed: (flags & CONNECT_FLAG_COMPRESSED) !== 0,
+    });
+    offset += 5 + length;
+  }
+  return {
+    envelopes,
+    rest: offset === 0 ? buffer : buffer.subarray(offset),
+  };
+};
+
+// ── Minimal protobuf helpers (encode + decode) ─────────────────────────────
+
+const writeVarint = (value: number, out: number[]): void => {
+  let n = value >>> 0;
+  while (n > 0x7f) {
+    out.push((n & 0x7f) | 0x80);
+    n >>>= 7;
+  }
+  out.push(n);
+};
+
+const encodeKey = (field: number, wire: number, out: number[]): void => {
+  writeVarint((field << 3) | wire, out);
+};
+
+export const encodeProtoString = (field: number, value: string): Uint8Array => {
+  const bytes = textEncoder.encode(value);
+  const out: number[] = [];
+  encodeKey(field, 2, out);
+  writeVarint(bytes.byteLength, out);
+  for (const b of bytes) out.push(b);
+  return Uint8Array.from(out);
+};
+
+export const encodeProtoBytes = (
+  field: number,
+  value: Uint8Array,
+): Uint8Array => {
+  const out: number[] = [];
+  encodeKey(field, 2, out);
+  writeVarint(value.byteLength, out);
+  for (const b of value) out.push(b);
+  return Uint8Array.from(out);
+};
+
+export const encodeProtoInt32 = (field: number, value: number): Uint8Array => {
+  const out: number[] = [];
+  encodeKey(field, 0, out);
+  writeVarint(value, out);
+  return Uint8Array.from(out);
+};
+
+export const concatBytes = (parts: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const total = parts.reduce((n, p) => n + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.byteLength;
+  }
+  return out;
+};
+
+type TProtoField = {
+  readonly field: number;
+  readonly wire: number;
+  readonly bytes: Uint8Array;
+  readonly varint: number | null;
+};
+
+const readVarint = (
+  buf: Uint8Array,
+  offset: number,
+): { readonly value: number; readonly next: number } => {
+  let result = 0;
+  let shift = 0;
+  let pos = offset;
+  while (pos < buf.byteLength) {
+    const byte = buf[pos] ?? 0;
+    pos += 1;
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return { value: result >>> 0, next: pos };
+    shift += 7;
+    if (shift > 35) {
+      throw new CursorCaptureDecodeError("invalid_protobuf", "varint too long");
+    }
+  }
+  throw new CursorCaptureDecodeError(
+    "truncated_connect_frame",
+    "truncated protobuf varint",
+  );
+};
+
+const parseProtoFields = (buf: Uint8Array): ReadonlyArray<TProtoField> => {
+  const fields: TProtoField[] = [];
+  let offset = 0;
+  while (offset < buf.byteLength) {
+    const key = readVarint(buf, offset);
+    offset = key.next;
+    const field = key.value >>> 3;
+    const wire = key.value & 0x07;
+    if (wire === 0) {
+      const v = readVarint(buf, offset);
+      fields.push({
+        field,
+        wire,
+        bytes: new Uint8Array(0),
+        varint: v.value,
+      });
+      offset = v.next;
+      continue;
+    }
+    if (wire === 2) {
+      const len = readVarint(buf, offset);
+      offset = len.next;
+      const end = offset + len.value;
+      if (end > buf.byteLength) {
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          "truncated length-delimited protobuf field",
+        );
+      }
+      fields.push({
+        field,
+        wire,
+        bytes: buf.subarray(offset, end),
+        varint: null,
+      });
+      offset = end;
+      continue;
+    }
+    if (wire === 5) {
+      if (offset + 4 > buf.byteLength) {
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          "truncated fixed32 protobuf field",
+        );
+      }
+      fields.push({
+        field,
+        wire,
+        bytes: buf.subarray(offset, offset + 4),
+        varint: null,
+      });
+      offset += 4;
+      continue;
+    }
+    if (wire === 1) {
+      if (offset + 8 > buf.byteLength) {
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          "truncated fixed64 protobuf field",
+        );
+      }
+      fields.push({
+        field,
+        wire,
+        bytes: buf.subarray(offset, offset + 8),
+        varint: null,
+      });
+      offset += 8;
+      continue;
+    }
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      `unsupported protobuf wire type ${wire}`,
+    );
+  }
+  return fields;
+};
+
+const protoStringField = (
+  fields: ReadonlyArray<TProtoField>,
+  field: number,
+): string | null => {
+  for (const f of fields) {
+    if (f.field === field && f.wire === 2) return textDecoder.decode(f.bytes);
+  }
+  return null;
+};
+
+const protoMessageField = (
+  fields: ReadonlyArray<TProtoField>,
+  field: number,
+): Uint8Array | null => {
+  for (const f of fields) {
+    if (f.field === field && f.wire === 2) return f.bytes;
+  }
+  return null;
+};
+
+const protoIntField = (
+  fields: ReadonlyArray<TProtoField>,
+  field: number,
+): number | null => {
+  for (const f of fields) {
+    if (f.field === field && f.wire === 0 && f.varint !== null) return f.varint;
+  }
+  return null;
+};
+
+// ── BidiService wire shapes (HTTP/1 RunSSE companion RPC) ──────────────────
+//
+// Field numbers taken from the installed runtime's generated descriptors
+// (`aiserver.v1.BidiRequestId`, `aiserver.v1.BidiAppendRequest`):
+//   BidiRequestId       { 1: request_id (string) }
+//   BidiAppendRequest   { 1: data (string, hex-encoded AgentClientMessage),
+//                          2: request_id (message BidiRequestId),
+//                          3: append_seqno (int64/varint),
+//                          4: data_binary (bytes, AgentClientMessage) }
+// The installed client picks `data_binary` when `binaryEncoding` is set,
+// otherwise a hex string in `data`. Both carry the same application bytes —
+// decode prefers `data_binary`, falling back to hex-decoding `data`.
+
+export type TCursorBidiRequestId = {
+  readonly requestId: string;
+};
+
+export type TCursorBidiAppendRequest = {
+  readonly requestId: string | null;
+  readonly appendSeqno: number | null;
+  /** Decoded AgentClientMessage bytes carried by this companion RPC. */
+  readonly data: Uint8Array | null;
+};
+
+export const encodeBidiRequestId = (requestId: string): Uint8Array =>
+  encodeProtoString(1, requestId);
+
+export const decodeBidiRequestId = (
+  bytes: Uint8Array,
+): TCursorBidiRequestId | null => {
+  const fields = parseProtoFields(bytes);
+  const requestId = protoStringField(fields, 1);
+  if (requestId === null) return null;
+  return { requestId };
+};
+
+const hexToBytes = (hex: string): Uint8Array | null => {
+  if (hex.length % 2 !== 0) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i += 1) {
+    const byteStr = hex.slice(i * 2, i * 2 + 2);
+    const byte = Number.parseInt(byteStr, 16);
+    if (Number.isNaN(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
+};
+
+/**
+ * Encode a `BidiAppendRequest`. `binary: true` uses field 4 (`data_binary`)
+ * matching the installed client's `binaryEncoding` mode; otherwise field 1
+ * (`data`) carries the hex-encoded bytes — mirrors the two wire shapes the
+ * vendor client actually emits.
+ */
+export const encodeBidiAppendRequest = (args: {
+  readonly requestId: string;
+  readonly appendSeqno: number;
+  readonly data: Uint8Array;
+  readonly binary?: boolean;
+}): Uint8Array => {
+  const requestIdMsg = encodeProtoBytes(2, encodeBidiRequestId(args.requestId));
+  const seqno = encodeProtoInt32(3, args.appendSeqno);
+  const dataField =
+    args.binary === true
+      ? encodeProtoBytes(4, args.data)
+      : encodeProtoString(1, Buffer.from(args.data).toString("hex"));
+  return concatBytes([dataField, requestIdMsg, seqno]);
+};
+
+/**
+ * Decode a `BidiAppendRequest`. Never throws — a companion whose bytes are
+ * malformed still needs its raw envelope preserved for the transaction
+ * buffer, so the caller decides whether a null field blocks dispatch.
+ */
+export const decodeBidiAppendRequest = (
+  bytes: Uint8Array,
+): TCursorBidiAppendRequest => {
+  let fields: ReadonlyArray<TProtoField>;
+  try {
+    fields = parseProtoFields(bytes);
+  } catch {
+    return { requestId: null, appendSeqno: null, data: null };
+  }
+  const requestIdBytes = protoMessageField(fields, 2);
+  const requestId =
+    requestIdBytes === null
+      ? null
+      : (decodeBidiRequestId(requestIdBytes)?.requestId ?? null);
+  const appendSeqno = protoIntField(fields, 3);
+  const dataBinary = protoMessageField(fields, 4);
+  if (dataBinary !== null) {
+    return { requestId, appendSeqno, data: dataBinary };
+  }
+  const dataHex = protoStringField(fields, 1);
+  const data = dataHex === null ? null : hexToBytes(dataHex);
+  return { requestId, appendSeqno, data };
+};
+
+/**
+ * Decode the Connect-framed body of a captured RunSSE (primary) request into
+ * its `BidiRequestId` correlation id. Returns null if the body is not a
+ * well-formed single-envelope Connect message (RunSSE's request body is
+ * normally exactly this — no application content).
+ */
+export const requestIdFromCapturedRunSseBody = (
+  body: Uint8Array | null,
+): string | null => {
+  if (body === null || body.byteLength === 0) return null;
+  const { envelopes } = takeConnectEnvelopes(body);
+  const first = envelopes.find((e) => !e.endStream);
+  if (first === undefined) return null;
+  try {
+    return decodeBidiRequestId(first.payload)?.requestId ?? null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Decode the Connect-framed body of a captured BidiAppend companion request.
+ * Returns the best-effort decode (never throws) — a companion is buffered
+ * even when its bytes are malformed so nothing is silently dropped.
+ */
+export const decodeCapturedBidiAppendBody = (
+  body: Uint8Array | null,
+): TCursorBidiAppendRequest => {
+  if (body === null || body.byteLength === 0) {
+    return { requestId: null, appendSeqno: null, data: null };
+  }
+  const { envelopes } = takeConnectEnvelopes(body);
+  const first = envelopes.find((e) => !e.endStream);
+  if (first === undefined) {
+    return { requestId: null, appendSeqno: null, data: null };
+  }
+  return decodeBidiAppendRequest(first.payload);
+};
+
+/**
+ * Build `agent.v1.AgentServerMessage` with `interaction_update` /
+ * duplex cases for hermetic fixtures (field numbers from artifact).
+ */
+export const encodeAgentServerMessage = (args: {
+  readonly interactionUpdate?: Uint8Array;
+  readonly execServerMessage?: Uint8Array;
+  readonly interactionQuery?: Uint8Array;
+}): Uint8Array => {
+  const parts: Uint8Array[] = [];
+  if (args.interactionUpdate !== undefined) {
+    parts.push(encodeProtoBytes(1, args.interactionUpdate));
+  }
+  if (args.execServerMessage !== undefined) {
+    parts.push(encodeProtoBytes(2, args.execServerMessage));
+  }
+  if (args.interactionQuery !== undefined) {
+    parts.push(encodeProtoBytes(7, args.interactionQuery));
+  }
+  return concatBytes(parts);
+};
+
+export const encodeTextDeltaUpdate = (text: string): Uint8Array =>
+  encodeProtoBytes(1, encodeProtoString(1, text));
+
+export const encodeThinkingDeltaUpdate = (text: string): Uint8Array =>
+  encodeProtoBytes(4, encodeProtoString(1, text));
+
+export const encodeTokenDeltaUpdate = (tokens: number): Uint8Array =>
+  encodeProtoBytes(8, encodeProtoInt32(1, tokens));
+
+/**
+ * `InteractionUpdate.turn_ended` (field 14, `TurnEndedUpdate`) — the real
+ * native turn-completion marker. Test/fixture-only encoder mirroring the
+ * field numbers confirmed by read-only inspection of the installed vendor
+ * artifact: input_tokens(1), output_tokens(2), cache_read_tokens(3),
+ * cache_write_tokens(4), reasoning_tokens(5) — all optional int64 counters.
+ */
+export const encodeTurnEndedUpdate = (
+  args: {
+    readonly inputTokens?: number;
+    readonly outputTokens?: number;
+    readonly cacheReadTokens?: number;
+    readonly cacheWriteTokens?: number;
+    readonly reasoningTokens?: number;
+  } = {},
+): Uint8Array => {
+  const parts: Uint8Array[] = [];
+  if (args.inputTokens !== undefined) {
+    parts.push(encodeProtoInt32(1, args.inputTokens));
+  }
+  if (args.outputTokens !== undefined) {
+    parts.push(encodeProtoInt32(2, args.outputTokens));
+  }
+  if (args.cacheReadTokens !== undefined) {
+    parts.push(encodeProtoInt32(3, args.cacheReadTokens));
+  }
+  if (args.cacheWriteTokens !== undefined) {
+    parts.push(encodeProtoInt32(4, args.cacheWriteTokens));
+  }
+  if (args.reasoningTokens !== undefined) {
+    parts.push(encodeProtoInt32(5, args.reasoningTokens));
+  }
+  return encodeProtoBytes(14, concatBytes(parts));
+};
+
+export const encodeMcpPartialToolCallUpdate = (args: {
+  readonly callId: string;
+  readonly toolName: string;
+  readonly argsTextDelta: string;
+  readonly providerIdentifier?: string;
+  readonly serverIdentifier?: string;
+}): Uint8Array => {
+  const mcpArgs = concatBytes([
+    encodeProtoString(1, args.toolName),
+    encodeProtoString(3, args.callId),
+    encodeProtoString(5, args.toolName),
+    ...(args.providerIdentifier !== undefined
+      ? [encodeProtoString(4, args.providerIdentifier)]
+      : []),
+    ...(args.serverIdentifier !== undefined
+      ? [encodeProtoString(9, args.serverIdentifier)]
+      : []),
+  ]);
+  const mcpToolCall = encodeProtoBytes(1, mcpArgs);
+  // ToolCall.mcp_tool_call = field 15
+  const toolCall = encodeProtoBytes(15, mcpToolCall);
+  const partial = concatBytes([
+    encodeProtoString(1, args.callId),
+    encodeProtoBytes(2, toolCall),
+    encodeProtoString(3, args.argsTextDelta),
+  ]);
+  // InteractionUpdate.partial_tool_call = field 7
+  return encodeProtoBytes(7, partial);
+};
+
+export const encodeMcpToolCallStartedUpdate = (args: {
+  readonly callId: string;
+  readonly toolName: string;
+  readonly argumentsJson: string;
+}): Uint8Array => {
+  const mcpArgs = concatBytes([
+    encodeProtoString(1, args.toolName),
+    encodeProtoString(3, args.callId),
+    encodeProtoString(5, args.toolName),
+  ]);
+  const mcpToolCall = encodeProtoBytes(1, mcpArgs);
+  const toolCall = encodeProtoBytes(15, mcpToolCall);
+  const started = concatBytes([
+    encodeProtoString(1, args.callId),
+    encodeProtoBytes(2, toolCall),
+  ]);
+  // Prefer streaming args via a preceding partial; started carries id/name.
+  void args.argumentsJson;
+  return encodeProtoBytes(2, started);
+};
+
+/** Native shell tool (ToolCall.shell_tool_call = field 1) — unsupported by default. */
+export const encodeNativeShellToolStartedUpdate = (
+  callId: string,
+): Uint8Array => {
+  const shell = encodeProtoString(1, "echo"); // minimal placeholder args message
+  const toolCall = encodeProtoBytes(1, shell);
+  const started = concatBytes([
+    encodeProtoString(1, callId),
+    encodeProtoBytes(2, toolCall),
+  ]);
+  return encodeProtoBytes(2, started);
+};
+
+const parseMcpArgs = (
+  bytes: Uint8Array,
+): {
+  readonly name: string;
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly providerIdentifier: string | null;
+  readonly serverIdentifier: string | null;
+} => {
+  const fields = parseProtoFields(bytes);
+  return {
+    name: protoStringField(fields, 1) ?? "",
+    toolCallId: protoStringField(fields, 3) ?? "",
+    toolName: protoStringField(fields, 5) ?? protoStringField(fields, 1) ?? "",
+    providerIdentifier: protoStringField(fields, 4),
+    serverIdentifier: protoStringField(fields, 9),
+  };
+};
+
+const parseToolCall = (
+  bytes: Uint8Array,
+):
+  | { readonly kind: "mcp"; readonly args: ReturnType<typeof parseMcpArgs> }
+  | { readonly kind: "native"; readonly toolCase: string } => {
+  const fields = parseProtoFields(bytes);
+  const mcp = protoMessageField(fields, 15);
+  if (mcp !== null) {
+    const mcpFields = parseProtoFields(mcp);
+    const argsMsg = protoMessageField(mcpFields, 1);
+    if (argsMsg === null) {
+      return { kind: "native", toolCase: "mcp_tool_call_missing_args" };
+    }
+    return { kind: "mcp", args: parseMcpArgs(argsMsg) };
+  }
+  const nativeCases: ReadonlyArray<readonly [number, string]> = [
+    [1, "shell_tool_call"],
+    [3, "delete_tool_call"],
+    [4, "glob_tool_call"],
+    [5, "grep_tool_call"],
+    [8, "read_tool_call"],
+    [12, "edit_tool_call"],
+    [13, "ls_tool_call"],
+    [16, "sem_search_tool_call"],
+  ];
+  for (const [field, name] of nativeCases) {
+    if (protoMessageField(fields, field) !== null) {
+      return { kind: "native", toolCase: name };
+    }
+  }
+  return { kind: "native", toolCase: "unknown_tool" };
+};
+
+export const decodeInteractionUpdate = (
+  bytes: Uint8Array,
+): TCursorDecodedInteraction => {
+  const fields = parseProtoFields(bytes);
+  const textDelta = protoMessageField(fields, 1);
+  if (textDelta !== null) {
+    const t = protoStringField(parseProtoFields(textDelta), 1) ?? "";
+    return { kind: "text_delta", text: t };
+  }
+  const thinkingDelta = protoMessageField(fields, 4);
+  if (thinkingDelta !== null) {
+    const t = protoStringField(parseProtoFields(thinkingDelta), 1) ?? "";
+    return { kind: "thinking_delta", text: t };
+  }
+  const tokenDelta = protoMessageField(fields, 8);
+  if (tokenDelta !== null) {
+    const tokens = protoIntField(parseProtoFields(tokenDelta), 1) ?? 0;
+    return { kind: "token_delta", tokens };
+  }
+  const heartbeat = protoMessageField(fields, 13);
+  if (heartbeat !== null) return { kind: "heartbeat" };
+
+  // `InteractionUpdate.turn_ended` (field 14, `TurnEndedUpdate`) is the real
+  // native turn-completion marker used by the official Cursor client — it is
+  // authoritative independent of any Connect transport `endStream` envelope
+  // (confirmed by read-only deminified inspection of the installed vendor
+  // artifact: the official client sets a local "terminal turn" flag on this
+  // update and, from then on, treats a subsequent transport close/error as a
+  // benign "Ignoring transport close after terminal agent stream", not a
+  // failure). `TurnEndedUpdate` fields are all optional scalar counters:
+  // input_tokens(1), output_tokens(2), cache_read_tokens(3),
+  // cache_write_tokens(4), reasoning_tokens(5).
+  const turnEnded = protoMessageField(fields, 14);
+  if (turnEnded !== null) {
+    const tf = parseProtoFields(turnEnded);
+    return {
+      kind: "turn_ended",
+      inputTokens: protoIntField(tf, 1),
+      outputTokens: protoIntField(tf, 2),
+      cacheReadTokens: protoIntField(tf, 3),
+      cacheWriteTokens: protoIntField(tf, 4),
+      reasoningTokens: protoIntField(tf, 5),
+    };
+  }
+
+  const partial = protoMessageField(fields, 7);
+  if (partial !== null) {
+    const pf = parseProtoFields(partial);
+    const callId = protoStringField(pf, 1) ?? "";
+    const argsTextDelta = protoStringField(pf, 3) ?? "";
+    const toolBytes = protoMessageField(pf, 2);
+    if (toolBytes === null) {
+      return { kind: "ignored", reason: "partial_tool_call_missing_tool" };
+    }
+    const tool = parseToolCall(toolBytes);
+    if (tool.kind === "native") {
+      return { kind: "native_tool", toolCase: tool.toolCase, callId };
+    }
+    return {
+      kind: "mcp_tool_partial",
+      argsTextDelta,
+      intent: {
+        callId: tool.args.toolCallId || callId,
+        name: tool.args.toolName || tool.args.name,
+        argumentsText: argsTextDelta,
+        providerIdentifier: tool.args.providerIdentifier,
+        serverIdentifier: tool.args.serverIdentifier,
+      },
+    };
+  }
+
+  const started = protoMessageField(fields, 2);
+  if (started !== null) {
+    const sf = parseProtoFields(started);
+    const callId = protoStringField(sf, 1) ?? "";
+    const toolBytes = protoMessageField(sf, 2);
+    if (toolBytes === null) {
+      return { kind: "ignored", reason: "tool_call_started_missing_tool" };
+    }
+    const tool = parseToolCall(toolBytes);
+    if (tool.kind === "native") {
+      return { kind: "native_tool", toolCase: tool.toolCase, callId };
+    }
+    return {
+      kind: "mcp_tool_started",
+      intent: {
+        callId: tool.args.toolCallId || callId,
+        name: tool.args.toolName || tool.args.name,
+        argumentsText: "",
+        providerIdentifier: tool.args.providerIdentifier,
+        serverIdentifier: tool.args.serverIdentifier,
+      },
+    };
+  }
+
+  // tool_call_completed / summaries / shell_output — ignored for chunk stream
+  if (protoMessageField(fields, 3) !== null) {
+    return { kind: "ignored", reason: "tool_call_completed" };
+  }
+  if (protoMessageField(fields, 5) !== null) {
+    return { kind: "ignored", reason: "thinking_completed" };
+  }
+  return { kind: "ignored", reason: "unhandled_interaction_update" };
+};
+
+/**
+ * `agent.v1.ExecServerMessage.message` oneof field numbers from artifact
+ * `2026.07.23-e383d2b`. Values are subtype tags only — never log args payloads.
+ */
+export const CURSOR_EXEC_SERVER_MESSAGE_CASES: ReadonlyArray<
+  readonly [field: number, subtype: string]
+> = [
+  [2, "shell_args"],
+  [3, "write_args"],
+  [4, "delete_args"],
+  [5, "grep_args"],
+  [7, "read_args"],
+  [8, "ls_args"],
+  [9, "diagnostics_args"],
+  [10, "request_context_args"],
+  [11, "mcp_args"],
+  [14, "shell_stream_args"],
+  [16, "background_shell_spawn_args"],
+  [17, "list_mcp_resources_exec_args"],
+  [18, "read_mcp_resource_exec_args"],
+  [20, "fetch_args"],
+  [21, "record_screen_args"],
+  [22, "computer_use_args"],
+  [23, "write_shell_stdin_args"],
+  [27, "execute_hook_args"],
+  [28, "subagent_args"],
+  [29, "redacted_read_args"],
+  [30, "force_background_shell_args"],
+  [31, "force_background_subagent_args"],
+  [36, "mcp_state_exec_args"],
+  [37, "subagent_await_args"],
+  [38, "smart_mode_classifier_args"],
+  [40, "canvas_diagnostics_args"],
+  [41, "shell_allowlist_precheck_args"],
+  [42, "mcp_allowlist_precheck_args"],
+  [43, "web_fetch_allowlist_precheck_args"],
+  [44, "git_diff_request"],
+  [45, "pi_read_args"],
+  [46, "pi_bash_args"],
+  [47, "pi_edit_args"],
+  [48, "pi_write_args"],
+  [49, "pi_grep_args"],
+  [50, "pi_find_args"],
+  [51, "pi_ls_args"],
+  [52, "mini_swe_agent_bash_args"],
+  [53, "conversation_search_args"],
+  [54, "agent_store_conflict_args"],
+] as const;
+
+const PROTOCOL_CONTROL_SUBTYPES: ReadonlySet<string> = new Set([
+  "request_context_args",
+  "diagnostics_args",
+  "shell_allowlist_precheck_args",
+  "mcp_allowlist_precheck_args",
+  "web_fetch_allowlist_precheck_args",
+  "smart_mode_classifier_args",
+  "mcp_state_exec_args",
+  "execute_hook_args",
+  "canvas_diagnostics_args",
+]);
+
+export const classifyCursorExecSubtype = (
+  subtype: string,
+): TCursorExecClass => {
+  if (subtype === "mcp_args") return "caller_mcp_tool";
+  if (PROTOCOL_CONTROL_SUBTYPES.has(subtype)) return "protocol_control";
+  if (subtype.endsWith("_args") || subtype.endsWith("_request")) {
+    return "native_exec";
+  }
+  return "unknown";
+};
+
+export type TCursorDecodedExecServerMessage = {
+  readonly id: number | null;
+  readonly execId: string | null;
+  readonly subtype: string;
+  readonly classification: TCursorExecClass;
+  /** Present only for mcp_args — names/ids only; argumentsText may be empty. */
+  readonly mcp: TCursorMcpToolIntent | null;
+};
+
+/**
+ * Decode `agent.v1.McpArgs` for caller tool handoff. Does not dump map values
+ * into diagnostics; argumentsText is "{}" unless a simple string map is present
+ * (we intentionally omit opaque protobuf map values).
+ */
+export const decodeCursorMcpArgs = (
+  bytes: Uint8Array,
+): TCursorMcpToolIntent => {
+  const fields = parseProtoFields(bytes);
+  const name = protoStringField(fields, 1) ?? "";
+  const toolCallId = protoStringField(fields, 3) ?? "";
+  const toolName = protoStringField(fields, 5) ?? name;
+  const providerIdentifier = protoStringField(fields, 4);
+  const serverIdentifier = protoStringField(fields, 9);
+  return {
+    callId: toolCallId,
+    name: toolName || name || "mcp_tool",
+    // Opaque protobuf map values are not flattened into JSON here — avoids
+    // leaking tool argument content into logs while still naming the call.
+    argumentsText: "{}",
+    providerIdentifier,
+    serverIdentifier,
+  };
+};
+
+/**
+ * Decode ExecServerMessage to a safe subtype classification. Never returns
+ * shell/fs argument payloads — only field tags + MCP name/id for caller handoff.
+ */
+export const decodeExecServerMessage = (
+  bytes: Uint8Array,
+): TCursorDecodedExecServerMessage => {
+  const fields = parseProtoFields(bytes);
+  const id = protoIntField(fields, 1);
+  const execId = protoStringField(fields, 15);
+  let subtype = "unknown_exec_server_message";
+  let caseBytes: Uint8Array | null = null;
+  for (const [field, name] of CURSOR_EXEC_SERVER_MESSAGE_CASES) {
+    const msg = protoMessageField(fields, field);
+    if (msg !== null) {
+      subtype = name;
+      caseBytes = msg;
+      break;
+    }
+  }
+  const classification = classifyCursorExecSubtype(subtype);
+  const mcp =
+    classification === "caller_mcp_tool" && caseBytes !== null
+      ? decodeCursorMcpArgs(caseBytes)
+      : null;
+  return { id, execId, subtype, classification, mcp };
+};
+
+/** Hermetic fixture: ExecServerMessage with a chosen oneof case (empty case body). */
+export const encodeExecServerMessage = (args: {
+  readonly id?: number;
+  readonly execId?: string;
+  readonly caseField: number;
+  readonly caseBytes?: Uint8Array;
+}): Uint8Array => {
+  const parts: Uint8Array[] = [];
+  if (args.id !== undefined) parts.push(encodeProtoInt32(1, args.id));
+  if (args.execId !== undefined) parts.push(encodeProtoString(15, args.execId));
+  parts.push(
+    encodeProtoBytes(args.caseField, args.caseBytes ?? new Uint8Array(0)),
+  );
+  return concatBytes(parts);
+};
+
+export const encodeMcpArgsMessage = (args: {
+  readonly name: string;
+  readonly toolCallId: string;
+  readonly toolName?: string;
+  readonly providerIdentifier?: string;
+  readonly serverIdentifier?: string;
+}): Uint8Array =>
+  concatBytes([
+    encodeProtoString(1, args.name),
+    encodeProtoString(3, args.toolCallId),
+    ...(args.providerIdentifier !== undefined
+      ? [encodeProtoString(4, args.providerIdentifier)]
+      : []),
+    encodeProtoString(5, args.toolName ?? args.name),
+    ...(args.serverIdentifier !== undefined
+      ? [encodeProtoString(9, args.serverIdentifier)]
+      : []),
+  ]);
+
+/** RequestContextResult.success { request_context } — opaque non-empty context bytes. */
+export const encodeRequestContextResultSuccess = (
+  requestContextBytes: Uint8Array,
+): Uint8Array => {
+  if (requestContextBytes.byteLength === 0) {
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      "request_context success fixture requires non-empty context bytes",
+    );
+  }
+  const success = encodeProtoBytes(1, requestContextBytes);
+  return encodeProtoBytes(1, success);
+};
+
+/** ExecClientMessage { id, request_context_result } */
+export const encodeExecClientRequestContextResult = (args: {
+  readonly id: number;
+  readonly execId?: string;
+  readonly requestContextBytes: Uint8Array;
+}): Uint8Array =>
+  concatBytes([
+    encodeProtoInt32(1, args.id),
+    ...(args.execId !== undefined ? [encodeProtoString(15, args.execId)] : []),
+    encodeProtoBytes(
+      10,
+      encodeRequestContextResultSuccess(args.requestContextBytes),
+    ),
+  ]);
+
+/** AgentClientMessage { exec_client_message } */
+export const encodeAgentClientExecClientMessage = (
+  execClientMessage: Uint8Array,
+): Uint8Array => encodeProtoBytes(2, execClientMessage);
+
+/** AgentClientMessage { client_heartbeat } — empty message body (benign duplex keepalive). */
+export const encodeAgentClientHeartbeat = (): Uint8Array =>
+  encodeProtoBytes(7, new Uint8Array(0));
+
+/**
+ * AgentClientMessage oneof field tags (artifact 2026.07.23-e383d2b).
+ * Metadata only — never log payloads.
+ */
+export const CURSOR_AGENT_CLIENT_MESSAGE_CASES: ReadonlyArray<
+  readonly [field: number, name: string]
+> = [
+  [1, "run_request"],
+  [2, "exec_client_message"],
+  [3, "kv_client_message"],
+  [4, "conversation_action"],
+  [5, "exec_client_control_message"],
+  [6, "interaction_response"],
+  [7, "client_heartbeat"],
+  [8, "prewarm_request"],
+] as const;
+
+/**
+ * ExecClientMessage.message oneof tags we care about for follow-up triage.
+ * Full list is large; unknown tags surface as `exec_client_field_<n>`.
+ */
+export const CURSOR_EXEC_CLIENT_RESULT_CASES: ReadonlyArray<
+  readonly [field: number, name: string]
+> = [
+  [2, "shell_result"],
+  [3, "write_result"],
+  [4, "delete_result"],
+  [5, "grep_result"],
+  [7, "read_result"],
+  [8, "ls_result"],
+  [9, "diagnostics_result"],
+  [10, "request_context_result"],
+  [11, "mcp_result"],
+  [14, "shell_stream"],
+  [16, "background_shell_spawn_result"],
+  [20, "fetch_result"],
+  [22, "computer_use_result"],
+  [27, "execute_hook_result"],
+  [28, "subagent_result"],
+  [29, "redacted_read_result"],
+  [36, "mcp_state_exec_result"],
+  [41, "shell_allowlist_precheck_result"],
+  [42, "mcp_allowlist_precheck_result"],
+  [43, "web_fetch_allowlist_precheck_result"],
+] as const;
+
+export type TCursorFollowUpKind =
+  | "request_context_result"
+  | "benign_control"
+  | "forbidden_native"
+  | "unknown";
+
+/** Metadata-only classification of a builder→daemon follow-up payload. */
+export type TCursorFollowUpClassification = {
+  readonly kind: TCursorFollowUpKind;
+  readonly connectFlags: number | null;
+  readonly connectPayloadBytes: number;
+  readonly agentClientCase: string | null;
+  readonly execClientCase: string | null;
+  readonly execId: string | null;
+  readonly execNumericId: number | null;
+  /** Safe one-line diagnostic — field tags only, no args/paths/content. */
+  readonly diagnostic: string;
+};
+
+const agentClientCaseOf = (
+  fields: ReadonlyArray<TProtoField>,
+): { readonly name: string; readonly bytes: Uint8Array } | null => {
+  for (const [field, name] of CURSOR_AGENT_CLIENT_MESSAGE_CASES) {
+    const bytes = protoMessageField(fields, field);
+    if (bytes !== null) return { name, bytes };
+  }
+  return null;
+};
+
+const execClientCaseOf = (
+  fields: ReadonlyArray<TProtoField>,
+): string | null => {
+  for (const [field, name] of CURSOR_EXEC_CLIENT_RESULT_CASES) {
+    if (protoMessageField(fields, field) !== null) return name;
+  }
+  // Unknown oneof member — report field number only.
+  for (const f of fields) {
+    if (
+      f.wire === 2 &&
+      f.field !== 1 &&
+      f.field !== 15 &&
+      f.field !== 39 &&
+      f.field !== 45
+    ) {
+      return `exec_client_field_${f.field}`;
+    }
+  }
+  return null;
+};
+
+/**
+ * Classify AgentClientMessage bytes (Connect payload, not including the
+ * 5-byte Connect header). Never inspects argument/result content — tags only.
+ */
+export const classifyAgentClientFollowUp = (
+  agentClientMessageBytes: Uint8Array,
+  connectMeta?: { readonly flags?: number; readonly payloadBytes?: number },
+): TCursorFollowUpClassification => {
+  const connectFlags = connectMeta?.flags ?? null;
+  const connectPayloadBytes =
+    connectMeta?.payloadBytes ?? agentClientMessageBytes.byteLength;
+  const base = {
+    connectFlags,
+    connectPayloadBytes,
+  };
+  try {
+    const fields = parseProtoFields(agentClientMessageBytes);
+    const agentCase = agentClientCaseOf(fields);
+    if (agentCase === null) {
+      return {
+        ...base,
+        kind: "unknown",
+        agentClientCase: null,
+        execClientCase: null,
+        execId: null,
+        execNumericId: null,
+        diagnostic: `followup unknown_agent_client flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    // Benign duplex keepalives / prewarm — skip and keep waiting.
+    if (
+      agentCase.name === "client_heartbeat" ||
+      agentCase.name === "prewarm_request"
+    ) {
+      return {
+        ...base,
+        kind: "benign_control",
+        agentClientCase: agentCase.name,
+        execClientCase: null,
+        execId: null,
+        execNumericId: null,
+        diagnostic: `followup benign ${agentCase.name} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    if (agentCase.name === "exec_client_control_message") {
+      // stream_close / throw / heartbeat — heartbeat is benign; others reject.
+      const ctrlFields = parseProtoFields(agentCase.bytes);
+      const ctrl =
+        protoMessageField(ctrlFields, 3) !== null
+          ? "heartbeat"
+          : protoMessageField(ctrlFields, 1) !== null
+            ? "stream_close"
+            : protoMessageField(ctrlFields, 2) !== null
+              ? "throw"
+              : "unknown_control";
+      if (ctrl === "heartbeat") {
+        return {
+          ...base,
+          kind: "benign_control",
+          agentClientCase: agentCase.name,
+          execClientCase: ctrl,
+          execId: null,
+          execNumericId: null,
+          diagnostic: `followup benign exec_client_control.heartbeat flags=${connectFlags} bytes=${connectPayloadBytes}`,
+        };
+      }
+      return {
+        ...base,
+        kind: "forbidden_native",
+        agentClientCase: agentCase.name,
+        execClientCase: ctrl,
+        execId: null,
+        execNumericId: null,
+        diagnostic: `followup forbidden exec_client_control.${ctrl} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    if (agentCase.name !== "exec_client_message") {
+      return {
+        ...base,
+        kind: "forbidden_native",
+        agentClientCase: agentCase.name,
+        execClientCase: null,
+        execId: null,
+        execNumericId: null,
+        diagnostic: `followup forbidden agent_client.${agentCase.name} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    const execFields = parseProtoFields(agentCase.bytes);
+    const execId = protoStringField(execFields, 15);
+    const execNumericId = protoIntField(execFields, 1);
+    const execCase = execClientCaseOf(execFields);
+    if (execCase === "request_context_result") {
+      // Ensure no sibling native result fields ride along.
+      for (const [field, name] of CURSOR_EXEC_CLIENT_RESULT_CASES) {
+        if (field === 10) continue;
+        if (protoMessageField(execFields, field) !== null) {
+          return {
+            ...base,
+            kind: "forbidden_native",
+            agentClientCase: agentCase.name,
+            execClientCase: `${execCase}+${name}`,
+            execId,
+            execNumericId,
+            diagnostic: `followup forbidden request_context_result mixed with ${name} id=${execNumericId} exec_id_len=${execId?.length ?? 0} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+          };
+        }
+      }
+      return {
+        ...base,
+        kind: "request_context_result",
+        agentClientCase: agentCase.name,
+        execClientCase: execCase,
+        execId,
+        execNumericId,
+        diagnostic: `followup allow request_context_result id=${execNumericId} exec_id_len=${execId?.length ?? 0} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    if (execCase === null) {
+      return {
+        ...base,
+        kind: "unknown",
+        agentClientCase: agentCase.name,
+        execClientCase: null,
+        execId,
+        execNumericId,
+        diagnostic: `followup unknown empty_exec_client id=${execNumericId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    // Allowlist-adjacent protocol results that are NOT request_context — still
+    // not forwardable on this bridge (only request_context is implemented).
+    if (
+      execCase === "diagnostics_result" ||
+      execCase === "shell_allowlist_precheck_result" ||
+      execCase === "mcp_allowlist_precheck_result" ||
+      execCase === "web_fetch_allowlist_precheck_result" ||
+      execCase === "mcp_state_exec_result" ||
+      execCase === "execute_hook_result"
+    ) {
+      return {
+        ...base,
+        kind: "forbidden_native",
+        agentClientCase: agentCase.name,
+        execClientCase: execCase,
+        execId,
+        execNumericId,
+        diagnostic: `followup unsupported_control ${execCase} id=${execNumericId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    return {
+      ...base,
+      kind: "forbidden_native",
+      agentClientCase: agentCase.name,
+      execClientCase: execCase,
+      execId,
+      execNumericId,
+      diagnostic: `followup forbidden ${execCase} id=${execNumericId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+    };
+  } catch {
+    return {
+      ...base,
+      kind: "unknown",
+      agentClientCase: null,
+      execClientCase: null,
+      execId: null,
+      execNumericId: null,
+      diagnostic: `followup parse_error flags=${connectFlags} bytes=${connectPayloadBytes}`,
+    };
+  }
+};
+
+/**
+ * True when Connect payload bytes are AgentClientMessage.exec_client_message
+ * carrying request_context_result (allowlisted follow-up). Prefer
+ * {@link classifyAgentClientFollowUp} when diagnostics are needed.
+ */
+export const isAllowlistedRequestContextFollowUp = (
+  agentClientMessageBytes: Uint8Array,
+): boolean =>
+  classifyAgentClientFollowUp(agentClientMessageBytes).kind ===
+  "request_context_result";
+
+export const decodeAgentServerMessage = (
+  bytes: Uint8Array,
+): TCursorDecodedInteraction => {
+  const fields = parseProtoFields(bytes);
+  const interaction = protoMessageField(fields, 1);
+  if (interaction !== null) return decodeInteractionUpdate(interaction);
+  const execServer = protoMessageField(fields, 2);
+  if (execServer !== null) {
+    const decoded = decodeExecServerMessage(execServer);
+    return {
+      kind: "exec_server",
+      classification: decoded.classification,
+      subtype: decoded.subtype,
+      id: decoded.id,
+      execId: decoded.execId,
+      mcp: decoded.mcp,
+    };
+  }
+  if (protoMessageField(fields, 5) !== null) {
+    return {
+      kind: "requires_duplex",
+      messageCase: "exec_server_control_message",
+      execSubtype: "abort",
+      execClass: "protocol_control",
+    };
+  }
+  if (protoMessageField(fields, 7) !== null) {
+    return {
+      kind: "requires_duplex",
+      messageCase: "interaction_query",
+      execSubtype: null,
+      execClass: "protocol_control",
+    };
+  }
+  if (protoMessageField(fields, 3) !== null) {
+    return { kind: "ignored", reason: "conversation_checkpoint_update" };
+  }
+  if (protoMessageField(fields, 4) !== null) {
+    return { kind: "ignored", reason: "kv_server_message" };
+  }
+  return { kind: "ignored", reason: "empty_or_unknown_server_message" };
+};
+
+/**
+ * Map a classified ExecServerMessage onto the failure that capture must raise.
+ * MCP caller tools are handled by the chunk decoder (emit tool_calls then this).
+ */
+export const cursorExecServerFailure = (
+  decoded: TCursorDecodedExecServerMessage,
+): CursorCaptureDecodeError => {
+  const tag = `exec_server_message.${decoded.subtype}`;
+  if (decoded.classification === "caller_mcp_tool") {
+    return new CursorCaptureDecodeError(
+      "caller_mcp_tool_cancel",
+      `${tag} mapped to caller tool_calls; native MCP execution is not performed`,
+      { execSubtype: decoded.subtype, execClass: decoded.classification },
+    );
+  }
+  if (
+    decoded.classification === "protocol_control" &&
+    decoded.subtype === "request_context_args"
+  ) {
+    return new CursorCaptureDecodeError(
+      "requires_request_context_duplex",
+      `${tag}: remote agent protocol requires a BiDi RequestContextResult follow-up before inference can proceed; fabricated RequestContextSuccess is not sent`,
+      { execSubtype: decoded.subtype, execClass: decoded.classification },
+    );
+  }
+  if (decoded.classification === "protocol_control") {
+    return new CursorCaptureDecodeError(
+      "requires_duplex_bridge",
+      `${tag}: protocol control requires a truthful ExecClientMessage follow-up (not implemented for this subtype)`,
+      { execSubtype: decoded.subtype, execClass: decoded.classification },
+    );
+  }
+  if (decoded.classification === "native_exec") {
+    return new CursorCaptureDecodeError(
+      "unsupported_native_exec",
+      `${tag}: filesystem/shell/native exec is rejected; capture never executes native tools`,
+      { execSubtype: decoded.subtype, execClass: decoded.classification },
+    );
+  }
+  return new CursorCaptureDecodeError(
+    "requires_duplex_bridge",
+    `${tag}: unclassified ExecServerMessage subtype`,
+    { execSubtype: decoded.subtype, execClass: decoded.classification },
+  );
+};
+
+const chunkBase = (
+  providerModelId: string,
+  created: number,
+  id: string,
+): Pick<TChatCompletionChunk, "id" | "object" | "created" | "model"> => ({
+  id,
+  object: "chat.completion.chunk",
+  created,
+  model: providerModelId,
+});
+
+/**
+ * Decode a complete Connect response body (zero or more envelopes + optional
+ * end-stream) into canonical chat chunks. Throws {@link CursorCaptureDecodeError}
+ * on compressed frames, end-stream errors, duplex requirements, or native tools
+ * (unless `allowNativeToolIntents` is set).
+ */
+export const chunksFromCursorConnectResponseBytes = (
+  body: Uint8Array,
+  args: {
+    readonly providerModelId: string;
+    readonly allowNativeToolIntents?: boolean;
+    readonly chunkId?: string;
+    readonly created?: number;
+    /** From response `connect-content-encoding` when envelopes may be compressed. */
+    readonly connectContentEncoding?: string | null;
+  },
+): ReadonlyArray<TChatCompletionChunk> => {
+  const { envelopes, rest } = takeConnectEnvelopes(body);
+  if (rest.byteLength > 0) {
+    throw new CursorCaptureDecodeError(
+      "truncated_connect_frame",
+      `trailing ${rest.byteLength} bytes are not a complete Connect envelope`,
+    );
+  }
+
+  const created = args.created ?? Math.floor(Date.now() / 1000);
+  const id = args.chunkId ?? `cursor-capture-${created}`;
+  const chunks: TChatCompletionChunk[] = [];
+  let toolIndex = 0;
+  const toolIndexByCallId = new Map<string, number>();
+  let sawMeaningful = false;
+  let tokenSum = 0;
+
+  const ensureToolIndex = (callId: string): number => {
+    const existing = toolIndexByCallId.get(callId);
+    if (existing !== undefined) return existing;
+    const next = toolIndex;
+    toolIndexByCallId.set(callId, next);
+    toolIndex += 1;
+    return next;
+  };
+
+  for (const env of envelopes) {
+    const payload = resolveConnectEnvelopePayload(
+      env,
+      args.connectContentEncoding,
+    );
+    if (env.endStream) {
+      const raw = textDecoder.decode(payload);
+      if (raw.length === 0 || raw === "{}") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new CursorCaptureDecodeError(
+          "connect_end_stream_error",
+          `invalid Connect end-stream JSON: ${raw.slice(0, 200)}`,
+        );
+      }
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        "error" in parsed &&
+        (parsed as { error?: unknown }).error !== undefined &&
+        (parsed as { error?: unknown }).error !== null
+      ) {
+        const err = (parsed as { error: unknown }).error;
+        const msg =
+          typeof err === "object" &&
+          err !== null &&
+          typeof (err as { message?: unknown }).message === "string"
+            ? (err as { message: string }).message
+            : JSON.stringify(err);
+        throw new CursorCaptureDecodeError("connect_end_stream_error", msg);
+      }
+      continue;
+    }
+
+    const decoded = decodeAgentServerMessage(payload);
+    switch (decoded.kind) {
+      case "text_delta": {
+        if (decoded.text.length === 0) break;
+        sawMeaningful = true;
+        chunks.push({
+          ...chunkBase(args.providerModelId, created, id),
+          choices: [
+            {
+              index: 0,
+              delta: { content: decoded.text },
+              finish_reason: null,
+            },
+          ],
+        });
+        break;
+      }
+      case "thinking_delta": {
+        if (decoded.text.length === 0) break;
+        sawMeaningful = true;
+        chunks.push({
+          ...chunkBase(args.providerModelId, created, id),
+          choices: [
+            {
+              index: 0,
+              delta: { reasoning_content: decoded.text },
+              finish_reason: null,
+            },
+          ],
+        });
+        break;
+      }
+      case "mcp_tool_partial":
+      case "mcp_tool_started": {
+        sawMeaningful = true;
+        const intent = decoded.intent;
+        const index = ensureToolIndex(intent.callId);
+        const argsDelta =
+          decoded.kind === "mcp_tool_partial" ? decoded.argsTextDelta : "";
+        chunks.push({
+          ...chunkBase(args.providerModelId, created, id),
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index,
+                    id: intent.callId,
+                    type: "function",
+                    function: {
+                      name: intent.name,
+                      arguments: argsDelta,
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        });
+        break;
+      }
+      case "token_delta": {
+        // Untyped single counter — NOT an authoritative prompt/completion split.
+        // Do not invent usage.completion_tokens / total_tokens from it.
+        tokenSum += decoded.tokens;
+        break;
+      }
+      case "turn_ended": {
+        // The real native turn-completion marker (`InteractionUpdate.turn_ended`,
+        // field 14) — authoritative independent of Connect transport
+        // `endStream`. Treat the turn as meaningfully complete even with zero
+        // streamed text (e.g. a tool-only turn), and stop honoring the count
+        // separately — the finish chunk below already emits once, driven by
+        // `sawMeaningful`.
+        sawMeaningful = true;
+        break;
+      }
+      case "exec_server": {
+        if (
+          decoded.classification === "caller_mcp_tool" &&
+          decoded.mcp !== null
+        ) {
+          sawMeaningful = true;
+          const intent = decoded.mcp;
+          const index = ensureToolIndex(
+            intent.callId || `exec-${decoded.id ?? 0}`,
+          );
+          chunks.push({
+            ...chunkBase(args.providerModelId, created, id),
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index,
+                      id: intent.callId || `exec-${decoded.id ?? 0}`,
+                      type: "function",
+                      function: {
+                        name: intent.name,
+                        arguments: intent.argumentsText,
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          });
+        }
+        throw cursorExecServerFailure({
+          id: decoded.id,
+          execId: decoded.execId,
+          subtype: decoded.subtype,
+          classification: decoded.classification,
+          mcp: decoded.mcp,
+        });
+      }
+      case "requires_duplex": {
+        throw new CursorCaptureDecodeError(
+          "requires_duplex_bridge",
+          `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active`,
+          {
+            execSubtype: decoded.execSubtype,
+            execClass: decoded.execClass,
+          },
+        );
+      }
+      case "native_tool": {
+        // Never silently relabel native intents as caller tools unless explicitly
+        // opted in (tests). Production always fails closed.
+        if (args.allowNativeToolIntents === true) {
+          sawMeaningful = true;
+          const index = ensureToolIndex(decoded.callId);
+          chunks.push({
+            ...chunkBase(args.providerModelId, created, id),
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index,
+                      id: decoded.callId,
+                      type: "function",
+                      function: {
+                        name: `cursor_native_${decoded.toolCase}`,
+                        arguments: "{}",
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          });
+          break;
+        }
+        throw new CursorCaptureDecodeError(
+          "unsupported_native_tool_intent",
+          `native tool intent ${decoded.toolCase} (call ${decoded.callId}) is not in the caller contract`,
+        );
+      }
+      case "heartbeat":
+      case "ignored":
+        break;
+    }
+  }
+
+  const finishReason =
+    toolIndexByCallId.size > 0 ? ("tool_calls" as const) : ("stop" as const);
+  if (sawMeaningful) {
+    chunks.push({
+      ...chunkBase(args.providerModelId, created, id),
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: finishReason,
+        },
+      ],
+    });
+  } else if (tokenSum > 0) {
+    // Token deltas alone are not enough to invent a completion — no usage, no
+    // finish. Callers treat this as empty meaningful output.
+    void tokenSum;
+  }
+  return chunks;
+};
+
+/** Why a tolerant decode stopped before the Connect body was exhausted. */
+export type TCursorDecodeBlock = {
+  readonly code: TCursorDecodeFailureCode;
+  readonly message: string;
+  /** Present for `requires_duplex_bridge` / `unsupported_native_tool_intent`. */
+  readonly toolCallId: string | null;
+};
+
+export type TCursorTolerantDecodeResult = {
+  readonly chunks: ReadonlyArray<TChatCompletionChunk>;
+  readonly blocked: TCursorDecodeBlock | null;
+};
+
+/**
+ * Same decode as {@link chunksFromCursorConnectResponseBytes}, but a
+ * duplex-required or unsupported-native-tool message stops the decode and
+ * returns everything decoded so far (already-seen text / reasoning / caller
+ * tool calls) instead of discarding it. Never fabricates a `finish_reason`
+ * for the blocked turn — the integrator decides how to surface `blocked`
+ * (typically: emit the caller tool call already decoded, if any, and cancel
+ * the transaction rather than pretending the turn completed).
+ *
+ * Compressed frames / truncated Connect / end-stream errors still throw —
+ * those are transport failures, not semantic boundaries.
+ */
+export const chunksFromCursorConnectResponseBytesTolerant = (
+  body: Uint8Array,
+  args: {
+    readonly providerModelId: string;
+    readonly chunkId?: string;
+    readonly created?: number;
+    readonly connectContentEncoding?: string | null;
+  },
+): TCursorTolerantDecodeResult => {
+  const { envelopes, rest } = takeConnectEnvelopes(body);
+  if (rest.byteLength > 0) {
+    throw new CursorCaptureDecodeError(
+      "truncated_connect_frame",
+      `trailing ${rest.byteLength} bytes are not a complete Connect envelope`,
+    );
+  }
+
+  const created = args.created ?? Math.floor(Date.now() / 1000);
+  const id = args.chunkId ?? `cursor-capture-${created}`;
+  const chunks: TChatCompletionChunk[] = [];
+  let toolIndex = 0;
+  const toolIndexByCallId = new Map<string, number>();
+  let sawMeaningful = false;
+  let tokenSum = 0;
+  let blocked: TCursorDecodeBlock | null = null;
+
+  const ensureToolIndex = (callId: string): number => {
+    const existing = toolIndexByCallId.get(callId);
+    if (existing !== undefined) return existing;
+    const next = toolIndex;
+    toolIndexByCallId.set(callId, next);
+    toolIndex += 1;
+    return next;
+  };
+
+  for (const env of envelopes) {
+    if (blocked !== null) break;
+    const payload = resolveConnectEnvelopePayload(
+      env,
+      args.connectContentEncoding,
+    );
+    if (env.endStream) {
+      const raw = textDecoder.decode(payload);
+      if (raw.length === 0 || raw === "{}") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new CursorCaptureDecodeError(
+          "connect_end_stream_error",
+          `invalid Connect end-stream JSON: ${raw.slice(0, 200)}`,
+        );
+      }
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        "error" in parsed &&
+        (parsed as { error?: unknown }).error !== undefined &&
+        (parsed as { error?: unknown }).error !== null
+      ) {
+        const err = (parsed as { error: unknown }).error;
+        const msg =
+          typeof err === "object" &&
+          err !== null &&
+          typeof (err as { message?: unknown }).message === "string"
+            ? (err as { message: string }).message
+            : JSON.stringify(err);
+        throw new CursorCaptureDecodeError("connect_end_stream_error", msg);
+      }
+      continue;
+    }
+
+    const decoded = decodeAgentServerMessage(payload);
+    switch (decoded.kind) {
+      case "text_delta": {
+        if (decoded.text.length === 0) break;
+        sawMeaningful = true;
+        chunks.push({
+          ...chunkBase(args.providerModelId, created, id),
+          choices: [
+            {
+              index: 0,
+              delta: { content: decoded.text },
+              finish_reason: null,
+            },
+          ],
+        });
+        break;
+      }
+      case "thinking_delta": {
+        if (decoded.text.length === 0) break;
+        sawMeaningful = true;
+        chunks.push({
+          ...chunkBase(args.providerModelId, created, id),
+          choices: [
+            {
+              index: 0,
+              delta: { reasoning_content: decoded.text },
+              finish_reason: null,
+            },
+          ],
+        });
+        break;
+      }
+      case "mcp_tool_partial":
+      case "mcp_tool_started": {
+        sawMeaningful = true;
+        const intent = decoded.intent;
+        const index = ensureToolIndex(intent.callId);
+        const argsDelta =
+          decoded.kind === "mcp_tool_partial" ? decoded.argsTextDelta : "";
+        chunks.push({
+          ...chunkBase(args.providerModelId, created, id),
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index,
+                    id: intent.callId,
+                    type: "function",
+                    function: {
+                      name: intent.name,
+                      arguments: argsDelta,
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        });
+        break;
+      }
+      case "token_delta": {
+        // Untyped single counter — omit from OpenAI usage until split is known.
+        tokenSum += decoded.tokens;
+        break;
+      }
+      case "turn_ended": {
+        // Authoritative native turn-completion marker — see the non-tolerant
+        // decode above for the full rationale.
+        sawMeaningful = true;
+        break;
+      }
+      case "exec_server": {
+        if (
+          decoded.classification === "caller_mcp_tool" &&
+          decoded.mcp !== null
+        ) {
+          sawMeaningful = true;
+          const intent = decoded.mcp;
+          const callId = intent.callId || `exec-${decoded.id ?? 0}`;
+          const index = ensureToolIndex(callId);
+          chunks.push({
+            ...chunkBase(args.providerModelId, created, id),
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index,
+                      id: callId,
+                      type: "function",
+                      function: {
+                        name: intent.name,
+                        arguments: intent.argumentsText,
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          });
+        }
+        {
+          const err = cursorExecServerFailure({
+            id: decoded.id,
+            execId: decoded.execId,
+            subtype: decoded.subtype,
+            classification: decoded.classification,
+            mcp: decoded.mcp,
+          });
+          blocked = {
+            code: err.code,
+            message: err.message,
+            toolCallId: decoded.mcp?.callId ?? null,
+          };
+        }
+        break;
+      }
+      case "requires_duplex": {
+        blocked = {
+          code: "requires_duplex_bridge",
+          message: `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active`,
+          toolCallId: null,
+        };
+        break;
+      }
+      case "native_tool": {
+        blocked = {
+          code: "unsupported_native_tool_intent",
+          message: `native tool intent ${decoded.toolCase} (call ${decoded.callId}) is not in the caller contract`,
+          toolCallId: decoded.callId,
+        };
+        break;
+      }
+      case "heartbeat":
+      case "ignored":
+        break;
+    }
+  }
+
+  // Only emit a finish chunk when the decode completed without a semantic
+  // block. A blocked turn leaves the caller to cancel / surface the boundary
+  // — inventing `stop` here would look like a completed inference. Never attach
+  // fabricated usage from untyped TokenDeltaUpdate.
+  if (blocked === null && sawMeaningful) {
+    const finishReason =
+      toolIndexByCallId.size > 0 ? ("tool_calls" as const) : ("stop" as const);
+    chunks.push({
+      ...chunkBase(args.providerModelId, created, id),
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: finishReason,
+        },
+      ],
+    });
+  } else {
+    void tokenSum;
+  }
+
+  return { chunks, blocked };
+};
+
+export const chunksStreamFromCursorConnectResponse = (
+  body: Uint8Array,
+  args: {
+    readonly providerModelId: string;
+    readonly allowNativeToolIntents?: boolean;
+    readonly signal?: AbortSignal;
+  },
+): ReadableStream<TChatCompletionChunk> => {
+  const chunks = chunksFromCursorConnectResponseBytes(body, args);
+  return new ReadableStream<TChatCompletionChunk>({
+    start(controller) {
+      if (args.signal?.aborted) {
+        controller.error(
+          args.signal.reason instanceof Error
+            ? args.signal.reason
+            : new Error("aborted"),
+        );
+        return;
+      }
+      const onAbort = (): void => {
+        controller.error(new Error("aborted"));
+      };
+      args.signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        for (const chunk of chunks) {
+          if (args.signal?.aborted) {
+            throw new Error("aborted");
+          }
+          controller.enqueue(chunk);
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        args.signal?.removeEventListener("abort", onAbort);
+      }
+    },
+    cancel() {
+      // Caller cancelled — no vendor loop to feed.
+    },
+  });
+};
+
+/**
+ * Stream Connect envelopes from an upstream response body into canonical
+ * chunks as each envelope completes. Does not buffer the entire answer first.
+ * Semantic blocks (duplex / native tool) error the stream after any prior
+ * chunks were already enqueued — callers that need partial+block should use
+ * {@link chunksFromCursorConnectResponseBytesTolerant} on a finished body.
+ */
+export const chunksStreamFromCursorConnectResponseBody = (
+  body: ReadableStream<Uint8Array>,
+  args: {
+    readonly providerModelId: string;
+    readonly allowNativeToolIntents?: boolean;
+    readonly signal?: AbortSignal;
+    /** From response `connect-content-encoding` when envelopes may be compressed. */
+    readonly connectContentEncoding?: string | null;
+  },
+): ReadableStream<TChatCompletionChunk> => {
+  const created = Math.floor(Date.now() / 1000);
+  const id = `cursor-capture-${created}`;
+  return new ReadableStream<TChatCompletionChunk>({
+    async start(controller) {
+      if (args.signal?.aborted) {
+        controller.error(
+          args.signal.reason instanceof Error
+            ? args.signal.reason
+            : new Error("aborted"),
+        );
+        return;
+      }
+      const onAbort = (): void => {
+        controller.error(new Error("aborted"));
+      };
+      args.signal?.addEventListener("abort", onAbort, { once: true });
+      const reader = body.getReader();
+      let pending = new Uint8Array(0);
+      let toolIndex = 0;
+      const toolIndexByCallId = new Map<string, number>();
+      let sawMeaningful = false;
+      let closed = false;
+
+      const ensureToolIndex = (callId: string): number => {
+        const existing = toolIndexByCallId.get(callId);
+        if (existing !== undefined) return existing;
+        const next = toolIndex;
+        toolIndexByCallId.set(callId, next);
+        toolIndex += 1;
+        return next;
+      };
+
+      const emitDecoded = (decoded: TCursorDecodedInteraction): void => {
+        switch (decoded.kind) {
+          case "text_delta": {
+            if (decoded.text.length === 0) return;
+            sawMeaningful = true;
+            controller.enqueue({
+              ...chunkBase(args.providerModelId, created, id),
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: decoded.text },
+                  finish_reason: null,
+                },
+              ],
+            });
+            return;
+          }
+          case "thinking_delta": {
+            if (decoded.text.length === 0) return;
+            sawMeaningful = true;
+            controller.enqueue({
+              ...chunkBase(args.providerModelId, created, id),
+              choices: [
+                {
+                  index: 0,
+                  delta: { reasoning_content: decoded.text },
+                  finish_reason: null,
+                },
+              ],
+            });
+            return;
+          }
+          case "mcp_tool_partial":
+          case "mcp_tool_started": {
+            sawMeaningful = true;
+            const intent = decoded.intent;
+            const index = ensureToolIndex(intent.callId);
+            const argsDelta =
+              decoded.kind === "mcp_tool_partial" ? decoded.argsTextDelta : "";
+            controller.enqueue({
+              ...chunkBase(args.providerModelId, created, id),
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: [
+                      {
+                        index,
+                        id: intent.callId,
+                        type: "function",
+                        function: {
+                          name: intent.name,
+                          arguments: argsDelta,
+                        },
+                      },
+                    ],
+                  },
+                  finish_reason: null,
+                },
+              ],
+            });
+            return;
+          }
+          case "token_delta":
+            // Untyped — omit usage.
+            return;
+          case "turn_ended":
+            // Authoritative native turn-completion marker — handled by the
+            // caller immediately after this call returns (finishes the
+            // stream without waiting for a Connect `endStream` envelope or
+            // socket close).
+            sawMeaningful = true;
+            return;
+          case "exec_server": {
+            if (
+              decoded.classification === "caller_mcp_tool" &&
+              decoded.mcp !== null
+            ) {
+              sawMeaningful = true;
+              const intent = decoded.mcp;
+              const callId = intent.callId || `exec-${decoded.id ?? 0}`;
+              const index = ensureToolIndex(callId);
+              controller.enqueue({
+                ...chunkBase(args.providerModelId, created, id),
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index,
+                          id: callId,
+                          type: "function",
+                          function: {
+                            name: intent.name,
+                            arguments: intent.argumentsText,
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+            throw cursorExecServerFailure({
+              id: decoded.id,
+              execId: decoded.execId,
+              subtype: decoded.subtype,
+              classification: decoded.classification,
+              mcp: decoded.mcp,
+            });
+          }
+          case "requires_duplex":
+            throw new CursorCaptureDecodeError(
+              "requires_duplex_bridge",
+              `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active`,
+              {
+                execSubtype: decoded.execSubtype,
+                execClass: decoded.execClass,
+              },
+            );
+          case "native_tool":
+            if (args.allowNativeToolIntents === true) {
+              sawMeaningful = true;
+              const index = ensureToolIndex(decoded.callId);
+              controller.enqueue({
+                ...chunkBase(args.providerModelId, created, id),
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index,
+                          id: decoded.callId,
+                          type: "function",
+                          function: {
+                            name: `cursor_native_${decoded.toolCase}`,
+                            arguments: "{}",
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              });
+              return;
+            }
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_tool_intent",
+              `native tool intent ${decoded.toolCase} (call ${decoded.callId}) is not in the caller contract`,
+            );
+          case "heartbeat":
+          case "ignored":
+            return;
+        }
+      };
+
+      let turnEndedSeen = false;
+      try {
+        readLoop: for (;;) {
+          if (args.signal?.aborted) throw new Error("aborted");
+          const { value, done } = await reader.read();
+          if (done) break;
+          const next = new Uint8Array(pending.byteLength + value.byteLength);
+          next.set(pending, 0);
+          next.set(value, pending.byteLength);
+          const taken = takeConnectEnvelopes(next);
+          // Copy the unconsumed tail into a fresh ArrayBuffer-backed
+          // Uint8Array — `subarray` views are `Uint8Array<ArrayBufferLike>`
+          // under TS 5.7+ DOM libs and are not assignable to
+          // `Uint8Array<ArrayBuffer>` without an unsafe cast.
+          pending = new Uint8Array(taken.rest);
+          for (const env of taken.envelopes) {
+            const payload = resolveConnectEnvelopePayload(
+              env,
+              args.connectContentEncoding,
+            );
+            if (env.endStream) {
+              const raw = textDecoder.decode(payload);
+              if (raw.length === 0 || raw === "{}") continue;
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(raw);
+              } catch {
+                throw new CursorCaptureDecodeError(
+                  "connect_end_stream_error",
+                  `invalid Connect end-stream JSON: ${raw.slice(0, 200)}`,
+                );
+              }
+              if (
+                typeof parsed === "object" &&
+                parsed !== null &&
+                "error" in parsed &&
+                (parsed as { error?: unknown }).error != null
+              ) {
+                const err = (parsed as { error: unknown }).error;
+                const msg =
+                  typeof err === "object" &&
+                  err !== null &&
+                  typeof (err as { message?: unknown }).message === "string"
+                    ? (err as { message: string }).message
+                    : JSON.stringify(err);
+                throw new CursorCaptureDecodeError(
+                  "connect_end_stream_error",
+                  msg,
+                );
+              }
+              continue;
+            }
+            const decoded = decodeAgentServerMessage(payload);
+            emitDecoded(decoded);
+            if (decoded.kind === "turn_ended") {
+              // Genuine native completion marker — finish now, independent
+              // of Connect `endStream` or the socket closing. A transport
+              // close/error observed AFTER this point is benign (matches the
+              // official client's "Ignoring transport close after terminal
+              // agent stream").
+              turnEndedSeen = true;
+              break readLoop;
+            }
+          }
+        }
+        if (!turnEndedSeen && pending.byteLength > 0) {
+          throw new CursorCaptureDecodeError(
+            "truncated_connect_frame",
+            `trailing ${pending.byteLength} bytes are not a complete Connect envelope`,
+          );
+        }
+        if (sawMeaningful) {
+          controller.enqueue({
+            ...chunkBase(args.providerModelId, created, id),
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason:
+                  toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+              },
+            ],
+          });
+        }
+        closed = true;
+        controller.close();
+      } catch (err) {
+        if (!closed) {
+          controller.error(err instanceof Error ? err : new Error(String(err)));
+        }
+      } finally {
+        args.signal?.removeEventListener("abort", onAbort);
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore
+        }
+      }
+    },
+    cancel() {
+      // Caller cancelled — abort is linked by the capture runner.
+    },
+  });
+};
+
+/**
+ * Decode a daemon-owned upstream `Response` from a captured AgentService
+ * exchange. Streams envelopes as they arrive (does not buffer the full body
+ * by default).
+ */
+export const chunksFromCursorCapturedResponse = (
+  response: Response,
+  args: {
+    readonly providerModelId: string;
+    readonly allowNativeToolIntents?: boolean;
+    readonly signal?: AbortSignal;
+  },
+): Promise<ReadableStream<TChatCompletionChunk>> => {
+  if (response.body === null) {
+    return Promise.resolve(
+      new ReadableStream<TChatCompletionChunk>({
+        start(controller) {
+          controller.close();
+        },
+      }),
+    );
+  }
+  return Promise.resolve(
+    chunksStreamFromCursorConnectResponseBody(response.body, args),
+  );
+};
