@@ -137,6 +137,8 @@ let rollbackLatchLoaded = false;
 // SERVER-ANCHORED timestamp check (TCB-5) so a skewed daemon clock stops
 // rejecting grants signed on a correct viewer clock.
 let serverClockOffsetMs: number | null = null;
+/** Local clock when `serverClockOffsetMs` was measured. */
+let serverClockOffsetAtMs = 0;
 
 const cursorPath = (): string => doctorStatePath("doctor-report.cursor.json");
 const pendingPath = (): string => doctorStatePath("doctor-report.pending.json");
@@ -361,6 +363,7 @@ const anchorPolicyReceipt = (
     policy.expires_at_ms - DOCTOR_REPORTING_POLICY_TTL_MS - now;
   if (Math.abs(impliedOffset) <= MAX_SERVER_CLOCK_OFFSET_MS) {
     serverClockOffsetMs = impliedOffset;
+    serverClockOffsetAtMs = now;
   }
 };
 
@@ -369,15 +372,26 @@ const anchorPolicyReceipt = (
  * accepted bootstrap receipt, or null before any receipt. Lets the
  * device-grant verifier test a signer timestamp against CLOUD time, not only
  * the possibly-skewed daemon clock (TCB-5).
+ *
+ * The offset has the same life as its receipt (rework-8): it is null when the
+ * receipt is older than DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS, or when the
+ * local clock went back below the measurement. A stale offset must not keep
+ * admitting grants after the receipt that produced it expired.
  */
-export const daemonServerNowMs = (): number | null =>
-  serverClockOffsetMs === null ? null : clock() + serverClockOffsetMs;
+export const daemonServerNowMs = (): number | null => {
+  if (serverClockOffsetMs === null) return null;
+  const now = clock();
+  const age = now - serverClockOffsetAtMs;
+  if (age < 0 || age >= DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS) return null;
+  return now + serverClockOffsetMs;
+};
 
 /** Test-only: inject a server-clock offset when no real receipt feeds one. */
 export const setDaemonServerClockOffsetForTests = (
   offsetMs: number | null,
 ): void => {
   serverClockOffsetMs = offsetMs;
+  serverClockOffsetAtMs = clock();
 };
 
 /**
@@ -1168,5 +1182,6 @@ export const resetDoctorEngineForTests = (): void => {
   rollbackLatchedFor = null;
   rollbackLatchLoaded = false;
   serverClockOffsetMs = null;
+  serverClockOffsetAtMs = 0;
   resetDoctorRepeatForTests();
 };
