@@ -562,23 +562,143 @@ const transportFailureFrom = (err: unknown): TTransportFailure => {
     : { reason: "network error" };
 };
 
+/**
+ * TMR-1 upstream liveness bounds. An upstream that ACCEPTS the socket and
+ * then stalls — never writes a status line, or goes silent mid-body — used to
+ * pin the request forever: fetch has no header deadline, and the client-side
+ * frame-aligned heartbeat only proves WE can still write, masking the stall
+ * from the client's own idle timeout. Bound both phases upstream-side:
+ *   - header wait: `UPSTREAM_HEADER_TIMEOUT_MS` (abort → transport failure →
+ *     the hop WALKS, nothing was generated so failover cannot double-spend);
+ *   - body: `UPSTREAM_READ_IDLE_TIMEOUT_MS` per READ — every chunk arrival
+ *     re-arms it; a byte drought errors the stream mid-flight.
+ */
+export const UPSTREAM_HEADER_TIMEOUT_MS = 30_000;
+export const UPSTREAM_READ_IDLE_TIMEOUT_MS = 60_000;
+
+export type TUpstreamTimeouts = {
+  /** Deadline for response headers (redirect chain included). */
+  readonly headerMs?: number;
+  /** Per-read idle bound on the response body. */
+  readonly readIdleMs?: number;
+};
+
+/** Abort reason for the header deadline — surfaces as
+ *  `network error: UpstreamHeaderTimeoutError` through transportFailureFrom. */
+export class UpstreamHeaderTimeoutError extends Error {
+  constructor(headerMs: number) {
+    super(`upstream produced no response headers within ${headerMs}ms`);
+    this.name = "UpstreamHeaderTimeoutError";
+  }
+}
+
+/** Error an upstream body stream raises when no bytes arrive within the idle
+ *  bound. Name is stable for classification/assertions. */
+export class UpstreamReadIdleError extends Error {
+  constructor(idleMs: number) {
+    super(`upstream stalled: no body bytes for ${idleMs}ms`);
+    this.name = "UpstreamReadIdleError";
+  }
+}
+
+/**
+ * Wrap a response body with a PER-READ idle watchdog (TMR-1). Each `pull`
+ * races the underlying read against `idleMs`; on expiry the stream errors and
+ * the dead socket's read is cancelled. Pull-based, so the wrapper adds no
+ * buffering and honours downstream backpressure. A client cancel still
+ * propagates to the source.
+ */
+export const withUpstreamReadIdleTimeout = (
+  body: ReadableStream<Uint8Array>,
+  idleMs: number,
+): ReadableStream<Uint8Array> => {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  return new ReadableStream<Uint8Array>({
+    start() {
+      reader = body.getReader();
+    },
+    async pull(controller) {
+      if (reader === null) return;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const read = await Promise.race([
+          reader.read(),
+          new Promise<"idle">((resolve) => {
+            timer = setTimeout(() => resolve("idle"), Math.max(0, idleMs));
+          }),
+        ]);
+        if (read === "idle") {
+          void reader
+            .cancel("upstream read idle timeout")
+            .catch(() => undefined);
+          controller.error(new UpstreamReadIdleError(idleMs));
+          return;
+        }
+        if (read.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(read.value);
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    },
+    cancel(reason) {
+      const r = reader;
+      reader = null;
+      return r === null ? undefined : r.cancel(reason);
+    },
+  });
+};
+
 export const postUpstream = async (
   url: string,
   init: RequestInit,
   onTransportFailure?: (failure: TTransportFailure) => void,
+  timeouts?: TUpstreamTimeouts,
 ): Promise<Response | null> => {
+  const headerMs = timeouts?.headerMs ?? UPSTREAM_HEADER_TIMEOUT_MS;
+  const readIdleMs = timeouts?.readIdleMs ?? UPSTREAM_READ_IDLE_TIMEOUT_MS;
+  // The fetch signal composes the caller's abort with the header watchdog —
+  // a caller abort still wins and cancels in-flight body reads; the watchdog
+  // only fires when the caller did not (TMR-1).
+  const headerAbort = new AbortController();
+  const timer = setTimeout(
+    () => {
+      headerAbort.abort(new UpstreamHeaderTimeoutError(headerMs));
+    },
+    Math.max(0, headerMs),
+  );
+  const callerSignal = init.signal instanceof AbortSignal ? init.signal : null;
+  const fetchSignal =
+    callerSignal === null
+      ? headerAbort.signal
+      : AbortSignal.any([callerSignal, headerAbort.signal]);
   try {
     // Vendor credentials + the request body ride this call — redirects are
     // re-issued only under the shared same-origin/canonical-cloud policy,
     // never auto-followed to an arbitrary origin.
-    return await fetchWithBoundedRedirects(
+    const resp = await fetchWithBoundedRedirects(
       url,
-      (target) => fetch(target, { ...init, redirect: "manual" }),
+      (target) =>
+        fetch(target, { ...init, redirect: "manual", signal: fetchSignal }),
       "walker",
     );
+    if (resp.body === null) return resp;
+    // Preserve status/headers verbatim; only the byte source gains the
+    // per-read idle watchdog.
+    return new Response(withUpstreamReadIdleTimeout(resp.body, readIdleMs), {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: resp.headers,
+    });
   } catch (err) {
     onTransportFailure?.(transportFailureFrom(err));
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -609,12 +729,14 @@ export const postWithReplayStripRetry = async (
   wire: TUpstreamWire,
   signal: AbortSignal,
   onTransportFailure?: (failure: TTransportFailure) => void,
+  timeouts?: TUpstreamTimeouts,
 ): Promise<Response | null> => {
   const send = (b: unknown): Promise<Response | null> =>
     postUpstream(
       url,
       { method: "POST", headers, body: JSON.stringify(b), signal },
       onTransportFailure,
+      timeouts,
     );
   const first = await send(body);
   // Anything other than a pre-stream 400 → nothing to recover from.

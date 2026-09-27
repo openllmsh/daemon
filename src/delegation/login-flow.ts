@@ -1,4 +1,5 @@
-import { spawn as admittedSpawn } from "../windows-process";
+import type { TReapOutcome, TSupervisedChild } from "../child-supervisor";
+import { superviseSpawn } from "../child-supervisor";
 /**
  * Shared, provider-agnostic login-flow scaffolding for the subscription
  * delegates.
@@ -28,7 +29,7 @@ import {
 } from "../auth-events";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
-import { logInfo, logWarn, safeDiagnosticMessage } from "../logger";
+import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -40,7 +41,9 @@ import {
 } from "../pending-auth";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
+import type { TChildCleanupOutcome } from "./spawn";
 import {
+  childCleanupOutcome,
   DEFAULT_LOGIN_TIMEOUT_MS,
   redactUrls,
   spawnCwd,
@@ -730,15 +733,35 @@ export const finishInBackground = async (opts: {
    * background generics unless a provider opts in.
    */
   readonly backgroundCrashDetail?: TStreamLoginCrashDetail;
+  /** Confirmed group-cleanup result for a supervised login child. When
+   *  present and `confirmed === false`, the slot keeps containment
+   *  (`cleanupUnknown`) until `whenReleased` settles rather than ending on
+   *  the root exit alone. */
+  readonly cleanup?: TChildCleanupOutcome;
+  readonly whenReleased?: Promise<TReapOutcome>;
 }): Promise<void> => {
   const flow = opts.slot.flow();
   const flowId = flow?.flowId;
   const stillThisFlow = (): boolean =>
     flowId !== undefined && opts.slot.flow()?.flowId === flowId;
   const watchdogMs = opts.verifyWatchdogMs ?? LOGIN_VERIFY_WATCHDOG_MS;
+  const endSlot = (): void => {
+    if (opts.cleanup !== undefined && !opts.cleanup.confirmed) {
+      opts.slot.markCleanupUnknown();
+      if (opts.whenReleased !== undefined) {
+        // end(flowId) no-ops when a NEWER flow already owns the slot, so the
+        // deferred release can never tear down a successor.
+        void opts.whenReleased.finally(() => {
+          opts.slot.end(flowId);
+        });
+      }
+      return;
+    }
+    opts.slot.end();
+  };
 
   const settleNone = (clearPending: boolean): void => {
-    if (stillThisFlow()) opts.slot.end();
+    if (stillThisFlow()) endSlot();
     finalizeLoginTerminal({
       flow,
       event: { kind: "none" },
@@ -863,10 +886,10 @@ export const finishInBackground = async (opts: {
       provider: opts.provider,
       clearPending,
     });
-    if (stillThisFlow()) opts.slot.end();
+    if (stillThisFlow()) endSlot();
     return;
   }
-  opts.slot.end();
+  endSlot();
   finalizeLoginTerminal({
     flow,
     event,
@@ -1028,14 +1051,31 @@ export const spawnStreamLogin = async <T>(
   opts: TStreamLoginOpts<T>,
 ): Promise<TStreamLoginResult<T>> => {
   const flow = resolveLoginFlow(opts.provider, opts.mode ?? "browser");
-  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  // Supervised child: spawned in its OWN process group so a vendor launcher
+  // can't leave descendants behind (TH-2), and every kill path goes through
+  // `terminate()` — TERM the group → bounded grace → KILL → bounded final
+  // reap — so a child that ignores SIGTERM still dies (PL-D3). The slot is
+  // released only once cleanup is confirmed; an unconfirmed reap retains
+  // containment via `cleanupUnknown` until `whenReleased` settles.
+  let child: TSupervisedChild | null = null;
+  let terminatePromise: Promise<TReapOutcome> | null = null;
+  const requestTerminate = (): Promise<TReapOutcome> => {
+    if (terminatePromise !== null) return terminatePromise;
+    if (child === null) {
+      // Cancel raced the spawn — flagged by wasCancelled; the post-spawn
+      // check below terminates the child the moment it exists.
+      return Promise.resolve("reap_unconfirmed");
+    }
+    // A terminate() throw (e.g. an unexpected signalGroup errno) means the
+    // reap could not be CONFIRMED — never propagated, never "exited".
+    terminatePromise = child
+      .terminate()
+      .catch((): TReapOutcome => "reap_unconfirmed");
+    return terminatePromise;
+  };
   if (
     !opts.slot.start(() => {
-      try {
-        proc?.kill();
-      } catch {
-        // already exited — its own exit handler ran
-      }
+      void requestTerminate();
     }, flow)
   ) {
     return {
@@ -1051,7 +1091,8 @@ export const spawnStreamLogin = async <T>(
     };
   }
   try {
-    proc = admittedSpawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
+    child = superviseSpawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
+      kind: "login",
       stdin: "ignore",
       // Always pipe BOTH fds: the prompt may be on stdout (device-code) while
       // the `--sandbox-exec` shim writes inner posix_spawn EPERM to stderr.
@@ -1072,25 +1113,29 @@ export const spawnStreamLogin = async <T>(
       flow,
     };
   }
-  if (proc === null) {
-    opts.slot.end(flow.flowId);
-    return {
-      found: null,
-      captured: "login spawn failed",
-      exitCode: null,
-      crashed: false,
-      spawnFailure: { code: "unknown", message: "login spawn failed" },
-      flow,
-    };
-  }
-  const child = proc;
+  const supervised = child;
+  const proc = supervised.subprocess;
   emitLoginStarted(flow);
+  // A cancel that raced `slot.start` must still kill the just-spawned child.
+  if (opts.slot.wasCancelled()) void requestTerminate();
+  /** Release the slot only after confirmed cleanup (reap_unconfirmed keeps
+   *  containment until the supervisor's `whenReleased` settles). */
+  const endOwnership = (reap: TReapOutcome): void => {
+    if (reap === "reap_unconfirmed") {
+      opts.slot.markCleanupUnknown();
+      void supervised.whenReleased.finally(() => {
+        opts.slot.end(flow.flowId);
+      });
+      return;
+    }
+    opts.slot.end(flow.flowId);
+  };
 
   const promptStream = (
-    opts.stream === "stdout" ? child.stdout : child.stderr
+    opts.stream === "stdout" ? proc.stdout : proc.stderr
   ) as ReadableStream<Uint8Array>;
   const otherStream = (
-    opts.stream === "stdout" ? child.stderr : child.stdout
+    opts.stream === "stdout" ? proc.stderr : proc.stdout
   ) as ReadableStream<Uint8Array>;
   let promptBuf = "";
   let otherBuf = "";
@@ -1151,21 +1196,17 @@ export const spawnStreamLogin = async <T>(
     if (!timedOut) {
       // The prompt reader hit EOF before the ceiling — the child normally has
       // already exited, so this resolves at once. Guard the rare case where the
-      // fd closed but the process lingers: race a short grace and kill on
+      // fd closed but the process lingers: race a short grace and terminate on
       // expiry, so a wedged child can't hang the connect indefinitely.
       const EXIT_GRACE_MS = 2_000;
       const exitCode = await Promise.race([
-        child.exited,
+        proc.exited,
         sleep(EXIT_GRACE_MS).then(() => null),
       ]);
-      if (exitCode === null) {
-        try {
-          child.kill();
-        } catch {
-          // already gone
-        }
-      }
-      opts.slot.end();
+      if (exitCode === null) void requestTerminate();
+      // Bounded: the shared terminate is already in-flight or resolves
+      // "exited" for a naturally-reaped child. Ownership ends on the outcome.
+      endOwnership(await requestTerminate());
       return {
         found: null,
         captured,
@@ -1175,12 +1216,7 @@ export const spawnStreamLogin = async <T>(
         flow,
       };
     }
-    try {
-      child.kill();
-    } catch {
-      // already gone
-    }
-    opts.slot.end();
+    endOwnership(await requestTerminate());
     return {
       found: null,
       captured,
@@ -1206,41 +1242,50 @@ export const spawnStreamLogin = async <T>(
   let reaped = false;
   const reaper = setTimeout(() => {
     reaped = true;
-    try {
-      child.kill();
-    } catch {
-      // already exited — its own exit handler ran
-    }
+    void requestTerminate();
   }, ceilingMs);
-  void child.exited.then(async (exitCode) => {
-    clearTimeout(reaper);
-    const finalExit = reaped ? 0 : exitCode;
-    if (opts.onBackgroundExit !== undefined) {
-      // Only opted-in diagnostics wait for the non-prompt stream remainder.
-      // Existing providers keep their original completion timing.
-      await Promise.race([otherDone, sleep(200)]);
-      try {
-        opts.onBackgroundExit({
-          exitCode: finalExit,
-          captured: combined(),
-          reaped,
-        });
-      } catch {
-        // best-effort — never skip finishInBackground
+  void proc.exited
+    .then(async (exitCode) => {
+      clearTimeout(reaper);
+      // Confirm the group reap BEFORE finishInBackground releases the slot —
+      // a still-live descendant group keeps containment (cleanupUnknown)
+      // rather than letting the next login believe the abandoned flow is
+      // fully dead.
+      const reap = await requestTerminate();
+      const finalExit = reaped ? 0 : exitCode;
+      if (opts.onBackgroundExit !== undefined) {
+        // Only opted-in diagnostics wait for the non-prompt stream remainder.
+        // Existing providers keep their original completion timing.
+        await Promise.race([otherDone, sleep(200)]);
+        try {
+          opts.onBackgroundExit({
+            exitCode: finalExit,
+            captured: combined(),
+            reaped,
+          });
+        } catch {
+          // best-effort — never skip finishInBackground
+        }
       }
-    }
-    return finishInBackground({
-      provider: opts.provider,
-      slot: opts.slot,
-      verify: opts.verify,
-      waitStoreHint: opts.waitStoreHint,
-      verifyWatchdogMs: opts.verifyWatchdogMs,
-      onConnected: opts.onConnected,
-      exitCode: finalExit,
-      captured: combined(),
-      backgroundCrashDetail: opts.backgroundCrashDetail,
+      return finishInBackground({
+        provider: opts.provider,
+        slot: opts.slot,
+        verify: opts.verify,
+        waitStoreHint: opts.waitStoreHint,
+        verifyWatchdogMs: opts.verifyWatchdogMs,
+        onConnected: opts.onConnected,
+        exitCode: finalExit,
+        captured: combined(),
+        backgroundCrashDetail: opts.backgroundCrashDetail,
+        cleanup: childCleanupOutcome(reap, opts.slot.wasCancelled()),
+        whenReleased: supervised.whenReleased,
+      });
+    })
+    .catch((error: unknown) => {
+      // Terminal cleanup bookkeeping must never be an unhandled rejection —
+      // the slot's containment (inFlight / cleanupUnknown) is the safe state.
+      logError("login-flow", error, { provider: opts.provider });
     });
-  });
   return { found };
 };
 
