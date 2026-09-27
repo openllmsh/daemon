@@ -8,8 +8,11 @@
  * only.
  */
 import {
+  closeSync,
   existsSync,
+  openSync,
   readdirSync,
+  readSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -1626,30 +1629,66 @@ const cmdQuotedUrl = (url: string): string =>
  *  `start` builtin opens the URL (cmd has no sh to hand off to). */
 export type TOpenerScriptKind = "open" | "xdg-open" | "cmd";
 
+/** Ownership marker embedded in every launcher {@link writeOpenerScript}
+ *  writes. The stale-launcher sweep reads the file's head and deletes only
+ *  when this marker is present — a same-named foreign file is never ours to
+ *  remove (the tmp dir can be shared or redirected). Exported for the sweep
+ *  regression suite. */
+export const OPENER_SCRIPT_MARKER = "openllm-opener-v1";
+
 const openerScriptContent = (kind: TOpenerScriptKind, url: string): string => {
   if (kind === "cmd") {
     // `start` returns as soon as the browser launch is queued; the `(goto)`
     // idiom then ends the batch WITHOUT the "batch file cannot be found"
     // error a trailing `del "%~f0"` would print, while `&` still runs the
     // self-delete. CRLF line endings: `goto` misbehaves on LF-only batches.
-    return `@echo off\r\nstart "" "${cmdQuotedUrl(url)}"\r\n(goto) 2>nul & del /f /q "%~f0"\r\n`;
+    return `@echo off\r\nrem ${OPENER_SCRIPT_MARKER}\r\nstart "" "${cmdQuotedUrl(url)}"\r\n(goto) 2>nul & del /f /q "%~f0"\r\n`;
   }
   // `rm -f -- "$0"` deletes the script BEFORE `exec` hands off to the opener,
   // so the sign-in URL persists neither in the transient unit's metadata /
   // `ps` output nor as a leftover file.
-  return `#!/bin/sh\nrm -f -- "$0"\nexec ${kind} ${shSingleQuoted(url)}\n`;
+  return `#!/bin/sh\n# ${OPENER_SCRIPT_MARKER}\nrm -f -- "$0"\nexec ${kind} ${shSingleQuoted(url)}\n`;
 };
 
 /** Launcher filenames carry this prefix so a sweep can find exactly the files
- *  we wrote — nothing else under the daemon tmp dir matches it. */
+ *  we wrote — nothing else under the daemon tmp dir matches it. (The brief
+ *  `open-*.sh` name an intermediate, never-shipped revision used is NOT
+ *  matched: it is a common prefix, and sweeping it could delete foreign
+ *  files when the tmp dir is shared or redirected.) */
 const OPENER_SCRIPT_PREFIX = "openllm-open-";
 
 const isOpenerScriptName = (name: string): boolean =>
-  (name.startsWith(OPENER_SCRIPT_PREFIX) &&
-    (name.endsWith(".sh") || name.endsWith(".cmd"))) ||
-  // The launcher's pre-rename `open-*.sh` name — same private dir, same job;
-  // a daemon that ran the older build may still hold one.
-  (name.startsWith("open-") && name.endsWith(".sh"));
+  name.startsWith(OPENER_SCRIPT_PREFIX) &&
+  (name.endsWith(".sh") || name.endsWith(".cmd"));
+
+/** Bytes of file head the ownership check reads — the marker line sits in the
+ *  first two lines of every generated launcher, far under this bound. */
+const OPENER_MARKER_READ_BYTES = 512;
+
+/** True only when `path` carries {@link OPENER_SCRIPT_MARKER} in its head —
+ *  the ownership proof a sweep requires before deleting a launcher-named
+ *  file. Never throws. */
+const isOpenerScriptFile = (path: string): boolean => {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const head = Buffer.alloc(OPENER_MARKER_READ_BYTES);
+    const n = readSync(fd, head, 0, head.length, 0);
+    return head.subarray(0, n).toString("utf8").includes(OPENER_SCRIPT_MARKER);
+  } catch {
+    return false;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // best-effort close
+    }
+  }
+};
 
 /**
  * A launcher older than this can only come from a queued transient unit that
@@ -1669,9 +1708,11 @@ export const OPENER_SCRIPT_GRACE_MS = 120_000;
 
 /**
  * Remove launcher scripts older than {@link OPENER_SCRIPT_STALE_MS} from `dir`
- * (bounded stale-launcher cleanup). One directory listing; only files with
- * the launcher prefix are touched. Never throws — a missed file waits for the
- * next open's sweep or the armed timer.
+ * (bounded stale-launcher cleanup). One directory listing; a file is touched
+ * only when its NAME matches {@link OPENER_SCRIPT_PREFIX} AND its head carries
+ * {@link OPENER_SCRIPT_MARKER} — the ownership proof that keeps the sweep off
+ * foreign same-named files when the tmp dir is shared or redirected. Never
+ * throws — a missed file waits for the next open's sweep or the armed timer.
  */
 export const sweepStaleOpenerScripts = (
   dir: string = daemonTempDir(),
@@ -1685,10 +1726,11 @@ export const sweepStaleOpenerScripts = (
   }
   for (const name of names) {
     if (!isOpenerScriptName(name)) continue;
+    const path = join(dir, name);
     try {
-      if (now - statSync(join(dir, name)).mtimeMs <= OPENER_SCRIPT_STALE_MS)
-        continue;
-      rmSync(join(dir, name), { force: true });
+      if (now - statSync(path).mtimeMs <= OPENER_SCRIPT_STALE_MS) continue;
+      if (!isOpenerScriptFile(path)) continue;
+      rmSync(path, { force: true });
     } catch {
       // best-effort — a raced-away or busy file is retried on the next open
     }
@@ -1882,11 +1924,41 @@ export const openerArgv = (
 };
 
 /**
+ * The URL form safe to write to a log line: `origin + pathname` only. The
+ * query and fragment can carry OAuth `code`/`state` secrets, so failure
+ * diagnostics never log them (the full URL still reaches the user through the
+ * `auth.login.prompt` card, and through the no-launcher manual-open log where
+ * it IS the fallback). Unparseable input yields a fixed placeholder.
+ */
+export const redactUrlForLog = (url: string): string => {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "(unparseable URL)";
+  }
+};
+
+/** Test seam: substitutes the browser-launcher spawn so a test can drive the
+ *  failure paths without launching a real browser. Production never sets
+ *  this. */
+let openerSpawnForTests: typeof admittedSpawn | null = null;
+export const setOpenerSpawnForTests = (
+  spawn: typeof admittedSpawn | null,
+): void => {
+  openerSpawnForTests = spawn;
+};
+
+/**
  * The async body of {@link openUrl}: probe the manager, write the launcher,
  * spawn it, arm the backstop cleanup. Never throws — every failure path ends
  * in the manual-open log.
+ *
+ * Exported for the regression suite: a direct call bypasses {@link openUrl}'s
+ * NODE_ENV=test browser guard, so under the test runner the spawn step runs
+ * ONLY through {@link setOpenerSpawnForTests} — never a real launcher.
  */
-const openUrlBestEffort = async (url: string): Promise<void> => {
+export const openUrlBestEffort = async (url: string): Promise<void> => {
   const os = platform();
   // Probe the systemd USER MANAGER itself, not INVOCATION_ID (S4R-2): the var
   // only proves we are supervised, while `systemd-run --user` fails
@@ -1924,8 +1996,14 @@ const openUrlBestEffort = async (url: string): Promise<void> => {
     // Deliberately UNWRAPPED (no `sandboxSpawnArgs`): opening the user's
     // browser is a user-facing action like the session-PTY exemption — the
     // launcher must reach the real GUI session/LaunchServices state, and it
-    // takes only the URL string (no filesystem payload to confine).
-    const proc = admittedSpawn(argv, {
+    // takes only the URL string (no filesystem payload to confine). Under the
+    // test runner a direct call to this exported body must install the seam —
+    // the real launcher would pop a browser on the developer's machine.
+    const spawnImpl =
+      openerSpawnForTests ??
+      (process.env.NODE_ENV === "test" ? null : admittedSpawn);
+    if (spawnImpl === null) return;
+    const proc = spawnImpl(argv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
@@ -1962,7 +2040,8 @@ const openUrlBestEffort = async (url: string): Promise<void> => {
         logWarn(
           "spawn",
           "Browser opener exited non-zero — open the sign-in URL manually",
-          { opener: argv[0], code, url },
+          // Redacted: the URL's query can carry OAuth code/state secrets.
+          { opener: argv[0], code, url: redactUrlForLog(url) },
         );
       }
     });
@@ -1974,11 +2053,13 @@ const openUrlBestEffort = async (url: string): Promise<void> => {
         // best-effort cleanup — the file sits in the daemon-private tmp
       }
     }
-    // best-effort — the user can copy the URL from the card detail; say so
+    // best-effort — the user can copy the URL from the card detail; say so.
+    // The URL is logged REDACTED: its query can carry OAuth `code`/`state`
+    // secrets that must not land in `openllmd.log` (rework P3).
     logWarn(
       "spawn",
       "Browser opener failed to spawn — open the sign-in URL manually",
-      { url },
+      { url: redactUrlForLog(url) },
     );
   }
 };
