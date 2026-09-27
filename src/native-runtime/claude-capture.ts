@@ -44,6 +44,7 @@ import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { createCaptureLoopbackGuard } from "./capture-loopback-guard";
 import type { TClaudeToolCaptureStatus } from "./claude-tool-capture-status";
 import { CLAUDE_TOOL_CAPTURE_STATUS } from "./claude-tool-capture-status";
 import type {
@@ -178,12 +179,23 @@ export const startClaudeCaptureLoopback = (args: {
   readonly inferenceGate?: TClaudeCaptureInferenceGate;
   readonly onAuxiliarySettled?: (reason: string) => void;
 }): TClaudeCaptureLoopback => {
+  const guard = createCaptureLoopbackGuard();
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
     async fetch(req: Request): Promise<Response> {
-      const url = new URL(req.url);
-      if (!isClaudeMessagesInferencePath(url.pathname)) {
+      // Request-private nonce gate FIRST — before any body read, before any
+      // path/inference classification, before capture/preamble handling.
+      // Loopback + an ephemeral port is not authentication: a different
+      // local user, or a page in the user's own browser, could otherwise
+      // race the real `claude` child to this port. Never log the raw
+      // (pre-peel) URL — it carries the secret path segment.
+      const peeled = guard.peel(new URL(req.url));
+      if (peeled === null) {
+        return new Response(null, { status: 404 });
+      }
+
+      if (!isClaudeMessagesInferencePath(peeled.pathname)) {
         return new Response("{}", {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -198,11 +210,14 @@ export const startClaudeCaptureLoopback = (args: {
       const body = rawBody !== null && rawBody.byteLength > 0 ? rawBody : null;
       const headers: ReadonlyArray<TCapturedHeaderPair> =
         preserveCapturedHeaders(req.headers);
-      const externalUrl = `${CLAUDE_CAPTURE_TRUSTED_ORIGIN}${url.pathname}${url.search}`;
+      // Restored external URL and observed-URL diagnostics are built from
+      // the PEELED url only — the nonce never reaches the vendor origin and
+      // never lands in a recorded/loggable envelope field.
+      const externalUrl = `${CLAUDE_CAPTURE_TRUSTED_ORIGIN}${peeled.pathname}${peeled.search}`;
       const envelope: TCapturedRequestEnvelope = {
         transport: "http",
         method,
-        observedUrl: url.toString(),
+        observedUrl: peeled.toString(),
         externalUrl,
         headers,
         body,
@@ -237,7 +252,7 @@ export const startClaudeCaptureLoopback = (args: {
   });
 
   return {
-    baseUrl: `http://127.0.0.1:${server.port}`,
+    baseUrl: guard.baseUrl(`http://127.0.0.1:${server.port}`),
     stop: (): void => {
       server.stop(true);
     },
