@@ -37,7 +37,7 @@ import { isStreamResetError } from "@openllmsh/tunnel";
 import {
   guardCrashLoop,
   guardRtcCircuitBreaker,
-  markHealthyBoot,
+  scheduleHealthyBootMark,
 } from "./boot-guard";
 import {
   drainDisposableChildren,
@@ -659,12 +659,12 @@ export const runDaemonMain = async (
   // device/model work chained to the initial refresh.
   startBootstrapLoop();
 
-  // Mark this boot as healthy once the listener is bound and a small stabilization
-  // window has elapsed, then clear the crash-loop history so transient restarts do
-  // not accumulate into a permanent park.
-  setTimeout(() => {
-    markHealthyBoot();
-  }, 3_000);
+  // Mark this boot as healthy only after the post-listen stabilization window
+  // (RT-4): a self-updated binary can still crash during the first bootstrap
+  // tick, control-channel bring-up, or RTC init — clearing the crash-loop
+  // history seconds after listen would let a bad update loop forever without
+  // ever reaching the `.prev` rollback path.
+  scheduleHealthyBootMark();
 
   // Single line to stdout so the install-time launcher can confirm boot.
   process.stdout.write(
