@@ -1605,9 +1605,8 @@ pidfile="$1"; timeout_bin="$2"; job_timeout="$3"; curl_bin="$4"; url="$5"; setsi
 # second installer sees "launch in progress" rather than a dead placeholder.
 # The marker is dropped once the owner record is up; the record itself is
 # removed only after the whole process group is CONFIRMED gone (the EXIT
-# trap below re-probes after the reap poll — and NEVER when the pgid is
-# unknown, e.g. a ps failure: an unverifiable group
-# leaves the pid+start record for a re-run to reap).
+# trap below re-probes after the reap poll). When no group was observed, the
+# leader pid is the fallback liveness check.
 # The start identity uses the `ps lstart` format deliberately: this job body
 # is a standalone `bash -c` that cannot reach the lock block's boot-scoped
 # reader, and the records are internal to this installer — never compared
@@ -1797,12 +1796,15 @@ rm -f "$lockd/owner.tmp.$$" "$launchfile" 2>/dev/null || true
 # duplicate.
 [ "$published" = 1 ] || exit 0
 # The pidfile is removed only when it is still OURS and the process group is
-# CONFIRMED gone. An unknown group keeps the owner record for a re-run.
+# gone. If no group was observed, probe the leader pid instead.
 # `group_confirmed_gone` covers the set -m path where the leader died before
 # `ps` could report AND its whole group is already empty: that shape is
 # proven dead too, so the pidfile must not linger.
 group_confirmed_gone=0
-trap 'if { { [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null; } \
+trap 'if { { [ "${group_observed:-0}" = 1 ] && [ -n "${pgid:-}" ] \
+  && ! kill -0 -- -"$pgid" 2>/dev/null; } \
+  || { [ "${group_observed:-0}" != 1 ] && [ -n "${leader_pid:-}" ] \
+  && ! kill -0 "$leader_pid" 2>/dev/null; } \
   || [ "$group_confirmed_gone" = 1 ]; } \
   && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
   rm -f "$ownerfile" 2>/dev/null || true
@@ -1810,25 +1812,43 @@ trap 'if { { [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null; } \
 fi' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
+group_observed=0
+leader_pid=""
 if [ -n "$timeout_bin" ]; then
-  # GNU timeout leads its own process group. Its children can outlive it.
-  # Use the leader pid even when the group exits before the first probe.
-  # The EXIT trap must prove that the group is gone before it clears the lock.
+  # GNU timeout usually leads its own process group, but do not assume that.
+  # Observe the group before and after waiting. If it was never visible, use
+  # the timeout leader's liveness instead of treating an empty probe as proof.
   "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url" &
   twait=$!
-  pgid="$twait"
+  leader_pid="$twait"
+  if kill -0 -- -"$twait" 2>/dev/null \
+    || [ "$(ps -o pgid= -p "$twait" 2>/dev/null | tr -d ' ')" = "$twait" ]; then
+    pgid="$twait"
+    group_observed=1
+  fi
   wait "$twait" 2>/dev/null || true
-  if [ -n "$pgid" ] && kill -0 -- -"$pgid" 2>/dev/null; then
+  if [ "$group_observed" != 1 ] && kill -0 -- -"$twait" 2>/dev/null; then
+    pgid="$twait"
+    group_observed=1
+  fi
+  if [ "$group_observed" = 1 ] && kill -0 -- -"$pgid" 2>/dev/null; then
     kill -TERM -- -"$pgid" 2>/dev/null || true
     sleep 1
     kill -KILL -- -"$pgid" 2>/dev/null || true
+  elif [ "$group_observed" != 1 ] && ! kill -0 "$leader_pid" 2>/dev/null; then
+    group_confirmed_gone=1
   fi
 elif [ -n "$setsid_bin" ]; then
   # setsid(1) starts the pipeline as its own session + process-group leader,
   # so the leader pid IS the pgid — `$!` after the pipeline would NOT be it.
   "$setsid_bin" bash -c "$pipeline" "$curl_bin" "$url" &
   leader=$!
+  leader_pid="$leader"
   pgid="$leader"
+  if kill -0 -- -"$pgid" 2>/dev/null \
+    || [ "$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" = "$pgid" ]; then
+    group_observed=1
+  fi
   # The deadline watchdog. Its sleeps run as NAMED children under a TERM
   # trap — `kill "$watchdog"` below then stands the whole watchdog down
   # cleanly; a plain `( sleep …; kill …)` subshell would orphan its
@@ -1855,6 +1875,7 @@ elif [ -n "$setsid_bin" ]; then
   # the GROUP alive (and the log pipe open). Finish a surviving group here
   # too, or the watchdog's pending KILL is stood down with nothing sent.
   if kill -0 -- -"$pgid" 2>/dev/null; then
+    group_observed=1
     kill -TERM -- -"$pgid" 2>/dev/null || true
     sleep 1
     kill -KILL -- -"$pgid" 2>/dev/null || true
@@ -1868,6 +1889,7 @@ else
   set -m
   bash -c "$pipeline" "$curl_bin" "$url" &
   leader=$!
+  leader_pid="$leader"
   pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')"
   [[ "$pgid" =~ ^[0-9]+$ ]] || pgid=""
   # Under `set -m` a background job leads its own group, so its pgid is the
@@ -1877,6 +1899,7 @@ else
   if [ -z "$pgid" ] && kill -0 -- -"$leader" 2>/dev/null; then
     pgid="$leader"
   fi
+  [ -n "$pgid" ] && group_observed=1
   # Leader already dead AND no group with that id — the tree is PROVEN gone
   # (a dead leader with surviving children would still answer the group
   # probe). The EXIT trap can then drop the pidfile instead of leaving a
