@@ -165,6 +165,64 @@ export type TNativeTurn = {
 };
 
 /**
+ * Tool-bearing / reasoning-aware history turn for bridge-capture multi-turn
+ * construction. Distinct from {@link TNativeTurn}: the text-only native path
+ * and content-hash resume store keep the flat shape; capture history must not
+ * silently drop tool call IDs, tool results, or reasoning items into a string.
+ *
+ * Adapters may map these onto a proven provider input mechanism (exact
+ * structured inject, or cold text seed when ONLY plain text is present). When
+ * no exact mechanism is proven, the shared history planner returns
+ * `unsupported` instead of a lossy seed.
+ */
+export type TNativeHistoryToolCall = {
+  readonly id: string;
+  readonly name: string;
+  /** Raw JSON arguments string as on the wire (not reparsed). */
+  readonly arguments: string;
+};
+
+export type TNativeHistoryTurn =
+  | {
+      readonly kind: "text";
+      readonly role: "user" | "assistant";
+      readonly text: string;
+    }
+  | {
+      readonly kind: "assistant_tools";
+      readonly text: string | null;
+      readonly toolCalls: ReadonlyArray<TNativeHistoryToolCall>;
+      /** Opaque reasoning items (Responses) — preserved verbatim when present. */
+      readonly reasoningItems?: ReadonlyArray<unknown>;
+      readonly reasoningContent?: string | null;
+    }
+  | {
+      readonly kind: "tool_result";
+      readonly toolCallId: string;
+      readonly content: string;
+    };
+
+/** Walker/native decline ownership once capture may have touched upstream. */
+export type TCaptureOwnership = "none" | "accepted" | "uncertain";
+
+/**
+ * Map a request-capture session's dispatch/accept flags onto the walker
+ * terminality signal. Shared by Claude/Codex/Cursor adapters so they cannot
+ * drift on the no-second-send contract.
+ *
+ * - dispatch not started → `none` (pre-send; existing fallback policy applies)
+ * - dispatch started + upstream accepted → `accepted` (TERMINAL for the walk)
+ * - dispatch started + accept unknown → `uncertain` (TERMINAL; do NOT retry)
+ */
+export const captureOwnershipFromSession = (session: {
+  readonly dispatchStarted: () => boolean;
+  readonly upstreamAccepted: () => boolean;
+}): TCaptureOwnership => {
+  if (!session.dispatchStarted()) return "none";
+  return session.upstreamAccepted() ? "accepted" : "uncertain";
+};
+
+/**
  * A native-eligible request decomposed for session-resume execution: the
  * system prompt plus the ordered user/assistant TEXT turns. The session store
  * derives the conversation identity + the delta turn to feed from `turns`.
@@ -321,8 +379,9 @@ export type TNativeRunResult =
        * upstream. `accepted` / `uncertain` MUST be terminal for the hop —
        * walker must not fall through to handrolled or fleet (no second send).
        * Absent / `none` = pre-send decline; existing fallback policy applies.
+       * Prefer {@link captureOwnershipFromSession} over hand-rolled mapping.
        */
-      readonly captureOwnership?: "none" | "accepted" | "uncertain";
+      readonly captureOwnership?: TCaptureOwnership;
     };
 
 export type TNativeTerminalResult =

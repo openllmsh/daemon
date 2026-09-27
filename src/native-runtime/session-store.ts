@@ -127,7 +127,7 @@ export const renderSeed = (
 };
 
 /**
- * Builder feed for one native text turn.
+ * Builder feed for one native TEXT turn (no tool/reasoning artifacts).
  *
  * When bridge request capture is active the vendor builder never observes the
  * true assistant/tool response (local settlement only). Warm `--resume` /
@@ -135,6 +135,10 @@ export const renderSeed = (
  * history injection is proven, capture turns always start cold and seed prior
  * turns via {@link renderSeed}, and the session map must not publish a resume
  * handle.
+ *
+ * Tool-bearing / reasoning history MUST NOT go through this helper — use
+ * `captureAwareHistoryBuilderPlan` in `request-capture-history.ts`, which
+ * refuses lossy silent success when IDs/roles/reasoning would be dropped.
  */
 export type TCaptureAwareTextBuilderPlan = {
   readonly builderResumeId: string | null;

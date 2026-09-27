@@ -66,6 +66,13 @@ export type TCaptureDestinationPolicy = {
   readonly allowedOrigins: ReadonlySet<string>;
   /** When true, `http://127.0.0.1` / `http://localhost` / `http://[::1]` are trusted (hermetic tests). */
   readonly allowLoopback?: boolean;
+  /**
+   * Optional provider-specific admission beyond the exact origin set (e.g.
+   * Cursor's authenticated dynamic `agentUrl` / `agentnUrl` host family).
+   * Invoked only after protocol/credentials/loopback checks; must not widen
+   * to caller-provided or lookalike hosts.
+   */
+  readonly allowUrl?: (url: URL) => boolean;
 };
 
 /**
@@ -86,7 +93,25 @@ export type TCaptureUsageOwnership =
 export type TBuilderSettlement =
   | { readonly kind: "suppressed"; readonly reason: string }
   | { readonly kind: "cancelled"; readonly reason: string }
-  | { readonly kind: "failed"; readonly reason: string };
+  | { readonly kind: "failed"; readonly reason: string }
+  /**
+   * Keep the builder's intercepted stream alive for allowlisted pre-inference
+   * duplex controls (e.g. Cursor `request_context_args`). Not a true upstream
+   * completion — inference output still belongs to the daemon.
+   *
+   * `connectContentEncoding` (when the real upstream negotiated one, e.g.
+   * `gzip`) MUST be forwarded onto the synthetic response headers the
+   * builder's Connect client sees — a compressed injected envelope with no
+   * matching `connect-content-encoding` header leaves the real Connect
+   * parser unable to decide how to decode it, which can hang the RPC forever
+   * rather than erroring (observed as a caller-side hard timeout with no
+   * structured decline).
+   */
+  | {
+      readonly kind: "duplex_bridge";
+      readonly reason: string;
+      readonly connectContentEncoding?: string | null;
+    };
 
 /**
  * Terminal outcome of the capture session (daemon-facing).
@@ -111,6 +136,29 @@ export type TCaptureTerminalOutcome =
       readonly reason: string;
       readonly usage: TCaptureUsageOwnership;
     };
+
+/**
+ * Map a finished capture terminal onto walker `captureOwnership`.
+ * `uncertain_accept` and post-accept failures are both no-second-send.
+ * Pre-dispatch cancel/fail → `none`.
+ */
+export const captureOwnershipFromTerminal = (
+  terminal: TCaptureTerminalOutcome | null,
+): "none" | "accepted" | "uncertain" => {
+  if (terminal === null) return "none";
+  if (terminal.kind === "uncertain_accept") return "uncertain";
+  if (terminal.kind === "dispatched") return "accepted";
+  if (terminal.kind === "failed" && terminal.usage.kind === "daemon_upstream") {
+    return "accepted";
+  }
+  if (
+    terminal.kind === "cancelled" &&
+    terminal.usage.kind === "daemon_upstream"
+  ) {
+    return "accepted";
+  }
+  return "none";
+};
 
 export type TRequestCaptureErrorCode =
   | "duplicate_capture"
@@ -167,10 +215,17 @@ export const preserveCapturedHeaders = (
   return out;
 };
 
+/** HTTP/2 pseudoheader names (`:method`, `:scheme`, …) — framing, not Web Headers. */
+export const isHttpPseudoHeaderName = (name: string): boolean =>
+  name.startsWith(":");
+
 /**
- * Rebuild a Headers object from preserved pairs. Retains every value including
- * Authorization / Cookie / vendor tokens. Drops only hop-by-hop `host` when
- * `dropHost` is true so `fetch` can set the dispatch target's host.
+ * Rebuild a Headers object from preserved pairs. Retains every application
+ * value including Authorization / Cookie / vendor tokens. Drops:
+ *   - hop-by-hop `host` when `dropHost` is true (so `fetch` sets the target),
+ *   - HTTP/2 pseudoheaders (`:scheme`, `:authority`, `:path`, `:method`, …)
+ *     which are illegal in the Fetch/`Headers` API and belong in
+ *     {@link TCaptureFraming} / URL / method instead.
  */
 export const headersInitFromCaptured = (
   pairs: ReadonlyArray<TCapturedHeaderPair>,
@@ -179,6 +234,7 @@ export const headersInitFromCaptured = (
   const headers = new Headers();
   for (const [name, value] of pairs) {
     if (opts.dropHost === true && name.toLowerCase() === "host") continue;
+    if (isHttpPseudoHeaderName(name)) continue;
     headers.append(name, value);
   }
   return headers;
@@ -258,13 +314,16 @@ export const validateCaptureDestination = (
     return { ok: true, url };
   }
   const origin = url.origin;
-  if (!policy.allowedOrigins.has(origin)) {
-    return {
-      ok: false,
-      reason: `origin ${origin} is not in the capture destination allowlist`,
-    };
+  if (policy.allowedOrigins.has(origin)) {
+    return { ok: true, url };
   }
-  return { ok: true, url };
+  if (policy.allowUrl?.(url) === true) {
+    return { ok: true, url };
+  }
+  return {
+    ok: false,
+    reason: `origin ${origin} is not in the capture destination allowlist`,
+  };
 };
 
 /**
@@ -408,7 +467,10 @@ export type TRequestCaptureSession = {
 
 let nextCaptureId = 0;
 
-const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
+/** Default max body size for a captured request/response — shared with
+ *  dispatch senders that must bound an in-memory inbound buffer (e.g. Codex
+ *  WS frame collection). */
+export const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
 
 export const createRequestCaptureSession = (
@@ -428,6 +490,11 @@ export const createRequestCaptureSession = (
     if (!ac.signal.aborted) ac.abort();
   };
   budget.signal.addEventListener("abort", linkAbort, { once: true });
+  // Caller signal listener: `{ once: true }` self-removes once it FIRES, but a
+  // signal that never aborts (the common case) leaves this listener attached
+  // to the caller's AbortSignal for as long as that signal lives — past this
+  // session's own lifetime. Remove it explicitly on dispose (still safe to
+  // remove an already-self-removed listener).
   opts.signal?.addEventListener("abort", linkAbort, { once: true });
 
   let captured: TCapturedRequestEnvelope | null = null;
@@ -463,8 +530,23 @@ export const createRequestCaptureSession = (
   const finishTerminal = (outcome: TCaptureTerminalOutcome): void => {
     if (terminal !== null) return;
     terminal = outcome;
-    linkAbort();
-    budget.release();
+    // Successful dispatch must NOT abort `session.signal` yet. Senders pass
+    // `AbortSignal.any([session.signal, callerSignal])` into `fetch`; aborting
+    // here cancels a still-live Response body and Bun surfaces
+    // `AbortError("The operation was aborted.")` while the daemon decodes —
+    // the live Claude bridge-capture text decline. Cancel/fail/uncertain still
+    // abort immediately. `dispose()` (after the body is released) aborts.
+    //
+    // `budget.release()` itself aborts the budget signal, which is also wired
+    // to `linkAbort` — detach that listener before releasing on success so the
+    // capture-wait timer stops without killing the upstream body.
+    if (outcome.kind === "dispatched") {
+      budget.signal.removeEventListener("abort", linkAbort);
+      budget.release();
+    } else {
+      linkAbort();
+      budget.release();
+    }
     if (builderSettlement === null) {
       if (outcome.kind === "cancelled") {
         finishBuilder({ kind: "cancelled", reason: "capture cancelled" });
@@ -611,9 +693,19 @@ export const createRequestCaptureSession = (
         // Abort handlers may settle `terminal` during the await. Read through a
         // function so CFA does not keep the pre-await `null` narrowing (which
         // would make `.kind` a property access on `never`).
+        // Prefer an already-recorded terminal reason over a generic timeout —
+        // `finishTerminal` aborts the budget signal on fail/cancel, which would
+        // otherwise make `budget.expired()` true and swallow e.g. "turn ended
+        // before capture" into "capture timed out after Nms".
         const ended = ((): TCaptureTerminalOutcome | null => terminal)();
         if (ended !== null && ended.kind === "cancelled") {
           throw new RequestCaptureError("aborted", "capture cancelled");
+        }
+        if (
+          ended !== null &&
+          (ended.kind === "failed" || ended.kind === "uncertain_accept")
+        ) {
+          throw new RequestCaptureError("not_captured", ended.reason);
         }
         throw new RequestCaptureError(
           budget.expired() ? "timeout" : "aborted",
@@ -640,6 +732,12 @@ export const createRequestCaptureSession = (
         );
       }
       dispatchStarted = true;
+      // Capture wait is over. Detach the pre-capture budget so its timer cannot
+      // abort an in-flight upstream dispatch (Codex live attempt-24: ~60s
+      // budget abort closed the WS and the sender synthesized empty [DONE]).
+      // Same detach-before-release pattern as successful `finishTerminal`.
+      budget.signal.removeEventListener("abort", linkAbort);
+      budget.release();
     },
 
     markUpstreamAccepted(): void {
@@ -704,6 +802,10 @@ export const createRequestCaptureSession = (
       }
       budget.release();
       linkAbort();
+      // Detach from the caller's own signal — it may vastly outlive this
+      // disposed session (e.g. a request-scoped AbortSignal reused across
+      // hops), and this listener closes over the whole session state.
+      opts.signal?.removeEventListener("abort", linkAbort);
     },
 
     terminal: (): TCaptureTerminalOutcome | null => terminal,
