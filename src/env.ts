@@ -70,10 +70,8 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   renameSync,
-  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -82,7 +80,26 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
 import type { TUpdateRouteConfig } from "@openllmsh/protocol/update-policy";
 import { resolveUpdateSetting } from "@openllmsh/protocol/update-policy";
-import { processStartIdentity } from "../../tunnel/session/local-runtime";
+import type { TDirLockOptions } from "../../tunnel/session/dir-lock";
+import {
+  acquireDirLockSync,
+  envDirLockCodec,
+  finishDirLockRelease,
+  moveDirNoReplace,
+  publishDirLockOwner,
+  releaseDirLock,
+  stealDirLock,
+  sweepDirLockResidue,
+} from "../../tunnel/session/dir-lock";
+import type {
+  TProcessIdentity,
+  TProcessStartIdentityReader,
+} from "../../tunnel/session/local-runtime";
+import {
+  legacyProcessStartIdentity,
+  processIdentityStatus,
+  processStartIdentity,
+} from "../../tunnel/session/local-runtime";
 // NOTE: logger.ts imports `stateDir` from this module — a benign cycle, since
 // both sides only dereference the other's exports lazily inside functions.
 import { logWarn, safeDiagnosticMessage } from "./logger";
@@ -366,10 +383,6 @@ const parseEnvLines = (text: string): Map<string, string> => {
  * passes `serviceEnvFilePath()` so it seeds the PROD `.env` even under the dev
  * flag — see `serviceEnvFilePath` / `service.ts writeEnvFileIfNeeded`.
  */
-const lockWait = (): void => {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-};
-
 /**
  * Shared env-file lock protocol `openllm-env-lock/v1` — the SAME protocol the
  * shell installers implement in `packages/daemon/install.sh` and
@@ -383,35 +396,67 @@ const lockWait = (): void => {
  *
  *   kind=openllm-env-lock/v1 pid=<pid> start=<start identity> nonce=<hex>
  *
- * `start` is the owner's `ps -o lstart=` identity under LC_ALL=C TZ=UTC with
- * whitespace collapsed to single spaces (`processStartIdentity`, normalised
- * the same way) — it distinguishes a LIVE-but-reused pid from the real owner
- * (PID reuse). A `-` records an owner that could not read its own identity.
+ * `start` is the owner's canonical start identity — `processStartIdentity`,
+ * whitespace collapsed to single spaces. On Linux that is the boot-scoped
+ * `boot:<boot_id>:<starttime ticks>` pair; on macOS the `ps -o lstart=`
+ * text under LC_ALL=C TZ=UTC. It distinguishes a LIVE-but-reused pid from
+ * the real owner (PID reuse). Records written by older builds can carry the
+ * `ps lstart` text or `-` (an owner that could not read its own identity);
+ * `-` is never written by this build.
  *
  * A held lock is STALE only when its marked owner record names a dead pid,
- * or a live pid whose current start identity differs from the recorded one.
- * A lock dir with no/unreadable/unmarked owner is HELD — the one exception
- * is a dir older than the stale window that still has no complete owner
- * (a holder killed between `mkdir` and publish), which may be reclaimed.
+ * or a live pid whose current start identity differs from the recorded one
+ * (mixed legacy/boot-scoped formats are re-probed in the record's own
+ * format through `processIdentityStatus` before a live pid can convict).
+ * A lock dir with no/unreadable/unmarked owner is HELD — but only inside a
+ * short "unproven" bound ({@link envLockOrphanMs}, default 30 s): past it an
+ * ownerless dir (a holder killed between `mkdir` and publish) is reclaimed.
+ * A marked owner whose start is `-` can never be proven, so a live pid
+ * still holds it for the full stale window — a transient probe failure on
+ * the owner's side must never make a live lock reclaimable in seconds. The
+ * orphan bound still caps the legacy `.env.lock` FILE — an unprovable
+ * identity must not wedge the lock for the full stale window.
  *
- * Reclaim is an atomic `mv` of the lock dir to `<envfile>.lock.stale.<pid>.
- * <nonce>` — exactly one contender wins the rename. The winner re-reads the
- * owner INSIDE the quarantine: if it turns out to be live after all (it was
- * published between the check and the move), it is moved back — but only
- * when `.lock.d` still does not exist (rename is a no-replace), otherwise
- * it stays quarantined. Either way acquisition is retried. Quarantine dirs
- * older than the stale window are deleted during acquisition passes when
- * their contents are only `owner.tmp.*` publish residue (or empty — the
- * crash-between-mkdir-and-publish shape) or a complete marked owner record.
+ * Reclaim is MARK-FIRST. A contender that judges the dir stale drops a
+ * `steal.<pid>.<nonce>` marker INSIDE it (noclobber create), re-judges the
+ * SAME generation (inode match + the pre-mark mtime for the age term, since
+ * the marker create already bumped it), and only then `mv`s it to
+ * `<envfile>.lock.stale.<pid>.<nonce>.<seq>`. The marker bridges the gap
+ * between the re-check and the move: a paused publisher that commits its
+ * owner record while a steal is in flight sees the marker (or the dir gone)
+ * and fails its own publish rather than holding a quarantined dir — two
+ * holders can never result. A steal that loses the rename (another
+ * contender moved first) or fails its re-check just drops its marker.
+ * Quarantine dirs are never moved back; a committed steal is final because
+ * publishers self-detect it. Old quarantine dirs are deleted during
+ * acquisition passes when their contents are only `owner.tmp.*`/`steal.*`
+ * residue (or empty) or a complete marked owner record.
  *
- * Release moves `.lock.d` to `<envfile>.lock.rel.<pid>.<nonce>` first, then
- * verifies the nonce inside matches before deleting — a holder whose lock
- * was stolen/replaced never deletes a successor's lock: the moved dir holds
- * the successor's record, the nonce differs, and it is moved back.
+ * The publisher's veto is bound to the dir GENERATION, not the path: the
+ * inode of the just-`mkdir`'d dir is captured at acquire and re-stat'd
+ * after the record lands. A different inode — or a vanished dir — means
+ * this generation was quarantined and the path re-taken by a successor, so
+ * the publish drops its own record instead of writing into the
+ * successor's dir. A fresh unmarked dir is immovable (never stale, and a
+ * release only moves a dir that reads as its own), so the inode captured
+ * right after `mkdir` can only be ours.
+ *
+ * Release first reads the owner AT the live path and moves `.lock.d` to
+ * `<envfile>.lock.rel.<pid>.<nonce>` ONLY when that record is marked with
+ * our nonce — a foreign marked owner (a successor that re-took the path
+ * after our dir was stolen) is never touched. The captured dir is then
+ * verified inside the quarantine: our nonce means delete; a foreign record
+ * means the path was swapped mid-move and the dir is put back NO-REPLACE —
+ * a fresh `mkdir` plus a verified verbatim copy of its flat files (each
+ * file is written no-replace, fsync'd and re-read; the source is removed
+ * only after every copy lands whole). `rename` could silently replace a
+ * successor's just-`mkdir`'d (still empty) dir that landed in the
+ * check→move gap; `mkdir` fails outright and the captured dir stays parked
+ * for the sweep instead.
  *
  * The pre-dir `.env.lock` FILE format is still honoured for one release:
  * a legacy file lock can never prove its owner's start identity, so it is
- * HELD only inside the bounded reclaim window ({@link envLockStaleMs}) —
+ * HELD only inside the bounded reclaim window ({@link envLockOrphanMs}) —
  * while a recorded pid is alive or its content is unparseable — and is
  * reclaimed past the window even when the pid is still alive. A dead-pid
  * record is reclaimed ONLY by atomic rename to a unique quarantine name —
@@ -419,9 +464,6 @@ const lockWait = (): void => {
  * quarantine: a record that turns out to be live AND young is put back with
  * a no-replace restore, never over a successor lock file.
  */
-const ENV_LOCK_KIND = "openllm-env-lock/v1";
-const ENV_LOCK_MARKER = `kind=${ENV_LOCK_KIND}`;
-
 // Both knobs share the installers' exact rule: decimal digits AND > 0 —
 // "0" (or anything non-numeric, including "0x10"/"1e3") falls back to the
 // defaults, never a zero-length window.
@@ -433,12 +475,24 @@ const envLockStaleMs = (): number => {
   return 600_000;
 };
 
+const envLockOrphanMs = (): number => {
+  const raw = process.env.OPENLLM_ENV_LOCK_ORPHAN_SECS;
+  if (raw !== undefined && /^[0-9]+$/.test(raw) && Number(raw) > 0) {
+    return Number(raw) * 1000;
+  }
+  return 30_000;
+};
+
+// The request-path bound: a held foreign lock must never stall the daemon
+// event loop for the old 10 s — every retry also re-probes `ps`, so the wait
+// AND the probe rate are both capped low here (installers keep a more
+// patient default; the knob is shared).
 const envLockWaitMs = (): number => {
   const raw = process.env.OPENLLM_ENV_LOCK_WAIT_SECS;
   if (raw !== undefined && /^[0-9]+$/.test(raw) && Number(raw) > 0) {
     return Number(raw) * 1000;
   }
-  return 10_000;
+  return 1_000;
 };
 
 export type TEnvLockOwner =
@@ -500,143 +554,267 @@ const envLockOwnerAlive = (pid: number): boolean => {
 };
 
 /**
- * The owner's start identity, normalised exactly like the shell side
- * (`ps -o lstart=` under LC_ALL=C TZ=UTC, whitespace collapsed). Tri-state:
- * a string identity, null for a confirmed-dead pid, undefined when unknown.
+ * The owner's start identity in the canonical format — `processStartIdentity`
+ * (`boot:<boot_id>:<ticks>` on Linux, `ps -o lstart=` text on other POSIX),
+ * whitespace collapsed exactly like the shell side. Tri-state: a string
+ * identity, null for a confirmed-dead pid, undefined when unknown.
+ *
+ * Probing can spawn a helper, and a contested lock re-judges on every
+ * retry — so reads are cached briefly per pid. A cached value can only
+ * delay a steal by the TTL (the conservative direction): a dead-and-reused
+ * pid inside the window still compares equal to its own recorded start,
+ * never the other way around. A FAILED probe (undefined) is never cached:
+ * a stale "unknown" could otherwise be trusted for minutes, and a
+ * `start=-` record it produced could be reclaimable while the owner was
+ * still alive.
  */
-const envLockStartIdentity = (pid: number): string | null | undefined => {
-  const raw = processStartIdentity(pid);
+const IDENTITY_PROBE_TTL_MS = 250;
+const identityCache = new Map<
+  number,
+  { readonly value: string | null; readonly at: number }
+>();
+let identityProbeCount = 0;
+let envLockProbe: TProcessStartIdentityReader = processStartIdentity;
+let envLockLegacyProbe: TProcessStartIdentityReader =
+  legacyProcessStartIdentity;
+let selfIdentity: string | null | undefined;
+let selfIdentityRead = false;
+
+const envLockStartIdentityProbe = (pid: number): string | null | undefined => {
+  identityProbeCount += 1;
+  const raw = envLockProbe(pid);
   if (typeof raw !== "string") return raw;
   const value = raw.trim().replace(/\s+/g, " ");
   return value.length > 0 ? value : undefined;
 };
 
-/** The shared staleness predicate — identical rules on both sides. */
-const envLockDirIsStale = (dir: string): boolean => {
+const envLockLegacyStartIdentityProbe = (
+  pid: number,
+): string | null | undefined => {
+  const raw = envLockLegacyProbe(pid);
+  if (typeof raw !== "string") return raw;
+  const value = raw.trim().replace(/\s+/g, " ");
+  return value.length > 0 ? value : undefined;
+};
+
+const envLockStartIdentity = (pid: number): string | null | undefined => {
+  if (pid === process.pid) {
+    // Our own identity is immutable once read — but a failed probe is NOT
+    // latched: a permanently cached "unknown" would publish `start=-`, a
+    // record any contender may reclaim while we are still alive. The next
+    // call re-probes.
+    if (!selfIdentityRead) {
+      const value = envLockStartIdentityProbe(pid);
+      if (typeof value === "string") {
+        selfIdentity = value;
+        selfIdentityRead = true;
+      }
+      return value;
+    }
+    return selfIdentity;
+  }
+  const now = Date.now();
+  const hit = identityCache.get(pid);
+  if (hit !== undefined && now - hit.at < IDENTITY_PROBE_TTL_MS)
+    return hit.value;
+  const value = envLockStartIdentityProbe(pid);
+  if (value !== undefined) {
+    if (identityCache.size > 128) identityCache.clear();
+    identityCache.set(pid, { value, at: now });
+  }
+  return value;
+};
+
+/**
+ * Identity reader bound to ONE owner record. The per-pid cache is trusted
+ * only when its entry MATCHES the record's start: a matching identity can
+ * only delay a steal by the TTL — the conservative direction. A cached
+ * MISMATCH may be the predecessor's identity on a pid that was reused inside
+ * the window — serving it would convict a live owner as dead — so a
+ * non-matching entry always falls through to a fresh probe.
+ */
+const envLockStartIdentityForRecord = (
+  pid: number,
+  recordedStart: string,
+): string | null | undefined => {
+  if (pid === process.pid) return envLockStartIdentity(pid);
+  const expected = recordedStart.trim().replace(/\s+/g, " ");
+  const now = Date.now();
+  const hit = identityCache.get(pid);
+  if (
+    hit !== undefined &&
+    now - hit.at < IDENTITY_PROBE_TTL_MS &&
+    hit.value === expected
+  )
+    return hit.value;
+  const value = envLockStartIdentityProbe(pid);
+  if (value !== undefined) {
+    if (identityCache.size > 128) identityCache.clear();
+    identityCache.set(pid, { value, at: now });
+  }
+  return value;
+};
+
+/**
+ * `processIdentityStatus` verdicts, briefly cached per (pid, recorded
+ * start). A contested lock re-judges on every retry and a mixed-format
+ * record costs a second bridging probe — the verdict itself is rate-limited
+ * too (EL-4). Only "alive" answers are cached: a cached "dead" could
+ * outlive a same-second pid reuse on a coarse `ps lstart` record and
+ * convict the live successor, and a cached "unknown" would make a
+ * transient probe outage outlive the TTL — both re-probe every call.
+ */
+const statusCache = new Map<
+  string,
+  { readonly value: TProcessIdentity; readonly at: number }
+>();
+
+const envLockIdentityStatus = (
+  pid: number,
+  recordedStart: string,
+): TProcessIdentity => {
+  const key = `${pid} ${recordedStart}`;
+  const now = Date.now();
+  const hit = statusCache.get(key);
+  if (hit !== undefined && now - hit.at < IDENTITY_PROBE_TTL_MS)
+    return hit.value;
+  const value = processIdentityStatus(
+    pid,
+    recordedStart,
+    (probePid) => envLockStartIdentityForRecord(probePid, recordedStart),
+    envLockLegacyStartIdentityProbe,
+  );
+  // Only an "alive" verdict is cached: a cached "dead" could outlive a
+  // same-second pid reuse on a coarse `ps lstart` record and convict the
+  // LIVE successor, and a cached "unknown" would keep a dead owner
+  // unreclaimed while a transient probe failure clears — both re-probe
+  // every time.
+  if (value === "alive") {
+    if (statusCache.size > 128) statusCache.clear();
+    statusCache.set(key, { value, at: now });
+  }
+  return value;
+};
+
+/**
+ * Test seam: cumulative `ps` identity probes this process has spawned —
+ * lets the bounded-wait regression pin the rate limit (EL-4).
+ */
+export const envLockIdentityProbesForTest = (): number => identityProbeCount;
+
+/**
+ * Test seam: swap the raw start-identity probe and reset every identity
+ * cache (self latch, per-pid cache, verdict cache), so a transient probe
+ * outage is replayable. Call with no argument to restore the real probe.
+ */
+export const envLockSwapProbeForTest = (
+  impl?: TProcessStartIdentityReader,
+): void => {
+  envLockProbe = impl ?? processStartIdentity;
+  envLockLegacyProbe = impl ?? legacyProcessStartIdentity;
+  selfIdentity = undefined;
+  selfIdentityRead = false;
+  identityCache.clear();
+  statusCache.clear();
+};
+
+/** Test seam: runs inside the acquire AFTER our dir's inode is captured and
+ *  BEFORE the owner publish — the exact window a successor swap exploits. */
+let envLockPublishGapForTests: ((lockDir: string) => void) | null = null;
+export const envLockPublishGapForTest = (
+  hook: ((lockDir: string) => void) | null,
+): void => {
+  envLockPublishGapForTests = hook;
+};
+let envLockStealGapForTests: ((lockDir: string) => void) | null = null;
+export const envLockStealGapForTest = (
+  hook: ((lockDir: string) => void) | null,
+): void => {
+  envLockStealGapForTests = hook;
+};
+
+const envLockDirInoDefault = (dir: string): number | undefined => {
+  try {
+    return lstatSync(dir).ino;
+  } catch {
+    return undefined;
+  }
+};
+let envLockDirIno = envLockDirInoDefault;
+
+/** Test seam: force the "inode unknown" acquire branch — a failed capture
+ *  must never let the publish land in an unproven dir. */
+export const envLockDirInoProbeForTest = (
+  probe: ((dir: string) => number | undefined) | null,
+): void => {
+  envLockDirIno = probe ?? envLockDirInoDefault;
+};
+
+/**
+ * The shared staleness predicate — identical rules on both sides.
+ *
+ * `asOfMtimeMs` substitutes a pre-captured dir mtime for the age terms: the
+ * steal path passes the PRE-MARK stat because our own `steal.*` marker
+ * create already bumped the dir's mtime.
+ */
+const envLockDirIsStale = (dir: string, asOfMtimeMs?: number): boolean => {
   const owner = envLockReadOwner(dir);
+  let ageMs = Number.NaN;
+  if (asOfMtimeMs !== undefined) {
+    ageMs = Date.now() - asOfMtimeMs;
+  } else {
+    try {
+      ageMs = Date.now() - lstatSync(dir).mtimeMs;
+    } catch {
+      // unreadable — stay held
+    }
+  }
   if (owner.state === "marked") {
     if (!envLockOwnerAlive(owner.pid)) return true;
-    if (owner.start === "-") {
-      // The start identity can never be proven ("-"): the lock is held only
-      // inside the same bounded window an ownerless dir gets — past it a
-      // live-but-unidentifiable pid no longer wedges the lock.
-      try {
-        return Date.now() - lstatSync(dir).mtimeMs >= envLockStaleMs();
-      } catch {
-        return false;
-      }
-    }
-    // PID reuse: only a REAL recorded start compared against a successfully
-    // read current identity can prove the holder is gone. Anything unknown
-    // keeps the lock held.
-    const current = envLockStartIdentity(owner.pid);
-    return current !== null && current !== undefined && current !== owner.start;
+    if (owner.start.trim().replace(/\s+/g, " ") === "-") return false;
+    // PID reuse is proven only through `processIdentityStatus`: it bridges
+    // the legacy `ps lstart` records older builds (and pre-XS-1 installers)
+    // wrote against this build's boot-scoped Linux probe — an old record
+    // of a live owner still reads alive. An unreadable identity is
+    // "unknown" — the lock stays held.
+    // An unproven identity is held. Only a fresh probe that proves the
+    // recorded owner is dead may make a marked lock stale.
+    return envLockIdentityStatus(owner.pid, owner.start) === "dead";
   }
-  // Unmarked: HELD unless the dir is old AND still has no complete owner —
-  // and never while a parseable pid in it is still alive.
-  let ageMs = Number.NaN;
-  try {
-    ageMs = Date.now() - lstatSync(dir).mtimeMs;
-  } catch {
-    return false;
-  }
-  if (!(ageMs >= envLockStaleMs())) return false;
+  // Unmarked: HELD unless past the short unproven bound AND still without a
+  // complete owner — and never while a parseable pid in it is still alive.
+  if (!(ageMs >= envLockOrphanMs())) return false;
   if (owner.pid !== null && envLockOwnerAlive(owner.pid)) return false;
   return true;
 };
 
-/** Move an apparently-stale lock dir aside; only one contender's rename wins. */
-const envLockQuarantine = (
+/** Test seam for the same stale-reclaim primitive used by live acquire. */
+export const envLockSteal = (
   lockDir: string,
-  stem: string,
-  nonce: string,
+  _stem: string,
+  _nonce: string,
+  onQuarantine?: (path: string) => void,
 ): void => {
-  const quarantine = `${stem}.stale.${process.pid}.${nonce}`;
-  try {
-    renameSync(lockDir, quarantine);
-  } catch {
-    return; // another contender moved it first, or it was released.
-  }
-  // Re-read inside the quarantine: a live owner that raced publication is
-  // restored — but never over an existing lock dir (no-replace).
-  if (envLockDirIsStale(quarantine)) return;
-  try {
-    lstatSync(lockDir);
-    return; // a successor lock exists — leave it quarantined.
-  } catch {
-    // absent
-  }
-  try {
-    renameSync(quarantine, lockDir);
-  } catch {
-    // raced — leave it quarantined.
-  }
+  const options = envDirLockOptions();
+  stealDirLock(lockDir, envDirLockCodec, {
+    ...options,
+    onStep: (step, path): void => {
+      options.onStep?.(step, path);
+      if (step === "after-steal-rename") onQuarantine?.(path);
+    },
+  });
 };
 
-/**
- * Delete old quarantine/release dirs whose contents are only `owner.tmp.*`
- * publish residue (or NOTHING — a holder killed between the lock mkdir and
- * the owner publish, then quarantined) or a complete marked owner record.
- * Anything foreign — an unmarked owner, an unrelated file — keeps the dir.
- * Exported as a protocol seam for the regression tests.
- */
+/** Test seam for the shared lock residue sweep. */
 export const envLockSweepQuarantine = (
   parentDir: string,
   baseName: string,
 ): void => {
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(parentDir);
-  } catch {
-    return;
-  }
-  const staleMs = envLockStaleMs();
-  for (const entry of entries) {
-    if (
-      !entry.startsWith(`${baseName}.lock.stale.`) &&
-      !entry.startsWith(`${baseName}.lock.rel.`)
-    )
-      continue;
-    const path = join(parentDir, entry);
-    let isDir = false;
-    let mtimeMs = 0;
-    try {
-      const stat = lstatSync(path);
-      isDir = stat.isDirectory();
-      mtimeMs = stat.mtimeMs;
-    } catch {
-      continue;
-    }
-    if (!isDir || Date.now() - mtimeMs < staleMs) continue;
-    // Contents must be limited to the owner record (+ an unfinished tmp).
-    // An OWNERLESS residue — a holder killed between the lock mkdir and the
-    // publish, then quarantined — is swept too when all it holds is
-    // `owner.tmp.*` files (or nothing); anything foreign keeps it.
-    let clean = true;
-    let hasOwner = false;
-    try {
-      for (const child of readdirSync(path)) {
-        if (child === "owner") hasOwner = true;
-        else if (!child.startsWith("owner.tmp.")) clean = false;
-      }
-    } catch {
-      clean = false;
-    }
-    if (!clean) continue;
-    if (hasOwner && envLockReadOwner(path).state !== "marked") continue;
-    for (const child of readdirSync(path)) {
-      try {
-        unlinkSync(join(path, child));
-      } catch {
-        // best effort
-      }
-    }
-    try {
-      rmdirSync(path);
-    } catch {
-      // best effort
-    }
-  }
+  sweepDirLockResidue(
+    join(parentDir, `${baseName}.lock.d`),
+    envDirLockCodec,
+    envDirLockOptions(),
+  );
 };
 
 /**
@@ -674,7 +852,7 @@ export const envLockLegacyResolveQuarantine = (
     withinWindow = true;
     try {
       withinWindow =
-        Date.now() - lstatSync(quarantinePath).mtimeMs < envLockStaleMs();
+        Date.now() - lstatSync(quarantinePath).mtimeMs < envLockOrphanMs();
     } catch {
       // keep the conservative default
     }
@@ -694,27 +872,36 @@ export const envLockLegacyResolveQuarantine = (
       // O_EXCL create is the same strict no-replace guarantee (rename would
       // not be — it silently replaces a successor that lands mid-check).
       let restored = false;
+      let created = false;
       let fd = -1;
       try {
         fd = openSync(legacyPath, "wx");
+        created = true;
         writeFileSync(fd, movedText);
+        fsyncSync(fd);
         closeSync(fd);
         fd = -1;
-        restored = true;
+        // Verify the landed copy before the captured record is consumed —
+        // a short or scrambled write must not delete the only valid copy.
+        restored = readFileSync(legacyPath, "utf-8") === movedText;
       } catch {
+        // covered below — anything we created is removed, foreign paths
+        // (a refused `wx` create) are never ours to unlink.
+      }
+      if (!restored && created) {
+        // A half-written or mis-verified file must not masquerade as a
+        // lock — remove only OUR fresh create, never a successor's.
         if (fd >= 0) {
           try {
             closeSync(fd);
           } catch {
             // best effort
           }
-          // A half-written file must not masquerade as a lock — remove
-          // only OUR fresh create, never whatever a successor wrote.
-          try {
-            unlinkSync(legacyPath);
-          } catch {
-            // best effort
-          }
+        }
+        try {
+          unlinkSync(legacyPath);
+        } catch {
+          // best effort
         }
       }
       if (restored) {
@@ -781,7 +968,7 @@ const envLockLegacyHeld = (legacyPath: string, nonce: string): boolean => {
       } catch {
         // the file exists but its age is unknown — stay held
       }
-      if (!(ageMs >= envLockStaleMs())) return true;
+      if (!(ageMs >= envLockOrphanMs())) return true;
     }
     const quarantine = `${legacyPath}.stale.${process.pid}.${nonce}.${attempt}`;
     try {
@@ -795,176 +982,88 @@ const envLockLegacyHeld = (legacyPath: string, nonce: string): boolean => {
   return true; // could not stabilise this pass — treat as still held
 };
 
-/**
- * Publish OUR owner record inside the just-mkdir'd lock dir — NO-REPLACE.
- * A publisher paused between the mkdir and this call may have been
- * quarantined and its path re-taken by a successor, and `rename` would
- * silently stamp over the successor's record. `link` fails outright on an
- * existing owner; the O_EXCL create carries the same guarantee where
- * hardlinks do not work. Returns true ONLY when the live record afterwards
- * carries OUR nonce — the dir may be swapped even after a successful link,
- * so holding is never assumed from the write alone. A return of false means
- * "did not acquire" (a successor owns this path — retry from the top);
- * a throw means the tmp write itself failed. Exported as a protocol seam
- * for the regression tests.
- */
+/** Test seam for the shared owner publisher. */
 export const envLockPublishOwner = (
   lockDir: string,
   nonce: string,
+  expectedIno?: number,
 ): boolean => {
-  const start = envLockStartIdentity(process.pid) ?? "-";
-  const record = `${ENV_LOCK_MARKER} pid=${process.pid} start=${start} nonce=${nonce}\n`;
-  const tmp = join(lockDir, `owner.tmp.${process.pid}`);
-  const ownerPath = join(lockDir, "owner");
-  writeFileSync(tmp, record, "utf-8");
-  let published = false;
-  try {
-    linkSync(tmp, ownerPath);
-    published = true;
-  } catch {
-    // EEXIST means a successor owns this dir — never replace its record.
-    // Any other failure (no hardlink support) gets the same no-replace
-    // guarantee from an O_EXCL create.
-    let fd = -1;
-    try {
-      fd = openSync(ownerPath, "wx");
-      writeFileSync(fd, record);
-      closeSync(fd);
-      fd = -1;
-      published = true;
-    } catch {
-      if (fd >= 0) {
-        try {
-          closeSync(fd);
-        } catch {
-          // best effort
-        }
-        // A half-written create must not masquerade as an owner — remove
-        // only OUR fresh file, never a successor's record.
-        try {
-          unlinkSync(ownerPath);
-        } catch {
-          // best effort
-        }
-      }
-    }
-  }
-  try {
-    unlinkSync(tmp);
-  } catch {
-    // best effort — swept later either way
-  }
-  if (!published) return false;
-  const now = envLockReadOwner(lockDir);
-  return now.state === "marked" && now.nonce === nonce;
+  const ino = expectedIno ?? envLockDirIno(lockDir);
+  const start = envLockStartIdentity(process.pid);
+  if (ino === undefined || typeof start !== "string" || start.length === 0)
+    return false;
+  return publishDirLockOwner(
+    lockDir,
+    ino,
+    { kind: envDirLockCodec.kind, pid: process.pid, start, nonce },
+    envDirLockCodec,
+    envDirLockOptions(),
+  );
 };
+
+/** Test seam for the shared no-replace quarantine restore. */
+export const envLockRestoreQuarantinedDir = (
+  released: string,
+  lockDir: string,
+): void => {
+  moveDirNoReplace(released, lockDir, envDirLockCodec);
+};
+
+/** Test seam for the shared release adjudicator. */
+export const envLockFinishRelease = (
+  released: string,
+  lockDir: string,
+  nonce: string,
+): void => {
+  finishDirLockRelease(
+    released,
+    lockDir,
+    { pid: process.pid, nonce },
+    envDirLockCodec,
+    envDirLockOptions(),
+  );
+};
+
+/** Test seam for the shared release primitive. */
+export const envLockReleaseDir = (lockDir: string, nonce: string): void => {
+  const owner = envDirLockCodec.readOwner(lockDir);
+  if (owner?.pid !== process.pid || owner.nonce !== nonce) return;
+  releaseDirLock(lockDir, owner, envDirLockCodec, envDirLockOptions());
+};
+
+const envDirLockOptions = (): TDirLockOptions => ({
+  waitMs: envLockWaitMs(),
+  reclaimMs: envLockStaleMs(),
+  pollMs: 10,
+  inode: envLockDirIno,
+  startIdentity: envLockStartIdentity,
+  legacyStartIdentity: envLockLegacyStartIdentityProbe,
+  isStale: envLockDirIsStale,
+  onStep: (step, path): void => {
+    if (step === "before-publish") envLockPublishGapForTests?.(path);
+    if (step === "after-steal-marker") envLockStealGapForTests?.(path);
+  },
+});
 
 /** Serialize env-file read/modify/write operations across daemon processes. */
 const withEnvFileLock = (
   targetPath: string,
   operation: () => boolean,
+  waitMs?: number,
 ): boolean => {
   const stem = `${targetPath}.lock`;
   const lockDir = `${stem}.d`;
-  const parentDir = dirname(targetPath);
-  const baseName = basename(targetPath);
   const nonce = randomUUID().replace(/-/g, "");
-  const deadline = Date.now() + envLockWaitMs();
-  let sweeps = 0;
-  let acquired = false;
-  // Bounded cleanup once per acquire so quarantined residue cannot linger
-  // until the next contested acquire (identical trigger on the bash side).
-  envLockSweepQuarantine(parentDir, baseName);
-  while (Date.now() < deadline) {
-    if (envLockLegacyHeld(stem, nonce)) {
-      lockWait();
-      continue;
-    }
-    try {
-      mkdirSync(lockDir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-      sweeps += 1;
-      if (sweeps % 25 === 0) envLockSweepQuarantine(parentDir, baseName);
-      try {
-        if (envLockDirIsStale(lockDir)) {
-          envLockQuarantine(lockDir, stem, nonce);
-        }
-      } catch {
-        // Another writer may have released/replaced it; retry normally.
-      }
-      lockWait();
-      continue;
-    }
-    // Publish the owner record atomically inside the new lock dir —
-    // NO-REPLACE: if our dir was quarantined and the path re-taken by a
-    // successor while we were paused, the publish must fail rather than
-    // stamp over the successor's record.
-    let published: boolean;
-    try {
-      published = envLockPublishOwner(lockDir, nonce);
-    } catch {
-      // The tmp write itself failed — drop the lock WE made rather than
-      // hold it unmarked.
-      try {
-        unlinkSync(join(lockDir, `owner.tmp.${process.pid}`));
-      } catch {
-        // best effort
-      }
-      try {
-        rmdirSync(lockDir);
-      } catch {
-        // best effort
-      }
-      return false;
-    }
-    if (!published) {
-      // A successor owns the dir at this path (or it was swapped
-      // mid-publish) — NOT ours to remove. Retry acquisition from the top.
-      lockWait();
-      continue;
-    }
-    acquired = true;
-    break;
-  }
-  if (!acquired) return false;
+  const release = acquireDirLockSync(lockDir, envDirLockCodec, {
+    ...envDirLockOptions(),
+    waitMs: waitMs ?? envLockWaitMs(),
+    legacyHeld: (): boolean => envLockLegacyHeld(stem, nonce),
+  });
+  if (release === null) return false;
   try {
     return operation();
   } finally {
-    // Release = rename to `.rel.<pid>.<nonce>` first, then delete ONLY when
-    // the owner record inside is provably ours — a stolen/replaced lock
-    // holds a successor's record, which we put back instead of deleting.
-    const released = `${stem}.rel.${process.pid}.${nonce}`;
-    try {
-      renameSync(lockDir, released);
-      const owner = envLockReadOwner(released);
-      if (owner.state === "marked" && owner.nonce === nonce) {
-        for (const child of readdirSync(released)) {
-          try {
-            unlinkSync(join(released, child));
-          } catch {
-            // best effort
-          }
-        }
-        try {
-          rmdirSync(released);
-        } catch {
-          // best effort
-        }
-      } else {
-        try {
-          lstatSync(lockDir);
-        } catch {
-          try {
-            renameSync(released, lockDir);
-          } catch {
-            // leave it quarantined
-          }
-        }
-      }
-    } catch {
-      // The lock dir vanished under us (stolen/quarantined) — nothing held.
-    }
+    release();
   }
 };
 
@@ -1352,24 +1451,30 @@ const persistLocalCallerToken = (token: string, filePath: string): void => {
   }
 };
 
-const pathEntryExists = (path: string): boolean => {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
 export const localCallerToken = (): string => {
   const filePath = localCallerTokenFilePath();
   if (cachedLocalCallerToken !== null) {
     // The file is the handoff to sibling first-party components — if it
-    // vanished (external cleanup, or a test re-pointed the state dir)
-    // re-persist the SAME token rather than silently diverging. A symlink
-    // standing in its place is never written through: the atomic writer
-    // refuses unsafe targets and the in-memory token stays authoritative.
-    if (!pathEntryExists(filePath)) {
+    // vanished (external cleanup, or a test re-pointed the state dir) OR
+    // still carries a token from a previous boot, re-persist the SAME
+    // in-memory token rather than silently diverging — a stale file 401s
+    // every CLI call for the rest of this boot. A symlink or other
+    // non-regular path standing in its place is never followed or written
+    // through: the atomic writer refuses unsafe targets and the in-memory
+    // token stays authoritative.
+    let rewrite = true;
+    try {
+      const stat = lstatSync(filePath);
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        rewrite =
+          readFileSync(filePath, "utf-8").trim() !== cachedLocalCallerToken;
+      } else {
+        rewrite = false; // non-regular target — leave it, keep ours.
+      }
+    } catch {
+      // absent, or a regular file we could not read — re-persist.
+    }
+    if (rewrite) {
       persistLocalCallerToken(cachedLocalCallerToken, filePath);
     }
     return cachedLocalCallerToken;

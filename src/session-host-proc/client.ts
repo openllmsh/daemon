@@ -46,6 +46,7 @@ import {
   verifyWindowsSessionDirectory,
   verifyWindowsSessionFile,
 } from "../../../tunnel/session/windows-session-pipe";
+import type { TPtyBackend } from "../bs-pty";
 import { requestedPtyBackend } from "../bs-pty";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";
@@ -67,9 +68,20 @@ import {
 import type { TSessionHostMeta } from "./main";
 
 const SPAWN_SOCKET_TIMEOUT_MS = 2_000;
-// Native PTY compilation + exec-status reconciliation has a bounded 12s
-// startup deadline; leave a small process/socket margin for the host sibling.
-const NATIVE_SPAWN_SOCKET_TIMEOUT_MS = 15_000;
+// Real backends have a bounded multi-second startup (native PTY compile +
+// exec-status reconciliation ~12 s; the Windows ConPTY compile is similar —
+// SH-3); leave a small process/socket margin for the host sibling. Only the
+// fake `bun` test backend keeps the short wait.
+const LONG_SPAWN_SOCKET_TIMEOUT_MS = 15_000;
+/**
+ * SH-3: the socket-publish wait per PTY backend. Every real backend gets
+ * the long wait — a ConPTY first-compile on Windows can run ~12 s, so the
+ * old 2 s bound killed the host mid-startup and orphaned the vendor
+ * process. Only the `bun` fake backend (a test label `requestedPtyBackend`
+ * never resolves to in production) keeps the short bound.
+ */
+export const spawnSocketTimeoutMsForBackend = (backend: TPtyBackend): number =>
+  backend === "bun" ? SPAWN_SOCKET_TIMEOUT_MS : LONG_SPAWN_SOCKET_TIMEOUT_MS;
 /** Per-pid `ps` identity read. Expiry is unknown, never dead. */
 const PROCESS_IDENTITY_TIMEOUT_MS = process.platform === "win32" ? 1500 : 250;
 const DISCOVERY_CONCURRENCY = 4;
@@ -204,7 +216,10 @@ const readProcessStartTime = async (
   budget: TDeadlineBudget,
 ): Promise<string | null | undefined> => {
   if (budget.expired()) return undefined;
-  if (process.platform === "win32") return processStartIdentity(pid);
+  // win32 (Win32 FFI) and linux (/proc ticks + boot_id) resolve in-process —
+  // no helper spawn, so no `ps` dependency or lstart-rejection failure (SH-2).
+  if (process.platform === "win32" || process.platform === "linux")
+    return processStartIdentity(pid);
   try {
     const proc = admittedSpawn(processStartCommand(pid), {
       stdout: "pipe",
@@ -526,11 +541,23 @@ const discoverSessionHostsOnce = async (): Promise<TDiscoveryOutcome> => {
     const socketPath = sessionHostSocketPath(id);
     const meta = readSessionHostMeta(id);
     if (meta === null) {
-      // Startup metadata is published atomically, but an interrupted rename,
-      // transient read error, or active staging transition must not make the
-      // first registry scan destructive. Reap only after the normal startup
-      // grace has elapsed.
-      if (sessionHostDirectoryAgeMs(directory) > SESSION_HOST_STARTUP_GRACE_MS)
+      // SH-6: an unreadable meta.json (EMFILE, an interrupted rename, or a
+      // newer record shape) is never proof of death — the published dir also
+      // carries owner.json, so reap only when the recorded owner is PROVABLY
+      // dead. Unverifiable dirs are left for a later scan; age alone does not
+      // authorize deletion.
+      const record = readOwnerRecord(join(directory, "owner.json"));
+      const provenDead =
+        record !== null &&
+        record.pid !== null &&
+        (record.processStartTime !== null
+          ? processIdentityStatus(record.pid, record.processStartTime) ===
+            "dead"
+          : !processAlive(record.pid));
+      if (
+        provenDead &&
+        sessionHostDirectoryAgeMs(directory) > SESSION_HOST_STARTUP_GRACE_MS
+      )
         reapSessionHostDir(directory);
       continue;
     }
@@ -709,9 +736,7 @@ const waitForSessionHostSocket = async (id: string): Promise<string | null> => {
   const socketPath = sessionHostSocketPath(id);
   const timeoutMs =
     spawnHarnessForTests?.socketTimeoutMs ??
-    (requestedPtyBackend() === "native"
-      ? NATIVE_SPAWN_SOCKET_TIMEOUT_MS
-      : SPAWN_SOCKET_TIMEOUT_MS);
+    spawnSocketTimeoutMsForBackend(requestedPtyBackend());
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (socketPresent(socketPath)) return socketPath;
@@ -851,6 +876,30 @@ const killOrphanedSessionHost = async (
   };
   const signalGroup = (signal: "SIGTERM" | "SIGKILL"): void => {
     if (process.platform === "win32") {
+      // No POSIX groups on Windows — `taskkill /T` takes the whole tree so a
+      // wrapper's children (ConPTY host, vendor CLI) cannot outlive the
+      // leader (SH-4). Identity-gated like the POSIX group kill: a proven-
+      // recycled or unverifiable pid is never signalled.
+      const verdict = orphanPidVerdict();
+      if (verdict === "foreign" || verdict === "unknown" || verdict === "dead")
+        return;
+      try {
+        const killed = admittedSpawnSync(
+          [
+            "taskkill",
+            "/pid",
+            String(pid),
+            "/t",
+            ...(signal === "SIGKILL" ? ["/f"] : []),
+          ],
+          { stdout: "ignore", stderr: "ignore", timeout: 5_000 },
+        );
+        if (killed.exitCode === 0) return;
+        // taskkill ran but failed — the tree may have survived, so fall
+        // through to the direct child kill rather than claiming done.
+      } catch {
+        // taskkill missing/failed — fall through to the direct child kill
+      }
       try {
         proc.kill(signal);
       } catch {

@@ -58,6 +58,69 @@ has_command() { command -v "$1" >/dev/null 2>&1; }
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+# --- arguments ---------------------------------------------------------------
+# Private-prerelease path (NR2-3): `--from-file <path>` supplies a LOCAL daemon
+# binary verified against the operator-provided `--sha256 <hex>` digest of
+# THAT file (e.g. `sha256sum openllmd-darwin-arm64`), and
+# `--cli-from-file`/`--cli-sha256` do the same for the CLI binary. When any of
+# these is given NOTHING is downloaded — no manifest, no .sha256, no binary
+# fetch — and components you did not supply are left untouched. All other
+# arguments are rejected so a typo can never silently change an install.
+FROM_FILE=""
+FROM_SHA=""
+CLI_FROM_FILE=""
+CLI_SHA=""
+usage() {
+  cat <<'USAGE'
+Usage: install.sh [options]
+  --from-file <path>     install the openllmd binary from a local file
+  --sha256 <hex>         sha256 digest of the --from-file file (required with it)
+  --cli-from-file <path> install the openllm CLI binary from a local file too
+  --cli-sha256 <hex>     sha256 digest of the --cli-from-file file (required with it)
+  -h, --help             show this text
+USAGE
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from-file)
+      FROM_FILE="${2:-}"
+      [ -n "$FROM_FILE" ] || die "--from-file needs a path"
+      shift 2
+      ;;
+    --from-file=*) FROM_FILE="${1#*=}"; shift ;;
+    --sha256)
+      FROM_SHA="${2:-}"
+      [ -n "$FROM_SHA" ] || die "--sha256 needs a hex digest"
+      shift 2
+      ;;
+    --sha256=*) FROM_SHA="${1#*=}"; shift ;;
+    --cli-from-file)
+      CLI_FROM_FILE="${2:-}"
+      [ -n "$CLI_FROM_FILE" ] || die "--cli-from-file needs a path"
+      shift 2
+      ;;
+    --cli-from-file=*) CLI_FROM_FILE="${1#*=}"; shift ;;
+    --cli-sha256)
+      CLI_SHA="${2:-}"
+      [ -n "$CLI_SHA" ] || die "--cli-sha256 needs a hex digest"
+      shift 2
+      ;;
+    --cli-sha256=*) CLI_SHA="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (supported: --from-file, --sha256, --cli-from-file, --cli-sha256)" ;;
+  esac
+done
+if [ -n "$FROM_FILE" ] || [ -n "$FROM_SHA" ]; then
+  [ -n "$FROM_FILE" ] && [ -n "$FROM_SHA" ] \
+    || die "--from-file and --sha256 must be given together"
+fi
+if [ -n "$CLI_FROM_FILE" ] || [ -n "$CLI_SHA" ]; then
+  [ -n "$CLI_FROM_FILE" ] && [ -n "$CLI_SHA" ] \
+    || die "--cli-from-file and --cli-sha256 must be given together"
+  [ -n "$FROM_FILE" ] \
+    || die "--cli-from-file requires --from-file (this installer must always install the daemon)"
+fi
+
 # Replacement policy: the version advertised by /api/install is the release of
 # record — an advertised PRERELEASE is installable, and a prerelease install may
 # move to a newer stable (or newer prerelease). The only refusal left is a
@@ -86,7 +149,7 @@ installed_version() {
   if [[ "$output" =~ (^|[^[:alnum:].+_-])v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?)([^[:alnum:].+-]|$) ]]; then
     version="${BASH_REMATCH[2]}"
   else
-    die "could not parse installed version at $binary; refusing to overwrite it"
+    die "could not parse a version from $binary; refusing to overwrite"
   fi
   INSTALLED_VERSION="$version"
 }
@@ -165,39 +228,74 @@ refuse_downgrade() {
 #
 #   kind=openllm-env-lock/v1 pid=<pid> start=<start identity> nonce=<hex>
 #
-# `start` is the owner's `ps -o lstart=` identity under LC_ALL=C TZ=UTC
-# with whitespace collapsed to single spaces — the same value the daemon's
-# `processStartIdentity` reads. It distinguishes a LIVE-but-reused pid from
-# the real owner (PID reuse). `-` records an owner that could not read its
-# own identity.
+# `start` is the owner's canonical start identity, the same value the
+# daemon's `processStartIdentity` reads: on Linux the boot-scoped
+# `boot:<boot_id>:<starttime ticks>` pair (built from
+# /proc/sys/kernel/random/boot_id and field 22 of /proc/<pid>/stat, parsed
+# after the last ') ' of the comm field); on macOS the `ps -o lstart=` text
+# under LC_ALL=C TZ=UTC, whitespace collapsed to single spaces. It
+# distinguishes a LIVE-but-reused pid from the real owner (PID reuse).
+# Records written by older builds can carry the `ps lstart` text — a
+# live-pid record in the other format is re-probed in the record's own
+# format before it can convict — or `-` (an owner that could not read its
+# own identity). `-` is never written by this build.
 #
 # A held lock is STALE only when its marked owner names a dead pid, or a
 # live pid whose current start identity differs. A dir with no, unreadable
-# or unmarked owner is HELD — the one exception is a dir older than the
-# stale window that still has no complete owner (a holder killed between
-# `mkdir` and publish), which may be reclaimed.
+# or unmarked owner is HELD — but only inside a short "unproven" bound
+# (OPENLLM_ENV_LOCK_ORPHAN_SECS, default 30 s): past it an ownerless dir
+# (a holder killed between `mkdir` and publish) is reclaimed. A marked
+# owner whose start is `-` can never be proven, so a live pid still holds
+# it for the full stale window — a transient probe failure on the owner's
+# side must never make a live lock reclaimable in seconds. The orphan bound
+# still caps the legacy `.env.lock` FILE — an unprovable identity must not
+# wedge the lock for the full stale window.
 #
-# Reclaim is an atomic `mv .lock.d .lock.stale.<pid>.<nonce>` — exactly one
-# contender wins the rename. The winner re-reads the owner INSIDE the
-# quarantine: if it turns out to be live after all it is moved back, but
-# only when `.lock.d` still does not exist (no-replace); otherwise it stays
-# quarantined. Acquisition is retried either way. Quarantine dirs older
-# than the stale window are swept when their contents are only `owner.tmp.*`
-# publish residue (or empty — the crash-between-mkdir-and-publish shape) or
-# a complete marked owner record.
+# Reclaim is MARK-FIRST. A contender that judges the dir stale drops a
+# `steal.<pid>.<nonce>` marker INSIDE it (noclobber create), re-judges the
+# SAME generation (inode match + the pre-mark mtime for the age term,
+# since the marker create already bumped it), and only then `mv`s it to
+# `.lock.stale.<pid>.<nonce>.<seq>`. The marker bridges the gap between the
+# re-check and the move: a paused publisher that commits its owner record
+# while a steal is in flight sees the marker (or the dir gone) and fails
+# its own publish rather than holding a quarantined dir — two holders can
+# never result. A steal that loses the rename (another contender moved
+# first) or fails its re-check just drops its marker. Quarantine dirs are
+# never moved back; a committed steal is final because publishers
+# self-detect it. Old quarantine dirs are swept when their contents are
+# only `owner.tmp.*`/`steal.*` residue (or empty) or a complete marked
+# owner record.
 #
-# Release is `mv .lock.d .lock.rel.<pid>.<nonce>` first, then the record's
-# nonce is verified before deleting — a holder whose lock was stolen or
-# replaced finds a successor's record and puts it back instead of deleting.
+# The publisher's veto is bound to the dir GENERATION, not the path: the
+# inode of the just-`mkdir`'d dir is captured at acquire and re-stat'd
+# after the record lands. A different inode — or a vanished dir — means
+# this generation was quarantined and the path re-taken by a successor, so
+# the publish drops its own record instead of writing into the
+# successor's dir. A fresh unmarked dir is immovable (never stale, and a
+# release only moves a dir that reads as its own), so the inode captured
+# right after `mkdir` can only be ours.
+#
+# Release first reads the owner AT the live path and moves `.lock.d` to
+# `.lock.rel.<pid>.<nonce>` ONLY when that record is marked with our nonce
+# — a foreign marked owner (a successor that re-took the path after our
+# dir was stolen) is never touched. The captured dir is then verified
+# inside the quarantine: our nonce means delete; a foreign record means
+# the path was swapped mid-move and the dir is put back NO-REPLACE — a
+# fresh `mkdir` plus a verbatim copy of its flat files. `mv` could
+# silently replace a successor's just-`mkdir`'d (still empty) dir that
+# landed in the check->move gap; `mkdir` fails outright and the captured
+# dir stays parked for the sweep instead.
 #
 # The pre-dir `.env.lock` FILE is still honoured for one release: HELD
-# while its recorded pid is alive or its content is unparseable. A dead-pid
-# record is reclaimed ONLY by atomic rename to a unique quarantine name —
-# the live path is never unlinked directly — then re-read there: a record
-# that turns out to be live is put back with a no-replace link, never over
-# a successor lock file.
+# only inside the bounded orphan window — while a recorded pid is alive or
+# its content is unparseable — and reclaimed past it even on a live pid.
+# A dead-pid record is reclaimed ONLY by atomic rename to a unique
+# quarantine name — the live path is never unlinked directly — then
+# re-read there: a record that turns out to be live AND young is put back
+# with a no-replace link, never over a successor lock file.
 ENV_LOCK_STALE_SECS="${OPENLLM_ENV_LOCK_STALE_SECS:-600}"
 ENV_LOCK_WAIT_SECS="${OPENLLM_ENV_LOCK_WAIT_SECS:-10}"
+ENV_LOCK_ORPHAN_SECS="${OPENLLM_ENV_LOCK_ORPHAN_SECS:-30}"
 # Same knob rule as the daemon: decimal digits AND > 0 — "0" or junk falls
 # back to the defaults, never a zero-length window. Leading zeros are
 # DECIMAL on the daemon side (Number("08") is 8) but invalid octal to
@@ -209,6 +307,9 @@ ENV_LOCK_STALE_SECS=$((10#$ENV_LOCK_STALE_SECS))
 [[ "$ENV_LOCK_WAIT_SECS" =~ ^[0-9]+$ ]] || ENV_LOCK_WAIT_SECS=0
 ENV_LOCK_WAIT_SECS=$((10#$ENV_LOCK_WAIT_SECS))
 [ "$ENV_LOCK_WAIT_SECS" -gt 0 ] || ENV_LOCK_WAIT_SECS=10
+[[ "$ENV_LOCK_ORPHAN_SECS" =~ ^[0-9]+$ ]] || ENV_LOCK_ORPHAN_SECS=0
+ENV_LOCK_ORPHAN_SECS=$((10#$ENV_LOCK_ORPHAN_SECS))
+[ "$ENV_LOCK_ORPHAN_SECS" -gt 0 ] || ENV_LOCK_ORPHAN_SECS=30
 ENV_LOCK_DIR=""
 ENV_LOCK_NONCE=""
 ENV_LOCK_QSEQ=0
@@ -222,19 +323,77 @@ env_lock_pid_alive() {
   # "08" is invalid octal to [[ -gt ]] but decimal pid 8 to the daemon's
   # Number() — validate digits, convert through 10#, compare in decimal [ ].
   [[ "$1" =~ ^[0-9]+$ ]] || return 1
-  local pid=$((10#$1))
+  local pid=$((10#$1)) stat state
+  if [ -r "/proc/$pid/stat" ]; then
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    stat="${stat##*) }"
+    read -r state _ <<< "$stat"
+    [ "$state" = "Z" ] && return 1
+  fi
   [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null
 }
 
 # `ps -o lstart=` under the fixed locale/timezone the daemon's
-# processStartIdentity uses, whitespace collapsed to single spaces.
-env_lock_start_identity() {
+# legacyProcessStartIdentity uses, whitespace collapsed to single spaces.
+# This is the identity format records written by OLDER builds carry — used
+# to re-probe a live pid in a record's own format before it can convict.
+env_lock_legacy_start_identity() {
   local out
   out="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || out=""
   out="$(printf '%s' "$out" | tr -s '[:space:]' ' ')"
   out="${out# }"
   out="${out% }"
   printf '%s' "$out"
+}
+
+# True when $1 is a post-RT-1 `boot:<boot_id>:<ticks>` start identity —
+# the same shape the daemon's BOOT_IDENTITY_RE accepts.
+env_lock_is_boot_identity() {
+  local re='^boot:[0-9a-f-]{36}:[0-9]+$'
+  [[ "$1" =~ $re ]]
+}
+
+# Collapse whitespace exactly like the daemon's normalizeProcessStartIdentity
+# (`value.trim().split(/\s+/).join(" ")`) so a padded legacy record still
+# compares equal.
+env_lock_normalize_identity() {
+  local out
+  out="$(printf '%s' "$1" | tr -s '[:space:]' ' ')"
+  out="${out# }"
+  out="${out% }"
+  printf '%s' "$out"
+}
+
+# The canonical start identity — the value the daemon's processStartIdentity
+# reads for the same pid. On Linux that is `boot:<boot_id>:<ticks>`: the
+# kernel boot id (both sides lowercased) plus /proc/<pid>/stat field 22 in
+# USER_HZ ticks — parsed AFTER the last ") " because comm can hold spaces or
+# a ')'. On macOS and other POSIX the `ps lstart` text above. Empty means
+# unknown or dead — never a guess.
+env_lock_start_identity() {
+  local pid="$1" boot stat rest ticks
+  if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    boot="$(printf '%s' "$boot" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    local re='^[0-9a-f-]{36}$'
+    [[ "$boot" =~ $re ]] || return 0
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    [ -n "$stat" ] || return 0
+    # Fields are numbered from the pid: dropping "<pid> (<comm>) " leaves
+    # field 3 as index 0 — the daemon reads starttime (field 22) as index
+    # 19. `${stat##*) }` cuts through the LAST ") " (comm can hold a ')');
+    # a stat with no ") " at all degrades to `slice(1)` exactly like the
+    # daemon's `lastIndexOf(") ")` fallback.
+    rest="${stat##*) }"
+    [ "$rest" = "$stat" ] && rest="${stat:1}"
+    local -a f
+    read -r -a f <<< "$rest"
+    ticks="${f[19]:-}"
+    [[ "$ticks" =~ ^[0-9]+$ && "$ticks" =~ [1-9] ]] || return 0
+    printf 'boot:%s:%s' "$boot" "$((10#$ticks))"
+    return 0
+  fi
+  env_lock_legacy_start_identity "$pid"
 }
 
 # Read <dir>/owner into ENV_LOCK_OWNER_{STATE,PID,START,NONCE}. STATE is
@@ -288,8 +447,9 @@ env_lock_read_owner() {
 }
 
 env_lock_dir_age_secs() {
-  local mtime now
-  mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)"
+  local mtime="${2:-}" now
+  [[ "$mtime" =~ ^[0-9]+$ ]] || \
+    mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)"
   now="$(date +%s 2>/dev/null || true)"
   if [[ "$mtime" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]]; then
     printf '%s\n' $((10#$now - 10#$mtime))
@@ -298,55 +458,114 @@ env_lock_dir_age_secs() {
   fi
 }
 
+# Inode of a path (no deref — `stat` only dereferences under -L on both
+# GNU and BSD, matching the daemon's lstatSync). The steal re-check uses
+# it to prove the dir it marked is the SAME generation the staleness
+# verdict was computed against.
+env_lock_path_ino() {
+  stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null || true
+}
+
 # The ONE staleness predicate — identical rules on the daemon side.
-# $1 = the lock dir (or a quarantined dir).
+# $1 = the lock dir (or a quarantined dir); $2 = optional PRE-CAPTURED dir
+# mtime used for the age terms (the steal re-check — our own `steal.*`
+# marker create already bumped the dir's mtime).
 env_lock_is_stale_dir() {
-  local dir="$1" current age
+  local dir="$1" as_of="${2:-}" current bridged recorded age
   env_lock_read_owner "$dir"
+  age="$(env_lock_dir_age_secs "$dir" "$as_of")"
   if [ "$ENV_LOCK_OWNER_STATE" = "marked" ]; then
     env_lock_pid_alive "$ENV_LOCK_OWNER_PID" || return 0
-    if [ "$ENV_LOCK_OWNER_START" = "-" ]; then
-      # The start identity can never be proven ("-"): the lock is held only
-      # inside the same bounded window an ownerless dir gets — past it a
-      # live-but-unidentifiable pid no longer wedges the lock.
-      age="$(env_lock_dir_age_secs "$dir")"
-      { [ "$age" -ge 0 ] && [ "$age" -ge "$ENV_LOCK_STALE_SECS" ]; }
-      return
+    # The daemon normalizes the recorded identity before comparing —
+    # same collapse here so a padded legacy record still matches.
+    recorded="$(env_lock_normalize_identity "$ENV_LOCK_OWNER_START")"
+    if [ "$recorded" = "-" ]; then
+      # An unproven identity is held. Only a fresh probe that proves the
+      # recorded owner is dead may make a marked lock stale.
+      return 1
     fi
     current="$(env_lock_start_identity "$ENV_LOCK_OWNER_PID")"
-    # PID reuse is proven ONLY by a live-but-different identity; anything
-    # unreadable keeps the lock held.
-    [ -n "$current" ] && [ "$current" != "$ENV_LOCK_OWNER_START" ]
-    return
+    if [ -z "$current" ]; then
+      # The probe could not answer: re-check liveness — a dead pid is
+      # stale, a live-but-unreadable identity stays held.
+      if env_lock_pid_alive "$ENV_LOCK_OWNER_PID"; then return 1; else return 0; fi
+    fi
+    [ "$current" = "$recorded" ] && return 1
+    # Same-format mismatch is proven PID reuse. A MIXED format pair is the
+    # boundary case (XS-1): a record written in the legacy `ps lstart`
+    # format by an older installer or daemon must be re-probed in its own
+    # format before a live pid can convict it.
+    env_lock_is_boot_identity "$current" || return 0
+    env_lock_is_boot_identity "$recorded" && return 0
+    bridged="$(env_lock_legacy_start_identity "$ENV_LOCK_OWNER_PID")"
+    if [ -z "$bridged" ]; then
+      if env_lock_pid_alive "$ENV_LOCK_OWNER_PID"; then return 1; else return 0; fi
+    fi
+    if [ "$bridged" = "$recorded" ]; then return 1; else return 0; fi
   fi
-  # Unmarked: HELD unless old AND still unclaimed — and never while a
-  # parseable pid inside it is still alive.
-  age="$(env_lock_dir_age_secs "$dir")"
-  { [ "$age" -ge 0 ] && [ "$age" -ge "$ENV_LOCK_STALE_SECS" ]; } || return 1
+  # Unmarked: HELD unless past the short unproven bound AND still without
+  # a complete owner — and never while a parseable pid in it is still
+  # alive.
+  { [ "$age" -ge 0 ] && [ "$age" -ge "$ENV_LOCK_ORPHAN_SECS" ]; } || return 1
   if [[ "$ENV_LOCK_OWNER_PID" =~ ^[0-9]+$ ]] && env_lock_pid_alive "$ENV_LOCK_OWNER_PID"; then
     return 1
   fi
   return 0
 }
 
-# Reclaim = `mv .lock.d .lock.stale.<pid>.<nonce>` — atomic; exactly one
-# contender wins the rename. A re-read owner that turns out to be live is
-# restored, but never over an existing `.lock.d` (no-replace).
-env_lock_quarantine() {
-  local lockdir="$1" stem="$2" q
-  q="$stem.stale.$$.$ENV_LOCK_NONCE"
-  mv "$lockdir" "$q" 2>/dev/null || return 0
-  env_lock_is_stale_dir "$q" && return 0
-  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
-    mv "$q" "$lockdir" 2>/dev/null || true
+# Reclaim an apparently-stale lock dir — MARK-FIRST. Drop a
+# `steal.<pid>.<nonce>` marker INSIDE the dir (noclobber create), re-judge
+# the SAME generation (inode match + the pre-mark mtime for the age term),
+# then `mv` it aside atomically — exactly one contender wins the rename.
+# The marker bridges check->move: a publisher that commits its owner record
+# while the steal is in flight sees the marker and fails its own publish,
+# so a committed steal can never leave two holders. A committed quarantine
+# is never moved back; the sweep removes it once it ages out.
+env_lock_steal() {
+  local lockdir="$1" stem="$2" marker q ino_before ino_after q_ino mtime before_owner after_owner
+  ino_before="$(env_lock_path_ino "$lockdir")"
+  mtime="$(stat -c %Y "$lockdir" 2>/dev/null || stat -f %m "$lockdir" 2>/dev/null || true)"
+  [ -n "$ino_before" ] || return 0  # vanished — the outer acquire retries
+  before_owner="$(cat "$lockdir/owner" 2>/dev/null || true)"
+  marker="$lockdir/steal.$$.$ENV_LOCK_NONCE"
+  # Do not put a marker in a successor that took this path.
+  [ "$(env_lock_path_ino "$lockdir")" = "$ino_before" ] || return 0
+  if ! (set -C; : > "$marker") 2>/dev/null; then
+    # A plain FILE at the lock path can never gain an owner record — park
+    # it like a stale dir. Anything else (dir vanished) retries at the top.
+    if [ -f "$lockdir" ]; then
+      ENV_LOCK_QSEQ=$((ENV_LOCK_QSEQ + 1))
+      mv "$lockdir" "$stem.stale.$$.$ENV_LOCK_NONCE.$ENV_LOCK_QSEQ" \
+        2>/dev/null || true
+    fi
+    return 0
   fi
+  ino_after="$(env_lock_path_ino "$lockdir")"
+  after_owner="$(cat "$lockdir/owner" 2>/dev/null || true)"
+  if [ -n "$ino_after" ] && [ "$ino_after" = "$ino_before" ] \
+    && [ "$after_owner" = "$before_owner" ] \
+    && env_lock_is_stale_dir "$lockdir" "$mtime"; then
+    ENV_LOCK_QSEQ=$((ENV_LOCK_QSEQ + 1))
+    q="$stem.stale.$$.$ENV_LOCK_NONCE.$ENV_LOCK_QSEQ"
+    if mv "$lockdir" "$q" 2>/dev/null; then
+      q_ino="$(env_lock_path_ino "$q")"
+      if [ "$q_ino" != "$ino_before" ]; then
+        # A moved path that no longer proves the marked generation is not
+        # ours to delete. Restore its contents no-replace, or leave the
+        # quarantine parked for bounded sweep.
+        env_lock_restore_dir "$q" "$lockdir"
+      fi
+      return 0  # committed — the marker (and dir) are parked with it
+    fi
+  fi
+  rm -f "$marker" 2>/dev/null || true
   return 0
 }
 
 # Delete old quarantine/release dirs whose contents are only `owner.tmp.*`
-# publish residue (or EMPTY — a holder killed between mkdir and publish,
-# then quarantined) or a complete marked owner record. Anything foreign is
-# kept.
+# publish residue or `steal.*` markers left by a steal committed
+# mid-publish (or EMPTY — a holder killed between mkdir and publish, then
+# quarantined) or a complete marked owner record. Anything foreign is kept.
 env_lock_sweep() {
   local stem="$1" entry child age ok has_owner
   for entry in "$stem".stale.* "$stem".rel.*; do
@@ -359,7 +578,7 @@ env_lock_sweep() {
       [ -e "$child" ] || continue
       case "${child##*/}" in
         owner) has_owner=1 ;;
-        owner.tmp.*) ;;
+        owner.tmp.*|steal.*) ;;
         *) ok=0 ;;
       esac
     done
@@ -390,11 +609,24 @@ env_lock_legacy_resolve() {
   read -r moved rest < "$q" 2>/dev/null || moved=""
   if [[ "$moved" =~ ^[0-9]+$ ]] && env_lock_pid_alive "$moved"; then
     age="$(env_lock_dir_age_secs "$q")"
-    if [ "$age" -lt 0 ] || [ "$age" -lt "$ENV_LOCK_STALE_SECS" ]; then
+    if [ "$age" -lt 0 ] || [ "$age" -lt "$ENV_LOCK_ORPHAN_SECS" ]; then
       if ln "$q" "$legacy" 2>/dev/null; then
         rm -f "$q" 2>/dev/null || true
-      elif (set -C; cat "$q" > "$legacy") 2>/dev/null; then
-        rm -f "$q" 2>/dev/null || true
+      elif (set -C; : > "$legacy") 2>/dev/null; then
+        # We claimed the name (noclobber create) — fill it and verify
+        # before consuming the captured record: a short write must not
+        # delete it. A mismatched file can only be OUR partial write —
+        # drop it and keep the quarantine for a later pass.
+        local l_sz q_sz
+        cat "$q" >> "$legacy" 2>/dev/null || true
+        l_sz="$(stat -c %s "$legacy" 2>/dev/null || stat -f %z "$legacy" 2>/dev/null || true)"
+        q_sz="$(stat -c %s "$q" 2>/dev/null || stat -f %z "$q" 2>/dev/null || true)"
+        if [ -n "$q_sz" ] && [ "$q_sz" = "$l_sz" ] \
+          && [ "$(cat "$legacy" 2>/dev/null)" = "$(cat "$q" 2>/dev/null)" ]; then
+          rm -f "$q" 2>/dev/null || true
+        else
+          rm -f "$legacy" 2>/dev/null || true
+        fi
       elif [ -e "$legacy" ] || [ -L "$legacy" ]; then
         # A successor holds the path — the captured copy is obsolete.
         rm -f "$q" 2>/dev/null || true
@@ -425,10 +657,10 @@ env_lock_legacy_held() {
     else
       # A live pid — or a record that cannot be parsed at all — can never
       # prove the owner's start identity, so the lock is held ONLY inside
-      # the bounded reclaim window (an unreadable age stays held); past it
+      # the bounded orphan window (an unreadable age stays held); past it
       # we reclaim below like any stale dir.
       age="$(env_lock_dir_age_secs "$legacy")"
-      if [ "$age" -lt 0 ] || [ "$age" -lt "$ENV_LOCK_STALE_SECS" ]; then
+      if [ "$age" -lt 0 ] || [ "$age" -lt "$ENV_LOCK_ORPHAN_SECS" ]; then
         return 0
       fi
     fi
@@ -449,20 +681,69 @@ env_lock_legacy_held() {
 # and its path re-taken by a successor, and `mv` would silently stamp over
 # the successor's record. `ln` fails outright on an existing owner; the
 # noclobber create carries the same guarantee where hardlinks do not work.
-# rc 0 = published AND the live record still carries OUR nonce (the dir may
-# be swapped even after a successful link — verify before believing the
-# lock is held); 1 = did not acquire, the caller retries from the top;
-# 2 = the tmp write itself failed, the caller drops its own dir.
+# $2 = the inode of the just-`mkdir`'d dir, captured at acquire — empty
+# means unknown and only the marker veto applies. rc 0 = published AND the
+# live record still carries OUR nonce (the dir may be swapped even after a
+# successful link — verify before believing the lock is held);
+# 1 = did not acquire, the caller retries from the top; 2 = the tmp write
+# itself failed, the caller drops its own dir.
 env_lock_publish_owner() {
-  local lockdir="$1" start
+  local lockdir="$1" want_ino="${2:-}" start stolen same_gen marker now_ino
+  for marker in "$lockdir"/steal.*; do
+    [ -e "$marker" ] && return 1
+  done
   start="$(env_lock_start_identity "$$")"
-  [ -n "$start" ] || start="-"
+  if [ -z "$start" ]; then
+    # A live owner MUST carry a provable start identity — `start=-` made a
+    # held lock reclaimable by a third writer while the owner was still
+    # alive (a transient probe failure used to be written as `-`). A failed
+    # probe publishes NOTHING: drop the dir WE made — only while it is
+    # still our generation — and report a retryable failure so the acquire
+    # loop re-probes from the top.
+    if [ -n "$want_ino" ] \
+      && [ "$(env_lock_path_ino "$lockdir")" = "$want_ino" ]; then
+      rmdir "$lockdir" 2>/dev/null || true
+    fi
+    return 1
+  fi
   printf 'kind=openllm-env-lock/v1 pid=%s start=%s nonce=%s\n' \
     "$$" "$start" "$ENV_LOCK_NONCE" > "$lockdir/owner.tmp.$$" 2>/dev/null \
     || return 2
   if ln "$lockdir/owner.tmp.$$" "$lockdir/owner" 2>/dev/null \
     || (set -C; cat "$lockdir/owner.tmp.$$" > "$lockdir/owner") 2>/dev/null; then
     rm -f "$lockdir/owner.tmp.$$" 2>/dev/null
+    # Generation + steal veto — checked AFTER our record lands: the dir at
+    # the path must still be the SAME generation we `mkdir`'d (inode match
+    # — a successor's dir carries no `steal.*` marker for OUR quarantined
+    # generation) AND hold no steal marker. stolen=1 means the hold is
+    # already lost: drop OUR record — only when it is still ours — and
+    # report failure; the caller retries acquisition from the top. An
+    # unknown want_ino falls back to the marker veto alone, exactly like
+    # the daemon (expectedIno undefined → same generation assumed).
+    stolen=1
+    same_gen=0
+    if [ -d "$lockdir" ]; then
+      now_ino="$(env_lock_path_ino "$lockdir")"
+      if [ -z "$want_ino" ] \
+        || { [ -n "$now_ino" ] && [ "$now_ino" = "$want_ino" ]; }; then
+        same_gen=1
+        stolen=0
+        for marker in "$lockdir"/steal.*; do
+          if [ -e "$marker" ]; then stolen=1; break; fi
+        done
+      fi
+    fi
+    if [ "$stolen" = 1 ]; then
+      env_lock_read_owner "$lockdir"
+      if [ "$ENV_LOCK_OWNER_STATE" = "marked" ] \
+        && [ "$ENV_LOCK_OWNER_NONCE" = "$ENV_LOCK_NONCE" ]; then
+        rm -f "$lockdir/owner" 2>/dev/null
+      fi
+      # Only OUR generation is ours to remove — a successor's dir at the
+      # same path is left for its real publisher.
+      [ "$same_gen" = 1 ] && rmdir "$lockdir" 2>/dev/null || true
+      return 1
+    fi
     env_lock_read_owner "$lockdir"
     [ "$ENV_LOCK_OWNER_STATE" = "marked" ] \
       && [ "$ENV_LOCK_OWNER_NONCE" = "$ENV_LOCK_NONCE" ]
@@ -476,7 +757,7 @@ env_lock_publish_owner() {
 # success sets ENV_LOCK_DIR + ENV_LOCK_NONCE (env_lock_release consumes
 # them) and returns 0.
 env_lock_acquire() {
-  local envfile="$1" stem lockdir deadline attempts pub_rc
+  local envfile="$1" stem lockdir deadline attempts pub_rc ino
   stem="$envfile.lock"
   lockdir="$stem.d"
   deadline=$((SECONDS + ENV_LOCK_WAIT_SECS))
@@ -488,16 +769,31 @@ env_lock_acquire() {
   while [ "$SECONDS" -lt "$deadline" ]; do
     if ! env_lock_legacy_held "$stem"; then
       if mkdir "$lockdir" 2>/dev/null; then
-        env_lock_publish_owner "$lockdir"
+        # Pin the generation we created so the publish veto detects a
+        # quarantine+path-reuse, not only an in-place steal marker. When
+        # the inode cannot be captured, publish NOTHING: a blind publish
+        # could stamp into a successor's claim. Remove this empty generation
+        # and retry immediately so the next attempt re-proves its own inode.
+        ino="$(env_lock_path_ino "$lockdir")"
+        if [ -z "$ino" ]; then
+          rmdir "$lockdir" 2>/dev/null || true
+          continue
+        fi
+        env_lock_publish_owner "$lockdir" "$ino"
         pub_rc=$?
         if [ "$pub_rc" = 0 ]; then
           ENV_LOCK_DIR="$lockdir"
           return 0
         elif [ "$pub_rc" = 2 ]; then
           # The tmp write failed — drop the dir WE made rather than hold it
-          # unmarked.
-          rm -f "$lockdir/owner.tmp.$$" 2>/dev/null
-          rmdir "$lockdir" 2>/dev/null || true
+          # unmarked, but ONLY while the path still proves OUR generation:
+          # an inode that no longer matches (or was never captured) means a
+          # successor may own this dir now — nothing inside it is ours to
+          # remove (identical guard in the daemon and CLI code).
+          if [ -n "$ino" ] && [ "$(env_lock_path_ino "$lockdir")" = "$ino" ]; then
+            rm -f "$lockdir/owner.tmp.$$" 2>/dev/null
+            rmdir "$lockdir" 2>/dev/null || true
+          fi
           return 1
         fi
         # pub_rc=1 — a successor owns the dir at this path (or it was
@@ -507,7 +803,7 @@ env_lock_acquire() {
       attempts=$((attempts + 1))
       [ $((attempts % 25)) -eq 0 ] && env_lock_sweep "$stem"
       if env_lock_is_stale_dir "$lockdir"; then
-        env_lock_quarantine "$lockdir" "$stem"
+        env_lock_steal "$lockdir" "$stem"
       fi
     fi
     sleep 0.01 2>/dev/null || sleep 1
@@ -515,24 +811,89 @@ env_lock_acquire() {
   return 1
 }
 
-# Release OUR lock: move `.lock.d` to `.lock.rel.<pid>.<nonce>` first, then
-# delete only when the owner record inside is provably ours — a stolen or
-# replaced lock holds a successor's record, which is put back (no-replace)
-# instead of deleted.
+# Restore a quarantined lock dir at the live path — NO-REPLACE. `mv` would
+# silently replace a successor's just-`mkdir`'d (still empty) dir that
+# landed in the check->move gap; `mkdir` is the atomic no-replace claim —
+# a re-taken path leaves the captured dir parked for the sweep. On a
+# successful claim each regular file is copied VERIFIED — a noclobber
+# create, then a byte-and-size compare against the source — and the
+# quarantined source is deleted only after EVERY copy lands whole: a
+# failed or partial copy rolls the fresh dir back to empty and keeps the
+# captured dir intact for a later pass — the only valid owner record is
+# never destroyed by an incomplete restore.
+env_lock_restore_dir() {
+  local rel="$1" lockdir="$2" child base dst ok=1 l_sz q_sz
+  # "$@" accumulates the basenames this pass copied — arbitrary foreign
+  # names (spaces, glob chars) cannot split or glob inside "$@".
+  set --
+  mkdir "$lockdir" 2>/dev/null || return 0
+  for child in "$rel"/*; do
+    [ -f "$child" ] || continue
+    base="${child##*/}"
+    dst="$lockdir/$base"
+    # Noclobber-claim the destination name FIRST (set -C create), then fill
+    # it — the claim distinguishes "a file THIS pass made" from a foreign
+    # entry that landed first, which is never removed below. The fill uses
+    # `>>` so a foreign swap can never be truncated by us.
+    if (set -C; : > "$dst") 2>/dev/null; then
+      cat "$child" >> "$dst" 2>/dev/null || true
+      l_sz="$(stat -c %s "$dst" 2>/dev/null || stat -f %z "$dst" 2>/dev/null || true)"
+      q_sz="$(stat -c %s "$child" 2>/dev/null || stat -f %z "$child" 2>/dev/null || true)"
+      if [ -n "$q_sz" ] && [ "$q_sz" = "$l_sz" ] \
+        && [ "$(cat "$child" 2>/dev/null)" = "$(cat "$dst" 2>/dev/null)" ]; then
+        set -- "$@" "$base"
+        continue
+      fi
+      # The copy failed or mis-verified: remove the file THIS pass made,
+      # then abort — the quarantined source is preserved for a later pass.
+      rm -f "$dst" 2>/dev/null || true
+    fi
+    ok=0
+    break
+  done
+  if [ "$ok" = 1 ]; then
+    # Flush the copied dir best-effort (no portable fsync exists in sh):
+    # `sync` covers the file payloads where it is available.
+    command -v sync >/dev/null 2>&1 && sync 2>/dev/null || true
+  else
+    # Roll the fresh dir back to its claimed-empty state — only the files
+    # this pass copied — then drop the dir itself.
+    for base in "$@"; do rm -f "$lockdir/$base" 2>/dev/null || true; done
+    rmdir "$lockdir" 2>/dev/null || true
+    return 0
+  fi
+  for base in "$@"; do rm -f "$rel/$base" 2>/dev/null || true; done
+  # Any entry that survived (non-regular or foreign residue) keeps the
+  # quarantine parked for the sweep instead of being lost.
+  rmdir "$rel" 2>/dev/null || true
+  return 0
+}
+
+# Release OUR lock: move `.lock.d` to `.lock.rel.<pid>.<nonce>` ONLY when
+# the record at the live path still reads as ours — a foreign marked owner
+# (a successor that re-took the path after our dir was stolen) is never
+# touched. The captured dir is then verified inside the quarantine: our
+# nonce means delete; a foreign record means the path was swapped mid-move
+# and the dir is restored NO-REPLACE (env_lock_restore_dir), never
+# `mv`'d over a successor's fresh dir.
 env_lock_release() {
   local lockdir="${ENV_LOCK_DIR:-}" stem rel
   [ -n "$lockdir" ] || return 0
   ENV_LOCK_DIR=""
   stem="${lockdir%.d}"
   rel="$stem.rel.$$.$ENV_LOCK_NONCE"
-  if mv "$lockdir" "$rel" 2>/dev/null; then
-    env_lock_read_owner "$rel"
-    if [ "$ENV_LOCK_OWNER_STATE" = "marked" ] && [ "$ENV_LOCK_OWNER_NONCE" = "$ENV_LOCK_NONCE" ]; then
-      local child
-      for child in "$rel"/*; do rm -f "$child" 2>/dev/null || true; done
-      rmdir "$rel" 2>/dev/null || true
-    elif [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
-      mv "$rel" "$lockdir" 2>/dev/null || true
+  env_lock_read_owner "$lockdir"
+  if [ "$ENV_LOCK_OWNER_STATE" = "marked" ] \
+    && [ "$ENV_LOCK_OWNER_NONCE" = "$ENV_LOCK_NONCE" ]; then
+    if mv "$lockdir" "$rel" 2>/dev/null; then
+      env_lock_read_owner "$rel"
+      if [ "$ENV_LOCK_OWNER_STATE" = "marked" ] && [ "$ENV_LOCK_OWNER_NONCE" = "$ENV_LOCK_NONCE" ]; then
+        local child
+        for child in "$rel"/*; do rm -f "$child" 2>/dev/null || true; done
+        rmdir "$rel" 2>/dev/null || true
+      else
+        env_lock_restore_dir "$rel" "$lockdir"
+      fi
     fi
   fi
   return 0
@@ -664,14 +1025,16 @@ case "$(uname -m)" in
 esac
 TARGET="${OS}-${ARCH}"
 
-has_command curl || die "curl is required"
-# --proto/--proto-redir need a curl new enough to know the options (≈7.21):
-# an older system curl fails the FIRST fetch with an opaque option error, so
-# detect support once and fail with the upgrade remedy up front.
-curl "${CURL_SCHEME[@]}" -V >/dev/null 2>&1 \
-  || die "this curl does not support --proto/--proto-redir — upgrade to curl 7.21.0 or newer and re-run"
+if [ -z "$FROM_FILE" ]; then
+  has_command curl || die "curl is required"
+  # --proto/--proto-redir need a curl new enough to know the options (≈7.21):
+  # an older system curl fails the FIRST fetch with an opaque option error, so
+  # detect support once and fail with the upgrade remedy up front.
+  curl "${CURL_SCHEME[@]}" -V >/dev/null 2>&1 \
+    || die "this curl does not support --proto/--proto-redir — upgrade to curl 7.21.0 or newer and re-run"
+fi
 # Checksum verification is mandatory — refuse rather than install unverified
-# bytes.
+# bytes (this is ALSO the --from-file integrity gate).
 if ! has_command shasum && ! has_command sha256sum; then
   die "shasum or sha256sum is required to verify the download"
 fi
@@ -692,28 +1055,32 @@ API_KEY=""
 # (allow-listed repo, well-formed digests, a published tag for this target) and
 # fails closed. Hitting it first means a mis-pinned or half-published release is
 # refused BEFORE we download anything. No query parameters.
-echo "Resolving the current OpenLLM release..."
-MANIFEST="$(curl "${CURL_SCHEME[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
-  || die "could not reach $ORIGIN/api/install — check OPENLLM_CLOUD_ORIGIN and your network"
+DAEMON_VERSION=""
+CLI_VERSION=""
+if [ -z "$FROM_FILE" ]; then
+  echo "Resolving the current OpenLLM release..."
+  MANIFEST="$(curl "${CURL_SCHEME[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
+    || die "could not reach $ORIGIN/api/install — check OPENLLM_CLOUD_ORIGIN and your network"
 
-# Extract one "key": "value" string field. The document is small, flat, and
-# machine-generated by us, so a scoped sed is enough — no jq dependency on a
-# fresh machine.
-json_field() {
-  printf '%s' "$MANIFEST" \
-    | tr -d '\n' \
-    | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
-}
+  # Extract one "key": "value" string field. The document is small, flat, and
+  # machine-generated by us, so a scoped sed is enough — no jq dependency on a
+  # fresh machine.
+  json_field() {
+    printf '%s' "$MANIFEST" \
+      | tr -d '\n' \
+      | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+  }
 
-DAEMON_VERSION="$(json_field daemon_version)"
-CLI_VERSION="$(json_field cli_version)"
-[ -n "$DAEMON_VERSION" ] || die "no daemon release is published yet"
-# Whatever /api/install advertises is the release of record — a PRERELEASE is
-# installable too (TCB-1/DR-1), and a prerelease install may move to a newer
-# stable. The only refusal is an actual DOWNGRADE of a managed component.
-refuse_downgrade "$BIN_DIR/openllmd" "$DAEMON_VERSION"
-refuse_downgrade "$BIN_DIR/openllm" "$CLI_VERSION"
-refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
+  DAEMON_VERSION="$(json_field daemon_version)"
+  CLI_VERSION="$(json_field cli_version)"
+  [ -n "$DAEMON_VERSION" ] || die "no daemon release is published yet"
+  # Whatever /api/install advertises is the release of record — a PRERELEASE is
+  # installable too (TCB-1/DR-1), and a prerelease install may move to a newer
+  # stable. The only refusal is an actual DOWNGRADE of a managed component.
+  refuse_downgrade "$BIN_DIR/openllmd" "$DAEMON_VERSION"
+  refuse_downgrade "$BIN_DIR/openllm" "$CLI_VERSION"
+  refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
+fi
 
 mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
 
@@ -723,24 +1090,40 @@ mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
 # the same pair the daemon's own self-update verifies against.
 install_component() {
   local name="$1" route="$2" version="$3"
+  local local_file="${4:-}" local_sha="${5:-}"
   local dest="$BIN_DIR/$name"
   local url="$ORIGIN/$route/$TARGET"
   local published installed stamp="$BIN_DIR/.$name.sha256.stamp"
 
-  published="$(curl "${CURL_SCHEME[@]}" -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
-  case "$published" in
-    [0-9a-f]*)
-      [[ "$published" =~ ^[0-9a-f]{64}$ ]] || die "malformed checksum for $name"
-      ;;
-    *) die "no published checksum for $name ($TARGET) — nothing to install" ;;
-  esac
+  if [ -n "$local_file" ]; then
+    # Private-prerelease path: the OPERATOR supplies both the bytes and the
+    # digest — no network fetch of either. The checksum covers the file as
+    # handed to us (a gzipped asset is decompressed after verification,
+    # exactly like the download path).
+    published="$(printf '%s' "$local_sha" | tr '[:upper:]' '[:lower:]')"
+    [[ "$published" =~ ^[0-9a-f]{64}$ ]] \
+      || die "malformed --sha256 digest for $name (expected 64 hex chars)"
+    [ -f "$local_file" ] && [ -r "$local_file" ] \
+      || die "--from-file path is not a readable regular file: $local_file"
+  else
+    published="$(curl "${CURL_SCHEME[@]}" -fsSL "$url.sha256" 2>/dev/null | cut -d' ' -f1 || true)"
+    case "$published" in
+      [0-9a-f]*)
+        [[ "$published" =~ ^[0-9a-f]{64}$ ]] || die "malformed checksum for $name"
+        ;;
+      *) die "no published checksum for $name ($TARGET) — nothing to install" ;;
+    esac
+  fi
 
   # Skip a tens-of-MB download when what's installed already matches.
   # Developer-ID-signed + notarized binaries keep their published digest on
   # disk (we no longer force ad-hoc re-sign when codesign --verify passes).
   # The stamp remains for the fallback ad-hoc path (unsigned/invalid) where
   # re-signing rewrites bytes after the published digest check.
-  if [ -x "$dest" ]; then
+  # NEVER in local mode: the operator's file must always be hashed and
+  # verified — a shortcut here would accept a wrong local file whenever the
+  # installed binary already carries the expected digest.
+  if [ -x "$dest" ] && [ -z "$local_file" ]; then
     installed="$(sha256_of "$dest" || true)"
     if [ -n "$installed" ]; then
       if [ "$installed" = "$published" ]; then
@@ -758,7 +1141,11 @@ install_component() {
     fi
   fi
 
-  echo "Downloading $name ${version:+$version }($TARGET)..."
+  if [ -n "$local_file" ]; then
+    echo "Installing $name from $local_file..."
+  else
+    echo "Downloading $name ${version:+$version }($TARGET)..."
+  fi
   # Stage inside $BIN_DIR: same filesystem as $dest (so the final mv is an
   # atomic rename, not a cross-device copy) and on the roomy root disk — minimal
   # cloud images mount a tiny RAM-backed /tmp where a download this size fails.
@@ -771,25 +1158,37 @@ install_component() {
   # exit on EVERY path, including a die here).
   (
     trap 'rm -f "$dl" "$bin"' EXIT
-    if [ -t 2 ]; then
+    local actual
+    if [ -n "$local_file" ]; then
+      cp "$local_file" "$dl" || die "could not stage local binary: $local_file"
+      # The operator's digest covers the FILE as supplied — verify BEFORE any
+      # decompression so the gate is on exactly the bytes they checksummed.
+      actual="$(sha256_of "$dl")"
+      [ -n "$actual" ] || die "could not hash $local_file"
+      if [ "$actual" != "$published" ]; then
+        die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+      fi
+    elif [ -t 2 ]; then
       curl "${CURL_SCHEME[@]}" -fL --progress-bar "$url" -o "$dl" || die "download failed: $url"
     else
       curl "${CURL_SCHEME[@]}" -fsSL "$url" -o "$dl" || die "download failed: $url"
     fi
 
     # Assets are gzipped; the pinned digest is over the DECOMPRESSED binary, so
-    # the integrity gate is independent of gzip's non-determinism.
+    # the integrity gate is independent of gzip's non-determinism. A local
+    # digest was already checked over the supplied file bytes.
     if gzip -t "$dl" >/dev/null 2>&1; then
       gzip -dc "$dl" > "$bin" || die "could not decompress $name"
     else
       mv "$dl" "$bin"
     fi
 
-    local actual
-    actual="$(sha256_of "$bin")"
-    [ -n "$actual" ] || die "could not hash the downloaded $name"
-    if [ "$actual" != "$published" ]; then
-      die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+    if [ -z "$local_file" ]; then
+      actual="$(sha256_of "$bin")"
+      [ -n "$actual" ] || die "could not hash the downloaded $name"
+      if [ "$actual" != "$published" ]; then
+        die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+      fi
     fi
 
     chmod 0755 "$bin"
@@ -809,12 +1208,20 @@ install_component() {
     fi
     # Re-probe immediately before replacement in case another installer or
     # operator changed the destination during the download — still only refusing
-    # a true downgrade (a newer installed build over the advertised one).
-    if installed_version "$dest"; then
+    # a true downgrade (a newer installed build over the advertised one). For a
+    # local file there is no advertised release: the staged binary's own
+    # reported version is the reference, so an older build still can't silently
+    # overwrite a newer install.
+    local check_version="$version"
+    if [ -n "$local_file" ]; then
+      installed_version "$bin"
+      check_version="$INSTALLED_VERSION"
+    fi
+    if [ -n "$check_version" ] && installed_version "$dest"; then
       installed="$INSTALLED_VERSION"
-      [ "$(semver_cmp "$installed" "$version")" != "1" ] \
-        || die "installed $name is $installed, newer than the advertised release $version — refusing to downgrade.
-  To force the advertised version, remove $dest and re-run this installer."
+      [ "$(semver_cmp "$installed" "$check_version")" != "1" ] \
+        || die "installed $name is $installed, newer than the install target $check_version — refusing to downgrade.
+  To force this version, remove $dest and re-run this installer."
     fi
     mv -f "$bin" "$dest"
   ) || exit 1
@@ -822,13 +1229,17 @@ install_component() {
   INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
 }
 
-install_component openllmd api/daemon/binary "$DAEMON_VERSION"
+install_component openllmd api/daemon/binary "$DAEMON_VERSION" "$FROM_FILE" "$FROM_SHA"
 # The CLI rides the same install: one command gets you both, and the daemon's
 # auto-update loop keeps them both current from here on.
-if [ -n "$CLI_VERSION" ]; then
+if [ -n "$CLI_FROM_FILE" ]; then
+  install_component openllm api/cli/binary "$CLI_VERSION" "$CLI_FROM_FILE" "$CLI_SHA"
+elif [ -n "$CLI_VERSION" ]; then
   install_component openllm api/cli/binary "$CLI_VERSION"
-else
+elif [ -z "$FROM_FILE" ]; then
   echo "  note: no CLI release published yet — skipping openllm"
+else
+  echo "  note: no --cli-from-file given — leaving any installed CLI untouched"
 fi
 
 # The native PTY backend is compiled into the daemon binary in v2.8 (G1), so
@@ -848,17 +1259,39 @@ read_env_value() {
 }
 
 write_env_file() {
+  # IMPORTANT — this function runs inside `$(...)` command substitution,
+  # where `set -e` DOES NOT APPLY: a failing command does not abort the
+  # subshell. EVERY fallible step below is therefore guarded explicitly with
+  # `|| die`. A half-written tmp must never reach the rename — a full disk
+  # otherwise drops the API key / device id while the installer exits 0.
+  #
   # The lock is the `<envfile>.lock.d` DIRECTORY of the shared
   # openllm-env-lock/v1 protocol above — the same protocol the daemon's
   # withEnvFileLock (packages/daemon/src/env.ts) and the CLI installer
   # implement, so a crashed holder is recovered (dead or reused pid owner,
-  # or a >10-min ownerless publish) instead of wedging every later install
-  # on "could not acquire config lock" — while a live holder's lock can
-  # never be stolen or deleted mid-write.
+  # or an ownerless publish past the orphan bound) instead of wedging every
+  # later install on "could not acquire config lock" — while a live
+  # holder's lock can never be stolen or deleted mid-write.
+  local current_key current_device current_pty desired_key desired_pty tmp line key
+  # An existing-but-unreadable env file would silently drop every preserved
+  # key — fail loudly instead of merging against an empty read. Checked BEFORE
+  # the lock: a die here must not strand a lock dir the EXIT trap isn't
+  # installed yet to release.
+  [ ! -f "$ENV_FILE" ] || [ -r "$ENV_FILE" ] \
+    || die "cannot read existing config file: $ENV_FILE"
   env_lock_acquire "$ENV_FILE" \
     || die "could not acquire config lock: $ENV_FILE.lock.d (remove it manually if no installer or daemon is running)"
+  # Any exit while the lock is held — die, a set -e failure, Ctrl-C, SIGTERM —
+  # must release the lock AND remove the temp file (it may carry the API key).
+  # A RETURN trap never fires on exit, so cleanup lives on EXIT/INT/TERM.
+  # env_lock_release deletes only a dir that still holds OUR owner record.
+  # `${tmp:-}`: at a normal function return the locals are already out of
+  # scope when this subshell's EXIT trap fires — an unbound $tmp under
+  # set -u would abort the trap before env_lock_release ran.
+  trap 'rm -f "${tmp:-}"; env_lock_release' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  local current_key current_device current_pty desired_key desired_pty tmp line key
   current_key="$(trim_whitespace "$(read_env_value OPENLLM_API_KEY || true)")"
   current_device="$(read_env_value OPENLLM_DEVICE_ID || true)"
   current_pty="$(read_env_value OPENLLM_DAEMON_PTY_SESSIONS || true)"
@@ -878,23 +1311,13 @@ write_env_file() {
   esac
 
   tmp="$ENV_FILE.tmp.$$"
-  # Any exit while the lock is held — die, a set -e failure, Ctrl-C, SIGTERM —
-  # must release the lock AND remove the temp file (it may carry the API key).
-  # A RETURN trap never fires on exit, so cleanup lives on EXIT/INT/TERM.
-  # env_lock_release deletes only a dir that still holds OUR owner record.
-  # `${tmp:-}`: at a normal function return the locals are already out of
-  # scope when this subshell's EXIT trap fires — an unbound $tmp under
-  # set -u would abort the trap before env_lock_release ran.
-  trap 'rm -f "${tmp:-}"; env_lock_release' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
   # Tighten umask only for the temp-file creation window (closing the race
   # before `chmod 0600`), then restore it so later installer steps and child
   # processes keep the caller's umask.
   local saved_umask
-  saved_umask="$(umask)"
-  umask 077
-  : > "$tmp"
+  saved_umask="$(umask)" || die "could not read the umask"
+  umask 077 || die "could not tighten the umask"
+  : > "$tmp" || die "could not create temp config file: $tmp"
   # Keep unrelated lines byte-for-byte, but replace every installer-owned key with
   # one canonical occurrence. An ignored invalid persisted key is therefore removed.
   local wrote_origin=0 wrote_port=0 wrote_key=0 wrote_device=0 wrote_pty=0
@@ -903,39 +1326,39 @@ write_env_file() {
       key="${line%%=*}"
       case "$key" in
         OPENLLM_CLOUD_ORIGIN)
-          [ "$wrote_origin" = 1 ] || { printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp"; wrote_origin=1; }
+          [ "$wrote_origin" = 1 ] || { printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp" || die "write failed: $tmp"; wrote_origin=1; }
           ;;
         OPENLLM_DAEMON_PORT)
-          [ "$wrote_port" = 1 ] || { printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp"; wrote_port=1; }
+          [ "$wrote_port" = 1 ] || { printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp" || die "write failed: $tmp"; wrote_port=1; }
           ;;
         OPENLLM_API_KEY)
-          if [ -n "$desired_key" ] && [ "$wrote_key" = 0 ]; then printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp"; wrote_key=1; fi
+          if [ -n "$desired_key" ] && [ "$wrote_key" = 0 ]; then printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp" || die "write failed: $tmp"; wrote_key=1; fi
           ;;
         OPENLLM_DEVICE_ID)
-          if [ -n "$current_device" ] && [ "$wrote_device" = 0 ]; then printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"; wrote_device=1; fi
+          if [ -n "$current_device" ] && [ "$wrote_device" = 0 ]; then printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp" || die "write failed: $tmp"; wrote_device=1; fi
           ;;
         OPENLLM_DAEMON_PTY_SESSIONS)
-          if [ -n "$desired_pty" ] && [ "$wrote_pty" = 0 ]; then printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"; wrote_pty=1; fi
+          if [ -n "$desired_pty" ] && [ "$wrote_pty" = 0 ]; then printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp" || die "write failed: $tmp"; wrote_pty=1; fi
           ;;
-        *) printf '%s\n' "$line" >> "$tmp" ;;
+        *) printf '%s\n' "$line" >> "$tmp" || die "write failed: $tmp" ;;
       esac
-    done < "$ENV_FILE"
+    done < "$ENV_FILE" || die "could not read config file: $ENV_FILE"
   fi
-  [ "$wrote_origin" = 1 ] || printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp"
-  [ "$wrote_port" = 1 ] || printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp"
-  [ -z "$desired_key" ] || [ "$wrote_key" = 1 ] || printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp"
-  [ -z "$current_device" ] || [ "$wrote_device" = 1 ] || printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp"
-  [ -z "$desired_pty" ] || [ "$wrote_pty" = 1 ] || printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp"
-  chmod 0600 "$tmp"
+  [ "$wrote_origin" = 1 ] || printf 'OPENLLM_CLOUD_ORIGIN=%s\n' "$ORIGIN" >> "$tmp" || die "write failed: $tmp"
+  [ "$wrote_port" = 1 ] || printf 'OPENLLM_DAEMON_PORT=%s\n' "$DAEMON_PORT" >> "$tmp" || die "write failed: $tmp"
+  [ -z "$desired_key" ] || [ "$wrote_key" = 1 ] || printf 'OPENLLM_API_KEY=%s\n' "$desired_key" >> "$tmp" || die "write failed: $tmp"
+  [ -z "$current_device" ] || [ "$wrote_device" = 1 ] || printf 'OPENLLM_DEVICE_ID=%s\n' "$current_device" >> "$tmp" || die "write failed: $tmp"
+  [ -z "$desired_pty" ] || [ "$wrote_pty" = 1 ] || printf 'OPENLLM_DAEMON_PTY_SESSIONS=%s\n' "$desired_pty" >> "$tmp" || die "write failed: $tmp"
+  chmod 0600 "$tmp" || die "could not chmod temp config file: $tmp"
   # Abort with a clear error if the atomic replace fails — never fall through to
   # announce success (or set API_KEY) on a config that was not written. The
   # EXIT trap still cleans up the temp file + lock on that die.
   mv -f "$tmp" "$ENV_FILE" || die "could not write config file: $ENV_FILE"
-  chmod 0600 "$ENV_FILE"
-  umask "$saved_umask"
+  chmod 0600 "$ENV_FILE" || die "could not chmod config file: $ENV_FILE"
+  umask "$saved_umask" || die "could not restore the umask"
   env_lock_release
   # The ONLY stdout line: the resolved key — the caller captures it as API_KEY.
-  printf '%s' "$desired_key"
+  printf '%s' "$desired_key" || die "could not report the API key"
 }
 
 # The whole write runs inside command substitution: the EXIT/INT/TERM traps
@@ -1174,16 +1597,22 @@ provision_clis() {
   local job_body
   job_body="$(cat <<'OPENLLM_VENDOR_JOB'
 pidfile="$1"; timeout_bin="$2"; job_timeout="$3"; curl_bin="$4"; url="$5"; setsid_bin="$6"; launchfile="$7"
-# The pidfile holds "<job leader pid> <start identity>" so a re-run can tell
-# a live job from a stale — or PID-REUSED — owner (same lstart identity the
-# env-file lock uses). It is published ATOMICALLY (temp + no-replace ln) only now that
-# the job's real identity is known — the parent's fresh launch marker covers
-# the spawn-to-publish gap, so a second installer sees "launch in progress"
-# rather than a dead placeholder. The marker is dropped once the pidfile is
-# up; the pidfile itself is removed only after the whole process group is
-# CONFIRMED gone (the EXIT trap below re-probes after the reap poll — and
-# NEVER when the pgid is unknown, e.g. the timeout branch or a ps failure:
-# an unverifiable group leaves the pid+start record for a re-run to reap).
+# The lock is `$pidfile.d/` — a directory mutex holding an `owner` record of
+# "<job pid> <start identity>" so a re-run can tell a live job from a stale
+# or PID-REUSED owner (the legacy `ps lstart` identity format — see below;
+# NOT the env-lock boot-scoped format). The record is published ATOMICALLY
+# (temp + no-replace ln inside the dir our `mkdir` created, verified against
+# that generation's inode) only now that the job's real identity is known —
+# the parent's fresh launch marker covers the spawn-to-publish gap, so a
+# second installer sees "launch in progress" rather than a dead placeholder.
+# The marker is dropped once the owner record is up; the record itself is
+# removed only after the whole process group is CONFIRMED gone (the EXIT
+# trap below re-probes after the reap poll). When no group was observed, the
+# leader pid is the fallback liveness check.
+# The start identity uses the `ps lstart` format deliberately: this job body
+# is a standalone `bash -c` that cannot reach the lock block's boot-scoped
+# reader, and the records are internal to this installer — never compared
+# against env-lock `owner` records.
 job_start="$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ 2>/dev/null | tr -s '[:space:]' ' ')"
 job_start="${job_start# }"; job_start="${job_start% }"
 # "<pid> <start>" record → live? (pid alive and, when both are known, the
@@ -1198,53 +1627,230 @@ job_owner_live() {
   [ -z "$now" ] || [ "$now" = "$s" ]
 }
 myrec="$$ ${job_start:--}"
-pidtmp="$pidfile.tmp.$$"
 published=0
-# The pidfile IS the mutex: publish it NO-REPLACE (`ln` never overwrites), so
-# a job paused before publishing can never stamp over a successor's live
-# record. A dead leftover is moved aside, re-read (it must still be the record
-# judged dead — otherwise a live owner published in between and it goes
-# straight back, no-replace), then deleted and the link retried.
-if printf '%s\n' "$myrec" > "$pidtmp" 2>/dev/null; then
-  for _try in 1 2 3; do
-    if ln "$pidtmp" "$pidfile" 2>/dev/null; then published=1; break; fi
-    seen="$(cat "$pidfile" 2>/dev/null || true)"
-    [ -n "$seen" ] || continue
-    job_owner_live "$seen" && break
-    q="$pidfile.tmp.$$.s$_try"
-    mv "$pidfile" "$q" 2>/dev/null || continue
-    if [ "$(cat "$q" 2>/dev/null || true)" != "$seen" ]; then
-      ln "$q" "$pidfile" 2>/dev/null || true
-      rm -f "$q" 2>/dev/null || true
+# The pidfile lock is a DIRECTORY mutex — the same shape the shared env-lock
+# block uses for `.env.lock.d`: claimed by atomic `mkdir`, owned through a
+# tmp+`ln` no-replace `owner` record inside, and bound to OUR generation by
+# the inode captured right after `mkdir`. A record travels WITH its dir, so
+# a steal's quarantine `mv` can never orphan a live record at the name the
+# way `mv pidfile q` did (a third racer publishing into the freed name once
+# produced two owners — the restore then either stamped the winner or, when
+# the name was re-taken, deleted the live record outright).
+lockd="$pidfile.d"
+ownerfile="$lockd/owner"
+job_dir_ino() {
+  stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null || true
+}
+job_dir_age() {
+  local m
+  m="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0)"
+  [ -n "$m" ] && [ "$m" -gt 0 ] 2>/dev/null || { echo 999999; return; }
+  echo $(( $(date +%s 2>/dev/null || echo 0) - m ))
+}
+# Re-adopt parked quarantine dirs first: a LIVE recorded owner is restored
+# no-replace when the name is free (its owner may still hold the lock); a
+# dead or unreadable dir is residue — swept whole, never partly deleted.
+for parked in "$pidfile".parked-*; do
+  [ -d "$parked" ] || continue
+  if ! prec="$(cat "$parked/owner" 2>/dev/null)"; then
+    printf 'vendor lock recovery: cannot read %s; keeping the parked lock and not starting a second job\n' \
+      "$parked/owner" >&2
+    exit 0
+  fi
+  if [ -z "$prec" ]; then
+    printf 'vendor lock recovery: empty %s; keeping the parked lock and not starting a second job\n' \
+      "$parked/owner" >&2
+    exit 0
+  fi
+  if job_owner_live "$prec"; then
+    if ! mkdir "$lockd" 2>/dev/null; then
+      printf 'vendor lock recovery: live parked owner cannot reclaim %s; not starting a second job\n' \
+        "$parked" >&2
+      exit 0
+    fi
+    parked_lock_ino="$(job_dir_ino "$lockd")"
+    if [ -z "$parked_lock_ino" ]; then
+      printf 'vendor lock recovery: cannot prove the new lock inode for %s; keeping the parked lock\n' \
+        "$parked" >&2
+      exit 0
+    fi
+    if
+      cat "$parked/owner" > "$lockd/owner.tmp.$$" 2>/dev/null \
+        && [ -s "$lockd/owner.tmp.$$" ] \
+        && [ "$(cat "$lockd/owner.tmp.$$" 2>/dev/null || true)" = "$prec" ] \
+        && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
+          || (set -C; cat "$lockd/owner.tmp.$$" > "$ownerfile") 2>/dev/null; } \
+        && [ -s "$ownerfile" ] \
+        && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$prec" ]
+    then
+      rm -rf "$parked" 2>/dev/null || true
+      rm -f "$lockd/owner.tmp.$$" 2>/dev/null
+    else
+      rm -f "$lockd/owner.tmp.$$" 2>/dev/null || true
+      if [ "$(job_dir_ino "$lockd")" = "$parked_lock_ino" ]; then
+        rmdir "$lockd" 2>/dev/null || true
+      fi
+      printf 'vendor lock recovery: could not restore %s; keeping the parked lock and not starting a second job\n' \
+        "$parked" >&2
+      exit 0
+    fi
+    continue
+  fi
+  rm -rf "$parked" 2>/dev/null || true
+done
+# A legacy `<cmd>.pid` FILE record (written by an older installer's file
+# mutex) is honored too: a live legacy owner still defers — the dir mutex
+# alone can never see it.
+if [ -f "$pidfile" ]; then
+  leg="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$leg" ] && job_owner_live "$leg" && exit 0
+fi
+for _try in 1 2 3; do
+  if mkdir "$lockd" 2>/dev/null; then
+    # Pin the generation we created: the post-publish verify detects a
+    # steal + successor-re-claim swap (identical inode guard to the
+    # env-lock's expectedIno). When the inode cannot be captured, publish
+    # NOTHING and remove NOTHING — a blind record could stamp into a
+    # successor's claim, and an unproven dir is never ours to rmdir.
+    lock_ino="$(job_dir_ino "$lockd")"
+    if [ -z "$lock_ino" ]; then
+      printf 'vendor lock: cannot prove the new lock inode for %s; leaving it empty\n' \
+        "$lockd" >&2
+      exit 0
+    fi
+    if printf '%s\n' "$myrec" > "$lockd/owner.tmp.$$" 2>/dev/null \
+      && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
+        || (set -C; cat "$lockd/owner.tmp.$$" > "$ownerfile") 2>/dev/null; }
+    then
+      rm -f "$lockd/owner.tmp.$$" 2>/dev/null
+      # The dir at the name must still be OUR generation AND carry OUR
+      # record — a swap mid-publish means a successor owns this claim.
+      now_ino="$(job_dir_ino "$lockd")"
+      if [ -n "$now_ino" ] && [ "$now_ino" = "$lock_ino" ] \
+        && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
+        published=1
+      elif [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
+        # A stray record of ours wherever it landed is still ours to drop —
+        # it would only make a successor's fresh claim look owned.
+        rm -f "$ownerfile" 2>/dev/null || true
+      fi
       break
     fi
-    rm -f "$q" 2>/dev/null || true
-  done
-fi
-rm -f "$pidtmp" "$launchfile" 2>/dev/null || true
+    rm -f "$lockd/owner.tmp.$$" 2>/dev/null
+    # The tmp write itself failed — drop the dir WE made, only while the
+    # inode still proves OUR generation (a swapped dir is a successor's).
+    now_ino="$(job_dir_ino "$lockd")"
+    if [ -n "$now_ino" ] && [ "$now_ino" = "$lock_ino" ]; then
+      rmdir "$lockd" 2>/dev/null || true
+    fi
+    break
+  fi
+  # The name is held — judge the record inside.
+  owner="$(cat "$ownerfile" 2>/dev/null || true)"
+  if [ -n "$owner" ]; then
+    job_owner_live "$owner" && break
+    judged="$owner"
+  else
+    # Ownerless dir: a publisher may be mid-write — wait briefly and retry,
+    # unless it is already older than the publish grace (a crashed
+    # publisher's residue — reclaimable like a dead record).
+    if [ "$(job_dir_age "$lockd")" -lt 30 ]; then
+      sleep 0.05 2>/dev/null || sleep 1
+      continue
+    fi
+    judged=""
+  fi
+  # STALE (dead owner, or aged ownerless): mark OUR steal inside the dir,
+  # re-verify the SAME generation still holds the SAME record, then `mv`
+  # the whole dir aside — the first marker+bound `mv` wins. The generation
+  # pin means a swap between our `cat` and `mv` can never hand us a
+  # foreign live dir blindly: the quarantine re-judge below restores it.
+  ino="$(job_dir_ino "$lockd")"
+  [ -n "$ino" ] || continue
+  ( set -C; : > "$lockd/steal.$$.$_try" ) 2>/dev/null || continue
+  now_ino="$(job_dir_ino "$lockd")"
+  owner2="$(cat "$ownerfile" 2>/dev/null || true)"
+  [ "$now_ino" = "$ino" ] && [ "$owner2" = "$judged" ] || continue
+  q="$pidfile.parked-$$.$_try"
+  if mv "$lockd" "$q" 2>/dev/null; then
+    # What we grabbed must still be the generation we marked — a swap in
+    # the check→`mv` window hands us a foreign dir. Restore it atomically:
+    # `mv` back lands whole onto a free name (or replaces a successor's
+    # still-empty claim, whose own inode pin then vetoes it); on a
+    # published dir the rename fails and the dir stays PARKED for the
+    # re-adopt sweep. A foreign dir is never deleted.
+    qino="$(job_dir_ino "$q")"
+    qowner="$(cat "$q/owner" 2>/dev/null || true)"
+    if [ "$qino" != "$ino" ] || [ "$qowner" != "$judged" ] \
+      || { [ -n "$qowner" ] && job_owner_live "$qowner"; }; then
+      # Never hand a foreign dir back carrying steal markers.
+      rm -f "$q"/steal.* 2>/dev/null || true
+      mv "$q" "$lockd" 2>/dev/null || true
+    else
+      rm -rf "$q" 2>/dev/null || true
+    fi
+  else
+    rm -f "$lockd/steal.$$.$_try" 2>/dev/null || true
+  fi
+done
+rm -f "$lockd/owner.tmp.$$" "$launchfile" 2>/dev/null || true
 # Not published → another live job owns this vendor install. Never run a
 # duplicate.
 [ "$published" = 1 ] || exit 0
 # The pidfile is removed only when it is still OURS and the process group is
-# CONFIRMED gone — never when the pgid is unknown (timeout branch, ps
-# failure): an unverifiable group leaves the pid+start record for a re-run.
-trap 'if [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null \
-  && [ "$(cat "$pidfile" 2>/dev/null || true)" = "$myrec" ]; then
-  rm -f "$pidfile" 2>/dev/null || true
+# gone. If no group was observed, probe the leader pid instead.
+# `group_confirmed_gone` covers the set -m path where the leader died before
+# `ps` could report AND its whole group is already empty: that shape is
+# proven dead too, so the pidfile must not linger.
+group_confirmed_gone=0
+trap 'if { { [ "${group_observed:-0}" = 1 ] && [ -n "${pgid:-}" ] \
+  && ! kill -0 -- -"$pgid" 2>/dev/null; } \
+  || { [ "${group_observed:-0}" != 1 ] && [ -n "${leader_pid:-}" ] \
+  && ! kill -0 "$leader_pid" 2>/dev/null; } \
+  || [ "$group_confirmed_gone" = 1 ]; } \
+  && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
+  rm -f "$ownerfile" 2>/dev/null || true
+  rmdir "$lockd" 2>/dev/null || true
 fi' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
+group_observed=0
+leader_pid=""
 if [ -n "$timeout_bin" ]; then
-  # GNU timeout runs the command as its own process-group leader and signals
-  # the GROUP — the `bash -c` wrapper AND the curl|bash pipeline it spawns —
-  # when the deadline hits.
-  "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url"
+  # GNU timeout usually leads its own process group, but do not assume that.
+  # Observe the group before and after waiting. If it was never visible, use
+  # the timeout leader's liveness instead of treating an empty probe as proof.
+  "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url" &
+  twait=$!
+  leader_pid="$twait"
+  if kill -0 -- -"$twait" 2>/dev/null \
+    || [ "$(ps -o pgid= -p "$twait" 2>/dev/null | tr -d ' ')" = "$twait" ]; then
+    pgid="$twait"
+    group_observed=1
+  fi
+  wait "$twait" 2>/dev/null || true
+  if [ "$group_observed" != 1 ] && kill -0 -- -"$twait" 2>/dev/null; then
+    pgid="$twait"
+    group_observed=1
+  fi
+  if [ "$group_observed" = 1 ] && kill -0 -- -"$pgid" 2>/dev/null; then
+    kill -TERM -- -"$pgid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- -"$pgid" 2>/dev/null || true
+  elif [ "$group_observed" != 1 ] && ! kill -0 "$leader_pid" 2>/dev/null; then
+    group_confirmed_gone=1
+  fi
 elif [ -n "$setsid_bin" ]; then
   # setsid(1) starts the pipeline as its own session + process-group leader,
   # so the leader pid IS the pgid — `$!` after the pipeline would NOT be it.
   "$setsid_bin" bash -c "$pipeline" "$curl_bin" "$url" &
   leader=$!
+  leader_pid="$leader"
   pgid="$leader"
+  if kill -0 -- -"$pgid" 2>/dev/null \
+    || [ "$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" = "$pgid" ]; then
+    group_observed=1
+  fi
   # The deadline watchdog. Its sleeps run as NAMED children under a TERM
   # trap — `kill "$watchdog"` below then stands the whole watchdog down
   # cleanly; a plain `( sleep …; kill …)` subshell would orphan its
@@ -1271,6 +1877,7 @@ elif [ -n "$setsid_bin" ]; then
   # the GROUP alive (and the log pipe open). Finish a surviving group here
   # too, or the watchdog's pending KILL is stood down with nothing sent.
   if kill -0 -- -"$pgid" 2>/dev/null; then
+    group_observed=1
     kill -TERM -- -"$pgid" 2>/dev/null || true
     sleep 1
     kill -KILL -- -"$pgid" 2>/dev/null || true
@@ -1284,6 +1891,7 @@ else
   set -m
   bash -c "$pipeline" "$curl_bin" "$url" &
   leader=$!
+  leader_pid="$leader"
   pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')"
   [[ "$pgid" =~ ^[0-9]+$ ]] || pgid=""
   # Under `set -m` a background job leads its own group, so its pgid is the
@@ -1292,6 +1900,14 @@ else
   # pipeline is still signalled and reaped as one group.
   if [ -z "$pgid" ] && kill -0 -- -"$leader" 2>/dev/null; then
     pgid="$leader"
+  fi
+  [ -n "$pgid" ] && group_observed=1
+  # Leader already dead AND no group with that id — the tree is PROVEN gone
+  # (a dead leader with surviving children would still answer the group
+  # probe). The EXIT trap can then drop the pidfile instead of leaving a
+  # dead record a re-run has to reap.
+  if [ -z "$pgid" ] && ! kill -0 "$leader" 2>/dev/null; then
+    group_confirmed_gone=1
   fi
   # Still unverified: signal the leader alone and leave pgid empty, so the
   # EXIT trap keeps the pidfile (the group cannot be confirmed gone).
@@ -1339,7 +1955,10 @@ OPENLLM_VENDOR_JOB
 )"
   local job_dir="$OPENLLM_DIR/cli-install"
   local spec name cmd dest url pidfile job_log launchfile launch_age in_progress owner owner_pid owner_start owner_live owner_start_now self_start
-  self_start="$(env_lock_start_identity "$$")"
+  # The vendor pidfile/launchfile records use the legacy `ps lstart` format
+  # — the detached job body writes its own record with inline `ps`, so the
+  # comparisons below must probe in that same format.
+  self_start="$(env_lock_legacy_start_identity "$$")"
   [ -n "$self_start" ] || self_start="-"
   # Publish residue: a job SIGKILLed between the pidfile tmp write and the
   # mv leaves `<cmd>.pid.tmp.<pid>` behind — bounded growth across repeated
@@ -1389,13 +2008,17 @@ OPENLLM_VENDOR_JOB
     launchfile="$job_dir/$cmd.launch"
     # Duplicate suppression across re-runs (LEAK-3). Two artifacts, never a
     # parent-written placeholder pidfile: the LAUNCH marker is created
-    # O_EXCL here before the job is spawned, and the JOB publishes the
-    # pidfile itself (temp + no-replace ln) once its real "<pid> <start identity>" is
-    # known. A live pidfile owner (PID-reuse-safe via the same lstart check
-    # as the env-file lock) or a launch marker with a LIVE launcher means
-    # "in progress" — covering the spawn-to-publish gap where the first
-    # installer may already have exited; stale leftovers are reclaimed.
-    owner="$(cat "$pidfile" 2>/dev/null || true)"
+    # O_EXCL here before the job is spawned, and the JOB publishes its owner
+    # record inside the `$pidfile.d` directory mutex (tmp + no-replace ln,
+    # bound to the mkdir'd generation) once its real "<pid> <start identity>"
+    # is known. A live owner (PID-reuse-safe via the recorded lstart
+    # identity vs a fresh lstart probe) or a launch marker with a LIVE
+    # launcher means "in progress" — covering the spawn-to-publish gap where
+    # the first installer may already have exited; stale leftovers are
+    # reclaimed. An older installer's `<cmd>.pid` FILE record is honored the
+    # same way: a live legacy-format owner still defers.
+    owner="$(cat "$pidfile.d/owner" 2>/dev/null || true)"
+    [ -z "$owner" ] && owner="$(cat "$pidfile" 2>/dev/null || true)"
     owner_pid="${owner%% *}"
     owner_start="${owner#* }"
     [ "$owner_start" = "$owner" ] && owner_start=""
@@ -1403,7 +2026,7 @@ OPENLLM_VENDOR_JOB
     if [[ "$owner_pid" =~ ^[0-9]+$ ]] && env_lock_pid_alive "$owner_pid"; then
       owner_live=1
       if [ -n "$owner_start" ] && [ "$owner_start" != "-" ]; then
-        owner_start_now="$(env_lock_start_identity "$owner_pid")"
+        owner_start_now="$(env_lock_legacy_start_identity "$owner_pid")"
         if [ -n "$owner_start_now" ] && [ "$owner_start_now" != "$owner_start" ]; then
           owner_live=0
         fi
@@ -1431,7 +2054,7 @@ OPENLLM_VENDOR_JOB
         if env_lock_pid_alive "$owner_pid"; then
           owner_live=1
           if [ -n "$owner_start" ] && [ "$owner_start" != "-" ]; then
-            owner_start_now="$(env_lock_start_identity "$owner_pid")"
+            owner_start_now="$(env_lock_legacy_start_identity "$owner_pid")"
             if [ -n "$owner_start_now" ] && [ "$owner_start_now" != "$owner_start" ]; then
               owner_live=0
             fi
@@ -1470,6 +2093,9 @@ OPENLLM_VENDOR_JOB
     # by the awk writer: the first bytes (which show why an install failed)
     # are kept, the rest dropped — a noisy or TERM-ignoring vendor job
     # cannot grow the log without bound (RG-1).
+    # The log writer's stdout AND stderr are redirected away from the
+    # caller: an inherited stderr would keep `ssh … | bash`, `| tee` and CI
+    # captures waiting on this detached process for the job's whole bound.
     env "${vendor_scrub[@]}" PATH="$run_path" \
       bash -c "$job_body" -- \
       "$pidfile" "$timeout_bin" "$job_timeout" "$curl_bin" "$url" "$setsid_bin" "$launchfile" \
@@ -1481,7 +2107,7 @@ OPENLLM_VENDOR_JOB
         next
       }
       { kept += length($0) + 1; print }
-    ' >>"$job_log" &
+    ' >>"$job_log" 2>/dev/null &
     VENDOR_JOBS_STARTED=$((VENDOR_JOBS_STARTED + 1))
   done
   # The shared skip-note log is append-only across runs — keep only its tail
@@ -1496,10 +2122,12 @@ OPENLLM_VENDOR_JOB
 # `|| true` + the subshell/background jobs keep this off the `set -euo
 # pipefail` path — a vendor install can never abort the daemon install.
 # Skipped on a manual update: rerunning every vendor's installer is a
-# first-install action the user didn't ask for.
+# first-install action the user didn't ask for. Also skipped ENTIRELY in
+# --from-file local mode (NR2-3): a private-prerelease install must never
+# touch the network — not even an opted-in vendor provisioning job.
 VENDOR_JOBS_STARTED=0
 VENDOR_MISSING_PRINTED=0
-if [ "$INSTALL_MODE" != update ]; then
+if [ "$INSTALL_MODE" != update ] && [ -z "$FROM_FILE" ]; then
   provision_clis || true
 fi
 
