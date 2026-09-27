@@ -25,10 +25,12 @@ import { daemonTempDir } from "../sandbox/working-set";
 import type { TChildCleanupOutcome } from "./spawn";
 import {
   bindAbort,
+  bindMintedTmpToChild,
   childCleanupOutcome,
   DEFAULT_LOGIN_TIMEOUT_MS,
+  discardMintedTmpDir,
   spawnCwd,
-  spawnEnv,
+  spawnEnvLeased,
   stripAnsi,
 } from "./spawn";
 
@@ -133,7 +135,11 @@ export const spawnHeadlessLogin = async (
   opts?: THeadlessLoginOpts,
 ): Promise<THeadlessLogin | THeadlessLoginMiss> => {
   const shimDir = await ensureNoBrowserShimDir();
-  const baseEnv = spawnEnv(env) ?? { ...process.env };
+  // A shared-root TMPDIR mints a per-run `run-*` dir owned by the child:
+  // bound to it post-spawn (removed on exit), discarded if the spawn fails
+  // (rework-7 / RG-2).
+  const leased = spawnEnvLeased(env);
+  const baseEnv = leased.env;
   const childEnv: Record<string, string | undefined> = { ...baseEnv };
   // No GUI → the printed URL is the hosted-callback (platform.claude.com) one
   // the user can complete from another machine; also makes any browser-open a
@@ -147,15 +153,23 @@ export const spawnHeadlessLogin = async (
   const timeoutMs =
     opts?.timeoutMs ?? opts?.urlTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
   const budget = createDeadlineBudget(timeoutMs, opts?.signal);
-  const child = superviseSpawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
-    kind: "login",
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    cwd: spawnCwd(env),
-    env: childEnv,
-  });
+  let child: TSupervisedChild;
+  try {
+    child = superviseSpawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
+      kind: "login",
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: spawnCwd(env),
+      env: childEnv,
+    });
+  } catch (error) {
+    discardMintedTmpDir(leased);
+    budget.release();
+    throw error;
+  }
   opts?.onSpawned?.(child);
+  bindMintedTmpToChild(leased, child.subprocess, "headless-login");
 
   const proc = child.subprocess;
   let terminatePromise: Promise<TReapOutcome> | null = null;

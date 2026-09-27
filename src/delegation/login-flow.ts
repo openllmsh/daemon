@@ -43,11 +43,13 @@ import { sandboxSpawnArgs } from "../sandbox/exec";
 import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
 import type { TChildCleanupOutcome } from "./spawn";
 import {
+  bindMintedTmpToChild,
   childCleanupOutcome,
   DEFAULT_LOGIN_TIMEOUT_MS,
+  discardMintedTmpDir,
   redactUrls,
   spawnCwd,
-  spawnEnv,
+  spawnEnvLeased,
 } from "./spawn";
 import { openUrl } from "./util";
 
@@ -1090,6 +1092,10 @@ export const spawnStreamLogin = async <T>(
       flow,
     };
   }
+  // A shared-root TMPDIR mints a per-run `run-*` dir the child owns; it is
+  // bound to the child post-spawn and removed on exit — or discarded here if
+  // the spawn itself fails (rework-7 / RG-2).
+  const leased = spawnEnvLeased(opts.env);
   try {
     child = superviseSpawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
       kind: "login",
@@ -1099,9 +1105,10 @@ export const spawnStreamLogin = async <T>(
       stdout: "pipe",
       stderr: "pipe",
       cwd: spawnCwd(opts.env),
-      env: spawnEnv(opts.env),
+      env: leased.env,
     });
   } catch (error) {
+    discardMintedTmpDir(leased);
     opts.slot.end(flow.flowId);
     const spawnFailure = spawnFailureFromError(error);
     return {
@@ -1115,6 +1122,9 @@ export const spawnStreamLogin = async <T>(
   }
   const supervised = child;
   const proc = supervised.subprocess;
+  // Lease the run dir to the real child + remove it on exit — deterministic
+  // even if the child dies before its registry identity lands.
+  bindMintedTmpToChild(leased, proc, "login-flow");
   emitLoginStarted(flow);
   // A cancel that raced `slot.start` must still kill the just-spawned child.
   if (opts.slot.wasCancelled()) void requestTerminate();
