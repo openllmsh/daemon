@@ -769,12 +769,25 @@ export const autoUpdateSuspended = (): boolean => {
   }
 };
 
+/**
+ * How far in the FUTURE a recorded attempt `ts` may sit before the record is
+ * distrusted. Small skew (an NTP step, a resumed VM) still counts as a real
+ * recent try; past this bound the timestamp is treated as corrupt and the
+ * record reads STALE (TCB-6). Fail open on purpose: a far-future `ts` would
+ * otherwise satisfy `now - ts < retryAfterMs` on every tick — the record is
+ * never overwritten while it blocks the next try, so the update would wait
+ * until the wall clock catches up. The next try runs instead, and
+ * `recordAttempt` then writes a sane `ts` over the corrupt one.
+ */
+const ATTEMPT_TS_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
 const attemptIsRecent = (
   attempt: TUpdateAttempt | undefined,
   version: string,
   now: number,
 ): boolean => {
   if (attempt === undefined || attempt.version !== version) return false;
+  if (attempt.ts > now + ATTEMPT_TS_MAX_FUTURE_SKEW_MS) return false;
   const retryAfterMs = attempt.retryAfterMs ?? UPDATE_ATTEMPT_COOLDOWN_MS;
   return now - attempt.ts < retryAfterMs;
 };
