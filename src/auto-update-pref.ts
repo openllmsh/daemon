@@ -76,6 +76,7 @@ export const setAutoUpdate = (enabled: boolean): void => {
       "auto-update",
       safeDiagnosticMessage`failed to persist preference to the env file`,
     );
+    throw new Error("failed to persist auto-update preference");
   }
   process.env[AUTO_UPDATE_KEY] = value;
 };

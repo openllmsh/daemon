@@ -566,7 +566,15 @@ const startServiceAfterCredentialGate = (
   // Mirrors how writeEnvFileIfNeeded persists an explicit cloud-origin/port.
   const autoUpdateEnv = process.env.OPENLLM_DAEMON_AUTO_UPDATE;
   if (autoUpdateEnv !== undefined) {
-    setAutoUpdate(autoUpdateEnv !== "0" && autoUpdateEnv !== "false");
+    try {
+      setAutoUpdate(autoUpdateEnv !== "0" && autoUpdateEnv !== "false");
+    } catch (error) {
+      // Do not abort the service registration: warn, and tell the user how to
+      // set the preference once the env file is writable.
+      process.stderr.write(
+        `warning: could not save OPENLLM_DAEMON_AUTO_UPDATE (${error instanceof Error ? error.message : String(error)}). Run \`openllmd auto-update ${autoUpdateEnv !== "0" && autoUpdateEnv !== "false" ? "on" : "off"}\` after you fix the env file.\n`,
+      );
+    }
   }
   hardenMacBinary(binPath); // arm64 SIGKILLs an unsigned binary launchd spawns
   if (isMac) startMac(binPath);

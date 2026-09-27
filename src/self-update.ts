@@ -20,21 +20,18 @@
  * verifies); the swap is atomic (same-dir temp + rename); and a persisted
  * attempt marker + cooldown bounds restart loops if a release is mis-published.
  *
- * Failure classes are treated differently on purpose: a DETERMINISTIC artifact
- * failure (SHA-256 mismatch, size cap, decompression, malformed digest, failed
- * pre-swap probe) permanently rejects that version on this host — re-fetching
- * the same bytes can never heal it — while a transient network error only
- * earns the bounded exponential backoff.
+ * A failed health check rejects the artifact on this host. Size limits,
+ * invalid compression, and malformed digests also cause rejection.
+ * Complete bodies with checksum mismatches also cause rejection.
+ * Transport failures cause a delay before retry.
  */
 
-import { dlopen, FFIType } from "bun:ffi";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
-  fsyncSync,
   openSync,
   readdirSync,
   renameSync,
@@ -61,8 +58,11 @@ import { spawnCwd, spawnEnv } from "./delegation/spawn";
 import { daemonEnv, daemonUpdateRoute } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "./logger";
+import type { TDarwinFullSync } from "./state-file";
 import {
   autoUpdateSuspended,
+  fsyncFdSync,
+  fsyncFileSync,
   isUpdateRejected,
   recentlyAttempted,
   recordAttempt,
@@ -70,6 +70,8 @@ import {
 } from "./state-file";
 import { DAEMON_VERSION } from "./version";
 import { nodeSpawnSync } from "./windows-process";
+
+export { fsyncFdSync, fsyncFileSync } from "./state-file";
 
 // Cap on how long we hold the restart waiting for `/v1` requests to drain.
 const DRAIN_MAX_MS = 30_000;
@@ -273,82 +275,6 @@ export const sweepStaleUpdateTemps = (dir: string): void => {
     } catch {
       // best-effort residue cleanup
     }
-  }
-};
-
-/**
- * macOS `fcntl(fd, F_FULLFSYNC)` — <fcntl.h> command 51. Darwin's fsync(2)
- * only hands bytes to the drive's write cache; F_FULLFSYNC is the barrier
- * that lands them on stable storage, which is the crash durability FSS-18
- * requires. Bound lazily out of libSystem; the `fullSync` seam on
- * {@link fsyncFdSync} exercises the darwin branch off-mac.
- */
-const DARWIN_F_FULLFSYNC = 51;
-
-/** The bound `fcntl(fd, F_FULLFSYNC, 0)` call, or null when it cannot load. */
-type TDarwinFullSync = (fd: number) => number;
-
-let cachedDarwinFullSync: TDarwinFullSync | null | undefined;
-
-const loadDarwinFullSync = (): TDarwinFullSync | null => {
-  if (cachedDarwinFullSync !== undefined) return cachedDarwinFullSync;
-  try {
-    const lib = dlopen("/usr/lib/libSystem.B.dylib", {
-      fcntl: {
-        // fcntl is variadic; F_FULLFSYNC ignores the third argument.
-        args: [FFIType.i32, FFIType.i32, FFIType.i32],
-        returns: FFIType.i32,
-      },
-    });
-    const fcntl = lib.symbols.fcntl;
-    cachedDarwinFullSync = (fd) => fcntl(fd, DARWIN_F_FULLFSYNC, 0);
-  } catch {
-    cachedDarwinFullSync = null;
-  }
-  return cachedDarwinFullSync;
-};
-
-/**
- * Flush an open descriptor to stable storage (FSS-18). Darwin needs
- * fcntl(F_FULLFSYNC): a plain fsync(2) can leave the bytes in the drive's
- * volatile write cache, so a power loss after the swap could still
- * resurrect the old binary or lose both. An unavailable or refused
- * F_FULLFSYNC falls back to fsync(2) — a weaker barrier, never a new
- * failure mode. Throws only on a real fsync failure.
- *
- * `platform`/`fullSync` are the test seam for the darwin branch: pass
- * `"darwin"` with a recording stub to observe the F_FULLFSYNC call, or
- * `null` to simulate a missing symbol. `undefined` binds real libc.
- */
-export const fsyncFdSync = (
-  fd: number,
-  platform: NodeJS.Platform = process.platform,
-  fullSync: TDarwinFullSync | null | undefined = undefined,
-): void => {
-  if (platform === "darwin") {
-    const fcntl = fullSync === undefined ? loadDarwinFullSync() : fullSync;
-    if (fcntl !== null) {
-      try {
-        if (fcntl(fd) === 0) return;
-      } catch {
-        // refused/faulted — fsync(2) below is still a real barrier
-      }
-    }
-  }
-  fsyncSync(fd);
-};
-
-/** fsync one file's bytes to stable storage (FSS-18). Throws on failure. */
-export const fsyncFileSync = (
-  path: string,
-  platform: NodeJS.Platform = process.platform,
-  fullSync?: TDarwinFullSync | null,
-): void => {
-  const fd = openSync(path, "r");
-  try {
-    fsyncFdSync(fd, platform, fullSync);
-  } finally {
-    closeSync(fd);
   }
 };
 
@@ -605,7 +531,7 @@ const readBodyCapped = async (
       `${label} exceeds the ${maxBytes}-byte cap`,
     );
   }
-  if (res.body === null) return Buffer.alloc(0);
+  if (res.body === null) throw new Error(`${label} returned an empty body`);
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
   const stallMs = bounds?.stallMs ?? DOWNLOAD_STALL_MS;
@@ -644,6 +570,22 @@ const readBodyCapped = async (
     } finally {
       if (stallTimer !== null) clearTimeout(stallTimer);
     }
+  }
+  if (total === 0) throw new Error(`${label} returned an empty body`);
+  // Content-Length counts the bytes ON THE WIRE. When the response is
+  // compressed (Content-Encoding other than identity), fetch hands back the
+  // decoded body, so the two lengths differ on every good download.
+  const encoding = (res.headers.get("content-encoding") ?? "identity")
+    .trim()
+    .toLowerCase();
+  if (
+    (encoding === "" || encoding === "identity") &&
+    res.headers.has("content-length") &&
+    Number.isSafeInteger(declared) &&
+    declared >= 0 &&
+    total !== declared
+  ) {
+    throw new Error(`${label} length differs from Content-Length`);
   }
   return Buffer.concat(chunks);
 };
@@ -1006,7 +948,7 @@ export const applyDaemonSelfUpdate = async (args: {
         detail: err instanceof Error ? err.message : String(err),
       };
     }
-    if (isUpdateRejected("daemon", latest, expected)) {
+    if (isUpdateRejected("daemon", latest, expected, dest)) {
       // The currently advertised artifact is already proven bad on this
       // host — do not spend the ~40 MB download again. A corrected
       // re-publish advertises a DIFFERENT digest and passes this gate.
@@ -1036,8 +978,7 @@ export const applyDaemonSelfUpdate = async (args: {
     }
     const actual = createHash("sha256").update(bin).digest("hex");
     if (actual !== expected) {
-      // A checksum mismatch is a mis-published artifact: deterministic —
-      // reject permanently instead of retrying the same bytes after backoff.
+      // A complete body with the wrong checksum rejects this artifact.
       rejectUpdateVersion("daemon", latest, expected);
       recordAttempt("daemon", latest, { digest: expected });
       return {
@@ -1134,6 +1075,14 @@ export const applyDaemonSelfUpdate = async (args: {
         }`,
       };
     }
+    // Save the attempt before the binary can change.
+    if (!recordAttempt("daemon", latest, { digest: expected })) {
+      return {
+        kind: "failed",
+        stage: "write",
+        detail: "failed to persist update attempt before swap",
+      };
+    }
     renameSync(tmp, dest); // atomic on POSIX; running process keeps old inode
     // FSS-18: fsync the directory so the rename's dirent survives a crash —
     // otherwise power loss could resurrect the old binary (or lose both).
@@ -1149,7 +1098,6 @@ export const applyDaemonSelfUpdate = async (args: {
         }`,
       );
     }
-    recordAttempt("daemon", latest, { digest: expected });
     return { kind: "updated" };
   } catch (err) {
     recordAttempt("daemon", latest);

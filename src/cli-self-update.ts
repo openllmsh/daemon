@@ -17,7 +17,7 @@
  *     `cli-install.ts`. Manual `openllm self-update` also still works — the two
  *     writers serialize through ONE cross-process lock dir
  *     (`updateLockDirFor(dest)`, `packages/tunnel/update-lock.ts`) covering
- *     probe → backup → rename → legacy-link → attempt marker, so a race can
+ *     probe → backup → attempt marker → rename → legacy-link, so a race can
  *     never leave `.prev` unrelated to the final binary or `state.json`
  *     describing the other update.
  *   - Its own attempt SLOT (`cli`) in the shared `state.json` so a daemon
@@ -332,7 +332,7 @@ export const applyCliSelfUpdate = async (args: {
     }
     const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== expected) {
-      // Mis-published artifact: deterministic — reject permanently.
+      // A complete body with the wrong checksum rejects this artifact.
       rejectUpdateVersion("cli", latest, expected);
       recordAttempt("cli", latest, { digest: expected });
       return {
@@ -473,6 +473,13 @@ export const applyCliSelfUpdate = async (args: {
           }`,
         };
       }
+      if (!recordAttempt("cli", latest, { digest: expected })) {
+        return {
+          kind: "failed",
+          stage: "write",
+          detail: "failed to persist update attempt before swap",
+        };
+      }
       renameSync(tmp, dest); // atomic on POSIX; a running CLI keeps its inode
       if (args.legacySymlink !== undefined) {
         // Replace the old binary file with a transitional symlink so
@@ -497,7 +504,6 @@ export const applyCliSelfUpdate = async (args: {
           }`,
         );
       }
-      recordAttempt("cli", latest, { digest: expected });
       return { kind: "updated" };
     } finally {
       cliSwapInFlightRegion = null;

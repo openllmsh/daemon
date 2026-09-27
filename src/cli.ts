@@ -82,7 +82,14 @@ const runAutoUpdate = (args: readonly string[]): never => {
   // (`auto-update on typo`) instead of silently ignoring it.
   if (args.length <= 1) {
     if (sub === "on" || sub === "off") {
-      setAutoUpdate(sub === "on");
+      try {
+        setAutoUpdate(sub === "on");
+      } catch (error) {
+        process.stderr.write(
+          `auto-update: could not save the setting (${error instanceof Error ? error.message : String(error)}). Nothing was changed.\n`,
+        );
+        process.exit(1);
+      }
       process.stdout.write(
         `auto-update ${sub === "on" ? "enabled" : "disabled"}\n`,
       );

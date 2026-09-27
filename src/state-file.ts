@@ -19,9 +19,13 @@
  * read failure yields defaults, a write failure is swallowed — the in-memory
  * guards in the callers still prevent tight loops.
  */
+import { dlopen, FFIType } from "bun:ffi";
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -29,12 +33,88 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   processIdentityStatus,
   processStartIdentity,
 } from "../../tunnel/session/local-runtime";
 import { stateDir } from "./env";
+
+/**
+ * macOS `fcntl(fd, F_FULLFSYNC)` — <fcntl.h> command 51. Darwin's fsync(2)
+ * only hands bytes to the drive's write cache; F_FULLFSYNC is the barrier
+ * that lands them on stable storage, which is the crash durability FSS-18
+ * requires. Bound lazily out of libSystem; the `fullSync` seam on
+ * {@link fsyncFdSync} exercises the darwin branch off-mac.
+ */
+const DARWIN_F_FULLFSYNC = 51;
+
+/** The bound `fcntl(fd, F_FULLFSYNC, 0)` call, or null when it cannot load. */
+export type TDarwinFullSync = (fd: number) => number;
+
+let cachedDarwinFullSync: TDarwinFullSync | null | undefined;
+
+const loadDarwinFullSync = (): TDarwinFullSync | null => {
+  if (cachedDarwinFullSync !== undefined) return cachedDarwinFullSync;
+  try {
+    const lib = dlopen("/usr/lib/libSystem.B.dylib", {
+      fcntl: {
+        // fcntl is variadic; F_FULLFSYNC ignores the third argument.
+        args: [FFIType.i32, FFIType.i32, FFIType.i32],
+        returns: FFIType.i32,
+      },
+    });
+    const fcntl = lib.symbols.fcntl;
+    cachedDarwinFullSync = (fd) => fcntl(fd, DARWIN_F_FULLFSYNC, 0);
+  } catch {
+    cachedDarwinFullSync = null;
+  }
+  return cachedDarwinFullSync;
+};
+
+/**
+ * Flush an open descriptor to stable storage (FSS-18). Darwin needs
+ * fcntl(F_FULLFSYNC): a plain fsync(2) can leave the bytes in the drive's
+ * volatile write cache, so a power loss after the swap could still
+ * resurrect the old binary or lose both. An unavailable or refused
+ * F_FULLFSYNC falls back to fsync(2) — a weaker barrier, never a new
+ * failure mode. Throws only on a real fsync failure.
+ *
+ * `platform`/`fullSync` are the test seam for the darwin branch: pass
+ * `"darwin"` with a recording stub to observe the F_FULLFSYNC call, or
+ * `null` to simulate a missing symbol. `undefined` binds real libc.
+ */
+export const fsyncFdSync = (
+  fd: number,
+  platform: NodeJS.Platform = process.platform,
+  fullSync: TDarwinFullSync | null | undefined = undefined,
+): void => {
+  if (platform === "darwin") {
+    const fcntl = fullSync === undefined ? loadDarwinFullSync() : fullSync;
+    if (fcntl !== null) {
+      try {
+        if (fcntl(fd) === 0) return;
+      } catch {
+        // refused/faulted — fsync(2) below is still a real barrier
+      }
+    }
+  }
+  fsyncSync(fd);
+};
+
+/** fsync one file's bytes to stable storage (FSS-18). Throws on failure. */
+export const fsyncFileSync = (
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+  fullSync?: TDarwinFullSync | null,
+): void => {
+  const fd = openSync(path, "r");
+  try {
+    fsyncFdSync(fd, platform, fullSync);
+  } finally {
+    closeSync(fd);
+  }
+};
 
 /** Which converger recorded an update attempt. */
 export type TUpdateSlot = "daemon" | "cli";
@@ -97,7 +177,7 @@ export type TDaemonState = {
   readonly rtcCrashesVersion?: string | null;
   /**
    * Published artifacts a converger must never install again: a downloaded
-   * artifact that failed a deterministic check (SHA-256 mismatch, size cap,
+   * artifact that failed a deterministic check (checksum, size cap,
    * decompression, malformed digest) or the pre-swap health probe, or a
    * version that crash-looped right after a swap (rolled back by
    * `boot-guard.ts`). Keyed by version + ARTIFACT DIGEST — a corrected
@@ -301,16 +381,17 @@ const coerceState = (v: unknown): TDaemonState => {
 };
 
 /**
- * Atomic write: pid-suffixed temp + rename. Best-effort — NEVER throws, and
- * returns whether the write landed so update-guard callers can fail closed
- * when their safety records can't persist (see {@link autoUpdateSuspended}).
+ * Write and sync the temp file. Rename it, then sync the directory.
+ * Return false if a step fails. Update callers must stop on failure.
  */
 const writeStateAtomic = (state: TDaemonState): boolean => {
   const tmp = join(stateDir(), `.state.json.${process.pid}.tmp`);
   try {
     mkdirSync(stateDir(), { recursive: true });
     writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+    fsyncFileSync(tmp);
     renameSync(tmp, stateFilePath());
+    if (process.platform !== "win32") fsyncFileSync(stateDir());
     return true;
   } catch {
     try {
@@ -824,6 +905,7 @@ export const recentlyAttempted = (
  * target version changes) and stamps a fresh jittered `retryAfterMs` so the
  * next try backs off exponentially up to {@link UPDATE_FAILURE_MAX_DELAY_MS}.
  * Merge-preserving: the other slot's record is untouched.
+ * Return true only after the file and directory are synced.
  */
 export const recordAttempt = (
   slot: TUpdateSlot,
@@ -833,10 +915,10 @@ export const recordAttempt = (
     readonly rng?: () => number;
     readonly digest?: string;
   },
-): void => {
+): boolean => {
   const now = opts?.now ?? Date.now();
   const rng = opts?.rng ?? Math.random;
-  mutateState((s) => {
+  return mutateState((s) => {
     const prev = s.updateAttempts[slot];
     const failures = (prev?.version === version ? (prev.failures ?? 0) : 0) + 1;
     const attempt: TUpdateAttempt = {
@@ -874,6 +956,53 @@ const rejectionMatches = (
   entry.version === version &&
   (entry.digest === "" || (digest !== undefined && entry.digest === digest));
 
+/** Keep the latest rollback rejection beside the installed binary. */
+export const rollbackRejectionPath = (binary: string): string =>
+  `${binary}.rollback-rejected.json`;
+
+/** Save the rejection without the state file or its lock. */
+export const writeRollbackRejection = (
+  binary: string,
+  version: string,
+  digest: string,
+): boolean => {
+  const path = rollbackRejectionPath(binary);
+  const tmp = join(
+    dirname(path),
+    `.openllmd.update.${process.pid}.rollback-rejected.tmp`,
+  );
+  try {
+    writeFileSync(tmp, JSON.stringify({ version, digest }), { mode: 0o600 });
+    fsyncFileSync(tmp);
+    renameSync(tmp, path);
+    if (process.platform !== "win32") fsyncFileSync(dirname(path));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // The update sweeper removes this temp after the process exits.
+    }
+  }
+};
+
+const isRollbackRejected = (
+  binary: string,
+  version: string,
+  digest: string | undefined,
+): boolean => {
+  try {
+    const entry = coerceRejectedEntry(
+      JSON.parse(readFileSync(rollbackRejectionPath(binary), "utf8")),
+    );
+    return entry !== null && rejectionMatches(entry, version, digest);
+  } catch {
+    return false;
+  }
+};
+
 /**
  * True when `slot`'s converger must never install `version`'s artifact
  * `digest` again — persisted rejection OR its in-memory mirror (a state-write
@@ -885,7 +1014,11 @@ export const isUpdateRejected = (
   slot: TUpdateSlot,
   version: string,
   digest?: string,
+  binary: string = process.execPath,
 ): boolean => {
+  if (slot === "daemon" && isRollbackRejected(binary, version, digest)) {
+    return true;
+  }
   if (
     (readState().rejectedUpdates?.[slot] ?? []).some((e) =>
       rejectionMatches(e, version, digest),
