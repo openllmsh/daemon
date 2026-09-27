@@ -374,11 +374,20 @@ export const runCodexCapturedToolTurn = async (
   // Empty after web_search suppression is still valid: hosted search alone.
   const session = createRequestCaptureSession({
     destinationPolicy: codexCaptureDestinationPolicy({ allowLoopback: false }),
-    // `runCapturedDispatch` completes the capture session as soon as it has a
-    // Response. Its internal signal aborts at that point, while the daemon
-    // still needs to consume the returned response body. Do not bind that
-    // session signal into the builder route; caller abort remains handled by
-    // `dispatchAbort` below and by builder settlement/dispose.
+    // Bind the CALLER's abort signal at session creation — same as the text
+    // capture path (`runCodexCapturedTextTurn`). Without this, `session.signal`
+    // is driven only by the capture-wait budget and by `dispatchStarted`/
+    // `complete()`'s own terminal transitions; a caller abort mid-dispatch
+    // (fetch/WS in flight) would never propagate to the in-flight sender at
+    // all. (CodeRabbit round-2: this was previously omitted here — the removed
+    // comment above claimed the text path's contract was "matched" by relying
+    // on `session.signal` alone, which was true only for the text path,
+    // because THAT session creation call already binds `signal: params.signal`.
+    // This call site did not, so caller abort was silently unhandled during
+    // dispatch. `runCapturedDispatch` completing the session on success does
+    // NOT abort `session.signal` — see `finishTerminal` in
+    // request-capture.ts — so binding this is safe on the success path too.)
+    signal: params.signal,
     captureTimeoutMs: params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS,
   });
 
@@ -491,10 +500,12 @@ export const runCodexCapturedToolTurn = async (
         ? { fetchImpl: params.fetchImpl }
         : {}),
     });
-    // No independent dispatch signal: reuse the session's own signal (the
-    // default when `signal` is omitted) so `complete()`'s terminal abort
-    // fires exactly once, on the same controller the dispatch already
-    // finished against — matches the text-capture path's contract.
+    // No independent dispatch signal passed here: `session.signal` is now
+    // bound to `params.signal` at session creation (see above), so
+    // `runCapturedDispatch`'s default (`session.signal` when `args.signal` is
+    // omitted) already carries caller abort into the in-flight sender —
+    // matches the text-capture path (`codex-capture.ts`), which passes
+    // `signal: params.signal` explicitly to the same effect.
     const dispatched = await runCapturedDispatch({
       session,
       sender,
