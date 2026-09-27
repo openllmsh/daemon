@@ -30,15 +30,7 @@
  *     `X-Msh-Device-Id`.
  *   - Usage: GET https://api.kimi.com/coding/v1/usages.
  */
-import {
-  mkdirSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
@@ -60,7 +52,11 @@ import {
 import { fetchWithBoundedRedirects } from "../upstream-redirect";
 import { USAGE_FETCH_TIMEOUT_MS } from "../usage-cache";
 import { accountHashField, jwtClaims, nonEmpty } from "./account-id";
-import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
+import {
+  pruneKimiSessionDirs,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import {
   cachedCliSemver,
@@ -253,41 +249,6 @@ const ensureModelConfig = async (accessToken: string): Promise<void> => {
       provisionInFlight = null;
     });
   return provisionInFlight;
-};
-
-// Every `kimi -p` run — the refresh ping AND the auth-config capture — leaves a
-// `sessions/wd_*` directory (~85 KB) under the isolated home, and nothing ever
-// reaps it (RG-5). Only daemon-spawned runs write inside the isolated
-// `KIMI_CODE_HOME`, so the whole `sessions/` dir is our own scratch space.
-// The age floor keeps a still-running child safe: every daemon kimi spawn is
-// bounded well under a minute (refresh 60 s, capture 20 s), so a dir older
-// than this can only belong to a finished run.
-const SESSION_PRUNE_AGE_MS = 5 * 60_000;
-
-/**
- * Best-effort sweep of `sessions/wd_*` dirs older than
- * {@link SESSION_PRUNE_AGE_MS} under the isolated Kimi home. Runs after each
- * native refresh so leftover ping sessions are deleted by the NEXT refresh —
- * steady state is at most one fresh dir at rest. Never throws.
- */
-export const pruneKimiSessionDirs = (now: number = Date.now()): void => {
-  const root = join(kimiHome(), "sessions");
-  let names: string[];
-  try {
-    names = readdirSync(root);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (!name.startsWith("wd_")) continue;
-    const dir = join(root, name);
-    try {
-      if (now - statSync(dir).mtimeMs < SESSION_PRUNE_AGE_MS) continue;
-      rmSync(dir, { recursive: true, force: true });
-    } catch {
-      // best-effort — a busy dir is retried after the next refresh
-    }
-  }
 };
 
 /**

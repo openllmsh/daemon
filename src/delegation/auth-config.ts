@@ -36,12 +36,13 @@
  * `docs/proposals/delegation-exec-fixtures.md` (amended) and
  * `docs/proposals/subscription-oauth-terms-compliance.md`.
  */
+import { readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { superviseSpawn } from "../child-supervisor";
 import type { TCliProvider } from "../cli-paths";
-import { cliBin, cliEnv, cliRoot } from "../cli-paths";
+import { cliBin, cliConfigDir, cliEnv, cliRoot } from "../cli-paths";
 import { localCallerToken } from "../env";
 import { logDebug, logInfo, logWarn } from "../logger";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
@@ -146,6 +147,49 @@ export type TCaptureSpec = {
    *  `/v1/messages` has never drifted (every capture returned the default), so
    *  the capture was pure risk with no benefit. */
   readonly liveCapture?: boolean;
+  /** Best-effort sweep of the spawn residue a capture run leaves under the
+   *  provider's isolated home. Runs in the capture's `finally`, so a failed
+   *  or timed-out run sweeps too. Set for a provider whose CLI writes
+   *  per-run residue (kimi leaves a `sessions/wd_*` dir per `kimi -p` —
+   *  RG-5). Never throws. */
+  readonly sweepSpawnResidue?: () => void;
+};
+
+// Every `kimi -p` run — the auth-config capture AND the native refresh ping —
+// leaves a `sessions/wd_*` directory (~85 KB) under the isolated
+// `KIMI_CODE_HOME`, and the CLI never reaps them (RG-5). Only daemon-spawned
+// runs write inside the isolated home, so the whole `sessions/` dir is our own
+// scratch space. The age floor keeps a still-running child safe: every daemon
+// kimi spawn is bounded well under a minute (refresh 60 s, capture 20 s), so a
+// dir older than this can only belong to a finished run.
+const KIMI_SESSION_PRUNE_AGE_MS = 5 * 60_000;
+
+/**
+ * Best-effort sweep of `sessions/wd_*` dirs older than
+ * {@link KIMI_SESSION_PRUNE_AGE_MS} under the isolated Kimi home. Runs after
+ * each kimi spawn — the native refresh (`kimi-code.ts`) AND the capture here
+ * (the `kimi_code` spec's `sweepSpawnResidue`) — so a leftover ping session is
+ * deleted by the NEXT kimi run; steady state is at most one fresh dir at
+ * rest. Never throws.
+ */
+export const pruneKimiSessionDirs = (now: number = Date.now()): void => {
+  const root = join(cliConfigDir("kimi_code"), "sessions");
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith("wd_")) continue;
+    const dir = join(root, name);
+    try {
+      if (now - statSync(dir).mtimeMs < KIMI_SESSION_PRUNE_AGE_MS) continue;
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort — a busy dir is retried after the next kimi run
+    }
+  }
 };
 
 const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
@@ -235,6 +279,9 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     }),
     // `kimi -p` is gated on a real TTY (raw-mode detection) — run under a PTY.
     usePty: true,
+    // The capture's `kimi -p ping` leaves a `sessions/wd_*` dir just like the
+    // refresh ping does — sweep it from the capture's `finally` too (RG-5).
+    sweepSpawnResidue: pruneKimiSessionDirs,
   },
   grok: {
     // Grok Build's chat goes through the CLI chat proxy. Both Grok Build models
@@ -541,6 +588,10 @@ const captureInferenceRequest = async (
       }
     } finally {
       recorder.stop();
+      // The reaped child may have left spawn residue under the isolated home
+      // (kimi's `sessions/wd_*`). Sweep it here so a failed or timed-out
+      // capture prunes too — the refresh path alone cannot reach these.
+      spec.sweepSpawnResidue?.();
     }
   }
 
