@@ -648,12 +648,30 @@ export const setDaemonTmpSweepIdentityReaderForTests = (
   identityReaderForTests = reader;
 };
 
-const tmpLeaseStatus = (lease: TTmpLease): "alive" | "dead" | "unknown" =>
-  processIdentityStatus(
-    lease.pid,
-    lease.startIdentity,
-    identityReaderForTests ?? processStartIdentity,
-  );
+/**
+ * Lease verdict WITHOUT a `ps` subprocess (rework-8): the sweep runs on the
+ * daemon event loop, and a sync `ps` per entry could block it for seconds.
+ * `kill(pid, 0)` answering ESRCH proves the owner is dead. Any live pid is
+ * "unknown" (it may be the owner or a reused pid), so the dir is kept: a
+ * reused pid can only delay a cleanup, never delete a live owner's dir.
+ */
+const tmpLeaseStatus = (lease: TTmpLease): "alive" | "dead" | "unknown" => {
+  if (identityReaderForTests !== null) {
+    return processIdentityStatus(
+      lease.pid,
+      lease.startIdentity,
+      identityReaderForTests,
+    );
+  }
+  try {
+    process.kill(lease.pid, 0);
+    return "unknown";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH"
+      ? "dead"
+      : "unknown";
+  }
+};
 
 /**
  * Pids with a live record in the daemon's child registry
