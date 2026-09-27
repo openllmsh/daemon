@@ -63,6 +63,37 @@ export const DAEMON_COMPILE_TARGET: Readonly<Record<TDaemonTarget, string>> = {
   "win32-x64": "bun-windows-x64-baseline",
 };
 
+/**
+ * Bun versions whose darwin runtime produces compiled binaries that macOS 27
+ * SIGKILLs at exec (exit 137 — the embedded Mach-O has an invalid code
+ * signature). Measured on 1.4.0; 1.3.14 and 1.4.1 are clean. An unversioned
+ * `bun-darwin-*` compile target embeds the toolchain's own runtime, so the
+ * compiler's version decides whether the shipped darwin binary starts at all.
+ */
+export const DARWIN_BROKEN_BUN_RUNTIMES = ["1.4.0"] as const;
+
+/**
+ * Release preflight: refuse to compile a darwin target with a Bun runtime
+ * whose darwin build output is dead on arrival. `targets` is the release set
+ * being compiled; `bunVersion` is the toolchain's version (`Bun.version` at
+ * the call site — a parameter so the decision is unit-testable). A target set
+ * with no darwin entry skips the check.
+ */
+export const assertDarwinSafeBunRuntime = (
+  targets: readonly string[],
+  bunVersion: string,
+): void => {
+  if (!targets.some((t) => t.includes("darwin"))) return;
+  if ((DARWIN_BROKEN_BUN_RUNTIMES as readonly string[]).includes(bunVersion)) {
+    throw new Error(
+      `Refusing to compile darwin targets with Bun ${bunVersion}: that darwin ` +
+        "runtime produces binaries macOS 27 SIGKILLs at exec (invalid code " +
+        "signature). Use the pinned toolchain (package.json packageManager) " +
+        "or Bun 1.3.14.",
+    );
+  }
+};
+
 /** Reverse map: Bun target spelling → release key (for `--target` selection). */
 export const BUN_TARGET_TO_DAEMON_TARGET: Readonly<
   Record<string, TDaemonTarget>

@@ -979,7 +979,10 @@ export class NativePty implements TPtyLike {
 
   private waitForExec(): Promise<void> {
     return new Promise<void>((resolvePromise, rejectPromise) => {
-      const deadline = Date.now() + STARTUP_DEADLINE_MS;
+      // PM-6: monotonic clock for deadlines — a wall-clock step (NTP, VM
+      // resume) must never false-fire the startup timeout and SIGKILL a
+      // healthy child.
+      const deadline = performance.now() + STARTUP_DEADLINE_MS;
       const check = (): void => {
         if (this.finished) {
           rejectPromise(new Error("native PTY ended during startup"));
@@ -1006,7 +1009,7 @@ export class NativePty implements TPtyLike {
             this.abortStartup();
             return;
           }
-          if (Date.now() >= deadline) {
+          if (performance.now() >= deadline) {
             const error = new Error(
               "native PTY startup timed out after 12000ms",
             );
@@ -1066,7 +1069,7 @@ export class NativePty implements TPtyLike {
       if (
         this.childExited &&
         !this.ioClosed &&
-        Date.now() >= this.finalDrainDeadline
+        performance.now() >= this.finalDrainDeadline
       ) {
         logWarn(
           "session",
@@ -1162,7 +1165,7 @@ export class NativePty implements TPtyLike {
     if (waited !== 1) return;
     this.childExited = true;
     this.finalDrainDeadline =
-      Date.now() +
+      performance.now() +
       (this.gracefulTerminationRequested
         ? GRACEFUL_FINAL_DRAIN_MS
         : FINAL_DRAIN_DEADLINE_MS);

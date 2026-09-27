@@ -95,6 +95,30 @@ const REQUEST_SAMPLE_DEBOUNCE_MS = 60_000;
 // The vendor usage endpoint has a separate, tight rate limit. Request-driven
 // samples therefore remain capped even during a long coding session.
 const REQUEST_SAMPLE_MIN_INTERVAL_MS = 2 * 60_000;
+// Bound on ONE vendor usage read (NET-6). The delegate fetchers also carry
+// `AbortSignal.timeout(USAGE_FETCH_TIMEOUT_MS)` — the socket-level abort that
+// makes the underlying request actually stop — while this constant ALSO caps
+// the whole `fetcher()` call inside the cache's single-flight promise, so a
+// fetcher that stalls anywhere else (or ignores the abort) cannot leave
+// `inFlight` pending forever and poison every later read for that provider.
+export const USAGE_FETCH_TIMEOUT_MS = 15_000;
+const USAGE_FETCH_TIMEOUT_REASON = "usage fetch timed out";
+
+// Test-only override so a regression case can exercise the in-flight cap
+// without waiting the real 15 s. Null restores the production bound.
+let usageFetchTimeoutMsForTest: number | null = null;
+export const setUsageFetchTimeoutMsForTest = (ms: number | null): void => {
+  usageFetchTimeoutMsForTest = ms;
+};
+
+// Age of a recorded timestamp. A FUTURE timestamp (a wall-clock rollback —
+// dual-boot RTC in local time, a restored VM snapshot — or a hand-edited cache
+// file) has an unknowable age and must read as EXPIRED, never as fresh:
+// `now - t < TTL` would otherwise be true for the whole offset and pin the
+// provider on a stale snapshot (TCB-6b). Same `t <= now` guard as
+// `boot-guard.ts` uses on persisted boot timestamps.
+const ageMs = (atMs: number, now: number): number =>
+  atMs > now ? Number.POSITIVE_INFINITY : now - atMs;
 
 type TUsageEntry = {
   // The last USABLE snapshot + when we obtained it (drives the "last known
@@ -358,8 +382,16 @@ const stampStale = (
   now: number,
 ): TProviderUsageSnapshot => {
   const observed = stampObservation(snapshot, atMs);
-  if (observed.kind !== "quota" || now - atMs < FRESH_TTL_MS) return observed;
-  return { ...observed, as_of_ms: observed.as_of_ms ?? atMs, stale: true };
+  if (observed.kind !== "quota" || ageMs(atMs, now) < FRESH_TTL_MS) {
+    return observed;
+  }
+  return {
+    ...observed,
+    // Never surface a future observation time to the UI — a corrupt persisted
+    // `as_of_ms`/`atMs` would render a negative "updated X ago" age.
+    as_of_ms: Math.min(observed.as_of_ms ?? atMs, now),
+    stale: true,
+  };
 };
 
 // What to serve right now without calling the vendor: the last good figures if
@@ -367,7 +399,7 @@ const stampStale = (
 // otherwise the last failure (or a loading placeholder before the first
 // attempt completes).
 const servable = (entry: TUsageEntry, now: number): TProviderUsageSnapshot => {
-  if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
+  if (entry.good !== null && ageMs(entry.good.atMs, now) < STALE_TTL_MS) {
     return withRefreshFailure(
       stampStale(entry.good.snapshot, entry.good.atMs, now),
       entry.failure,
@@ -410,7 +442,7 @@ export const cachedUsage = async (
       !options.force &&
       !resetExpiredBypass &&
       entry.good !== null &&
-      now - entry.good.atMs < FRESH_TTL_MS &&
+      ageMs(entry.good.atMs, now) < FRESH_TTL_MS &&
       isUsable(entry.good.snapshot)
     ) {
       return withRefreshFailure(
@@ -434,12 +466,12 @@ export const cachedUsage = async (
     // once the good has aged out, fall back to the short retry so a failed
     // refresh recovers sooner instead of sitting on FRESH_TTL.
     const goodServable =
-      entry.good !== null && now - entry.good.atMs < STALE_TTL_MS;
+      entry.good !== null && ageMs(entry.good.atMs, now) < STALE_TTL_MS;
     const backoff = goodServable ? FRESH_TTL_MS : FAILURE_RETRY_MS;
     if (
       !options.force &&
       !resetExpiredBypass &&
-      now - entry.lastAttemptAtMs < backoff
+      ageMs(entry.lastAttemptAtMs, now) < backoff
     ) {
       return servable(entry, now);
     }
@@ -448,13 +480,35 @@ export const cachedUsage = async (
   const run = withoutCommandReplayContext(
     async (): Promise<TProviderUsageSnapshot> => {
       let next: TProviderUsageSnapshot;
+      let capTimer: ReturnType<typeof setTimeout> | null = null;
       try {
-        next = await fetcher();
+        // NET-6: `inFlight` is shared by every concurrent caller, so a fetch
+        // that never settles would pin the provider forever (a half-open TCP
+        // connection after sleep or a network change). The delegate's own
+        // `AbortSignal.timeout` normally wins this race and yields its more
+        // specific reason; the cap guarantees the shared promise settles even
+        // when a fetcher ignores the abort. A timed-out read is recorded as a
+        // failed attempt, so the ordinary retry back-off still applies.
+        next = await Promise.race([
+          fetcher(),
+          new Promise<TProviderUsageSnapshot>((resolve) => {
+            capTimer = setTimeout(
+              () =>
+                resolve({
+                  kind: "unavailable",
+                  reason: USAGE_FETCH_TIMEOUT_REASON,
+                }),
+              usageFetchTimeoutMsForTest ?? USAGE_FETCH_TIMEOUT_MS,
+            );
+          }),
+        ]);
       } catch {
         next = {
           kind: "unavailable",
           reason: GENERIC_FETCH_FAILURE,
         };
+      } finally {
+        if (capTimer !== null) clearTimeout(capTimer);
       }
       const at = Date.now();
       if (generationFor(key) !== generation) {
@@ -555,7 +609,7 @@ export const peekUsageForQuotaGate = (
     (pool) => pool.reset_at_ms !== null && now >= pool.reset_at_ms,
   );
   const exhaustedPastFresh =
-    now - entry.good.atMs >= FRESH_TTL_MS &&
+    ageMs(entry.good.atMs, now) >= FRESH_TTL_MS &&
     pools.some((pool) => pool.percent_used >= 100);
   if (revalidate !== undefined && (resetPassed || exhaustedPastFresh)) {
     // Detached: TTL / backoff / single-flight stay inside cachedUsage.
@@ -565,7 +619,7 @@ export const peekUsageForQuotaGate = (
       resetExpired: resetPassed,
     }).catch(() => {});
   }
-  if (now - entry.good.atMs < STALE_TTL_MS) {
+  if (ageMs(entry.good.atMs, now) < STALE_TTL_MS) {
     return withRefreshFailure(
       stampStale(snapshot, entry.good.atMs, now),
       entry.failure,

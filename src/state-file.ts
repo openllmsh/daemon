@@ -1,32 +1,39 @@
 /**
  * Consolidated daemon-private state — ONE `state.json` under the state dir
  * instead of a scatter of single-purpose files. Holds the self-update attempt
- * cooldowns (daemon + CLI slots) and the crash-loop boot history. Strictly
- * daemon-private: nothing outside this binary reads or writes `state.json`, so
- * its shape is free to evolve — unlike the shared `.env` or the `installed/`
- * stamps, which are deployed contracts.
+ * cooldowns (daemon + CLI slots) and the crash-loop boot history. Shared with
+ * exactly one external writer: the `openllm` CLI's `self-update` records its
+ * own attempt/reject markers here — every writer serializes on the same
+ * on-disk lock (`state.json.lock.d`, see below) so cross-process
+ * read-modify-write cycles cannot clobber each other (FSS-08).
  *
  * CONCURRENCY INVARIANT: every mutation goes through {@link mutateState},
  * which MUST stay fully synchronous — read-fresh, transform, atomic
- * temp+rename write, with no awaits in between. The daemon and CLI update
- * convergers run concurrently (fired un-awaited on the same bootstrap tick),
- * but single-threaded JS plus sync-only file I/O means their read-modify-write
- * cycles can never interleave, so one slot's record can't clobber the other's.
- * That merge-preserving behavior is the guarantee that previously motivated
- * two separate attempt files.
+ * temp+rename write, with no awaits in between. In-process callers can never
+ * interleave (single-threaded sync I/O), and cross-process writers serialize
+ * on the `state.json.lock.d` mkdir lock below — so one writer's record can't
+ * clobber another's. That merge-preserving behavior is the guarantee that
+ * previously motivated two separate attempt files.
  *
  * Best-effort + never throws (mirrors `logger.ts` / `boot-guard.ts`): a
  * read failure yields defaults, a write failure is swallowed — the in-memory
  * guards in the callers still prevent tight loops.
  */
+import { randomBytes } from "node:crypto";
 import {
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import {
+  processIdentityStatus,
+  processStartIdentity,
+} from "../../tunnel/session/local-runtime";
 import { stateDir } from "./env";
 
 /** Which converger recorded an update attempt. */
@@ -333,13 +340,358 @@ export const readState = (): TDaemonState => {
   }
 };
 
+// ── Cross-process state lock ────────────────────────────────────────────────
+// FSS-08: `state.json` has two writers on one host — this daemon (attempts,
+// rejects, boot history, RTC sentinel) and the `openllm` CLI's `self-update`
+// (its own attempt/reject markers). With no shared lock, concurrent
+// read-modify-write cycles silently dropped records (the audit measured
+// 102–180 of 400 writes lost). Every mutation now serializes behind
+// `<stateDir>/state.json.lock.d` — a mkdir lock that mirrors the proven
+// `packages/tunnel/update-lock.ts` protocol (owner record, quarantine steal,
+// nonce-verified release) but runs SYNCHRONOUSLY because `mutateState` is
+// reachable from an `exit` hook. The CLI carries the mirror copy of this
+// block in `packages/cli/src/self-update.ts` — KEEP THE TWO IN SYNC.
+//
+// Steal policy (round-3 rework): a PROVEN-LIVE owner — live pid AND matching
+// recorded start identity — is NEVER stolen, however old the dir. A paused
+// holder keeps its lock; the alternative was forced steals that corrupted
+// read-modify-write cycles (lost boot history, rejects, device state). Only a
+// provably-gone owner (dead pid, or a reused pid whose live start identity no
+// longer matches the record) is stolen outright. An owner that can neither be
+// convicted nor proven live (no recorded start, inconclusive probe, or no
+// readable record at all) is UNPROVEN: still held, but reclaimed once the dir
+// has shown no complete owner for STATE_LOCK_RECLAIM_MS — a crash between
+// mkdir and publish can then never wedge every writer forever.
+const STATE_LOCK_DIR_NAME = "state.json.lock.d";
+const STATE_LOCK_OWNER_KIND = "openllm-state-lock/v1";
+const STATE_LOCK_OWNER_FILE = "owner.json";
+const STATE_LOCK_WAIT_MS = 2_000;
+const STATE_LOCK_POLL_MS = 10;
+const STATE_LOCK_RECLAIM_MS = 10 * 60_000;
+
+type TStateLockOwner = {
+  readonly kind: string;
+  readonly pid: number;
+  /**
+   * The owner's process-start identity (`processStartIdentity`). "" means the
+   * owner could not self-probe — liveness alone must not promote such a
+   * record to proven-live: a REUSED pid would otherwise inherit the dead
+   * owner's lock forever.
+   */
+  readonly start: string;
+  readonly nonce: string;
+};
+
+/** Nonces this process currently holds — detects same-process re-entry. */
+const ourStateLockNonces = new Set<string>();
+/** In-process nesting depth — a mutate inside a mutate reuses the held lock. */
+let stateLockDepth = 0;
+const stateLockWaitBuf = new Int32Array(new SharedArrayBuffer(4));
+
+const stateLockSleep = (ms: number): void => {
+  try {
+    Atomics.wait(stateLockWaitBuf, 0, 0, ms);
+  } catch {
+    // best-effort — a refused wait just shortens one poll
+  }
+};
+
+const stateLockPidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+const stateLockDir = (): string => join(stateDir(), STATE_LOCK_DIR_NAME);
+
+const readStateLockOwner = (dir: string): TStateLockOwner | null => {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(join(dir, STATE_LOCK_OWNER_FILE), "utf-8"),
+    ) as Partial<TStateLockOwner>;
+    if (
+      parsed.kind !== STATE_LOCK_OWNER_KIND ||
+      typeof parsed.pid !== "number" ||
+      typeof parsed.nonce !== "string"
+    )
+      return null;
+    return {
+      kind: parsed.kind,
+      pid: parsed.pid,
+      start: typeof parsed.start === "string" ? parsed.start : "",
+      nonce: parsed.nonce,
+    };
+  } catch {
+    return null;
+  }
+};
+
+/** Milliseconds since the lock dir last changed; a vanished dir reads as new. */
+const stateLockAgeMs = (dir: string): number => {
+  try {
+    return Math.max(0, Date.now() - statSync(dir).mtimeMs);
+  } catch {
+    return 0;
+  }
+};
+
 /**
- * Synchronous read-fresh → transform → atomic-write. MUST stay synchronous
- * end to end (see the module header) — that is the whole concurrency story.
+ * This process's start identity, cached — it cannot change. "" when the
+ * self-probe is unavailable: our record then stays UNPROVEN for readers
+ * (reclaimable by age) rather than unverifiable-forever.
+ */
+let ownStateLockStart: string | null = null;
+const myStateLockStart = (): string => {
+  if (ownStateLockStart !== null) return ownStateLockStart;
+  let start: string;
+  try {
+    start = processStartIdentity(process.pid) ?? "";
+  } catch {
+    start = "";
+  }
+  ownStateLockStart = start;
+  return start;
+};
+
+type TStateLockVerdict = "stale" | "proven-live" | "unproven";
+
+/**
+ * Three-way verdict for a recorded owner — mirrors `classifyOwner` in
+ * `packages/tunnel/update-lock.ts`:
+ *   - `proven-live` — the pid is alive AND its live start identity matches
+ *     the record. Never stolen, whatever the dir's age.
+ *   - `stale` — the pid is confirmed dead, or alive but a DIFFERENT process
+ *     (PID reuse: the live identity no longer matches the recorded start).
+ *   - `unproven` — live but unverifiable (empty recorded start, or an
+ *     inconclusive probe). Held; stealable only past the reclaim bound.
+ */
+const classifyStateLockOwner = (owner: TStateLockOwner): TStateLockVerdict => {
+  if (owner.start !== "") {
+    // Compare through `processIdentityStatus`, never raw string equality:
+    // it normalizes `ps lstart` whitespace, so a record written in padded
+    // (legacy) form still matches its live owner — a raw `===` would
+    // convict it as PID reuse and steal a live lock. The shared reader is
+    // also where the clock-independent Linux identity lands (a wall-clock
+    // step must never make a live owner look dead).
+    const status = processIdentityStatus(owner.pid, owner.start);
+    if (status === "alive") return "proven-live";
+    if (status === "dead") return "stale"; // dead pid, or a reused one
+    // "unknown" — the probe could not judge; fall through to liveness.
+  } else {
+    // No recorded start to compare: the raw probe is only a dead/alive
+    // oracle here (null = confirmed dead). A LIVE pid with nothing to
+    // compare stays UNPROVEN — never promoted on liveness alone, or a
+    // reused pid would inherit the dead owner's lock forever.
+    let probe: string | null | undefined;
+    try {
+      probe = processStartIdentity(owner.pid);
+    } catch {
+      probe = undefined;
+    }
+    if (probe === null) return "stale";
+  }
+  return stateLockPidAlive(owner.pid) ? "unproven" : "stale";
+};
+
+/**
+ * Steal a stale/wedged lock: rename it aside (only one racer wins the
+ * rename), then re-verify inside quarantine that the owner record is still
+ * the one we convicted — if a successor already owns it, move it back.
+ */
+const stealStateLock = (
+  lockDir: string,
+  owner: TStateLockOwner | null,
+): boolean => {
+  const quarantine = `${lockDir}.stale-${randomBytes(8).toString("hex")}`;
+  try {
+    renameSync(lockDir, quarantine);
+  } catch {
+    return false;
+  }
+  const current = readStateLockOwner(quarantine);
+  if (current !== null && current.nonce !== owner?.nonce) {
+    // Someone else owns what we moved aside — put it back.
+    try {
+      renameSync(quarantine, lockDir);
+    } catch {
+      // best-effort — residue is reclaimed by age below
+    }
+    return false;
+  }
+  try {
+    rmSync(quarantine, { recursive: true, force: true });
+  } catch {
+    // best-effort — residue is reclaimed by age below
+  }
+  return true;
+};
+
+/** Sweep orphaned quarantine dirs + dead-pid state temp files. */
+const sweepStateLockResidue = (): void => {
+  let entries: string[];
+  try {
+    entries = readdirSync(stateDir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (
+      entry.startsWith(`${STATE_LOCK_DIR_NAME}.stale-`) ||
+      entry.startsWith(`${STATE_LOCK_DIR_NAME}.rel-`)
+    ) {
+      if (stateLockAgeMs(join(stateDir(), entry)) < STATE_LOCK_RECLAIM_MS)
+        continue;
+      try {
+        rmSync(join(stateDir(), entry), { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+      continue;
+    }
+    // `.state.json.<pid>.tmp` left by a writer that died mid-rename.
+    const match = /^\.state\.json\.(\d+)\.tmp$/.exec(entry);
+    if (match === null) continue;
+    const pid = Number(match[1]);
+    if (pid > 0 && stateLockPidAlive(pid)) continue;
+    try {
+      rmSync(join(stateDir(), entry), { force: true });
+    } catch {
+      // best-effort
+    }
+  }
+};
+
+/**
+ * Acquire the cross-process `state.json` write lock. Returns a release
+ * function, or null when the lock stays held until `waitMs`. Never throws.
+ * KEEP IN SYNC with the CLI-side copy in `packages/cli/src/self-update.ts`.
+ */
+export const acquireStateLock = (opts?: {
+  waitMs?: number;
+}): (() => void) | null => {
+  const waitMs = opts?.waitMs ?? STATE_LOCK_WAIT_MS;
+  const ours: TStateLockOwner = {
+    kind: STATE_LOCK_OWNER_KIND,
+    pid: process.pid,
+    start: myStateLockStart(),
+    nonce: randomBytes(16).toString("hex"),
+  };
+  const lockDir = stateLockDir();
+  const deadline = Date.now() + waitMs;
+  // Per-call verdict cache: a contested acquire polls every few ms, and one
+  // `ps` identity probe per pass would dominate the wait. An owner record is
+  // immutable per nonce, so one classify per record is enough.
+  const verdicts = new Map<string, TStateLockVerdict>();
+  let swept = false;
+  for (;;) {
+    try {
+      mkdirSync(stateDir(), { recursive: true });
+      mkdirSync(lockDir);
+      try {
+        writeFileSync(
+          join(lockDir, STATE_LOCK_OWNER_FILE),
+          JSON.stringify(ours),
+        );
+      } catch {
+        // best-effort — an unpublished owner is unproven, still reclaimable
+      }
+      ourStateLockNonces.add(ours.nonce);
+      // Sweep stale quarantine dirs + dead-pid temps on EVERY clean acquire —
+      // otherwise they are only reaped on a contested acquire and residue
+      // grows without bound (round-3).
+      sweepStateLockResidue();
+      return () => {
+        ourStateLockNonces.delete(ours.nonce);
+        // Move our lock aside FIRST, then verify the quarantined owner is
+        // really ours before deleting — a successor's lock must move back.
+        const quarantine = `${lockDir}.rel-${ours.nonce}`;
+        try {
+          renameSync(lockDir, quarantine);
+        } catch {
+          return;
+        }
+        const moved = readStateLockOwner(quarantine);
+        if (moved !== null && moved.nonce === ours.nonce) {
+          try {
+            rmSync(quarantine, { recursive: true, force: true });
+          } catch {
+            // best-effort — residue is reclaimed by the sweeps
+          }
+        } else {
+          try {
+            renameSync(quarantine, lockDir);
+          } catch {
+            // best-effort
+          }
+        }
+        sweepStateLockResidue();
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        // The state dir itself is not writable — the write would fail anyway.
+        return null;
+      }
+    }
+    if (!swept) {
+      swept = true;
+      sweepStateLockResidue();
+    }
+    const owner = readStateLockOwner(lockDir);
+    if (owner !== null && ourStateLockNonces.has(owner.nonce)) {
+      // Same-process re-entry — mutateState's depth counter should have
+      // prevented this; fail fast instead of deadlocking on ourselves.
+      return null;
+    }
+    let verdict: TStateLockVerdict;
+    if (owner === null) {
+      verdict = "unproven";
+    } else {
+      const cached = verdicts.get(owner.nonce);
+      if (cached !== undefined) {
+        verdict = cached;
+      } else {
+        verdict = classifyStateLockOwner(owner);
+        verdicts.set(owner.nonce, verdict);
+      }
+    }
+    // NEVER steal a live verified owner — a paused holder keeps its lock
+    // however long the pause. Steal only a provably-gone owner, or a dir that
+    // has shown no complete provable owner past the reclaim bound.
+    const wedged = stateLockAgeMs(lockDir) >= STATE_LOCK_RECLAIM_MS;
+    if (
+      (verdict === "stale" || (verdict === "unproven" && wedged)) &&
+      stealStateLock(lockDir, owner)
+    ) {
+      verdicts.clear(); // the dir changed hands — old verdicts no longer apply
+      continue;
+    }
+    if (Date.now() >= deadline) return null;
+    stateLockSleep(STATE_LOCK_POLL_MS);
+  }
+};
+
+/**
+ * Synchronous read-fresh → transform → atomic-write, serialized across
+ * processes by `state.json.lock.d` (FSS-08). MUST stay synchronous end to
+ * end (see the module header) — that is the whole concurrency story.
  * Returns whether the transformed state actually persisted.
  */
 export const mutateState = (fn: (s: TDaemonState) => TDaemonState): boolean => {
-  return writeStateAtomic(fn(readState()));
+  if (stateLockDepth > 0) {
+    return writeStateAtomic(fn(readState()));
+  }
+  const release = acquireStateLock();
+  if (release === null) return false;
+  stateLockDepth += 1;
+  try {
+    return writeStateAtomic(fn(readState()));
+  } finally {
+    stateLockDepth -= 1;
+    release();
+  }
 };
 
 // ── Process-lifetime fallback guards ────────────────────────────────────────
@@ -389,6 +741,7 @@ export const clearInMemoryUpdateGuardsForTests = (): void => {
   memoryAttempts.clear();
   memoryRejected.clear();
   suspendedStateDirs.clear();
+  ourStateLockNonces.clear();
 };
 
 /**
@@ -401,11 +754,19 @@ export const clearInMemoryUpdateGuardsForTests = (): void => {
 export const autoUpdateSuspended = (): boolean => {
   const dir = stateDir();
   if (!suspendedStateDirs.has(dir)) return false;
-  if (writeStateAtomic(readState())) {
-    suspendedStateDirs.delete(dir);
-    return false;
+  // The probe write must hold the same lock as every other writer — an
+  // unlocked write here could itself clobber a concurrent update record.
+  const release = acquireStateLock();
+  if (release === null) return true;
+  try {
+    if (writeStateAtomic(readState())) {
+      suspendedStateDirs.delete(dir);
+      return false;
+    }
+    return true;
+  } finally {
+    release();
   }
-  return true;
 };
 
 const attemptIsRecent = (

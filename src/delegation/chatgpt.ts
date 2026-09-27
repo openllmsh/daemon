@@ -36,6 +36,8 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { fetchWithBoundedRedirects } from "../upstream-redirect";
+import { USAGE_FETCH_TIMEOUT_MS } from "../usage-cache";
 import { DAEMON_VERSION } from "../version";
 import { accountHash, nonEmpty } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
@@ -521,20 +523,26 @@ export const chatgptDelegate: TProviderDelegate = {
       if (cred.kind === "unavailable") return cred;
       const { accessToken, accountId } = cred.value;
       try {
-        const resp = await fetch(
+        const resp = await fetchWithBoundedRedirects(
           await resolveProviderUrl(PROVIDER, USAGE_PATH),
-          {
-            method: "GET",
-            headers: {
-              authorization: `Bearer ${accessToken}`,
-              ...(accountId !== null
-                ? { "chatgpt-account-id": accountId }
-                : {}),
-              "user-agent": OPENLLM_USER_AGENT,
-              originator: OPENLLM_ORIGINATOR,
-              accept: "application/json",
-            },
-          },
+          (target) =>
+            fetch(target, {
+              method: "GET",
+              headers: {
+                authorization: `Bearer ${accessToken}`,
+                ...(accountId !== null
+                  ? { "chatgpt-account-id": accountId }
+                  : {}),
+                "user-agent": OPENLLM_USER_AGENT,
+                originator: OPENLLM_ORIGINATOR,
+                accept: "application/json",
+              },
+              redirect: "manual",
+              // A half-open connection must not pin the shared in-flight
+              // usage read (NET-6) — see usage-cache.ts.
+              signal: AbortSignal.timeout(USAGE_FETCH_TIMEOUT_MS),
+            }),
+          "chatgpt",
         );
         if (!resp.ok) {
           const reason =

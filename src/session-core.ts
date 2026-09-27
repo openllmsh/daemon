@@ -57,6 +57,14 @@ const SCROLLBACK_MAX_BYTES = 1024 * 1024;
 /** One stalled viewer must not retain unbounded PTY output. */
 const CONSUMER_MAX_QUEUED_BYTES = 2 * 1024 * 1024;
 
+/** Terminal line pushed to attached consumers when PTY input is dropped (PM-2). */
+const PTY_INPUT_DROP_NOTICE = new TextEncoder().encode(
+  "\r\n[openllm] input dropped: the program is not reading fast enough\r\n",
+);
+/** One notice per interval — a program that is not reading would otherwise
+ *  print one line per dropped keystroke. */
+const INPUT_DROP_NOTICE_INTERVAL_MS = 2_000;
+
 /** Reaped children get time to flush their transcript before forcible exit. */
 const REAP_KILL_GRACE_MS = 10_000;
 
@@ -241,6 +249,12 @@ export type TSession = {
   lastExitReason: "evicted" | "reaped" | "done" | "killed" | null;
   /** Child status, when Bun's PTY-backed process supplied one. */
   exitCode: number | null;
+  /** Bytes the shared emulator dropped while its parser backlog overflowed
+   *  (RT-7). Non-zero marks the current drop episode so recovery is logged
+   *  once with the total. */
+  emulatorDroppedBytes: number;
+  /** Last time a dropped-input notice went to consumers (PM-2 throttle). */
+  lastInputDropNoticeAtMs: number;
 };
 
 const sessions = new Map<string, TSession>();
@@ -715,6 +729,39 @@ const pushScrollback = (s: TSession, chunk: Uint8Array): void => {
   }
 };
 
+/**
+ * Feed the shared screen emulator. @xterm/headless discards a write once
+ * more than 50 MB is pending in its parser queue — a flood like `yes` or a
+ * large `cat` outruns it (RT-7). The throw must not reach the PTY I/O
+ * failure path: the session is healthy, only this parser copy fell behind.
+ * Drop the chunk, count the loss, and keep feeding — consumers still get
+ * every byte through the fan-out and the emulator resyncs on later output.
+ */
+const writeEmulatorChunk = (s: TSession, chunk: Uint8Array): void => {
+  const emulator = s.emulator;
+  if (emulator === null) return;
+  try {
+    emulator.write(chunk);
+  } catch {
+    if (s.emulatorDroppedBytes === 0) {
+      logWarn(
+        "session",
+        "session screen emulator input dropped under output flood",
+        { id: s.id },
+      );
+    }
+    s.emulatorDroppedBytes += chunk.length;
+    return;
+  }
+  if (s.emulatorDroppedBytes > 0) {
+    logWarn("session", "session screen emulator resynced after output flood", {
+      id: s.id,
+      dropped_bytes: s.emulatorDroppedBytes,
+    });
+    s.emulatorDroppedBytes = 0;
+  }
+};
+
 const detachConsumer = (
   session: TSession,
   consumer: TAttachedConsumer,
@@ -998,6 +1045,21 @@ const reportPtyInputFailure = (session: TSession, error: unknown): void => {
       : {}),
     ...(nativeError ? { errno: error.errno } : {}),
   });
+  if (overflow) {
+    // PM-2 (Linux): a foreground program that does not read fills the PTY
+    // input queue, so the shim refuses the write. A real terminal blocks or
+    // drops excess input — it never kills the session. Drop the refused
+    // bytes, tell attached consumers once per interval, and keep going.
+    const now = Date.now();
+    if (
+      isAttached(session) &&
+      now - session.lastInputDropNoticeAtMs >= INPUT_DROP_NOTICE_INTERVAL_MS
+    ) {
+      session.lastInputDropNoticeAtMs = now;
+      sendOut(session, PTY_INPUT_DROP_NOTICE);
+    }
+    return;
+  }
   endPty(session, "killed");
   terminalClose(session);
 };
@@ -1271,6 +1333,8 @@ export const openSession = async (
       generation: 0,
       lastExitReason: null,
       exitCode: null,
+      emulatorDroppedBytes: 0,
+      lastInputDropNoticeAtMs: 0,
     };
     // Refresh resume metadata on every spawn/continue.
     s.cwd = cwd;
@@ -1325,7 +1389,7 @@ export const openSession = async (
         // Keep raw scrollback for the no-stream fallback path, and feed the
         // shared emulator that backs per-consumer reflow + attach replay.
         pushScrollback(s, chunk);
-        s.emulator?.write(chunk);
+        writeEmulatorChunk(s, chunk);
         if (!ptyReady) {
           pendingOutput.push(chunk);
           return;
