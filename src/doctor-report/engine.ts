@@ -120,6 +120,15 @@ let lastAttemptGeneration: string | null = null;
 // DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS (TCB-7).
 let policyAnchorKey: string | null = null;
 let policyAnchoredAtMs = 0;
+/**
+ * Highest local clock reading seen since the policy anchor (rework-8). A
+ * reading more than CLOCK_ROLLBACK_TOLERANCE_MS below it is a rollback, even
+ * when it is still above the anchor: advancing past the TTL and winding back
+ * must not make an expired policy live again.
+ */
+let policyClockHighWaterMs = 0;
+/** NTP slews and timer jitter below this are not treated as a rollback. */
+const CLOCK_ROLLBACK_TOLERANCE_MS = 2_000;
 // Rollback latch for the CURRENT anchor — keyed on the same
 // (generation, expires_at_ms) pair. Once a negative elapsed is observed the
 // receipt window is DEAD for that anchor: a local clock that later passes the
@@ -139,6 +148,8 @@ let rollbackLatchLoaded = false;
 let serverClockOffsetMs: number | null = null;
 /** Local clock when `serverClockOffsetMs` was measured. */
 let serverClockOffsetAtMs = 0;
+/** Highest local clock reading seen by `daemonServerNowMs` since then. */
+let serverClockHighWaterMs = 0;
 
 const cursorPath = (): string => doctorStatePath("doctor-report.cursor.json");
 const pendingPath = (): string => doctorStatePath("doctor-report.pending.json");
@@ -353,6 +364,7 @@ const anchorPolicyReceipt = (
 ): void => {
   policyAnchorKey = `${policy.generation}:${policy.expires_at_ms}`;
   policyAnchoredAtMs = now;
+  policyClockHighWaterMs = now;
   if (
     rollbackLatchedFor !== null ||
     readTextFile(rollbackLatchPath()) !== null
@@ -364,6 +376,7 @@ const anchorPolicyReceipt = (
   if (Math.abs(impliedOffset) <= MAX_SERVER_CLOCK_OFFSET_MS) {
     serverClockOffsetMs = impliedOffset;
     serverClockOffsetAtMs = now;
+    serverClockHighWaterMs = now;
   }
 };
 
@@ -382,7 +395,14 @@ export const daemonServerNowMs = (): number | null => {
   if (serverClockOffsetMs === null) return null;
   const now = clock();
   const age = now - serverClockOffsetAtMs;
-  if (age < 0 || age >= DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS) return null;
+  // Any rollback (also one that stays above the measurement) drops the
+  // offset until the next receipt re-measures it.
+  if (age < 0 || now + CLOCK_ROLLBACK_TOLERANCE_MS < serverClockHighWaterMs) {
+    serverClockOffsetMs = null;
+    return null;
+  }
+  if (age >= DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS) return null;
+  if (now > serverClockHighWaterMs) serverClockHighWaterMs = now;
   return now + serverClockOffsetMs;
 };
 
@@ -392,6 +412,7 @@ export const setDaemonServerClockOffsetForTests = (
 ): void => {
   serverClockOffsetMs = offsetMs;
   serverClockOffsetAtMs = clock();
+  serverClockHighWaterMs = serverClockOffsetAtMs;
 };
 
 /**
@@ -432,14 +453,17 @@ const reportingPolicyLive = (
     // (boot-time load, test injection) — anchor at first observation.
     policyAnchorKey = key;
     policyAnchoredAtMs = now;
+    policyClockHighWaterMs = now;
   }
   if (rollbackLatchedFor === key) return false;
   const elapsed = now - policyAnchoredAtMs;
-  if (elapsed < 0) {
+  if (elapsed < 0 || now + CLOCK_ROLLBACK_TOLERANCE_MS < policyClockHighWaterMs) {
+    serverClockOffsetMs = null;
     rollbackLatchedFor = key;
     persistRollbackLatch(key);
     return false;
   }
+  if (now > policyClockHighWaterMs) policyClockHighWaterMs = now;
   return elapsed < DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS;
 };
 
@@ -1183,5 +1207,7 @@ export const resetDoctorEngineForTests = (): void => {
   rollbackLatchLoaded = false;
   serverClockOffsetMs = null;
   serverClockOffsetAtMs = 0;
+  serverClockHighWaterMs = 0;
+  policyClockHighWaterMs = 0;
   resetDoctorRepeatForTests();
 };
