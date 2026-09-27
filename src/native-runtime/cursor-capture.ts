@@ -444,9 +444,14 @@ export const openCursorCaptureBridge = async (args: {
   /** Override temp root (tests). */
   readonly tempRoot?: string;
 }): Promise<TCursorCaptureBridge> => {
-  const policy =
-    args.destinationPolicy ??
-    cursorCaptureDestinationPolicy({ allowLoopback: true });
+  // CodeRabbit round 2: production must NOT default to `allowLoopback: true`
+  // — loopback destinations are a hermetic-test-only relaxation. The real
+  // production call site (`runCursorNativeCapture`) passes no
+  // `destinationPolicy`, so it now gets the STRICT default (official Cursor
+  // hosts only via `isOfficialCursorAgentCaptureUrl`); every test that needs
+  // loopback already passes `destinationPolicy:
+  // cursorCaptureDestinationPolicy({ allowLoopback: true })` explicitly.
+  const policy = args.destinationPolicy ?? cursorCaptureDestinationPolicy();
   const session = createRequestCaptureSession({
     destinationPolicy: policy,
     signal: args.signal,
@@ -1344,6 +1349,17 @@ export const runCursorCapturedTransaction = async (args: {
       session.markUpstreamAccepted();
       return response;
     });
+    // CodeRabbit round 2: `primaryPromise` isn't awaited until AFTER the
+    // companion loop below. If it rejects while that loop is still running,
+    // it would be a rejected promise with no attached handler at that point
+    // in time — flagged as an unhandled rejection by Node/Bun even though
+    // the code intends to observe it later. Attach a no-op catch on a
+    // SEPARATE consumer immediately so the promise is marked handled; this
+    // does not swallow the rejection for the real awaiter — `await
+    // primaryPromise` further down still receives the original error
+    // unchanged, since a `.catch` creates a new derived promise rather than
+    // mutating `primaryPromise` itself.
+    primaryPromise.catch(() => undefined);
 
     // Vendor order: open RunSSE, then append while the stream is live.
     // Cap in-flight companions at companionConcurrency (vendor default 16).
@@ -1481,6 +1497,192 @@ export const decodeCursorTransactionResponse = async (args: {
  * and write those exact bytes upstream. Does not fabricate context or feed
  * model output to the builder. Rejects any non-allowlisted follow-up.
  */
+const MAX_KV_CONTROL_FOLLOW_UPS = 32;
+
+/**
+ * Relay one real `KvServerMessage.get_blob_args` / `.set_blob_args` envelope
+ * into the still-live native builder and forward its matching real
+ * `KvClientMessage` reply upstream unchanged. The builder's ControlledKvManager
+ * owns actual blob-store semantics; the daemon never reads blob ids/data or
+ * fabricates cache misses/write acknowledgements. Genuine client heartbeats
+ * emitted while waiting are forwarded 1:1 as their original Connect envelopes
+ * — never replayed or scheduled by the daemon.
+ */
+export const forwardCursorKvControlThroughBuilder = async (args: {
+  readonly captureBridge: TCursorCaptureBridge;
+  readonly captureId: string;
+  readonly http2: TCursorHttp2DispatchSession;
+  readonly serverKvEnvelope: Uint8Array;
+  readonly connectContentEncoding?: string | null;
+  readonly followUpTimeoutMs?: number;
+  readonly signal?: AbortSignal;
+}): Promise<{ readonly forwardedFollowUps: number }> => {
+  if (isAbortSignalAborted(args.signal)) {
+    throw new RequestCaptureError("aborted", "client aborted before KV inject");
+  }
+  const { envelopes, rest } = takeConnectEnvelopes(args.serverKvEnvelope);
+  if (rest.byteLength > 0 || envelopes.length !== 1) {
+    throw new CursorCaptureDecodeError(
+      "truncated_connect_frame",
+      "KV inject requires exactly one complete Connect envelope",
+    );
+  }
+  const [serverEnvelope] = envelopes;
+  if (serverEnvelope === undefined || serverEnvelope.endStream) {
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      "KV inject rejects missing/end-stream control frames",
+    );
+  }
+  const serverPayload = resolveConnectEnvelopePayload(
+    serverEnvelope,
+    args.connectContentEncoding,
+  );
+  const serverDecoded = decodeAgentServerMessage(serverPayload);
+  // `id` is a proto3 implicit-presence uint32 — 0 is a real, valid id (live
+  // retest #34), never treated as "missing". Only subtype/kind gate this.
+  if (
+    serverDecoded.kind !== "kv_server" ||
+    (serverDecoded.subtype !== "get_blob" &&
+      serverDecoded.subtype !== "set_blob")
+  ) {
+    throw new CursorCaptureDecodeError(
+      "unsupported_native_kv",
+      `refusing unsupported KV server control subtype=${serverDecoded.kind === "kv_server" ? serverDecoded.subtype : "not_kv"} id=${serverDecoded.kind === "kv_server" ? serverDecoded.id : "null"}`,
+    );
+  }
+  const expectedId = serverDecoded.id;
+  const expectedReplyCase =
+    serverDecoded.subtype === "get_blob"
+      ? "get_blob_result"
+      : "set_blob_result";
+
+  // Preserve compressed/uncompressed envelope bytes exactly for the native
+  // builder: inspect only a decompressed COPY above.
+  args.captureBridge.injectServerFrames(args.captureId, args.serverKvEnvelope);
+
+  const deadline =
+    Date.now() + Math.max(1_000, args.followUpTimeoutMs ?? 10_000);
+  let forwardedFollowUps = 0;
+  let observedFollowUps = 0;
+  let aborted = isAbortSignalAborted(args.signal);
+  const onAbort = (): void => {
+    aborted = true;
+  };
+  args.signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    while (!aborted && Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const followUpPromise = args.captureBridge.waitForFollowUp({
+        parentCaptureId: args.captureId,
+        timeoutMs: remaining,
+      });
+      const abortPromise =
+        args.signal === undefined
+          ? null
+          : new Promise<"aborted">((resolve) => {
+              if (args.signal?.aborted === true) {
+                resolve("aborted");
+                return;
+              }
+              args.signal?.addEventListener("abort", () => resolve("aborted"), {
+                once: true,
+              });
+            });
+      const followUp =
+        abortPromise === null
+          ? await followUpPromise
+          : await Promise.race([followUpPromise, abortPromise]);
+      if (followUp === "aborted") {
+        throw new RequestCaptureError(
+          "aborted",
+          "client aborted while waiting for KV control reply",
+        );
+      }
+      if (followUp.body === null || followUp.body.byteLength === 0) continue;
+      const taken = takeConnectEnvelopes(followUp.body);
+      if (taken.rest.byteLength > 0 || taken.envelopes.length === 0) {
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          "builder KV follow-up is not complete Connect envelope(s)",
+        );
+      }
+      for (const env of taken.envelopes) {
+        observedFollowUps += 1;
+        if (observedFollowUps > MAX_KV_CONTROL_FOLLOW_UPS) {
+          throw new CursorCaptureDecodeError(
+            "unsupported_native_kv",
+            `KV control follow-up limit exceeded (${MAX_KV_CONTROL_FOLLOW_UPS})`,
+          );
+        }
+        if (env.endStream) {
+          throw new CursorCaptureDecodeError(
+            "unsupported_native_kv",
+            "builder sent end-stream while KV control reply was required",
+          );
+        }
+        const inspectPayload = resolveConnectEnvelopePayload(
+          env,
+          args.connectContentEncoding,
+        );
+        const classification = classifyAgentClientFollowUp(inspectPayload, {
+          flags: env.flags,
+          payloadBytes: env.payload.byteLength,
+        });
+        if (
+          classification.kind === "benign_control" &&
+          classification.agentClientCase === "client_heartbeat"
+        ) {
+          // The native builder emitted this exact keepalive while its own KV
+          // manager was working. Forward that exact envelope once; never
+          // manufacture or replay keepalives ourselves.
+          args.http2.writeClientFollowUp(
+            encodeConnectEnvelope(env.payload, env.flags),
+          );
+          forwardedFollowUps += 1;
+          continue;
+        }
+        if (classification.kind !== "kv_client_result") {
+          throw new CursorCaptureDecodeError(
+            "unsupported_native_kv",
+            `unexpected builder follow-up during KV control (${classification.diagnostic})`,
+          );
+        }
+        if (classification.execNumericId !== expectedId) {
+          throw new CursorCaptureDecodeError(
+            "unsupported_native_kv",
+            `KV reply id mismatch expected=${expectedId} actual=${classification.execNumericId ?? "null"} case=${classification.execClientCase ?? "null"}`,
+          );
+        }
+        if (classification.execClientCase !== expectedReplyCase) {
+          throw new CursorCaptureDecodeError(
+            "unsupported_native_kv",
+            `KV reply case mismatch expected=${expectedReplyCase} actual=${classification.execClientCase ?? "null"} id=${expectedId}`,
+          );
+        }
+        args.http2.writeClientFollowUp(
+          encodeConnectEnvelope(env.payload, env.flags),
+        );
+        forwardedFollowUps += 1;
+        return { forwardedFollowUps };
+      }
+    }
+    if (aborted) {
+      throw new RequestCaptureError(
+        "aborted",
+        "client aborted while waiting for KV control reply",
+      );
+    }
+    throw new CursorCaptureDecodeError(
+      "requires_kv_control_duplex",
+      `timed out waiting for KV control reply id=${expectedId} case=${expectedReplyCase}`,
+    );
+  } finally {
+    args.signal?.removeEventListener("abort", onAbort);
+  }
+};
+
 export const forwardCursorRequestContextThroughBuilder = async (args: {
   readonly captureBridge: TCursorCaptureBridge;
   readonly captureId: string;

@@ -109,6 +109,14 @@ export type TNativeServeOverrides = {
   readonly cursorCaptureRunAcp?: Parameters<
     typeof runCursorNativeCapture
   >[0]["runAcp"];
+  /**
+   * Hermetic-test-only capture destination override (e.g. loopback fake
+   * upstream). Production omits → {@link runCursorNativeCapture}'s own
+   * strict default (official Cursor hosts only).
+   */
+  readonly cursorCaptureDestinationPolicy?: Parameters<
+    typeof runCursorNativeCapture
+  >[0]["destinationPolicy"];
 };
 
 /** One conversation→session map per native provider (daemon-resident; the
@@ -809,6 +817,9 @@ const serveCursorHop = async (
           : {}),
         ...(overrides?.cursorCaptureRunAcp !== undefined
           ? { runAcp: overrides.cursorCaptureRunAcp }
+          : {}),
+        ...(overrides?.cursorCaptureDestinationPolicy !== undefined
+          ? { destinationPolicy: overrides.cursorCaptureDestinationPolicy }
           : {}),
       })
     : await runCursorNative({

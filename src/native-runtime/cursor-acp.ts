@@ -66,6 +66,7 @@ import {
   CursorCaptureDecodeError,
   chunksStreamFromCursorConnectResponseBody,
   defaultCursorCaptureSender,
+  forwardCursorKvControlThroughBuilder,
   forwardCursorRequestContextThroughBuilder,
   isCursorHttp2Envelope,
   openCursorCaptureBridge,
@@ -78,7 +79,7 @@ import {
   decodeAgentServerMessage,
   encodeConnectEnvelope,
   resolveConnectEnvelopePayload,
-  takeConnectEnvelopes,
+  takeConnectEnvelopesStrict,
 } from "./cursor-capture-decode";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
 import {
@@ -102,6 +103,7 @@ import {
 } from "./cursor-model-observation";
 import type { TCursorImage, TCursorTool } from "./cursor-request";
 import { acpPromptBlocks, extractJsonObject } from "./cursor-request";
+import type { TCaptureDestinationPolicy } from "./request-capture";
 import type { TNativeRunResult } from "./types";
 import {
   captureOwnershipFromSession,
@@ -1260,6 +1262,15 @@ export type TCursorNativeCaptureParams = {
    * capture preload / Connect offer path. Production omits → {@link runCursorNative}.
    */
   readonly runAcp?: (params: TCursorNativeParams) => Promise<TNativeRunResult>;
+  /**
+   * CodeRabbit round 2: production must NEVER default to loopback-allowed
+   * capture destinations. Omitted here → {@link openCursorCaptureBridge}'s
+   * own STRICT default (official Cursor hosts only). Hermetic local tests
+   * that dispatch against a `127.0.0.1` fake upstream pass
+   * `cursorCaptureDestinationPolicy({ allowLoopback: true })` explicitly —
+   * this is a test-only override, never a production relaxation.
+   */
+  readonly destinationPolicy?: TCaptureDestinationPolicy;
 };
 
 /**
@@ -1282,6 +1293,7 @@ export const runCursorNativeCapture = async (
   const bridge = await openCursorCaptureBridge({
     signal: params.signal,
     captureTimeoutMs: params.precommitMs ?? 60_000,
+    destinationPolicy: params.destinationPolicy,
   });
   const builderAbort = new AbortController();
   const builderSignal = AbortSignal.any([params.signal, builderAbort.signal]);
@@ -1404,6 +1416,10 @@ export const runCursorNativeCapture = async (
       let ignoredFramesSeen = 0;
       let requiresDuplexFramesSeen = 0;
       let nativeToolFramesSeen = 0;
+      // KV control (AgentServerMessage.kv_server_message, field 4) counts —
+      // metadata only, never the blob id/data bytes.
+      let kvGetFramesSeen = 0;
+      let kvSetFramesSeen = 0;
       // Bounded, deduplicated inventory of `ignored`-kind reasons (each
       // already carries only bounded field-tag metadata — see
       // `describeProtoFieldTags` — never payload/value).
@@ -1417,7 +1433,7 @@ export const runCursorNativeCapture = async (
       // after terminal agent stream" behavior) rather than a failure.
       let turnEndedSeen = false;
       const diagSnapshot = (): string =>
-        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} heartbeat=${heartbeatFramesSeen} ignored=${ignoredFramesSeen} requiresDuplex=${requiresDuplexFramesSeen} nativeTool=${nativeToolFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged} ignoredReasons=[${ignoredReasonsSeen.join(";")}]`;
+        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} heartbeat=${heartbeatFramesSeen} ignored=${ignoredFramesSeen} requiresDuplex=${requiresDuplexFramesSeen} nativeTool=${nativeToolFramesSeen} kvGet=${kvGetFramesSeen} kvSet=${kvSetFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged} ignoredReasons=[${ignoredReasonsSeen.join(";")}]`;
       const onAbortDuringPeel = (): void => {
         try {
           reader.cancel().catch(() => undefined);
@@ -1455,6 +1471,22 @@ export const runCursorNativeCapture = async (
       // Connect envelopes decode, stopping ONLY on a genuine `endStream`
       // marker (throwing on abort / protocol error / missing terminal — NEVER
       // synthesizing a finish chunk from a plain closed/cancelled reader).
+      // Tear the builder down ONLY on a genuine terminal signal (turn_ended /
+      // endStream) — never on the first model token, which would close the
+      // duplex inject path before a later real KV control round-trip (or
+      // interaction_query) could ever use it.
+      const teardownBuilderOnTerminal = (): void => {
+        bridge.closeDuplexInject(nonNullCaptureId);
+        settleCursorCaptureViaAcpCancel({
+          settlement: {
+            kind: "suppressed",
+            reason: "cursor capture reached a genuine native terminal",
+          },
+          cancelSession: () => {
+            builderAbort.abort();
+          },
+        });
+      };
       async function* stepChunks(): AsyncGenerator<TChatCompletionChunk> {
         try {
           for (;;) {
@@ -1471,6 +1503,7 @@ export const runCursorNativeCapture = async (
                 // transport closing afterward (no Connect endStream) is
                 // benign, not a failure — matches the official client.
                 phase = "done";
+                teardownBuilderOnTerminal();
                 yield {
                   ...baseChunk(),
                   choices: [
@@ -1491,7 +1524,11 @@ export const runCursorNativeCapture = async (
             const next = new Uint8Array(pending.byteLength + value.byteLength);
             next.set(pending, 0);
             next.set(value, pending.byteLength);
-            const taken = takeConnectEnvelopes(next);
+            // Strict: `pending` accumulates across repeated live reads, so an
+            // oversized declared length must fail the instant its 5-byte
+            // header is visible — never be tolerated as "incomplete" while
+            // this buffer keeps growing (CodeRabbit round 2).
+            const taken = takeConnectEnvelopesStrict(next);
             pending = new Uint8Array(taken.rest);
             for (const env of taken.envelopes) {
               framesSeen += 1;
@@ -1536,6 +1573,7 @@ export const runCursorNativeCapture = async (
                 // for the socket to close; per Connect spec this is always
                 // the last message on the stream.
                 phase = "done";
+                teardownBuilderOnTerminal();
                 if (sawModelOutput) {
                   yield {
                     ...baseChunk(),
@@ -1600,6 +1638,7 @@ export const runCursorNativeCapture = async (
                 // close/error as benign).
                 turnEndedSeen = true;
                 phase = "done";
+                teardownBuilderOnTerminal();
                 yield {
                   ...baseChunk(),
                   choices: [
@@ -1634,6 +1673,37 @@ export const runCursorNativeCapture = async (
                   classification: decoded.classification,
                   mcp: decoded.mcp,
                 });
+              }
+              if (decoded.kind === "kv_server") {
+                // Independent-reviewer-verified: `AgentServerMessage.kv_server_message`
+                // (field 4) is a real human/tool/service-facing native
+                // protocol, not inert bookkeeping — a genuine
+                // ControlledKvManager get/set round-trip against the live
+                // builder's own blobStore. Keep the builder alive across
+                // this (never torn down on first model token) and relay ONLY
+                // the exact known get/set envelope unchanged; the real reply
+                // bytes come back from the builder untouched — the daemon
+                // never fabricates a cache miss/write ack, never reads the
+                // blob id/data, and never invents/changes the captured model
+                // request. `tracing`/`unknown` KV subtypes are not relayed —
+                // they fail closed the same as any other unsupported case.
+                if (decoded.subtype === "get_blob") {
+                  kvGetFramesSeen += 1;
+                } else if (decoded.subtype === "set_blob") {
+                  kvSetFramesSeen += 1;
+                }
+                await forwardCursorKvControlThroughBuilder({
+                  captureBridge: bridge,
+                  captureId: nonNullCaptureId,
+                  http2,
+                  serverKvEnvelope: encodeConnectEnvelope(
+                    env.payload,
+                    env.flags,
+                  ),
+                  connectContentEncoding,
+                  signal: params.signal,
+                });
+                continue;
               }
               if (decoded.kind === "requires_duplex") {
                 // Independent-review fix: the H2 duplex path previously had
@@ -1738,20 +1808,18 @@ export const runCursorNativeCapture = async (
                   ignoredReasonsSeen.push(decoded.reason);
                 }
               }
-              if (sawModelOutput) {
-                // Cancel builder once model output begins — never feed it back.
-                bridge.closeDuplexInject(nonNullCaptureId);
-                settleCursorCaptureViaAcpCancel({
-                  settlement: {
-                    kind: "suppressed",
-                    reason:
-                      "request_context complete; daemon owns model stream",
-                  },
-                  cancelSession: () => {
-                    builderAbort.abort();
-                  },
-                });
-              }
+              // Independent-reviewer-verified fix: the builder used to be
+              // cancelled here — as soon as the FIRST model token arrived —
+              // which closed the duplex inject path before a later, real KV
+              // control round-trip (or interaction_query) could ever use it,
+              // producing exactly retest #32/#33's silent gap (frames
+              // counted but never answered). The builder now stays alive
+              // until a genuine terminal signal: `turn_ended` / Connect
+              // `endStream` (below), a thrown error, or the caller
+              // cancelling — never on first model output. Model output/tool
+              // calls are still never written back into the builder; only
+              // known control replies (request_context_result, KV get/set
+              // results) are ever forwarded to it.
             }
           }
         } finally {
@@ -1857,6 +1925,15 @@ export const runCursorNativeCapture = async (
               // ignore
             }
             http2.close();
+            // CodeRabbit round 2: every OTHER terminal path here (iterator
+            // error, stream cancel) aborts the builder; this natural-close
+            // path did not. In the common case `teardownBuilderOnTerminal()`
+            // already aborted it synchronously inside the generator before
+            // yielding the final chunk, so this is idempotent — but it is
+            // the defensive backstop if a future terminal branch inside
+            // `stepChunks()` ever returns without going through that
+            // teardown, so the builder process can never be left running.
+            builderAbort.abort();
             void bridge.dispose();
             return;
           }

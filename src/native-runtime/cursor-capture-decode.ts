@@ -69,6 +69,10 @@ export type TCursorDecodeFailureCode =
   | "unsupported_native_exec"
   /** ExecServerMessage mcp_args surfaced as caller tool_calls; do not execute locally. */
   | "caller_mcp_tool_cancel"
+  /** Server asked for KvServerMessage get/set — BiDi reply required; never fabricate a cache miss/write ack. */
+  | "requires_kv_control_duplex"
+  /** KvServerMessage subtype we don't relay (tracing/unknown), or a KvClientMessage reply that doesn't match the pending request (wrong id/type). */
+  | "unsupported_native_kv"
   | "invalid_protobuf";
 
 export type TCursorExecClass =
@@ -169,6 +173,15 @@ export type TCursorDecodedInteraction =
       readonly kind: "native_tool";
       readonly toolCase: string;
       readonly callId: string;
+    }
+  | {
+      readonly kind: "kv_server";
+      readonly subtype: "get_blob" | "set_blob" | "tracing" | "unknown";
+      /** Proto3 implicit-presence uint32 — 0 is a real id, never "absent". */
+      readonly id: number;
+      /** Lengths only — never the blob id/data bytes themselves. */
+      readonly blobIdLength: number | null;
+      readonly blobDataLength: number | null;
     }
   | { readonly kind: "ignored"; readonly reason: string };
 
@@ -309,8 +322,9 @@ export const encodeConnectEndStream = (
  * Pull complete Connect envelopes from a byte buffer. Returns parsed envelopes
  * and the unconsumed tail (partial frame).
  */
-export const takeConnectEnvelopes = (
+const takeConnectEnvelopesImpl = (
   buffer: Uint8Array,
+  opts: { readonly strict: boolean },
 ): {
   readonly envelopes: ReadonlyArray<TCursorConnectEnvelope>;
   readonly rest: Uint8Array;
@@ -319,11 +333,48 @@ export const takeConnectEnvelopes = (
   let offset = 0;
   while (offset + 5 <= buffer.byteLength) {
     const flags = buffer[offset] ?? 0;
+    // CodeRabbit round 2: `<<` coerces to a SIGNED 32-bit int, so a claimed
+    // length with the top bit set (>= 0x80000000) previously came out
+    // negative — `offset + 5 + length > buffer.byteLength` could then pass
+    // spuriously with a negative length, `buffer.subarray` would get an end
+    // index before its start (empty/garbage payload), and `offset += 5 +
+    // length` could move offset BACKWARD, risking an infinite loop over a
+    // hostile/corrupt stream. `>>> 0` forces the unsigned 32-bit
+    // reassembly Connect actually specifies.
     const length =
-      ((buffer[offset + 1] ?? 0) << 24) |
-      ((buffer[offset + 2] ?? 0) << 16) |
-      ((buffer[offset + 3] ?? 0) << 8) |
-      (buffer[offset + 4] ?? 0);
+      (((buffer[offset + 1] ?? 0) << 24) |
+        ((buffer[offset + 2] ?? 0) << 16) |
+        ((buffer[offset + 3] ?? 0) << 8) |
+        (buffer[offset + 4] ?? 0)) >>>
+      0;
+    // Bound the claimed length against the same cap already enforced on
+    // decompressed envelope payloads (reused, not duplicated). Two modes:
+    //   - lenient (default, `takeConnectEnvelopes`): this function is
+    //     documented to never throw — some callers (e.g.
+    //     `decodeCapturedBidiAppendBody`) buffer a companion best-effort
+    //     even when its bytes are malformed — so an over-cap claim is
+    //     treated as an incomplete frame: the loop stops and the bytes are
+    //     returned as `rest` for the caller to decide.
+    //   - strict (`takeConnectEnvelopesStrict`): live model/control stream
+    //     readers reassemble `pending = pending + newChunk` across repeated
+    //     network reads waiting for a declared length to complete. Treating
+    //     an absurd declared length as merely "incomplete" here means that
+    //     buffer grows without bound for as long as the sender keeps
+    //     sending anything (or forever if it sends nothing) — the exact
+    //     regression CodeRabbit flagged: "oversized length not fully fixed
+    //     by returning incomplete; live stream would retain/grow buffer
+    //     forever". Strict mode rejects the instant the 5-byte header
+    //     itself is visible, before any body bytes are required or
+    //     accumulated further.
+    if (length > CONNECT_COMPRESS_MAX_DECOMPRESSED_BYTES) {
+      if (opts.strict) {
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          `Connect envelope declares length ${length} exceeding ${CONNECT_COMPRESS_MAX_DECOMPRESSED_BYTES} bytes`,
+        );
+      }
+      break;
+    }
     if (offset + 5 + length > buffer.byteLength) break;
     const payload = buffer.subarray(offset + 5, offset + 5 + length);
     envelopes.push({
@@ -339,6 +390,28 @@ export const takeConnectEnvelopes = (
     rest: offset === 0 ? buffer : buffer.subarray(offset),
   };
 };
+
+export const takeConnectEnvelopes = (
+  buffer: Uint8Array,
+): {
+  readonly envelopes: ReadonlyArray<TCursorConnectEnvelope>;
+  readonly rest: Uint8Array;
+} => takeConnectEnvelopesImpl(buffer, { strict: false });
+
+/**
+ * Same framing as {@link takeConnectEnvelopes}, but rejects an oversized
+ * declared envelope length IMMEDIATELY once its 5-byte header is visible —
+ * before waiting for (or accumulating) any more body bytes. Use this for
+ * live model/control stream readers that reassemble a growing buffer across
+ * repeated network reads; use the lenient default for a single
+ * already-fully-received body where best-effort partial decode is wanted.
+ */
+export const takeConnectEnvelopesStrict = (
+  buffer: Uint8Array,
+): {
+  readonly envelopes: ReadonlyArray<TCursorConnectEnvelope>;
+  readonly rest: Uint8Array;
+} => takeConnectEnvelopesImpl(buffer, { strict: true });
 
 // ── Minimal protobuf helpers (encode + decode) ─────────────────────────────
 
@@ -532,6 +605,46 @@ const protoIntField = (
 };
 
 /**
+ * Read a proto3 `uint32` field with IMPLICIT presence: the real (confirmed)
+ * KV wire schema declares `KvServerMessage.id` / `KvClientMessage.id` as a
+ * non-optional uint32, so a genuine proto3 encoder OMITS the field entirely
+ * from the wire when its value is the zero default — an absent field and an
+ * explicit `id=0` are the same bytes. Live retest #34 hit exactly this: a
+ * real KV round-trip with id=0 was rejected as if the id were missing.
+ * This returns 0 when the field is entirely absent (proto3 default), the
+ * decoded varint when present with the correct wire type, and THROWS when
+ * the field number is present with the WRONG wire type (never silently
+ * treated as absent/defaulted) or when its wire type isn't a valid uint32
+ * encoding — a genuine wire-format violation must still fail closed.
+ */
+const protoUint32FieldOrDefault = (
+  fields: ReadonlyArray<TProtoField>,
+  field: number,
+): number => {
+  for (const f of fields) {
+    if (f.field !== field) continue;
+    if (f.wire !== 0 || f.varint === null) {
+      throw new CursorCaptureDecodeError(
+        "invalid_protobuf",
+        `field ${field} has wire type ${f.wire} — expected varint (0) for a uint32`,
+      );
+    }
+    // `readVarint` already returns an unsigned 32-bit value (`>>> 0`) and
+    // throws "varint too long" past 5 continuation bytes, so out-of-range
+    // encodings are already rejected upstream — this is a defensive re-check.
+    if (f.varint < 0 || f.varint > 0xffffffff) {
+      throw new CursorCaptureDecodeError(
+        "invalid_protobuf",
+        `field ${field} varint ${f.varint} out of uint32 range`,
+      );
+    }
+    return f.varint;
+  }
+  // Proto3 implicit presence: absent means the zero default, not "unknown".
+  return 0;
+};
+
+/**
  * Bounded, metadata-only summary of a decoded message's top-level protobuf
  * field tags — field number + wire type ONLY, never the field's bytes/value.
  * Exists so an unhandled/unknown message (a new oneof case the decoder
@@ -694,6 +807,7 @@ export const decodeCapturedBidiAppendBody = (
 export const encodeAgentServerMessage = (args: {
   readonly interactionUpdate?: Uint8Array;
   readonly execServerMessage?: Uint8Array;
+  readonly kvServerMessage?: Uint8Array;
   readonly interactionQuery?: Uint8Array;
 }): Uint8Array => {
   const parts: Uint8Array[] = [];
@@ -703,11 +817,83 @@ export const encodeAgentServerMessage = (args: {
   if (args.execServerMessage !== undefined) {
     parts.push(encodeProtoBytes(2, args.execServerMessage));
   }
+  if (args.kvServerMessage !== undefined) {
+    parts.push(encodeProtoBytes(4, args.kvServerMessage));
+  }
   if (args.interactionQuery !== undefined) {
     parts.push(encodeProtoBytes(7, args.interactionQuery));
   }
   return concatBytes(parts);
 };
+
+/**
+ * `AgentServerMessage.kv_server_message` (field 4, `KvServerMessage`) —
+ * hermetic test/fixture encoder mirroring the real native field numbers:
+ * id(1), get_blob_args(2: blob_id bytes1), set_blob_args(3: blob_id bytes1,
+ * blob_data bytes2), tracing(4).
+ */
+export const encodeKvServerMessage = (args: {
+  readonly id?: number;
+  readonly getBlobArgs?: { readonly blobId: Uint8Array };
+  readonly setBlobArgs?: {
+    readonly blobId: Uint8Array;
+    readonly blobData: Uint8Array;
+  };
+  readonly tracing?: Uint8Array;
+}): Uint8Array => {
+  const parts: Uint8Array[] = [];
+  if (args.id !== undefined) parts.push(encodeProtoInt32(1, args.id));
+  if (args.getBlobArgs !== undefined) {
+    parts.push(
+      encodeProtoBytes(2, encodeProtoBytes(1, args.getBlobArgs.blobId)),
+    );
+  }
+  if (args.setBlobArgs !== undefined) {
+    const inner = concatBytes([
+      encodeProtoBytes(1, args.setBlobArgs.blobId),
+      encodeProtoBytes(2, args.setBlobArgs.blobData),
+    ]);
+    parts.push(encodeProtoBytes(3, inner));
+  }
+  if (args.tracing !== undefined) {
+    parts.push(encodeProtoBytes(4, args.tracing));
+  }
+  return concatBytes(parts);
+};
+
+/**
+ * `AgentClientMessage.kv_client_message` (field 3, `KvClientMessage`) —
+ * hermetic test/fixture encoder: id(1), get_blob_result(2: blob_data
+ * optional bytes1), set_blob_result(3: error optional1).
+ */
+export const encodeKvClientMessage = (args: {
+  readonly id?: number;
+  readonly getBlobResult?: { readonly blobData?: Uint8Array };
+  readonly setBlobResult?: { readonly error?: Uint8Array };
+}): Uint8Array => {
+  const parts: Uint8Array[] = [];
+  if (args.id !== undefined) parts.push(encodeProtoInt32(1, args.id));
+  if (args.getBlobResult !== undefined) {
+    const inner =
+      args.getBlobResult.blobData !== undefined
+        ? encodeProtoBytes(1, args.getBlobResult.blobData)
+        : new Uint8Array(0);
+    parts.push(encodeProtoBytes(2, inner));
+  }
+  if (args.setBlobResult !== undefined) {
+    const inner =
+      args.setBlobResult.error !== undefined
+        ? encodeProtoBytes(1, args.setBlobResult.error)
+        : new Uint8Array(0);
+    parts.push(encodeProtoBytes(3, inner));
+  }
+  return concatBytes(parts);
+};
+
+/** Wrap `KvClientMessage` bytes as `AgentClientMessage.kv_client_message` (field 3). */
+export const encodeAgentClientKvMessage = (
+  kvClientMessage: Uint8Array,
+): Uint8Array => encodeProtoBytes(3, kvClientMessage);
 
 export const encodeTextDeltaUpdate = (text: string): Uint8Array =>
   encodeProtoBytes(1, encodeProtoString(1, text));
@@ -1235,6 +1421,7 @@ export const CURSOR_EXEC_CLIENT_RESULT_CASES: ReadonlyArray<
 
 export type TCursorFollowUpKind =
   | "request_context_result"
+  | "kv_client_result"
   | "benign_control"
   | "forbidden_native"
   | "unknown";
@@ -1359,6 +1546,57 @@ export const classifyAgentClientFollowUp = (
         diagnostic: `followup forbidden exec_client_control.${ctrl} flags=${connectFlags} bytes=${connectPayloadBytes}`,
       };
     }
+    if (agentCase.name === "kv_client_message") {
+      // AgentClientMessage.kv_client_message (field 3, KvClientMessage):
+      // id(1), get_blob_result(2: blob_data optional bytes1),
+      // set_blob_result(3: error optional1). Metadata only — reports which
+      // reply case + its id, never the blob data / error content.
+      const kvFields = parseProtoFields(agentCase.bytes);
+      // Proto3 implicit presence: KvClientMessage.id is a non-optional
+      // uint32, so id=0 is legitimately omitted on the wire by a real
+      // encoder — never treat "absent" as "unknown id" (live retest #34).
+      const kvId = protoUint32FieldOrDefault(kvFields, 1);
+      const getResult = protoMessageField(kvFields, 2);
+      const setResult = protoMessageField(kvFields, 3);
+      if (getResult !== null && setResult === null) {
+        const gf = parseProtoFields(getResult);
+        const blobData = protoMessageField(gf, 1);
+        return {
+          ...base,
+          kind: "kv_client_result",
+          agentClientCase: agentCase.name,
+          execClientCase: "get_blob_result",
+          execId: null,
+          execNumericId: kvId,
+          diagnostic: `followup allow kv_client.get_blob_result id=${kvId} blob_data_len=${blobData?.byteLength ?? 0} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+        };
+      }
+      if (setResult !== null && getResult === null) {
+        const sf = parseProtoFields(setResult);
+        const hasError = protoMessageField(sf, 1) !== null;
+        return {
+          ...base,
+          kind: "kv_client_result",
+          agentClientCase: agentCase.name,
+          execClientCase: "set_blob_result",
+          execId: null,
+          execNumericId: kvId,
+          diagnostic: `followup allow kv_client.set_blob_result id=${kvId} has_error=${hasError} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+        };
+      }
+      return {
+        ...base,
+        kind: "forbidden_native",
+        agentClientCase: agentCase.name,
+        execClientCase:
+          getResult !== null && setResult !== null
+            ? "get_blob_result+set_blob_result"
+            : "unknown_kv_client_reply",
+        execId: null,
+        execNumericId: kvId,
+        diagnostic: `followup forbidden kv_client_message ambiguous_or_unknown id=${kvId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
     if (agentCase.name !== "exec_client_message") {
       return {
         ...base,
@@ -1464,6 +1702,63 @@ export const isAllowlistedRequestContextFollowUp = (
   classifyAgentClientFollowUp(agentClientMessageBytes).kind ===
   "request_context_result";
 
+/**
+ * `AgentServerMessage.kv_server_message` (field 4, `KvServerMessage`) — the
+ * real native KV control protocol: id(1, uint32), get_blob_args(2:
+ * blob_id bytes1), set_blob_args(3: blob_id bytes1, blob_data bytes2),
+ * tracing(4). Metadata-only: reports lengths, never the blob id/data bytes.
+ * The caller (`forwardCursorKvControlThroughBuilder`) relays the ORIGINAL
+ * envelope bytes unchanged into the live builder — this function never
+ * extracts or exposes the actual blob content.
+ */
+const decodeKvServerMessage = (
+  bytes: Uint8Array,
+): TCursorDecodedInteraction => {
+  const fields = parseProtoFields(bytes);
+  const id = protoUint32FieldOrDefault(fields, 1);
+  const getArgs = protoMessageField(fields, 2);
+  if (getArgs !== null) {
+    const gf = parseProtoFields(getArgs);
+    const blobId = protoMessageField(gf, 1);
+    return {
+      kind: "kv_server",
+      subtype: "get_blob",
+      id,
+      blobIdLength: blobId?.byteLength ?? null,
+      blobDataLength: null,
+    };
+  }
+  const setArgs = protoMessageField(fields, 3);
+  if (setArgs !== null) {
+    const sf = parseProtoFields(setArgs);
+    const blobId = protoMessageField(sf, 1);
+    const blobData = protoMessageField(sf, 2);
+    return {
+      kind: "kv_server",
+      subtype: "set_blob",
+      id,
+      blobIdLength: blobId?.byteLength ?? null,
+      blobDataLength: blobData?.byteLength ?? null,
+    };
+  }
+  if (protoMessageField(fields, 4) !== null) {
+    return {
+      kind: "kv_server",
+      subtype: "tracing",
+      id,
+      blobIdLength: null,
+      blobDataLength: null,
+    };
+  }
+  return {
+    kind: "kv_server",
+    subtype: "unknown",
+    id,
+    blobIdLength: null,
+    blobDataLength: null,
+  };
+};
+
 export const decodeAgentServerMessage = (
   bytes: Uint8Array,
 ): TCursorDecodedInteraction => {
@@ -1505,8 +1800,9 @@ export const decodeAgentServerMessage = (
   if (protoMessageField(fields, 3) !== null) {
     return { kind: "ignored", reason: "conversation_checkpoint_update" };
   }
-  if (protoMessageField(fields, 4) !== null) {
-    return { kind: "ignored", reason: "kv_server_message" };
+  const kvServer = protoMessageField(fields, 4);
+  if (kvServer !== null) {
+    return decodeKvServerMessage(kvServer);
   }
   return {
     kind: "ignored",
@@ -1777,6 +2073,15 @@ export const chunksFromCursorConnectResponseBytes = (
             execSubtype: decoded.execSubtype,
             execClass: decoded.execClass,
           },
+        );
+      }
+      case "kv_server": {
+        // KvServerMessage get/set requires a real native BiDi reply from the
+        // live builder's ControlledKvManager (this bulk-decode path has no
+        // live IPC to forward into) — never fabricate a cache miss/write ack.
+        throw new CursorCaptureDecodeError(
+          "requires_kv_control_duplex",
+          `AgentServerMessage.kv_server_message.${decoded.subtype} requires client duplex follow-up; no-execution bridge not active (id=${decoded.id})`,
         );
       }
       case "native_tool": {
@@ -2068,6 +2373,14 @@ export const chunksFromCursorConnectResponseBytesTolerant = (
         };
         break;
       }
+      case "kv_server": {
+        blocked = {
+          code: "requires_kv_control_duplex",
+          message: `AgentServerMessage.kv_server_message.${decoded.subtype} requires client duplex follow-up; no-execution bridge not active (id=${decoded.id})`,
+          toolCallId: null,
+        };
+        break;
+      }
       case "native_tool": {
         blocked = {
           code: "unsupported_native_tool_intent",
@@ -2320,6 +2633,11 @@ export const chunksStreamFromCursorConnectResponseBody = (
                 execClass: decoded.execClass,
               },
             );
+          case "kv_server":
+            throw new CursorCaptureDecodeError(
+              "requires_kv_control_duplex",
+              `AgentServerMessage.kv_server_message.${decoded.subtype} requires client duplex follow-up; no-execution bridge not active (id=${decoded.id})`,
+            );
           case "native_tool":
             if (args.allowNativeToolIntents === true) {
               sawMeaningful = true;
@@ -2367,7 +2685,11 @@ export const chunksStreamFromCursorConnectResponseBody = (
           const next = new Uint8Array(pending.byteLength + value.byteLength);
           next.set(pending, 0);
           next.set(value, pending.byteLength);
-          const taken = takeConnectEnvelopes(next);
+          // Strict: `pending` accumulates across repeated live reads, so an
+          // oversized declared length must fail the instant its 5-byte
+          // header is visible — never tolerated as "incomplete" while this
+          // buffer keeps growing (CodeRabbit round 2).
+          const taken = takeConnectEnvelopesStrict(next);
           // Copy the unconsumed tail into a fresh ArrayBuffer-backed
           // Uint8Array — `subarray` views are `Uint8Array<ArrayBufferLike>`
           // under TS 5.7+ DOM libs and are not assignable to
