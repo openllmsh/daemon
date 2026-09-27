@@ -25,6 +25,7 @@ import {
   DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS,
   DOCTOR_REPORT_POLICY_SCHEMA_VERSION,
   DOCTOR_REPORT_SCHEMA_VERSION,
+  DOCTOR_REPORTING_POLICY_TTL_MS,
   doctorEventHasOutcomeLedger,
   doctorReportingScopeId,
   parseDoctorReport,
@@ -115,9 +116,17 @@ let lastAttemptAccountScope: string | null = null;
 let lastAttemptGeneration: string | null = null;
 // Receipt anchor for the CURRENT reporting policy — keyed on
 // (generation, expires_at_ms) so a re-stamped or re-generated policy
-// re-anchors. See DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS (TCB-7).
+// re-anchors, and refreshed by EVERY accepted bootstrap receipt. See
+// DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS (TCB-7).
 let policyAnchorKey: string | null = null;
 let policyAnchoredAtMs = 0;
+// Cloud→local clock offset estimated at each accepted policy receipt: the
+// cloud stamps `expires_at_ms` ≈ its-now + DOCTOR_REPORTING_POLICY_TTL_MS, so
+// `expires_at_ms − TTL − localNow` approximates `cloudNow − localNow` at
+// receipt. Null until the first receipt. Feeds the device-grant verifier's
+// SERVER-ANCHORED timestamp check (TCB-5) so a skewed daemon clock stops
+// rejecting grants signed on a correct viewer clock.
+let serverClockOffsetMs: number | null = null;
 
 const cursorPath = (): string => doctorStatePath("doctor-report.cursor.json");
 const pendingPath = (): string => doctorStatePath("doctor-report.pending.json");
@@ -276,6 +285,43 @@ const cursorMatchesScope = (
   cursor.generation === scope.generation;
 
 /**
+ * Sanity bound on the accepted cloud↔local offset estimate — a corrupt or
+ * absurd `expires_at_ms` must not tilt the server anchor by days.
+ */
+const MAX_SERVER_CLOCK_OFFSET_MS = 24 * 60 * 60 * 1000;
+
+/** Re-anchor the receipt window on an ACCEPTED policy receipt and refresh the
+ *  server-clock offset estimate in the same step. */
+const anchorPolicyReceipt = (
+  policy: TDaemonReportingPolicy,
+  now: number,
+): void => {
+  policyAnchorKey = `${policy.generation}:${policy.expires_at_ms}`;
+  policyAnchoredAtMs = now;
+  const impliedOffset =
+    policy.expires_at_ms - DOCTOR_REPORTING_POLICY_TTL_MS - now;
+  if (Math.abs(impliedOffset) <= MAX_SERVER_CLOCK_OFFSET_MS) {
+    serverClockOffsetMs = impliedOffset;
+  }
+};
+
+/**
+ * Server-anchored "now": local clock + the cloud offset measured at the last
+ * accepted bootstrap receipt, or null before any receipt. Lets the
+ * device-grant verifier test a signer timestamp against CLOUD time, not only
+ * the possibly-skewed daemon clock (TCB-5).
+ */
+export const daemonServerNowMs = (): number | null =>
+  serverClockOffsetMs === null ? null : clock() + serverClockOffsetMs;
+
+/** Test-only: inject a server-clock offset when no real receipt feeds one. */
+export const setDaemonServerClockOffsetForTests = (
+  offsetMs: number | null,
+): void => {
+  serverClockOffsetMs = offsetMs;
+};
+
+/**
  * Whether the policy permits an upload NOW, on the LOCAL clock: enabled, the
  * right schema, and received less than DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS
  * ago. This replaces the raw `reportingPolicyAllowsUpload` check
@@ -283,6 +329,12 @@ const cursorMatchesScope = (
  * comparing it with the daemon clock made uploads fail closed on any
  * daemon/cloud skew over the TTL and let revoked policies live over-long when
  * the local clock ran behind (TCB-7).
+ *
+ * Elapsed is measured receipt-relative on the daemon's clock; a NEGATIVE
+ * elapsed (clock rolled back below the anchor — NTP step-back, manual set)
+ * fails CLOSED: the window can no longer be trusted, so the policy is treated
+ * as expired rather than letting a wound-back clock keep it live (rework-5).
+ * A fresh accepted receipt re-anchors and ends the outage.
  */
 const reportingPolicyLive = (
   policy: TDaemonReportingPolicy | null,
@@ -298,10 +350,13 @@ const reportingPolicyLive = (
   }
   const key = `${policy.generation}:${policy.expires_at_ms}`;
   if (key !== policyAnchorKey) {
+    // First sight of a policy that arrived without a bootstrap callback
+    // (boot-time load, test injection) — anchor at first observation.
     policyAnchorKey = key;
     policyAnchoredAtMs = now;
   }
-  return now - policyAnchoredAtMs < DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS;
+  const elapsed = now - policyAnchoredAtMs;
+  return elapsed >= 0 && elapsed < DOCTOR_REPORT_POLICY_RECEIVED_TTL_MS;
 };
 
 type TUploadEligibility =
@@ -992,9 +1047,19 @@ export const onBootstrapReportingPolicy = (
   const scope = reportingScope();
   if (scope.policy === null || scope.policy.enabled === false) {
     cloudSuspended = true;
+    policyAnchorKey = null;
     discardReportingWindow();
     return;
   }
+  if (scope.policy.schema_version !== DOCTOR_REPORT_POLICY_SCHEMA_VERSION) {
+    // Not an acceptable receipt — nothing to anchor.
+    return;
+  }
+  // EVERY accepted receipt re-anchors the receipt window — even a
+  // byte-identical policy (rework-5 / TCB-7): the TTL measures "time since
+  // the last cloud receipt", not "age of this generation". The same step
+  // refreshes the server-clock offset for the grant verifier.
+  anchorPolicyReceipt(scope.policy, clock());
   if (!reportingPolicyLive(scope.policy, clock())) return;
   if (revokedAtPolicyRevision !== null && revision <= revokedAtPolicyRevision) {
     return;
@@ -1030,5 +1095,6 @@ export const resetDoctorEngineForTests = (): void => {
   clearAttemptMemory();
   policyAnchorKey = null;
   policyAnchoredAtMs = 0;
+  serverClockOffsetMs = null;
   resetDoctorRepeatForTests();
 };

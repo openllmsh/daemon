@@ -13,6 +13,7 @@ import {
   DEVICE_GRANT_TS_WINDOW_MS,
   decodeDeviceGrant,
 } from "@openllmsh/tunnel";
+import { daemonServerNowMs } from "./doctor-report/engine";
 import { logWarn, safeDiagnosticMessage } from "./logger";
 import { mutateState, readState } from "./state-file";
 
@@ -208,7 +209,7 @@ const STALE_TS_WARN_MIN_INTERVAL_MS = 60_000;
 let lastStaleTsWarnAt = Number.NEGATIVE_INFINITY;
 let staleTsWarnSuppressed = 0;
 
-const warnStaleTs = (skewMs: number): void => {
+const warnStaleTs = (skewMs: number, serverSkewMs: number | null): void => {
   const now = Date.now();
   if (now - lastStaleTsWarnAt < STALE_TS_WARN_MIN_INTERVAL_MS) {
     staleTsWarnSuppressed += 1;
@@ -220,6 +221,7 @@ const warnStaleTs = (skewMs: number): void => {
     safeDiagnosticMessage`device grant rejected: stale_ts (signer/verifier clock skew beyond the grant window)`,
     {
       skew_ms: skewMs,
+      ...(serverSkewMs === null ? {} : { server_skew_ms: serverSkewMs }),
       window_ms: DEVICE_GRANT_TS_WINDOW_MS,
       suppressed: staleTsWarnSuppressed,
     },
@@ -264,14 +266,28 @@ export const checkDeviceGrant = (
     return { ok: false, reason: "bad_sig" };
   }
   const now = Date.now();
-  if (Math.abs(now - envelope.ts) > DEVICE_GRANT_TS_WINDOW_MS) {
-    // Surface the measured skew: `stale_ts` rejections mean the viewer's clock
-    // differs from this host's by more than the grant window (TCB-5). The
-    // signed offset lands in the daemon log + doctor observations so support
-    // can see WHICH clock is off and by how much — signature-verified only,
-    // and rate-limited (see `warnStaleTs`).
-    warnStaleTs(now - envelope.ts);
-    return { ok: false, reason: "stale_ts" };
+  const localSkewMs = now - envelope.ts;
+  // Server-anchored check (TCB-5): when a bootstrap receipt has pinned the
+  // cloud↔local offset, a grant inside the window of CLOUD time is accepted
+  // even when THIS host's clock is skewed — the signer (viewer device) and
+  // the cloud are the two clocks a correct viewer is plausibly synced to.
+  // Reject only when BOTH anchors say stale; a skewed daemon clock can no
+  // longer fail valid grants on its own.
+  if (Math.abs(localSkewMs) > DEVICE_GRANT_TS_WINDOW_MS) {
+    const serverNow = daemonServerNowMs();
+    const serverSkewMs = serverNow === null ? null : serverNow - envelope.ts;
+    if (
+      serverSkewMs === null ||
+      Math.abs(serverSkewMs) > DEVICE_GRANT_TS_WINDOW_MS
+    ) {
+      // Surface the measured skew: `stale_ts` rejections mean the viewer's
+      // clock differs from every trusted anchor by more than the grant
+      // window (TCB-5). The signed offset lands in the daemon log + doctor
+      // observations so support can see WHICH clock is off and by how much —
+      // signature-verified only, and rate-limited (see `warnStaleTs`).
+      warnStaleTs(localSkewMs, serverSkewMs);
+      return { ok: false, reason: "stale_ts" };
+    }
   }
   if (envelope.key_id !== expect.keyId) {
     return { ok: false, reason: "key_id_mismatch" };
