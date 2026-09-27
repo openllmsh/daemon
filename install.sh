@@ -1091,7 +1091,10 @@ install_component() {
   # disk (we no longer force ad-hoc re-sign when codesign --verify passes).
   # The stamp remains for the fallback ad-hoc path (unsigned/invalid) where
   # re-signing rewrites bytes after the published digest check.
-  if [ -x "$dest" ]; then
+  # NEVER in local mode: the operator's file must always be hashed and
+  # verified — a shortcut here would accept a wrong local file whenever the
+  # installed binary already carries the expected digest.
+  if [ -x "$dest" ] && [ -z "$local_file" ]; then
     installed="$(sha256_of "$dest" || true)"
     if [ -n "$installed" ]; then
       if [ "$installed" = "$published" ]; then
@@ -1624,7 +1627,12 @@ rm -f "$pidtmp" "$launchfile" 2>/dev/null || true
 # The pidfile is removed only when it is still OURS and the process group is
 # CONFIRMED gone — never when the pgid is unknown (timeout branch, ps
 # failure): an unverifiable group leaves the pid+start record for a re-run.
-trap 'if [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null \
+# `group_confirmed_gone` covers the set -m path where the leader died before
+# `ps` could report AND its whole group is already empty: that shape is
+# proven dead too, so the pidfile must not linger.
+group_confirmed_gone=0
+trap 'if { { [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null; } \
+  || [ "$group_confirmed_gone" = 1 ]; } \
   && [ "$(cat "$pidfile" 2>/dev/null || true)" = "$myrec" ]; then
   rm -f "$pidfile" 2>/dev/null || true
 fi' EXIT
@@ -1707,6 +1715,13 @@ else
   # pipeline is still signalled and reaped as one group.
   if [ -z "$pgid" ] && kill -0 -- -"$leader" 2>/dev/null; then
     pgid="$leader"
+  fi
+  # Leader already dead AND no group with that id — the tree is PROVEN gone
+  # (a dead leader with surviving children would still answer the group
+  # probe). The EXIT trap can then drop the pidfile instead of leaving a
+  # dead record a re-run has to reap.
+  if [ -z "$pgid" ] && ! kill -0 "$leader" 2>/dev/null; then
+    group_confirmed_gone=1
   fi
   # Still unverified: signal the leader alone and leave pgid empty, so the
   # EXIT trap keeps the pidfile (the group cannot be confirmed gone).
@@ -1917,10 +1932,12 @@ OPENLLM_VENDOR_JOB
 # `|| true` + the subshell/background jobs keep this off the `set -euo
 # pipefail` path — a vendor install can never abort the daemon install.
 # Skipped on a manual update: rerunning every vendor's installer is a
-# first-install action the user didn't ask for.
+# first-install action the user didn't ask for. Also skipped ENTIRELY in
+# --from-file local mode (NR2-3): a private-prerelease install must never
+# touch the network — not even an opted-in vendor provisioning job.
 VENDOR_JOBS_STARTED=0
 VENDOR_MISSING_PRINTED=0
-if [ "$INSTALL_MODE" != update ]; then
+if [ "$INSTALL_MODE" != update ] && [ -z "$FROM_FILE" ]; then
   provision_clis || true
 fi
 
