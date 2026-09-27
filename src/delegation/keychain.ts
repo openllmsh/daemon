@@ -36,12 +36,36 @@
  * empty-password drift self-heals once (rename-aside + recreate); a chain
  * that still can't unlock is negative-cached so it stops re-prompting.
  * See docs/plan/2026-08-22-daemon-keychain-gui-prompt-wedge-fix.md.
+ *
+ * ── Path permissions (FSS-11) ─────────────────────────────────────────
+ * The chain's password is "" by design, so the filesystem modes on its path
+ * are the only barrier against another local macOS account copying the
+ * file and opening it. Every dir from the daemon state dir down to
+ * `Library/Keychains` is created 0700 and every file in the Keychains dir
+ * is forced 0600. `repairIsolatedKeychainPermissions` re-checks the modes
+ * on every readiness probe and readiness fails closed while the path
+ * cannot be proven private: a symlink at an expected path, a dir that is
+ * not a dir, a user-owned symlinked ancestor anywhere on the route, or a
+ * Keychains dir too large to scan completely all refuse the chain. Repair
+ * chmods SPELLED paths only — a canonical target is never chmodded —
+ * every managed dir is lstat'd before the first chmod, and the chmod runs
+ * through a no-follow fd (O_NOFOLLOW + fchmod), so a swapped-in link can
+ * never redirect it onto a foreign target. A parked `*-superseded-*` name
+ * that is not a plain file is refused before any `security` spawn.
  */
 import { randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
+  chmodSync,
+  closeSync,
   existsSync,
+  fchmodSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   opendirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -50,7 +74,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { superviseSpawn } from "../child-supervisor";
 import type { TDeadlineBudget } from "../deadline-budget";
 import {
@@ -59,6 +83,7 @@ import {
   splitReapBudget,
   waitUntilExpired,
 } from "../deadline-budget";
+import { stateDir } from "../env";
 import {
   logDebug,
   logError,
@@ -240,12 +265,21 @@ let lastWatcherSnapshot = emptyKeychainCounters();
 
 let securitySpawnSetupHookForTests: (() => Promise<void> | void) | null = null;
 let lastSecurityTimerMsForTests: number | null = null;
+let chmodAfterRenameHookForTests: ((path: string) => void) | null = null;
 
 /** Test-only: run after `superviseSpawn`, before the child timeout is armed. */
 export const setSecuritySpawnSetupHookForTests = (
   hook: (() => Promise<void> | void) | null,
 ): void => {
   securitySpawnSetupHookForTests = hook;
+};
+
+/** Test-only: runs with `kc` between the staged rename and its chmod so a
+ *  test can make that chmod fail with the staged file already in place. */
+export const setChmodAfterRenameHookForTests = (
+  hook: ((path: string) => void) | null,
+): void => {
+  chmodAfterRenameHookForTests = hook;
 };
 
 /** Test-only: delay passed to `setTimeout` for the last security child. */
@@ -985,32 +1019,38 @@ export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
 const DIR_SCAN_MAX_ENTRIES = 4096;
 
 /** Read at most `max` entry names from `dir` without materialising the whole
- *  directory (readdirSync would allocate every name up front). */
+ *  directory (readdirSync would allocate every name up front). `truncated`
+ *  reports that the dir held MORE than `max` entries — a caller that must
+ *  prove every entry safe has to fail closed on it. */
 const boundedDirNames = (
   dir: string,
   max: number = DIR_SCAN_MAX_ENTRIES,
-): string[] => {
+): { names: string[]; truncated: boolean } => {
   const names: string[] = [];
   const handle = opendirSync(dir);
   try {
+    let truncated = false;
     for (
       let entry = handle.readSync();
       entry !== null;
       entry = handle.readSync()
     ) {
+      if (names.length >= max) {
+        truncated = true;
+        break;
+      }
       names.push(entry.name);
-      if (names.length >= max) break;
     }
+    return { names, truncated };
   } finally {
     handle.closeSync();
   }
-  return names;
 };
 
 const brokenKeychainCount = (kc: string): number => {
   try {
     const prefix = `${basename(kc)}.broken-`;
-    return boundedDirNames(dirname(kc)).filter((name) =>
+    return boundedDirNames(dirname(kc)).names.filter((name) =>
       name.startsWith(prefix),
     ).length;
   } catch {
@@ -1032,7 +1072,7 @@ const isOwnedStagingName = (name: string): boolean =>
 
 const sweepOwnedStaging = (dir: string): void => {
   try {
-    for (const f of boundedDirNames(dir)) {
+    for (const f of boundedDirNames(dir).names) {
       if (isOwnedStagingName(f)) rmSync(join(dir, f), { force: true });
     }
   } catch {
@@ -1044,6 +1084,396 @@ const removeOwnedPath = (path: string): void => {
   try {
     rmSync(path, { force: true });
   } catch {}
+};
+
+// ── FSS-11: path permissions ────────────────────────────────────────────
+// The isolated chain unlocks with password "" by design. The only thing
+// that stops another local account from copying the file and opening it is
+// the filesystem mode on its path. macOS home dirs let the `staff` group
+// traverse them, so every dir from the daemon state dir down to
+// `Library/Keychains` must be 0700 and every file in the Keychains dir must
+// be 0600. Older installs created these with the umask (0755) and never
+// chmodded the file, so the modes are also repaired on every probe.
+
+/** Required mode for every directory on the isolated-keychain path. */
+const KEYCHAIN_DIR_MODE = 0o700;
+/** Required mode for the keychain file and every sibling file in the
+ *  Keychains dir. Parked backups and broken asides hold credentials too. */
+const KEYCHAIN_FILE_MODE = 0o600;
+const KEYCHAIN_PERM_MASK = 0o777;
+const STICKY_BIT = 0o1000;
+/** Permission bits plus special bits (sticky, setid): the full mode a
+ *  proven-private dir must match exactly. */
+const FULL_MODE_MASK = 0o7777;
+/** Group/other permission bits — set means accounts besides the owner can
+ *  enter or read. */
+const GROUP_OTHER_BITS = 0o077;
+
+/** Homes whose permissions were repaired at least once this process. The
+ *  info line is a boot breadcrumb, not a per-call record. */
+const permRepairLogged = new Set<string>();
+
+const logPermRepairOnce = (home: string, changed: number): void => {
+  if (permRepairLogged.has(home)) return;
+  permRepairLogged.add(home);
+  logInfo("keychain", "repaired isolated keychain path permissions", {
+    keychain_home: home,
+    fixed_entries: changed,
+  });
+};
+
+/** `realpathSync` that still resolves the existing prefix when the leaf (or
+ *  several trailing components) does not exist yet. The isolated home and
+ *  the state dir may be absent on a fresh install. */
+const canonicalPath = (path: string): string => {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    if (parent === path) return path;
+    return join(canonicalPath(parent), basename(path));
+  }
+};
+
+/** Open flags that make the FINAL component of a path safe to act on:
+ *  `O_NOFOLLOW` refuses to open a link and `O_DIRECTORY` requires a real
+ *  dir. The constants can be absent on win32, so they are read through an
+ *  optional-typed view — this path is darwin-gated, but the module must
+ *  still load everywhere. */
+const FLAG_NOFOLLOW: number =
+  (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+const FLAG_DIRECTORY: number =
+  (fsConstants as { O_DIRECTORY?: number }).O_DIRECTORY ?? 0;
+const DIR_OPEN_FLAGS = fsConstants.O_RDONLY | FLAG_NOFOLLOW | FLAG_DIRECTORY;
+const FILE_OPEN_FLAGS = fsConstants.O_RDONLY | FLAG_NOFOLLOW;
+
+/** fd that provably names a real dir at `path`: a final-component link or a
+ *  non-dir fails to open instead of being followed. The fd then pins the
+ *  inode, so an `fchmodSync` on it lands on the opened dir no matter how the
+ *  spelled name is swapped afterwards. */
+const openVerifiedDir = (path: string): number | null => {
+  try {
+    return openSync(path, DIR_OPEN_FLAGS);
+  } catch {
+    return null;
+  }
+};
+
+/** fd that provably names a real file (never a link) at `path`. */
+const openVerifiedFile = (path: string): number | null => {
+  try {
+    return openSync(path, FILE_OPEN_FLAGS);
+  } catch {
+    return null;
+  }
+};
+
+/** Force a regular file to 0600 through a no-follow fd. The spelled-path
+ *  fallback runs only when `lstat` proves the entry is a real file that
+ *  will not open (a mode like 000 blocks the open): the route above it is
+ *  already proven link-free, so the named chmod cannot land on a foreign
+ *  target. */
+const chmodFilePrivate = (file: string): boolean => {
+  const fd = openVerifiedFile(file);
+  if (fd !== null) {
+    try {
+      fchmodSync(fd, KEYCHAIN_FILE_MODE);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      closeSync(fd);
+    }
+  }
+  try {
+    if (!lstatSync(file).isFile()) return false;
+    chmodSync(file, KEYCHAIN_FILE_MODE);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Force a dir to 0700 through a no-follow fd. Same spelled-path fallback
+ *  as `chmodFilePrivate` for a real dir that will not open. The caller must
+ *  already have proven the route link-free; `lstat` is re-checked here so a
+ *  swapped-in link refuses instead of being chmodded through. */
+const chmodDirPrivate = (dir: string): boolean => {
+  const fd = openVerifiedDir(dir);
+  if (fd !== null) {
+    try {
+      fchmodSync(fd, KEYCHAIN_DIR_MODE);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      closeSync(fd);
+    }
+  }
+  try {
+    if (!lstatSync(dir).isDirectory()) return false;
+    chmodSync(dir, KEYCHAIN_DIR_MODE);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Verify the spelled route to `path`: every EXISTING component from the
+ *  leaf up to `/` — ancestors above the state dir included — must be a real
+ *  directory. The one allowed exception is a symlink owned by uid 0: macOS
+ *  links `/var` → `/private/var` and `/tmp` → `/private/tmp`, and no
+ *  non-root local account can plant or retarget a root-owned link. A
+ *  user-owned link mid-route would send every later chmod and `mkdir` into
+ *  a tree the link owner controls, so it refuses the path. Components that
+ *  do not exist yet are skipped: `mkdir` creates them and the post-create
+ *  repair pass re-proves the route before any file lands. */
+const spelledRouteIsSafe = (path: string): boolean => {
+  let cursor = path;
+  for (;;) {
+    try {
+      const st = lstatSync(cursor);
+      if (st.isSymbolicLink()) {
+        if (st.uid !== 0) return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    } catch (err) {
+      if (classifyStatError(err) !== "absent") return false;
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) return true;
+    cursor = parent;
+  }
+};
+
+/** Every directory that must be 0700 for the isolated chain to stay
+ *  private: `home`, its `Library` children, and — only when `home` is
+ *  spelled under the daemon state dir — every ancestor from
+ *  `dirname(home)` up to and including the state dir. A `home` outside the
+ *  state dir repairs `home` and below only; foreign ancestors (`/tmp`,
+ *  `/var`) are never touched.
+ *
+ *  `home` must arrive already normalized (`resolve`) and `stateDir()` is
+ *  normalized here too: a trailing separator or a `..` in either path would
+ *  make the lexical prefix test fail and refuse every valid vendor home.
+ *
+ *  Only SPELLED paths are returned — never canonical (`realpath`) forms.
+ *  A spelled managed dir that turns out to be a symlink is refused by the
+ *  repair pass, so a chmod can never land on an unproven resolved target.
+ *  Returns null when `home` reaches the state dir through a route the
+ *  spelled path does not show (a symlinked component above `home`): the
+ *  intended-path identity cannot be proven, so the caller must refuse
+ *  rather than pick chmod targets it cannot verify. */
+const protectedKeychainDirs = (home: string): string[] | null => {
+  const dirs = new Set<string>([
+    home,
+    join(home, "Library"),
+    dirname(isolatedKeychainPath(home)),
+    dirname(domainPrefsPath(home)),
+  ]);
+  const stateRoot = resolve(stateDir());
+  if (home.startsWith(`${stateRoot}/`)) {
+    // The spelled ancestors are the managed chain: each is lstat'd by the
+    // repair pass, so a link between the state dir and `home` refuses the
+    // repair instead of redirecting a chmod onto its target.
+    for (
+      let cursor = dirname(home);
+      cursor === stateRoot || cursor.startsWith(`${stateRoot}/`);
+      cursor = dirname(cursor)
+    ) {
+      dirs.add(cursor);
+      if (cursor === stateRoot) break;
+    }
+    return [...dirs];
+  }
+  // `home` is not spelled under the state dir. When its canonical form is
+  // still inside it, a link above `home` hides the real location — the
+  // spelled ancestors are not ours to verify, so refuse.
+  const canonHome = canonicalPath(home);
+  const canonState = canonicalPath(stateRoot);
+  if (canonHome === canonState || canonHome.startsWith(`${canonState}/`)) {
+    return null;
+  }
+  return [...dirs];
+};
+
+/** Force every existing dir on the keychain path to 0700 and every file in
+ *  the Keychains dir to 0600. The targets readiness hands to `security` are
+ *  lstat'd by name, so a capped scan can never skip them: a symlink or any
+ *  non-regular entry at an expected path fails closed instead of letting a
+ *  chmod or a `security` open land on a foreign target. Siblings that are
+ *  links are never chmodded through (their targets are unproven); the paths
+ *  the daemon does open are verified directly. A scan too big to prove
+ *  complete fails closed too. A sticky dir that group/other can enter is
+ *  shared space (like `/tmp`) — the chain must not live there, and chmodding
+ *  a dir that is not ours would break the share — while a sticky dir that
+ *  exposes nothing is still private, so its bit is cleared by the chmod that
+ *  enforces 0700. Every chmod runs through a no-follow fd (the spelled-path
+ *  fallback only fires for a real entry that will not open at all), so a
+ *  swap between the checks and the chmod cannot redirect it. Returns false
+ *  when the path cannot be proven private; the caller must not stage or
+ *  unlock a credential another account could copy. */
+const repairIsolatedKeychainPermissions = (home: string): boolean => {
+  if (!isAbsolute(home)) return false;
+  // Normalize `..`, `.` and trailing separators: a lexical oddity must not
+  // dodge the state-dir prefix test or refuse a valid vendor home.
+  const safeHome = resolve(home);
+  // `/` can never hold an isolated chain — refuse before it is walked or
+  // chmodded.
+  if (dirname(safeHome) === safeHome) return false;
+  // The real user home is never a valid isolated keychain home. Refuse
+  // before any chmod can touch it.
+  if (canonicalPath(safeHome) === canonicalPath(homedir())) return false;
+  const dirs = protectedKeychainDirs(safeHome);
+  // `home` reaches the state dir only through a link the spelled path does
+  // not name — the managed set is unverifiable, so touch nothing.
+  if (dirs === null) {
+    warnKeychainOnce(
+      `perm-unsafe:${safeHome}`,
+      "isolated keychain home reaches the state dir through a symlinked route; refusing to use the chain",
+      { keychain_home: safeHome },
+    );
+    return false;
+  }
+  // Every existing component of the spelled route — the ancestors above the
+  // state dir included — must be a real dir or a root-owned system link. A
+  // user-owned link mid-route would send every later chmod and `mkdir` into
+  // a tree the link owner controls.
+  if (!spelledRouteIsSafe(safeHome)) {
+    warnKeychainOnce(
+      `perm-unsafe:${safeHome}`,
+      "isolated keychain path crosses a symlinked ancestor; refusing to use the chain",
+      { keychain_home: safeHome },
+    );
+    return false;
+  }
+  let ok = true;
+  let changed = 0;
+  // Pass 1: lstat EVERY managed dir before the first chmod runs. A symlink
+  // at any managed path means every deeper spelled path resolves through an
+  // unproven foreign target, so one link refuses the whole repair — no dir,
+  // file, or sibling is chmodded at all.
+  const verifiedDirs: string[] = [];
+  for (const dir of dirs) {
+    let st: Stats;
+    try {
+      st = lstatSync(dir);
+    } catch (err) {
+      if (classifyStatError(err) !== "absent") ok = false;
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      warnKeychainOnce(
+        `perm-unsafe:${safeHome}`,
+        "isolated keychain path contains a symlinked or non-directory component; refusing to use the chain",
+        { keychain_home: safeHome },
+      );
+      return false;
+    }
+    verifiedDirs.push(dir);
+  }
+  // Pass 2: chmod each verified dir through a no-follow fd. The open proves
+  // the leaf is still a real dir and `fchmodSync` lands on that opened
+  // inode, so a name swap between pass 1 and here cannot redirect the chmod.
+  for (const dir of verifiedDirs) {
+    const fd = openVerifiedDir(dir);
+    if (fd === null) {
+      // lstat proved a real dir that will not open (e.g. mode 000). The
+      // route is already proven link-free, so a named chmod restores the
+      // access the fd open needs without following anything.
+      if (chmodDirPrivate(dir)) changed++;
+      else ok = false;
+      continue;
+    }
+    try {
+      const st = fstatSync(fd);
+      const permBits = st.mode & KEYCHAIN_PERM_MASK;
+      // Sticky AND open to group/other is shared space (like `/tmp`): never
+      // chmod a dir that is not ours, never let the chain live there.
+      if ((st.mode & STICKY_BIT) !== 0 && (permBits & GROUP_OTHER_BITS) !== 0) {
+        ok = false;
+        continue;
+      }
+      if ((st.mode & FULL_MODE_MASK) === KEYCHAIN_DIR_MODE) continue;
+      // fchmod to exactly 0700 also clears a private dir's stray sticky or
+      // setid bits, so a `01700` dir is repaired rather than refused.
+      fchmodSync(fd, KEYCHAIN_DIR_MODE);
+      changed++;
+    } catch {
+      ok = false;
+    } finally {
+      closeSync(fd);
+    }
+  }
+  // The files readiness hands to `security` (the chain and the legacy name
+  // it can be migrated from) or lets `security` write (the domain plist).
+  // Each is lstat'd by name — a symlink or a non-regular file there would
+  // open or overwrite an unproven target, so it fails closed.
+  for (const file of [
+    isolatedKeychainPath(safeHome),
+    legacyLoginKeychainPath(safeHome),
+    domainPrefsPath(safeHome),
+  ]) {
+    let st: Stats;
+    try {
+      st = lstatSync(file);
+    } catch (err) {
+      if (classifyStatError(err) !== "absent") ok = false;
+      continue;
+    }
+    if (!st.isFile()) {
+      ok = false;
+      continue;
+    }
+    if ((st.mode & KEYCHAIN_PERM_MASK) === KEYCHAIN_FILE_MODE) continue;
+    if (chmodFilePrivate(file)) changed++;
+    else ok = false;
+  }
+  const keychainsDir = dirname(isolatedKeychainPath(safeHome));
+  let dirSt: Stats | null = null;
+  try {
+    dirSt = lstatSync(keychainsDir);
+  } catch (err) {
+    if (classifyStatError(err) !== "absent") ok = false;
+  }
+  // Scan siblings only when the Keychains dir is a real dir — pass 1 proved
+  // every managed path above it link-free, so the spelled dir is the dir the
+  // daemon means.
+  if (dirSt?.isDirectory()) {
+    try {
+      const scan = boundedDirNames(keychainsDir);
+      // A capped scan cannot prove every sibling private — an unprotected
+      // chain could hide past the cap, so truncation fails closed.
+      if (scan.truncated) ok = false;
+      for (const name of scan.names) {
+        const file = join(keychainsDir, name);
+        try {
+          const st = lstatSync(file);
+          // Never chmod through a link — its target is unproven. A sibling
+          // link holds no chain bytes of ours; the named paths `security`
+          // opens are verified above and after any migration.
+          if (!st.isFile()) continue;
+          if ((st.mode & KEYCHAIN_PERM_MASK) === KEYCHAIN_FILE_MODE) continue;
+          if (chmodFilePrivate(file)) changed++;
+          else ok = false;
+        } catch (err) {
+          if (classifyStatError(err) !== "absent") ok = false;
+        }
+      }
+    } catch (err) {
+      if (classifyStatError(err) !== "absent") ok = false;
+    }
+  }
+  if (changed > 0) logPermRepairOnce(safeHome, changed);
+  if (!ok) {
+    warnKeychainOnce(
+      `perm-unsafe:${safeHome}`,
+      "isolated keychain path permissions are unsafe and could not be repaired; refusing to use the chain",
+      { keychain_home: safeHome },
+    );
+  }
+  return ok;
 };
 
 type TPreparedStaging = {
@@ -1058,11 +1488,17 @@ const prepareStagingKeychain = async (
   dir: string,
   signal?: AbortSignal,
 ): Promise<TPreparedStaging | null> => {
+  // FSS-11: refuse to stage a chain on a path that is not private. The
+  // first check runs BEFORE mkdir so a refused path is never created
+  // through (e.g. onto the target of a symlinked component); the second
+  // re-proves the dirs mkdir just materialised.
+  if (!repairIsolatedKeychainPermissions(home)) return null;
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: KEYCHAIN_DIR_MODE });
   } catch {
     return null;
   }
+  if (!repairIsolatedKeychainPermissions(home)) return null;
   sweepOwnedStaging(dir);
   const staging = ownedStagingPath(dir);
   const created = await runSecurity(
@@ -1115,6 +1551,13 @@ const createIsolatedKeychain = async (
     removeOwnedPath(prepared.path);
     return existsSync(kc);
   }
+  try {
+    // The staging file keeps the mode `create-keychain` gave it. Force 0600 —
+    // the "" password makes a world-readable chain file a credential leak.
+    chmodSync(kc, KEYCHAIN_FILE_MODE);
+  } catch {
+    return false;
+  }
   return (
     existsSync(kc) &&
     (await runSecurity(["unlock-keychain", "-p", "", kc], home, signal))
@@ -1154,9 +1597,15 @@ const recreateIsolatedKeychain = async (
       originalMoved = true;
     }
     renameSync(prepared.path, kc);
+    chmodAfterRenameHookForTests?.(kc);
+    chmodSync(kc, KEYCHAIN_FILE_MODE);
   } catch {
     removeOwnedPath(prepared.path);
-    if (originalMoved && !existsSync(kc)) {
+    if (originalMoved) {
+      // The failure can be post-rename (the chmod), leaving the staged file
+      // on `kc`. Remove whatever sits there so the original is restored —
+      // a staged file left in place would strand the credential at `aside`.
+      removeOwnedPath(kc);
       try {
         renameSync(aside, kc);
       } catch {}
@@ -1271,7 +1720,17 @@ const ensureDomainKeychainConfig = async (
     // Sync fs on purpose: callers of `ensureKeychainReady` may await the op
     // from a resolved-promise poll loop that never yields to the event loop —
     // an `fs/promises` await here would starve them (and us).
-    mkdirSync(dirname(domainPrefsPath(home)), { recursive: true });
+    const prefsDir = dirname(domainPrefsPath(home));
+    mkdirSync(prefsDir, { recursive: true, mode: KEYCHAIN_DIR_MODE });
+    // chmod through a no-follow fd so a swapped-in link at `prefsDir` can
+    // never redirect the chmod onto a foreign dir.
+    const prefsFd = openVerifiedDir(prefsDir);
+    if (prefsFd === null) return false;
+    try {
+      fchmodSync(prefsFd, KEYCHAIN_DIR_MODE);
+    } finally {
+      closeSync(prefsFd);
+    }
   } catch {
     return false;
   }
@@ -1320,6 +1779,14 @@ const keychainItemCount = async (
   kcPath: string,
   signal?: AbortSignal,
 ): Promise<number | null> => {
+  // Never hand `security` a path that is not a plain file: unlock/dump would
+  // follow a link onto an unproven foreign target. lstat by name — the only
+  // safe check before a spawn.
+  try {
+    if (!lstatSync(kcPath).isFile()) return null;
+  } catch {
+    return null;
+  }
   const unlocked = await spawnSecurity(
     ["unlock-keychain", "-p", "", kcPath],
     home,
@@ -1423,12 +1890,15 @@ const readMigrationMarker = (home: string): ReadonlySet<string> => {
   let parsed: unknown;
   try {
     const marker = migrationMarkerPath(home);
-    const size = statSync(marker).size;
-    if (size > MIGRATION_MARKER_MAX_BYTES) {
+    // lstat: a marker that is not a plain file (e.g. a link) is unreadable —
+    // a foreign file must never decide which parked chains are resolved.
+    const st = lstatSync(marker);
+    if (!st.isFile()) return new Set();
+    if (st.size > MIGRATION_MARKER_MAX_BYTES) {
       warnKeychainOnce(
         "migration-marker-oversized",
         "keychain migration marker exceeds the size cap; treating it as corrupt",
-        { marker_size: size },
+        { marker_size: st.size },
       );
       return new Set();
     }
@@ -1616,6 +2086,16 @@ const resolveSupersededLegacy = async (
  *  newest pending chain it did see rather than pretending none exists. */
 const PARKED_SCAN_MAX_ENTRIES = 256;
 
+/** How the parked-chain scan ended: `none` = nothing pending, `pending` =
+ *  the newest resumable parked chain, `unsafe` = a parked NAME that is not
+ *  a regular file. A parked link is skipped by the permission repair (its
+ *  target is unproven), so it must be refused HERE — before `security`
+ *  ever sees the path — instead of being selected and followed. */
+type TParkedLegacyScan =
+  | { readonly kind: "none" }
+  | { readonly kind: "pending"; readonly path: string }
+  | { readonly kind: "unsafe" };
+
 /** The newest `openllm-legacy-superseded-*.keychain-db` under the isolated
  *  HOME that is still PENDING migration. A parked file is left behind when a
  *  both-chains inspection failed AND the original `login.keychain-db` name
@@ -1623,15 +2103,18 @@ const PARKED_SCAN_MAX_ENTRIES = 256;
  *  readiness call must finish the migration rather than silently run on an
  *  empty chain. A parked path the completed-migration marker names is a
  *  resolved backup, never a migration source: without that record the same
- *  file would be re-staged, re-inspected, and re-parked on EVERY call. */
-const findParkedLegacyKeychain = (home: string): string | null => {
+ *  file would be re-staged, re-inspected, and re-parked on EVERY call.
+ *  Every candidate is `lstat`'d: a link or non-file at a parked name is
+ *  tamper debris that must refuse the chain before `security` follows it
+ *  onto an unproven target. */
+const findParkedLegacyKeychain = (home: string): TParkedLegacyScan => {
   const dir = dirname(legacyLoginKeychainPath(home));
   const resolvedBackups = readMigrationMarker(home);
   let names: string[];
   try {
-    names = boundedDirNames(dir);
+    names = boundedDirNames(dir).names;
   } catch {
-    return null;
+    return { kind: "none" };
   }
   let newest: string | null = null;
   let newestMs = -1;
@@ -1655,16 +2138,21 @@ const findParkedLegacyKeychain = (home: string): string | null => {
     }
     examined++;
     try {
-      const mtimeMs = statSync(path).mtimeMs;
-      if (mtimeMs > newestMs) {
+      const st = lstatSync(path);
+      // Only a plain file can be a migration source. A link or non-file at
+      // a parked name is refused: `statSync` would have followed the link
+      // and the selected path would reach `unlock-keychain`/`dump-keychain`
+      // before the later canonical check could stop it.
+      if (!st.isFile()) return { kind: "unsafe" };
+      if (st.mtimeMs > newestMs) {
         newest = path;
-        newestMs = mtimeMs;
+        newestMs = st.mtimeMs;
       }
     } catch {
       // A vanished or unreadable entry is not a migration source.
     }
   }
-  return newest;
+  return newest === null ? { kind: "none" } : { kind: "pending", path: newest };
 };
 
 /** Resolve a leftover pre-2.8 `login.keychain-db` under the isolated HOME.
@@ -1685,10 +2173,26 @@ const resolveLegacyKeychain = async (
   signal?: AbortSignal,
 ): Promise<TLegacyMigration> => {
   let legacy = legacyLoginKeychainPath(home);
-  if (!existsSync(legacy)) {
+  let legacyStat: Stats | null = null;
+  try {
+    // lstat by name: a link or non-file at the legacy path must never reach
+    // `security` — unlock/dump would follow it onto an unproven target.
+    // (The permission repair already refuses it; this is the re-check.)
+    legacyStat = lstatSync(legacy);
+  } catch (err) {
+    if (classifyStatError(err) !== "absent") {
+      return migrationFailed("keychain_migration_failed");
+    }
+  }
+  if (legacyStat === null) {
     const parked = findParkedLegacyKeychain(home);
-    if (parked === null) return migrationResolved;
-    legacy = parked;
+    if (parked.kind === "unsafe") {
+      return migrationFailed("keychain_permissions_unsafe");
+    }
+    if (parked.kind === "none") return migrationResolved;
+    legacy = parked.path;
+  } else if (!legacyStat.isFile()) {
+    return migrationFailed("keychain_permissions_unsafe");
   }
   if (!existsSync(kc)) {
     try {
@@ -1751,6 +2255,12 @@ const ensureKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // FSS-11: the "" password makes path modes the only barrier to other local
+  // accounts. Repair first and fail closed while the path cannot be proven
+  // private — never stage or unlock a credential another account could copy.
+  if (!repairIsolatedKeychainPermissions(home)) {
+    return noteTransientFailure(kc, "keychain_permissions_unsafe");
+  }
   // Migrate (or disarm) the pre-2.8 login-named chain before probing `kc`.
   // A failed migration must NOT fall through to create/unlock — the daemon
   // would front an EMPTY canonical chain while the credentials sit parked in
@@ -1763,7 +2273,22 @@ const ensureKeychainNow = async (
     logKeychainFailure(kc);
     return noteTransientFailure(kc, migration.cause);
   }
-  const existedAtStart = existsSync(kc);
+  // The migration can promote a parked chain onto `kc`. Re-prove the
+  // canonical path is a regular file before `security` opens it — a link
+  // here would put the unlock, and every later vendor write, on an
+  // unproven foreign target.
+  let kcStat: Stats | null = null;
+  try {
+    kcStat = lstatSync(kc);
+  } catch (err) {
+    if (classifyStatError(err) !== "absent") {
+      return noteTransientFailure(kc, "keychain_permissions_unsafe");
+    }
+  }
+  if (kcStat !== null && !kcStat.isFile()) {
+    return noteTransientFailure(kc, "keychain_permissions_unsafe");
+  }
+  const existedAtStart = kcStat !== null;
   const isInitialExistingUnlock =
     existedAtStart && !initialExistingKeychainUnlocks.has(kc);
   if (isInitialExistingUnlock) initialExistingKeychainUnlocks.add(kc);
@@ -1845,6 +2370,12 @@ export const ensureKeychainReady = async (
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
     if (skipEligible(kc) && domainConfiguredFor(kc)) {
+      // The fast path still enforces FSS-11: a mode regression between probes
+      // must not hand out a chain another account could read.
+      if (!repairIsolatedKeychainPermissions(home)) {
+        invalidateUnlockSkip(kc);
+        return { kind: "indeterminate", cause: "keychain_permissions_unsafe" };
+      }
       keychainCounters.skipped++;
       return READY;
     }
@@ -1861,6 +2392,11 @@ export const ensureKeychainReady = async (
         return ensureKeychainNow(home, kc);
       })();
       if (ready.kind !== "present") return ready;
+      // The promote path bypassed `ensureKeychainNow`'s FSS-11 gate — check
+      // the modes here so no `present` ever stands on an unprotected path.
+      if (!repairIsolatedKeychainPermissions(home)) {
+        return noteTransientFailure(kc, "keychain_permissions_unsafe");
+      }
       // `present` also gates VENDOR spawns — and a vendor CLI resolves the
       // chain through the isolated HOME's search list + default keychain, not
       // by path. An unlocked-but-unconfigured chain would land it on the
@@ -1905,6 +2441,11 @@ const observeKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // FSS-11: repair path modes before even reporting readiness — a present
+  // verdict must never stand on a chain another account could read.
+  if (!repairIsolatedKeychainPermissions(home)) {
+    return noteObserveTransientFailure(kc, "keychain_permissions_unsafe");
+  }
   if (!existsSync(kc)) {
     return { kind: "indeterminate", cause: "keychain_absent" };
   }
@@ -1946,6 +2487,10 @@ export const observeKeychainReady = async (
       return { kind: "indeterminate", cause: "keychain_wait_aborted" };
     }
     if (skipEligible(kc) && domainConfiguredFor(kc)) {
+      if (!repairIsolatedKeychainPermissions(home)) {
+        invalidateUnlockSkip(kc);
+        return { kind: "indeterminate", cause: "keychain_permissions_unsafe" };
+      }
       keychainCounters.skipped++;
       return READY;
     }
@@ -1958,6 +2503,9 @@ export const observeKeychainReady = async (
         return observeKeychainNow(home, kc);
       })();
       if (ready.kind !== "present") return ready;
+      if (!repairIsolatedKeychainPermissions(home)) {
+        return noteObserveTransientFailure(kc, "keychain_permissions_unsafe");
+      }
       if (domainConfiguredFor(kc)) return ready;
       return noteObserveTransientFailure(kc, "keychain_unconfigured");
     })().finally(() => {
@@ -1991,6 +2539,8 @@ export const resetKeychainStateForTests = (): void => {
   securitySpawnSetupHookForTests = null;
   lastSecurityTimerMsForTests = null;
   keychainWarnedOnce.clear();
+  permRepairLogged.clear();
+  chmodAfterRenameHookForTests = null;
 };
 
 /**
