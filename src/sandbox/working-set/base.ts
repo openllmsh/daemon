@@ -1233,7 +1233,12 @@ export const sweepDaemonTempDir = (
     }
     const scan = scanTmpEntry(path);
     lastTmpSweepStats.scanned += 1;
-    if (scan === null) continue;
+    if (scan === null) {
+      // The entry vanished while its walk was parked: close the walk's open
+      // directory handles now, or they leak for the daemon's life (rework-8).
+      abortTmpEntryWalk();
+      continue;
+    }
     if (scan.lease === null) {
       // UNLEASED — never auto-deleted (rework-5). Count it for the pass
       // report; a fresh mint whose lease write is still in flight looks the
@@ -1297,6 +1302,7 @@ export const sweepDaemonTempDir = (
     }
   }
   if (cycleComplete) {
+    abortTmpEntryWalk();
     closeTmpSweepListing();
     reportTmpSweepPass();
   } else if (pendingTmpEntry === null) {
