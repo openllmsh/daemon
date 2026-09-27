@@ -1573,21 +1573,23 @@ provision_clis() {
   local job_body
   job_body="$(cat <<'OPENLLM_VENDOR_JOB'
 pidfile="$1"; timeout_bin="$2"; job_timeout="$3"; curl_bin="$4"; url="$5"; setsid_bin="$6"; launchfile="$7"
-# The pidfile holds "<job leader pid> <start identity>" so a re-run can tell
-# a live job from a stale — or PID-REUSED — owner (the legacy `ps lstart`
-# identity format — see below; NOT the env-lock boot-scoped format).
-# It is published ATOMICALLY (temp + no-replace ln) only now that
-# the job's real identity is known — the parent's fresh launch marker covers
-# the spawn-to-publish gap, so a second installer sees "launch in progress"
-# rather than a dead placeholder. The marker is dropped once the pidfile is
-# up; the pidfile itself is removed only after the whole process group is
-# CONFIRMED gone (the EXIT trap below re-probes after the reap poll — and
-# NEVER when the pgid is unknown, e.g. the timeout branch or a ps failure:
-# an unverifiable group leaves the pid+start record for a re-run to reap).
-# The pidfile start identity uses the `ps lstart` format deliberately: this
-# job body is a standalone `bash -c` that cannot reach the lock block's
-# boot-scoped reader, and the records are internal to this installer — never
-# compared against env-lock `owner` records.
+# The lock is `$pidfile.d/` — a directory mutex holding an `owner` record of
+# "<job pid> <start identity>" so a re-run can tell a live job from a stale
+# or PID-REUSED owner (the legacy `ps lstart` identity format — see below;
+# NOT the env-lock boot-scoped format). The record is published ATOMICALLY
+# (temp + no-replace ln inside the dir our `mkdir` created, verified against
+# that generation's inode) only now that the job's real identity is known —
+# the parent's fresh launch marker covers the spawn-to-publish gap, so a
+# second installer sees "launch in progress" rather than a dead placeholder.
+# The marker is dropped once the owner record is up; the record itself is
+# removed only after the whole process group is CONFIRMED gone (the EXIT
+# trap below re-probes after the reap poll — and NEVER when the pgid is
+# unknown, e.g. the timeout branch or a ps failure: an unverifiable group
+# leaves the pid+start record for a re-run to reap).
+# The start identity uses the `ps lstart` format deliberately: this job body
+# is a standalone `bash -c` that cannot reach the lock block's boot-scoped
+# reader, and the records are internal to this installer — never compared
+# against env-lock `owner` records.
 job_start="$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ 2>/dev/null | tr -s '[:space:]' ' ')"
 job_start="${job_start# }"; job_start="${job_start% }"
 # "<pid> <start>" record → live? (pid alive and, when both are known, the
@@ -1602,30 +1604,126 @@ job_owner_live() {
   [ -z "$now" ] || [ "$now" = "$s" ]
 }
 myrec="$$ ${job_start:--}"
-pidtmp="$pidfile.tmp.$$"
 published=0
-# The pidfile IS the mutex: publish it NO-REPLACE (`ln` never overwrites), so
-# a job paused before publishing can never stamp over a successor's live
-# record. A dead leftover is moved aside, re-read (it must still be the record
-# judged dead — otherwise a live owner published in between and it goes
-# straight back, no-replace), then deleted and the link retried.
-if printf '%s\n' "$myrec" > "$pidtmp" 2>/dev/null; then
-  for _try in 1 2 3; do
-    if ln "$pidtmp" "$pidfile" 2>/dev/null; then published=1; break; fi
-    seen="$(cat "$pidfile" 2>/dev/null || true)"
-    [ -n "$seen" ] || continue
-    job_owner_live "$seen" && break
-    q="$pidfile.tmp.$$.s$_try"
-    mv "$pidfile" "$q" 2>/dev/null || continue
-    if [ "$(cat "$q" 2>/dev/null || true)" != "$seen" ]; then
-      ln "$q" "$pidfile" 2>/dev/null || true
-      rm -f "$q" 2>/dev/null || true
+# The pidfile lock is a DIRECTORY mutex — the same shape the shared env-lock
+# block uses for `.env.lock.d`: claimed by atomic `mkdir`, owned through a
+# tmp+`ln` no-replace `owner` record inside, and bound to OUR generation by
+# the inode captured right after `mkdir`. A record travels WITH its dir, so
+# a steal's quarantine `mv` can never orphan a live record at the name the
+# way `mv pidfile q` did (a third racer publishing into the freed name once
+# produced two owners — the restore then either stamped the winner or, when
+# the name was re-taken, deleted the live record outright).
+lockd="$pidfile.d"
+ownerfile="$lockd/owner"
+job_dir_ino() {
+  stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null || true
+}
+job_dir_age() {
+  local m
+  m="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0)"
+  [ -n "$m" ] && [ "$m" -gt 0 ] 2>/dev/null || { echo 999999; return; }
+  echo $(( $(date +%s 2>/dev/null || echo 0) - m ))
+}
+# Re-adopt parked quarantine dirs first: a LIVE recorded owner is restored
+# no-replace when the name is free (its owner may still hold the lock); a
+# dead or unreadable dir is residue — swept whole, never partly deleted.
+for parked in "$pidfile".parked-*; do
+  [ -d "$parked" ] || continue
+  prec="$(cat "$parked/owner" 2>/dev/null || true)"
+  if [ -n "$prec" ] && job_owner_live "$prec"; then
+    if mkdir "$lockd" 2>/dev/null; then
+      ( set -C; cat "$parked/owner" > "$ownerfile" ) 2>/dev/null || true
+      [ -f "$ownerfile" ] && rm -rf "$parked" 2>/dev/null || true
+    fi
+    continue
+  fi
+  rm -rf "$parked" 2>/dev/null || true
+done
+# A legacy `<cmd>.pid` FILE record (written by an older installer's file
+# mutex) is honored too: a live legacy owner still defers — the dir mutex
+# alone can never see it.
+if [ -f "$pidfile" ]; then
+  leg="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$leg" ] && job_owner_live "$leg" && exit 0
+fi
+for _try in 1 2 3; do
+  if mkdir "$lockd" 2>/dev/null; then
+    # Pin the generation we created: the post-publish verify detects a
+    # steal + successor-re-claim swap (identical inode guard to the
+    # env-lock's expectedIno).
+    lock_ino="$(job_dir_ino "$lockd")"
+    if printf '%s\n' "$myrec" > "$lockd/owner.tmp.$$" 2>/dev/null \
+      && { ln "$lockd/owner.tmp.$$" "$ownerfile" 2>/dev/null \
+        || (set -C; cat "$lockd/owner.tmp.$$" > "$ownerfile") 2>/dev/null; }
+    then
+      rm -f "$lockd/owner.tmp.$$" 2>/dev/null
+      # The dir at the name must still be OUR generation AND carry OUR
+      # record — a swap mid-publish means a successor owns this claim.
+      now_ino="$(job_dir_ino "$lockd")"
+      if { [ -z "$lock_ino" ] || [ "$now_ino" = "$lock_ino" ]; } \
+        && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
+        published=1
+      fi
       break
     fi
-    rm -f "$q" 2>/dev/null || true
-  done
-fi
-rm -f "$pidtmp" "$launchfile" 2>/dev/null || true
+    rm -f "$lockd/owner.tmp.$$" 2>/dev/null
+    # The tmp write itself failed — drop the dir WE made, only while the
+    # inode still proves OUR generation (a swapped dir is a successor's).
+    now_ino="$(job_dir_ino "$lockd")"
+    if [ -n "$lock_ino" ] && [ "$now_ino" = "$lock_ino" ]; then
+      rmdir "$lockd" 2>/dev/null || true
+    fi
+    break
+  fi
+  # The name is held — judge the record inside.
+  owner="$(cat "$ownerfile" 2>/dev/null || true)"
+  if [ -n "$owner" ]; then
+    job_owner_live "$owner" && break
+    judged="$owner"
+  else
+    # Ownerless dir: a publisher may be mid-write — wait briefly and retry,
+    # unless it is already older than the publish grace (a crashed
+    # publisher's residue — reclaimable like a dead record).
+    if [ "$(job_dir_age "$lockd")" -lt 30 ]; then
+      sleep 0.05 2>/dev/null || sleep 1
+      continue
+    fi
+    judged=""
+  fi
+  # STALE (dead owner, or aged ownerless): mark OUR steal inside the dir,
+  # re-verify the SAME generation still holds the SAME record, then `mv`
+  # the whole dir aside — the first marker+bound `mv` wins. The generation
+  # pin means a swap between our `cat` and `mv` can never hand us a
+  # foreign live dir blindly: the quarantine re-judge below restores it.
+  ino="$(job_dir_ino "$lockd")"
+  [ -n "$ino" ] || continue
+  ( set -C; : > "$lockd/steal.$$.$_try" ) 2>/dev/null || continue
+  now_ino="$(job_dir_ino "$lockd")"
+  owner2="$(cat "$ownerfile" 2>/dev/null || true)"
+  [ "$now_ino" = "$ino" ] && [ "$owner2" = "$judged" ] || continue
+  q="$pidfile.parked-$$.$_try"
+  if mv "$lockd" "$q" 2>/dev/null; then
+    # What we grabbed must still be the generation we marked — a swap in
+    # the check→`mv` window hands us a foreign dir. Restore it atomically:
+    # `mv` back lands whole onto a free name (or replaces a successor's
+    # still-empty claim, whose own inode pin then vetoes it); on a
+    # published dir the rename fails and the dir stays PARKED for the
+    # re-adopt sweep. A foreign dir is never deleted.
+    qino="$(job_dir_ino "$q")"
+    qowner="$(cat "$q/owner" 2>/dev/null || true)"
+    if [ "$qino" != "$ino" ] || [ "$qowner" != "$judged" ] \
+      || { [ -n "$qowner" ] && job_owner_live "$qowner"; }; then
+      # Never hand a foreign dir back carrying steal markers.
+      rm -f "$q"/steal.* 2>/dev/null || true
+      mv "$q" "$lockd" 2>/dev/null || true
+    else
+      rm -rf "$q" 2>/dev/null || true
+    fi
+  else
+    rm -f "$lockd/steal.$$.$_try" 2>/dev/null || true
+  fi
+done
+rm -f "$lockd/owner.tmp.$$" "$launchfile" 2>/dev/null || true
 # Not published → another live job owns this vendor install. Never run a
 # duplicate.
 [ "$published" = 1 ] || exit 0
@@ -1638,8 +1736,9 @@ rm -f "$pidtmp" "$launchfile" 2>/dev/null || true
 group_confirmed_gone=0
 trap 'if { { [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null; } \
   || [ "$group_confirmed_gone" = 1 ]; } \
-  && [ "$(cat "$pidfile" 2>/dev/null || true)" = "$myrec" ]; then
-  rm -f "$pidfile" 2>/dev/null || true
+  && [ "$(cat "$ownerfile" 2>/dev/null || true)" = "$myrec" ]; then
+  rm -f "$ownerfile" 2>/dev/null || true
+  rmdir "$lockd" 2>/dev/null || true
 fi' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
@@ -1827,13 +1926,17 @@ OPENLLM_VENDOR_JOB
     launchfile="$job_dir/$cmd.launch"
     # Duplicate suppression across re-runs (LEAK-3). Two artifacts, never a
     # parent-written placeholder pidfile: the LAUNCH marker is created
-    # O_EXCL here before the job is spawned, and the JOB publishes the
-    # pidfile itself (temp + no-replace ln) once its real "<pid> <start identity>" is
-    # known. A live pidfile owner (PID-reuse-safe via the recorded lstart
-    # identity vs a fresh lstart probe) or a launch marker with a LIVE launcher means
-    # "in progress" — covering the spawn-to-publish gap where the first
-    # installer may already have exited; stale leftovers are reclaimed.
-    owner="$(cat "$pidfile" 2>/dev/null || true)"
+    # O_EXCL here before the job is spawned, and the JOB publishes its owner
+    # record inside the `$pidfile.d` directory mutex (tmp + no-replace ln,
+    # bound to the mkdir'd generation) once its real "<pid> <start identity>"
+    # is known. A live owner (PID-reuse-safe via the recorded lstart
+    # identity vs a fresh lstart probe) or a launch marker with a LIVE
+    # launcher means "in progress" — covering the spawn-to-publish gap where
+    # the first installer may already have exited; stale leftovers are
+    # reclaimed. An older installer's `<cmd>.pid` FILE record is honored the
+    # same way: a live legacy-format owner still defers.
+    owner="$(cat "$pidfile.d/owner" 2>/dev/null || true)"
+    [ -z "$owner" ] && owner="$(cat "$pidfile" 2>/dev/null || true)"
     owner_pid="${owner%% *}"
     owner_start="${owner#* }"
     [ "$owner_start" = "$owner" ] && owner_start=""
