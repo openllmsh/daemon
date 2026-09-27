@@ -16,6 +16,76 @@
 import { randomUUID } from "node:crypto";
 import type { TMuseCallerTool } from "./muse-request";
 
+/**
+ * Settings / MCP registration name for the per-turn caller-tool server.
+ * Meta Muse wire form replaces hyphens with underscores and prefixes `mcp__`
+ * with a `.` separator — see {@link museMcpWireToolName}.
+ */
+export const MUSE_MCP_SERVER_NAME = "openllm-muse-client-tools" as const;
+
+/** Meta-observed MCP tool name prefix for this server (`mcp__openllm_muse_client_tools.`). */
+export const MUSE_MCP_WIRE_PREFIX =
+  `mcp__${MUSE_MCP_SERVER_NAME.replaceAll("-", "_")}.` as const;
+
+/**
+ * Wire name Muse's Meta `/responses` path emits for a caller tool registered on
+ * {@link MUSE_MCP_SERVER_NAME}. Exact leaf = caller tool name (no sanitization).
+ */
+export const museMcpWireToolName = (callerToolName: string): string =>
+  `${MUSE_MCP_WIRE_PREFIX}${callerToolName}`;
+
+export type TMuseToolNameMap = {
+  /** Full Meta wire name → original caller name. */
+  readonly wireToCaller: ReadonlyMap<string, string>;
+  /** Caller name set (for membership checks). */
+  readonly callerNames: ReadonlySet<string>;
+};
+
+export const buildMuseToolNameMap = (
+  tools: ReadonlyArray<{ readonly name: string }>,
+): TMuseToolNameMap => {
+  const wireToCaller = new Map<string, string>();
+  const callerNames = new Set<string>();
+  for (const t of tools) {
+    callerNames.add(t.name);
+    wireToCaller.set(museMcpWireToolName(t.name), t.name);
+  }
+  return { wireToCaller, callerNames };
+};
+
+export type TMuseMappedToolName =
+  | { readonly ok: true; readonly name: string }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Return-side map only. Exact registered wire → caller. Unknown names under
+ * our MCP wire prefix are refused (no blind prefix stripping). Non-MCP names
+ * (e.g. hosted `web_search`) pass through unchanged.
+ */
+export const mapMuseCapturedToolName = (
+  upstreamName: string,
+  nameMap: TMuseToolNameMap,
+): TMuseMappedToolName => {
+  const mapped = nameMap.wireToCaller.get(upstreamName);
+  if (mapped !== undefined) return { ok: true, name: mapped };
+  if (nameMap.callerNames.has(upstreamName)) {
+    return { ok: true, name: upstreamName };
+  }
+  if (upstreamName.startsWith(MUSE_MCP_WIRE_PREFIX)) {
+    return {
+      ok: false,
+      reason: `unknown muse MCP tool wire name: ${upstreamName}`,
+    };
+  }
+  if (upstreamName.startsWith("mcp__")) {
+    return {
+      ok: false,
+      reason: `unrecognized muse mcp__ tool wire name: ${upstreamName}`,
+    };
+  }
+  return { ok: true, name: upstreamName };
+};
+
 export type TMuseMcpServer = {
   readonly name: string;
   readonly url: string;
@@ -177,7 +247,7 @@ export const startMuseMcpServer = (params: {
           return rpcResult(id, {
             protocolVersion: "2025-03-26",
             capabilities: { tools: {} },
-            serverInfo: { name: "openllm-muse-client-tools", version: "1" },
+            serverInfo: { name: MUSE_MCP_SERVER_NAME, version: "1" },
           });
         case "notifications/initialized":
           return new Response(null, { status: 202 });
@@ -261,7 +331,7 @@ export const startMuseMcpServer = (params: {
   });
 
   return {
-    name: "openllm-muse-client-tools",
+    name: MUSE_MCP_SERVER_NAME,
     url: `http://127.0.0.1:${server.port}/mcp`,
     headers: [{ name: "Authorization", value: `Bearer ${token}` }],
     stop: () => {

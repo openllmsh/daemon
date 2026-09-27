@@ -751,6 +751,15 @@ export type TMuseNativeParams = {
   readonly rpcTimeoutMs?: number;
   readonly hostFactory?: TMuseHostFactory;
   readonly cwd?: string;
+  /**
+   * Optional Meta endpoint redirect written into the per-turn overlay as
+   * nested `settings.endpoint_transport`. Used by bridge-capture — never by
+   * the default MSP bridge path.
+   */
+  readonly endpointTransport?: {
+    readonly base_url: string;
+    readonly auth: "bearer";
+  };
 };
 
 const setupDecline = (
@@ -1398,6 +1407,9 @@ export const runMuseNative = async (
       modelId: params.providerModelId,
       ...(params.providerId !== undefined
         ? { providerId: params.providerId }
+        : {}),
+      ...(params.endpointTransport !== undefined
+        ? { endpointTransport: params.endpointTransport }
         : {}),
       parentDir: runtimeParent,
     });
