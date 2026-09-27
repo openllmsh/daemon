@@ -1263,7 +1263,7 @@ fi
 # Re-read under the same exclusive `$ENV_FILE.lock` protocol as the daemon's
 # writeEnvFileVars. Never rebuild this file from a pre-download snapshot: a daemon
 # can mint a device id or update credentials while binaries are downloading.
-# First match wins; the value is trimmed and ONE layer of surrounding quotes
+# First match wins; the value is trimmed. For OPENLLM_API_KEY only, ONE layer of surrounding quotes
 # is stripped — the same KEY="value" / KEY='value' parsing env_file_value (and
 # packages/cli/src/env.ts) applies, so a quoted persisted key is read as the
 # credential every runtime actually sees (FS-7).
@@ -1274,8 +1274,14 @@ read_env_value() {
     key="${line%%=*}"
     [ "$key" = "$wanted" ] || continue
     value="$(trim_whitespace "${line#*=}")"
-    value="${value#[\"\']}"
-    value="${value%[\"\']}"
+    # Only the API key is judged and rewritten in canonical form. Every other
+    # key is copied exactly as written: the daemon's parser keeps quote
+    # characters, so stripping them here would change OPENLLM_DEVICE_ID or
+    # flip OPENLLM_DAEMON_PTY_SESSIONS on the next installer run.
+    if [ "$wanted" = "OPENLLM_API_KEY" ]; then
+      value="${value#[\"\']}"
+      value="${value%[\"\']}"
+    fi
     printf '%s' "$value"
     return 0
   done < "$ENV_FILE"
