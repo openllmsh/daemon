@@ -1606,7 +1606,7 @@ pidfile="$1"; timeout_bin="$2"; job_timeout="$3"; curl_bin="$4"; url="$5"; setsi
 # The marker is dropped once the owner record is up; the record itself is
 # removed only after the whole process group is CONFIRMED gone (the EXIT
 # trap below re-probes after the reap poll — and NEVER when the pgid is
-# unknown, e.g. the timeout branch or a ps failure: an unverifiable group
+# unknown, e.g. a ps failure: an unverifiable group
 # leaves the pid+start record for a re-run to reap).
 # The start identity uses the `ps lstart` format deliberately: this job body
 # is a standalone `bash -c` that cannot reach the lock block's boot-scoped
@@ -1797,8 +1797,7 @@ rm -f "$lockd/owner.tmp.$$" "$launchfile" 2>/dev/null || true
 # duplicate.
 [ "$published" = 1 ] || exit 0
 # The pidfile is removed only when it is still OURS and the process group is
-# CONFIRMED gone — never when the pgid is unknown (timeout branch, ps
-# failure): an unverifiable group leaves the pid+start record for a re-run.
+# CONFIRMED gone. An unknown group keeps the owner record for a re-run.
 # `group_confirmed_gone` covers the set -m path where the leader died before
 # `ps` could report AND its whole group is already empty: that shape is
 # proven dead too, so the pidfile must not linger.
@@ -1812,34 +1811,13 @@ fi' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
 if [ -n "$timeout_bin" ]; then
-  # GNU timeout setpgid's ITSELF as the group leader (the managed child's
-  # pgid IS the timeout pid — verified on GNU coreutils and gtimeout), and
-  # only manages its direct child: a TERM-ignoring (or orphaned) GRANDCHILD
-  # outlives the wrapper with no bound. Run it in the background so the
-  # group id is knowable ($!), but trust `-$twait` only once it PROVES to be
-  # a live group: a timeout that never became a leader (non-GNU, or a stub)
-  # leaves pgid empty — the sweep is then skipped and the EXIT trap keeps
-  # the pidfile (a group we cannot verify is never signalled or declared
-  # dead).
+  # GNU timeout leads its own process group. Its children can outlive it.
+  # Use the leader pid even when the group exits before the first probe.
+  # The EXIT trap must prove that the group is gone before it clears the lock.
   "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url" &
   twait=$!
-  pgid=""
-  for _pgid_try in 1 2 3 4 5; do
-    if kill -0 -- -"$twait" 2>/dev/null; then pgid="$twait"; break; fi
-    kill -0 "$twait" 2>/dev/null || break
-    sleep 0.1 2>/dev/null || sleep 1
-  done
-  timeout_rc=0
-  wait "$twait" 2>/dev/null || timeout_rc=$?
-  # The timeout leader pid is always known. If the group was too short-lived
-  # for the observation loop, use that pid as the candidate and prove the
-  # group is gone before the EXIT trap drops the owner record.
-  # A successful short-lived stub may never have created a process group at
-  # all. Only timeout's terminating status authorizes the leader-pid fallback;
-  # an unverified successful wrapper keeps its owner record for a later sweep.
-  if [ -z "$pgid" ] && { [ "$timeout_rc" -eq 124 ] || [ "$timeout_rc" -eq 137 ]; }; then
-    pgid="$twait"
-  fi
+  pgid="$twait"
+  wait "$twait" 2>/dev/null || true
   if [ -n "$pgid" ] && kill -0 -- -"$pgid" 2>/dev/null; then
     kill -TERM -- -"$pgid" 2>/dev/null || true
     sleep 1
