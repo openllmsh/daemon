@@ -613,6 +613,36 @@ const envLockStartIdentity = (pid: number): string | null | undefined => {
 };
 
 /**
+ * Identity reader bound to ONE owner record. The per-pid cache is trusted
+ * only when its entry MATCHES the record's start: a matching identity can
+ * only delay a steal by the TTL — the conservative direction. A cached
+ * MISMATCH may be the predecessor's identity on a pid that was reused inside
+ * the window — serving it would convict a live owner as dead — so a
+ * non-matching entry always falls through to a fresh probe.
+ */
+const envLockStartIdentityForRecord = (
+  pid: number,
+  recordedStart: string,
+): string | null | undefined => {
+  if (pid === process.pid) return envLockStartIdentity(pid);
+  const expected = recordedStart.trim().replace(/\s+/g, " ");
+  const now = Date.now();
+  const hit = identityCache.get(pid);
+  if (
+    hit !== undefined &&
+    now - hit.at < IDENTITY_PROBE_TTL_MS &&
+    hit.value === expected
+  )
+    return hit.value;
+  const value = envLockStartIdentityProbe(pid);
+  if (value !== undefined) {
+    if (identityCache.size > 128) identityCache.clear();
+    identityCache.set(pid, { value, at: now });
+  }
+  return value;
+};
+
+/**
  * `processIdentityStatus` verdicts, briefly cached per (pid, recorded
  * start). A contested lock re-judges on every retry and a mixed-format
  * record costs a second bridging probe — the verdict itself is rate-limited
@@ -634,7 +664,9 @@ const envLockIdentityStatus = (
   const hit = statusCache.get(key);
   if (hit !== undefined && now - hit.at < IDENTITY_PROBE_TTL_MS)
     return hit.value;
-  const value = processIdentityStatus(pid, recordedStart, envLockStartIdentity);
+  const value = processIdentityStatus(pid, recordedStart, (probePid) =>
+    envLockStartIdentityForRecord(probePid, recordedStart),
+  );
   if (statusCache.size > 128) statusCache.clear();
   statusCache.set(key, { value, at: now });
   return value;
