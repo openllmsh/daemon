@@ -169,6 +169,12 @@ export const setPtySpawner = (fn: TPtySpawner | null): void => {
   productionSpawner = false;
 };
 
+/** TEST SEAM — mint the per-session scratch dir with an injected spawner too. */
+let mintSessionTmpForTests = false;
+export const setSessionTmpMintForTests = (on: boolean): void => {
+  mintSessionTmpForTests = on;
+};
+
 export { ptySupported } from "./bs-pty";
 
 type TSpawnedPty = { readonly pty: TPtyLike; readonly backend: TPtyBackend };
@@ -963,6 +969,18 @@ const terminalClose = (session: TSession): void => {
   }
 };
 
+/**
+ * Drop a session's scratch dir — unless a spawn is still in flight. The
+ * pending spawn passes that dir to the child as TMPDIR; removing it here
+ * would start the child without its TMPDIR. The spawn completion path sees
+ * the kill and removes the dir itself (`dropSessionTmp`), rework-8.
+ */
+const releaseSessionTmp = (s: TSession): void => {
+  if (s.tmpDir === null || pendingSpawns.has(s.id)) return;
+  removeTreeDeferred(s.tmpDir);
+  s.tmpDir = null;
+};
+
 const endPty = (
   s: TSession,
   reason: "evicted" | "reaped" | "done" | "killed",
@@ -975,10 +993,7 @@ const endPty = (
   // The PTY's scratch dir dies with it — deleted incrementally off this path
   // (a big scratch tree must not stall the close). Unleased/dead-leased by
   // now, so any remnant is the sweep's to finish.
-  if (s.tmpDir !== null) {
-    removeTreeDeferred(s.tmpDir);
-    s.tmpDir = null;
-  }
+  releaseSessionTmp(s);
   // Release the scrollback ring — a dead session can't be attached, so its
   // buffered output is dead weight until the row itself is evicted.
   s.scrollback.length = 0;
@@ -1041,10 +1056,7 @@ export const killAllSessions = (): void => {
       session.pty = null;
       session.pid = null;
     }
-    if (session.tmpDir !== null) {
-      removeTreeDeferred(session.tmpDir);
-      session.tmpDir = null;
-    }
+    releaseSessionTmp(session);
     for (const consumer of [...session.consumers]) {
       session.consumers.delete(consumer);
       try {
@@ -1379,9 +1391,10 @@ export const openSession = async (
     // spawners never mint (no real child → no filesystem fixture to manage).
     // Tracked on the session so EVERY end path — natural exit, kill,
     // killAll, reset — drops it, not just the spawn-failure paths.
-    const sessionTmpDir = productionSpawner
-      ? (mintDaemonTmpDir() ?? undefined)
-      : undefined;
+    const sessionTmpDir =
+      productionSpawner || mintSessionTmpForTests
+        ? (mintDaemonTmpDir() ?? undefined)
+        : undefined;
     if (sessionTmpDir !== undefined) {
       // A reused row could hold a stale mint from a spawn that never ended —
       // drop it before overwriting.
@@ -1532,6 +1545,10 @@ export const openSession = async (
       nack("spawn_failed");
     } finally {
       pendingSpawns.delete(s.id);
+      // An end path that ran while the spawn was pending (a fast exit applied
+      // through pendingExit, or a kill) skipped the scratch dir; drop it now
+      // unless this row still owns a live PTY.
+      if (s.pty === null) releaseSessionTmp(s);
     }
   } catch (err) {
     logWarn(
