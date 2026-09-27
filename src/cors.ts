@@ -20,6 +20,7 @@ import {
   isDaemonApiKeyCredential,
   isDevMode,
   isLocalCallerCredential,
+  isReleaseBuild,
 } from "./env";
 
 /**
@@ -40,8 +41,8 @@ const loopbackSibling = (origin: string): string | null => {
 
 /**
  * The OpenLLM product's own deployment origins. ONE daemon serves EVERY
- * deployment (prod + previews), not just the one it was paired with — the
- * whole point of the deployment-agnostic design
+ * deployment (prod + previews on a non-release build), not just the one it
+ * was paired with — the whole point of the deployment-agnostic design
  * (`docs/proposals/daemon-presence-without-heartbeat.md`). So the control
  * surface reflects any of these, regardless of the daemon's configured origin.
  */
@@ -54,8 +55,14 @@ const PROD_ORIGINS: ReadonlySet<string> = new Set([
  * OpenLLM's own Vercel preview deployments:
  *   `openllm-<hash>-quantide.vercel.app`
  *   `openllm-git-<branch>-quantide.vercel.app`
- * Anchored to the `openllm` project + `quantide` team so a stranger's
- * `*.vercel.app` can't reach the daemon's localhost control surface.
+ * The `openllm-` + `-quantide` anchor is NOT proof of ownership: Vercel names
+ * a deployment `<project>-<scope>.vercel.app`, so a stranger's project
+ * `openllm-x-quantide` or a team slug that ends in `-quantide` satisfies the
+ * regex (SP-2). A reflected origin can read the `/v1/*` responses of the
+ * local daemon, so a release binary (stable OR prerelease — both bake a real
+ * version) never trusts it. Non-release builds (source runs and `0.0.0-dev`
+ * dev/preview builds) still reflect it: a preview dashboard must reach a
+ * developer's daemon.
  */
 const PREVIEW_ORIGIN = /^https:\/\/openllm-[a-z0-9-]+-quantide\.vercel\.app$/;
 
@@ -80,7 +87,7 @@ const isLoopbackWebOrigin = (origin: string): boolean => {
 
 export const isTrustedDeploymentOrigin = (origin: string): boolean =>
   PROD_ORIGINS.has(origin) ||
-  PREVIEW_ORIGIN.test(origin) ||
+  (!isReleaseBuild() && PREVIEW_ORIGIN.test(origin)) ||
   (process.env.NODE_ENV === "development" && isLoopbackWebOrigin(origin));
 
 /**
@@ -169,8 +176,8 @@ const allowOrigin = (req: Request): string => {
     return origin;
   }
   // Any OpenLLM deployment's dashboard may drive this daemon — reflect the
-  // prod origins + the project's own previews even when the daemon was
-  // installed against a different one (e.g. a prod daemon used from a preview).
+  // prod origins + (on a non-release build) the project's own previews even
+  // when the daemon was installed against a different one.
   if (isTrustedDeploymentOrigin(origin)) return origin;
   // Dev mode keeps an EXACT allowlist — it only adds a real loopback origin
   // (a local dev server on an arbitrary port). A dev daemon can hold the
