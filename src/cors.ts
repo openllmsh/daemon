@@ -46,8 +46,10 @@ const loopbackSibling = (origin: string): string | null => {
  * (`docs/proposals/daemon-presence-without-heartbeat.md`). So the control
  * surface reflects any of these, regardless of the daemon's configured origin.
  */
+const PROD_DASHBOARD_ORIGIN = "https://openllm.sh";
+
 const PROD_ORIGINS: ReadonlySet<string> = new Set([
-  "https://openllm.sh",
+  PROD_DASHBOARD_ORIGIN,
   "https://www.openllm.sh",
 ]);
 
@@ -91,6 +93,25 @@ export const isTrustedDeploymentOrigin = (origin: string): boolean =>
   (process.env.NODE_ENV === "development" && isLoopbackWebOrigin(origin));
 
 /**
+ * The configured dashboard origin for the CORS trust paths below. A release
+ * binary never honors a preview-shaped configured origin: `PREVIEW_ORIGIN`
+ * cannot tell OpenLLM's previews from a stranger's (SP-2), so a release
+ * daemon whose config points at one — a stale preview pairing or a poisoned
+ * `OPENLLM_DASHBOARD_ORIGIN` — must grant that origin nothing. The prod
+ * origin takes its place (also as the `allow-origin` fallback: an
+ * `access-control-allow-origin` that named the preview would grant its
+ * pages read access to every response). A non-release build keeps the
+ * configured value verbatim — a preview dashboard must reach a developer's
+ * daemon.
+ */
+const trustedConfiguredOrigin = (): string => {
+  const configured = daemonEnv().dashboardOrigin;
+  return isReleaseBuild() && PREVIEW_ORIGIN.test(configured)
+    ? PROD_DASHBOARD_ORIGIN
+    : configured;
+};
+
+/**
  * May this request's `Origin` header call the local surfaces at all? A
  * browser ALWAYS sends `Origin` on a cross-site POST — including the
  * `text/plain` / `no-cors` "simple request" a hostile page uses to reach
@@ -102,7 +123,7 @@ export const isTrustedDeploymentOrigin = (origin: string): boolean =>
 export const requestOriginAllowed = (req: Request): boolean => {
   const origin = req.headers.get("origin");
   if (origin === null) return true;
-  const configured = daemonEnv().dashboardOrigin;
+  const configured = trustedConfiguredOrigin();
   if (origin === configured || loopbackSibling(configured) === origin) {
     return true;
   }
@@ -166,10 +187,12 @@ export const isLocalCallerAuthorized = (req: Request): boolean => {
  * The `access-control-allow-origin` to return for THIS request: the request's
  * `Origin` when it's the configured dashboard origin / its loopback sibling, a
  * trusted OpenLLM deployment (prod or a project preview), or — in dev — ANY
- * origin; else the configured origin.
+ * origin; else the configured origin. The configured value is sanitized by
+ * {@link trustedConfiguredOrigin} first — a release build never names a
+ * preview origin, configured or not.
  */
 const allowOrigin = (req: Request): string => {
-  const configured = daemonEnv().dashboardOrigin;
+  const configured = trustedConfiguredOrigin();
   const origin = req.headers.get("origin");
   if (origin === null) return configured;
   if (origin === configured || loopbackSibling(configured) === origin) {
