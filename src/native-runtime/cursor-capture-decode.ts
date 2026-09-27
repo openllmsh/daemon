@@ -1300,6 +1300,24 @@ export const decodeExecServerMessage = (
   return { id, execId, subtype, classification, mcp };
 };
 
+/**
+ * Proto3-correct numeric id of an `AgentServerMessage.exec_server_message`
+ * (field 2 → `ExecServerMessage.id`, field 1, uint32, implicit presence — 0
+ * is validly omitted on the wire). Scoped narrowly to request_context_args
+ * numeric-id correlation (and later matching a queued `stream_close` against
+ * that same exchange) — does NOT replace {@link decodeExecServerMessage}'s
+ * general nullable `id` field used by other exec-message consumers, to avoid
+ * broadening unrelated behavior.
+ */
+export const execServerContextNumericId = (
+  agentServerMessageBytes: Uint8Array,
+): number | null => {
+  const fields = parseProtoFields(agentServerMessageBytes);
+  const execServer = protoMessageField(fields, 2);
+  if (execServer === null) return null;
+  return protoUint32FieldOrDefault(parseProtoFields(execServer), 1);
+};
+
 /** Hermetic fixture: ExecServerMessage with a chosen oneof case (empty case body). */
 export const encodeExecServerMessage = (args: {
   readonly id?: number;
@@ -1374,6 +1392,21 @@ export const encodeAgentClientHeartbeat = (): Uint8Array =>
   encodeProtoBytes(7, new Uint8Array(0));
 
 /**
+ * `AgentClientMessage.exec_client_control_message` (field 5) wrapping
+ * `ExecClientControlMessage.stream_close` (field 1,
+ * `ExecClientStreamClose { id: uint32 field 1 }`) — hermetic test/fixture
+ * encoder mirroring the real native wire shape. `id` omitted encodes the
+ * proto3 zero default, matching what a real encoder produces for id=0.
+ */
+export const encodeAgentClientExecStreamClose = (
+  args: { readonly id?: number } = {},
+): Uint8Array => {
+  const streamClose =
+    args.id !== undefined ? encodeProtoInt32(1, args.id) : new Uint8Array(0);
+  return encodeProtoBytes(5, encodeProtoBytes(1, streamClose));
+};
+
+/**
  * AgentClientMessage oneof field tags (artifact 2026.07.23-e383d2b).
  * Metadata only — never log payloads.
  */
@@ -1422,6 +1455,17 @@ export const CURSOR_EXEC_CLIENT_RESULT_CASES: ReadonlyArray<
 export type TCursorFollowUpKind =
   | "request_context_result"
   | "kv_client_result"
+  /**
+   * `ExecClientControlMessage.stream_close` (field 1, `ExecClientStreamClose{id}`).
+   * The native generic-exec loop writes this unconditionally AFTER every exec
+   * result — including the request_context_args/result exchange — so it can
+   * arrive queued behind an unrelated later exchange (e.g. a KV control
+   * wait). It is NOT auto-approved: the caller must verify `execNumericId`
+   * matches the numeric id of an exec exchange it already forwarded in THIS
+   * capture before relaying it, and never against an unrelated id
+   * namespace (KV ids are a separate space from exec ids).
+   */
+  | "exec_stream_close"
   | "benign_control"
   | "forbidden_native"
   | "unknown";
@@ -1515,27 +1559,41 @@ export const classifyAgentClientFollowUp = (
       };
     }
     if (agentCase.name === "exec_client_control_message") {
-      // stream_close / throw / heartbeat — heartbeat is benign; others reject.
+      // stream_close / throw / heartbeat — heartbeat is benign; stream_close
+      // carries a numeric id the CALLER must verify against a known exec
+      // exchange (never auto-approved here); throw/unknown reject.
       const ctrlFields = parseProtoFields(agentCase.bytes);
-      const ctrl =
-        protoMessageField(ctrlFields, 3) !== null
-          ? "heartbeat"
-          : protoMessageField(ctrlFields, 1) !== null
-            ? "stream_close"
-            : protoMessageField(ctrlFields, 2) !== null
-              ? "throw"
-              : "unknown_control";
-      if (ctrl === "heartbeat") {
+      const heartbeat = protoMessageField(ctrlFields, 3);
+      if (heartbeat !== null) {
         return {
           ...base,
           kind: "benign_control",
           agentClientCase: agentCase.name,
-          execClientCase: ctrl,
+          execClientCase: "heartbeat",
           execId: null,
           execNumericId: null,
           diagnostic: `followup benign exec_client_control.heartbeat flags=${connectFlags} bytes=${connectPayloadBytes}`,
         };
       }
+      const streamClose = protoMessageField(ctrlFields, 1);
+      if (streamClose !== null) {
+        // `ExecClientStreamClose { id: uint32 field 1 }` — proto3 implicit
+        // presence, so id=0 is validly omitted on the wire (same fix class
+        // as the KV ids). Wrong wire type / out-of-range still rejects.
+        const scFields = parseProtoFields(streamClose);
+        const streamCloseId = protoUint32FieldOrDefault(scFields, 1);
+        return {
+          ...base,
+          kind: "exec_stream_close",
+          agentClientCase: agentCase.name,
+          execClientCase: "stream_close",
+          execId: null,
+          execNumericId: streamCloseId,
+          diagnostic: `followup exec_client_control.stream_close id=${streamCloseId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+        };
+      }
+      const ctrl =
+        protoMessageField(ctrlFields, 2) !== null ? "throw" : "unknown_control";
       return {
         ...base,
         kind: "forbidden_native",
@@ -1610,7 +1668,9 @@ export const classifyAgentClientFollowUp = (
     }
     const execFields = parseProtoFields(agentCase.bytes);
     const execId = protoStringField(execFields, 15);
-    const execNumericId = protoIntField(execFields, 1);
+    // Same proto3 implicit-presence fix as KV ids: `ExecClientMessage.id`
+    // is a non-optional uint32, so id=0 is validly omitted on the wire.
+    const execNumericId = protoUint32FieldOrDefault(execFields, 1);
     const execCase = execClientCaseOf(execFields);
     if (execCase === "request_context_result") {
       // Ensure no sibling native result fields ride along.
@@ -2677,11 +2737,26 @@ export const chunksStreamFromCursorConnectResponseBody = (
       };
 
       let turnEndedSeen = false;
+      // CodeRabbit round 3: a clean socket close (`done`) was previously
+      // treated as a successful completion whenever ANY meaningful output
+      // had streamed, with no check that a genuine terminal marker
+      // (`endStream` envelope or `turn_ended`) was ever actually observed —
+      // the same fabricated-success class of bug already fixed on the H2
+      // duplex path, but this HTTP1/general decode path had no equivalent
+      // guard. `sawEndStream` closes that gap.
+      let sawEndStream = false;
       try {
         readLoop: for (;;) {
           if (args.signal?.aborted) throw new Error("aborted");
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) {
+            if (!turnEndedSeen && !sawEndStream) {
+              throw new Error(
+                "cursor capture upstream closed without a terminal Connect end-stream marker or turn_ended",
+              );
+            }
+            break;
+          }
           const next = new Uint8Array(pending.byteLength + value.byteLength);
           next.set(pending, 0);
           next.set(value, pending.byteLength);
@@ -2701,6 +2776,10 @@ export const chunksStreamFromCursorConnectResponseBody = (
               args.connectContentEncoding,
             );
             if (env.endStream) {
+              // Genuine native/transport terminal marker — mark it BEFORE
+              // any trailer-shape branch below, so even an empty/`{}`
+              // trailer still counts as having seen it.
+              sawEndStream = true;
               const raw = textDecoder.decode(payload);
               if (raw.length === 0 || raw === "{}") continue;
               let parsed: unknown;

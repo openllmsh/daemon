@@ -81,6 +81,7 @@ import {
   decodeAgentServerMessage,
   decodeCapturedBidiAppendBody,
   encodeConnectEnvelope,
+  execServerContextNumericId,
   isCursorBidiAppendPath,
   requestIdFromCapturedRunSseBody,
   resolveConnectEnvelopePayload,
@@ -1516,6 +1517,20 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
   readonly connectContentEncoding?: string | null;
   readonly followUpTimeoutMs?: number;
   readonly signal?: AbortSignal;
+  /**
+   * The numeric id of an EARLIER request_context_args/result exchange
+   * already forwarded in this capture (from
+   * {@link forwardCursorRequestContextThroughBuilder}'s
+   * `contextExecNumericId`), if any. The native generic-exec loop writes an
+   * `ExecClientControlMessage.stream_close` unconditionally after every exec
+   * result, so this one can still be queued on the IPC channel and only
+   * surface here, during a later KV wait. It is relayed EXACTLY ONCE, and
+   * ONLY when its own id matches this value exactly — KV ids are a
+   * completely separate id namespace and must never be used for this match.
+   * `undefined`/`null` means no known context exchange, so any stream_close
+   * observed here is unattributable and still rejected.
+   */
+  readonly knownContextExecNumericId?: number | null;
 }): Promise<{ readonly forwardedFollowUps: number }> => {
   if (isAbortSignalAborted(args.signal)) {
     throw new RequestCaptureError("aborted", "client aborted before KV inject");
@@ -1565,6 +1580,10 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
     Date.now() + Math.max(1_000, args.followUpTimeoutMs ?? 10_000);
   let forwardedFollowUps = 0;
   let observedFollowUps = 0;
+  // A queued stream_close for the EARLIER request_context exchange must be
+  // relayed exactly once — never repeatedly, and never treated as a
+  // second/duplicate signal once seen.
+  let contextStreamCloseForwarded = false;
   let aborted = isAbortSignalAborted(args.signal);
   const onAbort = (): void => {
     aborted = true;
@@ -1643,6 +1662,35 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
           forwardedFollowUps += 1;
           continue;
         }
+        if (classification.kind === "exec_stream_close") {
+          // Live retest #35: the native generic-exec loop writes
+          // `ExecClientControlMessage.stream_close` unconditionally after
+          // EVERY exec result — including the earlier
+          // request_context_args/result exchange — so it can still be
+          // queued on the IPC channel and only surface here, mid-KV-wait.
+          // Narrow, verified relay: forward it UNCHANGED, exactly once, and
+          // ONLY when its id matches the KNOWN earlier context exchange's
+          // numeric id — never against `expectedId` (the KV request's own
+          // id; a completely separate id namespace), and never as a
+          // generic/blanket exec-control approval.
+          if (
+            contextStreamCloseForwarded ||
+            args.knownContextExecNumericId === undefined ||
+            args.knownContextExecNumericId === null ||
+            classification.execNumericId !== args.knownContextExecNumericId
+          ) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_kv",
+              `unattributed stream_close during KV control (already_forwarded=${contextStreamCloseForwarded} known_context_id=${args.knownContextExecNumericId ?? "null"} actual_id=${classification.execNumericId ?? "null"})`,
+            );
+          }
+          args.http2.writeClientFollowUp(
+            encodeConnectEnvelope(env.payload, env.flags),
+          );
+          contextStreamCloseForwarded = true;
+          forwardedFollowUps += 1;
+          continue;
+        }
         if (classification.kind !== "kv_client_result") {
           throw new CursorCaptureDecodeError(
             "unsupported_native_kv",
@@ -1693,7 +1741,21 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
   readonly connectContentEncoding?: string | null;
   /** Caller abort — must stop waiting for a follow-up promptly, not just at the deadline. */
   readonly signal?: AbortSignal;
-}): Promise<{ readonly forwardedFollowUp: Uint8Array }> => {
+}): Promise<{
+  readonly forwardedFollowUp: Uint8Array;
+  /**
+   * The numeric id of THIS request_context_args/result exchange (proto3
+   * implicit presence — 0 is a real id, never "unknown"). The native
+   * generic-exec loop writes an `ExecClientControlMessage.stream_close`
+   * unconditionally after every exec result, including this one; it is
+   * commonly still queued on the IPC channel when this call returns and
+   * only observed later (e.g. during a subsequent KV control wait). The
+   * caller passes this id forward so that a later queued stream_close can
+   * be verified against it before being relayed — never against an
+   * unrelated id namespace (KV ids are a separate space).
+   */
+  readonly contextExecNumericId: number | null;
+}> => {
   if (isAbortSignalAborted(args.signal)) {
     throw new RequestCaptureError(
       "aborted",
@@ -1758,7 +1820,11 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
     const decoded = decodeAgentServerMessage(inspectPayload);
     if (decoded.kind === "exec_server") {
       expectedExecId = decoded.execId;
-      expectedNumericId = decoded.id;
+      // Proto3-correct numeric id (0 is validly omitted on the wire) — used
+      // both for request_context_result acceptance below AND to let the
+      // caller later verify a queued stream_close against this exact
+      // exchange, never a plain nullable `decoded.id`.
+      expectedNumericId = execServerContextNumericId(inspectPayload);
     }
   }
 
@@ -1920,7 +1986,10 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
             ? soleForwardPart
             : concatBytesLocal(forwardParts);
         args.http2.writeClientFollowUp(forwarded);
-        return { forwardedFollowUp: forwarded };
+        return {
+          forwardedFollowUp: forwarded,
+          contextExecNumericId: expectedNumericId,
+        };
       }
       // Only benign frames in this IPC message — keep waiting.
     }

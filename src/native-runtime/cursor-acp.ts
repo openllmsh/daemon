@@ -1323,13 +1323,59 @@ export const runCursorNativeCapture = async (
 
   let dispatchStarted = false;
   try {
-    const tx = await bridge.waitForTransaction({
+    // CodeRabbit round 3: `runAcp` can decline FAST (auth failure, missing
+    // CLI, immediate vendor exit) — e.g. `{ kind: "declined", cooldownReason:
+    // "auth" }` resolved well before any transaction is ever captured. The
+    // previous code discarded that entirely (`void acpPromise.catch(() =>
+    // {})` only guards against an unhandled REJECTION) and unconditionally
+    // waited out the full `waitForTransaction` timeout, then declined with a
+    // generic "no output" reason — losing the real cooldown attribution and
+    // stalling for up to 30s on a process that had already exited. Race the
+    // two: an early ACP decline/rejection wins immediately and its
+    // cooldownReason/message is preserved; the normal happy path (a
+    // transaction arrives first) is unaffected.
+    // A single, shared transaction-wait promise — reused below if the ACP
+    // side settles first with something other than an early decline, so we
+    // never issue a second/duplicate `waitForTransaction` call.
+    const transactionPromise = bridge.waitForTransaction({
       quietMs: 75,
       maxWaitMs: Math.min(params.precommitMs ?? 60_000, 30_000),
     });
+    const raced = await Promise.race([
+      transactionPromise.then((tx) => ({ kind: "transaction" as const, tx })),
+      acpPromise.then(
+        (result) =>
+          result.kind === "declined"
+            ? ({ kind: "acp_declined" as const, result } as const)
+            : ({ kind: "acp_settled_other" as const } as const),
+        (err: unknown) => ({ kind: "acp_error" as const, err }) as const,
+      ),
+    ]);
+    if (raced.kind === "acp_declined") {
+      // No dispatch was ever attempted — nothing touched upstream.
+      return {
+        ...raced.result,
+        captureOwnership: captureOwnershipFromSession(bridge.session),
+      };
+    }
+    if (raced.kind === "acp_error") {
+      return {
+        kind: "declined",
+        reason:
+          raced.err instanceof Error ? raced.err.message : String(raced.err),
+        captureOwnership: captureOwnershipFromSession(bridge.session),
+      };
+    }
+    // `acp_settled_other` (acpPromise resolved "committed" — unexpected in
+    // bridge-capture mode, since the builder's own send is meant to be
+    // captured rather than streamed through ACP directly) falls through to
+    // await the SAME `transactionPromise` already in flight — no behavior
+    // change from before this fix for that edge case, and no duplicate
+    // `waitForTransaction` call.
+    const tx =
+      raced.kind === "transaction" ? raced.tx : await transactionPromise;
 
     const captureId = bridge.lastCaptureId();
-    dispatchStarted = true;
 
     let ownershipAtAccept: ReturnType<typeof captureOwnershipFromSession>;
 
@@ -1338,6 +1384,13 @@ export const runCursorNativeCapture = async (
       if (captureId === null) {
         throw new Error("missing primary capture id for duplex bridge");
       }
+      // Only from here on has a real dispatch actually begun — a missing
+      // capture id above is a pure local validation failure with zero
+      // upstream contact, so `dispatchStarted` must stay false for it
+      // (CodeRabbit round 3: it was previously set unconditionally right
+      // after `waitForTransaction`, before this id check, which would
+      // mislabel that validation failure as "uncertain" capture ownership).
+      dispatchStarted = true;
       // Rebind as a non-null local — the async generator below closes over
       // this across an `await`, and TS does not retain the `!== null`
       // narrowing of the outer `const` through that closure boundary.
@@ -1394,6 +1447,12 @@ export const runCursorNativeCapture = async (
       const reader = http2.response.body.getReader();
       let pending = new Uint8Array(0);
       let contextBridged = false;
+      // Track the ACTUAL numeric id of the request_context_args/result
+      // exchange (not just a boolean) — a later queued
+      // `ExecClientControlMessage.stream_close` for that exchange can only
+      // be verified/relayed during a subsequent KV control wait if this is
+      // known. Proto3 implicit presence: 0 is a real id, never "unknown".
+      let contextExecNumericId: number | null = null;
       let sawModelOutput = false;
       // Metadata-only diagnostics (never payload/args/content) so a stuck
       // phase is identifiable from the decline reason alone.
@@ -1614,17 +1673,19 @@ export const runCursorNativeCapture = async (
                 // Forward the EXACT original envelope (preserve compression
                 // flag + bytes) into the builder — never a re-encoded/
                 // rewritten copy of the control frame.
-                await forwardCursorRequestContextThroughBuilder({
-                  captureBridge: bridge,
-                  captureId: nonNullCaptureId,
-                  http2,
-                  serverExecEnvelope: encodeConnectEnvelope(
-                    env.payload,
-                    env.flags,
-                  ),
-                  connectContentEncoding,
-                  signal: params.signal,
-                });
+                const contextForward =
+                  await forwardCursorRequestContextThroughBuilder({
+                    captureBridge: bridge,
+                    captureId: nonNullCaptureId,
+                    http2,
+                    serverExecEnvelope: encodeConnectEnvelope(
+                      env.payload,
+                      env.flags,
+                    ),
+                    connectContentEncoding,
+                    signal: params.signal,
+                  });
+                contextExecNumericId = contextForward.contextExecNumericId;
                 contextBridged = true;
                 phase = "post_context_wait";
                 continue;
@@ -1702,6 +1763,7 @@ export const runCursorNativeCapture = async (
                   ),
                   connectContentEncoding,
                   signal: params.signal,
+                  knownContextExecNumericId: contextExecNumericId,
                 });
                 continue;
               }
@@ -1959,6 +2021,12 @@ export const runCursorNativeCapture = async (
     }
 
     // HTTP/1 (and injected sender) path — existing single-shot dispatch.
+    // `dispatchStarted` is set immediately before the actual dispatch call —
+    // never earlier — for the same reason as the H2 branch above: anything
+    // that could still throw before this point (id/shape validation) is a
+    // pure local failure with zero upstream contact and must report
+    // ownership "none", not "uncertain".
+    dispatchStarted = true;
     const sender = params.sender ?? defaultCursorCaptureSender;
     const dispatched = await runCursorCapturedTransaction({
       session: bridge.session,
