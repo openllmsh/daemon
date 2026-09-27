@@ -371,6 +371,19 @@ const anchorPolicyReceipt = (
   ) {
     clearRollbackLatch();
   }
+  measureServerClockOffset(policy, now);
+};
+
+/**
+ * Refresh the server-clock offset from a receipt stamp. Runs for EVERY
+ * receipt that carries a stamp — also a policy with reporting disabled —
+ * so the device-grant server anchor (TCB-5) does not depend on the user
+ * enabling diagnostics (rework-8).
+ */
+const measureServerClockOffset = (
+  policy: TDaemonReportingPolicy,
+  now: number,
+): void => {
   const impliedOffset =
     policy.expires_at_ms - DOCTOR_REPORTING_POLICY_TTL_MS - now;
   if (Math.abs(impliedOffset) <= MAX_SERVER_CLOCK_OFFSET_MS) {
@@ -1168,6 +1181,9 @@ export const onBootstrapReportingPolicy = (
   // An older dynamic-import callback is not evidence of credential recovery.
   if (revision !== getReportingPolicyRevision()) return;
   const scope = reportingScope();
+  if (scope.policy !== null && scope.policy.enabled === false) {
+    measureServerClockOffset(scope.policy, clock());
+  }
   if (scope.policy === null || scope.policy.enabled === false) {
     cloudSuspended = true;
     policyAnchorKey = null;
