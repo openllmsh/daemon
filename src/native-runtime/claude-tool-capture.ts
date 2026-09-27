@@ -1214,8 +1214,8 @@ export const runClaudeToolCapture = async (
         } catch {
           return "exit";
         }
-        const { value, done } = read;
-        if (done) return "exit";
+        if (read.done) return "exit";
+        const { value } = read;
         const inv = inventoryToolCallsFromChunks([value]);
         const hasTool = inv.toolCalls.length > 0;
         const hasText = value.choices.some(
