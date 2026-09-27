@@ -378,10 +378,6 @@ const parseEnvLines = (text: string): Map<string, string> => {
  * passes `serviceEnvFilePath()` so it seeds the PROD `.env` even under the dev
  * flag — see `serviceEnvFilePath` / `service.ts writeEnvFileIfNeeded`.
  */
-const lockWait = (): void => {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-};
-
 /**
  * Shared env-file lock protocol `openllm-env-lock/v1` — the SAME protocol the
  * shell installers implement in `packages/daemon/install.sh` and
@@ -567,8 +563,8 @@ const envLockOwnerAlive = (pid: number): boolean => {
  * pid inside the window still compares equal to its own recorded start,
  * never the other way around. A FAILED probe (undefined) is never cached:
  * a stale "unknown" could otherwise be trusted for minutes, and a
- * `start=-` record it produced was reclaimable while the owner was still
- * alive.
+ * `start=-` record it produced could be reclaimable while the owner was
+ * still alive.
  */
 const IDENTITY_PROBE_TTL_MS = 250;
 const identityCache = new Map<
@@ -713,6 +709,12 @@ export const envLockPublishGapForTest = (
 ): void => {
   envLockPublishGapForTests = hook;
 };
+let envLockStealGapForTests: ((lockDir: string) => void) | null = null;
+export const envLockStealGapForTest = (
+  hook: ((lockDir: string) => void) | null,
+): void => {
+  envLockStealGapForTests = hook;
+};
 
 const envLockDirInoDefault = (dir: string): number | undefined => {
   try {
@@ -752,19 +754,14 @@ const envLockDirIsStale = (dir: string, asOfMtimeMs?: number): boolean => {
   }
   if (owner.state === "marked") {
     if (!envLockOwnerAlive(owner.pid)) return true;
-    if (owner.start.trim().replace(/\s+/g, " ") === "-") {
-      // The start identity can never be proven ("-" — written only by
-      // older builds that latched a failed probe): the live pid holds the
-      // lock for the full CONSERVATIVE stale window, never the orphan
-      // bound — a transient probe failure on the owner's side must not
-      // make a live lock reclaimable in seconds.
-      return Number.isFinite(ageMs) && ageMs >= envLockStaleMs();
-    }
+    if (owner.start.trim().replace(/\s+/g, " ") === "-") return false;
     // PID reuse is proven only through `processIdentityStatus`: it bridges
     // the legacy `ps lstart` records older builds (and pre-XS-1 installers)
     // wrote against this build's boot-scoped Linux probe — an old record
     // of a live owner still reads alive. An unreadable identity is
     // "unknown" — the lock stays held.
+    // An unproven identity is held. Only a fresh probe that proves the
+    // recorded owner is dead may make a marked lock stale.
     return envLockIdentityStatus(owner.pid, owner.start) === "dead";
   }
   // Unmarked: HELD unless past the short unproven bound AND still without a
@@ -1404,10 +1401,10 @@ const withEnvFileLock = (
     startIdentity: envLockStartIdentity,
     legacyStartIdentity: envLockStartIdentity,
     isStale: envLockDirIsStale,
-    removeOnUnprovenInode: false,
-    legacyHeld: (deadline): boolean => envLockLegacyHeld(stem, nonce),
+    legacyHeld: (): boolean => envLockLegacyHeld(stem, nonce),
     onStep: (step, path): void => {
       if (step === "before-publish") envLockPublishGapForTests?.(path);
+      if (step === "after-steal-marker") envLockStealGapForTests?.(path);
     },
   });
   if (release === null) return false;
