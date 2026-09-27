@@ -70,11 +70,8 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   renameSync,
-  rmdirSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -83,9 +80,16 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { parseOpenllmDaemonPort } from "@openllmsh/protocol";
 import type { TUpdateRouteConfig } from "@openllmsh/protocol/update-policy";
 import { resolveUpdateSetting } from "@openllmsh/protocol/update-policy";
+import type { TDirLockOptions } from "../../tunnel/session/dir-lock";
 import {
   acquireDirLockSync,
   envDirLockCodec,
+  finishDirLockRelease,
+  moveDirNoReplace,
+  publishDirLockOwner,
+  releaseDirLock,
+  stealDirLock,
+  sweepDirLockResidue,
 } from "../../tunnel/session/dir-lock";
 import type {
   TProcessIdentity,
@@ -460,9 +464,6 @@ const parseEnvLines = (text: string): Map<string, string> => {
  * quarantine: a record that turns out to be live AND young is put back with
  * a no-replace restore, never over a successor lock file.
  */
-const ENV_LOCK_KIND = "openllm-env-lock/v1";
-const ENV_LOCK_MARKER = `kind=${ENV_LOCK_KIND}`;
-
 // Both knobs share the installers' exact rule: decimal digits AND > 0 —
 // "0" (or anything non-numeric, including "0x10"/"1e3") falls back to the
 // defaults, never a zero-length window.
@@ -787,149 +788,33 @@ const envLockDirIsStale = (dir: string, asOfMtimeMs?: number): boolean => {
   return true;
 };
 
-let envLockQuarantineSeq = 0;
-
-/**
- * Reclaim an apparently-stale lock dir — MARK-FIRST. Drop a
- * `steal.<pid>.<nonce>` marker INSIDE the dir (no-replace create), re-judge
- * the SAME generation (inode match + the pre-mark mtime for the age term),
- * then `mv` it aside atomically — exactly one contender wins the rename.
- * The marker bridges check→move: a publisher that commits its owner record
- * while the steal is in flight sees the marker and fails its own publish,
- * so a committed steal can never leave two holders. A committed quarantine
- * is never moved back; the sweep removes it once it ages out. Exported as a
- * protocol seam for the regression tests.
- */
+/** Test seam for the same stale-reclaim primitive used by live acquire. */
 export const envLockSteal = (
   lockDir: string,
-  stem: string,
-  nonce: string,
+  _stem: string,
+  _nonce: string,
+  onQuarantine?: (path: string) => void,
 ): void => {
-  let beforeIno = Number.NaN;
-  let beforeMtimeMs = Number.NaN;
-  try {
-    const stat = lstatSync(lockDir);
-    beforeIno = stat.ino;
-    beforeMtimeMs = stat.mtimeMs;
-  } catch {
-    return; // vanished — the outer acquire retries.
-  }
-  const marker = join(lockDir, `steal.${process.pid}.${nonce}`);
-  try {
-    const fd = openSync(marker, "wx", 0o600);
-    closeSync(fd);
-  } catch (error) {
-    // A plain FILE at the lock path can never gain an owner record — park it
-    // like a stale dir (`statSync` dereferences, same as the bash `-f`).
-    // Anything else (ENOENT) vanished: retry at the top.
-    if ((error as NodeJS.ErrnoException).code === "ENOTDIR") {
-      try {
-        if (statSync(lockDir).isFile()) {
-          envLockQuarantineSeq += 1;
-          renameSync(
-            lockDir,
-            `${stem}.stale.${process.pid}.${nonce}.${envLockQuarantineSeq}`,
-          );
-        }
-      } catch {
-        // raced — leave it.
-      }
-    }
-    return;
-  }
-  let stale = false;
-  try {
-    stale =
-      lstatSync(lockDir).ino === beforeIno &&
-      envLockDirIsStale(lockDir, beforeMtimeMs);
-  } catch {
-    stale = false; // vanished mid-judge
-  }
-  if (stale) {
-    try {
-      envLockQuarantineSeq += 1;
-      renameSync(
-        lockDir,
-        `${stem}.stale.${process.pid}.${nonce}.${envLockQuarantineSeq}`,
-      );
-      return; // committed — the marker (and dir) are parked with it.
-    } catch {
-      // Lost the rename or the dir vanished — fall through to unmark.
-    }
-  }
-  try {
-    unlinkSync(marker);
-  } catch {
-    // already gone, or moved with the dir.
-  }
+  const options = envDirLockOptions();
+  stealDirLock(lockDir, envDirLockCodec, {
+    ...options,
+    onStep: (step, path): void => {
+      options.onStep?.(step, path);
+      if (step === "after-steal-rename") onQuarantine?.(path);
+    },
+  });
 };
 
-/**
- * Delete old quarantine/release dirs whose contents are only `owner.tmp.*`
- * publish residue or `steal.*` markers left by a steal committed mid-publish
- * (or NOTHING — a holder killed between the lock mkdir and the owner
- * publish, then quarantined) or a complete marked owner record.
- * Anything foreign — an unmarked owner, an unrelated file — keeps the dir.
- * Exported as a protocol seam for the regression tests.
- */
+/** Test seam for the shared lock residue sweep. */
 export const envLockSweepQuarantine = (
   parentDir: string,
   baseName: string,
 ): void => {
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(parentDir);
-  } catch {
-    return;
-  }
-  const staleMs = envLockStaleMs();
-  for (const entry of entries) {
-    if (
-      !entry.startsWith(`${baseName}.lock.stale.`) &&
-      !entry.startsWith(`${baseName}.lock.rel.`)
-    )
-      continue;
-    const path = join(parentDir, entry);
-    let isDir = false;
-    let mtimeMs = 0;
-    try {
-      const stat = lstatSync(path);
-      isDir = stat.isDirectory();
-      mtimeMs = stat.mtimeMs;
-    } catch {
-      continue;
-    }
-    if (!isDir || Date.now() - mtimeMs < staleMs) continue;
-    // Contents must be limited to the owner record (+ an unfinished tmp).
-    // An OWNERLESS residue — a holder killed between the lock mkdir and the
-    // publish, then quarantined — is swept too when all it holds is
-    // `owner.tmp.*` files (or nothing); anything foreign keeps it.
-    let clean = true;
-    let hasOwner = false;
-    try {
-      for (const child of readdirSync(path)) {
-        if (child === "owner") hasOwner = true;
-        else if (!child.startsWith("owner.tmp.") && !child.startsWith("steal."))
-          clean = false;
-      }
-    } catch {
-      clean = false;
-    }
-    if (!clean) continue;
-    if (hasOwner && envLockReadOwner(path).state !== "marked") continue;
-    for (const child of readdirSync(path)) {
-      try {
-        unlinkSync(join(path, child));
-      } catch {
-        // best effort
-      }
-    }
-    try {
-      rmdirSync(path);
-    } catch {
-      // best effort
-    }
-  }
+  sweepDirLockResidue(
+    join(parentDir, `${baseName}.lock.d`),
+    envDirLockCodec,
+    envDirLockOptions(),
+  );
 };
 
 /**
@@ -1097,308 +982,68 @@ const envLockLegacyHeld = (legacyPath: string, nonce: string): boolean => {
   return true; // could not stabilise this pass — treat as still held
 };
 
-/**
- * Publish OUR owner record inside the just-mkdir'd lock dir — NO-REPLACE.
- * A publisher paused between the mkdir and this call may have been
- * quarantined and its path re-taken by a successor, and `rename` would
- * silently stamp over the successor's record. `link` fails outright on an
- * existing owner; the O_EXCL create carries the same guarantee where
- * hardlinks do not work. Returns true ONLY when the live record afterwards
- * carries OUR nonce — the dir may be swapped even after a successful link,
- * so holding is never assumed from the write alone.
- *
- * Steal veto: a `steal.*` marker inside the dir, the dir itself gone — or a
- * DIFFERENT inode at the path (`expectedIno`, captured right after our
- * `mkdir`) — means a contender committed to reclaiming our generation
- * while our record was in flight. On a path re-taken by a successor the
- * marker check alone is blind: the successor's dir carries no `steal.*`
- * marker for OUR quarantined generation. Our hold is already lost, so we
- * drop OUR record (only when it is still ours) and report failure; the
- * caller retries acquisition from the top. The dir at the path is removed
- * only when it is still our generation — a successor's dir is never ours
- * to `rmdir`. A return of false means "did not acquire"; a throw means the
- * tmp write itself failed. Exported as a protocol seam for the regression
- * tests.
- */
+/** Test seam for the shared owner publisher. */
 export const envLockPublishOwner = (
   lockDir: string,
   nonce: string,
   expectedIno?: number,
 ): boolean => {
+  const ino = expectedIno ?? envLockDirIno(lockDir);
   const start = envLockStartIdentity(process.pid);
-  if (typeof start !== "string" || start.length === 0) {
-    // A live owner MUST carry a provable start identity. `start=-` made a
-    // held lock reclaimable by a third writer while the owner was still
-    // alive (a transient probe failure used to be latched forever), so a
-    // failed probe publishes NOTHING. Drop the dir WE made — only while it
-    // is still our generation — and report a retryable failure; the
-    // acquire loop re-probes from the top.
-    if (expectedIno !== undefined) {
-      try {
-        if (lstatSync(lockDir).ino === expectedIno) rmdirSync(lockDir);
-      } catch {
-        // vanished or foreign — not ours to remove
-      }
-    }
+  if (ino === undefined || typeof start !== "string" || start.length === 0)
     return false;
-  }
-  const record = `${ENV_LOCK_MARKER} pid=${process.pid} start=${start} nonce=${nonce}\n`;
-  const tmp = join(lockDir, `owner.tmp.${process.pid}`);
-  const ownerPath = join(lockDir, "owner");
-  writeFileSync(tmp, record, "utf-8");
-  let published = false;
-  try {
-    linkSync(tmp, ownerPath);
-    published = true;
-  } catch {
-    // EEXIST means a successor owns this dir — never replace its record.
-    // Any other failure (no hardlink support) gets the same no-replace
-    // guarantee from an O_EXCL create.
-    let fd = -1;
-    try {
-      fd = openSync(ownerPath, "wx");
-      writeFileSync(fd, record);
-      closeSync(fd);
-      fd = -1;
-      published = true;
-    } catch {
-      if (fd >= 0) {
-        try {
-          closeSync(fd);
-        } catch {
-          // best effort
-        }
-        // A half-written create must not masquerade as an owner — remove
-        // only OUR fresh file, never a successor's record.
-        try {
-          unlinkSync(ownerPath);
-        } catch {
-          // best effort
-        }
-      }
-    }
-  }
-  try {
-    unlinkSync(tmp);
-  } catch {
-    // best effort — swept later either way
-  }
-  if (!published) return false;
-  // Generation + steal veto — checked AFTER our record lands: the dir at
-  // the path must still be the SAME generation we `mkdir`'d (inode match —
-  // a successor's dir carries no `steal.*` marker for our quarantined
-  // generation) AND must hold no steal marker. Never vetoed by a record we
-  // might overwrite — the marker is foreign to our own publish.
-  let stolen = true;
-  let sameGeneration = false;
-  try {
-    const stat = lstatSync(lockDir);
-    if (stat.isDirectory()) {
-      sameGeneration = expectedIno === undefined || stat.ino === expectedIno;
-      stolen =
-        !sameGeneration ||
-        readdirSync(lockDir).some((child) => child.startsWith("steal."));
-    }
-  } catch {
-    // dir vanished — it was stolen outright.
-  }
-  if (stolen) {
-    const ours = envLockReadOwner(lockDir);
-    if (ours.state === "marked" && ours.nonce === nonce) {
-      try {
-        unlinkSync(ownerPath);
-      } catch {
-        // best effort
-      }
-    }
-    // Only our own generation is ours to remove; a successor's dir at the
-    // same path (inode mismatch) is left for its real publisher.
-    if (sameGeneration) {
-      try {
-        rmdirSync(lockDir); // only succeeds once nothing foreign remains
-      } catch {
-        // best effort — the dir is being (or was) quarantined regardless
-      }
-    }
-    return false;
-  }
-  const now = envLockReadOwner(lockDir);
-  return now.state === "marked" && now.nonce === nonce;
+  return publishDirLockOwner(
+    lockDir,
+    ino,
+    { kind: envDirLockCodec.kind, pid: process.pid, start, nonce },
+    envDirLockCodec,
+    envDirLockOptions(),
+  );
 };
 
-/**
- * Put a quarantined foreign lock dir back at the live path — NO-REPLACE.
- * `rename` would silently replace a successor's just-`mkdir`'d (still
- * empty) dir that landed in the check→move gap; `mkdir` is the atomic
- * no-replace claim — if the path was re-taken, the captured dir simply
- * stays parked for the sweep. On a successful claim each regular-file
- * child is copied verbatim (`owner` first — the sort order already places
- * it ahead of `owner.tmp.*`/`steal.*`), then the quarantine is drained.
- * Exported as a protocol seam for the regression tests.
- */
+/** Test seam for the shared no-replace quarantine restore. */
 export const envLockRestoreQuarantinedDir = (
   released: string,
   lockDir: string,
 ): void => {
-  try {
-    mkdirSync(lockDir);
-  } catch {
-    return; // the path was re-taken — leave the quarantine parked
-  }
-  // The bash side expands `"$rel"/*`, which never matches dotfiles — skip
-  // them identically so a foreign dotfile keeps the quarantine parked on
-  // both sides. Every regular file is copied VERIFIED — created no-replace,
-  // fsync'd and re-read — and the quarantined source is deleted only after
-  // EVERY copy lands whole: a partial restore never destroys the only
-  // valid owner record.
-  const restored: string[] = [];
-  let ok = true;
-  let children: string[] = [];
-  try {
-    children = readdirSync(released).sort();
-  } catch {
-    ok = false; // nothing copyable — back out cleanly below
-  }
-  if (ok) {
-    for (const child of children) {
-      if (child.startsWith(".")) continue;
-      const src = join(released, child);
-      const dst = join(lockDir, child);
-      // `[ -f ]` on the bash side: a non-regular or unstatable entry is
-      // skipped, never copied — it keeps the quarantine parked below.
-      try {
-        if (!statSync(src).isFile()) continue;
-      } catch {
-        continue;
-      }
-      let created = false;
-      let fd = -1;
-      try {
-        const data = readFileSync(src);
-        fd = openSync(dst, "wx", 0o600);
-        created = true;
-        writeFileSync(fd, data);
-        fsyncSync(fd);
-        closeSync(fd);
-        fd = -1;
-        if (!readFileSync(dst).equals(data))
-          throw new Error("restored copy failed verification");
-        restored.push(child);
-      } catch {
-        ok = false;
-        if (fd >= 0) {
-          try {
-            closeSync(fd);
-          } catch {
-            // best effort
-          }
-        }
-        // Drop the partial file OUR copy created — never a foreign entry.
-        if (created) {
-          try {
-            unlinkSync(dst);
-          } catch {
-            // best effort
-          }
-        }
-        break;
-      }
-    }
-  }
-  if (ok) {
-    try {
-      fsyncDirectory(lockDir);
-    } catch {
-      ok = false;
-    }
-  }
-  if (!ok) {
-    // Roll the fresh dir back to its claimed-empty state: only the files
-    // THIS pass created are removed, then the dir itself when it is empty
-    // again. The quarantined source is preserved whole for a later pass.
-    for (const child of restored) {
-      try {
-        unlinkSync(join(lockDir, child));
-      } catch {
-        // best effort
-      }
-    }
-    try {
-      rmdirSync(lockDir);
-    } catch {
-      // a foreign entry arrived — leave the dir for its owner
-    }
-    return;
-  }
-  for (const child of restored) {
-    try {
-      unlinkSync(join(released, child));
-    } catch {
-      // best effort — a non-empty quarantine keeps the dir for the sweep
-    }
-  }
-  try {
-    rmdirSync(released);
-  } catch {
-    // best effort — foreign entries keep it parked for the sweep
-  }
+  moveDirNoReplace(released, lockDir, envDirLockCodec);
 };
 
-/**
- * Adjudicate a lock dir ALREADY moved into `<stem>.rel.<pid>.<nonce>`: our
- * own marked record means the release proceeds (empty + rmdir); anything
- * else — a successor's dir swapped in between our pre-check and the move —
- * is restored at the live path no-replace. Exported as a protocol seam for
- * the regression tests.
- */
+/** Test seam for the shared release adjudicator. */
 export const envLockFinishRelease = (
   released: string,
   lockDir: string,
   nonce: string,
 ): void => {
-  const owner = envLockReadOwner(released);
-  if (owner.state === "marked" && owner.nonce === nonce) {
-    try {
-      for (const child of readdirSync(released)) {
-        try {
-          unlinkSync(join(released, child));
-        } catch {
-          // best effort
-        }
-      }
-    } catch {
-      // unreadable — the rmdir below fails then, leaving it parked
-    }
-    try {
-      rmdirSync(released);
-    } catch {
-      // best effort
-    }
-    return;
-  }
-  envLockRestoreQuarantinedDir(released, lockDir);
+  finishDirLockRelease(
+    released,
+    lockDir,
+    { pid: process.pid, nonce },
+    envDirLockCodec,
+    envDirLockOptions(),
+  );
 };
 
-/**
- * Release OUR lock dir. Only a dir that still reads as OURS at the live
- * path is moved aside — a foreign marked owner (a successor that re-took
- * the path after our dir was stolen) is never touched; an unmarked,
- * missing or unreadable path is already not ours. The captured dir is then
- * adjudicated by {@link envLockFinishRelease}: delete when provably ours,
- * restore no-replace when the path was swapped mid-move. Exported as a
- * protocol seam for the regression tests.
- */
+/** Test seam for the shared release primitive. */
 export const envLockReleaseDir = (lockDir: string, nonce: string): void => {
-  const released = `${lockDir.slice(0, -2)}.rel.${process.pid}.${nonce}`;
-  try {
-    const pre = envLockReadOwner(lockDir);
-    if (pre.state !== "marked" || pre.nonce !== nonce) return;
-    renameSync(lockDir, released);
-  } catch {
-    return; // vanished under us (stolen/quarantined) — nothing held
-  }
-  envLockFinishRelease(released, lockDir, nonce);
+  const owner = envDirLockCodec.readOwner(lockDir);
+  if (owner?.pid !== process.pid || owner.nonce !== nonce) return;
+  releaseDirLock(lockDir, owner, envDirLockCodec, envDirLockOptions());
 };
+
+const envDirLockOptions = (): TDirLockOptions => ({
+  waitMs: envLockWaitMs(),
+  reclaimMs: envLockStaleMs(),
+  pollMs: 10,
+  inode: envLockDirIno,
+  startIdentity: envLockStartIdentity,
+  legacyStartIdentity: envLockLegacyStartIdentityProbe,
+  isStale: envLockDirIsStale,
+  onStep: (step, path): void => {
+    if (step === "before-publish") envLockPublishGapForTests?.(path);
+    if (step === "after-steal-marker") envLockStealGapForTests?.(path);
+  },
+});
 
 /** Serialize env-file read/modify/write operations across daemon processes. */
 const withEnvFileLock = (
@@ -1410,18 +1055,9 @@ const withEnvFileLock = (
   const lockDir = `${stem}.d`;
   const nonce = randomUUID().replace(/-/g, "");
   const release = acquireDirLockSync(lockDir, envDirLockCodec, {
+    ...envDirLockOptions(),
     waitMs: waitMs ?? envLockWaitMs(),
-    reclaimMs: envLockStaleMs(),
-    pollMs: 10,
-    inode: envLockDirIno,
-    startIdentity: envLockStartIdentity,
-    legacyStartIdentity: envLockLegacyStartIdentityProbe,
-    isStale: envLockDirIsStale,
     legacyHeld: (): boolean => envLockLegacyHeld(stem, nonce),
-    onStep: (step, path): void => {
-      if (step === "before-publish") envLockPublishGapForTests?.(path);
-      if (step === "after-steal-marker") envLockStealGapForTests?.(path);
-    },
   });
   if (release === null) return false;
   try {
