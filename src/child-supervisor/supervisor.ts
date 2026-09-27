@@ -391,11 +391,8 @@ export const superviseSpawn = (
     resolveReleased,
   };
   trackedChildren.set(pid, tracked);
-  // Persist the cross-restart identity record OFF the spawn hot path. Reading
-  // the start time is a `ps` subprocess; doing it synchronously here blocked the
-  // event loop on every spawn (a status sweep fans out 5 `--version` probes at
-  // once), starving unrelated async work. Defer it: resolve the identity via the
-  // non-blocking reader, then write the record once it lands.
+  // Read the shared process identity, then persist the record.
+  // Linux reads /proc in-process. macOS uses an async ps helper.
   //
   // A short probe (`--version`) can exit within milliseconds — before
   // `ps -o lstart=` can read its start time (null identity), or before this
