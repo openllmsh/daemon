@@ -31,6 +31,15 @@ let nonceLruCap = DEVICE_GRANT_NONCE_CAP;
 const nonceOrder: string[] = [];
 const nonceSeen = new Map<string, number>();
 
+/** TEST SEAM — replace the verifier's local clock reading so nonce-expiry
+ *  arithmetic can be exercised across the acceptance window without real
+ *  waits. Never set in production. */
+let nowImpl: () => number = () => Date.now();
+
+export const setDeviceGrantNowForTests = (fn: (() => number) | null): void => {
+  nowImpl = fn ?? (() => Date.now());
+};
+
 /** In-memory pin; hydrated from state.json on first read. */
 let pinnedPubkey: string | null | undefined;
 
@@ -153,13 +162,17 @@ const pruneExpiredNonces = (now: number): void => {
 
 /**
  * Remember a verified nonce until its envelope can no longer be accepted.
- * Retention is `max(localNow, envelopeTs, serverNow) + WINDOW`: the envelope
- * anchor alone is NOT enough — a grant accepted through the SERVER anchor
- * while the local clock runs far ahead stores `envelopeTs + WINDOW`, already
- * past on the local clock, so the next `pruneExpiredNonces` drops it and a
- * replay of the same signed grant verifies AGAIN inside the server window
- * (rework-6 P1). Grounding expiry in the verifier's own acceptance time keeps
- * the nonce alive for a full window after EITHER anchor admits the grant.
+ * Retention is the LAST local-clock instant either anchor admits `ts`:
+ *   - the LOCAL anchor accepts while `now <= ts + WINDOW`;
+ *   - the SERVER anchor accepts while `serverNow <= ts + WINDOW`, which in
+ *     local time is `now + (ts + WINDOW - serverNow)` (assuming the receipt
+ *     offset holds until the next bootstrap refreshes it).
+ * `max(...) + WINDOW` alone is NOT enough (rework-7): a grant accepted
+ * through the server anchor while the local clock runs AHEAD and the
+ * envelope is future-dated vs the server keeps `now + WINDOW` — but the
+ * server still admits that `ts` until `serverNow` reaches `ts + WINDOW`,
+ * up to a full window later, so a replay verifies AGAIN after the nonce
+ * was pruned.
  *
  * Callers MUST `pruneExpiredNonces(now)` before invoking this so capacity
  * checks see a fresh map. Returns false when the map is already full of
@@ -183,10 +196,12 @@ const rememberNonce = (
     );
     return false;
   }
-  nonceSeen.set(
-    n,
-    Math.max(now, envelopeTs, serverNow ?? 0) + DEVICE_GRANT_TS_WINDOW_MS,
-  );
+  const localAnchorEnd = envelopeTs + DEVICE_GRANT_TS_WINDOW_MS;
+  const serverAnchorEnd =
+    serverNow === null
+      ? Number.NEGATIVE_INFINITY
+      : now + envelopeTs + DEVICE_GRANT_TS_WINDOW_MS - serverNow;
+  nonceSeen.set(n, Math.max(now, localAnchorEnd, serverAnchorEnd));
   nonceOrder.push(n);
   return true;
 };
@@ -274,7 +289,7 @@ export const checkDeviceGrant = (
   if (!verifyDeviceGrantNode(pinned, msg, envelope.sig)) {
     return { ok: false, reason: "bad_sig" };
   }
-  const now = Date.now();
+  const now = nowImpl();
   const localSkewMs = now - envelope.ts;
   // Server-anchored check (TCB-5): when a bootstrap receipt has pinned the
   // cloud↔local offset, a grant inside the window of CLOUD time is accepted
