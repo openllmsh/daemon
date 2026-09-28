@@ -297,15 +297,29 @@ export type TCodexCaptureToolTurnParams = TCodexNativeParams & {
 };
 
 type TCaptureClient = ReturnType<typeof createIsolatedCodexAppServerClient>;
+type TCaptureReceiver = ReturnType<typeof startCodexCaptureReceiver>;
+type TCaptureSession = ReturnType<typeof createRequestCaptureSession>;
 
 /**
  * Refuse any builder-side `item/tool/call` without executing it. Capture
  * ownership means the daemon consumes true Responses tool intents; the
  * builder must not become a second execution boundary.
+ *
+ * Registered BEFORE `turn/start` and stays the active sink through the
+ * whole capture/dispatch window — `settleCodexCaptureTurn`'s own `addSink`
+ * call only replaces it AFTER `runCapturedDispatch` resolves. Its
+ * `onCompleted` therefore mirrors the text-capture path's early-watch sink
+ * (`codex-capture.ts`'s `runCodexCapturedTextTurn`): a native
+ * `turn/completed` that lands before anything has been captured/dispatched
+ * must fail the capture session immediately with the real reason, not be
+ * swallowed — otherwise the daemon silently waits out the full precommit
+ * timeout instead of surfacing why the native side already ended the turn.
  */
 const attachToolCallRefusalSink = (
   client: TCaptureClient,
   threadId: string,
+  session: TCaptureSession,
+  receiver: TCaptureReceiver,
 ): {
   readonly refusedCallIds: () => ReadonlyArray<string>;
   readonly onToolCall: (
@@ -338,7 +352,26 @@ const attachToolCallRefusalSink = (
     onDelta: () => {},
     onAgentMessage: () => {},
     onUsage: () => {},
-    onCompleted: () => {},
+    onCompleted: (status, errorMessage) => {
+      if (receiver.capturedCount() > 0 || session.dispatchStarted()) {
+        // Capture/dispatch already under way — terminal ownership belongs
+        // to `settleCodexCaptureTurn`'s own (later) sink; do not interfere.
+        return;
+      }
+      const detail =
+        errorMessage !== null && errorMessage.length > 0
+          ? `${status}: ${errorMessage}`
+          : status;
+      try {
+        session.complete({
+          kind: "failed",
+          reason: `codex turn ended before capture (${detail})`,
+          usage: { kind: "none" },
+        });
+      } catch {
+        // session may already be terminal/disposed
+      }
+    },
     onToolCall,
   });
   return {
@@ -508,7 +541,7 @@ export const runCodexCapturedToolTurn = async (
       };
     }
     threadId = started.thread.id;
-    refusal = attachToolCallRefusalSink(client, threadId);
+    refusal = attachToolCallRefusalSink(client, threadId, session, receiver);
 
     let turnUserText: string;
     if (plan.kind === "structured_items") {
