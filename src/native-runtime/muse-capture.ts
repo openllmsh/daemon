@@ -939,7 +939,18 @@ export const openMuseBridgeCaptureHandle = (opts: {
   readonly captureTimeoutMs?: number;
 }): TMuseBridgeCaptureHandle => {
   const session = createRequestCaptureSession({
-    destinationPolicy: museCaptureDestinationPolicy({ allowLoopback: true }),
+    // PRODUCTION path: never allow a loopback destination. The receiver's
+    // own `fetch` handler always sets `envelope.externalUrl` via
+    // `remapMuseObservedUrlToExternal` — a fixed rewrite onto the trusted
+    // `MUSE_CAPTURE_EXTERNAL_ORIGIN`, already in `allowedOrigins` — so a
+    // genuine captured request is never loopback and this changes nothing
+    // for real traffic. `allowLoopback: true` here would only matter if
+    // some future bug ever fed an unremapped/loopback URL into
+    // `captureSend`; keeping it `false` fails that closed instead of
+    // silently accepting it. (The hermetic `runMuseHermeticCaptureRoundTrip`
+    // below is a different, test-only session that legitimately dispatches
+    // to a loopback mock and keeps `allowLoopback: true`.)
+    destinationPolicy: museCaptureDestinationPolicy({ allowLoopback: false }),
     signal: opts.signal,
     captureTimeoutMs: opts.captureTimeoutMs ?? 60_000,
   });
