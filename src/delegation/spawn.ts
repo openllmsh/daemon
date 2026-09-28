@@ -1881,9 +1881,9 @@ const openerScriptContent = (kind: TOpenerScriptKind, url: string): string => {
     // self-delete. CRLF line endings: `goto` misbehaves on LF-only batches.
     return `@echo off\r\nrem ${OPENER_SCRIPT_MARKER}\r\nstart "" "${cmdQuotedUrl(url)}"\r\n(goto) 2>nul & del /f /q "%~f0"\r\n`;
   }
-  // `rm -f -- "$0"` deletes the script BEFORE `exec` hands off to the opener,
-  // so the sign-in URL persists neither in the transient unit's metadata /
-  // `ps` output nor as a leftover file.
+  // Delete the script before the opener starts.
+  // S4R-1 (P3): The opener requires the URL in argv.
+  // Other local users can see that URL in the process list.
   return `#!/bin/sh\n# ${OPENER_SCRIPT_MARKER}\nrm -f -- "$0"\nexec ${kind} ${shSingleQuoted(url)}\n`;
 };
 
