@@ -444,6 +444,32 @@ conversations can overwrite each other's vendor-session mapping — see
 `docs/plan/bridge-request-capture/session-continuity.md` (deferred; not a
 capture blocker).
 
+**Bridge/capture ownership rule.** Capture is a transport wrapper over each
+provider's bridge, not a parallel bridge implementation. CLI arguments, SDK
+query configuration, RPC request shapes, authentication/spawn configuration,
+and common session-resource setup/cleanup must each have one provider-owned
+implementation used by both modes. Capture supplies interception, destination
+relocation, direct dispatch and response/control handling. Necessary differences
+(such as isolated versus shared clients, inert versus paused caller-tool handlers,
+and Muse's native hosted-search mode) are explicit policy inputs at the shared
+boundary, not copied orchestration. Tests must exercise both consumers of that
+boundary so a future bridge change carries through to capture automatically.
+
+The shared owners live alongside each provider, not in a cross-provider framework:
+- Claude: `claude-spawn.ts` owns CLI arguments and spawning;
+  `claude-tool-sdk-options.ts` owns common SDK query/MCP configuration. Held
+  caller-tool callbacks and inert capture callbacks remain explicit policies.
+- Codex: `codex-app-server.ts` owns dynamic-tool mapping and thread/turn request
+  builders. Shared bridge clients and isolated capture clients use those same
+  builders; capture still owns its private `CODEX_HOME` and exit-before-cleanup.
+- Cursor: `runCursorNativeCapture` wraps `runCursorNative` itself. Both modes
+  receive the same normalized serve inputs; capture adds only transport controls.
+- Muse: `openMuseTurnSession` in `muse-runtime.ts` owns turn directories, MCP,
+  overlay configuration, host/session creation and partial-failure cleanup for
+  both modes. Native approval/turn processing and direct captured-response
+  processing remain separate. Capture selects native hosted search through the
+  shared overlay, without substituting a caller tool or rewriting vendor bytes.
+
 **Bridge request capture (`bridge-capture` sub-method).** Cloud
 `ACTIVE_SUB_METHOD` may select `bridge-capture` (global or
 `provider:bridge-capture`). Serve activates only **ready** paths declared in
