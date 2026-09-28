@@ -1646,6 +1646,18 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
           "builder KV follow-up is not complete Connect envelope(s)",
         );
       }
+      // CodeRabbit review (benchmark round 3): validate the ENTIRE batch
+      // before writing anything upstream. Previously the KV reply was
+      // forwarded and the function returned the instant it matched —
+      // meaning a trailing envelope in the SAME IPC message (e.g. a queued
+      // stream_close for an earlier exchange, arriving right after this
+      // KV reply in one native write) was silently dropped, never even
+      // inspected. `orderedForwardBytes` buffers every forwardable
+      // envelope in original position; nothing is written until the whole
+      // batch is confirmed valid, and a forbidden envelope later in the
+      // batch aborts with zero partial forwards.
+      const orderedForwardBytes: Uint8Array[] = [];
+      let acceptedResultBytes: Uint8Array | null = null;
       for (const env of taken.envelopes) {
         observedFollowUps += 1;
         if (observedFollowUps > MAX_KV_CONTROL_FOLLOW_UPS) {
@@ -1673,12 +1685,11 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
           classification.agentClientCase === "client_heartbeat"
         ) {
           // The native builder emitted this exact keepalive while its own KV
-          // manager was working. Forward that exact envelope once; never
-          // manufacture or replay keepalives ourselves.
-          args.http2.writeClientFollowUp(
+          // manager was working. Buffer that exact envelope in original
+          // position; never manufacture or replay keepalives ourselves.
+          orderedForwardBytes.push(
             encodeConnectEnvelope(env.payload, env.flags),
           );
-          forwardedFollowUps += 1;
           continue;
         }
         if (classification.kind === "exec_stream_close") {
@@ -1688,32 +1699,34 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
           // mcp_state_exec_args exchange — so it can still be queued on the
           // IPC channel and only surface here, mid-KV-wait. Narrow, verified
           // relay: forward it UNCHANGED, and ONLY when its id is a member of
-          // the KNOWN set of already-completed control exchanges — never
-          // against `expectedId` (the KV request's own id; a completely
-          // separate id namespace), never as a generic/blanket exec-control
-          // approval, and never rejected merely because a DIFFERENT known
-          // id was already forwarded (each distinct id is tracked, and
-          // relayed, independently — this is what a batch of several
-          // completed exchanges legitimately looks like).
+          // the KNOWN set of already-completed control exchanges. KV and
+          // exec numeric ids are DIFFERENT namespaces — this is a hard
+          // invariant, never relaxed: a stream_close is NEVER accepted
+          // merely because it numerically equals `expectedId` (the KV
+          // request's own id); it must be a member of
+          // `knownControlExecNumericIds`, full stop. Also never a
+          // generic/blanket exec-control approval, and never rejected
+          // merely because a DIFFERENT known id was already forwarded (each
+          // distinct id is tracked, and relayed, independently — this is
+          // what a batch of several completed exchanges legitimately looks
+          // like).
+          const id = classification.execNumericId;
           if (
-            classification.execNumericId === null ||
+            id === null ||
             args.knownControlExecNumericIds === undefined ||
             args.knownControlExecNumericIds === null ||
-            !args.knownControlExecNumericIds.has(
-              classification.execNumericId,
-            ) ||
-            forwardedControlStreamCloseIds.has(classification.execNumericId)
+            !args.knownControlExecNumericIds.has(id) ||
+            forwardedControlStreamCloseIds.has(id)
           ) {
             throw new CursorCaptureDecodeError(
               "unsupported_native_kv",
-              `unattributed stream_close during KV control (already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${classification.execNumericId ?? "null"})`,
+              `unattributed stream_close during KV control (already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${id ?? "null"})`,
             );
           }
-          args.http2.writeClientFollowUp(
+          orderedForwardBytes.push(
             encodeConnectEnvelope(env.payload, env.flags),
           );
-          forwardedControlStreamCloseIds.add(classification.execNumericId);
-          forwardedFollowUps += 1;
+          forwardedControlStreamCloseIds.add(id);
           continue;
         }
         if (classification.kind !== "kv_client_result") {
@@ -1734,12 +1747,20 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
             `KV reply case mismatch expected=${expectedReplyCase} actual=${classification.execClientCase ?? "null"} id=${expectedId}`,
           );
         }
-        args.http2.writeClientFollowUp(
-          encodeConnectEnvelope(env.payload, env.flags),
-        );
+        const resultBytes = encodeConnectEnvelope(env.payload, env.flags);
+        acceptedResultBytes = resultBytes;
+        orderedForwardBytes.push(resultBytes);
+      }
+      // The whole batch validated cleanly — flush every buffered envelope
+      // now, in its original order.
+      for (const part of orderedForwardBytes) {
+        args.http2.writeClientFollowUp(part);
         forwardedFollowUps += 1;
+      }
+      if (acceptedResultBytes !== null) {
         return { forwardedFollowUps };
       }
+      // Only benign/close frames in this IPC message — keep waiting.
     }
     if (aborted) {
       throw new RequestCaptureError(
@@ -1920,6 +1941,14 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
       // forwarded upstream (`forwardParts`) are always the original envelope
       // (compressed or not) unchanged, using the same negotiated
       // `connect-content-encoding` this duplex stream was opened with.
+      // CodeRabbit review (benchmark round 3): validate this whole batch
+      // before writing anything upstream, exactly like the KV and
+      // mcp_state_exec relays — `orderedForwardBytes` buffers every
+      // forwardable envelope in original position; nothing is written
+      // until the batch is confirmed valid, so a forbidden envelope later
+      // in the same batch never lets an earlier benign one leak through
+      // first.
+      const orderedForwardBytes: Uint8Array[] = [];
       const forwardParts: Uint8Array[] = [];
       let accepted: TCursorFollowUpClassification | null = null;
       for (const env of followTaken.envelopes) {
@@ -1946,6 +1975,35 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
           payloadBytes: env.payload.byteLength,
         });
         lastClassification = classification;
+        if (classification.kind === "exec_stream_close") {
+          // The native generic-exec loop writes stream_close
+          // unconditionally AFTER every exec result — including this
+          // exchange's own. This is the FIRST control exchange in a
+          // capture, so there is no set of earlier-completed exchanges to
+          // correlate against here (unlike KV/mcp_state_exec, which may
+          // run after request_context and so accept a `
+          // knownControlExecNumericIds` set) — the only legitimate match
+          // is THIS exchange's own expected id, and ONLY once this
+          // exchange's own result has already been accepted earlier in
+          // this SAME batch's iteration order. A self-id close observed
+          // BEFORE its own result, or any other id, is rejected.
+          const id = classification.execNumericId;
+          const isOwnExchangeAfterAccepted =
+            id !== null &&
+            expectedNumericId !== null &&
+            id === expectedNumericId &&
+            accepted !== null;
+          if (id === null || !isOwnExchangeAfterAccepted) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_exec",
+              `unattributed stream_close during request_context control (expected_id=${expectedNumericId ?? "null"} actual_id=${id ?? "null"})`,
+            );
+          }
+          orderedForwardBytes.push(
+            encodeConnectEnvelope(env.payload, env.flags),
+          );
+          continue;
+        }
         if (classification.kind === "benign_control") {
           skipped.push(classification.diagnostic);
           continue;
@@ -1981,10 +2039,13 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
             );
           }
           accepted = classification;
-          forwardParts.push(encodeConnectEnvelope(env.payload, env.flags));
+          const resultBytes = encodeConnectEnvelope(env.payload, env.flags);
+          forwardParts.push(resultBytes);
+          orderedForwardBytes.push(resultBytes);
           continue;
         }
         // Forbidden / unknown — fail closed with metadata-only diagnostics.
+        // Nothing in `orderedForwardBytes` has been written yet.
         throw new CursorCaptureDecodeError(
           "unsupported_native_exec",
           `builder follow-up is not an allowlisted request_context_result; refusing to forward (${classification.diagnostic}; skipped=[${skipped.join("; ")}])`,
@@ -2004,13 +2065,17 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
           `builder follow-up has trailing ${followTaken.rest.byteLength} incomplete bytes (${lastClassification?.diagnostic ?? "no_class"})`,
         );
       }
+      // The whole batch validated cleanly — flush every buffered envelope
+      // now, in its original order.
+      for (const part of orderedForwardBytes) {
+        args.http2.writeClientFollowUp(part);
+      }
       if (accepted !== null && forwardParts.length > 0) {
         const [soleForwardPart] = forwardParts;
         const forwarded =
           forwardParts.length === 1 && soleForwardPart !== undefined
             ? soleForwardPart
             : concatBytesLocal(forwardParts);
-        args.http2.writeClientFollowUp(forwarded);
         return {
           forwardedFollowUp: forwarded,
           contextExecNumericId: expectedNumericId,
@@ -2260,6 +2325,18 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           `builder follow-up is not a complete Connect envelope (${lastClassification.diagnostic})`,
         );
       }
+      // CodeRabbit review (benchmark round 3): this batch is fully
+      // classified and validated BEFORE anything is written upstream.
+      // Previously heartbeat/stream_close envelopes were forwarded
+      // immediately as encountered while the accepted result was only
+      // buffered and flushed at the very end — reversing native wire order
+      // whenever the result preceded a heartbeat/close in the same IPC
+      // message, and risking a partial forward if a LATER envelope in the
+      // same batch turned out to be forbidden. `orderedForwardBytes`
+      // accumulates every forwardable envelope in its ORIGINAL position;
+      // nothing is written via `writeClientFollowUp` until the whole batch
+      // has been walked with no rejection.
+      const orderedForwardBytes: Uint8Array[] = [];
       const forwardParts: Uint8Array[] = [];
       let accepted: TCursorFollowUpClassification | null = null;
       for (const env of followTaken.envelopes) {
@@ -2302,9 +2379,10 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           // The native builder emitted this exact keepalive while its own
           // MCP-state manager was working — this exchange can legitimately
           // take a while (listing/kicking multiple configured servers).
-          // Forward that exact envelope once; never manufacture or replay
-          // keepalives ourselves (mirrors the KV control relay).
-          args.http2.writeClientFollowUp(
+          // Buffer that exact envelope in original position; never
+          // manufacture or replay keepalives ourselves (mirrors the KV
+          // control relay).
+          orderedForwardBytes.push(
             encodeConnectEnvelope(env.payload, env.flags),
           );
           continue;
@@ -2314,28 +2392,36 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           // stream_close is written unconditionally after EVERY exec
           // result, so one for an EARLIER completed control exchange can
           // still be queued and only surface here. Relay it unchanged,
-          // exactly once, and ONLY when its id is a member of the known set
-          // of ALREADY-completed control exchanges — never a generic/blind
-          // approval, never matched against this exchange's OWN expected id
-          // (a different, not-yet-resolved exchange).
+          // exactly once, and ONLY when its id is either (a) a member of
+          // the known set of ALREADY-completed control exchanges from
+          // PRIOR waits, or (b) THIS exchange's own expected id, but ONLY
+          // once this exchange's own result has already been accepted
+          // earlier in this SAME batch's iteration order — a self-id close
+          // observed BEFORE its own result is not a legitimate native
+          // shape (the generic-exec loop writes stream_close AFTER the
+          // result) and stays rejected. Never a generic/blind approval.
+          const id = classification.execNumericId;
+          const isKnownEarlierExchange =
+            id !== null && args.knownControlExecNumericIds?.has(id) === true;
+          const isOwnExchangeAfterAccepted =
+            id !== null &&
+            expectedNumericId !== null &&
+            id === expectedNumericId &&
+            accepted !== null;
           if (
-            classification.execNumericId === null ||
-            args.knownControlExecNumericIds === undefined ||
-            args.knownControlExecNumericIds === null ||
-            !args.knownControlExecNumericIds.has(
-              classification.execNumericId,
-            ) ||
-            forwardedControlStreamCloseIds.has(classification.execNumericId)
+            id === null ||
+            forwardedControlStreamCloseIds.has(id) ||
+            !(isKnownEarlierExchange || isOwnExchangeAfterAccepted)
           ) {
             throw new CursorCaptureDecodeError(
               "unsupported_native_exec",
-              `unattributed stream_close during mcp_state_exec control (already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${classification.execNumericId ?? "null"})`,
+              `unattributed stream_close during mcp_state_exec control (already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${id ?? "null"})`,
             );
           }
-          args.http2.writeClientFollowUp(
+          orderedForwardBytes.push(
             encodeConnectEnvelope(env.payload, env.flags),
           );
-          forwardedControlStreamCloseIds.add(classification.execNumericId);
+          forwardedControlStreamCloseIds.add(id);
           continue;
         }
         if (classification.kind === "benign_control") {
@@ -2375,11 +2461,15 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
             );
           }
           accepted = classification;
-          forwardParts.push(encodeConnectEnvelope(env.payload, env.flags));
+          const resultBytes = encodeConnectEnvelope(env.payload, env.flags);
+          forwardParts.push(resultBytes);
+          orderedForwardBytes.push(resultBytes);
           continue;
         }
         // Forbidden / unknown — fail closed with metadata-only diagnostics.
-        // Never a fabricated state reply of our own.
+        // Nothing in `orderedForwardBytes` has been written yet, so an
+        // earlier benign envelope in this same batch is never leaked
+        // upstream ahead of discovering this rejection.
         throw new CursorCaptureDecodeError(
           "unsupported_native_exec",
           `builder follow-up is not an allowlisted mcp_state_exec_result; refusing to forward (${classification.diagnostic}; skipped=[${skipped.join("; ")}])`,
@@ -2399,13 +2489,17 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           `builder follow-up has trailing ${followTaken.rest.byteLength} incomplete bytes (${lastClassification?.diagnostic ?? "no_class"})`,
         );
       }
+      // The whole batch validated cleanly — flush every buffered envelope
+      // now, in its original order.
+      for (const part of orderedForwardBytes) {
+        args.http2.writeClientFollowUp(part);
+      }
       if (accepted !== null && forwardParts.length > 0) {
         const [soleForwardPart] = forwardParts;
         const forwarded =
           forwardParts.length === 1 && soleForwardPart !== undefined
             ? soleForwardPart
             : concatBytesLocal(forwardParts);
-        args.http2.writeClientFollowUp(forwarded);
         return {
           forwardedFollowUp: forwarded,
           completedExecNumericId: expectedNumericId,
