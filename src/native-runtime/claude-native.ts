@@ -40,11 +40,9 @@ import {
   newAnthropicStreamState,
 } from "@openllmsh/wire/providers/anthropic/streaming";
 import { Schema } from "effect";
-import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
-import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { runClaudeTextCapture } from "./claude-capture";
+import { spawnClaudeCli } from "./claude-spawn";
 import type { TCapturedDispatchSender } from "./request-capture";
 import type { TNativeRunResult } from "./types";
 import {
@@ -202,50 +200,19 @@ export const runClaudeNative = async (
   // and break auth. The load-bearing prep is the SCRUBBED env below —
   // `cleanNativeSpawnEnv` drops `ANTHROPIC_*`/`CLAUDE_CODE_*` auth vars that
   // would otherwise override the subscription credential.
-  const argv = [
-    params.bin,
-    "-p",
-    "--output-format",
-    "stream-json",
-    "--include-partial-messages",
-    "--verbose",
-    "--setting-sources",
-    "",
-    // Belt-and-suspenders with `--setting-sources ""`: never load an MCP
-    // server (e.g. the user's global openllm MCP) — a loaded openllm MCP would
-    // run `openllm` under the isolated HOME and recursively create
-    // `<iso home>/.openllm/...`.
-    "--strict-mcp-config",
-    "--tools",
-    "",
-    "--max-turns",
-    "1",
-    "--model",
-    params.providerModelId,
-    // Resume feeds ONLY the delta turn into the persisted session (which
-    // already holds prior history + the system prompt). A fresh start applies
-    // the system prompt and seeds with `userText`.
-    ...(params.resumeSessionId !== null
-      ? ["--resume", params.resumeSessionId]
-      : params.systemText !== null
-        ? ["--system-prompt", params.systemText]
-        : []),
-  ];
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     // The bridge reads claude's isolated login-keychain credential to serve the
     // request; securityd denies a Seatbelt-confined caller, so it runs
     // unconfined on macOS (confined on Linux) — `sandbox/policy.ts`.
-    proc = Bun.spawn(
-      sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
-      {
-        stdin: new TextEncoder().encode(params.userText),
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: spawnCwd(params.env),
-        env: cleanNativeSpawnEnv(params.env),
-      },
-    );
+    proc = spawnClaudeCli({
+      bin: params.bin,
+      providerModelId: params.providerModelId,
+      systemText: params.systemText,
+      resumeSessionId: params.resumeSessionId,
+      userText: params.userText,
+      finalEnv: cleanNativeSpawnEnv(params.env),
+    });
   } catch (error) {
     return {
       kind: "declined",

@@ -23,17 +23,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import {
-  createSdkMcpServer,
-  query,
-  tool,
-} from "@anthropic-ai/claude-agent-sdk";
+import { query, tool } from "@anthropic-ai/claude-agent-sdk";
 import type {
   TChatCompletionResponse,
   TServerSearchCall,
 } from "@openllmsh/protocol";
 import { z } from "zod";
-import { spawnCwd } from "../delegation/util";
 import type {
   TToolContinuationIdentity,
   TValidatedToolContinuation,
@@ -42,6 +37,10 @@ import {
   mintToolContinuation,
   validateToolContinuation,
 } from "./claude-tool-continuation";
+import {
+  buildClaudeToolSdkOptionsBase,
+  claudeToolResumeAndSystemPromptOptions,
+} from "./claude-tool-sdk-options";
 import type { TNativeTokens } from "./types";
 import { cleanNativeSpawnEnv, normalizeNativeTerminalResult } from "./types";
 
@@ -585,33 +584,19 @@ const buildIterator = (
   const q = query({
     prompt: params.userText,
     options: {
-      model: params.providerModelId,
-      pathToClaudeCodeExecutable: params.bin,
-      env: cleanNativeSpawnEnv(params.env),
-      cwd: spawnCwd(params.env),
-      settingSources: [],
-      // Strip ALL built-in tools (Bash/Read/Write/Edit/…): a completion
-      // passthrough must NEVER execute a tool on the user's machine — the
-      // CLIENT runs its own tools. Only the client's function tools (the MCP
-      // server below) reach the model. Mirrors `claude-native.ts`'s
-      // `--tools ""`, which the plain-text path relies on for the same reason.
-      tools: [],
-      mcpServers: {
-        openllm: createSdkMcpServer({
-          name: "openllm",
-          version: "1.0.0",
-          tools: sdkTools,
-        }),
-      },
-      // Grant ONLY the registered client tools; deny anything else (built-ins
-      // are already gone via `tools: []` — this is the defense-in-depth guard).
+      ...buildClaudeToolSdkOptionsBase({
+        bin: params.bin,
+        env: cleanNativeSpawnEnv(params.env),
+        providerModelId: params.providerModelId,
+        tools: sdkTools,
+      }),
+      // Passthrough contract: tool_use PAUSES for the client's own execution
+      // (unlike capture's deny-all, which never reaches a real handler).
       canUseTool: buildPermit(allowed) as never,
-      ...(params.systemText !== null
-        ? { systemPrompt: params.systemText }
-        : {}),
-      ...(params.resumeSessionId !== null
-        ? { resume: params.resumeSessionId }
-        : {}),
+      ...claudeToolResumeAndSystemPromptOptions({
+        systemText: params.systemText,
+        resumeSessionId: params.resumeSessionId,
+      }),
     } as never,
   });
   const it = (q as AsyncIterable<unknown>)[Symbol.asyncIterator]();

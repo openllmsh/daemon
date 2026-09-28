@@ -25,11 +25,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import {
-  createSdkMcpServer,
-  query,
-  tool,
-} from "@anthropic-ai/claude-agent-sdk";
+import { query, tool } from "@anthropic-ai/claude-agent-sdk";
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
@@ -60,6 +56,10 @@ export {
   CLAUDE_TOOL_CAPTURE_STATUS,
 } from "./claude-tool-capture-status";
 
+import {
+  buildClaudeToolSdkOptionsBase,
+  claudeToolResumeAndSystemPromptOptions,
+} from "./claude-tool-sdk-options";
 import type { TClientTool } from "./claude-tool-session";
 import {
   CLAUDE_MCP_TOOL_PREFIX,
@@ -703,33 +703,29 @@ export const claudeToolCaptureSdkBuilder: TClaudeToolCaptureBuilder = async (
   const q = query({
     prompt: promptText,
     options: {
-      model: args.providerModelId,
-      pathToClaudeCodeExecutable: args.bin,
-      env: spawnEnv,
-      cwd: spawnCwd(args.cleanedEnv),
-      settingSources: [],
-      tools: [],
-      mcpServers: {
-        openllm: createSdkMcpServer({
-          name: "openllm",
-          version: "1.0.0",
-          tools: sdkTools,
-        }),
-      },
-      // Deny everything — capture must never execute tools even if a handler
-      // were somehow reached before interrupt.
+      ...buildClaudeToolSdkOptionsBase({
+        bin: args.bin,
+        env: spawnEnv,
+        providerModelId: args.providerModelId,
+        tools: sdkTools,
+      }),
+      // Hard deny — capture has no legitimate execution path at all (unlike
+      // passthrough's pause-for-client-result).
       canUseTool: async () => ({
         behavior: "deny" as const,
         message: "claude tool capture: tool execution denied (inert capture)",
       }),
+      // Capture's own AbortController — independent interrupt/close, unlike
+      // the passthrough session which stays held open across requests.
       abortController,
-      // Skip SDK auto title-generation Messages (live capture otherwise ate the
-      // title JSON as the daemon answer). Loopback gate is the hard backstop.
+      // Skip SDK auto title-generation (live capture otherwise ate the title
+      // JSON as the daemon answer); the loopback gate is the hard backstop.
       title: CLAUDE_TOOL_CAPTURE_SESSION_TITLE,
-      ...(resumeId !== null ? { resume: resumeId } : {}),
-      ...(args.systemText !== null && resumeId === null
-        ? { systemPrompt: args.systemText }
-        : {}),
+      ...claudeToolResumeAndSystemPromptOptions({
+        systemText: args.systemText,
+        resumeSessionId: resumeId,
+        suppressSystemPromptWhenResuming: true,
+      }),
     },
   });
 

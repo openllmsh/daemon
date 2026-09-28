@@ -42,11 +42,9 @@ import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
 import { isMeaningfulChunk } from "@openllmsh/wire/lib/streaming/peek";
 import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
 import { defaultUpstreamUrl } from "../delegation/auth-config";
-import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
-import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { createCaptureLoopbackGuard } from "./capture-loopback-guard";
+import { spawnClaudeCli } from "./claude-spawn";
 import type { TClaudeToolCaptureStatus } from "./claude-tool-capture-status";
 import { CLAUDE_TOOL_CAPTURE_STATUS } from "./claude-tool-capture-status";
 import type {
@@ -645,41 +643,16 @@ export const runClaudeTextCapture = async (
   const cleaned = cleanNativeSpawnEnv(params.env);
   const spawnEnv = withClaudeCaptureBaseUrl(cleaned, loopback.baseUrl);
 
-  const argv = [
-    params.bin,
-    "-p",
-    "--output-format",
-    "stream-json",
-    "--include-partial-messages",
-    "--verbose",
-    "--setting-sources",
-    "",
-    "--strict-mcp-config",
-    "--tools",
-    "",
-    "--max-turns",
-    "1",
-    "--model",
-    params.providerModelId,
-    ...(params.resumeSessionId !== null
-      ? ["--resume", params.resumeSessionId]
-      : params.systemText !== null
-        ? ["--system-prompt", params.systemText]
-        : []),
-  ];
-
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(
-      sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
-      {
-        stdin: new TextEncoder().encode(params.userText),
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: spawnCwd(spawnEnv),
-        env: spawnEnv,
-      },
-    );
+    proc = spawnClaudeCli({
+      bin: params.bin,
+      providerModelId: params.providerModelId,
+      systemText: params.systemText,
+      resumeSessionId: params.resumeSessionId,
+      userText: params.userText,
+      finalEnv: spawnEnv,
+    });
   } catch (error) {
     loopback.stop();
     session.dispose();
