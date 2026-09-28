@@ -1601,11 +1601,9 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
         parentCaptureId: args.captureId,
         timeoutMs: remaining,
       });
-      // CodeRabbit review: a fresh anonymous "abort" listener was previously
-      // registered on EVERY loop iteration with no corresponding removal —
-      // each non-firing iteration leaked one listener on `args.signal` for
-      // the signal's lifetime. Track it locally and remove it in a
-      // per-iteration `finally`, regardless of which side of the race won.
+      // A per-iteration abort listener is tracked locally and removed in a
+      // `finally` below, regardless of which side of the race wins — no
+      // listener may outlive the iteration that registered it.
       let onIterationAbort: (() => void) | null = null;
       const abortPromise =
         args.signal === undefined
@@ -1646,16 +1644,12 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
           "builder KV follow-up is not complete Connect envelope(s)",
         );
       }
-      // CodeRabbit review (benchmark round 3): validate the ENTIRE batch
-      // before writing anything upstream. Previously the KV reply was
-      // forwarded and the function returned the instant it matched —
-      // meaning a trailing envelope in the SAME IPC message (e.g. a queued
-      // stream_close for an earlier exchange, arriving right after this
-      // KV reply in one native write) was silently dropped, never even
-      // inspected. `orderedForwardBytes` buffers every forwardable
-      // envelope in original position; nothing is written until the whole
-      // batch is confirmed valid, and a forbidden envelope later in the
-      // batch aborts with zero partial forwards.
+      // The ENTIRE batch is validated before anything is written upstream:
+      // `orderedForwardBytes` buffers every forwardable envelope (e.g. a
+      // queued stream_close trailing the KV reply in one native write) in
+      // original position, so nothing is dropped by an early return and a
+      // forbidden envelope later in the batch aborts with zero partial
+      // forwards.
       const orderedForwardBytes: Uint8Array[] = [];
       let acceptedResultBytes: Uint8Array | null = null;
       for (const env of taken.envelopes) {
@@ -1787,6 +1781,15 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
   readonly connectContentEncoding?: string | null;
   /** Caller abort — must stop waiting for a follow-up promptly, not just at the deadline. */
   readonly signal?: AbortSignal;
+  /**
+   * Numeric ids of EARLIER request_context and/or mcp_state_exec exchanges
+   * already forwarded in this capture. The generic-exec loop can leave a
+   * stream_close for any such exchange queued on the IPC channel until this
+   * later request_context wait. Each known id is relayed exactly once; an
+   * unknown/null/duplicate id remains fail-closed. This set is intentionally
+   * exec-only: KV uses a separate numeric id namespace.
+   */
+  readonly knownControlExecNumericIds?: ReadonlySet<number> | null;
 }): Promise<{
   readonly forwardedFollowUp: Uint8Array;
   /**
@@ -1883,6 +1886,10 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
     Date.now() + Math.max(1_000, args.followUpTimeoutMs ?? 10_000);
   const skipped: string[] = [];
   let lastClassification: TCursorFollowUpClassification | null = null;
+  // Each DISTINCT known-completed-exchange id (or this exchange's own id,
+  // once accepted) gets its queued stream_close relayed exactly once —
+  // tracked per id, never a single boolean.
+  const forwardedControlStreamCloseIds = new Set<number>();
   let aborted = isAbortSignalAborted(args.signal);
   const onAbort = (): void => {
     aborted = true;
@@ -1896,24 +1903,35 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
         parentCaptureId: args.captureId,
         timeoutMs: remaining,
       });
+      // A per-iteration abort listener is tracked locally and removed in a
+      // `finally` below, regardless of which side of the race wins — no
+      // listener may outlive the iteration that registered it.
+      let onIterationAbort: (() => void) | null = null;
       const abortPromise =
         args.signal === undefined
           ? null
           : new Promise<"aborted">((resolve) => {
-              const abortSignal: AbortSignal =
-                args.signal ?? new AbortController().signal;
+              const abortSignal: AbortSignal = args.signal as AbortSignal;
               if (abortSignal.aborted) {
                 resolve("aborted");
                 return;
               }
-              abortSignal.addEventListener("abort", () => resolve("aborted"), {
+              onIterationAbort = () => resolve("aborted");
+              abortSignal.addEventListener("abort", onIterationAbort, {
                 once: true,
               });
             });
-      const followUp =
-        abortPromise === null
-          ? await followUpPromise
-          : await Promise.race([followUpPromise, abortPromise]);
+      let followUp: Awaited<typeof followUpPromise> | "aborted";
+      try {
+        followUp =
+          abortPromise === null
+            ? await followUpPromise
+            : await Promise.race([followUpPromise, abortPromise]);
+      } finally {
+        if (onIterationAbort !== null) {
+          args.signal?.removeEventListener("abort", onIterationAbort);
+        }
+      }
       if (followUp === "aborted") {
         throw new RequestCaptureError(
           "aborted",
@@ -1941,13 +1959,10 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
       // forwarded upstream (`forwardParts`) are always the original envelope
       // (compressed or not) unchanged, using the same negotiated
       // `connect-content-encoding` this duplex stream was opened with.
-      // CodeRabbit review (benchmark round 3): validate this whole batch
-      // before writing anything upstream, exactly like the KV and
-      // mcp_state_exec relays — `orderedForwardBytes` buffers every
-      // forwardable envelope in original position; nothing is written
-      // until the batch is confirmed valid, so a forbidden envelope later
-      // in the same batch never lets an earlier benign one leak through
-      // first.
+      // The whole batch is validated before anything is written upstream —
+      // `orderedForwardBytes` buffers every forwardable envelope in
+      // original position; a forbidden envelope later in the same batch
+      // never lets an earlier benign one leak through first.
       const orderedForwardBytes: Uint8Array[] = [];
       const forwardParts: Uint8Array[] = [];
       let accepted: TCursorFollowUpClassification | null = null;
@@ -1977,31 +1992,38 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
         lastClassification = classification;
         if (classification.kind === "exec_stream_close") {
           // The native generic-exec loop writes stream_close
-          // unconditionally AFTER every exec result — including this
-          // exchange's own. This is the FIRST control exchange in a
-          // capture, so there is no set of earlier-completed exchanges to
-          // correlate against here (unlike KV/mcp_state_exec, which may
-          // run after request_context and so accept a `
-          // knownControlExecNumericIds` set) — the only legitimate match
-          // is THIS exchange's own expected id, and ONLY once this
-          // exchange's own result has already been accepted earlier in
-          // this SAME batch's iteration order. A self-id close observed
-          // BEFORE its own result, or any other id, is rejected.
+          // unconditionally AFTER every exec result. A queued close is
+          // accepted only when its id is either a member of
+          // `knownControlExecNumericIds` (an earlier completed exec
+          // exchange) or THIS exchange's own id — and for the own-id case,
+          // only once this exchange's own result has already been
+          // accepted earlier in this same batch's iteration order; a
+          // self-id close observed before its own result is rejected.
+          // Each distinct id is forwarded exactly once — a duplicate for
+          // an already-forwarded id is rejected. KV numeric ids are a
+          // separate namespace and are never a member of this set.
           const id = classification.execNumericId;
+          const isKnownEarlierExchange =
+            id !== null && args.knownControlExecNumericIds?.has(id) === true;
           const isOwnExchangeAfterAccepted =
             id !== null &&
             expectedNumericId !== null &&
             id === expectedNumericId &&
             accepted !== null;
-          if (id === null || !isOwnExchangeAfterAccepted) {
+          if (
+            id === null ||
+            forwardedControlStreamCloseIds.has(id) ||
+            !(isKnownEarlierExchange || isOwnExchangeAfterAccepted)
+          ) {
             throw new CursorCaptureDecodeError(
               "unsupported_native_exec",
-              `unattributed stream_close during request_context control (expected_id=${expectedNumericId ?? "null"} actual_id=${id ?? "null"})`,
+              `unattributed stream_close during request_context control (expected_id=${expectedNumericId ?? "null"} already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${id ?? "null"})`,
             );
           }
           orderedForwardBytes.push(
             encodeConnectEnvelope(env.payload, env.flags),
           );
+          forwardedControlStreamCloseIds.add(id);
           continue;
         }
         if (classification.kind === "benign_control") {
@@ -2248,12 +2270,9 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
         parentCaptureId: args.captureId,
         timeoutMs: remaining,
       });
-      // CodeRabbit review: a fresh anonymous "abort" listener was previously
-      // registered on EVERY loop iteration with no corresponding removal —
-      // each non-firing iteration (i.e. every one except whichever iteration
-      // actually observes the abort) leaked one listener on `args.signal`
-      // for the lifetime of that signal. Track it locally and remove it in
-      // a per-iteration `finally`, regardless of which side of the race won.
+      // A per-iteration abort listener is tracked locally and removed in a
+      // `finally` below, regardless of which side of the race wins — no
+      // listener may outlive the iteration that registered it.
       let onIterationAbort: (() => void) | null = null;
       const abortPromise =
         args.signal === undefined
@@ -2325,17 +2344,12 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           `builder follow-up is not a complete Connect envelope (${lastClassification.diagnostic})`,
         );
       }
-      // CodeRabbit review (benchmark round 3): this batch is fully
-      // classified and validated BEFORE anything is written upstream.
-      // Previously heartbeat/stream_close envelopes were forwarded
-      // immediately as encountered while the accepted result was only
-      // buffered and flushed at the very end — reversing native wire order
-      // whenever the result preceded a heartbeat/close in the same IPC
-      // message, and risking a partial forward if a LATER envelope in the
-      // same batch turned out to be forbidden. `orderedForwardBytes`
-      // accumulates every forwardable envelope in its ORIGINAL position;
-      // nothing is written via `writeClientFollowUp` until the whole batch
-      // has been walked with no rejection.
+      // This batch is fully classified and validated before anything is
+      // written upstream. `orderedForwardBytes` accumulates every
+      // forwardable envelope in its original position; nothing is written
+      // via `writeClientFollowUp` until the whole batch has been walked
+      // with no rejection — preserving native wire order and avoiding a
+      // partial forward if a later envelope turns out to be forbidden.
       const orderedForwardBytes: Uint8Array[] = [];
       const forwardParts: Uint8Array[] = [];
       let accepted: TCursorFollowUpClassification | null = null;

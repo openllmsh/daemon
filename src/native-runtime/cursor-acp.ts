@@ -1901,6 +1901,10 @@ export const runCursorNativeCapture = async (
                     ),
                     connectContentEncoding,
                     signal: params.signal,
+                    // Empty at call time today (request_context is the
+                    // first control exchange processed per capture); kept
+                    // symmetric with the KV and mcp_state_exec call sites.
+                    knownControlExecNumericIds: completedControlExecNumericIds,
                   });
                 if (contextForward.contextExecNumericId !== null) {
                   completedControlExecNumericIds.add(
