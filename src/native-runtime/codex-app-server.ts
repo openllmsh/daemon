@@ -129,6 +129,18 @@ class CodexAppServerClient {
   private stdin: { write: (s: string) => void; flush?: () => void } | null =
     null;
   private proc: ReturnType<typeof Bun.spawn> | null = null;
+  /**
+   * The CURRENT/most-recent child's `proc.exited` promise, retained here
+   * (not read off `this.proc`) so it survives a `dispose()` call — `dispose()`
+   * nulls `this.proc` immediately, but this field is untouched by it and is
+   * only reassigned by {@link start} on the NEXT spawn. This is what makes
+   * {@link disposeAndWaitForExit} idempotent: a synchronous `dispose()`
+   * followed by `disposeAndWaitForExit()`, or two concurrent
+   * `disposeAndWaitForExit()` calls, all resolve `this.exited` off the SAME
+   * promise for the SAME child, so none of them can resolve early just
+   * because an earlier call already cleared `this.proc`.
+   */
+  private exited: Promise<number> | null = null;
   private readonly spawnArgvExtra: readonly string[];
   /** True when created via {@link createIsolatedCodexAppServerClient}. */
   readonly isolated: boolean;
@@ -151,7 +163,10 @@ class CodexAppServerClient {
 
   /**
    * Kill the child and reject in-flight RPCs. Required for isolated capture
-   * builders; safe but unusual for the shared warm client.
+   * builders; safe but unusual for the shared warm client. Signals the kill
+   * and returns immediately — it does NOT wait for the process to actually
+   * exit (that's {@link disposeAndWaitForExit}). Unchanged: kept exactly as
+   * the shared warm client's fire-and-forget teardown always worked.
    */
   dispose(): void {
     const proc = this.proc;
@@ -162,6 +177,40 @@ class CodexAppServerClient {
       // already exited
     }
     this.teardown("codex app-server disposed");
+  }
+
+  /**
+   * Same signal + teardown as {@link dispose} (calls it verbatim, so the
+   * shared warm client's immediate/fire-and-forget behavior is untouched),
+   * but resolves only once the child has ACTUALLY exited — awaits
+   * {@link exited}, the persistent per-spawn promise, rather than returning
+   * as soon as the kill signal is sent. `kill()` only requests termination;
+   * the process can still be running — and, in the capture path, still
+   * holding/reading its ephemeral `CODEX_HOME` — for a window after
+   * `dispose()` returns. Callers that must delete that directory (isolated
+   * capture builders) need this, not `dispose()`, to avoid deleting out from
+   * under a still-live child.
+   *
+   * IDEMPOTENT and safe to call concurrently or after a prior synchronous
+   * `dispose()`: reads {@link exited} (a field, not derived from `this.proc`)
+   * BEFORE calling `dispose()`, so every caller — however many, in whatever
+   * order relative to a plain `dispose()` — awaits the SAME promise for the
+   * SAME child and none can resolve early just because an earlier call
+   * already cleared `this.proc`.
+   *
+   * Does NOT swallow an unexpected rejection from `exited` as a confirmed
+   * exit — `Bun.Subprocess.exited` does not reject in normal operation, but
+   * if it ever did, treating that as "the child is gone" would be unsafe
+   * (the caller could delete a directory a still-running child is using).
+   * The rejection propagates; callers that chain cleanup after this MUST
+   * NOT run that cleanup from a `.catch()` on this call.
+   */
+  async disposeAndWaitForExit(): Promise<void> {
+    const exited = this.exited;
+    this.dispose();
+    if (exited !== null) {
+      await exited;
+    }
   }
 
   private async start(): Promise<void> {
@@ -176,6 +225,10 @@ class CodexAppServerClient {
       },
     );
     this.proc = proc;
+    // Reset for THIS spawn — a respawn (shared warm client only) must not
+    // let a stale `disposeAndWaitForExit()` caller from the PREVIOUS child
+    // keep awaiting an already-settled promise for a process that's gone.
+    this.exited = proc.exited;
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -183,10 +236,20 @@ class CodexAppServerClient {
     void this.pump(proc.stdout as ReadableStream<Uint8Array>).catch(() => {
       // reader ends on child exit; teardown below handles state
     });
-    void proc.exited.then(() => {
-      if (this.proc === proc) this.proc = null;
-      this.teardown("codex app-server exited");
-    });
+    // Always settle local state on exit, whichever way `exited` settles —
+    // an unexpected rejection must still null `this.proc`/tear down pending
+    // RPCs locally, even though `disposeAndWaitForExit` itself does not
+    // treat that rejection as a confirmed clean exit (see its doc comment).
+    void proc.exited.then(
+      () => {
+        if (this.proc === proc) this.proc = null;
+        this.teardown("codex app-server exited");
+      },
+      () => {
+        if (this.proc === proc) this.proc = null;
+        this.teardown("codex app-server exited (unexpectedly)");
+      },
+    );
     await this.request("initialize", {
       clientInfo: {
         name: "openllmd",

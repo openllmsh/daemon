@@ -25,7 +25,10 @@
  * injection still refuses explicitly (see `codexHistoryToResponsesItems`).
  */
 
+import { join } from "node:path";
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
+import { logError, safeDiagnosticMessage } from "../logger";
+import { daemonTempDir } from "../sandbox/working-set";
 import type { TClientTool } from "./claude-tool-session";
 import type { TCodexNativeParams } from "./codex-app-server";
 import {
@@ -42,6 +45,8 @@ import {
   settleCodexCaptureTurn,
   startCodexCaptureReceiver,
 } from "./codex-capture";
+import type { TCodexCaptureEphemeralHomeHandle } from "./codex-capture-ephemeral-home";
+import { createCodexCaptureEphemeralHome } from "./codex-capture-ephemeral-home";
 import { suppressHostedSearchClientTool } from "./codex-web-search";
 import {
   createRequestCaptureSession,
@@ -398,16 +403,50 @@ export const runCodexCapturedToolTurn = async (
       ? { workspaceRoutes: params.captureWorkspaceRoutes }
       : {}),
   });
-  const redirects = codexCaptureRedirectArgs(receiver.baseUrl);
-  const client = createIsolatedCodexAppServerClient(params.bin, params.env, {
-    spawnArgvExtra: redirects.argv,
-  });
+  const redirects = codexCaptureRedirectArgs(receiver.guardedBaseUrl);
 
   let threadId: string | null = null;
   let turnId: string | null = null;
   let captureOwnership: TCaptureOwnership = "none";
   let refusal: ReturnType<typeof attachToolCallRefusalSink> | null = null;
   const order: string[] = [];
+
+  // Request-private ephemeral `CODEX_HOME` for the redirect keys — see
+  // `codex-capture-ephemeral-home.ts` for the full source-verified
+  // rationale. Never `-c` argv, never the daemon's shared/durable
+  // `cliEnv("chatgpt").CODEX_HOME`. Must be built BEFORE the client is
+  // constructed (the client's env carries the ephemeral home).
+  const durableCodexHome = params.env.CODEX_HOME;
+  if (typeof durableCodexHome !== "string" || durableCodexHome.length === 0) {
+    receiver.stop();
+    session.dispose();
+    return {
+      kind: "declined",
+      reason:
+        "codex capture: CODEX_HOME missing from isolated env; refusing to spawn without a private redirect config",
+    };
+  }
+  let ephemeralHome: TCodexCaptureEphemeralHomeHandle;
+  try {
+    ephemeralHome = await createCodexCaptureEphemeralHome({
+      durableCodexHome,
+      chatgptBaseUrl: redirects.chatgptBaseUrl,
+      openaiBaseUrl: redirects.openaiBaseUrl,
+      tempRoot: join(daemonTempDir(), "codex-capture-home"),
+    });
+  } catch (err) {
+    receiver.stop();
+    session.dispose();
+    return {
+      kind: "declined",
+      reason: `codex capture: ephemeral CODEX_HOME setup failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const client = createIsolatedCodexAppServerClient(params.bin, {
+    ...params.env,
+    CODEX_HOME: ephemeralHome.ephemeralHome,
+  });
 
   const disposeAll = (): void => {
     if (threadId !== null) {
@@ -418,7 +457,28 @@ export const runCodexCapturedToolTurn = async (
       }
     }
     receiver.stop();
-    client.dispose();
+    // `dispose()` only SIGNALS the child; the ephemeral home it was reading
+    // its redirect config from must not be deleted until the child has
+    // ACTUALLY exited (`disposeAndWaitForExit` awaits the persistent exit
+    // promise) — otherwise a still-live child could be mid-read/mid-write
+    // against a directory this removes out from under it. Fire-and-forget
+    // from here (this function stays synchronous), but the two steps are
+    // chained. An unexpected rejection from `disposeAndWaitForExit` is NOT
+    // treated as a confirmed exit — cleanup only runs in the success branch,
+    // never from a `.catch()` — so this deliberately leaks the ephemeral
+    // directory rather than risk deleting it out from under a child we could
+    // not confirm has exited; the rejection is logged, not swallowed, and
+    // never left as an unhandled promise.
+    client
+      .disposeAndWaitForExit()
+      .then(() => ephemeralHome.cleanup())
+      .catch((err) => {
+        logError(
+          "native-runtime",
+          safeDiagnosticMessage`codex capture: could not confirm isolated app-server exit; ephemeral CODEX_HOME left in place rather than risk deleting a live directory`,
+          { message: err instanceof Error ? err.message : String(err) },
+        );
+      });
     // Defer session dispose: completing the capture session aborts its
     // internal signal, and Bun can surface that as a late AbortError on the
     // dispatch AbortSignal.any used during fetch. Releasing on a microtask

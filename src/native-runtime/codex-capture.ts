@@ -3,19 +3,41 @@
  *
  * Keeps existing inbound adapters + `runCodexNative` routing. When the
  * selected sub-method is `bridge-capture` for chatgpt, an ISOLATED
- * `codex app-server` child is spawned with:
+ * `codex app-server` child is spawned with `CODEX_HOME` pointed at a fresh,
+ * request-private ephemeral home (`codex-capture-ephemeral-home.ts`) whose
+ * `config.toml` carries:
  *
- *   -c chatgpt_base_url=<loopback>/backend-api
- *   -c openai_base_url=<loopback>/openllm-capture/codex
+ *   chatgpt_base_url = "<loopback>/<nonce>/backend-api"
+ *   openai_base_url = "<loopback>/<nonce>/openllm-capture/codex"
  *
- * The openai path deliberately does NOT end in `/backend-api/codex`, so
- * `supports_codex_backend_routes` is false and WorkspaceRouting cannot rewrite
- * the Responses authority off loopback (openai/codex rust-v0.156.0). Preamble
- * still uses `/backend-api` and is forwarded to chatgpt.com with application
- * JSON semantics preserved. Bun `fetch` may decompress control responses while
- * leaving stale `content-encoding`/`content-length`; the receiver reframes
- * those headers around the decoded body before serving (inference envelopes
- * never take this path). `/wham/accounts/check` vendor-selected
+ * never as `-c key=value` argv (world-readable via `ps`/cmdline) and never
+ * written into the daemon's shared, durable `cliEnv("chatgpt").CODEX_HOME` —
+ * see `codex-capture-ephemeral-home.ts` for the full source-verified
+ * rationale (auth-storage-backend selection, keyring keying, refresh/logout
+ * safety through the `auth.json` symlink).
+ *
+ * `<nonce>` is a fresh, unguessable per-receiver secret path segment from
+ * the shared `createCaptureLoopbackGuard()` (`capture-loopback-guard.ts`).
+ * Loopback + an OS-assigned ephemeral port is NOT authentication: any local
+ * process (a different OS user, or a webpage in the user's own browser via a
+ * blind cross-origin POST) that discovers the port could otherwise submit a
+ * valid-shaped request and win the single-shot capture race. Every inbound
+ * request is REQUIRED to present the exact nonce as its leading path segment
+ * — checked in constant time — and is rejected 404 BEFORE any preamble
+ * forward, capture offer, or WS upgrade when it is missing, wrong, or a
+ * same-prefix lookalike. The nonce is transport-only: it is peeled off (never
+ * inspected/rewritten) before path classification and before restoring the
+ * external URL, and it is never forwarded upstream or logged.
+ *
+ * The openai path (after the nonce) deliberately does NOT end in
+ * `/backend-api/codex`, so `supports_codex_backend_routes` is false and
+ * WorkspaceRouting cannot rewrite the Responses authority off loopback
+ * (openai/codex rust-v0.156.0). Preamble still uses `/backend-api` and is
+ * forwarded to chatgpt.com with application JSON semantics preserved. Bun
+ * `fetch` may decompress control responses while leaving stale
+ * `content-encoding`/`content-length`; the receiver reframes those headers
+ * around the decoded body before serving (inference envelopes never take
+ * this path). `/wham/accounts/check` vendor-selected
  * `workspace_backend_origin` values are recorded in request-private memory
  * (never logged) and restored as the daemon dispatch origin. Dispatch never
  * hardcodes production chatgpt.com when a constrained backend was selected.
@@ -28,6 +50,7 @@
  * parity is unproven. Cold / isolated builders only.
  */
 
+import { join } from "node:path";
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { decodeProviderEventStream } from "@openllmsh/wire/lib/streaming/provider-decode";
 import type { TChatGptStreamEvent } from "@openllmsh/wire/providers/chatgpt/streaming";
@@ -37,12 +60,17 @@ import {
   newChatGptStreamState,
 } from "@openllmsh/wire/providers/chatgpt/streaming";
 import { Schema } from "effect";
+import { logError, safeDiagnosticMessage } from "../logger";
+import { daemonTempDir } from "../sandbox/working-set";
+import { createCaptureLoopbackGuard } from "./capture-loopback-guard";
 import type { TCodexNativeParams } from "./codex-app-server";
 import {
   codexBaseStartParams,
   createIsolatedCodexAppServerClient,
   effortOf,
 } from "./codex-app-server";
+import type { TCodexCaptureEphemeralHomeHandle } from "./codex-capture-ephemeral-home";
+import { createCodexCaptureEphemeralHome } from "./codex-capture-ephemeral-home";
 import type {
   TBuilderSettlement,
   TCaptureDestinationPolicy,
@@ -143,8 +171,6 @@ const ChatGptStreamEventSchema: Schema.Schema<TChatGptStreamEvent> =
 export type TCodexCaptureRedirectArgs = {
   readonly chatgptBaseUrl: string;
   readonly openaiBaseUrl: string;
-  /** Argv fragment: `["-c", "chatgpt_base_url=…", "-c", "openai_base_url=…"]`. */
-  readonly argv: readonly string[];
 };
 
 /**
@@ -153,6 +179,13 @@ export type TCodexCaptureRedirectArgs = {
  *   - `openai_base_url` → loopback {@link CODEX_CAPTURE_OPENAI_PATH_PREFIX}
  *     so workspace routing does NOT engage (base does not end in
  *     `/backend-api/codex`).
+ *
+ * These values are handed to the spawned app-server via a request-private,
+ * per-capture ephemeral `CODEX_HOME` ({@link createCodexCaptureEphemeralHome}),
+ * never as `-c key=value` argv — argv is visible to every local process/user
+ * (`ps`, `/proc/<pid>/cmdline`), which would leak the loopback-guard nonce
+ * embedded in these URLs to other local accounts. See
+ * {@link createCodexCaptureEphemeralHome} for the source evidence.
  */
 export const codexCaptureRedirectArgs = (
   loopbackBase: string,
@@ -160,16 +193,7 @@ export const codexCaptureRedirectArgs = (
   const base = loopbackBase.replace(/\/+$/, "");
   const chatgptBaseUrl = `${base}/backend-api`;
   const openaiBaseUrl = `${base}${CODEX_CAPTURE_OPENAI_PATH_PREFIX}`;
-  return {
-    chatgptBaseUrl,
-    openaiBaseUrl,
-    argv: [
-      "-c",
-      `chatgpt_base_url=${chatgptBaseUrl}`,
-      "-c",
-      `openai_base_url=${openaiBaseUrl}`,
-    ],
-  };
+  return { chatgptBaseUrl, openaiBaseUrl };
 };
 
 /** Trusted static origins + admission for validated discovered backends. */
@@ -502,6 +526,14 @@ export type TCodexCapturePreambleMode = "forward" | "stub-204";
 
 export type TCodexCaptureReceiver = {
   readonly baseUrl: string;
+  /**
+   * The guarded base URL to hand to `codexCaptureRedirectArgs` (and thence to
+   * the spawned official CLI) — `baseUrl` with the per-receiver secret path
+   * prefix appended. Every request to this receiver MUST present that exact
+   * prefix or is rejected 404 before any preamble/capture/WS-upgrade
+   * handling. Never log this value or forward it upstream.
+   */
+  readonly guardedBaseUrl: string;
   readonly stop: () => void;
   /** Count of `/responses` offers accepted into the session (0 or 1). */
   readonly capturedCount: () => number;
@@ -572,6 +604,13 @@ export const startCodexCaptureReceiver = (
   const preambleFetch = opts.preambleFetch ?? fetch;
   const workspaceRoutes =
     opts.workspaceRoutes ?? createCodexWorkspaceRouteMemory();
+  // Fresh, unguessable per-receiver secret — loopback + an OS-assigned
+  // ephemeral port is not authentication (another local OS user, or a
+  // same-machine webpage's blind cross-origin POST, could otherwise win the
+  // single-shot capture race). Required as the exact leading path segment of
+  // every inbound request; peeled off (never inspected/rewritten, never
+  // logged, never forwarded upstream) before classification/handling.
+  const loopbackGuard = createCaptureLoopbackGuard();
 
   const classify = (pathname: string): TCodexCaptureObservedRequest["kind"] => {
     if (isCodexCaptureInferencePath(pathname)) return "inference";
@@ -579,12 +618,13 @@ export const startCodexCaptureReceiver = (
     return "other";
   };
 
-  const noteObserved = (req: Request): void => {
-    const url = new URL(req.url);
+  /** Metadata log uses the PEELED pathname only — the nonce itself is never
+   *  recorded, even in this diagnostics-only PATH/METHOD list. */
+  const noteObserved = (req: Request, peeledUrl: URL): void => {
     observed.push({
       method: req.method.toUpperCase(),
-      pathname: url.pathname,
-      kind: classify(url.pathname),
+      pathname: peeledUrl.pathname,
+      kind: classify(peeledUrl.pathname),
     });
   };
 
@@ -617,8 +657,16 @@ export const startCodexCaptureReceiver = (
     return remapCodexObservedUrlToExternal(observedUrl, resolved.origin);
   };
 
-  const offerFromHttp = async (req: Request): Promise<Response> => {
-    const observedUrl = req.url;
+  // `peeledUrl` is the guard-verified URL with the secret prefix already
+  // stripped (same origin/search/hash, remaining pathname preserved) — every
+  // classification/forward/capture decision below uses ONLY this, never the
+  // raw `req.url`, so the nonce itself never reaches path matching, external
+  // URL construction, logs, or upstream requests.
+  const offerFromHttp = async (
+    req: Request,
+    peeledUrl: URL,
+  ): Promise<Response> => {
+    const observedUrl = peeledUrl.toString();
     const headers = preserveCapturedHeaders(req.headers);
     const bodyBuf = await req.arrayBuffer();
     const body = bodyBuf.byteLength === 0 ? null : new Uint8Array(bodyBuf);
@@ -643,18 +691,20 @@ export const startCodexCaptureReceiver = (
     return localSettlementHttpResponse();
   };
 
-  const forwardPreamble = async (req: Request): Promise<Response> => {
-    const url = new URL(req.url);
+  const forwardPreamble = async (
+    req: Request,
+    peeledUrl: URL,
+  ): Promise<Response> => {
     // Trusted destination only — remap to chatgpt.com, preserve path/query and
     // the vendor-built application headers/body (auth included). Strip Host so
     // fetch sets it for the external origin.
     const fwd = new Headers(req.headers);
     fwd.delete("host");
     preambleForwardCount += 1;
-    const recordRoutes = isWorkspaceAccountsCheckPath(url.pathname);
+    const recordRoutes = isWorkspaceAccountsCheckPath(peeledUrl.pathname);
     try {
       const response = await preambleFetch(
-        `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${url.pathname}${url.search}`,
+        `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${peeledUrl.pathname}${peeledUrl.search}`,
         {
           method: req.method,
           headers: fwd,
@@ -683,9 +733,17 @@ export const startCodexCaptureReceiver = (
       if (opts.signal?.aborted) {
         return new Response(null, { status: 499 });
       }
-      const url = new URL(req.url);
-      const kind = classify(url.pathname);
-      noteObserved(req);
+      // Gate FIRST, before any preamble/capture/WS-upgrade handling and
+      // before reading the body: require the exact per-receiver secret path
+      // segment. Missing/wrong/lookalike → 404, with nothing else touched
+      // (no counting, no observation, no forward). The raw pre-peel URL is
+      // never logged.
+      const peeledUrl = loopbackGuard.peel(new URL(req.url));
+      if (peeledUrl === null) {
+        return new Response(null, { status: 404 });
+      }
+      const kind = classify(peeledUrl.pathname);
+      noteObserved(req, peeledUrl);
       const wantsUpgrade =
         req.headers.get("upgrade")?.toLowerCase() === "websocket";
 
@@ -693,7 +751,7 @@ export const startCodexCaptureReceiver = (
         const upgraded = srv.upgrade(req, {
           data: {
             headers: preserveCapturedHeaders(req.headers),
-            observedUrl: req.url,
+            observedUrl: peeledUrl.toString(),
             bodyChunks: [],
             offered: false,
             warmupSkipped: 0,
@@ -705,7 +763,7 @@ export const startCodexCaptureReceiver = (
       }
 
       if (kind === "inference") {
-        return offerFromHttp(req);
+        return offerFromHttp(req, peeledUrl);
       }
 
       // Recognized preamble: forward to chatgpt.com (default) or stub for the
@@ -717,7 +775,7 @@ export const startCodexCaptureReceiver = (
         isCodexCapturePreambleMethod(req.method) &&
         !wantsUpgrade
       ) {
-        return forwardPreamble(req);
+        return forwardPreamble(req, peeledUrl);
       }
       return new Response(null, { status: 204 });
     },
@@ -793,6 +851,7 @@ export const startCodexCaptureReceiver = (
   });
 
   const baseUrl = `http://127.0.0.1:${server.port}`;
+  const guardedBaseUrl = loopbackGuard.baseUrl(baseUrl);
 
   const stop = (): void => {
     try {
@@ -812,6 +871,7 @@ export const startCodexCaptureReceiver = (
 
   return {
     baseUrl,
+    guardedBaseUrl,
     stop,
     capturedCount: (): number => capturedCount,
     // Inference is never forwarded from this receiver.
@@ -1346,12 +1406,9 @@ export const runCodexCapturedTextTurn = async (
       ? { workspaceRoutes: params.captureWorkspaceRoutes }
       : {}),
   });
-  const redirects = codexCaptureRedirectArgs(receiver.baseUrl);
-  const client = createIsolatedCodexAppServerClient(params.bin, params.env, {
-    spawnArgvExtra: redirects.argv,
-  });
+  const redirects = codexCaptureRedirectArgs(receiver.guardedBaseUrl);
 
-  let phase = "initialize";
+  let phase = "ephemeral-home";
   let threadId: string | null = null;
   let turnId: string | null = null;
   let captureOwnership: "none" | "accepted" | "uncertain" = "none";
@@ -1376,6 +1433,46 @@ export const runCodexCapturedTextTurn = async (
     ...(captureOwnership !== "none" ? { captureOwnership } : {}),
   });
 
+  // Request-private ephemeral `CODEX_HOME` for the redirect keys — NEVER
+  // `-c` argv (leaks to other local users via argv/cmdline) and NEVER the
+  // daemon's shared/durable `cliEnv("chatgpt").CODEX_HOME/config.toml` (a
+  // module-local lock cannot protect that against a second daemon process, a
+  // legacy bridge binary, or a crash). See `codex-capture-ephemeral-home.ts`
+  // for the full source-verified rationale. Must be built BEFORE
+  // `ensureStarted()` spawns the child (it reads config.toml at startup) and
+  // BEFORE the client is even constructed (the client's env carries the
+  // ephemeral home). Missing `CODEX_HOME` or an unsafe durable auth-storage
+  // mode fails closed — there is no safe fallback that still redirects the
+  // real app-server away from production chatgpt.com.
+  const durableCodexHome = params.env.CODEX_HOME;
+  if (typeof durableCodexHome !== "string" || durableCodexHome.length === 0) {
+    receiver.stop();
+    session.dispose();
+    return decline(
+      "codex capture: CODEX_HOME missing from isolated env; refusing to spawn without a private redirect config",
+    );
+  }
+  let ephemeralHome: TCodexCaptureEphemeralHomeHandle;
+  try {
+    ephemeralHome = await createCodexCaptureEphemeralHome({
+      durableCodexHome,
+      chatgptBaseUrl: redirects.chatgptBaseUrl,
+      openaiBaseUrl: redirects.openaiBaseUrl,
+      tempRoot: join(daemonTempDir(), "codex-capture-home"),
+    });
+  } catch (err) {
+    receiver.stop();
+    session.dispose();
+    return decline(
+      `codex capture: ephemeral CODEX_HOME setup failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const client = createIsolatedCodexAppServerClient(params.bin, {
+    ...params.env,
+    CODEX_HOME: ephemeralHome.ephemeralHome,
+  });
+
   const disposeAll = (): void => {
     try {
       session.dispose();
@@ -1383,7 +1480,28 @@ export const runCodexCapturedTextTurn = async (
       // ignore
     }
     receiver.stop();
-    client.dispose();
+    // `dispose()` only SIGNALS the child; the ephemeral home it was reading
+    // its redirect config from must not be deleted until the child has
+    // ACTUALLY exited (`disposeAndWaitForExit` awaits the persistent exit
+    // promise) — otherwise a still-live child could be mid-read/mid-write
+    // against a directory this removes out from under it. Fire-and-forget
+    // from here (this function stays synchronous), but the two steps are
+    // chained. An unexpected rejection from `disposeAndWaitForExit` is NOT
+    // treated as a confirmed exit — cleanup only runs in the success branch,
+    // never from a `.catch()` — so this deliberately leaks the ephemeral
+    // directory rather than risk deleting it out from under a child we could
+    // not confirm has exited; the rejection is logged, not swallowed, and
+    // never left as an unhandled promise.
+    client
+      .disposeAndWaitForExit()
+      .then(() => ephemeralHome.cleanup())
+      .catch((err) => {
+        logError(
+          "native-runtime",
+          safeDiagnosticMessage`codex capture: could not confirm isolated app-server exit; ephemeral CODEX_HOME left in place rather than risk deleting a live directory`,
+          { message: err instanceof Error ? err.message : String(err) },
+        );
+      });
   };
 
   try {
