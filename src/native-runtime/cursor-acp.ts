@@ -1572,12 +1572,28 @@ export const runCursorNativeCapture = async (
       let pendingMcpArgsBytes = 0;
       const pendingMcpToolCalls = new Map<
         string,
-        { readonly name: string; readonly index: number; argsText: string }
+        {
+          readonly name: string;
+          readonly index: number;
+          argsText: string;
+          /**
+           * True once this call's `argsText` is already a COMPLETE,
+           * schema-confirmed map (from a `mcp_tool_started` that carried a
+           * full args map — see `decodeCursorMcpArgs`/`parseMcpArgs`).
+           * Once true, further `mcp_tool_partial` fragments for the SAME
+           * call id must never be concatenated onto it — that would corrupt
+           * otherwise-valid JSON into garbage (round 9 review). Normal
+           * fragment-only accumulation (seeded empty, appended by partials)
+           * is unaffected — this flag stays false for that case throughout.
+           */
+          complete: boolean;
+        }
       >();
       const bufferMcpToolCallUpdate = (
         callId: string,
         name: string,
         argsTextDelta: string,
+        isCompleteSeed: boolean,
       ): void => {
         const existing = pendingMcpToolCalls.get(callId);
         if (
@@ -1589,6 +1605,11 @@ export const runCursorNativeCapture = async (
             `pending MCP tool call count exceeds ${MAX_PENDING_MCP_TOOL_CALLS}`,
           );
         }
+        if (existing?.complete === true) {
+          // Already a complete, authoritative-shaped map — silently ignore
+          // any further fragment; never append onto it.
+          return;
+        }
         pendingMcpArgsBytes += argsTextDelta.length;
         if (pendingMcpArgsBytes > MAX_PENDING_MCP_ARGS_BYTES) {
           throw new CursorCaptureDecodeError(
@@ -1597,13 +1618,17 @@ export const runCursorNativeCapture = async (
           );
         }
         if (existing !== undefined) {
-          existing.argsText += argsTextDelta;
+          existing.argsText = isCompleteSeed
+            ? argsTextDelta
+            : existing.argsText + argsTextDelta;
+          existing.complete = isCompleteSeed;
           return;
         }
         pendingMcpToolCalls.set(callId, {
           name,
           index: ensureToolIndex(callId),
           argsText: argsTextDelta,
+          complete: isCompleteSeed,
         });
       };
       /**
@@ -1964,6 +1989,7 @@ export const runCursorNativeCapture = async (
                     name: intent.name,
                     index: ensureToolIndex(callId),
                     argsText: intent.argumentsText,
+                    complete: true,
                   });
                   phase = "done";
                   teardownBuilderOnTerminal();
@@ -2080,10 +2106,23 @@ export const runCursorNativeCapture = async (
                 modelFramesSeen += 1;
                 phase = "model_stream";
                 const intent = decoded.intent;
+                // Round 9 review: `mcp_tool_started` can ALREADY carry a
+                // COMPLETE args map (verified schema — see
+                // `parseMcpArgs`/`decodeCursorMcpArgs`), not just an empty
+                // placeholder. Seed the buffer with that complete map
+                // directly (never discard it as `""`) and mark it complete
+                // so a later `mcp_tool_partial` fragment for the SAME call
+                // id is never concatenated onto it — that would corrupt
+                // otherwise-valid JSON. A `started` with NO complete args
+                // (the ordinary case) still seeds an empty, non-complete
+                // buffer, preserving normal fragment-only accumulation.
+                const isCompleteSeed =
+                  decoded.kind === "mcp_tool_started" &&
+                  intent.argumentsText.length > 0;
                 const argsDelta =
                   decoded.kind === "mcp_tool_partial"
                     ? decoded.argsTextDelta
-                    : "";
+                    : intent.argumentsText;
                 // Buffer WITHOUT emitting — never yield a partial/possibly
                 // truncated argument fragment to the caller. See
                 // `pendingMcpToolCalls` above: an authoritative
@@ -2091,7 +2130,12 @@ export const runCursorNativeCapture = async (
                 // call id) replaces this buffered text entirely; otherwise
                 // it is flushed once, as a whole, at the genuine turn
                 // terminal.
-                bufferMcpToolCallUpdate(intent.callId, intent.name, argsDelta);
+                bufferMcpToolCallUpdate(
+                  intent.callId,
+                  intent.name,
+                  argsDelta,
+                  isCompleteSeed,
+                );
               } else if (decoded.kind === "heartbeat") {
                 heartbeatFramesSeen += 1;
               } else if (decoded.kind === "native_tool") {
@@ -2148,11 +2192,26 @@ export const runCursorNativeCapture = async (
       clearTimeout(precommitTimer);
 
       if (first.kind !== "meaningful") {
+        // Round 9 review: on a precommit TIMEOUT specifically, `stepChunks()`
+        // is quite possibly still blocked inside `await reader.read()` on
+        // the real H2 socket — that pending read is WHY nothing arrived
+        // before the deadline. `iterator.return()` only takes effect the
+        // NEXT time the generator actually resumes, which never happens
+        // until that pending read itself settles — so the previous
+        // `await iterator.return(undefined)` here could hang FOREVER
+        // waiting on a read that will never resolve on its own. Fix: close
+        // the real H2 session and cancel the reader FIRST — this is what
+        // actually unblocks the pending read — then request iterator
+        // cleanup fire-and-forget (never awaited; a caught rejection is
+        // fine, an unbounded hang here is not). Bridge/builder cleanup and
+        // ownership reporting are unchanged.
+        http2.close();
         try {
-          await iterator.return(undefined);
+          void reader.cancel().catch(() => undefined);
         } catch {
-          // ignore
+          // ignore — reader may already be released/cancelled
         }
+        void iterator.return(undefined).catch(() => undefined);
         try {
           reader.releaseLock();
         } catch {
@@ -2161,7 +2220,6 @@ export const runCursorNativeCapture = async (
         bridge.closeDuplexInject(captureId);
         builderAbort.abort();
         await bridge.dispose();
-        http2.close();
         if (first.kind === "timeout") {
           return {
             kind: "declined",

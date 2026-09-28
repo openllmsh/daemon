@@ -987,9 +987,29 @@ export const encodeMcpToolCallStartedUpdate = (args: {
   readonly callId: string;
   readonly toolName: string;
   readonly argumentsJson: string;
+  /**
+   * A REAL, complete `args` map (field 2 of the nested `McpArgs`) — verified
+   * native schema: a `tool_call_started` update can already carry the
+   * complete arguments, not just an empty placeholder streamed later via
+   * partials. Omit to encode the ordinary "no args yet" shape (`argumentsJson`
+   * is otherwise unused — it exists only to mirror the real caller-facing
+   * shape at this fixture's call sites).
+   */
+  readonly args?: { readonly [key: string]: TCursorMcpFixtureValue };
 }): Uint8Array => {
   const mcpArgs = concatBytes([
     encodeProtoString(1, args.toolName),
+    ...(args.args !== undefined
+      ? Object.entries(args.args).map(([k, v]) =>
+          encodeProtoBytes(
+            2,
+            concatBytes([
+              encodeProtoString(1, k),
+              encodeProtoBytes(2, encodeMcpFixtureValue(v)),
+            ]),
+          ),
+        )
+      : []),
     encodeProtoString(3, args.callId),
     encodeProtoString(5, args.toolName),
   ]);
