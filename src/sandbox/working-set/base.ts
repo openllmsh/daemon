@@ -41,7 +41,8 @@
  *   read-only
  *     - the system trees the runtime + spawned tools (`bash`, `curl`, the
  *       vendor CLIs' loaders) need: `/usr`, `/lib*`, `/bin`, `/sbin`, `/opt`,
- *       `/etc` (resolv.conf + TLS trust), `/proc`, `/sys`, `/run`, `/var`;
+ *       `/etc` (resolv.conf + TLS trust), `/proc`, `/sys`, `/run`;
+ *       `/var` is not granted on Linux;
  *     - the vendor-CLI binary dirs — READ+EXEC only (the daemon runs the CLIs
  *       but never installs or updates them; that is user-run + unsandboxed);
  *     - `~/.bun/bin` (exec `bun` — read+exec only, launcher-trojan guard).
@@ -2097,7 +2098,9 @@ export const baseWorkingSet = (homeOverride?: string): TWorkingSet => {
     "/proc",
     "/sys",
     "/run",
-    "/var",
+    // Linux can store user homes and private temporary files under /var.
+    // A grant on /var would expose those files through every layer.
+    ...(process.platform === "linux" ? [] : ["/var"]),
   ]);
   return {
     readWrite: [...readWrite],
