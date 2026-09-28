@@ -47,6 +47,19 @@ export type TMuseEndpointTransportSettings = {
   readonly auth: "bearer";
 };
 
+/**
+ * `tools.web_search.mode` (native `WebSearchMode`, static string-table
+ * evidence: `settings.rs`). `"hosted"` makes the vendor backend execute the
+ * search and fold results into the turn (`web_search_call` stream items,
+ * no caller round-trip); live-verified against muse-bin 1.4.0-R4302.1 via
+ * `runMuseNativeCapture`'s own overlay seam — see
+ * `tmp/bridge-capture-benchmark/muse-native-search-hosted-events.ndjson`.
+ * `"client"` is only the currently-observed unset behavior on this muse-bin
+ * build, not asserted as a documented/universal default; this overlay never
+ * writes it.
+ */
+export type TMuseWebSearchMode = "hosted";
+
 export type TMuseOverlay = {
   /**
    * Env overlay merged onto a cleaned Muse spawn env. Replaces HOME and all
@@ -129,6 +142,8 @@ export const createMuseExecutionOverlay = async (params: {
    * `endpoint_transport` only — never as flat `base_url` / `api_base_url`.
    */
   readonly endpointTransport?: TMuseEndpointTransportSettings;
+  /** Capture-only seam — see {@link TMuseWebSearchMode}. Omit for the bridge's default (unchanged) behavior. */
+  readonly webSearchMode?: TMuseWebSearchMode;
   readonly parentDir?: string;
 }): Promise<TMuseOverlay> => {
   // Validate durable auth resolution BEFORE allocating overlay dirs so a
@@ -191,6 +206,9 @@ export const createMuseExecutionOverlay = async (params: {
               auth: params.endpointTransport.auth,
             },
           }
+        : {}),
+      ...(params.webSearchMode !== undefined
+        ? { tools: { web_search: { mode: params.webSearchMode } } }
         : {}),
     };
     const settingsPath = join(museDir, "settings.json");

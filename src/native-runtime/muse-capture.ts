@@ -1234,6 +1234,11 @@ export const runMuseNativeCapture = async (
         ? { providerId: params.providerId }
         : {}),
       endpointTransport: handle.endpointTransport,
+      // Capture-only: server-executed search folds into the captured turn
+      // instead of leaking an unresolved `muse.web_search` function_call
+      // (live-verified, see `createMuseExecutionOverlay`'s doc comment).
+      // Never applied to the non-capture bridge overlay.
+      webSearchMode: "hosted",
       parentDir: dirs.runtimeParent,
     });
     overlayCleanup = overlay.cleanup;
