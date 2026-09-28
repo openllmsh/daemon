@@ -57,6 +57,10 @@ import {
   newChatGptStreamState,
 } from "@openllmsh/wire/providers/chatgpt/streaming";
 import { Schema } from "effect";
+import {
+  createCaptureLoopbackProxyGuard,
+  museCaptureProxyNoProxyHosts,
+} from "./capture-loopback-proxy-guard";
 import type { TMuseToolNameMap } from "./muse-mcp-server";
 import {
   buildMuseToolNameMap,
@@ -275,6 +279,40 @@ export type TMuseCaptureEndpointTransportDocument = {
   };
 };
 
+/**
+ * Origin-only BY THIS PARSER'S OWN (conservative) choice, not a real vendor
+ * schema requirement: `muse config validate --plane defaults` accepts a
+ * `settings.endpoint_transport.base_url` carrying a path segment and only
+ * rejects a query string. This parser stays stricter as defense-in-depth —
+ * accepting a path here would invite the "generic unsafe URL accept" this
+ * receiver must not do, since nothing downstream can act on it correctly
+ * (see below).
+ *
+ * A path-embedded nonce still can't reach this receiver: the real
+ * muse-bin's startup model-catalog fetch (observed both via `muse exec
+ * --base-url` and via the production `settings.endpoint_transport` seam
+ * through `runMuseNativeCapture`'s own composition) lands at the base
+ * URL's bare origin with any path segment silently dropped. That is
+ * evidence about the CATALOG endpoint specifically, not a proven property
+ * of every Meta-provider endpoint or every muse-bin version — treat it as
+ * the concrete, evidenced reason this parser can't rely on a URL path,
+ * not as a blanket claim.
+ *
+ * `startMuseCaptureReceiver` instead uses the private `HTTP_PROXY`/
+ * `http_proxy` proxy-hop guard (`capture-loopback-proxy-guard.ts`): the
+ * nonce rides `Proxy-Authorization`, never the destination URL. This is
+ * now verified positive on the real production seam — a real
+ * `runMuseNativeCapture` run (real `cliEnv("muse")`, real default
+ * `hostFactory`, real registered tool, `fetchImpl` as the only override)
+ * captured the real `/responses` request with valid proxy auth, the real
+ * `Authorization` header intact, no proxy-header leak, and the registered
+ * tool's schema present in the body — see
+ * `tests/transport/muse-capture-real-cli-construction.e2e.test.ts`.
+ *
+ * `tests/transport/muse-bridge-request-capture.test.ts` has a regression
+ * asserting a `capture-loopback-guard.ts`-produced (path-nonce) URL is
+ * still rejected here — this parser's own choice, not a vendor requirement.
+ */
 const parseMuseCaptureOriginOnlyBaseUrl = (baseUrlRaw: string): string => {
   const baseUrl = baseUrlRaw.trim();
   if (baseUrl.length === 0) {
@@ -677,6 +715,26 @@ export type TMuseCaptureReceiver = {
   readonly suppressedRetryCount: () => number;
   /** Always 0 — non-inference / reminder traffic is stubbed locally. */
   readonly originalExternalSendCount: () => number;
+  /**
+   * Requests rejected before capture for missing/wrong `Proxy-Authorization`
+   * — the loopback-guard authentication failures, never a body/path issue.
+   */
+  readonly proxyAuthRejectedCount: () => number;
+  /**
+   * Child-scoped `HTTP_PROXY`/`http_proxy`/`NO_PROXY`/`no_proxy` env
+   * additions for this receiver's private proxy-hop guard. `mcpServerUrl`
+   * excludes a registered local MCP server's own address so its
+   * `tools/list`/`tools/call` traffic stays direct — never proxied, never
+   * gated by this guard. Callers MUST merge this into the spawned child's
+   * own env (never global/system config) alongside `baseUrl`.
+   */
+  readonly proxyEnv: (mcpServerUrl: string | null) => Record<string, string>;
+  /**
+   * The exact `Proxy-Authorization` header value a real proxy-aware client
+   * (or a hermetic fixture simulating one) must present to this receiver.
+   * See `TCaptureLoopbackProxyGuard.proxyAuthorizationHeaderValue`.
+   */
+  readonly proxyAuthorizationHeaderValue: () => string;
 };
 
 export type TStartMuseCaptureReceiverOptions = {
@@ -698,7 +756,17 @@ export const startMuseCaptureReceiver = (
   let capturedCount = 0;
   let reminderStubCount = 0;
   let suppressedRetryCount = 0;
+  let proxyAuthRejectedCount = 0;
   let builderSettlement: TBuilderSettlement | null = null;
+  // Real muse-bin drops any path segment on `endpoint_transport.base_url`
+  // before issuing a request (confirmed twice against the real binary —
+  // see the doc comment on `parseMuseCaptureOriginOnlyBaseUrl`), so the
+  // `capture-loopback-guard.ts` path-nonce cannot reach this receiver. This
+  // header-based proxy-hop guard is the verified alternative: real muse-bin
+  // (reqwest) honors `HTTP_PROXY`/`http_proxy` and sends a normal
+  // `Proxy-Authorization` header, independent of the real `Authorization`
+  // header and body (also confirmed against the real binary).
+  const proxyGuard = createCaptureLoopbackProxyGuard();
 
   const offerEnvelope = async (
     envelope: TCapturedRequestEnvelope,
@@ -718,12 +786,36 @@ export const startMuseCaptureReceiver = (
     return settlement;
   };
 
+  // IPv6 loopback (`::1`), deliberately DIFFERENT from the per-turn MCP
+  // server's `127.0.0.1` (`muse-mcp-server.ts`) — a distinct address, not
+  // just a distinct port. `NO_PROXY` entries are not reliably port-scoped
+  // across HTTP client implementations (some match a bare hostname
+  // regardless of the request's actual port); excluding the MCP server's
+  // address by a DIFFERENT address family removes that ambiguity entirely,
+  // rather than relying on `HTTP_PROXY`/`NO_PROXY` port-matching being
+  // correct. Requires no OS-level alias configuration (unlike a second
+  // `127.0.0.x` address, verified unreachable without one on this
+  // development machine) — but IPv6 is not universally available or
+  // enabled on every host; a host with IPv6 disabled would need a
+  // different exclusion strategy, not assumed away here. `proxyEnv` also
+  // always sets `NO_PROXY`/`no_proxy` explicitly (never omitted, even to
+  // `""`), so an ambient inherited value can never survive the merge.
   const server = Bun.serve({
     port: 0,
-    hostname: "127.0.0.1",
+    hostname: "::1",
     async fetch(req: Request): Promise<Response> {
       if (opts.signal?.aborted) {
         return new Response(null, { status: 499 });
+      }
+      // Authenticate BEFORE any body read, path classification, or capture —
+      // a missing/wrong Proxy-Authorization is rejected here, before this
+      // receiver does anything else with the request. 407 (Proxy
+      // Authentication Required) is the correct status for this failure
+      // mode, distinct from the 404 the path-based guard uses elsewhere —
+      // never logs the presented or expected credential.
+      if (!proxyGuard.authenticate(req.headers)) {
+        proxyAuthRejectedCount += 1;
+        return new Response(null, { status: 407 });
       }
       const url = new URL(req.url);
       const method = req.method.toUpperCase();
@@ -746,8 +838,12 @@ export const startMuseCaptureReceiver = (
         return localPreambleResponse(url.pathname);
       }
 
+      // Strip the proxy hop-framing header before anything downstream sees
+      // it — it authenticates the CHILD's hop to this receiver, never the
+      // real application request, and must never be recorded, classified
+      // as an application header, or forwarded anywhere.
       const headers: ReadonlyArray<TCapturedHeaderPair> =
-        preserveCapturedHeaders(req.headers);
+        preserveCapturedHeaders(proxyGuard.stripHopFraming(req.headers));
       const envelope: TCapturedRequestEnvelope = {
         transport: "http",
         method,
@@ -787,13 +883,38 @@ export const startMuseCaptureReceiver = (
     { once: true },
   );
 
+  // Bracketed IPv6 literal — required in both a URL host and a proxy
+  // userinfo@host value.
+  const hostAndPort = `[::1]:${server.port}`;
   return {
-    baseUrl: `http://127.0.0.1:${server.port}`,
+    baseUrl: `http://${hostAndPort}`,
     stop,
     capturedCount: (): number => capturedCount,
     reminderStubCount: (): number => reminderStubCount,
     suppressedRetryCount: (): number => suppressedRetryCount,
     originalExternalSendCount: (): number => 0,
+    proxyAuthRejectedCount: (): number => proxyAuthRejectedCount,
+    proxyEnv: (mcpServerUrl: string | null): Record<string, string> => {
+      const proxyUrl = proxyGuard.proxyUrl(hostAndPort);
+      const noProxy = museCaptureProxyNoProxyHosts(mcpServerUrl);
+      // ALWAYS set NO_PROXY/no_proxy, even to "" when there is no MCP host
+      // to exclude — never merely omit them. `cleanMuseSpawnEnv` inherits
+      // the ambient process env (minus the poison list), so a pre-existing
+      // NO_PROXY the parent process happened to carry (e.g. a blanket "*",
+      // or an entry matching this receiver's own listen address) would
+      // otherwise survive untouched into the child and could steer its
+      // client away from the authenticated proxy hop for this receiver's
+      // own address. An explicit (possibly empty) value here always wins
+      // the merge, since this is applied last in the spawn-env composition.
+      return {
+        HTTP_PROXY: proxyUrl,
+        http_proxy: proxyUrl,
+        NO_PROXY: noProxy,
+        no_proxy: noProxy,
+      };
+    },
+    proxyAuthorizationHeaderValue: (): string =>
+      proxyGuard.proxyAuthorizationHeaderValue(),
   };
 };
 
@@ -1109,6 +1230,13 @@ export const runMuseNativeCapture = async (
     const spawnEnv: NodeJS.ProcessEnv = {
       ...cleanMuseSpawnEnv(params.env),
       ...overlay.env,
+      // Child-scoped only (never global/system config) — the private
+      // proxy-hop guard authenticating this receiver's own loopback, since
+      // its path-nonce sibling cannot reach real muse-bin (see
+      // `startMuseCaptureReceiver`'s doc comment). Excludes the per-turn MCP
+      // server's own address from proxying so `tools/list`/`tools/call`
+      // stay direct, exactly as without capture.
+      ...handle.receiver.proxyEnv(mcp?.url ?? null),
     };
     assertMuseCaptureEnvKeychainSafe(spawnEnv);
 
@@ -1294,11 +1422,20 @@ export const runMuseHermeticCaptureRoundTrip = async (args: {
     receiver.stop();
   };
 
+  // This helper fakes HTTP directly rather than spawning a client — so it
+  // must present the SAME `Proxy-Authorization` a real proxy-aware client
+  // (or a spawned fixture simulating one) would, or the receiver's guard
+  // correctly 407s it before capture, same as it would an unauthenticated
+  // caller.
+  const proxyAuthHeader = receiver.proxyAuthorizationHeaderValue();
   try {
     if (args.reminderBody !== undefined) {
       const reminderRes = await fetch(`${receiver.baseUrl}/responses`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "proxy-authorization": proxyAuthHeader,
+        },
         body: Buffer.from(args.reminderBody),
         signal: args.signal,
       });
@@ -1310,6 +1447,7 @@ export const runMuseHermeticCaptureRoundTrip = async (args: {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer sk-exp-dummy-key",
+        "proxy-authorization": proxyAuthHeader,
       },
       body: Buffer.from(args.primaryBody),
       signal: args.signal,
