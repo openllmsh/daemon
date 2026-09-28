@@ -34,8 +34,46 @@ export const MUSE_MCP_WIRE_PREFIX =
 export const museMcpWireToolName = (callerToolName: string): string =>
   `${MUSE_MCP_WIRE_PREFIX}${callerToolName}`;
 
+/**
+ * A SECOND, DISTINCT real wire form — the local MSP `session.onApproval`
+ * flow (the "bridge" transport, `@muse-code/sdk` native session, never
+ * Meta's hosted `/responses` path) names an MCP tool call
+ * `mcp__<server_snake>__<tool>` — double underscore throughout, no `.`
+ * anywhere — NOT {@link MUSE_MCP_WIRE_PREFIX}'s dot form. Confirmed by a
+ * live, sanitized, structural-only diagnostic capture of the real SDK's
+ * actual `approval/requested` `toolName`/`subject.toolName` values against
+ * the real production `defaultMuseHostFactory` + `cliEnv` +
+ * `noop_ping`-registered caller tool on 2026-09-28: the observed value was
+ * exactly `mcp__openllm_muse_client_tools__noop_ping`, never
+ * `mcp__openllm_muse_client_tools.noop_ping`. This is why
+ * `isRegisteredCallerToolApproval` (muse-web-search.ts) missed every
+ * bridge-mode caller-tool approval before this constant existed: the name
+ * map only ever contained the dot form, which the approval flow never
+ * sends. The dot form ({@link museMcpWireToolName}) remains correct and
+ * UNCHANGED for the capture-mode return-side parse in `muse-capture.ts`
+ * (Meta's `/responses` transport, confirmed working end-to-end already) —
+ * this second form is added ADDITIONALLY to {@link buildMuseToolNameMap},
+ * never in place of it.
+ */
+export const MUSE_MCP_APPROVAL_WIRE_PREFIX =
+  `mcp__${MUSE_MCP_SERVER_NAME.replaceAll("-", "_")}__` as const;
+
+/**
+ * Wire name the local MSP `session.onApproval` flow (bridge transport)
+ * emits for a caller tool registered on {@link MUSE_MCP_SERVER_NAME}. See
+ * {@link MUSE_MCP_APPROVAL_WIRE_PREFIX} for how this was confirmed and how
+ * it differs from {@link museMcpWireToolName}.
+ */
+export const museMcpApprovalWireToolName = (callerToolName: string): string =>
+  `${MUSE_MCP_APPROVAL_WIRE_PREFIX}${callerToolName}`;
+
 export type TMuseToolNameMap = {
-  /** Full Meta wire name → original caller name. */
+  /** Full Meta wire name → original caller name. Contains BOTH the
+   *  dot-form ({@link museMcpWireToolName}, capture/`/responses` transport)
+   *  and the double-underscore form
+   *  ({@link museMcpApprovalWireToolName}, bridge/`session.onApproval`
+   *  transport) for every registered tool — a lookup by either real wire
+   *  form resolves to the same caller name. */
   readonly wireToCaller: ReadonlyMap<string, string>;
   /** Caller name set (for membership checks). */
   readonly callerNames: ReadonlySet<string>;
@@ -49,6 +87,7 @@ export const buildMuseToolNameMap = (
   for (const t of tools) {
     callerNames.add(t.name);
     wireToCaller.set(museMcpWireToolName(t.name), t.name);
+    wireToCaller.set(museMcpApprovalWireToolName(t.name), t.name);
   }
   return { wireToCaller, callerNames };
 };
