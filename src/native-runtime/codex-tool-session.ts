@@ -34,10 +34,11 @@ import type {
 import {
   type CodexAppServerClient,
   clientFor,
-  codexBaseStartParams,
+  codexDynamicToolsFrom,
+  codexToolStartParams,
+  codexTurnStartParams,
   effortOf,
 } from "./codex-app-server";
-import { suppressHostedSearchClientTool } from "./codex-web-search";
 import type { TNativeTokens } from "./types";
 import { tokensFromResponse } from "./types";
 
@@ -185,31 +186,22 @@ export const startCodexToolTurn = async (
     };
   }
   // Hosted search (thread config, always-on) and a client-executed
-  // `web_search` function are mutually exclusive on one turn — drop the
-  // client copy so it can't shadow the provider-owned tool. An empty
-  // remainder still starts the turn: the model answers via hosted search.
-  const dynamicClientTools = suppressHostedSearchClientTool(params.tools);
+  // `web_search` function are mutually exclusive on one turn — dropped by
+  // `codexDynamicToolsFrom` so the client copy can't shadow the
+  // provider-owned tool. An empty remainder still starts the turn: the model
+  // answers via hosted search.
   const client = clientFor(params.bin, params.env);
   let threadId: string;
   try {
     await client.ensureStarted();
-    const started = (await client.request("thread/start", {
-      ...codexBaseStartParams(params.providerModelId, params.systemText),
-      // Route dynamic-tool calls to US via `item/tool/call` instead of the
-      // `codex-code-mode-host` sidecar (which the isolated install doesn't
-      // ship). Verified live 2026-07-14: with code-mode ON the call never
-      // reaches the client (once misread as "0.144.0 doesn't emit
-      // item/tool/call"); with it OFF the call fires and the turn completes.
-      // `experimentalRawEvents` matches openclaw's thread/start.
-      features: { code_mode: false, code_mode_only: false },
-      experimentalRawEvents: true,
-      dynamicTools: dynamicClientTools.map((t) => ({
-        type: "function",
-        name: t.name,
-        description: t.description ?? t.name,
-        inputSchema: t.parameters ?? { type: "object", properties: {} },
-      })),
-    })) as { thread?: { id?: string } };
+    const started = (await client.request(
+      "thread/start",
+      codexToolStartParams(
+        params.providerModelId,
+        params.systemText,
+        codexDynamicToolsFrom(params.tools),
+      ),
+    )) as { thread?: { id?: string } };
     if (typeof started.thread?.id !== "string") {
       return { kind: "declined", reason: "thread/start returned no thread id" };
     }
@@ -236,11 +228,10 @@ export const startCodexToolTurn = async (
 
   const effort = effortOf(params.reasoningEffort);
   try {
-    const turn = (await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: params.userText, text_elements: [] }],
-      ...(effort !== null ? { effort } : {}),
-    })) as { turn?: { id?: string } };
+    const turn = (await client.request(
+      "turn/start",
+      codexTurnStartParams(threadId, params.userText, effort),
+    )) as { turn?: { id?: string } };
     h.turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {
     client.removeSink(threadId);

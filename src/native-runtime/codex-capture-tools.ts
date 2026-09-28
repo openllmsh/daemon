@@ -30,9 +30,14 @@ import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { daemonTempDir } from "../sandbox/working-set";
 import type { TClientTool } from "./claude-tool-session";
-import type { TCodexNativeParams } from "./codex-app-server";
+import type {
+  TCodexDynamicToolSpec,
+  TCodexNativeParams,
+} from "./codex-app-server";
 import {
-  codexBaseStartParams,
+  codexDynamicToolsFrom,
+  codexToolStartParams,
+  codexTurnStartParams,
   createIsolatedCodexAppServerClient,
   effortOf,
 } from "./codex-app-server";
@@ -47,7 +52,6 @@ import {
 } from "./codex-capture";
 import type { TCodexCaptureEphemeralHomeHandle } from "./codex-capture-ephemeral-home";
 import { createCodexCaptureEphemeralHome } from "./codex-capture-ephemeral-home";
-import { suppressHostedSearchClientTool } from "./codex-web-search";
 import {
   createRequestCaptureSession,
   runCapturedDispatch,
@@ -125,23 +129,18 @@ export const CODEX_STRUCTURED_INJECT_LIVE_PROVEN = true as const;
 export const CODEX_STRUCTURED_INJECT_PROVEN =
   CODEX_STRUCTURED_INJECT_LIVE_PROVEN;
 
-export type TCodexDynamicToolSpec = {
-  readonly type: "function";
-  readonly name: string;
-  readonly description: string;
-  readonly inputSchema: Record<string, unknown>;
-};
+export type { TCodexDynamicToolSpec };
 
-/** Map caller tools → app-server `dynamicTools`, dropping hosted-search clashes. */
+/**
+ * Map caller tools → app-server `dynamicTools`, dropping hosted-search
+ * clashes. Thin capture-path alias of the shared `codex-app-server.ts`
+ * mapping (the bridge tool path, `codex-tool-session.ts`, uses the same
+ * function directly) — kept as its own export since tests and callers here
+ * already import it by this name.
+ */
 export const codexCaptureDynamicTools = (
   tools: ReadonlyArray<TClientTool>,
-): ReadonlyArray<TCodexDynamicToolSpec> =>
-  suppressHostedSearchClientTool(tools).map((t) => ({
-    type: "function" as const,
-    name: t.name,
-    description: t.description ?? t.name,
-    inputSchema: t.parameters ?? { type: "object", properties: {} },
-  }));
+): ReadonlyArray<TCodexDynamicToolSpec> => codexDynamicToolsFrom(tools);
 
 /**
  * Convert capture history into raw Responses items for `thread/inject_items`.
@@ -527,12 +526,14 @@ export const runCodexCapturedToolTurn = async (
 
   try {
     await client.ensureStarted();
-    const started = (await client.request("thread/start", {
-      ...codexBaseStartParams(params.providerModelId, params.systemText),
-      features: { code_mode: false, code_mode_only: false },
-      experimentalRawEvents: true,
-      dynamicTools,
-    })) as { thread?: { id?: string } };
+    const started = (await client.request(
+      "thread/start",
+      codexToolStartParams(
+        params.providerModelId,
+        params.systemText,
+        dynamicTools,
+      ),
+    )) as { thread?: { id?: string } };
     if (typeof started.thread?.id !== "string") {
       disposeAll();
       return {
@@ -580,11 +581,10 @@ export const runCodexCapturedToolTurn = async (
     }
 
     const effort = effortOf(params.reasoningEffort);
-    const turn = (await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: turnUserText, text_elements: [] }],
-      ...(effort !== null ? { effort } : {}),
-    })) as { turn?: { id?: string } };
+    const turn = (await client.request(
+      "turn/start",
+      codexTurnStartParams(threadId, turnUserText, effort),
+    )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
 
     const sender = createCodexCapturedDispatchSender({

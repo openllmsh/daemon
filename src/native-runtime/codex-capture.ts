@@ -66,6 +66,7 @@ import { createCaptureLoopbackGuard } from "./capture-loopback-guard";
 import type { TCodexNativeParams } from "./codex-app-server";
 import {
   codexBaseStartParams,
+  codexTurnStartParams,
   createIsolatedCodexAppServerClient,
   effortOf,
 } from "./codex-app-server";
@@ -1617,11 +1618,10 @@ export const runCodexCapturedTextTurn = async (
 
     phase = "turn-start";
     const effort = effortOf(params.reasoningEffort);
-    const turn = (await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: params.userText, text_elements: [] }],
-      ...(effort !== null ? { effort } : {}),
-    })) as { turn?: { id?: string } };
+    const turn = (await client.request(
+      "turn/start",
+      codexTurnStartParams(threadId, params.userText, effort),
+    )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
 
     if (params.signal.aborted) {

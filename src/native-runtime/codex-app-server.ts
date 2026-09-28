@@ -33,7 +33,11 @@ import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
-import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
+import type { TClientTool } from "./claude-tool-session";
+import {
+  CODEX_HOSTED_WEB_SEARCH_CONFIG,
+  suppressHostedSearchClientTool,
+} from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
@@ -669,6 +673,71 @@ export const codexBaseStartParams = (
   ...(systemText !== null ? { developerInstructions: systemText } : {}),
 });
 
+/** One dynamic (client function) tool as the app-server's `thread/start.dynamicTools`
+ *  entry shape (`inputSchema` is raw JSON — the client's JSON-Schema passes through). */
+export type TCodexDynamicToolSpec = {
+  readonly type: "function";
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Record<string, unknown>;
+};
+
+/**
+ * Map caller function tools → app-server `dynamicTools`, after dropping the
+ * hosted-search collision (Codex owns `web_search` on native hops — see
+ * `codex-web-search.ts`). Identical mapping was previously duplicated between
+ * the bridge tool path (`codex-tool-session.ts`) and the bridge-capture tool
+ * path (`codex-capture-tools.ts`); both now call this one definition.
+ */
+export const codexDynamicToolsFrom = (
+  tools: ReadonlyArray<TClientTool>,
+): ReadonlyArray<TCodexDynamicToolSpec> =>
+  suppressHostedSearchClientTool(tools).map((t) => ({
+    type: "function" as const,
+    name: t.name,
+    description: t.description ?? t.name,
+    inputSchema: t.parameters ?? { type: "object", properties: {} },
+  }));
+
+/**
+ * The `thread/start` fields shared by BOTH codex tool bridges — the bridge
+ * tool path (`codex-tool-session.ts`) and the bridge-capture tool path
+ * (`codex-capture-tools.ts`) — layered on top of {@link codexBaseStartParams}.
+ * Routes dynamic-tool calls to US via `item/tool/call` instead of the
+ * `codex-code-mode-host` sidecar (which the isolated install doesn't ship).
+ * Verified live 2026-07-14: with code-mode ON the call never reaches the
+ * client (once misread as "0.144.0 doesn't emit item/tool/call"); with it
+ * OFF the call fires and the turn completes. `experimentalRawEvents` matches
+ * openclaw's `thread/start`.
+ */
+export const codexToolStartParams = (
+  providerModelId: string,
+  systemText: string | null,
+  dynamicTools: ReadonlyArray<TCodexDynamicToolSpec>,
+): Record<string, unknown> => ({
+  ...codexBaseStartParams(providerModelId, systemText),
+  features: { code_mode: false, code_mode_only: false },
+  experimentalRawEvents: true,
+  dynamicTools,
+});
+
+/**
+ * The `turn/start` input shared by EVERY codex call site — bridge text
+ * (`runCodexNative`), bridge tool (`codex-tool-session.ts`), bridge-capture
+ * text (`codex-capture.ts`), and bridge-capture tool (`codex-capture-tools.ts`):
+ * one text element (no `text_elements` payload of our own) plus the optional
+ * canonical `effort`.
+ */
+export const codexTurnStartParams = (
+  threadId: string,
+  text: string,
+  effort: string | null,
+): Record<string, unknown> => ({
+  threadId,
+  input: [{ type: "text", text, text_elements: [] }],
+  ...(effort !== null ? { effort } : {}),
+});
+
 export const runCodexNative = async (
   params: TCodexNativeParams,
 ): Promise<TNativeRunResult> => {
@@ -792,11 +861,10 @@ export const runCodexNative = async (
 
   const effort = effortOf(params.reasoningEffort);
   try {
-    const turn = (await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: params.userText, text_elements: [] }],
-      ...(effort !== null ? { effort } : {}),
-    })) as { turn?: { id?: string } };
+    const turn = (await client.request(
+      "turn/start",
+      codexTurnStartParams(threadId, params.userText, effort),
+    )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {
     client.removeSink(threadId);
