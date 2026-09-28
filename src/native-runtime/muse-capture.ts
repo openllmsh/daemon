@@ -46,7 +46,6 @@
  */
 
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { decodeProviderEventStream } from "@openllmsh/wire/lib/streaming/provider-decode";
@@ -62,22 +61,17 @@ import {
   museCaptureProxyNoProxyHosts,
 } from "./capture-loopback-proxy-guard";
 import type { TMuseToolNameMap } from "./muse-mcp-server";
-import {
-  buildMuseToolNameMap,
-  mapMuseCapturedToolName,
-  startMuseMcpServer,
-} from "./muse-mcp-server";
-import { createMuseExecutionOverlay } from "./muse-overlay";
+import { mapMuseCapturedToolName } from "./muse-mcp-server";
 import type { TMuseCallerTool, TMuseInputPart } from "./muse-request";
-import type { TMuseHostFactory, TMuseSpawnTarget } from "./muse-runtime";
+import type {
+  TMuseHostFactory,
+  TMuseSpawnTarget,
+  TMuseTurnSessionResult,
+} from "./muse-runtime";
 import {
-  allocateMuseTurnDirs,
-  cleanMuseSpawnEnv,
-  defaultMuseHostFactory,
-  MUSE_APPROVAL_MODE,
   MUSE_SERVE_SAFETY_ARGS,
   museTurnDeclineReason,
-  openMuseHostWithTimeout,
+  openMuseTurnSession,
   wrapMuseServeSpawn,
 } from "./muse-runtime";
 import type {
@@ -1177,10 +1171,6 @@ export const runMuseNativeCapture = async (
     captureTimeoutMs,
   });
 
-  let turnRoot: string | undefined;
-  let overlayCleanup: (() => Promise<void>) | null = null;
-  let mcpStop: (() => void) | null = null;
-  let hostClose: (() => Promise<void>) | null = null;
   let captureOwnership: "none" | "accepted" | "uncertain" = "none";
   /**
    * Set when the native Muse turn ends BEFORE any capture envelope was ever
@@ -1189,100 +1179,59 @@ export const runMuseNativeCapture = async (
    * out the full capture timeout for an envelope that will never arrive.
    */
   let turnEndedBeforeCaptureReason: string | null = null;
+  let sessionHandle: TMuseTurnSessionResult | null = null;
 
   const disposeAll = async (): Promise<void> => {
     handle.dispose();
-    if (hostClose !== null) await hostClose().catch(() => {});
-    if (overlayCleanup !== null) await overlayCleanup().catch(() => {});
-    if (mcpStop !== null) {
-      try {
-        mcpStop();
-      } catch {
-        // ignore
-      }
-    }
-    if (turnRoot !== undefined) {
-      await rm(turnRoot, { recursive: true, force: true }).catch(() => {});
+    if (sessionHandle !== null) {
+      const closing = sessionHandle;
+      sessionHandle = null;
+      await closing.cleanup();
     }
   };
 
   try {
-    const dirs = await allocateMuseTurnDirs(
-      params.cwd ?? tmpdir(),
-      "muse-capture-",
-    );
-    turnRoot = dirs.turnRoot;
-
-    let mcp: ReturnType<typeof startMuseMcpServer> | null = null;
-    if ((params.tools?.length ?? 0) > 0) {
-      // Caller tools via per-turn MCP — same contract as the non-capture bridge.
-      // Capture does not invent Meta-side tools; the builder's body is forwarded.
-      mcp = startMuseMcpServer({
-        tools: params.tools ?? [],
-        onToolCall: () => {
-          // Capture owns the hop — caller-tool handoff is not supported mid-capture.
-        },
-      });
-      mcpStop = () => mcp?.stop();
-    }
-
-    const overlay = await createMuseExecutionOverlay({
-      baseEnv: params.env,
-      mcp,
-      modelId: params.providerModelId,
+    // Shared provider-owned opener — same dirs/MCP/overlay/spawn/session
+    // lifecycle as the non-capture bridge (`runMuseNative`), with ONLY the
+    // capture-specific options below: the endpoint-transport redirect,
+    // hosted web-search folding, the private proxy-hop guard env, and the
+    // Keychain-safety env assertion. Capture does not invent Meta-side
+    // tools — caller tools still register on the same per-turn MCP server,
+    // but a `tools/call` mid-capture is a no-op (capture owns the hop; the
+    // builder's own body is forwarded verbatim, see the comment on
+    // `openMuseTurnSession`'s `onToolCall` hook default).
+    sessionHandle = await openMuseTurnSession({
+      bin: params.bin,
+      env: params.env,
+      providerModelId: params.providerModelId,
       ...(params.providerId !== undefined
         ? { providerId: params.providerId }
         : {}),
+      tools: params.tools ?? [],
+      signal: params.signal,
+      rpcTimeoutMs,
+      ...(params.hostFactory !== undefined
+        ? { hostFactory: params.hostFactory }
+        : {}),
+      cwd: params.cwd ?? tmpdir(),
+      dirPrefix: "muse-capture-",
       endpointTransport: handle.endpointTransport,
       // Capture-only: server-executed search folds into the captured turn
       // instead of leaking an unresolved `muse.web_search` function_call
       // (live-verified, see `createMuseExecutionOverlay`'s doc comment).
       // Never applied to the non-capture bridge overlay.
       webSearchMode: "hosted",
-      parentDir: dirs.runtimeParent,
-    });
-    overlayCleanup = overlay.cleanup;
-
-    const spawnEnv: NodeJS.ProcessEnv = {
-      ...cleanMuseSpawnEnv(params.env),
-      ...overlay.env,
       // Child-scoped only (never global/system config) — the private
       // proxy-hop guard authenticating this receiver's own loopback, since
       // its path-nonce sibling cannot reach real muse-bin (see
       // `startMuseCaptureReceiver`'s doc comment). Excludes the per-turn MCP
       // server's own address from proxying so `tools/list`/`tools/call`
       // stay direct, exactly as without capture.
-      ...handle.receiver.proxyEnv(mcp?.url ?? null),
-    };
-    assertMuseCaptureEnvKeychainSafe(spawnEnv);
-
-    const spawn = wrapMuseServeSpawn(params.bin);
-    const hostFactory = params.hostFactory ?? defaultMuseHostFactory;
-    const host = await openMuseHostWithTimeout(
-      (signal) =>
-        hostFactory({
-          command: spawn.command,
-          args: spawn.args,
-          cwd: dirs.workspaceRoot,
-          env: spawnEnv,
-          signal,
-        }),
-      rpcTimeoutMs,
-      "muse capture spawn",
-      params.signal,
-    );
-    hostClose = () => host.close();
-
-    const session = await host.startSession({
-      sessionId: Bun.randomUUIDv7(),
-      workspaceRoot: dirs.workspaceRoot,
-      modelId: params.providerModelId,
-      ...(params.providerId !== undefined
-        ? { providerId: params.providerId }
-        : {}),
-      approvalMode: MUSE_APPROVAL_MODE,
+      extraEnv: (mcpServerUrl) => handle.receiver.proxyEnv(mcpServerUrl),
+      assertEnv: assertMuseCaptureEnvKeychainSafe,
     });
 
+    const { session, callerToolNameMap } = sessionHandle;
     const turn = await session.sendUserTurn(params.parts);
 
     // If the native turn ends (completed/cancelled/failed) BEFORE any capture
@@ -1349,10 +1298,9 @@ export const runMuseNativeCapture = async (
       dispatched.response,
       params.providerModelId,
     );
-    const nameMap = buildMuseToolNameMap(params.tools ?? []);
     const nameMapped =
-      nameMap.wireToCaller.size > 0
-        ? mapMuseCaptureChunkToolNames(rawChunks, nameMap)
+      callerToolNameMap.wireToCaller.size > 0
+        ? mapMuseCaptureChunkToolNames(rawChunks, callerToolNameMap)
         : rawChunks;
     // Capture-only guard: a clean upstream EOF with no observed terminal
     // finish_reason (dropped connection, truncated body after 200) must not
