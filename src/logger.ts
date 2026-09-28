@@ -29,12 +29,7 @@
  * Best-effort + self-contained: never throws (a logging failure must not take
  * down the daemon), depends only on `stateDir`, rotates past a size cap.
  */
-import {
-  appendFileSync,
-  existsSync,
-  renameSync,
-  statSync,
-} from "node:fs";
+import { appendFileSync, existsSync, renameSync, statSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { observeDoctorEvent } from "./doctor-report/engine";
 import type { TSafeDiagnosticMessage } from "./doctor-report/message";
