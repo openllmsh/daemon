@@ -79,7 +79,7 @@ import type {
 } from "./muse-events";
 import { createMuseTurnState } from "./muse-events";
 import type { TMuseMcpServer } from "./muse-mcp-server";
-import { startMuseMcpServer } from "./muse-mcp-server";
+import { buildMuseToolNameMap, startMuseMcpServer } from "./muse-mcp-server";
 import type { TMuseOverlay } from "./muse-overlay";
 import { createMuseExecutionOverlay } from "./muse-overlay";
 import type { TMuseCallerTool, TMuseInputPart } from "./muse-request";
@@ -652,8 +652,25 @@ const wrapOfficialHost = async (
           : {}),
         approvalMode: start.approvalMode,
       });
+      // Per-session mutable approval delegate. The real MSP SDK exposes
+      // exactly ONE `onApproval` registration slot per session (a second
+      // `session.onApproval(...)` call replaces, not adds, the callback —
+      // see `MuseClient`/`session` from `@muse-code/sdk`), so we install our
+      // OWN single real callback here, once, for the lifetime of the
+      // session, and have it always invoke whichever handler is currently
+      // assigned to `approvalHandler`. `TMuseSession.onApproval(handler)`
+      // (below) then just reassigns `approvalHandler` — it does NOT attempt
+      // a second real SDK registration, so callers (e.g. `runMuseNative`)
+      // can safely upgrade the policy after `startSession` resolves without
+      // silently landing on a no-op and without ever having two live SDK
+      // callbacks racing each other.
+      let approvalHandler: (
+        request: TMuseApprovalRequest,
+      ) =>
+        | Promise<{ readonly choiceId: string }>
+        | { readonly choiceId: string } = decideNativeApproval;
       session.onApproval((request) =>
-        decideNativeApproval(mapApprovalRequest(request)),
+        approvalHandler(mapApprovalRequest(request)),
       );
       return {
         sessionId: session.sessionId,
@@ -727,8 +744,14 @@ const wrapOfficialHost = async (
             },
           };
         },
-        onApproval: () => {
-          // Official path is wired at startSession; extra handlers are ignored.
+        onApproval: (handler) => {
+          // Reassigns the per-session delegate the ONE real SDK callback
+          // (registered once, above, at `startSession` time) invokes —
+          // never a second real `session.onApproval` registration. Replaces
+          // whatever handler is currently active (including the
+          // `decideNativeApproval` default), so exactly one handler is ever
+          // live for this session at a time.
+          approvalHandler = handler;
         },
       };
     },
@@ -1386,6 +1409,17 @@ export const runMuseNative = async (
     );
     turnRoot = dirs.turnRoot;
     const { workspaceRoot, runtimeParent } = dirs;
+    // OUR OWN registered caller/MCP tools, in BOTH the bare form and Meta's
+    // observed MCP wire form (`mcp__openllm_muse_client_tools.<leaf>`) —
+    // built by the SAME shared helper the return-side tool-name mapping
+    // already uses, over the SAME `params.tools` this turn registers, so
+    // approval matching verifies against our OWN server's real prefix
+    // rather than guessing or accepting an arbitrary name. Approving only
+    // lets the turn proceed to OUR loopback MCP server (which immediately
+    // ends the turn via `onToolCall` below), never native execution. See
+    // `decideMuseNativeApproval`/`isRegisteredCallerToolApproval` in
+    // `muse-web-search.ts`.
+    const callerToolNameMap = buildMuseToolNameMap(params.tools ?? []);
     if ((params.tools?.length ?? 0) > 0) {
       mcp = startMuseMcpServer({
         tools: params.tools ?? [],
@@ -1458,7 +1492,19 @@ export const runMuseNative = async (
       "muse session/start",
     );
     phaseMarks.sessionReadyAt = musePhaseNow();
-    session.onApproval(decideNativeApproval);
+    // Upgrades the session's per-session approval delegate (installed once,
+    // for real, inside `wrapOfficialHost.startSession`) from the default
+    // `decideNativeApproval` (web_search only) to the caller-tool-aware
+    // policy for THIS turn's registered tools. This reassigns the delegate
+    // the ONE real SDK callback invokes — it is not a second live SDK
+    // registration, so this take effect immediately and exclusively; only
+    // THIS caller (the non-capture bridge path, the one that actually
+    // reaches MSP's local approval prompt for a caller-tool call; capture
+    // mode never does, since it decodes the model's raw wire response
+    // itself) approves our own registered caller/MCP tools.
+    session.onApproval((request) =>
+      decideMuseNativeApproval(request, callerToolNameMap),
+    );
     await withTimeout(
       confirmExactModelAndPolicy(
         session,

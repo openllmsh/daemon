@@ -34,6 +34,7 @@
  */
 
 import type { TServerSearchCall } from "@openllmsh/protocol";
+import type { TMuseToolNameMap } from "./muse-mcp-server";
 
 /** MSP approval choice fields this policy reads. */
 export type TMuseApprovalChoice = {
@@ -183,19 +184,95 @@ const pickChoice = (
   );
 
 /**
+ * True iff `request` is asking approval for a tool call whose name is one of
+ * OUR OWN registered caller/MCP function tools (`params.tools` on
+ * `runMuseNative`, served by the per-turn loopback `startMuseMcpServer`).
+ * Approving this does NOT execute anything native: it only lets MSP proceed
+ * to call our own loopback MCP server, whose handler immediately fires
+ * `onToolCall` and ends the turn as an OpenAI `tool_calls` intent for the
+ * caller to run themselves — the same "returned unexecuted" contract already
+ * used for Claude/Codex/Cursor caller tools.
+ *
+ * `nameMap` MUST be built by the shared {@link buildMuseToolNameMap} (from
+ * `muse-mcp-server.ts`) over the SAME `params.tools` this turn actually
+ * registered. An approval request's `toolName` may carry either the bare
+ * caller name OR Meta's observed MCP wire form
+ * (`mcp__openllm_muse_client_tools.<leaf>` — {@link MUSE_MCP_WIRE_PREFIX} /
+ * `museMcpWireToolName`, verified against the same server this daemon
+ * itself started this turn); this checks EXACT membership in either form via
+ * `nameMap.callerNames`/`nameMap.wireToCaller` — never a `startsWith`/
+ * `endsWith`/substring match, which could let a differently-sourced tool
+ * whose name merely ends in a registered leaf (e.g. a same-named tool from
+ * an unrelated MCP server) pass as ours. Defense in depth mirrors
+ * {@link isHostNativeWebSearchApproval}: a `protectedWrite` flag, or a
+ * `subject.kind`/`path`/`command` naming a real execution surface (shell,
+ * fileAccess, process), never approves even given a name match.
+ */
+export const isRegisteredCallerToolApproval = (
+  request: TMuseApprovalRequest,
+  nameMap: TMuseToolNameMap,
+): boolean => {
+  if (request.protectedWrite === true) return false;
+  const requestTool = asString(request.toolName);
+  const subjectTool = asString(request.subject?.toolName);
+  if (
+    requestTool !== null &&
+    subjectTool !== null &&
+    requestTool !== subjectTool
+  ) {
+    return false;
+  }
+  const toolName = requestTool ?? subjectTool;
+  if (toolName === null) return false;
+  const isOurRegisteredTool =
+    nameMap.callerNames.has(toolName) || nameMap.wireToCaller.has(toolName);
+  if (!isOurRegisteredTool) return false;
+
+  const subjectKind = asString(request.subject?.kind);
+  if (
+    subjectKind !== null &&
+    subjectKind !== "tool" &&
+    subjectKind !== "network"
+  ) {
+    return false;
+  }
+  if (asString(request.subject?.path) !== null) return false;
+  if (asString(request.subject?.command) !== null) return false;
+  return true;
+};
+
+/**
  * Narrow host-native approval decision.
  * - `web_search` → approve once only (`decision=approved`, `scope=once`)
+ * - a registered caller/MCP tool (when `nameMap` is given) → approve once
+ *   only — see {@link isRegisteredCallerToolApproval}; never native
+ *   execution, only a handoff to our own loopback MCP server
  * - everything else → deny/abort once
- * No `approvedForSession` / persistent allow fallback.
+ * No `approvedForSession` / persistent allow fallback for EITHER approve
+ * branch — an approval choice that isn't explicitly `scope: "once"` is
+ * never accepted, matching the same strict rule `web_search` already used;
+ * a broader/session/persistent grant is refused with a thrown error rather
+ * than silently taken.
  */
 export const decideMuseNativeApproval = (
   request: TMuseApprovalRequest,
+  nameMap?: TMuseToolNameMap,
 ): { readonly choiceId: string } => {
   if (isHostNativeWebSearchApproval(request)) {
     const allow = pickChoice(request.availableChoices, ["approved"], "once");
     if (allow !== undefined) return { choiceId: allow.choiceId };
     throw new Error(
       "Muse offered no approve-once choice for host-native web_search",
+    );
+  }
+  if (
+    nameMap !== undefined &&
+    isRegisteredCallerToolApproval(request, nameMap)
+  ) {
+    const allow = pickChoice(request.availableChoices, ["approved"], "once");
+    if (allow !== undefined) return { choiceId: allow.choiceId };
+    throw new Error(
+      "Muse offered no approve-once choice for a registered caller tool",
     );
   }
   const deny =
