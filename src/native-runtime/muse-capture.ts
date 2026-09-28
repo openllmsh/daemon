@@ -99,7 +99,7 @@ import type { TCaptureHistoryBuilderPlan } from "./request-capture-history";
 import { captureAwareHistoryBuilderPlan } from "./request-capture-history";
 import { requireCaptureTerminalFinishReason } from "./request-capture-output";
 import type { TNativeHistoryTurn, TNativeRunResult } from "./types";
-import { PRE_COMMIT_TIMEOUT_MS } from "./types";
+import { captureOwnershipFromSession, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
 export type TMuseCaptureBlockerCode =
   | "native_reqwest_stack"
@@ -1382,15 +1382,34 @@ export const runMuseNativeCapture = async (
       sessionId: () => null,
     };
   } catch (error) {
+    // `captureOwnership` (the local variable) is only ever assigned AFTER
+    // `runCapturedDispatch` resolves (line ~1324 above) — if the sender
+    // throws AFTER it already marked the session's own dispatchStarted /
+    // upstreamAccepted (e.g. a real upstream send was attempted or even
+    // accepted, then the sender itself threw), that assignment never runs
+    // and this local stays "none", understating real ownership and letting
+    // the walker retry/fall back to another fleet member on a request that
+    // may have already reached (or been accepted by) the real upstream.
+    // Read the session's OWN authoritative state — captured BEFORE
+    // `disposeAll()` tears the session down — and prefer it whenever the
+    // local variable was never set.
+    const ownership =
+      captureOwnership !== "none"
+        ? captureOwnership
+        : captureOwnershipFromSession(handle.session);
     await disposeAll();
     if (params.signal.aborted) {
-      return { kind: "declined", reason: "client aborted", captureOwnership };
+      return {
+        kind: "declined",
+        reason: "client aborted",
+        ...(ownership !== "none" ? { captureOwnership: ownership } : {}),
+      };
     }
     const message = error instanceof Error ? error.message : String(error);
     return {
       kind: "declined",
       reason: `muse capture failed: ${message}`,
-      ...(captureOwnership !== "none" ? { captureOwnership } : {}),
+      ...(ownership !== "none" ? { captureOwnership: ownership } : {}),
     };
   }
 };
