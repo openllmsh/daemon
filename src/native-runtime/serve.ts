@@ -798,20 +798,23 @@ const serveCursorHop = async (
   if (req.promptText.length === 0 && req.images.length === 0) {
     return { declined: "no user turn to answer" };
   }
+  const bridgeParams = {
+    bin: overrides?.bin ?? cliBin("cursor"),
+    env: overrides?.env ?? cliEnv("cursor"),
+    providerModelId: params.providerModelId,
+    systemText: req.systemText,
+    userText: req.promptText,
+    images: req.images,
+    tools: req.tools,
+    jsonInstructionText:
+      req.jsonMode !== null
+        ? jsonInstruction(req.jsonMode, req.jsonSchema)
+        : null,
+    signal: params.signal,
+  };
   const run = captureActive
     ? await runCursorNativeCapture({
-        bin: overrides?.bin ?? cliBin("cursor"),
-        env: overrides?.env ?? cliEnv("cursor"),
-        providerModelId: params.providerModelId,
-        systemText: req.systemText,
-        userText: req.promptText,
-        images: req.images,
-        tools: req.tools,
-        jsonInstructionText:
-          req.jsonMode !== null
-            ? jsonInstruction(req.jsonMode, req.jsonSchema)
-            : null,
-        signal: params.signal,
+        ...bridgeParams,
         ...(overrides?.cursorCaptureSender !== undefined
           ? { sender: overrides.cursorCaptureSender }
           : {}),
@@ -822,20 +825,7 @@ const serveCursorHop = async (
           ? { destinationPolicy: overrides.cursorCaptureDestinationPolicy }
           : {}),
       })
-    : await runCursorNative({
-        bin: overrides?.bin ?? cliBin("cursor"),
-        env: overrides?.env ?? cliEnv("cursor"),
-        providerModelId: params.providerModelId,
-        systemText: req.systemText,
-        userText: req.promptText,
-        images: req.images,
-        tools: req.tools,
-        jsonInstructionText:
-          req.jsonMode !== null
-            ? jsonInstruction(req.jsonMode, req.jsonSchema)
-            : null,
-        signal: params.signal,
-      });
+    : await runCursorNative(bridgeParams);
   if (run.kind === "declined") {
     return declinedOutcome(
       run.reason,
@@ -928,25 +918,18 @@ const serveMuseHop = async (
   }
   let run: TNativeRunResult;
   try {
+    const bridgeParams = {
+      bin: overrides?.bin ?? cliBin("muse"),
+      env: overrides?.env ?? cliEnv("muse"),
+      providerModelId: params.providerModelId,
+      parts: req.parts,
+      promptText: req.promptText,
+      tools: req.tools,
+      signal: params.signal,
+    };
     run = captureActive
-      ? await runMuseNativeCapture({
-          bin: overrides?.bin ?? cliBin("muse"),
-          env: overrides?.env ?? cliEnv("muse"),
-          providerModelId: params.providerModelId,
-          parts: req.parts,
-          promptText: req.promptText,
-          tools: req.tools,
-          signal: params.signal,
-        })
-      : await runMuseNative({
-          bin: overrides?.bin ?? cliBin("muse"),
-          env: overrides?.env ?? cliEnv("muse"),
-          providerModelId: params.providerModelId,
-          parts: req.parts,
-          promptText: req.promptText,
-          tools: req.tools,
-          signal: params.signal,
-        });
+      ? await runMuseNativeCapture(bridgeParams)
+      : await runMuseNative(bridgeParams);
   } catch (error) {
     return { declined: error instanceof Error ? error.message : String(error) };
   }
