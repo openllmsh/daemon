@@ -1467,18 +1467,16 @@ export const runCursorNativeCapture = async (
       const reader = http2.response.body.getReader();
       let pending = new Uint8Array(0);
       let contextBridged = false;
-      // Track the ACTUAL numeric id of the request_context_args/result
-      // exchange (not just a boolean) — a later queued
-      // `ExecClientControlMessage.stream_close` for that exchange can only
-      // be verified/relayed during a subsequent KV control wait if this is
-      // known. Proto3 implicit presence: 0 is a real id, never "unknown".
-      let contextExecNumericId: number | null = null;
       // Verified generic-exec-loop behavior: `stream_close` is written
       // unconditionally after EVERY exec result — not just request_context
       // — so a queued one can reference ANY earlier completed control
       // exchange (request_context OR mcp_state_exec, including a prior one
-      // in a batch of several). Tracks every completed exchange's numeric
-      // id for exact correlation; never used to relax/guess an unknown id.
+      // in a batch of several). Tracks EVERY completed exchange's numeric
+      // id (never just the most recent — a single "latest wins" scalar
+      // would incorrectly reject a still-valid stream_close for an OLDER
+      // completed exchange once a newer one has also completed) for exact
+      // correlation; never used to relax/guess an unknown id. Fed into both
+      // KV and mcp_state_exec forward calls.
       const completedControlExecNumericIds = new Set<number>();
       let sawModelOutput = false;
       // Metadata-only diagnostics (never payload/args/content) so a stuck
@@ -1904,7 +1902,6 @@ export const runCursorNativeCapture = async (
                     connectContentEncoding,
                     signal: params.signal,
                   });
-                contextExecNumericId = contextForward.contextExecNumericId;
                 if (contextForward.contextExecNumericId !== null) {
                   completedControlExecNumericIds.add(
                     contextForward.contextExecNumericId,
@@ -1952,12 +1949,6 @@ export const runCursorNativeCapture = async (
                   completedControlExecNumericIds.add(
                     stateForward.completedExecNumericId,
                   );
-                  // KV's own stream_close correlation (below) only tracks a
-                  // single "known" id — keep it pointed at the MOST
-                  // RECENTLY completed control exchange (request_context OR
-                  // mcp_state_exec) so a queued stream_close for whichever
-                  // ran last is still relayed correctly there too.
-                  contextExecNumericId = stateForward.completedExecNumericId;
                 }
                 continue;
               }
@@ -2105,7 +2096,7 @@ export const runCursorNativeCapture = async (
                   ),
                   connectContentEncoding,
                   signal: params.signal,
-                  knownContextExecNumericId: contextExecNumericId,
+                  knownControlExecNumericIds: completedControlExecNumericIds,
                 });
                 continue;
               }

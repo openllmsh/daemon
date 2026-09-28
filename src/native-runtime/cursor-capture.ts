@@ -1518,19 +1518,22 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
   readonly followUpTimeoutMs?: number;
   readonly signal?: AbortSignal;
   /**
-   * The numeric id of an EARLIER request_context_args/result exchange
-   * already forwarded in this capture (from
-   * {@link forwardCursorRequestContextThroughBuilder}'s
-   * `contextExecNumericId`), if any. The native generic-exec loop writes an
-   * `ExecClientControlMessage.stream_close` unconditionally after every exec
-   * result, so this one can still be queued on the IPC channel and only
-   * surface here, during a later KV wait. It is relayed EXACTLY ONCE, and
-   * ONLY when its own id matches this value exactly — KV ids are a
-   * completely separate id namespace and must never be used for this match.
-   * `undefined`/`null` means no known context exchange, so any stream_close
-   * observed here is unattributable and still rejected.
+   * Numeric ids of EARLIER exec exchanges (request_context and/or
+   * mcp_state_exec) already forwarded in this capture. The native
+   * generic-exec loop writes an `ExecClientControlMessage.stream_close`
+   * unconditionally after EVERY exec result, so one for any earlier
+   * completed exchange can still be queued on the IPC channel and only
+   * surface here, during a later KV wait. Each distinct id is relayed
+   * EXACTLY ONCE — a DIFFERENT known id is a separate, legitimate signal
+   * (e.g. a batch of several completed exchanges), never conflated with
+   * "already forwarded". KV ids are a completely separate id namespace and
+   * must never be used for this match. `undefined`/`null`/empty means no
+   * known completed exchange, so any stream_close observed here is
+   * unattributable and still rejected — this is never relaxed to "most
+   * recent id only", which would incorrectly reject a still-valid stream_close
+   * for an OLDER completed exchange once a newer one has also completed.
    */
-  readonly knownContextExecNumericId?: number | null;
+  readonly knownControlExecNumericIds?: ReadonlySet<number> | null;
 }): Promise<{ readonly forwardedFollowUps: number }> => {
   if (isAbortSignalAborted(args.signal)) {
     throw new RequestCaptureError("aborted", "client aborted before KV inject");
@@ -1580,10 +1583,11 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
     Date.now() + Math.max(1_000, args.followUpTimeoutMs ?? 10_000);
   let forwardedFollowUps = 0;
   let observedFollowUps = 0;
-  // A queued stream_close for the EARLIER request_context exchange must be
-  // relayed exactly once — never repeatedly, and never treated as a
-  // second/duplicate signal once seen.
-  let contextStreamCloseForwarded = false;
+  // Each DISTINCT known-completed-exchange id gets its queued stream_close
+  // relayed exactly once — tracked per id, never a single boolean (which
+  // would incorrectly reject a second, legitimately different known id in a
+  // batch scenario).
+  const forwardedControlStreamCloseIds = new Set<number>();
   let aborted = isAbortSignalAborted(args.signal);
   const onAbort = (): void => {
     aborted = true;
@@ -1597,22 +1601,37 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
         parentCaptureId: args.captureId,
         timeoutMs: remaining,
       });
+      // CodeRabbit review: a fresh anonymous "abort" listener was previously
+      // registered on EVERY loop iteration with no corresponding removal —
+      // each non-firing iteration leaked one listener on `args.signal` for
+      // the signal's lifetime. Track it locally and remove it in a
+      // per-iteration `finally`, regardless of which side of the race won.
+      let onIterationAbort: (() => void) | null = null;
       const abortPromise =
         args.signal === undefined
           ? null
           : new Promise<"aborted">((resolve) => {
-              if (args.signal?.aborted === true) {
+              const abortSignal: AbortSignal = args.signal as AbortSignal;
+              if (abortSignal.aborted) {
                 resolve("aborted");
                 return;
               }
-              args.signal?.addEventListener("abort", () => resolve("aborted"), {
+              onIterationAbort = () => resolve("aborted");
+              abortSignal.addEventListener("abort", onIterationAbort, {
                 once: true,
               });
             });
-      const followUp =
-        abortPromise === null
-          ? await followUpPromise
-          : await Promise.race([followUpPromise, abortPromise]);
+      let followUp: Awaited<typeof followUpPromise> | "aborted";
+      try {
+        followUp =
+          abortPromise === null
+            ? await followUpPromise
+            : await Promise.race([followUpPromise, abortPromise]);
+      } finally {
+        if (onIterationAbort !== null) {
+          args.signal?.removeEventListener("abort", onIterationAbort);
+        }
+      }
       if (followUp === "aborted") {
         throw new RequestCaptureError(
           "aborted",
@@ -1665,29 +1684,35 @@ export const forwardCursorKvControlThroughBuilder = async (args: {
         if (classification.kind === "exec_stream_close") {
           // Live retest #35: the native generic-exec loop writes
           // `ExecClientControlMessage.stream_close` unconditionally after
-          // EVERY exec result — including the earlier
-          // request_context_args/result exchange — so it can still be
-          // queued on the IPC channel and only surface here, mid-KV-wait.
-          // Narrow, verified relay: forward it UNCHANGED, exactly once, and
-          // ONLY when its id matches the KNOWN earlier context exchange's
-          // numeric id — never against `expectedId` (the KV request's own
-          // id; a completely separate id namespace), and never as a
-          // generic/blanket exec-control approval.
+          // EVERY exec result — including an earlier request_context_args/
+          // mcp_state_exec_args exchange — so it can still be queued on the
+          // IPC channel and only surface here, mid-KV-wait. Narrow, verified
+          // relay: forward it UNCHANGED, and ONLY when its id is a member of
+          // the KNOWN set of already-completed control exchanges — never
+          // against `expectedId` (the KV request's own id; a completely
+          // separate id namespace), never as a generic/blanket exec-control
+          // approval, and never rejected merely because a DIFFERENT known
+          // id was already forwarded (each distinct id is tracked, and
+          // relayed, independently — this is what a batch of several
+          // completed exchanges legitimately looks like).
           if (
-            contextStreamCloseForwarded ||
-            args.knownContextExecNumericId === undefined ||
-            args.knownContextExecNumericId === null ||
-            classification.execNumericId !== args.knownContextExecNumericId
+            classification.execNumericId === null ||
+            args.knownControlExecNumericIds === undefined ||
+            args.knownControlExecNumericIds === null ||
+            !args.knownControlExecNumericIds.has(
+              classification.execNumericId,
+            ) ||
+            forwardedControlStreamCloseIds.has(classification.execNumericId)
           ) {
             throw new CursorCaptureDecodeError(
               "unsupported_native_kv",
-              `unattributed stream_close during KV control (already_forwarded=${contextStreamCloseForwarded} known_context_id=${args.knownContextExecNumericId ?? "null"} actual_id=${classification.execNumericId ?? "null"})`,
+              `unattributed stream_close during KV control (already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${classification.execNumericId ?? "null"})`,
             );
           }
           args.http2.writeClientFollowUp(
             encodeConnectEnvelope(env.payload, env.flags),
           );
-          contextStreamCloseForwarded = true;
+          forwardedControlStreamCloseIds.add(classification.execNumericId);
           forwardedFollowUps += 1;
           continue;
         }
@@ -2139,10 +2164,11 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
     Date.now() + Math.max(1_000, args.followUpTimeoutMs ?? 10_000);
   const skipped: string[] = [];
   let observedFollowUps = 0;
-  // A queued stream_close for an EARLIER exchange must be relayed exactly
-  // once — never repeatedly, and never treated as a second/duplicate signal
-  // once seen.
-  let controlStreamCloseForwarded = false;
+  // Each DISTINCT known-completed-exchange id gets its queued stream_close
+  // relayed exactly once — tracked per id, never a single boolean (which
+  // would incorrectly reject a second, legitimately different known id in a
+  // batch scenario, e.g. two sequential mcp_state_exec queries).
+  const forwardedControlStreamCloseIds = new Set<number>();
   let lastClassification: TCursorFollowUpClassification | null = null;
   let aborted = isAbortSignalAborted(args.signal);
   const onAbort = (): void => {
@@ -2184,6 +2210,29 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           abortPromise === null
             ? await followUpPromise
             : await Promise.race([followUpPromise, abortPromise]);
+      } catch (err) {
+        // The REAL `captureBridge.waitForFollowUp()` owns its own internal
+        // timer and REJECTS (never hangs) once `timeoutMs` elapses without a
+        // reply — this loop does not own that timer itself, only the outer
+        // `deadline`. Preserve abort identity first: if the caller aborted
+        // around the same moment, surface that, never a misattributed
+        // timeout. Otherwise normalize the bridge's own rejection to the
+        // correct semantic code rather than leaking its internal error
+        // shape to callers who only expect `CursorCaptureDecodeError`.
+        if (aborted || isAbortSignalAborted(args.signal)) {
+          throw new RequestCaptureError(
+            "aborted",
+            `client aborted while waiting for mcp_state_exec_result (last=${lastClassification?.diagnostic ?? "none"}; skipped=[${skipped.join("; ")}])`,
+          );
+        }
+        throw new CursorCaptureDecodeError(
+          "requires_mcp_state_exec_duplex",
+          `builder follow-up wait failed (${err instanceof Error ? err.message : String(err)}; last=${lastClassification?.diagnostic ?? "none"}; skipped=[${skipped.join("; ")}])`,
+          {
+            execSubtype: "mcp_state_exec_args",
+            execClass: "protocol_control",
+          },
+        );
       } finally {
         if (onIterationAbort !== null) {
           args.signal?.removeEventListener("abort", onIterationAbort);
@@ -2270,21 +2319,23 @@ export const forwardCursorMcpStateExecThroughBuilder = async (args: {
           // approval, never matched against this exchange's OWN expected id
           // (a different, not-yet-resolved exchange).
           if (
-            controlStreamCloseForwarded ||
+            classification.execNumericId === null ||
             args.knownControlExecNumericIds === undefined ||
             args.knownControlExecNumericIds === null ||
-            classification.execNumericId === null ||
-            !args.knownControlExecNumericIds.has(classification.execNumericId)
+            !args.knownControlExecNumericIds.has(
+              classification.execNumericId,
+            ) ||
+            forwardedControlStreamCloseIds.has(classification.execNumericId)
           ) {
             throw new CursorCaptureDecodeError(
               "unsupported_native_exec",
-              `unattributed stream_close during mcp_state_exec control (already_forwarded=${controlStreamCloseForwarded} actual_id=${classification.execNumericId ?? "null"})`,
+              `unattributed stream_close during mcp_state_exec control (already_forwarded_ids=[${[...forwardedControlStreamCloseIds].join(",")}] actual_id=${classification.execNumericId ?? "null"})`,
             );
           }
           args.http2.writeClientFollowUp(
             encodeConnectEnvelope(env.payload, env.flags),
           );
-          controlStreamCloseForwarded = true;
+          forwardedControlStreamCloseIds.add(classification.execNumericId);
           continue;
         }
         if (classification.kind === "benign_control") {
