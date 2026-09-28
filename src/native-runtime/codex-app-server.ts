@@ -562,6 +562,37 @@ export const clientFor = (
 };
 
 /**
+ * Dispose the shared warm client for `bin` IF ONE EXISTS — never creates one.
+ * GET-ONLY by design: `clientFor` would spawn a fresh child on a miss, which
+ * is exactly wrong for a cleanup call (nothing to clean up must mean nothing
+ * happens, never "make one so we can kill it"). Deletes the captured
+ * instance from the shared map BEFORE disposing it, so a concurrent
+ * `clientFor(bin, env)` racing this call cannot receive (and then have
+ * unexpectedly killed out from under it) the exact instance being torn
+ * down — it will see the map miss and create its own fresh replacement
+ * instead. Awaits the real child exit via
+ * {@link CodexAppServerClient.disposeAndWaitForExit} (kill() alone only
+ * requests termination); resolves `false` when no shared client for `bin`
+ * was registered (nothing to dispose), `true` once the child has actually
+ * exited.
+ *
+ * Intended for a standalone short-lived caller process (e.g. a benchmark
+ * harness) that itself invoked `tryServeNativeRuntime` for a chatgpt
+ * "bridge" (non-capture) hop and thereby caused this module to create the
+ * shared client — never for use inside the daemon's own long-lived runtime,
+ * which must keep serving warm requests across calls.
+ */
+export const disposeSharedCodexAppServerClientAndWaitForExit = async (
+  bin: string,
+): Promise<boolean> => {
+  const existing = clients.get(bin);
+  if (existing === undefined) return false;
+  clients.delete(bin);
+  await existing.disposeAndWaitForExit();
+  return true;
+};
+
+/**
  * Fresh app-server child that is NOT shared with {@link clientFor}. Capture
  * builders must use this so `turn/interrupt` cannot disturb unrelated warm
  * threads, and so `-c chatgpt_base_url` / `-c openai_base_url` redirects apply

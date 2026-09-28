@@ -123,6 +123,51 @@ export const CODEX_CAPTURE_EXTERNAL_RESPONSES_URL = `${CODEX_CAPTURE_EXTERNAL_OR
  */
 export const CODEX_CAPTURE_OPENAI_PATH_PREFIX = "/openllm-capture/codex";
 
+/**
+ * The real chatgpt.com path prefix `openai_base_url`-scoped controls resolve
+ * against on production (`model-provider/src/models_endpoint.rs`
+ * `MODELS_ENDPOINT = "/models"`, resolved against the codex backend base as
+ * `https://chatgpt.com/backend-api/codex/models`) — distinct from
+ * {@link CODEX_CAPTURE_EXTERNAL_RESPONSES_PATH}'s `/backend-api/codex/responses`
+ * (inference only, never forwarded from the preamble path).
+ */
+const CODEX_CAPTURE_REAL_OPENAI_PATH_PREFIX = "/backend-api/codex";
+
+/**
+ * Confirmed model-catalog control path landing under the LOCAL
+ * {@link CODEX_CAPTURE_OPENAI_PATH_PREFIX} redirect (observed empirically:
+ * `${CODEX_CAPTURE_OPENAI_PATH_PREFIX}/models`, 404 when forwarded verbatim
+ * — that internal prefix is capture plumbing only and never a real
+ * chatgpt.com route). Narrowly scoped to this ONE confirmed control, not a
+ * broad prefix-swap allowlist for arbitrary `openai_base_url`-prefixed
+ * preamble traffic — every other path under that prefix (there is currently
+ * no other known non-inference traffic there) is left forwarded exactly as
+ * before rather than guessed at.
+ */
+const isCodexCaptureModelCatalogPreamblePath = (pathname: string): boolean =>
+  pathname === `${CODEX_CAPTURE_OPENAI_PATH_PREFIX}/models` ||
+  pathname.startsWith(`${CODEX_CAPTURE_OPENAI_PATH_PREFIX}/models/`);
+
+/**
+ * The real chatgpt.com pathname to forward a preamble request to. Relocates
+ * ONLY the allowlisted model-catalog control path back onto the vendor's
+ * real `/backend-api/codex` prefix; every other preamble path (the
+ * `chatgpt_base_url`-prefixed `/backend-api/*` traffic, which already
+ * matches real routes exactly) is returned unchanged. This only fixes OUR
+ * OWN outbound forwarding target for this one control — it never touches
+ * the native client's own `supports_codex_backend_routes` decision, which is
+ * already fixed at configuration time by keeping `openai_base_url` off that
+ * suffix (see that constant's doc comment); nothing here changes what base
+ * URL the native binary itself was configured with.
+ */
+const codexCapturePreambleForwardPath = (pathname: string): string =>
+  isCodexCaptureModelCatalogPreamblePath(pathname)
+    ? pathname.replace(
+        CODEX_CAPTURE_OPENAI_PATH_PREFIX,
+        CODEX_CAPTURE_REAL_OPENAI_PATH_PREFIX,
+      )
+    : pathname;
+
 /** Sentinel stored when accounts/check reports literal `NO_CONSTRAINT`. */
 export const CODEX_CAPTURE_UNCONSTRAINED_BACKEND = "NO_CONSTRAINT";
 
@@ -702,9 +747,10 @@ export const startCodexCaptureReceiver = (
     fwd.delete("host");
     preambleForwardCount += 1;
     const recordRoutes = isWorkspaceAccountsCheckPath(peeledUrl.pathname);
+    const forwardPath = codexCapturePreambleForwardPath(peeledUrl.pathname);
     try {
       const response = await preambleFetch(
-        `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${peeledUrl.pathname}${peeledUrl.search}`,
+        `${CODEX_CAPTURE_EXTERNAL_ORIGIN}${forwardPath}${peeledUrl.search}`,
         {
           method: req.method,
           headers: fwd,
