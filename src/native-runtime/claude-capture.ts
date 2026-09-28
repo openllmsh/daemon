@@ -35,7 +35,9 @@ import { existsSync } from "node:fs";
 import type {
   TChatCompletionChunk,
   TChatCompletionRequest,
+  TErrorEnvelope,
 } from "@openllmsh/protocol";
+import { classifyHopError } from "@openllmsh/wire/lib/error-class";
 import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
 import { isMeaningfulChunk } from "@openllmsh/wire/lib/streaming/peek";
 import { decodeAnthropicEventStream } from "@openllmsh/wire/providers/anthropic/streaming";
@@ -322,6 +324,177 @@ export const chunksFromCapturedAnthropicResponse = (
   return decodeAnthropicEventStream(body, { providerModelId });
 };
 
+/** Hard cap on how much of a non-2xx error body we read into memory. Vendor
+ *  error JSON is always small; this bounds a captured-but-hostile/broken
+ *  upstream response independent of the (much larger) request-side
+ *  `maxBodyBytes` budget. */
+const MAX_CAPTURED_ERROR_BODY_BYTES = 32 * 1024;
+
+/** Cap on the `message`/detail text folded into `reason` — independent of
+ *  {@link MAX_CAPTURED_ERROR_BODY_BYTES}, since a hostile body can still put
+ *  an oversized string inside otherwise-valid JSON within that byte bound. */
+const MAX_ERROR_DETAIL_CHARS = 200;
+
+/**
+ * Best-effort structured envelope from a bounded error body — mirrors the
+ * shared daemon parse (`walker.ts`'s `errorEnvelopeFrom`) closely enough for
+ * {@link classifyHopError}, without importing `walker.ts` (would cycle back
+ * into native-runtime). Validates `message`/`type`/`code` as strings with a
+ * fallback rather than casting `unknown` to `TErrorEnvelope["error"]` — an
+ * object-shaped but malformed field (e.g. `message: 123` or `message: {}`)
+ * must not reach {@link classifyHopError} untyped and must not throw here.
+ */
+const errorEnvelopeFromBoundedBody = (
+  raw: string,
+): TErrorEnvelope | undefined => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw.length > 0
+      ? {
+          error: {
+            message: raw.slice(0, MAX_ERROR_DETAIL_CHARS),
+            type: "upstream_error",
+          },
+        }
+      : undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const errorField = (parsed as Record<string, unknown>).error;
+  if (typeof errorField === "string") {
+    return {
+      error: {
+        message: errorField.slice(0, MAX_ERROR_DETAIL_CHARS),
+        type: "upstream_error",
+      },
+    };
+  }
+  if (typeof errorField !== "object" || errorField === null) {
+    return undefined;
+  }
+  const e = errorField as Record<string, unknown>;
+  return {
+    error: {
+      message:
+        typeof e.message === "string"
+          ? e.message.slice(0, MAX_ERROR_DETAIL_CHARS)
+          : "upstream error (unparseable message)",
+      type: typeof e.type === "string" ? e.type : "upstream_error",
+      ...(typeof e.code === "string" ? { code: e.code } : {}),
+    },
+  };
+};
+
+/**
+ * Read at most {@link MAX_CAPTURED_ERROR_BODY_BYTES} of a non-2xx captured
+ * response body, bounded by BOTH byte count and time. A vendor 4xx/5xx body
+ * is always small JSON; a stalled/slow-drip body must not hang capture
+ * cleanup indefinitely, and the caller's own abort must cancel the read
+ * immediately rather than waiting out the full deadline. Never throws — any
+ * failure/timeout/abort yields whatever partial snippet was captured so far,
+ * so classification still proceeds on status alone if nothing was read.
+ */
+const readBoundedErrorBody = async (
+  response: Response,
+  signal: AbortSignal,
+): Promise<string> => {
+  const body = response.body;
+  if (body === null) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  const pump = async (): Promise<void> => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      if (value === undefined) continue;
+      const remaining = MAX_CAPTURED_ERROR_BODY_BYTES - total;
+      if (remaining <= 0) return;
+      const slice =
+        value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      chunks.push(slice);
+      total += slice.byteLength;
+      if (total >= MAX_CAPTURED_ERROR_BODY_BYTES) return;
+    }
+  };
+
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      pump().catch(() => undefined),
+      new Promise<void>((resolve) => {
+        deadlineTimer = setTimeout(resolve, PRE_COMMIT_TIMEOUT_MS);
+      }),
+      new Promise<void>((resolve) => {
+        onAbort = () => resolve();
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    clearTimeout(deadlineTimer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    // Closing pending reads is synchronous; an upstream cancel hook may
+    // never settle, so it must not extend the read deadline or caller abort.
+    void reader.cancel().catch(() => undefined);
+  }
+  if (chunks.length === 0) return "";
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+};
+
+/**
+ * Classify a non-2xx captured Anthropic response into a declined
+ * `TNativeRunResult` — status, vendor error body (bounded read, bounded
+ * time), and `Retry-After` (surfaced via `cooldownReason`, the shared
+ * rate-limit/quota signal; the exact header value is not separately threaded
+ * through `TNativeRunResult`) are all preserved. Reuses {@link
+ * classifyHopError}, the same cloud/daemon policy every other hop classifies
+ * through, instead of a capture-local status table that could silently drift
+ * from it. `signal` bounds the body read so a stalled 429/5xx body cannot
+ * delay the decline (and the ownership cleanup that follows it) past the
+ * caller's own abort or the shared pre-commit deadline.
+ */
+const declinedForNonOkCapturedResponse = async (
+  response: Response,
+  signal: AbortSignal,
+): Promise<Extract<TNativeRunResult, { readonly kind: "declined" }>> => {
+  const raw = await readBoundedErrorBody(response, signal);
+  const envelope = errorEnvelopeFromBoundedBody(raw);
+  const classified = classifyHopError({
+    status: response.status,
+    envelope,
+    providerFormat: "anthropic",
+    aborted: false,
+  });
+  const retryAfter = response.headers.get("retry-after");
+  const detail =
+    envelope?.error?.message ?? raw.slice(0, MAX_ERROR_DETAIL_CHARS);
+  const reason = [
+    `claude capture upstream HTTP ${response.status}`,
+    detail.length > 0 ? `: ${detail}` : "",
+    retryAfter !== null ? ` (retry-after: ${retryAfter})` : "",
+  ].join("");
+  return {
+    kind: "declined",
+    reason,
+    // A committed-hop abort never reaches this path (aborted: false above),
+    // so classifyHopError always returns "transient" here.
+    ...(classified.kind === "transient"
+      ? { cooldownReason: classified.reason }
+      : {}),
+    captureOwnership: "accepted",
+  };
+};
+
 /**
  * Called ONLY after `runCapturedDispatch` already succeeded (single call
  * site, post-dispatch) — every decline returned here MUST carry
@@ -604,6 +777,33 @@ export const runClaudeTextCapture = async (
         daemonDispatchCount,
         preambleExternalForwards: 0,
         capturedEnvelope: session.captured(),
+      },
+    };
+  }
+
+  // Dispatch success only means the daemon reached the upstream — a non-2xx
+  // status (429 rate limit, 401 auth, 5xx, …) is a real vendor rejection, not
+  // an SSE stream to decode. Decoding it as SSE anyway silently discards the
+  // status, the vendor error body, and any `Retry-After`/cooldown signal.
+  // Ownership is already `accepted` at this point (the send landed) — decline
+  // here, never fall through to `chunksFromCapturedAnthropicResponse`.
+  if (!dispatchResult.response.ok) {
+    const declined = await declinedForNonOkCapturedResponse(
+      dispatchResult.response,
+      params.signal,
+    );
+    kill();
+    loopback.stop();
+    session.dispose();
+    await stdoutTask.catch(() => undefined);
+    return {
+      run: declined,
+      diagnostics: {
+        textSettlement: textSettlement ?? "unproven_text_settlement",
+        toolCapture: CLAUDE_TOOL_CAPTURE_STATUS,
+        daemonDispatchCount,
+        preambleExternalForwards: 0,
+        capturedEnvelope: dispatchResult.envelope,
       },
     };
   }
