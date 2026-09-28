@@ -73,6 +73,8 @@ export type TCursorDecodeFailureCode =
   | "requires_kv_control_duplex"
   /** KvServerMessage subtype we don't relay (tracing/unknown), or a KvClientMessage reply that doesn't match the pending request (wrong id/type). */
   | "unsupported_native_kv"
+  /** Server asked for McpStateExecArgs — BiDi reply required; never fabricate a servers/tools state reply. */
+  | "requires_mcp_state_exec_duplex"
   | "invalid_protobuf";
 
 export type TCursorExecClass =
@@ -1541,6 +1543,26 @@ export const encodeExecServerMessage = (args: {
 };
 
 /**
+ * `ExecServerMessage.mcp_state_exec_args` (field 36) payload — hermetic
+ * fixture encoder mirroring the verified native schema `McpStateExecArgs`:
+ * server_identifiers (field 1, repeated string), kick_only (field 2, bool).
+ * A `serverIdentifiers` array of length > 1 models a batched query across
+ * multiple configured MCP servers in one exchange.
+ */
+export const encodeMcpStateExecArgs = (
+  args: {
+    readonly serverIdentifiers?: ReadonlyArray<string>;
+    readonly kickOnly?: boolean;
+  } = {},
+): Uint8Array =>
+  concatBytes([
+    ...(args.serverIdentifiers ?? []).map((id) => encodeProtoString(1, id)),
+    ...(args.kickOnly !== undefined
+      ? [encodeProtoInt32(2, args.kickOnly ? 1 : 0)]
+      : []),
+  ]);
+
+/**
  * Hermetic fixture encoder for one `google.protobuf.Value`, mirroring the
  * real oneof: null_value(1), number_value(2, fixed64 double), string_value(3),
  * bool_value(4), struct_value(5), list_value(6).
@@ -1652,6 +1674,24 @@ export const encodeExecClientRequestContextResult = (args: {
     ),
   ]);
 
+/**
+ * `ExecClientMessage.mcp_state_exec_result` (field 36) — hermetic
+ * test/fixture encoder. Real shape is `McpStateExecResult { success |
+ * error | rejected }`; tests only need OPAQUE bytes to prove exact
+ * byte-for-byte forwarding (the daemon never decodes this content), so
+ * `resultBytes` is accepted as-is rather than modeling the full oneof.
+ */
+export const encodeExecClientMcpStateExecResult = (args: {
+  readonly id: number;
+  readonly execId?: string;
+  readonly resultBytes: Uint8Array;
+}): Uint8Array =>
+  concatBytes([
+    encodeProtoInt32(1, args.id),
+    ...(args.execId !== undefined ? [encodeProtoString(15, args.execId)] : []),
+    encodeProtoBytes(36, args.resultBytes),
+  ]);
+
 /** AgentClientMessage { exec_client_message } */
 export const encodeAgentClientExecClientMessage = (
   execClientMessage: Uint8Array,
@@ -1725,6 +1765,15 @@ export const CURSOR_EXEC_CLIENT_RESULT_CASES: ReadonlyArray<
 export type TCursorFollowUpKind =
   | "request_context_result"
   | "kv_client_result"
+  /**
+   * `ExecClientMessage.mcp_state_exec_result` (field 36) — the builder's
+   * REAL, authoritative reply to a server `mcp_state_exec_args` control
+   * query (list/kick configured MCP servers). Opaque here on purpose: the
+   * daemon never decodes/logs server names, tool schemas, or instructions
+   * — it only correlates by numeric id and relays the exact bytes upstream
+   * unchanged, exactly like `request_context_result`/KV.
+   */
+  | "mcp_state_exec_result"
   /**
    * `ExecClientControlMessage.stream_close` (field 1, `ExecClientStreamClose{id}`).
    * The native generic-exec loop writes this unconditionally AFTER every exec
@@ -1979,14 +2028,42 @@ export const classifyAgentClientFollowUp = (
         diagnostic: `followup unknown empty_exec_client id=${execNumericId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
       };
     }
-    // Allowlist-adjacent protocol results that are NOT request_context — still
-    // not forwardable on this bridge (only request_context is implemented).
+    if (execCase === "mcp_state_exec_result") {
+      // Ensure no sibling native result fields ride along — same guard as
+      // request_context_result above.
+      for (const [field, name] of CURSOR_EXEC_CLIENT_RESULT_CASES) {
+        if (field === 36) continue;
+        if (protoMessageField(execFields, field) !== null) {
+          return {
+            ...base,
+            kind: "forbidden_native",
+            agentClientCase: agentCase.name,
+            execClientCase: `${execCase}+${name}`,
+            execId,
+            execNumericId,
+            diagnostic: `followup forbidden mcp_state_exec_result mixed with ${name} id=${execNumericId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+          };
+        }
+      }
+      return {
+        ...base,
+        kind: "mcp_state_exec_result",
+        agentClientCase: agentCase.name,
+        execClientCase: execCase,
+        execId,
+        execNumericId,
+        // Opaque — never decode/report server names, tool schemas, or
+        // instructions. Metadata only (id + byte count).
+        diagnostic: `followup allow mcp_state_exec_result id=${execNumericId} flags=${connectFlags} bytes=${connectPayloadBytes}`,
+      };
+    }
+    // Allowlist-adjacent protocol results that are NOT request_context /
+    // mcp_state_exec — still not forwardable on this bridge.
     if (
       execCase === "diagnostics_result" ||
       execCase === "shell_allowlist_precheck_result" ||
       execCase === "mcp_allowlist_precheck_result" ||
       execCase === "web_fetch_allowlist_precheck_result" ||
-      execCase === "mcp_state_exec_result" ||
       execCase === "execute_hook_result"
     ) {
       return {

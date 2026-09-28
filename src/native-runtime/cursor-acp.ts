@@ -67,6 +67,7 @@ import {
   chunksStreamFromCursorConnectResponseBody,
   defaultCursorCaptureSender,
   forwardCursorKvControlThroughBuilder,
+  forwardCursorMcpStateExecThroughBuilder,
   forwardCursorRequestContextThroughBuilder,
   isCursorHttp2Envelope,
   openCursorCaptureBridge,
@@ -1472,6 +1473,13 @@ export const runCursorNativeCapture = async (
       // be verified/relayed during a subsequent KV control wait if this is
       // known. Proto3 implicit presence: 0 is a real id, never "unknown".
       let contextExecNumericId: number | null = null;
+      // Verified generic-exec-loop behavior: `stream_close` is written
+      // unconditionally after EVERY exec result — not just request_context
+      // — so a queued one can reference ANY earlier completed control
+      // exchange (request_context OR mcp_state_exec, including a prior one
+      // in a batch of several). Tracks every completed exchange's numeric
+      // id for exact correlation; never used to relax/guess an unknown id.
+      const completedControlExecNumericIds = new Set<number>();
       let sawModelOutput = false;
       // Metadata-only diagnostics (never payload/args/content) so a stuck
       // phase is identifiable from the decline reason alone.
@@ -1498,6 +1506,9 @@ export const runCursorNativeCapture = async (
       // metadata only, never the blob id/data bytes.
       let kvGetFramesSeen = 0;
       let kvSetFramesSeen = 0;
+      // `exec_server_message.mcp_state_exec_args` (field 36) relay count —
+      // metadata only, never server names/tool schemas/instructions.
+      let mcpStateExecFramesSeen = 0;
       // Bounded, deduplicated inventory of `ignored`-kind reasons (each
       // already carries only bounded field-tag metadata — see
       // `describeProtoFieldTags` — never payload/value).
@@ -1511,7 +1522,7 @@ export const runCursorNativeCapture = async (
       // after terminal agent stream" behavior) rather than a failure.
       let turnEndedSeen = false;
       const diagSnapshot = (): string =>
-        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} heartbeat=${heartbeatFramesSeen} ignored=${ignoredFramesSeen} requiresDuplex=${requiresDuplexFramesSeen} nativeTool=${nativeToolFramesSeen} kvGet=${kvGetFramesSeen} kvSet=${kvSetFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged} ignoredReasons=[${ignoredReasonsSeen.join(";")}]`;
+        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} heartbeat=${heartbeatFramesSeen} ignored=${ignoredFramesSeen} requiresDuplex=${requiresDuplexFramesSeen} nativeTool=${nativeToolFramesSeen} kvGet=${kvGetFramesSeen} kvSet=${kvSetFramesSeen} mcpStateExec=${mcpStateExecFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged} ignoredReasons=[${ignoredReasonsSeen.join(";")}]`;
       const onAbortDuringPeel = (): void => {
         try {
           reader.cancel().catch(() => undefined);
@@ -1894,8 +1905,60 @@ export const runCursorNativeCapture = async (
                     signal: params.signal,
                   });
                 contextExecNumericId = contextForward.contextExecNumericId;
+                if (contextForward.contextExecNumericId !== null) {
+                  completedControlExecNumericIds.add(
+                    contextForward.contextExecNumericId,
+                  );
+                }
                 contextBridged = true;
                 phase = "post_context_wait";
+                continue;
+              }
+              if (
+                decoded.kind === "exec_server" &&
+                decoded.subtype === "mcp_state_exec_args"
+              ) {
+                // Real benchmark evidence: `mcp_state_exec_args` (field 36,
+                // verified native schema `McpStateExecArgs { server_identifiers
+                // repeated string, kick_only bool }` → `McpStateExecResult
+                // { success | error | rejected }`) was previously rejected
+                // outright via the generic protocol_control failure. It is a
+                // genuine list/kick MCP-servers control query — never a tool
+                // call, never model output — so it is relayed exactly like
+                // request_context/KV: inject the EXACT original bytes into
+                // the still-live builder, wait for its own authoritative
+                // reply, forward those exact bytes upstream. Never decode or
+                // report server names/tool schemas/instructions anywhere
+                // (opaque relay only), never fabricate a state reply, and —
+                // unlike request_context — legitimately repeatable within one
+                // turn (e.g. a batch of server queries), so no "already
+                // bridged" guard here.
+                execFramesSeen += 1;
+                mcpStateExecFramesSeen += 1;
+                const stateForward =
+                  await forwardCursorMcpStateExecThroughBuilder({
+                    captureBridge: bridge,
+                    captureId: nonNullCaptureId,
+                    http2,
+                    serverExecEnvelope: encodeConnectEnvelope(
+                      env.payload,
+                      env.flags,
+                    ),
+                    connectContentEncoding,
+                    signal: params.signal,
+                    knownControlExecNumericIds: completedControlExecNumericIds,
+                  });
+                if (stateForward.completedExecNumericId !== null) {
+                  completedControlExecNumericIds.add(
+                    stateForward.completedExecNumericId,
+                  );
+                  // KV's own stream_close correlation (below) only tracks a
+                  // single "known" id — keep it pointed at the MOST
+                  // RECENTLY completed control exchange (request_context OR
+                  // mcp_state_exec) so a queued stream_close for whichever
+                  // ran last is still relayed correctly there too.
+                  contextExecNumericId = stateForward.completedExecNumericId;
+                }
                 continue;
               }
               if (decoded.kind === "turn_ended") {

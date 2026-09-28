@@ -2013,6 +2013,375 @@ export const forwardCursorRequestContextThroughBuilder = async (args: {
   }
 };
 
+/**
+ * Relay one real `AgentServerMessage.exec_server_message.mcp_state_exec_args`
+ * envelope into the still-live native builder and forward its matching real
+ * `ExecClientMessage.mcp_state_exec_result` reply upstream unchanged.
+ *
+ * Verified native schema (installed artifact 2026.07.23-e383d2b):
+ * `McpStateExecArgs { server_identifiers: repeated string(1),
+ * kick_only: bool(2) }` → `McpStateExecResult { success | error | rejected }`
+ * (a `McpStateSuccess` lists the user's configured MCP servers, their tools,
+ * and instructions). This is a real control-plane exchange — never a tool
+ * call, never model output — so it is relayed exactly like
+ * `request_context_args`/KV: the daemon injects the EXACT original server
+ * bytes into the builder, waits for its own authoritative reply, and
+ * forwards those exact bytes upstream. It never decodes or reports server
+ * names / tool schemas / instructions anywhere (they may be sensitive user
+ * configuration) and never fabricates a state reply of its own.
+ */
+const MAX_MCP_STATE_EXEC_FOLLOW_UPS = 32;
+const MAX_MCP_STATE_EXEC_SKIPPED_DIAGNOSTICS = 16;
+
+export const forwardCursorMcpStateExecThroughBuilder = async (args: {
+  readonly captureBridge: TCursorCaptureBridge;
+  readonly captureId: string;
+  readonly http2: TCursorHttp2DispatchSession;
+  readonly serverExecEnvelope: Uint8Array;
+  readonly followUpTimeoutMs?: number;
+  /** Present when the server frame may be gzip-compressed (inspection only). */
+  readonly connectContentEncoding?: string | null;
+  /** Caller abort — must stop waiting for a follow-up promptly, not just at the deadline. */
+  readonly signal?: AbortSignal;
+  /**
+   * Numeric ids of EARLIER exec exchanges (request_context and/or
+   * mcp_state_exec) already forwarded in this capture. The native
+   * generic-exec loop writes an `ExecClientControlMessage.stream_close`
+   * unconditionally after every exec result, so one for an earlier
+   * exchange can still be queued on the IPC channel and only surface here,
+   * during a later mcp_state_exec wait. Relayed exactly once, and ONLY
+   * when its id is a member of this set — never against an unrelated id
+   * namespace (KV ids are separate). `undefined`/`null`/empty means no
+   * known completed exchange, so any stream_close observed here is
+   * unattributable and still rejected.
+   */
+  readonly knownControlExecNumericIds?: ReadonlySet<number> | null;
+}): Promise<{
+  readonly forwardedFollowUp: Uint8Array;
+  /** This exchange's own numeric id — feed into a later wait's
+   * `knownControlExecNumericIds` so a queued stream_close for THIS
+   * exchange can still be correlated and relayed if it arrives late. */
+  readonly completedExecNumericId: number | null;
+}> => {
+  if (isAbortSignalAborted(args.signal)) {
+    throw new RequestCaptureError(
+      "aborted",
+      "client aborted before mcp_state_exec inject",
+    );
+  }
+  // Validate the server frame is exactly mcp_state_exec_args before inject.
+  // Inspect a DECOMPRESSED COPY only — `args.serverExecEnvelope` (forwarded
+  // to the builder byte-for-byte via injectServerFrames) is never mutated.
+  const { envelopes, rest } = takeConnectEnvelopes(args.serverExecEnvelope);
+  if (rest.byteLength > 0 || envelopes.length === 0) {
+    throw new CursorCaptureDecodeError(
+      "truncated_connect_frame",
+      "mcp_state_exec inject requires complete Connect envelope(s) only",
+    );
+  }
+  for (const env of envelopes) {
+    if (env.endStream) {
+      throw new CursorCaptureDecodeError(
+        "invalid_protobuf",
+        "mcp_state_exec inject rejects end-stream control frames",
+      );
+    }
+    const inspectPayload = resolveConnectEnvelopePayload(
+      env,
+      args.connectContentEncoding,
+    );
+    const decoded = decodeAgentServerMessage(inspectPayload);
+    if (
+      decoded.kind !== "exec_server" ||
+      decoded.subtype !== "mcp_state_exec_args"
+    ) {
+      throw cursorExecServerFailure(
+        decoded.kind === "exec_server"
+          ? {
+              id: decoded.id,
+              execId: decoded.execId,
+              subtype: decoded.subtype,
+              classification: decoded.classification,
+              mcp: decoded.mcp,
+            }
+          : {
+              id: null,
+              execId: null,
+              subtype: "unknown_exec_server_message",
+              classification: "unknown",
+              mcp: null,
+            },
+      );
+    }
+  }
+
+  // Expected correlation ids from the server mcp_state_exec_args frame.
+  let expectedExecId: string | null = null;
+  let expectedNumericId: number | null = null;
+  for (const env of envelopes) {
+    const inspectPayload = resolveConnectEnvelopePayload(
+      env,
+      args.connectContentEncoding,
+    );
+    const decoded = decodeAgentServerMessage(inspectPayload);
+    if (decoded.kind === "exec_server") {
+      expectedExecId = decoded.execId;
+      expectedNumericId = execServerContextNumericId(inspectPayload);
+    }
+  }
+
+  args.captureBridge.injectServerFrames(
+    args.captureId,
+    args.serverExecEnvelope,
+  );
+
+  const deadline =
+    Date.now() + Math.max(1_000, args.followUpTimeoutMs ?? 10_000);
+  const skipped: string[] = [];
+  let observedFollowUps = 0;
+  // A queued stream_close for an EARLIER exchange must be relayed exactly
+  // once — never repeatedly, and never treated as a second/duplicate signal
+  // once seen.
+  let controlStreamCloseForwarded = false;
+  let lastClassification: TCursorFollowUpClassification | null = null;
+  let aborted = isAbortSignalAborted(args.signal);
+  const onAbort = (): void => {
+    aborted = true;
+  };
+  args.signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    while (!aborted && Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const followUpPromise = args.captureBridge.waitForFollowUp({
+        parentCaptureId: args.captureId,
+        timeoutMs: remaining,
+      });
+      // CodeRabbit review: a fresh anonymous "abort" listener was previously
+      // registered on EVERY loop iteration with no corresponding removal —
+      // each non-firing iteration (i.e. every one except whichever iteration
+      // actually observes the abort) leaked one listener on `args.signal`
+      // for the lifetime of that signal. Track it locally and remove it in
+      // a per-iteration `finally`, regardless of which side of the race won.
+      let onIterationAbort: (() => void) | null = null;
+      const abortPromise =
+        args.signal === undefined
+          ? null
+          : new Promise<"aborted">((resolve) => {
+              const abortSignal: AbortSignal = args.signal as AbortSignal;
+              if (abortSignal.aborted) {
+                resolve("aborted");
+                return;
+              }
+              onIterationAbort = () => resolve("aborted");
+              abortSignal.addEventListener("abort", onIterationAbort, {
+                once: true,
+              });
+            });
+      let followUp: Awaited<typeof followUpPromise> | "aborted";
+      try {
+        followUp =
+          abortPromise === null
+            ? await followUpPromise
+            : await Promise.race([followUpPromise, abortPromise]);
+      } finally {
+        if (onIterationAbort !== null) {
+          args.signal?.removeEventListener("abort", onIterationAbort);
+        }
+      }
+      if (followUp === "aborted") {
+        throw new RequestCaptureError(
+          "aborted",
+          `client aborted while waiting for mcp_state_exec_result (last=${lastClassification?.diagnostic ?? "none"}; skipped=[${skipped.join("; ")}])`,
+        );
+      }
+      if (followUp.body === null || followUp.body.byteLength === 0) {
+        if (skipped.length < MAX_MCP_STATE_EXEC_SKIPPED_DIAGNOSTICS) {
+          skipped.push("empty_body");
+        }
+        continue;
+      }
+      const followTaken = takeConnectEnvelopes(followUp.body);
+      if (followTaken.envelopes.length === 0) {
+        lastClassification = classifyAgentClientFollowUp(followUp.body, {
+          payloadBytes: followUp.body.byteLength,
+        });
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          `builder follow-up is not a complete Connect envelope (${lastClassification.diagnostic})`,
+        );
+      }
+      const forwardParts: Uint8Array[] = [];
+      let accepted: TCursorFollowUpClassification | null = null;
+      for (const env of followTaken.envelopes) {
+        observedFollowUps += 1;
+        if (observedFollowUps > MAX_MCP_STATE_EXEC_FOLLOW_UPS) {
+          throw new CursorCaptureDecodeError(
+            "unsupported_native_exec",
+            `mcp_state_exec control follow-up limit exceeded (${MAX_MCP_STATE_EXEC_FOLLOW_UPS})`,
+          );
+        }
+        if (env.endStream) {
+          if (skipped.length < MAX_MCP_STATE_EXEC_SKIPPED_DIAGNOSTICS) {
+            skipped.push(`end_stream_flags=${env.flags}`);
+          }
+          continue;
+        }
+        let inspectPayload: Uint8Array;
+        try {
+          inspectPayload = resolveConnectEnvelopePayload(
+            env,
+            args.connectContentEncoding,
+          );
+        } catch (err) {
+          throw err instanceof CursorCaptureDecodeError
+            ? new CursorCaptureDecodeError(
+                err.code,
+                `builder follow-up ${err.message} (flags=${env.flags} bytes=${env.payload.byteLength})`,
+              )
+            : err;
+        }
+        const classification = classifyAgentClientFollowUp(inspectPayload, {
+          flags: env.flags,
+          payloadBytes: env.payload.byteLength,
+        });
+        lastClassification = classification;
+        if (
+          classification.kind === "benign_control" &&
+          classification.agentClientCase === "client_heartbeat"
+        ) {
+          // The native builder emitted this exact keepalive while its own
+          // MCP-state manager was working — this exchange can legitimately
+          // take a while (listing/kicking multiple configured servers).
+          // Forward that exact envelope once; never manufacture or replay
+          // keepalives ourselves (mirrors the KV control relay).
+          args.http2.writeClientFollowUp(
+            encodeConnectEnvelope(env.payload, env.flags),
+          );
+          continue;
+        }
+        if (classification.kind === "exec_stream_close") {
+          // Verified generic-exec-loop behavior (same as request_context):
+          // stream_close is written unconditionally after EVERY exec
+          // result, so one for an EARLIER completed control exchange can
+          // still be queued and only surface here. Relay it unchanged,
+          // exactly once, and ONLY when its id is a member of the known set
+          // of ALREADY-completed control exchanges — never a generic/blind
+          // approval, never matched against this exchange's OWN expected id
+          // (a different, not-yet-resolved exchange).
+          if (
+            controlStreamCloseForwarded ||
+            args.knownControlExecNumericIds === undefined ||
+            args.knownControlExecNumericIds === null ||
+            classification.execNumericId === null ||
+            !args.knownControlExecNumericIds.has(classification.execNumericId)
+          ) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_exec",
+              `unattributed stream_close during mcp_state_exec control (already_forwarded=${controlStreamCloseForwarded} actual_id=${classification.execNumericId ?? "null"})`,
+            );
+          }
+          args.http2.writeClientFollowUp(
+            encodeConnectEnvelope(env.payload, env.flags),
+          );
+          controlStreamCloseForwarded = true;
+          continue;
+        }
+        if (classification.kind === "benign_control") {
+          if (skipped.length < MAX_MCP_STATE_EXEC_SKIPPED_DIAGNOSTICS) {
+            skipped.push(classification.diagnostic);
+          }
+          continue;
+        }
+        if (classification.kind === "mcp_state_exec_result") {
+          // Optional correlation: when both sides carry ids, they must match.
+          if (
+            expectedExecId !== null &&
+            classification.execId !== null &&
+            classification.execId !== expectedExecId
+          ) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_exec",
+              `mcp_state_exec_result exec_id mismatch (refusing to forward); ${classification.diagnostic}`,
+              {
+                execSubtype: "mcp_state_exec_result_id_mismatch",
+                execClass: "protocol_control",
+              },
+            );
+          }
+          if (
+            expectedNumericId !== null &&
+            classification.execNumericId !== null &&
+            classification.execNumericId !== expectedNumericId
+          ) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_exec",
+              `mcp_state_exec_result id mismatch (refusing to forward); ${classification.diagnostic}`,
+              {
+                execSubtype: "mcp_state_exec_result_id_mismatch",
+                execClass: "protocol_control",
+              },
+            );
+          }
+          accepted = classification;
+          forwardParts.push(encodeConnectEnvelope(env.payload, env.flags));
+          continue;
+        }
+        // Forbidden / unknown — fail closed with metadata-only diagnostics.
+        // Never a fabricated state reply of our own.
+        throw new CursorCaptureDecodeError(
+          "unsupported_native_exec",
+          `builder follow-up is not an allowlisted mcp_state_exec_result; refusing to forward (${classification.diagnostic}; skipped=[${skipped.join("; ")}])`,
+          {
+            execSubtype:
+              classification.execClientCase ?? classification.agentClientCase,
+            execClass:
+              classification.kind === "forbidden_native"
+                ? "native_exec"
+                : "unknown",
+          },
+        );
+      }
+      if (followTaken.rest.byteLength > 0) {
+        throw new CursorCaptureDecodeError(
+          "truncated_connect_frame",
+          `builder follow-up has trailing ${followTaken.rest.byteLength} incomplete bytes (${lastClassification?.diagnostic ?? "no_class"})`,
+        );
+      }
+      if (accepted !== null && forwardParts.length > 0) {
+        const [soleForwardPart] = forwardParts;
+        const forwarded =
+          forwardParts.length === 1 && soleForwardPart !== undefined
+            ? soleForwardPart
+            : concatBytesLocal(forwardParts);
+        args.http2.writeClientFollowUp(forwarded);
+        return {
+          forwardedFollowUp: forwarded,
+          completedExecNumericId: expectedNumericId,
+        };
+      }
+      // Only benign frames in this IPC message — keep waiting.
+    }
+    if (aborted) {
+      throw new RequestCaptureError(
+        "aborted",
+        `client aborted while waiting for mcp_state_exec_result (last=${lastClassification?.diagnostic ?? "none"}; skipped=[${skipped.join("; ")}])`,
+      );
+    }
+
+    throw new CursorCaptureDecodeError(
+      "requires_mcp_state_exec_duplex",
+      `timed out waiting for mcp_state_exec_result (last=${lastClassification?.diagnostic ?? "none"}; skipped=[${skipped.join("; ")}])`,
+      {
+        execSubtype: "mcp_state_exec_args",
+        execClass: "protocol_control",
+      },
+    );
+  } finally {
+    args.signal?.removeEventListener("abort", onAbort);
+  }
+};
+
 const concatBytesLocal = (parts: ReadonlyArray<Uint8Array>): Uint8Array => {
   const total = parts.reduce((n, p) => n + p.byteLength, 0);
   const out = new Uint8Array(total);
