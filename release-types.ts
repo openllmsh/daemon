@@ -24,16 +24,9 @@ export const DAEMON_TARGETS = [
 export type TDaemonTarget = (typeof DAEMON_TARGETS)[number];
 
 /**
- * The targets this release actually builds, stages, hashes, and publishes —
- * the ONE switch every release/compile/stage/hash/publish/manifest path
- * iterates. `DAEMON_TARGETS` stays the buildable superset so the Windows code
- * still typechecks, but Windows is off for 2.8.0-beta.1: add "win32-x64" back
- * here (or iterate DAEMON_TARGETS) to re-enable it.
+ * These targets are built and published for a release.
  */
-export const DAEMON_RELEASE_TARGETS = DAEMON_TARGETS.filter(
-  (target): target is Exclude<TDaemonTarget, "win32-x64"> =>
-    target !== "win32-x64",
-);
+export const DAEMON_RELEASE_TARGETS: readonly TDaemonTarget[] = DAEMON_TARGETS;
 
 /**
  * The checked-in input closure for a compiled daemon. Release, CI receipt,
@@ -108,14 +101,13 @@ export const BUN_TARGET_TO_DAEMON_TARGET: Readonly<
 export const daemonRawFilename = (target: TDaemonTarget): string =>
   `openllmd-${target}${target === "win32-x64" ? ".exe" : ""}`;
 
-/** The extensionless staging raw name (the distribution asset, minus `.gz`).
- *  Windows keeps the extensionless raw as an unchanged copy of the PE. */
+/** Isolated staging uses an extensionless copy of the raw binary. */
 export const daemonStagingRawName = (target: TDaemonTarget): string =>
   `openllmd-${target}`;
 
 /** The gzip distribution asset name for a release key. */
 export const daemonAssetFilename = (target: TDaemonTarget): string =>
-  `${daemonStagingRawName(target)}.gz`;
+  `${daemonRawFilename(target)}.gz`;
 
 /** The installed binary name on the target OS. */
 export const daemonInstalledName = (target: TDaemonTarget): string =>
