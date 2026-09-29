@@ -200,6 +200,7 @@ import type { TRefreshErrorClass } from "./delegation/refresh";
 import { authReasonCodeForRefreshError } from "./delegation/refresh";
 import type { TProviderDelegate } from "./delegation/types";
 import { stateDir } from "./env";
+import { effectiveExecutionSelectionForHop } from "./execution-registry";
 import { forwardToCloud } from "./forward";
 import {
   clearHopCooldown,
@@ -2820,10 +2821,12 @@ const walkPlan = async (
         // explicit selection at all (null) — same precedence as the legacy
         // `subMethodOverrides[provider] ?? requestedSubMethod` above (
         // 09-implementation-plan.md §4.2).
-        executionSelection:
-          executionSelectionOverrides[hop.provider] ??
-          requestedExecutionSelection ??
-          null,
+        executionSelection: effectiveExecutionSelectionForHop(
+          hop.provider,
+          executionSelectionOverrides,
+          subMethodOverrides,
+          requestedExecutionSelection,
+        ),
         stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>

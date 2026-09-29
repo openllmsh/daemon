@@ -348,3 +348,17 @@ export const describeExecutionSelectionRefusal = (
   }
   return refusal.reason;
 };
+
+/**
+ * The explicit selection for one provider hop. A provider override in either
+ * vocabulary beats the global new-vocabulary preference; a legacy override
+ * returns null so native-runtime dispatch keeps its legacy semantics.
+ */
+export const effectiveExecutionSelectionForHop = (
+  provider: string,
+  executionSelectionOverrides: Readonly<Record<string, TExecutionSelection>>,
+  legacyOverrides: Readonly<Record<string, TSubMethod>>,
+  globalSelection: TExecutionSelection | null,
+): TExecutionSelection | null =>
+  executionSelectionOverrides[provider] ??
+  (legacyOverrides[provider] === undefined ? globalSelection : null);
