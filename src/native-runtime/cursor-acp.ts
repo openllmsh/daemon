@@ -56,9 +56,8 @@ import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logInfo, safeDiagnosticMessage } from "../logger";
-import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import type { TLinuxLaunchHandle } from "../sandbox/linux-adapter";
-import { linuxLaunchHandle } from "../sandbox/linux-adapter";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
@@ -358,18 +357,23 @@ export class AcpClient {
     // The ACP bridge reads cursor's isolated macOS keychain credential;
     // securityd denies a Seatbelt-confined caller, so it runs unconfined on
     // macOS (confined on Linux) — `sandbox/policy.ts`.
-    const argv = sandboxSpawnArgs([bin, "acp"], {
-      probe: unwrapKeychainSpawn("cursor"),
-    });
-    this.sandbox = linuxLaunchHandle(argv);
-    this.proc = admittedSpawn(argv, {
-      stdin: "pipe",
-      stdout: "pipe",
-      // Native stderr is not a safe diagnostic channel (may contain secrets).
-      stderr: "ignore",
-      cwd: spawnCwd(env),
-      env: cleanNativeSpawnEnv(env),
-    });
+    const spawned = withSandboxSpawn(
+      [bin, "acp"],
+      (argv, sandbox) => ({
+        sandbox,
+        proc: admittedSpawn(argv, {
+          stdin: "pipe",
+          stdout: "pipe",
+          // Native stderr is not a safe diagnostic channel (may contain secrets).
+          stderr: "ignore",
+          cwd: spawnCwd(env),
+          env: cleanNativeSpawnEnv(env),
+        }),
+      }),
+      { probe: unwrapKeychainSpawn("cursor") },
+    );
+    this.sandbox = spawned.sandbox;
+    this.proc = spawned.proc;
     this.stdin = this.proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;

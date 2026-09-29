@@ -12,7 +12,8 @@ import { spawn as admittedSpawn } from "../windows-process";
 import { childEnvironment } from "./child-policy";
 import type { TSandboxState } from "./landlock";
 import { applyDaemonSandbox, sandboxAppliedInProcess } from "./landlock";
-import { prepareLinuxLaunch } from "./linux-adapter";
+import type { TLinuxLaunchHandle } from "./linux-adapter";
+import { linuxLaunchHandle, prepareLinuxLaunch } from "./linux-adapter";
 import { runWindowsConfinedTask } from "./windows-task";
 
 export type TSandboxSpawnOpts = {
@@ -227,6 +228,23 @@ export const sandboxSpawnArgs = (
     "--",
     ...argv,
   ];
+};
+
+/** Prepare and start one child. The callback must return after synchronous spawn. */
+export const withSandboxSpawn = <TChild>(
+  argv: readonly string[],
+  spawn: (argv: string[], sandbox: TLinuxLaunchHandle | undefined) => TChild,
+  opts?: TSandboxSpawnOpts,
+): TChild => {
+  const prepared = linuxLaunchHandle(argv);
+  const wrapped = prepared ? [...argv] : sandboxSpawnArgs(argv, opts);
+  const sandbox = prepared ?? linuxLaunchHandle(wrapped);
+  try {
+    return spawn(wrapped, sandbox);
+  } catch (error) {
+    sandbox?.cancelBeforeSpawn?.();
+    throw error;
+  }
 };
 
 /**

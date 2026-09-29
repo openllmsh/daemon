@@ -53,7 +53,7 @@ import {
 import { Schema } from "effect";
 import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
-import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { daemonTempDir } from "../sandbox/working-set";
 import type { TNativeRunResult } from "./types";
@@ -339,16 +339,18 @@ export const runClaudeNative = async (
     // superviseSpawn leads an independent process group, so terminate()
     // TERM→KILLs the WHOLE tree — a launcher-descended grandchild can't
     // outlive the request (PL-D5).
-    child = superviseSpawn(
-      sandboxSpawnArgs(argv, { probe: unwrapKeychainSpawn("claude_code") }),
-      {
-        kind: "native-runtime",
-        stdin: new TextEncoder().encode(params.userText),
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: spawnCwd(params.env),
-        env: cleanNativeSpawnEnv(params.env),
-      },
+    child = withSandboxSpawn(
+      argv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "native-runtime",
+          stdin: new TextEncoder().encode(params.userText),
+          stdout: "pipe",
+          stderr: "pipe",
+          cwd: spawnCwd(params.env),
+          env: cleanNativeSpawnEnv(params.env),
+        }),
+      { probe: unwrapKeychainSpawn("claude_code") },
     );
     await child.sandbox?.ready;
   } catch (error) {

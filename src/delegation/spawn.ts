@@ -50,7 +50,7 @@ import {
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { currentTickId } from "../op-context";
 import { childEnvironment } from "../sandbox/child-policy";
-import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import {
   daemonTempDir,
   leaseDaemonTmpDirWithIdentity,
@@ -566,9 +566,10 @@ export const runCaptureResult = async (
       cwd: spawnCwd(env),
       env: leased.env,
     };
-    const child = superviseSpawn(
-      sandboxSpawnArgs(command, { probe: opts?.probe }),
-      spawnOptions,
+    const child = withSandboxSpawn(
+      command,
+      (wrapped) => superviseSpawn(wrapped, spawnOptions),
+      { probe: opts?.probe },
     );
     spawned = child;
     const spawnedAtMs = performance.now();
@@ -1042,16 +1043,18 @@ export const spawnLogin = async (
   const leased = spawnEnvLeased(env);
   let child: TSupervisedChild;
   try {
-    child = superviseSpawn(
-      sandboxSpawnArgs(argv, { probe: loginOpts?.probe }),
-      {
-        kind: "login",
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: spawnCwd(env),
-        env: leased.env,
-      },
+    child = withSandboxSpawn(
+      argv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "login",
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          cwd: spawnCwd(env),
+          env: leased.env,
+        }),
+      { probe: loginOpts?.probe },
     );
   } catch (error) {
     // Spawn never produced a child — the minted dir is ours to remove
@@ -1588,16 +1591,18 @@ export const spawnLoginPty = async (
     // was already gated to darwin/linux above. We POLL `tsFile` for
     // `opts.until`.
     const scriptArgv = ptyScriptArgv(argv, tsFile) ?? [...argv];
-    const child = superviseSpawn(
-      sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }),
-      {
-        kind: "login",
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-        cwd: spawnCwd(env),
-        env: leased.env,
-      },
+    const child = withSandboxSpawn(
+      scriptArgv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "login",
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          cwd: spawnCwd(env),
+          env: leased.env,
+        }),
+      { probe: opts?.probe },
     );
     const proc = child.subprocess;
     released = Promise.allSettled([proc.exited, child.whenReleased]);

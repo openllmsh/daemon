@@ -46,7 +46,7 @@ import { cliBin, cliConfigDir, cliEnv, cliRoot } from "../cli-paths";
 import { localCallerToken } from "../env";
 import { logDebug, logInfo, logWarn } from "../logger";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { fetchWithBoundedRedirects } from "../upstream-redirect";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
@@ -566,23 +566,25 @@ const captureInferenceRequest = async (
     // claude's identity capture runs the CLI's `exec`, which reads the isolated
     // keychain credential; unconfined on macOS for the keychain providers,
     // confined otherwise — `sandbox/policy.ts`.
-    const admittedArgv = sandboxSpawnArgs(spawnArgv, {
-      probe: unwrapKeychainSpawn(provider),
-    });
-    child = superviseSpawn(admittedArgv, {
-      kind: "vendor-capture",
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      cwd: tmpdir(),
-      env: {
-        ...captureChildEnv(provider, recorder.base),
-        // Added AFTER the allowlist (which strips OPENLLM_*): the per-boot
-        // local caller credential lets a vendor CLI component call this
-        // daemon's /v1 surface without the paired sk-llm key.
-        OPENLLM_LOCAL_TOKEN: localCallerToken(),
-      },
-    });
+    child = withSandboxSpawn(
+      spawnArgv,
+      (admittedArgv) =>
+        superviseSpawn(admittedArgv, {
+          kind: "vendor-capture",
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          cwd: tmpdir(),
+          env: {
+            ...captureChildEnv(provider, recorder.base),
+            // Added AFTER the allowlist (which strips OPENLLM_*): the per-boot
+            // local caller credential lets a vendor CLI component call this
+            // daemon's /v1 surface without the paired sk-llm key.
+            OPENLLM_LOCAL_TOKEN: localCallerToken(),
+          },
+        }),
+      { probe: unwrapKeychainSpawn(provider) },
+    );
     captured = await withTimeout(
       Promise.race([
         recorder.first,
