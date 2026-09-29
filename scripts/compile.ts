@@ -321,11 +321,10 @@ const buildOne = async (
 };
 
 /**
- * Windows qualification is native-only in Phase 2. `target === null` means
- * the all-target request (the release list — Windows is off for
- * 2.8.0-beta.1, so it passes on POSIX), while an array represents an
- * explicit subset. The `--host` path is checked separately by its host
- * platform.
+ * A null target selects the full release list, including Windows.
+ * The full release list must run on a native Windows host.
+ * An array selects an explicit subset.
+ * The `--host` path checks its host platform separately.
  */
 export const assertNativeWindowsBuild = (
   target: string | readonly string[] | null,
