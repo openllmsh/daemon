@@ -1295,7 +1295,26 @@ export const formatHopFailuresHeader = (
     })
     .join(";");
 
-const serveSubscription = async (
+/** The handrolled transport's upstream wire for `provider`, or `undefined`
+ *  when the provider has no manual (handrolled) transport at all (cursor,
+ *  muse). A read-only lookup over the same `UPSTREAM_WIRE` table
+ *  `serveSubscriptionHop` uses — never a second, duplicated map — so a
+ *  benchmark or diagnostic caller can determine handrolled-eligibility
+ *  without re-deriving the provider→wire mapping. */
+export const upstreamWireFor = (provider: string): TUpstreamWire | undefined =>
+  UPSTREAM_WIRE[provider];
+
+/**
+ * The walker's manual (handrolled) upstream-HTTP transport for one
+ * subscription hop — exported ONLY as a benchmark/diagnostic seam (see
+ * `scripts/bridge-capture-benchmark/`). Production call sites remain
+ * `serveSubscriptionHop`'s own internal calls above; this export changes no
+ * behavior, it just lets an external, read-only caller reuse the exact same
+ * `acquireUpstream` → `buildUpstreamRequest` → streaming/cleanup pipeline
+ * production handrolled dispatch already runs, rather than reimplementing
+ * headers/credential-acquisition/body-adaptation in a parallel script.
+ */
+export const serveSubscription = async (
   hop: THop,
   wire: TUpstreamWire,
   args: TWalkArgs,
