@@ -372,10 +372,15 @@ param([AllowEmptyString()][string] $Prerelease)
             if ($updated -cne $value) { $key.SetValue('Path', $updated, $kind); $key.Flush() }
         } finally { $key.Dispose() }
         $env:Path = Add-ManagedPathEntry $env:Path $Bin
-        # W integration: provide the bounded WM_SETTINGCHANGE helper in the daemon.
-        # Use SendMessageTimeoutW with Environment, 1000 ms, and SMTO_ABORTIFHUNG.
-        # Retain its process handle. Apply a 5-second limit and 2-second grace.
-        Write-Warning 'Environment notification is unavailable in this build. Sign out and sign in if a new shell cannot find openllm.'
+        try {
+            # .NET broadcasts WM_SETTINGCHANGE("Environment") for User writes.
+            # .NET uses SendMessageTimeout to bound the wait.
+            # Keep the PATH value kind. Use a temporary value for the broadcast.
+            try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', '1', 'User') }
+            finally { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'User') }
+        } catch {
+            Write-Warning 'Environment notification failed. The PATH was kept. Sign out and sign in if a new shell cannot find openllm.'
+        }
     }
 
     function Assert-ReplacementSupported {
