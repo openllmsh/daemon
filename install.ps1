@@ -363,6 +363,9 @@ param([AllowEmptyString()][string] $Prerelease)
 
     function Send-EnvironmentNotification {
         $childScript = @'
+# .NET uses SendMessageTimeout with flags 0 and a 1000 ms timeout.
+# It does not expose SMTO_ABORTIFHUNG or report a recipient timeout.
+# The parent treats a child deadline or a nonzero exit as failure.
 try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'User'); exit 0 } catch { exit 1 }
 '@
         $process = New-Object Diagnostics.Process
@@ -434,7 +437,9 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             if ($key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $updated -or $key.GetValueKind('Path') -ne $kind) { throw 'The user PATH write could not be verified.' }
             $env:Path = Add-ManagedPathEntry $env:Path $Bin
             if (-not (Send-EnvironmentNotification)) {
-                Write-Warning 'Environment notification did not complete. The install is complete. Open a new terminal to see the new PATH. Sign out and sign in if the command is still unavailable.'
+                Write-Warning 'Environment notification failed or exceeded the child deadline. The install is complete. Open a new terminal to see the new PATH. Windows does not report recipient timeouts through this API. Sign out and sign in if the command is still unavailable.'
+            } else {
+                Write-Host 'The environment notification request finished. Windows does not report recipient timeouts through this API. Sign out and sign in if a new terminal cannot find the command.'
             }
         } finally {
             try { $key.DeleteValue('OPENLLM_ENV_BROADCAST', $false) }
