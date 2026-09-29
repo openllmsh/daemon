@@ -33,7 +33,7 @@ import type {
 } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
@@ -172,6 +172,7 @@ class CodexAppServerClient {
     });
     this.child = child;
     const proc = child.subprocess;
+    await child.sandbox?.ready;
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -611,6 +612,7 @@ export const runCodexNative = async (
     }
     threadId = opened.thread.id;
   } catch (error) {
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       kind: "declined",
       reason: error instanceof Error ? error.message : String(error),

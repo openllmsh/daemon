@@ -53,7 +53,7 @@ import {
 import { Schema } from "effect";
 import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { daemonTempDir } from "../sandbox/working-set";
 import type { TNativeRunResult } from "./types";
@@ -350,8 +350,10 @@ export const runClaudeNative = async (
         env: cleanNativeSpawnEnv(params.env),
       },
     );
+    await child.sandbox?.ready;
   } catch (error) {
     removeSystemPromptFile();
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       kind: "declined",
       reason: `spawn failed: ${error instanceof Error ? error.message : String(error)}`,

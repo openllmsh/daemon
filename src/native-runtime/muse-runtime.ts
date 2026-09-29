@@ -70,7 +70,8 @@ import {
 } from "../delegation/muse";
 import { spawnCwd } from "../delegation/util";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
+import { linuxLaunchHandle } from "../sandbox/linux-adapter";
 import { DAEMON_VERSION } from "../version";
 import type {
   TMuseFoldedItem,
@@ -613,6 +614,7 @@ const wrapOfficialHost = async (
   }
   let spawned: Awaited<ReturnType<typeof handshake.initialize>>;
   try {
+    await linuxLaunchHandle([options.command, ...options.args])?.ready;
     spawned = await handshake.initialize({
       clientInfo: { name: "openllm_daemon", version: DAEMON_VERSION },
       capabilities: MUSE_CLIENT_CAPABILITIES,
@@ -757,6 +759,7 @@ const setupDecline = (
   error: unknown,
   signal: AbortSignal,
 ): TNativeRunResult => {
+  if (error instanceof SandboxLaunchError) throw error;
   if (signal.aborted) {
     return { kind: "declined", reason: "client aborted" };
   }

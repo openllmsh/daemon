@@ -35,7 +35,10 @@ import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
 import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
-import { sandboxUnavailableResponse } from "../sandbox/exec";
+import {
+  SandboxLaunchError,
+  sandboxUnavailableResponse,
+} from "../sandbox/exec";
 import { runClaudeNative } from "./claude-native";
 import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import { hasClientTools, tryServeNativeToolTurn } from "./claude-tool-serve";
@@ -285,7 +288,13 @@ export const tryServeNativeRuntime = async (
           "cursor ACP can't honor n>1 or logprobs (single un-scored message per turn)",
       };
     }
-    return serveCursorHop(params, overrides);
+    return serveCursorHop(params, overrides).catch(
+      (error: unknown): Response => {
+        if (error instanceof SandboxLaunchError)
+          return sandboxUnavailableResponse(error.code);
+        throw error;
+      },
+    );
   }
   if (params.provider === "muse") {
     // muse is BRIDGE-ONLY. Decline controls the native runtime cannot honor
@@ -304,7 +313,11 @@ export const tryServeNativeRuntime = async (
     if (unsupported !== null) {
       return { declined: `muse runtime can't honor ${unsupported}` };
     }
-    return serveMuseHop(params, overrides);
+    return serveMuseHop(params, overrides).catch((error: unknown): Response => {
+      if (error instanceof SandboxLaunchError)
+        return sandboxUnavailableResponse(error.code);
+      throw error;
+    });
   }
   // Generation controls the native runtimes can't honor (non-default
   // temperature/top_p/penalties, stop, seed, n, logprobs, logit_bias,
@@ -409,6 +422,8 @@ export const tryServeNativeRuntime = async (
           });
   } catch (error) {
     lease.abandon();
+    if (error instanceof SandboxLaunchError)
+      return sandboxUnavailableResponse(error.code);
     return {
       declined: error instanceof Error ? error.message : String(error),
     };
@@ -602,6 +617,8 @@ const serveMuseHop = async (
       signal: params.signal,
     });
   } catch (error) {
+    if (error instanceof SandboxLaunchError)
+      return sandboxUnavailableResponse(error.code);
     return { declined: error instanceof Error ? error.message : String(error) };
   }
   if (run.kind === "declined") {

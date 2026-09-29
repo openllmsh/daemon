@@ -56,7 +56,9 @@ import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { estimateBodyTokens } from "@openllmsh/wire/lib/canonical/token-estimate";
 import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logInfo, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
+import type { TLinuxLaunchHandle } from "../sandbox/linux-adapter";
+import { linuxLaunchHandle } from "../sandbox/linux-adapter";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
@@ -336,6 +338,7 @@ class AcpClient {
     }
   >();
   private readonly proc: ReturnType<typeof Bun.spawn>;
+  private readonly sandbox: TLinuxLaunchHandle | undefined;
   private readonly stdin: { write: (s: string) => void; flush?: () => void };
   private disposed = false;
   private cancelTimer: ReturnType<typeof setTimeout> | undefined;
@@ -355,17 +358,18 @@ class AcpClient {
     // The ACP bridge reads cursor's isolated macOS keychain credential;
     // securityd denies a Seatbelt-confined caller, so it runs unconfined on
     // macOS (confined on Linux) — `sandbox/policy.ts`.
-    this.proc = admittedSpawn(
-      sandboxSpawnArgs([bin, "acp"], { probe: unwrapKeychainSpawn("cursor") }),
-      {
-        stdin: "pipe",
-        stdout: "pipe",
-        // Native stderr is not a safe diagnostic channel (may contain secrets).
-        stderr: "ignore",
-        cwd: spawnCwd(env),
-        env: cleanNativeSpawnEnv(env),
-      },
-    );
+    const argv = sandboxSpawnArgs([bin, "acp"], {
+      probe: unwrapKeychainSpawn("cursor"),
+    });
+    this.sandbox = linuxLaunchHandle(argv);
+    this.proc = admittedSpawn(argv, {
+      stdin: "pipe",
+      stdout: "pipe",
+      // Native stderr is not a safe diagnostic channel (may contain secrets).
+      stderr: "ignore",
+      cwd: spawnCwd(env),
+      env: cleanNativeSpawnEnv(env),
+    });
     this.stdin = this.proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -380,11 +384,12 @@ class AcpClient {
     });
   }
 
-  request(
+  async request(
     method: string,
     params: unknown,
     timeoutMs: number = RPC_TIMEOUT_MS,
   ): Promise<unknown> {
+    await this.sandbox?.ready;
     this.rpcCounts[method] = (this.rpcCounts[method] ?? 0) + 1;
     const id = this.nextId++;
     return new Promise<unknown>((resolve, reject) => {
@@ -590,6 +595,7 @@ const setupDecline = (
   error: unknown,
   signal: AbortSignal,
 ): TNativeRunResult => {
+  if (error instanceof SandboxLaunchError) throw error;
   if (signal.aborted) {
     return { kind: "declined", reason: "client aborted" };
   }
@@ -1362,6 +1368,7 @@ export const runCursorNativeImage = async (
   ): Promise<TCursorNativeImageResult> => {
     client.dispose();
     await cleanupWorkspace();
+    if (error instanceof SandboxLaunchError) throw error;
     if (params.signal.aborted) {
       return { kind: "declined", reason: "client aborted" };
     }

@@ -50,7 +50,7 @@ import {
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { currentTickId } from "../op-context";
 import { childEnvironment } from "../sandbox/child-policy";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, sandboxSpawnArgs } from "../sandbox/exec";
 import {
   daemonTempDir,
   leaseDaemonTmpDirWithIdentity,
@@ -574,6 +574,7 @@ export const runCaptureResult = async (
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
+    await child.sandbox?.ready;
     // Tie the minted tmp dir to the real child — the lease upgrade is async
     // off the spawn path, and the exit watcher removes the dir outright when
     // the child dies (rework-7 / RG-2).
@@ -824,10 +825,11 @@ export const runCaptureResult = async (
       if (timer !== null) clearTimeout(timer);
       budget.release();
     }
-  } catch {
+  } catch (error) {
     // A throw after spawn (stdout read, budget setup) must not leave the
     // child running with its scratch dir deleted under it.
     if (spawned !== null) await spawned.terminate().catch(() => undefined);
+    if (error instanceof SandboxLaunchError) throw error;
     return { kind: "failed" };
   } finally {
     // Removes the dir only when no child was bound to it (setup or spawn
@@ -1066,6 +1068,7 @@ export const spawnLogin = async (
     return terminatePromise;
   };
   try {
+    await child.sandbox?.ready;
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
@@ -1451,8 +1454,9 @@ export const spawnLogin = async (
       whenReleased: child.whenReleased,
       ...stamp,
     };
-  } catch {
+  } catch (error) {
     const reap = await requestTerminate();
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       code: -1,
       output: "",
@@ -1594,6 +1598,7 @@ export const spawnLoginPty = async (
     );
     const proc = child.subprocess;
     released = Promise.allSettled([proc.exited, child.whenReleased]);
+    await child.sandbox?.ready;
     // Lease upgrade only — NOT the exit watcher: the typescript lives inside
     // the minted dir and is read once more after the child exits, so removal
     // must wait for the function's own cleanup (the finally below removes the
