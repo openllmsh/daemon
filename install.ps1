@@ -81,6 +81,7 @@ param([AllowEmptyString()][string] $Prerelease)
         $handler = New-Object Net.Http.HttpClientHandler
         $handler.AllowAutoRedirect = $false
         $client = New-Object Net.Http.HttpClient($handler)
+        $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
         $deadline = New-Object Threading.CancellationTokenSource
         $deadline.CancelAfter($Seconds * 1000)
         try {
