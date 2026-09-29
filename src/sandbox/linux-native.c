@@ -719,17 +719,7 @@ static int lease(struct record *r, int guardian, int init, int complete) {
   return 0;
 }
 /* Inspect each child before reaping. Adoption supplies the launch boundary. */
-static int reapChildren(int force, int target, int *result) {
-  char path[96];
-  snprintf(path, sizeof(path), "/proc/self/task/%d/children", getpid());
-  int children = open(path, CLOEXEC);
-  if (children < 0)
-    return -1;
-  void *stream = fdopen(children, "r");
-  if (!stream) {
-    close(children);
-    return -1;
-  }
+static int reapChildStream(void *stream, int force, int target, int *result) {
   int child;
   while (fscanf(stream, "%d", &child) == 1) {
     char start[32], check[32];
@@ -772,6 +762,19 @@ static int reapChildren(int force, int target, int *result) {
   if (got > 0 && got == target)
     *result = (status & 127) ? 128 + (status & 127) : (status >> 8) & 255;
   return got < 0 && ERR == 10 ? 1 : 0;
+}
+static int reapChildren(int force, int target, int *result) {
+  char path[96];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/children", getpid());
+  int children = open(path, CLOEXEC);
+  if (children < 0)
+    return -1;
+  void *stream = fdopen(children, "r");
+  if (!stream) {
+    close(children);
+    return -1;
+  }
+  return reapChildStream(stream, force, target, result);
 }
 static void cleanup(struct record *r, int guardian, int init, int initfd,
                     int monitorfd, int target, int *result) {
