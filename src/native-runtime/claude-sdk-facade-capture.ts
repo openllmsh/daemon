@@ -211,6 +211,9 @@ const runClaudeSdkFacadeCaptureCore = async (
     suppressReason:
       "claude sdk-facade capture: original external send suppressed; the facade builder never sees the true response",
   });
+  // Dispatch may reject before historical replay finishes. Observe it now;
+  // later awaits still see the original rejection and preserve ownership.
+  void dispatchPromise.catch(() => undefined);
 
   const replay = await replayClaudeSdkFacadeHistory({
     stdin,
