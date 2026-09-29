@@ -1046,10 +1046,12 @@ group_confirmed_gone=0
 group_id_proven=0
 # The vendor claim stays held until the entire observed process group has
 # ended. An uncertain group leaves the worker association for safe recovery.
-trap 'if [ "${group_observed:-0}" = 1 ] && [ -n "${pgid:-}" ] \
-  && ! kill -0 -- -"$pgid" 2>/dev/null; then
+trap 'if [ "${group_confirmed_gone:-0}" = 1 ] || { \
+  { [ "${group_observed:-0}" = 1 ] || [ "${group_id_proven:-0}" = 1 ]; } \
+  && [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null; }; then
   ( set -C; printf "release\n" > "$request" ) 2>/dev/null || true
   wait "$leasepid" 2>/dev/null || true
+  rm -f "$request" 2>/dev/null || true
 fi' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
@@ -1199,12 +1201,7 @@ fi
 OPENLLM_VENDOR_JOB
 )"
   local job_dir="$OPENLLM_DIR/cli-install"
-  local spec name cmd dest url pidfile job_log launchfile launch_age in_progress owner owner_pid owner_start owner_live owner_start_now self_start
-  # The vendor pidfile/launchfile records use the legacy `ps lstart` format
-  # — the detached job body writes its own record with inline `ps`, so the
-  # comparisons below must probe in that same format.
-  self_start="$(env_lock_legacy_start_identity "$$")"
-  [ -n "$self_start" ] || self_start="-"
+  local spec name cmd dest url pidfile job_log launchfile
   # Legacy residue is held for explicit doctor clearance by the native helper.
   for spec in "${specs[@]}"; do
     IFS='|' read -r name cmd dest url <<<"$spec"
