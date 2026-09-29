@@ -32,7 +32,8 @@ set -euo pipefail
 OPENLLM_DIR="$HOME/.openllm"
 BIN_DIR="$OPENLLM_DIR/bin"
 ENV_FILE="${OPENLLM_DAEMON_ENV_FILE:-$OPENLLM_DIR/.env}"
-DAEMON_PORT="${OPENLLM_DAEMON_PORT:-8787}"
+# DAEMON_PORT is resolved in preflight (env → existing env-file value → default),
+# once `env_file_value`/`die` are defined — see below.
 # `install` (default) is a first-time install; `update` is a manual full-product
 # rerun (`openllm update`). Update mode converges the verified binaries + config
 # but must NOT repeat first-install side effects: no vendor-CLI provisioning, no
@@ -93,6 +94,25 @@ env_file_value() {
   return 0
 }
 
+# Read one KEY's RAW value from the shared env file (first match wins) —
+# outer-whitespace trimmed only, no quote or comment stripping. Used only for
+# the port, whose protocol-compatible parsing (`normalize_daemon_port`) needs
+# the untouched value: whether a comment sits inside or outside the quotes
+# changes the correct strip order, so `env_file_value`'s single fixed order
+# (quotes always stripped first) cannot be reused here.
+env_file_raw_value() {
+  local wanted="$1" line key
+  [ -f "$ENV_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ""|\#*) continue ;; esac
+    key="${line%%=*}"
+    [ "$key" = "$wanted" ] || continue
+    trim_whitespace "${line#*=}"
+    return 0
+  done < "$ENV_FILE"
+  return 0
+}
+
 is_usable_api_key() {
   local key="$1"
   # Minted keys are `sk-llm-` + a 10-byte base64url id (14 chars) + `.` +
@@ -131,6 +151,57 @@ ORIGIN="${OPENLLM_CLOUD_ORIGIN:-}"
 ORIGIN="${ORIGIN%/}"
 has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
 [ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
+# Effective port — explicit env, else the port already persisted in the shared
+# env file, else the default. Mirrors the ORIGIN precedence above. A malformed
+# selected value falls back to the default rather than partially parsing.
+#
+# `normalize_daemon_port` mirrors packages/protocol/daemon-port.ts's
+# `parseOpenllmDaemonPort` byte-for-byte: strip an inline `# comment` and one
+# layer of quotes, in the order that depends on whether the comment sits
+# INSIDE or OUTSIDE the quotes (`"59321 # local"` vs `"59321" # local` vs a
+# bare `59321 # local`), then require a plain decimal in 1-65535. No eval, no
+# sourcing, no octal interpretation (a leading-zero string like `"08787"`
+# still parses as decimal here, matching `Number.parseInt(_, 10)`), and the
+# digit-count bound below keeps `[ ... -ge ... ]` from ever seeing a string
+# long enough to trip a shell integer-overflow diagnostic.
+normalize_daemon_port() {
+  local raw="$1" trimmed value decommented stripped
+  trimmed="$(trim_whitespace "$raw")"
+  if [[ "$trimmed" =~ ^\".*\"$ || "$trimmed" =~ ^\'.*\'$ ]] && [ "${#trimmed}" -ge 2 ]; then
+    value="${trimmed:1:${#trimmed}-2}"
+    if [[ "$value" =~ ^(.*)[[:space:]]#.*$ ]]; then
+      value="$(trim_whitespace "${BASH_REMATCH[1]}")"
+    fi
+  else
+    decommented="$trimmed"
+    if [[ "$trimmed" =~ ^(.*)[[:space:]]#.*$ ]]; then
+      decommented="$(trim_whitespace "${BASH_REMATCH[1]}")"
+    fi
+    if { [[ "$decommented" =~ ^\".*\"$ || "$decommented" =~ ^\'.*\'$ ]] && [ "${#decommented}" -ge 2 ]; }; then
+      value="${decommented:1:${#decommented}-2}"
+    else
+      value="$decommented"
+    fi
+  fi
+  stripped="$(trim_whitespace "$value")"
+  case "$stripped" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#stripped}" -le 7 ] || return 1
+  { [ "$stripped" -ge 1 ] && [ "$stripped" -le 65535 ]; } || return 1
+  printf '%s' "$stripped"
+}
+DAEMON_PORT="${OPENLLM_DAEMON_PORT:-}"
+if [ -n "$DAEMON_PORT" ]; then
+  NORMALIZED_PORT="$(normalize_daemon_port "$DAEMON_PORT")" && DAEMON_PORT="$NORMALIZED_PORT" || DAEMON_PORT=""
+fi
+if [ -z "$DAEMON_PORT" ]; then
+  RAW_PERSISTED_PORT="$(env_file_raw_value OPENLLM_DAEMON_PORT)"
+  if [ -n "$RAW_PERSISTED_PORT" ]; then
+    NORMALIZED_PORT="$(normalize_daemon_port "$RAW_PERSISTED_PORT")" && DAEMON_PORT="$NORMALIZED_PORT"
+  fi
+fi
+[ -n "$DAEMON_PORT" ] || DAEMON_PORT=8787
 case "$INSTALL_MODE" in
   install|update) ;;
   *) die "OPENLLM_INSTALL_MODE must be 'install' or 'update'" ;;

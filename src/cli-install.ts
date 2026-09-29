@@ -35,6 +35,7 @@ import {
 } from "./cli-paths";
 import { cliVersion } from "./delegation/util";
 import { logWarn, safeDiagnosticMessage } from "./logger";
+import { resolveManagerCandidate } from "./manager-resolution";
 
 export type TCliInstallState = {
   readonly installed: boolean;
@@ -162,19 +163,22 @@ const linkSidecars = (isolatedBin: string): void => {
  * Returns `true` when the link was re-pointed (the caller must then recompute the
  * binary signature, since the resolved target changed).
  */
-const reconcileIsolatedLink = async (
+/**
+ * Resolve the preferred host candidate through the manager-resolution
+ * coordinator. With zero adapters registered (default), this returns the
+ * first existing candidate unchanged — identical to the pre-coordinator
+ * behavior. A candidate recognized as a manager shim that cannot be
+ * resolved is treated as absent (never linked, never version-probed),
+ * rather than silently falling through to a lower-priority candidate.
+ */
+const resolveHostBinary = async (
   provider: TCliProvider,
-  bin: string,
-): Promise<boolean> => {
+): Promise<string | undefined> => {
   const host = hostCliCandidates(provider).find((c) => existsSync(c));
-  if (host === undefined) return false;
-  try {
-    if (realpathSync(bin) === realpathSync(host)) return false;
-  } catch {
-    // Broken link / unresolvable host — fall through to re-link defensively.
-  }
-  await linkIsolatedCli(provider, host);
-  return true;
+  if (host === undefined) return undefined;
+  const resolved = await resolveManagerCandidate(host);
+  if (resolved.kind === "unresolved") return undefined;
+  return resolved.target ?? undefined;
 };
 
 /**
@@ -247,16 +251,66 @@ const probeCliInstallState = async (
   const now = Date.now();
   const bin = cliBin(provider);
   if (!existsSync(bin)) {
-    const host = hostCliCandidates(provider).find((c) => existsSync(c));
+    const host = await resolveHostBinary(provider);
     if (host === undefined) {
       return { installed: false, version: null };
     }
     await linkIsolatedCli(provider, host);
+    cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
   } else {
+    // The isolated link's OWN immediate target (not the fully-resolved
+    // realpath — a resolved manager selection is a plain absolute path to a
+    // real binary, never itself a shim) may be a manager shim on the FIRST
+    // observation of a pre-existing link (no throttle entry yet — e.g. a
+    // daemon restart finding a link created by a prior process/version, or
+    // one hand-crafted before this resolution step existed). Check that
+    // unconditionally, before any TTL gating, so a link that points directly
+    // at an unresolvable shim can never be version-probed/delegated through
+    // unconfined — this is a cheap, synchronous, subprocess-free check
+    // (`recognizes`) unless the shim shape actually matches.
+    let immediateTarget: string | undefined;
+    try {
+      immediateTarget = readlinkSync(bin);
+    } catch {
+      immediateTarget = undefined;
+    }
+    if (immediateTarget !== undefined) {
+      const resolved = await resolveManagerCandidate(immediateTarget);
+      if (resolved.kind === "unresolved") {
+        // Recognized as a manager shim but it no longer resolves: fail
+        // closed rather than falling through to probe the shim unconfined.
+        cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+        return { installed: false, version: null };
+      }
+      if (
+        resolved.kind === "resolved" &&
+        resolved.target !== null &&
+        resolved.target !== immediateTarget
+      ) {
+        await linkIsolatedCli(provider, resolved.target);
+      }
+    }
+
+    // Separately, on a throttled cadence, re-derive the PREFERRED host
+    // candidate (`hostCliCandidates()` precedence) in case a higher-priority
+    // path newly exists (e.g. a vendor update relocated the binary). Best
+    // effort: if no preferred candidate is currently discoverable, the
+    // existing (already shim-checked above) link is left as-is rather than
+    // treated as absent — a transient PATH/candidate change must not evict a
+    // link that is otherwise known-good.
     const until = cliInstallReconcileUntil.get(provider);
-    if (until !== undefined && until <= now) {
-      await reconcileIsolatedLink(provider, bin);
+    if (until === undefined || until <= now) {
       cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+      const host = await resolveHostBinary(provider);
+      if (host !== undefined) {
+        try {
+          if (realpathSync(bin) !== realpathSync(host)) {
+            await linkIsolatedCli(provider, host);
+          }
+        } catch {
+          await linkIsolatedCli(provider, host);
+        }
+      }
     }
   }
   if (!existsSync(bin)) {
