@@ -2,7 +2,14 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { SandboxLaunchError } from "./exec";
 
+export type TLinuxLaunchOutcome =
+  | { readonly kind: "setup_rejected"; readonly code: 78 }
+  | { readonly kind: "exec_failed"; readonly code: 127 }
+  | { readonly kind: "exited"; readonly code: number }
+  | { readonly kind: "owner_lost"; readonly code: null };
+
 export type TLinuxLaunchHandle = {
+  readonly completion: Promise<TLinuxLaunchOutcome>;
   readonly ready: Promise<void>;
   readonly cleanup: Promise<void>;
   readonly signal: (signal: 1 | 2 | 9 | 15) => void;
@@ -42,6 +49,10 @@ export const prepareLinuxLaunch = (): string[] => {
   let resolveReady: () => void = () => {};
   let rejectReady: (error: Error) => void = () => {};
   let resolveCleanup: () => void = () => {};
+  let resolveCompletion: (outcome: TLinuxLaunchOutcome) => void = () => {};
+  const completion = new Promise<TLinuxLaunchOutcome>((resolve) => {
+    resolveCompletion = resolve;
+  });
   const ready = new Promise<void>((resolve, reject) => {
     resolveReady = resolve;
     rejectReady = reject;
@@ -62,6 +73,9 @@ export const prepareLinuxLaunch = (): string[] => {
   let leasePath = "";
   let launchId = "";
   let lostOuter = false;
+  let execFailed = false;
+  let exitCode: number | null = null;
+  const status = new Int32Array(1);
   const deadline = performance.now() + 10000;
   const finish = (): void => {
     clearInterval(timer);
@@ -71,6 +85,15 @@ export const prepareLinuxLaunch = (): string[] => {
     if (ownerFd >= 0) native.sandboxClose(ownerFd);
     launches.delete(name);
     resolveCleanup();
+    resolveCompletion(
+      !registered
+        ? { kind: "setup_rejected", code: 78 }
+        : execFailed
+          ? { kind: "exec_failed", code: 127 }
+          : exitCode === null
+            ? { kind: "owner_lost", code: null }
+            : { kind: "exited", code: exitCode },
+    );
   };
   const fail = (): void => {
     recordLinuxSandboxRejection("SETUP_FAILED");
@@ -146,8 +169,16 @@ export const prepareLinuxLaunch = (): string[] => {
       }
     } else {
       if (!completed && !lostOuter) {
-        const result = native.sandboxCompletion(socket, out[0] as number);
-        if (result === 1) completed = true;
+        const result = native.sandboxCompletion(
+          socket,
+          out[0] as number,
+          ptr(status),
+        );
+        if (result === 1) {
+          completed = true;
+          exitCode = status[0] ?? null;
+        }
+        if (result === 2) execFailed = true;
         if (result < 0) {
           lostOuter = true;
           signal(9);
@@ -172,7 +203,7 @@ export const prepareLinuxLaunch = (): string[] => {
     }
   }, 10);
   timer.unref();
-  launches.set(name, { ready, cleanup, signal });
+  launches.set(name, { ready, cleanup, signal, completion });
   return ["--sandbox-control", name];
 };
 

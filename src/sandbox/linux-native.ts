@@ -20,7 +20,10 @@ const symbols = {
   sandboxDescriptorsExited: { args: [FFIType.ptr], returns: FFIType.i32 },
   sandboxSignal: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
   sandboxClose: { args: [FFIType.i32], returns: FFIType.i32 },
-  sandboxCompletion: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  sandboxCompletion: {
+    args: [FFIType.i32, FFIType.i32, FFIType.ptr],
+    returns: FFIType.i32,
+  },
 } as const;
 
 type TNative = ReturnType<typeof cc<typeof symbols>>["symbols"];

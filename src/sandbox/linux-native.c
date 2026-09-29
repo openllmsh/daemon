@@ -8,6 +8,7 @@ extern int *__errno_location(void);
 extern int open(const char *, int, ...);
 extern int close(int);
 extern long read(int, void *, usize);
+extern long recv(int, void *, usize, int);
 extern long write(int, const void *, usize);
 extern long pread(int, void *, usize, long);
 extern long lseek(int, long, int);
@@ -1290,12 +1291,12 @@ int sandboxOuter(char *data, unsigned int length) {
   int guardfd = pidfd(guard), monitorfd = -1, initfd = -1, vendorfd = -1,
       monitor = 0, init = 0, vendor = 0;
   int tracked = 0, identified = 0, enforced = 0, armed = 0, committed = 0,
-      complete = 0, result = 78, failed = 0;
+      complete = 0, result = 78, failed = 0, execClosed = 0;
   long setup = now() + DEADLINE, cancel = 0;
   if (guardfd < 0)
     failed = 1;
-  while (!failed && !complete) {
-    if (!alive(guardfd)) {
+  while (!failed && (!complete || !execClosed)) {
+    if (!complete && !alive(guardfd)) {
       struct pollfd queued = {control[0], 1, 0};
       int queuedResult = poll(&queued, 1, 0);
       if (queuedResult < 0 && ERR == 4)
@@ -1325,7 +1326,8 @@ int sandboxOuter(char *data, unsigned int length) {
       failed = 1;
       break;
     }
-    struct pollfd p[2] = {{control[0], 1, 0}, {helperControl[0], 1, 0}};
+    struct pollfd p[2] = {{control[0], 1, 0},
+                          {execClosed ? -1 : helperControl[0], 1, 0}};
     poll(p, 2, 10);
     if (p[0].revents) {
       struct message m;
@@ -1412,6 +1414,30 @@ int sandboxOuter(char *data, unsigned int length) {
         break;
       }
     }
+    if (committed && !execClosed && p[1].revents) {
+      char peek;
+      long available = recv(helperControl[0], &peek, 1, 2 | 0x40);
+      if (available == 0) {
+        execClosed = 1;
+      } else if (available > 0) {
+        struct message m;
+        struct cred c;
+        int got = receive(helperControl[0], &r, &m, 0, 0, &c);
+        if (got == 0)
+          continue;
+        if (got != 1 || c.pid != vendor || m.stage != EXEC_ERROR ||
+            m.value != 127 ||
+            (daemonSocket >= 0 &&
+             sendRecord(daemonSocket, &r, EXEC_ERROR, 127, vendor, 0, 0))) {
+          failed = 1;
+          break;
+        }
+        execClosed = 1;
+      } else if (ERR != 11 && ERR != 4) {
+        failed = 1;
+        break;
+      }
+    }
   }
   close(helperControl[0]);
   close(control[0]);
@@ -1455,7 +1481,6 @@ extern int bind(int, const void *, unsigned int);
 extern int listen(int, int);
 extern int connect(int, const void *, unsigned int);
 extern int accept4(int, void *, unsigned int *, int);
-extern long recv(int, void *, usize, int);
 static int address(struct address *a, const char *name) {
   usize n = strlen(name);
   if (n < 16 || n > 100)
@@ -1602,7 +1627,7 @@ int sandboxDescriptorsExited(int *fds) {
 }
 int sandboxSignal(int fd, int value) { return signalPid(fd, value); }
 int sandboxClose(int fd) { return close(fd); }
-int sandboxCompletion(int socket, int outer) {
+int sandboxCompletion(int socket, int outer, int *status) {
   struct message peek;
   long n = recv(socket, &peek, sizeof(peek), 2 | 0x40);
   if (n < 0 && (ERR == 11 || ERR == 4))
@@ -1616,5 +1641,13 @@ int sandboxCompletion(int socket, int outer) {
   struct message m;
   struct cred c;
   int got = receive(socket, &r, &m, 0, 0, &c);
-  return got == 1 && c.pid == outer && m.stage == COMPLETE ? 1 : -1;
+  if (got == 0)
+    return 0;
+  if (got != 1 || c.pid != outer)
+    return -1;
+  if (m.stage == COMPLETE && m.value >= 0 && m.value <= 255) {
+    *status = m.value;
+    return 1;
+  }
+  return m.stage == EXEC_ERROR && m.value == 127 ? 2 : -1;
 }
