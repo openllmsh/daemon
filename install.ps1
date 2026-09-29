@@ -273,6 +273,12 @@ param([AllowEmptyString()][string] $Prerelease)
         Unblock-File -LiteralPath $Output -ErrorAction Stop
     }
 
+    function Get-VersionPattern {
+        $number = '(?:0|[1-9][0-9]*)'
+        $identifier = '(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+        return $number + '\.' + $number + '\.' + $number + '(?:-' + $identifier + '(?:\.' + $identifier + ')*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
+    }
+
     function Get-ImageVersion {
         param([string] $Path)
         $process = New-Object Diagnostics.Process
@@ -296,9 +302,7 @@ param([AllowEmptyString()][string] $Prerelease)
             if (-not $stdout.Wait(2000) -or -not $stderr.Wait(2000)) { throw "Version probe output did not close: $Path" }
             if ($process.ExitCode -ne 0) { throw "Version probe failed: $Path (exit $($process.ExitCode))" }
             $output = $stdout.Result.Trim()
-            $number = '(?:0|[1-9][0-9]*)'
-            $identifier = '(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
-            $grammar = '^(?:openllmd? v)?(?<version>' + $number + '\.' + $number + '\.' + $number + '(?:-' + $identifier + '(?:\.' + $identifier + ')*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)\z'
+            $grammar = '^(?:openllmd? v)?(?<version>' + (Get-VersionPattern) + ')\z'
             if ($output -cnotmatch $grammar) { throw "Invalid executable version: $Path" }
             return $Matches['version']
         } finally { $process.Dispose() }
@@ -306,10 +310,14 @@ param([AllowEmptyString()][string] $Prerelease)
 
     function Compare-Version {
         param([string] $Left, [string] $Right)
-        $leftParts = $Left.Split('+')[0].Split(@([char]'-'), 2)
-        $rightParts = $Right.Split('+')[0].Split(@([char]'-'), 2)
-        $leftCore = $leftParts[0].Split('.')
-        $rightCore = $rightParts[0].Split('.')
+        $grammar = '^' + (Get-VersionPattern) + '\z'
+        foreach ($value in @($Left, $Right)) {
+            if ($value -cnotmatch $grammar) { throw "Invalid version: $value" }
+        }
+        $leftParts = @(@($Left.Split('+'))[0].Split(@([char]'-'), 2))
+        $rightParts = @(@($Right.Split('+'))[0].Split(@([char]'-'), 2))
+        $leftCore = @($leftParts[0].Split('.'))
+        $rightCore = @($rightParts[0].Split('.'))
         function Compare-Number {
             param([string] $A, [string] $B)
             if ($A.Length -ne $B.Length) { return [Math]::Sign($A.Length - $B.Length) }
@@ -321,8 +329,8 @@ param([AllowEmptyString()][string] $Prerelease)
         }
         if ($leftParts.Count -ne $rightParts.Count) { return [Math]::Sign($rightParts.Count - $leftParts.Count) }
         if ($leftParts.Count -eq 1) { return 0 }
-        $a = $leftParts[1].Split('.')
-        $b = $rightParts[1].Split('.')
+        $a = @($leftParts[1].Split('.'))
+        $b = @($rightParts[1].Split('.'))
         for ($i = 0; $i -lt [Math]::Max($a.Count, $b.Count); $i++) {
             if ($i -ge $a.Count) { return -1 }
             if ($i -ge $b.Count) { return 1 }
