@@ -1148,11 +1148,9 @@ else
     pgid="$leader"
   fi
   [ -n "$pgid" ] && group_observed=1
-  # Leader already dead AND no group with that id — the tree is PROVEN gone
-  # (a dead leader with surviving children would still answer the group
-  # probe). The EXIT trap can then drop the pidfile instead of leaving a
-  # dead record a re-run has to reap.
-  if [ -z "$pgid" ] && ! kill -0 "$leader" 2>/dev/null; then
+  # Check the group again after the leader ends. A child can still run.
+  # Release the lease only when both checks show no process.
+  if [ -z "$pgid" ] && ! kill -0 "$leader" 2>/dev/null && ! kill -0 -- -"$leader" 2>/dev/null; then
     group_confirmed_gone=1
   fi
   # Still unverified: signal the leader alone and leave pgid empty, so the
