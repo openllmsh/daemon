@@ -99,15 +99,6 @@ let bubblewrapFailure: LinuxSandboxError | undefined;
 export const qualifiedBubblewrapVersion = (): string | null =>
   bubblewrap?.version ?? null;
 
-/** Mount the private /tmp before restoring writable paths below it. */
-export const linuxWritableMountArguments = (
-  paths: readonly string[],
-): string[] => [
-  "--tmpfs",
-  "/tmp",
-  ...paths.flatMap((path) => ["--bind", path, path]),
-];
-
 /** Version 0.5.0 adds --clearenv. The other required flags predate it. */
 const checkBubblewrap = (): { path: string; version: string } => {
   const path = ["/usr/bin/bwrap", "/bin/bwrap"].find(existsSync);
@@ -295,7 +286,9 @@ export const buildChildPolicy = (
       ...(hooks?.fault === "planned_alias"
         ? ["--ro-bind", "/proc", hooks.barrier]
         : []),
-      ...linuxWritableMountArguments(rw),
+      "--tmpfs",
+      "/tmp",
+      ...rw.flatMap((path) => ["--bind", path, path]),
       "--proc",
       "/proc",
       "--tmpfs",
