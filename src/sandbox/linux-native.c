@@ -793,6 +793,8 @@ static void cleanup(struct record *r, int guardian, int init, int initfd,
       fullWrite(2, s, strlen(s));
       reported = 1;
     }
+    if (reported && done < 0)
+      return;
     poll(0, 0, reported ? 100 : 20);
   }
   lease(r, guardian, init, 1);
