@@ -47,7 +47,7 @@ export type TSupervisedChild = {
   readonly pgid: number;
   readonly terminate: (opts?: TTerminateOptions) => Promise<TReapOutcome>;
   readonly beginTask: () => () => void;
-  /** Settles when tracking is dropped (confirmed exit). Pending while unconfirmed. */
+  /** Settle when tracking ends. Report sandbox cleanup failures explicitly. */
   readonly whenReleased: Promise<TReapOutcome>;
 };
 
@@ -258,18 +258,38 @@ const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
   }
 };
 
+const releaseSandboxChild = (
+  tracked: TTrackedChild,
+  cleanup: "confirmed" | "unconfirmed",
+  confirmedOutcome: "exited" | "terminated",
+): TReapOutcome => {
+  const outcome =
+    cleanup === "confirmed" ? confirmedOutcome : "reap_unconfirmed";
+  if (cleanup === "unconfirmed") {
+    logWarn(
+      "child-supervisor",
+      safeDiagnosticMessage`sandbox cleanup is unconfirmed`,
+      {
+        pid: tracked.handle.pid,
+        pgid: tracked.handle.pgid,
+      },
+    );
+  }
+  releaseChild(tracked, outcome);
+  return outcome;
+};
+
 const finishTrackedChild = async (
   tracked: TTrackedChild,
 ): Promise<TReapOutcome> => {
+  if (tracked.handle.sandbox) {
+    const result = await tracked.handle.sandbox.cleanup;
+    return releaseSandboxChild(tracked, result.cleanup, "exited");
+  }
   try {
     await waitChildExited(tracked.handle);
   } catch {
     // Natural-exit waiter; terminate() owns cleanup if it already started.
-  }
-  if (tracked.handle.sandbox) {
-    await tracked.handle.sandbox.cleanup;
-    releaseChild(tracked, "exited");
-    return "exited";
   }
   if (tracked.terminating !== null) {
     const outcome = await tracked.terminating;
@@ -309,7 +329,9 @@ const terminateTrackedChild = (
       if (first !== "exited") launch.signal(9);
       let timer: ReturnType<typeof setTimeout> | undefined;
       const outcome = await Promise.race([
-        launch.cleanup.then(() => "terminated" as const),
+        launch.cleanup.then((result) =>
+          releaseSandboxChild(tracked, result.cleanup, "terminated"),
+        ),
         new Promise<"reap_unconfirmed">((resolve) => {
           timer = setTimeout(
             () => resolve("reap_unconfirmed"),

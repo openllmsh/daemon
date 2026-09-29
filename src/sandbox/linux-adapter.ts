@@ -20,10 +20,14 @@ export type TLinuxLaunchOutcome =
   | { readonly kind: "reap_unconfirmed"; readonly code: null }
   | { readonly kind: "owner_lost"; readonly code: null };
 
+export type TLinuxCleanupResult = {
+  readonly cleanup: "confirmed" | "unconfirmed";
+};
+
 export type TLinuxLaunchHandle = {
   readonly completion: Promise<TLinuxLaunchOutcome>;
   readonly ready: Promise<void>;
-  readonly cleanup: Promise<void>;
+  readonly cleanup: Promise<TLinuxCleanupResult>;
   readonly signal: (signal: 1 | 2 | 9 | 15) => void;
 };
 const launches = new Map<string, TLinuxLaunchHandle>();
@@ -76,7 +80,7 @@ export const prepareLinuxLaunch = (): string[] => {
   }
   let resolveReady: () => void = () => {};
   let rejectReady: (error: Error) => void = () => {};
-  let resolveCleanup: () => void = () => {};
+  let resolveCleanup: (result: TLinuxCleanupResult) => void = () => {};
   let resolveCompletion: (outcome: TLinuxLaunchOutcome) => void = () => {};
   const completion = new Promise<TLinuxLaunchOutcome>((resolve) => {
     resolveCompletion = resolve;
@@ -86,12 +90,11 @@ export const prepareLinuxLaunch = (): string[] => {
     rejectReady = reject;
   });
   void ready.catch(() => {});
-  const cleanup = new Promise<void>((resolve) => {
+  const cleanup = new Promise<TLinuxCleanupResult>((resolve) => {
     resolveCleanup = resolve;
   });
   let socket = -1;
   let registered = false;
-  let readySettled = false;
   let completed = false;
   const out = new Int32Array(8);
   let ownerFd = -1;
@@ -108,7 +111,8 @@ export const prepareLinuxLaunch = (): string[] => {
   const status = new Int32Array(1);
   const deadline = performance.now() + 10000;
   let cleanupDeadline = Number.POSITIVE_INFINITY;
-  let stopped = false;
+  let state: "pending" | "ready" | "rejected" | "finished" = "pending";
+  const stopped = (): boolean => state === "finished";
   let readiness: ReadStream | undefined;
   let readinessFd = -1;
   const cancelWait = (): void => {
@@ -119,16 +123,42 @@ export const prepareLinuxLaunch = (): string[] => {
   };
   let leaseWatcher: FSWatcher | undefined;
   let leaseWatchAttempted = false;
-  const rejectPendingReady = (): void => {
-    if (readySettled) return;
-    readySettled = true;
-    rejectReady(
-      new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux setup rejected"),
-    );
+  /*
+   * Settle all launch promises through this table. Ignore late events.
+   * Event       | Pending ready | Ready or rejected | Completion | Cleanup
+   * ready       | resolve       | no change         | pending    | pending
+   * reject      | reject        | no change         | pending    | pending
+   * finish true | reject        | no change         | outcome    | confirmed
+   * finish false| reject        | no change         | unconfirmed| unconfirmed
+   * finished    | no change     | no change         | no change  | no change
+   */
+  const settle = (
+    event: "ready" | "reject" | "finish",
+    outcome?: TLinuxLaunchOutcome,
+  ): void => {
+    if (stopped()) return;
+    if (state === "pending") {
+      if (event === "ready") {
+        state = "ready";
+        resolveReady();
+      } else {
+        state = "rejected";
+        rejectReady(
+          new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux setup rejected"),
+        );
+      }
+    }
+    if (event === "finish" && outcome) {
+      state = "finished";
+      resolveCleanup({
+        cleanup:
+          outcome.kind === "reap_unconfirmed" ? "unconfirmed" : "confirmed",
+      });
+      resolveCompletion(outcome);
+    }
   };
   const finish = (confirmed: boolean = true): void => {
-    if (stopped) return;
-    stopped = true;
+    if (stopped()) return;
     cancelWait();
     leaseWatcher?.close();
     native.sandboxClose(listener);
@@ -137,7 +167,6 @@ export const prepareLinuxLaunch = (): string[] => {
     if (registered) for (const fd of fds) native.sandboxClose(fd);
     if (ownerFd >= 0) native.sandboxClose(ownerFd);
     launches.delete(name);
-    rejectPendingReady();
     const outcome: TLinuxLaunchOutcome = !confirmed
       ? { kind: "reap_unconfirmed", code: null }
       : rejected || !registered
@@ -147,12 +176,11 @@ export const prepareLinuxLaunch = (): string[] => {
           : exitCode === null
             ? { kind: "owner_lost", code: null }
             : { kind: "exited", code: exitCode };
-    if (confirmed) resolveCleanup();
-    resolveCompletion(outcome);
+    settle("finish", outcome);
   };
   const fail = (): void => {
     recordLinuxSandboxRejection("SETUP_FAILED");
-    rejectPendingReady();
+    settle("reject");
     if (!admitted) finish();
     else {
       rejected = true;
@@ -162,7 +190,7 @@ export const prepareLinuxLaunch = (): string[] => {
     }
   };
   const signal = (value: 1 | 2 | 9 | 15): void => {
-    if (stopped) return;
+    if (stopped()) return;
     if (registered)
       cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
     queueMicrotask(drive);
@@ -261,8 +289,7 @@ export const prepareLinuxLaunch = (): string[] => {
         registered = true;
         leasePath = ownership.subarray(0, ownership.indexOf(0)).toString();
         launchId = ownership.subarray(4096, 4160).toString();
-        readySettled = true;
-        resolveReady();
+        settle("ready");
         if (pendingSignal) signal(pendingSignal as 1 | 2 | 9 | 15);
       } else if (result === 2) {
         admitted = true;
@@ -307,10 +334,10 @@ export const prepareLinuxLaunch = (): string[] => {
     }
   };
   const drive = (): void => {
-    if (stopped) return;
+    if (stopped()) return;
     cancelWait();
     step();
-    if (stopped) return;
+    if (stopped()) return;
     if (leasePath && !leaseWatchAttempted) {
       leaseWatchAttempted = true;
       try {
@@ -329,7 +356,7 @@ export const prepareLinuxLaunch = (): string[] => {
         fail();
       }
     }
-    if (stopped) return;
+    if (stopped()) return;
     const targets: number[] = [];
     if (!rejected && !lostOuter && !completed)
       targets.push(socket < 0 ? listener : socket);
@@ -358,7 +385,7 @@ export const prepareLinuxLaunch = (): string[] => {
     readiness = createReadStream("", { fd, autoClose: true, highWaterMark: 1 });
     readiness.once("data", drive);
     readiness.once("error", () => {
-      if (!stopped) {
+      if (!stopped()) {
         fail();
         drive();
       }
