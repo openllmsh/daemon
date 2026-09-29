@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import type { TCliProvider } from "../cli-paths";
 import { CLI_PROVIDERS, cliHome } from "../cli-paths";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { DAEMON_VERSION } from "../version";
@@ -26,6 +27,12 @@ export const LINUX_SETUP_ENV = {
   LC_ALL: "C",
   PWD: "/",
 } as const;
+
+const LINUX_VENDOR_ENV_ALLOWLIST: Readonly<
+  Partial<Record<TCliProvider, ReadonlySet<string>>>
+> = {
+  chatgpt: new Set(["OPENAI_BASE_URL"]),
+};
 
 export type TLinuxSandboxReason =
   | "READY"
@@ -203,7 +210,10 @@ export const linuxVendorEnvironment = (
   if (provider) {
     const { captureChildEnv } =
       require("../delegation/auth-config") as typeof import("../delegation/auth-config");
-    for (const key of Object.keys(captureChildEnv(provider, ""))) {
+    const approvedKeys = new Set(Object.keys(captureChildEnv(provider, "")));
+    for (const key of LINUX_VENDOR_ENV_ALLOWLIST[provider] ?? [])
+      approvedKeys.add(key);
+    for (const key of approvedKeys) {
       const value = process.env[key];
       if (value !== undefined) overlay[key] = value;
     }
