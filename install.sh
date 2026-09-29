@@ -1701,17 +1701,13 @@ prerelease_cleanup() {
         "$BIN_DIR"/.openllm.pr-dl.$$ "$BIN_DIR"/.openllm.pr-bin.$$ \
         "$BIN_DIR"/.openllm.pr-staged.$$
 }
-# Commit bookkeeping: PR_ASIDE lists components whose installed file was moved
-# to a .pr-old backup, PR_PLACED those whose staged file landed. The commit
-# helpers RETURN failure — never die() — so this abort path always runs.
+# PR_ASIDE lists saved binaries. PR_PLACED lists installed replacements.
+# Commit helpers return failure so the caller can restore the saved binaries.
 PR_ASIDE=""
 PR_PLACED=""
 prerelease_abort() {
   local name
-  # Put back every binary that was set aside. For a component already placed
-  # this rolls back the swap; for a place that failed mid-move it recovers
-  # the old file. A half-swapped pair is the failure this prevents. A backup
-  # that cannot be restored is left in place (never deleted) and reported.
+  # Restore the saved binaries. Keep a backup if its restore fails.
   for name in $PR_ASIDE; do
     mv -f "$BIN_DIR/.$name.pr-old.$$" "$BIN_DIR/$name" 2>/dev/null \
       || echo "Error: rollback failed — the previous $name is still at $BIN_DIR/.$name.pr-old.$$" >&2
@@ -1820,17 +1816,16 @@ prerelease_commit_check() {
   return 0
 }
 
-# Move one verified staged file into place. The installed binary is first
-# renamed to a same-filesystem .pr-old backup so prerelease_abort can restore
-# it if this component's — or the other component's — place fails.
+# Save a hard link to the old binary. Rename the new binary over the old path.
+# A crash before or after the rename leaves the canonical path in place.
 prerelease_commit_place() {
   local name="$1"
   local staged="$BIN_DIR/.$name.pr-staged.$$" dest="$BIN_DIR/$name"
   local backup="$BIN_DIR/.$name.pr-old.$$"
   [ -f "$staged" ] || return 0
   if [ -e "$dest" ] || [ -L "$dest" ]; then
-    if ! mv -f "$dest" "$backup" 2>/dev/null; then
-      echo "Error: could not move $dest aside — refusing to replace it" >&2
+    if ! ln "$dest" "$backup" 2>/dev/null; then
+      echo "Error: could not back up $dest — refusing to replace it" >&2
       return 1
     fi
     PR_ASIDE="$PR_ASIDE $name"
@@ -1845,6 +1840,9 @@ prerelease_commit_place() {
 }
 
 if [ -n "$PRERELEASE_TAG" ]; then
+  trap prerelease_abort EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   prerelease_stage openllmd "$PRE_SHA_DAEMON" \
     "$(prerelease_asset_url openllmsh/daemon "openllmd-$TARGET.gz")" "$DAEMON_VERSION" \
     || prerelease_abort
@@ -1856,7 +1854,8 @@ if [ -n "$PRERELEASE_TAG" ]; then
   prerelease_commit_check openllm "$CLI_VERSION" || prerelease_abort
   prerelease_commit_place openllmd || prerelease_abort
   prerelease_commit_place openllm || prerelease_abort
-  # Both renames landed — the set-aside backups are no longer needed.
+  trap - EXIT INT TERM
+  # Both renames succeeded. Remove the backups.
   rm -f "$BIN_DIR"/.openllmd.pr-old.$$ "$BIN_DIR"/.openllm.pr-old.$$
 else
   install_component openllmd api/daemon/binary "$DAEMON_VERSION" "$FROM_FILE" "$FROM_SHA"
