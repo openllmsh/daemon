@@ -841,7 +841,7 @@ static int namespaceFilter(void) {
   B(0x06, 0, 0, 0x50026);
   B(0x15, 0, 3, NR_CLONE);
   B(0x20, 0, 0, 16);
-  B(0x45, 0, 1, 0x7e020000);
+  B(0x45, 0, 1, 0x7e020080);
   B(0x06, 0, 0, 0x50001);
   B(0x06, 0, 0, 0x7fff0000);
 #undef B
