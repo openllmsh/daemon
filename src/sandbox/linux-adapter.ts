@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { SandboxLaunchError } from "./exec";
 
 export type TLinuxLaunchOutcome =
@@ -121,8 +121,39 @@ export const prepareLinuxLaunch = (): string[] => {
   const timer = setInterval(() => {
     if (rejected) {
       try {
-        const lease: unknown = JSON.parse(readFileSync(leasePath, "utf8"));
         const owner = new Int32Array([ownerFd, ownerFd, ownerFd]);
+        if (native.sandboxDescriptorsExited(ptr(owner))) {
+          const lock = native.sandboxLeaseLock(
+            ptr(Buffer.from(`${leasePath}\0`)),
+            0,
+          );
+          if (lock >= 0) {
+            try {
+              const lease: unknown = JSON.parse(
+                readFileSync(leasePath, "utf8"),
+              );
+              if (
+                typeof lease === "object" &&
+                lease !== null &&
+                "launchId" in lease &&
+                lease.launchId === launchId &&
+                "guardianPid" in lease &&
+                lease.guardianPid === 0
+              ) {
+                const temp = `${leasePath}.recover`;
+                writeFileSync(
+                  temp,
+                  JSON.stringify({ ...lease, cleanupComplete: true }),
+                  { mode: 0o600 },
+                );
+                renameSync(temp, leasePath);
+              }
+            } finally {
+              native.sandboxClose(lock);
+            }
+          }
+        }
+        const lease: unknown = JSON.parse(readFileSync(leasePath, "utf8"));
         if (
           typeof lease === "object" &&
           lease !== null &&

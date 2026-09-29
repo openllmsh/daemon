@@ -41,6 +41,8 @@ extern int setsockopt(int, int, int, const void *, unsigned int);
 extern int pipe2(int *, int);
 extern int rename(const char *, const char *);
 extern int fsync(int);
+extern int flock(int, int);
+extern int unlink(const char *);
 extern long readlink(const char *, char *, usize);
 extern long getxattr(const char *, const char *, void *, usize);
 extern int posix_spawn(int *, const char *, const void *, const void *,
@@ -659,6 +661,27 @@ static int pollSignal(int fd) {
   int value = 0;
   return read(fd, &value, sizeof(value)) == sizeof(value) ? value : 0;
 }
+static int leaseLockPath(const char *path, char *lock) {
+  const char *name = strrchr(path, '/');
+  if (!name || strlen(path) > 4000 || name - path < 15 ||
+      strncmp(name - 15, "/sandbox-leases", 15) ||
+      strlen(name) < 6 || strcmp(name + strlen(name) - 5, ".json"))
+    return -1;
+  snprintf(lock, 4096, "%.*s/tmp/%.*s/.owner-lock", (int)(name - path - 15), path,
+           (int)strlen(name) - 6, name + 1);
+  return 0;
+}
+int sandboxLeaseLock(const char *path, int create) {
+  char lock[4096];
+  if (leaseLockPath(path, lock))
+    return -1;
+  int fd = open(lock, 2 | CLOEXEC | (create ? 64 : 0), 0600);
+  if (fd >= 0 && flock(fd, 2 | 4)) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
 static int lease(struct record *r, int guardian, int init, int complete) {
   char temp[4096], body[1024];
   if (strlen(r->lease) > 4000)
@@ -683,7 +706,13 @@ static int lease(struct record *r, int guardian, int init, int complete) {
   close(fd);
   if (rc)
     return -1;
-  return rename(temp, r->lease);
+  if (rename(temp, r->lease))
+    return -1;
+  if (complete) {
+    if (!leaseLockPath(r->lease, temp))
+      unlink(temp);
+  }
+  return 0;
 }
 /* Inspect each child before reaping. Adoption supplies the launch boundary. */
 static int reapChildren(int force, int target, int *result) {
@@ -1057,6 +1086,9 @@ static int guardian(struct record *r) {
   outer = checkOwner(r->outer, r->outerStart);
   if (caller < 0 || outer < 0)
     return failEmpty(socket, r, 31);
+  /* The inherited lock covers the gap between spawn and this record. */
+  if (lease(r, getpid(), 0, 0))
+    return failEmpty(socket, r, 31);
   int status[2];
   if (pipe2(status, CLOEXEC | NONBLOCK))
     return failEmpty(socket, r, 32);
@@ -1268,7 +1300,10 @@ int sandboxOuter(char *data, unsigned int length) {
     argv[i] = r.self[i];
   argv[r.nself] = "--sandbox-guardian";
   argv[r.nself + 1] = 0;
-  int inherited[4] = {policy, control[1], helperControl[1], argfd};
+  int leaseLock = sandboxLeaseLock(r.lease, 1);
+  if (leaseLock < 0)
+    return failEmpty(-1, &r, 0);
+  int inherited[5] = {policy, control[1], helperControl[1], argfd, leaseLock};
   if (lease(&r, 0, 0, 0))
     return failEmpty(-1, &r, 0);
   int daemonSocket = -1;
@@ -1279,7 +1314,10 @@ int sandboxOuter(char *data, unsigned int length) {
       return failEmpty(-1, &r, 0);
     }
   }
-  int guard = spawn(argv, inherited, 4);
+  if (fault(&r, "pre_guardian_crash"))
+    die(78);
+  int guard = spawn(argv, inherited, 5);
+  close(leaseLock);
   close(control[1]);
   close(helperControl[1]);
   close(policy);
