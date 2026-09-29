@@ -487,7 +487,9 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         Assert-SafePath $journal
         if (-not (Test-Path -LiteralPath $journal)) { return $false }
         try {
-            $records = @([IO.File]::ReadAllText($journal) | ConvertFrom-Json)
+            # Windows PowerShell 5.1 sends a JSON array as one object.
+            # Write-Output sends each record so the count and the loop see all of them.
+            $records = @([IO.File]::ReadAllText($journal) | ConvertFrom-Json | Write-Output)
             if ($records.Count -lt 1 -or $records.Count -gt 2) { throw 'Invalid move count.' }
             $seen = @()
             foreach ($record in $records) {
