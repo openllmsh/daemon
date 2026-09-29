@@ -141,11 +141,26 @@ export const linuxVendorEnvironment = (
     (name) => selected === cliHome(name, home),
   );
   const overlay: Record<string, string> = {};
-  if (provider)
-    for (const key of Object.keys(cliEnv(provider))) {
+  if (provider) {
+    const operationKeys: Readonly<
+      Partial<Record<typeof provider, readonly string[]>>
+    > = {
+      claude_code: ["ANTHROPIC_BASE_URL"],
+      kimi_code: [
+        "KIMI_MODEL_NAME",
+        "KIMI_MODEL_API_KEY",
+        "KIMI_MODEL_BASE_URL",
+      ],
+      grok: ["GROK_CLI_CHAT_PROXY_BASE_URL"],
+    };
+    for (const key of [
+      ...Object.keys(cliEnv(provider)),
+      ...(operationKeys[provider] ?? []),
+    ]) {
       const value = process.env[key];
       if (value !== undefined) overlay[key] = value;
     }
+  }
   const env = cleanNativeSpawnEnv(overlay);
   for (const key of Object.keys(env)) {
     if (/^(?:OPENLLM_|PRIVATE_PLANE_|RELAY_|DEVICE_GRANT_)/i.test(key))
