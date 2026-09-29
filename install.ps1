@@ -579,13 +579,13 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         try {
             $alias = Join-Path $bin 'ollm.cmd'
             Assert-SafePath $alias
-            # A bare `exit /b` returns the real exit code of openllm.exe; `%errorlevel%`
-            # could expand an inherited ERRORLEVEL variable instead.
-            $aliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b`r`n"
+            # Clear the variable so CMD reads the process exit code.
+            $aliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`nset `"ERRORLEVEL=`"`r`n`"%~dp0openllm.exe`" %*`r`nexit /b %ERRORLEVEL%`r`n"
             $previousAliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b %errorlevel%`r`n"
+            $bareExitAliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b`r`n"
             if ([IO.File]::Exists($alias)) {
                 $current = [IO.File]::ReadAllText($alias)
-                if ($current -ceq $previousAliasText) { [IO.File]::Delete($alias) }
+                if ($current -ceq $previousAliasText -or $current -ceq $bareExitAliasText) { [IO.File]::Delete($alias) }
                 elseif ($current -cne $aliasText) { throw "An unmanaged alias exists: $alias" }
             }
             if (-not [IO.File]::Exists($alias)) {
