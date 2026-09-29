@@ -245,7 +245,11 @@ const runClaudeSdkFacadeCaptureCore = async (
     // child is killed) — dispose so `dispatchPromise`'s `takeCaptured()`
     // rejects instead of hanging forever.
     session.dispose();
-    void dispatchPromise.catch(() => undefined);
+    // A late or signal-independent sender may still produce a live body.
+    // Discard it explicitly, without waiting for dispatch or cancellation.
+    void dispatchPromise
+      .then(({ response }) => response.body?.cancel())
+      .catch(() => undefined);
     void drainRemaining.catch(() => undefined);
     logError(
       "native-runtime",

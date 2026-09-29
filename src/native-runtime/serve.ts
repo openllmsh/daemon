@@ -1293,12 +1293,12 @@ const serveCursorHop = async (
     );
   } catch (err) {
     fail(err);
-    return errorJson(
-      502,
+    const reason =
       partialUsageFrom(err) === null
         ? "native runtime stream ended before output"
-        : "native runtime stream failed after output began",
-    );
+        : "native runtime stream failed after output began";
+    if (captureActive) return declinedOutcome(reason, undefined, "accepted");
+    return errorJson(502, reason);
   }
   settle(canonical);
   return deliverJsonResponse(
