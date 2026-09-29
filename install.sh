@@ -1187,8 +1187,12 @@ fi
 # dead: a pid+start-identity record a re-run can safely reap beats a missing
 # lock next to a live vendor process.
 if [ -n "$pgid" ]; then
-  reap_deadline=$((SECONDS + 10))
-  while kill -0 -- -"$pgid" 2>/dev/null && [ "$SECONDS" -lt "$reap_deadline" ]; do
+  reap_begin=$SECONDS
+  reap_previous=$SECONDS
+  for ((reap_attempt=0; reap_attempt<100; reap_attempt++)); do
+    kill -0 -- -"$pgid" 2>/dev/null || break
+    if [ "$SECONDS" -lt "$reap_previous" ] || [ "$((SECONDS - reap_begin))" -ge 10 ]; then break; fi
+    reap_previous=$SECONDS
     sleep 0.1 2>/dev/null || sleep 1
   done
 fi
