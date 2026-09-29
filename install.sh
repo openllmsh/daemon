@@ -1020,9 +1020,10 @@ lockd="$pidfile.d"
 # worker before its first owner-temp mutation. It uses the launch helper's
 # association for the after-mkdir and before-grant checks.
 [ -x "$helper" ] || exit 74
+worker_pid="${BASHPID:-$$}"
 request="$pidfile.v3.${BASHPID:-$$}.$RANDOM.request"
 ready="$pidfile.v3.${BASHPID:-$$}.$RANDOM.ready"
-"$helper" --internal-lock-control v "$lockd" "${BASHPID:-$$}" \
+"$helper" --internal-lock-control v "$lockd" "$worker_pid" \
   "$request" "$ready" "$launchfile" "$launch_nonce" "$max_wait" < /dev/null &
 leasepid=$!
 ready_begin=$SECONDS
@@ -1056,7 +1057,8 @@ fi
 ( set -C; printf "%s\n" "$action" > "$request" ) 2>/dev/null || true
 wait "$leasepid" 2>/dev/null || true
 rm -f "$request" 2>/dev/null || true' EXIT
-pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
+pipeline='"$2" --internal-lock-control vendor-group "$3" "$4" || exit 74
+"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
 group_observed=0
 leader_pid=""
@@ -1064,7 +1066,7 @@ if [ -n "$timeout_bin" ]; then
   # GNU timeout usually leads its own process group, but do not assume that.
   # Observe the group before and after waiting. If it was never visible, use
   # the timeout leader's liveness instead of treating an empty probe as proof.
-  "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url" &
+  "$timeout_bin" -k 15 "$job_timeout" bash -c "$pipeline" "$curl_bin" "$url" "$helper" "$lockd" "$worker_pid" &
   twait=$!
   leader_pid="$twait"
   if kill -0 -- -"$twait" 2>/dev/null \
@@ -1087,7 +1089,7 @@ if [ -n "$timeout_bin" ]; then
 elif [ -n "$setsid_bin" ]; then
   # setsid(1) starts the pipeline as its own session + process-group leader,
   # so the leader pid IS the pgid — `$!` after the pipeline would NOT be it.
-  "$setsid_bin" bash -c "$pipeline" "$curl_bin" "$url" &
+  "$setsid_bin" bash -c "$pipeline" "$curl_bin" "$url" "$helper" "$lockd" "$worker_pid" &
   leader=$!
   leader_pid="$leader"
   pgid="$leader"
@@ -1134,7 +1136,7 @@ else
   # in its OWN process group. Record the REAL pgid via ps — never assume $!
   # is a group id.
   set -m
-  bash -c "$pipeline" "$curl_bin" "$url" &
+  bash -c "$pipeline" "$curl_bin" "$url" "$helper" "$lockd" "$worker_pid" &
   leader=$!
   leader_pid="$leader"
   group_id_proven=1
