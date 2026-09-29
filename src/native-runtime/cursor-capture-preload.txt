@@ -1127,11 +1127,6 @@ class CapturedHttp2Stream extends EventEmitter {
         parentCaptureId: this._duplexId,
       },
     };
-    pending.set(id, {
-      settle() {
-        // Follow-ups are fire-and-acknowledge; parent owns upstream write.
-      },
-    });
     ipc.write(`${JSON.stringify(payload)}\n`);
   }
 

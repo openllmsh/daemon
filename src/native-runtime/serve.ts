@@ -216,22 +216,24 @@ const toolContinuationIdentity = (): TToolContinuationIdentity => {
  *
  *   - `firstTurn`  — no prior assistant turn; a fresh session is CORRECT.
  *   - `resumeHit`  — prior history AND the prefix matched → delta-only feed.
- *   - `resumeMiss` — prior history but NO match → `renderSeed` cold start.
+ *   - `resumeMiss` — non-capture prior history but NO match → cold start.
+ *   - `captureCold` — prior history intentionally re-seeded for capture.
  *
  * The ratio that matters is `resumeMiss / (resumeHit + resumeMiss)`;
- * `firstTurn` is excluded because it isn't a correlation failure.
+ * `firstTurn` and `captureCold` are excluded: neither is a correlation failure.
  */
 type TResumeStats = {
   firstTurn: number;
   resumeHit: number;
   resumeMiss: number;
+  captureCold: number;
 };
 
 const resumeStats: Record<TNativeRuntimeProvider, TResumeStats> = {
-  claude_code: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
-  chatgpt: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
-  cursor: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
-  muse: { firstTurn: 0, resumeHit: 0, resumeMiss: 0 },
+  claude_code: { firstTurn: 0, resumeHit: 0, resumeMiss: 0, captureCold: 0 },
+  chatgpt: { firstTurn: 0, resumeHit: 0, resumeMiss: 0, captureCold: 0 },
+  cursor: { firstTurn: 0, resumeHit: 0, resumeMiss: 0, captureCold: 0 },
+  muse: { firstTurn: 0, resumeHit: 0, resumeMiss: 0, captureCold: 0 },
 };
 
 /** Snapshot the resume-correlation counters (introspection / tests). */
@@ -247,21 +249,41 @@ export const nativeResumeStats = (): Record<
 
 /** Reset the counters (tests). */
 export const resetNativeResumeStats = (): void => {
-  resumeStats.claude_code = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
-  resumeStats.chatgpt = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
-  resumeStats.cursor = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
-  resumeStats.muse = { firstTurn: 0, resumeHit: 0, resumeMiss: 0 };
+  resumeStats.claude_code = {
+    firstTurn: 0,
+    resumeHit: 0,
+    resumeMiss: 0,
+    captureCold: 0,
+  };
+  resumeStats.chatgpt = {
+    firstTurn: 0,
+    resumeHit: 0,
+    resumeMiss: 0,
+    captureCold: 0,
+  };
+  resumeStats.cursor = {
+    firstTurn: 0,
+    resumeHit: 0,
+    resumeMiss: 0,
+    captureCold: 0,
+  };
+  resumeStats.muse = {
+    firstTurn: 0,
+    resumeHit: 0,
+    resumeMiss: 0,
+    captureCold: 0,
+  };
 };
 
 /**
  * Record one correlation outcome and log it. A MISS logs at `warn` with the
- * transcript size being re-sent (the cost of the fallback); the other two log
+ * transcript size being re-sent (the cost of the fallback); all other outcomes log
  * at `debug` so steady-state traffic stays quiet.
  */
 const recordResumeOutcome = (
   provider: TNativeRuntimeProvider,
   variant: TBridgeVariant,
-  outcome: "firstTurn" | "resumeHit" | "resumeMiss",
+  outcome: keyof TResumeStats,
   turnCount: number,
   seedChars: number,
 ): void => {
@@ -279,6 +301,7 @@ const recordResumeOutcome = (
     firstTurn: s.firstTurn,
     resumeHit: s.resumeHit,
     resumeMiss: s.resumeMiss,
+    captureCold: s.captureCold,
   };
   if (outcome === "resumeMiss") {
     logWarn(
@@ -732,16 +755,17 @@ export const tryServeNativeRuntime = async (
   const userText = feed.userText;
   const systemText = feed.systemText;
   const builderResumeId = feed.builderResumeId;
-  // Instrumentation: which of the three correlation outcomes this turn took.
-  // `hasPrior && builderResumeId === null` is the expensive `renderSeed` fallback
-  // (includes capture-forced cold starts).
+  // Intentional capture reseeding is not a failed session correlation and must
+  // not inflate the resume-miss ratio or emit a misleading MISS warning.
   recordResumeOutcome(
     textProvider,
     executionIdentity.variant,
     builderResumeId !== null
       ? "resumeHit"
       : hasPrior
-        ? "resumeMiss"
+        ? captureActive
+          ? "captureCold"
+          : "resumeMiss"
         : "firstTurn",
     req.turns.length,
     builderResumeId === null && hasPrior ? userText.length : 0,
