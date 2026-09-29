@@ -1049,10 +1049,13 @@ group_id_proven=0
 trap 'if [ "${group_confirmed_gone:-0}" = 1 ] || { \
   { [ "${group_observed:-0}" = 1 ] || [ "${group_id_proven:-0}" = 1 ]; } \
   && [ -n "${pgid:-}" ] && ! kill -0 -- -"$pgid" 2>/dev/null; }; then
-  ( set -C; printf "release\n" > "$request" ) 2>/dev/null || true
-  wait "$leasepid" 2>/dev/null || true
-  rm -f "$request" 2>/dev/null || true
-fi' EXIT
+  action=release
+else
+  action=preserve
+fi
+( set -C; printf "%s\n" "$action" > "$request" ) 2>/dev/null || true
+wait "$leasepid" 2>/dev/null || true
+rm -f "$request" 2>/dev/null || true' EXIT
 pipeline='"$0" --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 300 -fsSL "$1" | bash'
 pgid=""
 group_observed=0
