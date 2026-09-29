@@ -1038,7 +1038,10 @@ const envDirLockOptions = (): TDirLockOptions => ({
   ownerlessMs: envLockOrphanMs(),
   pollMs: 10,
   inode: envLockDirIno,
-  startIdentity: envLockStartIdentity,
+  startIdentity:
+    process.platform === "win32"
+      ? envLockStartIdentity
+      : envLockStartIdentityProbe,
   ownerStartIdentity: envLockStartIdentity,
   legacyStartIdentity: envLockLegacyStartIdentityProbe,
   isStale: envLockDirIsStale,
