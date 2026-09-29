@@ -27,17 +27,14 @@
  * drained in the background purely so the process can exit cleanly, exactly
  * mirroring `runClaudeTextCapture`'s `stdoutTask`.
  *
- * **BLOCKED for multi-turn/tool-continuation, enforced pre-spawn.**
- * `runClaudeSdkFacadeCaptureCore` calls `claude-sdk-facade.ts`'s SHARED
- * `sdkFacadeRequiresUnsupportedAssistantReplay` guard immediately after
- * `planClaudeSdkFacadeTurn` and refuses (with that module's
- * `SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON`) BEFORE
- * `createRequestCaptureSession`/`startClaudeCaptureLoopback` runs, before
- * the loopback MCP server starts, and before `spawnClaudeFacadeCli` is
- * called — no capture resource is ever opened for a request this gate
- * refuses. See `claude-sdk-facade.ts`'s module doc for why the check lives
- * there (one shared implementation, applied identically to native and
- * capture) rather than being duplicated in this file.
+ * Multi-turn and tool-continuation history is construction-proven against
+ * the real installed CLI (see `claude-sdk-facade.ts`'s module doc for the H1
+ * evidence — wire-shape/protocol proof against a local mock upstream, never
+ * proof under genuine authenticated inference) — there is no pre-spawn
+ * refusal for it. The one shared history plan (`planClaudeSdkFacadeTurn`)
+ * and shared framed-replay writer (`replayClaudeSdkFacadeHistory`) are
+ * exactly what both this module and `runClaudeSdkFacadeCore` use, so the two
+ * variants never drift.
  */
 
 import { existsSync } from "node:fs";
@@ -57,8 +54,6 @@ import {
   logSdkFacadePhaseTiming,
   planClaudeSdkFacadeTurn,
   replayClaudeSdkFacadeHistory,
-  SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON,
-  sdkFacadeRequiresUnsupportedAssistantReplay,
   type TClaudeFacadeStdinWriter,
   type TClaudeSdkFacadeParams,
 } from "./claude-sdk-facade";
@@ -117,16 +112,6 @@ const runClaudeSdkFacadeCaptureCore = async (
   const plan = planClaudeSdkFacadeTurn(params.canonical);
   if (!plan.ok) {
     return { kind: "declined", reason: plan.reason };
-  }
-  if (sdkFacadeRequiresUnsupportedAssistantReplay(plan)) {
-    // Refuse BEFORE opening any capture resource (session/loopback) — see
-    // `claude-sdk-facade.ts`'s module doc and this same guard's use in
-    // `runClaudeSdkFacadeCore`. No spawn, no loopback, no dispatch attempt
-    // for a request this gate refuses.
-    return {
-      kind: "declined",
-      reason: SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON,
-    };
   }
 
   const session = createRequestCaptureSession({

@@ -88,26 +88,14 @@ export const PROVIDER_EXECUTION_REGISTRY: readonly TProviderExecutionRegistratio
       // selection for its PROVEN shape, never a claim that H6's gates passed.
       // H1's real-CLI construction proof (`claude-sdk-facade.ts`'s module doc,
       // `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`)
-      // found that "replays the full canonical history itself" is proven true
-      // only for a SINGLE first turn against this installed CLI — an
-      // assistant-typed replay frame (required by any multi-turn or
-      // tool-continuation history) is never acknowledged by the real CLI.
-      // This registration does NOT narrow to single-turn-only at the registry
-      // level (the correct fix is a protocol-shape qualification, not a
-      // registry-level capability change) because the multi-turn shape is
-      // instead BLOCKED one layer down, structurally, before any spawn: both
-      // `runClaudeSdkFacade` and `runClaudeSdkFacadeCapture`
-      // (`claude-sdk-facade.ts`/`claude-sdk-facade-capture.ts`) call the SAME
-      // shared `sdkFacadeRequiresUnsupportedAssistantReplay` guard immediately
-      // after planning the turn and refuse pre-dispatch — no spawn, no
-      // capture resource, no send — rather than reaching the CLI and
-      // exhausting the replay deadline. That guard runs unconditionally
-      // inside those two functions themselves, so it holds even for a caller
-      // that reaches them without going through this registry's
-      // `resolveExecutionSelection` first. Treat multi-turn `sdk-facade` as an
-      // evidenced, actively BLOCKED gap — not merely "pending" and not a
-      // runtime timeout — until the underlying protocol-shape investigation
-      // resolves it.
+      // now covers ordinary multi-turn and tool-continuation history too, not
+      // just a single first turn: the earlier "assistant frame never
+      // acknowledged" finding was a bug in this facade's own frame
+      // construction (it mis-assigned the ack-wait flag to assistant frames
+      // as well as user frames), not a genuine CLI limitation — the reference
+      // protocol, and the real CLI, only ever wait for an ack after a
+      // `type:"user"` frame. Fixed, there is no assistant-replay gap left to
+      // gate here.
       variants: ["stream-json", "sdk-facade", "handrolled"],
       captureVariants: ["stream-json", "sdk-facade"],
     },

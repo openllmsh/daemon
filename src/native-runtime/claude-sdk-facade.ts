@@ -25,72 +25,81 @@
  * `anthropicMessagesFromHistoryTurns`/`buildClaudeToolNameMap` — rather than
  * a parallel history planner (00-requirements.md req. 3).
  *
- * Replay protocol (Hermes §3.B, adapted — see `replayClaudeSdkFacadeHistory`):
- * every frame but the last is written with `shouldQuery: false` and MUST be
- * acknowledged by a zero-turn `result` line before the next frame is sent.
- * The final frame omits `shouldQuery` (defaults to triggering generation)
- * and is the turn's ONE real model call — replay itself makes no network
- * request (Hermes §3.E: admission is a transport invariant;
+ * Replay protocol (Hermes §3.B) — role-specific, matching the reference
+ * implementation exactly (`tmp/hermes-claude-sdk-reference/directsdk.py:581-595`):
+ * ONLY a `type:"user"` frame that is not the last frame is written with
+ * `shouldQuery: false` and MUST be acknowledged by a zero-turn `result` line
+ * before the next frame is sent. A `type:"assistant"` historical frame (any
+ * prior assistant/tool-use turn) is written and NEVER waited on — the
+ * installed CLI appends it to conversation state silently, with no ack and
+ * no error, and only ever resumes generation on the next `type:"user"` frame
+ * that omits `shouldQuery`. The final frame (always `type:"user"` — history
+ * decomposition guarantees a trailing user/tool-result turn) omits
+ * `shouldQuery` and is the turn's ONE real model call — replay itself makes
+ * no network request (Hermes §3.E: admission is a transport invariant;
  * `sdk-facade-capture` in `claude-sdk-facade-capture.ts` relies on exactly
  * this to intercept only that one call).
  *
- * **H1 real-CLI construction proof (verified, not merely `--help`-inferred):**
- * `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`
+ * **Earlier adaptation error (corrected):** a prior version of
+ * {@link planClaudeSdkFacadeTurn} assigned `shouldQuery: false` to EVERY
+ * non-final frame regardless of role, including `type:"assistant"` frames.
+ * Because {@link replayClaudeSdkFacadeHistory} waits for an ack whenever
+ * `shouldQuery === false`, that misassignment made the replay loop wait for
+ * an acknowledgment the CLI never sends for an assistant frame — a genuine
+ * hang bound only by `PRE_COMMIT_TIMEOUT_MS`. A guard
+ * (`sdkFacadeRequiresUnsupportedAssistantReplay`) was added to refuse any
+ * plan containing an assistant frame before ever spawning the CLI, avoiding
+ * the hang but also blocking every ordinary multi-turn or tool-continuation
+ * request — a correctness bug in the adaptation, not a genuine CLI
+ * limitation, per the reference source above (only `type:"user"` frames are
+ * ever assigned `shouldQuery: false`; `type:"assistant"` frames are appended
+ * unconditionally with no ack expectation at all).
+ *
+ * **H1 real-CLI construction proof (verified against the real installed
+ * `claude` binary, not merely `--help`-inferred or the reference source
+ * alone):** `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`
  * (opt-in, `RUN_DAEMON_LIVE=1`, real installed `claude` binary, dummy API
- * key, no login) is the concrete evidence, and it is MIXED:
+ * key, no login, no network — either no request at all for the local ack
+ * accounting, or a local mock upstream for the one real dispatch) now
+ * proves the CORRECTED protocol end to end:
  *
- *   - PROVEN: a `type:"user"` `shouldQuery:false` frame DOES receive a
- *     zero-turn `result` line (`num_turns: 0`) before the next write — the
- *     single-turn (no prior assistant message) case this facade needs for
- *     plain first-turn text is genuinely safe for real traffic. The SAME
- *     test proves a single-turn `sdk-facade-capture` request reaches
- *     exactly one real `/v1/messages` POST end to end through the actual
- *     production dispatch function.
- *   - DISPROVEN, not merely unproven: a `type:"assistant"` `shouldQuery:
- *     false` frame — the exact shape `anthropicMessagesFromHistoryTurns`
- *     emits for ANY prior assistant turn (`{role: turn.role, ...}`, role
- *     `"assistant"`) — receives NO acknowledgment at all from the real
- *     installed CLI within any bounded wait; it is silently dropped, not
- *     acked and not errored. The same test proves this end to end too: a
- *     multi-turn (system + user + assistant + user) `sdk-facade-capture`
- *     request through the real production function never reaches the
- *     upstream and exhausts the full replay deadline before declining.
+ *   - A `type:"user"` `shouldQuery:false` frame DOES receive a zero-turn
+ *     `result` line (`num_turns: 0`) before the next write.
+ *   - A `type:"assistant"` frame written WITHOUT `shouldQuery` (the fixed
+ *     construction) produces no ack and no error, exactly as expected — the
+ *     replay loop does not wait on it, so there is nothing to hang on.
+ *   - A genuine multi-turn history (system + user + assistant + user, with
+ *     unique per-turn sentinel text) reaches the production dispatch
+ *     function (`runClaudeSdkFacadeCapture`) exactly ONCE, and the
+ *     captured body's `messages` array is the ORDERED `[user, assistant,
+ *     user]` triple with each turn's own sentinel in the right slot and no
+ *     other turn's sentinel bled into it (not merely "the text appears
+ *     somewhere in the body") — proof against missing, reordered, or
+ *     duplicated turns.
+ *   - Separately, a tool_use/tool_result continuation (assistant `tool_use`
+ *     for a declared caller tool + a `tool_result` user turn, both non-final
+ *     history frames) reaches the same production function exactly once,
+ *     and the captured `tool_use` block carries the CLI's own
+ *     `mcp__openllm__`-prefixed wire name plus the original call id and
+ *     parsed input, while the `tool_result` block carries the original id
+ *     and content.
+ *   - Separately again, `runClaudeSdkFacade` — the NORMAL, non-capture
+ *     production path, not just the capture-interception path — replays the
+ *     same multi-turn history against a real local fake `/v1/messages` SSE
+ *     upstream and produces a COMMITTED run whose output matches that
+ *     upstream's scripted completion, with the upstream's own captured
+ *     request confirming the full history reached it.
  *
- * Consequence: EVERY multi-turn or tool-continuation `sdk-facade`/
- * `sdk-facade-capture` request — anything needing at least one assistant-
- * typed replay frame — is UNQUALIFIED for real traffic against this
- * installed CLI version; the real CLI would occupy a full
- * `PRE_COMMIT_TIMEOUT_MS` (60s) before declining if it were ever asked to
- * replay one. Only a single first-turn request (caller tools included —
- * the model's OWN `tool_use` on that first turn needs no assistant REPLAY
- * frame) is construction-proven safe today.
- *
- * **BLOCKED, enforced pre-spawn (this is the required gate, not a runtime
- * timeout):** {@link planClaudeSdkFacadeTurn} still plans the full
- * multi-turn shape (it stays the one shared, exact history decomposition —
- * 00-requirements.md req. 3 — and its own frame-construction unit tests in
- * `claude-sdk-facade.test.ts` keep exercising it as a protocol-mechanism
- * experiment, independent of whether a plan is ever dispatched). What
- * changed: {@link sdkFacadeRequiresUnsupportedAssistantReplay} inspects that
- * plan for any frame that would require the disproven acknowledgment (a
- * `shouldQuery: false` frame with `type: "assistant"` — i.e. any frame
- * decomposed from a genuine prior assistant/tool-continuation turn, never a
- * naive `messages.length` check, which both under-refuses a system-message-
- * padded first turn and over-refuses nothing it shouldn't), and BOTH
- * `runClaudeSdkFacadeCore` (this file) and `runClaudeSdkFacadeCaptureCore`
- * (`claude-sdk-facade-capture.ts`) call it immediately after `plan.ok` and
- * refuse with {@link SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON} BEFORE
- * either spawns the CLI, starts the loopback MCP server, or (capture only)
- * opens the capture session/loopback — no process, no capture resource, no
- * network activity for a request this gate refuses. Because the check lives
- * in the ONE shared plan-refusal step both production entry points already
- * call first, it applies no matter which of the two functions a caller
- * invokes directly — it is not contingent on `execution-registry.ts`'s
- * pre-dispatch resolution being consulted first. Multi-turn `sdk-facade` is
- * therefore a documented, evidenced-and-BLOCKED capability gap, not a
- * silently "ready" registration and not a request that would hang until a
- * runtime timeout — see 09-implementation-plan.md §13's execution-status
- * update for the exact wording.
+ * All of the above is CONSTRUCTION/SHAPE proof — the exact bytes this
+ * facade builds are ones the real installed CLI accepts and threads through
+ * correctly against a local mock upstream — never proof of correctness
+ * under genuine AUTHENTICATED inference, a different installed CLI version,
+ * or real network conditions (H6, separately tracked, still unattempted).
+ * On that evidence, `sdkFacadeRequiresUnsupportedAssistantReplay` and its
+ * refusal have been removed — the shape it blocked was never actually
+ * unsupported by the CLI, only mis-encoded by this facade. See
+ * 09-implementation-plan.md §13b for the corrected execution-status
+ * wording.
  *
  * Streaming output reuses `@openllmsh/wire`'s
  * `fromAnthropicStreamEvent`/`newAnthropicStreamState` UNCHANGED — the same
@@ -200,10 +209,22 @@ export const planClaudeSdkFacadeTurn = (
   if (messages.length === 0) {
     return { ok: false, reason: "no user turn to answer" };
   }
+  const lastIndex = messages.length - 1;
   const frames: TClaudeSdkFacadeFrame[] = messages.map((message, i) => ({
     type: message.role,
     message,
-    ...(i < messages.length - 1 ? { shouldQuery: false as const } : {}),
+    // Role-specific, matching the reference implementation exactly
+    // (`tmp/hermes-claude-sdk-reference/directsdk.py:581-595`): ONLY a
+    // non-final `type:"user"` frame is marked `shouldQuery: false` (and
+    // therefore awaited for a zero-turn ack by
+    // `replayClaudeSdkFacadeHistory`). A `type:"assistant"` frame is ALWAYS
+    // written unconditionally — the installed CLI appends it to
+    // conversation state with no ack and no error either way, and waiting
+    // on one hangs the replay loop for no reason (see this module's doc
+    // comment's "earlier adaptation error").
+    ...(i < lastIndex && message.role === "user"
+      ? { shouldQuery: false as const }
+      : {}),
   }));
   return {
     ok: true,
@@ -213,48 +234,6 @@ export const planClaudeSdkFacadeTurn = (
     toolNameMap,
   };
 };
-
-/**
- * Typed refusal reason shared verbatim by both `runClaudeSdkFacadeCore`
- * (below) and `runClaudeSdkFacadeCaptureCore`
- * (`claude-sdk-facade-capture.ts`) — one string, not two independently
- * worded guard implementations.
- */
-export const SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON =
-  "sdk-facade: this history requires replaying a prior assistant turn " +
-  "(multi-turn or tool-continuation), which the installed claude CLI never " +
-  "acknowledges — refusing before spawn rather than occupying the full " +
-  "replay deadline (see 12-hermes-adoption-plan.md H1 and this module's " +
-  "doc comment)";
-
-/**
- * Whether `plan`'s frames would require the CLI to acknowledge a REPLAYED
- * frame decomposed from a prior ASSISTANT turn — the exact shape H1's
- * real-CLI construction proof found the installed CLI silently drops,
- * never acknowledging it (this module's doc comment).
- *
- * Deliberately NOT a `canonical.messages.length` check: a leading system
- * message inflates length without adding assistant history (would
- * over-refuse a genuine first turn), and this module's own decomposition
- * — {@link historyTurnsFromCanonicalMessages} /
- * {@link anthropicMessagesFromHistoryTurns} — is what actually determines
- * which frames are replayed and which of those are assistant-typed; a
- * length heuristic would drift from that decomposition the moment either
- * function's shape rules change. A prior tool call is itself an assistant
- * turn (`anthropicMessagesFromHistoryTurns` emits `{role: "assistant", ...}`
- * for it — see `claude-tool-capture.ts`), so tool-result continuation is
- * caught by this same check; it is never confused with a first-turn
- * `tools` declaration alone (which adds no history frames and leaves
- * `plan.frames` exactly the single final query frame).
- *
- * Only a `shouldQuery: false` frame needs an acknowledgment at all
- * ({@link replayClaudeSdkFacadeHistory}) — the final frame never carries
- * that flag — so checking `frame.type === "assistant"` on every frame is
- * equivalent to, and clearer than, excluding the last frame by index.
- */
-export const sdkFacadeRequiresUnsupportedAssistantReplay = (
-  plan: Extract<TClaudeSdkFacadeTurnPlan, { readonly ok: true }>,
-): boolean => plan.frames.some((frame) => frame.type === "assistant");
 
 /** Bun's writable stdin pipe, narrowed to the subset every framed writer in
  *  this codebase uses (matches `codex-app-server.ts`'s own narrowing). */
@@ -668,12 +647,6 @@ const runClaudeSdkFacadeCore = async (
   const plan = planClaudeSdkFacadeTurn(params.canonical);
   if (!plan.ok) {
     return { kind: "declined", reason: plan.reason };
-  }
-  if (sdkFacadeRequiresUnsupportedAssistantReplay(plan)) {
-    return {
-      kind: "declined",
-      reason: SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON,
-    };
   }
 
   let mcpServer: TClaudeFacadeMcpServerRef | null = null;

@@ -533,10 +533,15 @@ stdin write, `--resume`-based session persistence) or `agent-sdk` (a held
 `query()`), `sdk-facade` drives `claude -p --input-format stream-json
 --output-format stream-json` with the ENTIRE canonical history replayed as
 framed input lines every turn — `--no-session-persistence`, no vendor session
-at all. Every historical frame carries `shouldQuery: false` and must receive a
-zero-turn `result` acknowledgment before the next one is sent (Hermes-inspired
-structured full-history replay); the final frame is the turn's one real model
-call. This makes the variant STATELESS at the daemon level — no session-store
+at all. The `shouldQuery: false` acknowledgment contract is ROLE-SPECIFIC,
+matching the reference implementation this facade is adapted from exactly
+(`tmp/hermes-claude-sdk-reference/directsdk.py:581-595`): only a non-final
+`type:"user"` frame carries `shouldQuery: false` and must receive a zero-turn
+`result` acknowledgment before the next frame is sent; a `type:"assistant"`
+historical frame is always written unconditionally and is never acknowledged
+(Hermes-inspired structured full-history replay); the final frame (always
+`type:"user"`) is the turn's one real model call. This makes the variant
+STATELESS at the daemon level — no session-store
 lease, no new conversation identifier (00-requirements.md req. 5) — the
 client's own message history already correlates the turn, exactly like an
 ordinary completion call. History → frames reuses the SAME exact decomposition
@@ -556,29 +561,37 @@ frame's one real `/v1/messages` POST is ever intercepted. Hermetic protocol
 fixture: `tests/transport/native-runtime-fixtures/fake-claude-facade.ts`
 (`tests/transport/claude-sdk-facade{,-capture}.test.ts`). REAL-CLI construction
 proof (H1, opt-in `RUN_DAEMON_LIVE=1`, no login —
-`tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`) found
-the `shouldQuery`/zero-turn-acknowledgment contract MIXED, not uniformly
-proven or unproven: a `type:"user"` replay frame IS acknowledged by the
-installed CLI (a single first-turn `sdk-facade`/`sdk-facade-capture` request
-reaches exactly one real `/v1/messages` POST end to end), but a
-`type:"assistant"` replay frame — the shape any multi-turn or
-tool-continuation history requires — is NEVER acknowledged by the real CLI.
-**This is now enforced as a pre-spawn refusal, not a runtime timeout:**
-`claude-sdk-facade.ts#sdkFacadeRequiresUnsupportedAssistantReplay` inspects
-the planned frames for any assistant-typed replay frame, and both
-`runClaudeSdkFacadeCore` and `runClaudeSdkFacadeCaptureCore` call that SAME
-shared guard immediately after `planClaudeSdkFacadeTurn` and decline — before
-spawning the CLI, before starting the loopback MCP server, and (capture only)
-before opening the capture session/loopback — whenever it fires. Only
-single-turn `sdk-facade` traffic is construction-proven safe AND reachable
-today; multi-turn/tool-continuation `sdk-facade` traffic is BLOCKED
-structurally, pending the underlying protocol-shape investigation (a
-different replay frame encoding, an undiscovered CLI flag, or a
-version-specific gap) — this is a required correctness gate, not a "planned
-capability" and not a fallback to another variant. Live-authenticated
-validation (H6) for the single-turn shape remains separately pending — see
-`claude-sdk-facade.ts`'s module doc and 09-implementation-plan.md §13 for the
-exact evidenced status.
+`tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`)
+confirms the role-specific contract above against the real installed CLI: a
+`type:"user"` `shouldQuery:false` replay frame IS acknowledged with a
+zero-turn `result`; a `type:"assistant"` frame written WITHOUT `shouldQuery`
+is never acknowledged and never waited on. Proven end to end through the
+ACTUAL production functions, never a hand-rolled spawn: `runClaudeSdkFacade
+Capture` reaches exactly one real `/v1/messages` POST for a single-turn
+request, for a genuinely multi-turn request (system + user + assistant +
+user, each turn a unique sentinel) — with the captured body's `messages`
+array structurally verified as the ORDERED `[user, assistant, user]` triple,
+each turn's sentinel in the right slot and no other turn's bled in — and for
+a tool_use/tool_result continuation, with the captured `tool_use` block
+carrying the CLI's `mcp__openllm__`-prefixed wire name, original call id and
+parsed input, and the `tool_result` block carrying the original id and
+content. `runClaudeSdkFacade` — the NORMAL, non-capture path — separately
+replays the same multi-turn history against a real local fake SSE upstream
+and produces a COMMITTED run with matching output and confirmed history
+delivery. **An earlier stage of this facade mis-adapted the reference
+protocol** (assigning `shouldQuery: false` to every non-final frame BY
+INDEX, including assistant frames, rather than by role) and, on finding the
+real CLI never acks an assistant-typed frame, concluded multi-turn history
+was unsupported by the vendor CLI and added a pre-spawn refusal for it. That
+refusal has been REMOVED: with the corrected, role-specific construction, an
+assistant frame is never assigned the flag that would make the replay loop
+wait for a nonexistent acknowledgment, so there is no hang to guard against
+and no unsupported shape to refuse. All of the above is CONSTRUCTION/SHAPE
+proof against a local mock upstream — never proof under genuine
+authenticated inference, a different CLI version, or real network
+conditions; live-authenticated validation (H6) remains separately pending —
+see `claude-sdk-facade.ts`'s module doc and 09-implementation-plan.md §13b
+for the exact evidenced status.
 Capture turns force cold construction + full-history seed
 (`captureAwareTextBuilderPlan` / `historyTurnsFromCanonicalMessages` +
 `captureAwareHistoryBuilderPlan`) and never publish a warm resume handle.
