@@ -12,10 +12,10 @@
  * shipping the proprietary pipeline + decoupling the daemon's release
  * cadence from `core`, not raw bytes.)
  *
- * Targets: the release list (`DAEMON_RELEASE_TARGETS`) — darwin-{arm64,
- * x64-baseline}, linux-{x64-baseline,arm64}. win32-x64 is off for
- * 2.8.0-beta.1 but remains buildable: `--target(s) win32-x64` on a native
- * Windows host still works.
+ * Targets include macOS, Linux, and Windows.
+ * Windows targets require a native Windows host.
+ * Select each host partition with --targets for prerelease builds.
+ * Stable releases select the four non-Windows targets.
  * x64 uses the `baseline` (Nehalem) tier — no AVX/AVX2/FMA required, runs on
  * any x86_64 CPU from 2008 onward.
  *
