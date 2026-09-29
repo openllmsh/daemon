@@ -903,12 +903,24 @@ static int finalMount(struct record *r) {
   if (fault(r, "proc_alias") && mount("/proc", r->tests[1], 0, 4096, 0))
     return -1;
 #endif
+  /* Read the visible mount ID. Mount table order does not select the top. */
+  int proc = open("/proc", OPATH | CLOEXEC | DIRECTORY);
+  if (proc < 0)
+    return -1;
+  char infoPath[64], info[4096];
+  snprintf(infoPath, sizeof(infoPath), "/proc/self/fdinfo/%d", proc);
+  int infoResult = textFile(infoPath, info, sizeof(info));
+  close(proc);
+  u64 visible = 0;
+  char *mountId = infoResult < 0 ? 0 : strstr(info, "\nmnt_id:");
+  if (!mountId || sscanf(mountId, "\nmnt_id: %llu", &visible) != 1)
+    return -1;
   char *buf = malloc(MAX_RECORD);
   if (!buf)
     return -1;
   if (textFile("/proc/self/mountinfo", buf, MAX_RECORD) < 0)
     return -1;
-  int count = 0;
+  int found = 0;
   char *p = buf;
   char options[256] = {0};
   int subset = 0;
@@ -922,17 +934,20 @@ static int finalMount(struct record *r) {
     char *type = strstr(p, " - proc ");
     if (type) {
       char target[4096], opts[256];
-      if (sscanf(p, "%*d %*d %*s %*s %4095s %255s", target, opts) != 2 ||
+      u64 id;
+      if (sscanf(p, "%llu %*d %*s %*s %4095s %255s", &id, target, opts) != 3 ||
           strcmp(target, "/proc"))
         return -1;
-      count++;
-      memcpy(options, opts, strlen(opts) + 1);
-      subset = strstr(type, "subset=pid") != 0;
+      if (id == visible) {
+        found = 1;
+        memcpy(options, opts, strlen(opts) + 1);
+        subset = strstr(type, "subset=pid") != 0;
+      }
     }
     p = end + 1;
   }
   free(buf);
-  if (count != 3 || !subset || !strstr(options, "ro,") ||
+  if (!found || !subset || !strstr(options, "ro,") ||
       !strstr(options, "nosuid") || !strstr(options, "nodev") ||
       !strstr(options, "noexec"))
     return -1;
