@@ -432,6 +432,10 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
 
     function Set-ManagedPath {
         param([string] $Bin)
+        if ($Bin.Contains(';')) {
+            Write-Warning 'Installation finished. PATH was not changed because the bin directory contains a semicolon. Run the installed commands by their full paths. To use PATH, use a profile directory without a semicolon and run the installer again.'
+            return
+        }
         $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
         try {
             $key.DeleteValue('OPENLLM_ENV_BROADCAST', $false)
