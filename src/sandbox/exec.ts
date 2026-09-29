@@ -279,7 +279,6 @@ export const runSandboxExec = async (
     const {
       getLinuxNamespaceFallbackReason,
       recordLinuxNamespaceFallback,
-      runLinuxSandboxSelfTest,
     } = await import("./linux-status");
     const separator = process.argv.indexOf("--");
     const flag = process.argv.indexOf("--sandbox-landlock-only");
@@ -293,13 +292,6 @@ export const runSandboxExec = async (
       } catch (error) {
         reason = recordLinuxNamespaceFallback(error);
       }
-    }
-    const control = process.argv.indexOf("--sandbox-control");
-    const isProbe =
-      tail[0] === process.execPath && tail.at(-1) === "--sandbox-probe";
-    if (!reason && !isProbe && !(control >= 0 && control < separator)) {
-      const result = await runLinuxSandboxSelfTest();
-      if (!result.passed) reason = result.reason;
     }
     if (!reason) return runLinuxSandbox(tail, opts?.home);
     process.stderr.write(`sandbox: landlock-only reason=${reason}\n`);
