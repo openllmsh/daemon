@@ -435,10 +435,33 @@ param([AllowEmptyString()][string] $Prerelease)
     }
 
     function Complete-Onboarding {
-        # W integration: call the native credential gate after transaction completion.
-        # Accept a distinct cancelled result. Never infer it from a nonzero status.
-        # Register a user task only after validation. Keep files on cancellation.
+        param(
+            [Parameter(Mandatory = $true)]
+            [ValidateSet('started', 'cancelled', 'deferred', 'failed')]
+            [string] $Status,
+            [string] $Diagnostic = ''
+        )
+        # The runtime must report a distinct result after its credential gate.
+        # A nonzero process exit does not identify cancellation.
+        # This step cannot register tasks or change the installed files.
+        switch ($Status) {
+            'started' {
+                Write-Output 'OpenLLM is installed. Startup is complete.'
+                return
+            }
+            'cancelled' {
+                Write-Output 'API key setup was cancelled.'
+            }
+            'failed' {
+                if (-not $Diagnostic) { $Diagnostic = 'The runtime did not report the failed operation.' }
+                throw "Startup failed. Verified binaries were kept. $Diagnostic Fix the error, then run openllm start."
+            }
+            'deferred' {
+                if ($Diagnostic) { Write-Output $Diagnostic }
+            }
+        }
         Write-Output 'OpenLLM is installed. Startup is incomplete. Run openllm start when ready.'
+        Write-Output 'Step 2: Run openllm start. Follow the sign-in instructions and enter your API key.'
     }
 
     try {
@@ -501,7 +524,9 @@ param([AllowEmptyString()][string] $Prerelease)
         } catch { throw "Managed setup failed. Verified binaries were kept. Fix this error and rerun the installer: $($_.Exception.Message)" }
         $transactionLock.Dispose()
         $transactionLock = $null
-        Complete-Onboarding
+        # W1 must supply native input and distinct credential results first.
+        # The current start command returns 1 for both cancellation and errors.
+        Complete-Onboarding -Status 'deferred' -Diagnostic 'Native Windows credential setup is unavailable in this build.'
     } finally {
         if ($null -ne $transactionLock) { $transactionLock.Dispose() }
         [Net.ServicePointManager]::SecurityProtocol = $savedTls
