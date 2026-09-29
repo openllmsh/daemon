@@ -477,6 +477,35 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         }
     }
 
+    function Test-CompletedInstallTransaction {
+        param([string] $Root)
+        $journal = Join-Path $Root 'install-transaction.json'
+        Assert-SafePath $journal
+        if (-not (Test-Path -LiteralPath $journal)) { return $false }
+        try {
+            $records = @([IO.File]::ReadAllText($journal) | ConvertFrom-Json)
+            if ($records.Count -lt 1 -or $records.Count -gt 2) { throw 'Invalid move count.' }
+            $seen = @()
+            foreach ($record in $records) {
+                $allowed = @((Join-Path $Root 'bin\openllmd.exe'), (Join-Path $Root 'bin\openllm.exe'))
+                if ($record.Path -notin $allowed -or $record.Path -in $seen -or $record.Digest -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid move record.' }
+                Assert-SafePath $record.Path
+                if ((Get-FileHash -LiteralPath $record.Path -Algorithm SHA256).Hash -ine $record.Digest) { throw 'Installed digest differs.' }
+                $seen += $record.Path
+            }
+        } catch { throw "An incomplete transaction exists. Keep its recovery files: $journal. $($_.Exception.Message)" }
+        return $true
+    }
+
+    function Remove-CompletedInstallJournal {
+        param([string] $Root)
+        $journal = Join-Path $Root 'install-transaction.json'
+        try {
+            Assert-SafePath $journal
+            [IO.File]::Delete($journal)
+        } catch { Write-Warning "Installation finished. The completed journal could not be removed: $journal. Rerun the installer to retry cleanup." }
+    }
+
     function Install-ImagePair {
         param([object[]] $Images, [string] $Root)
         $journal = Join-Path $Root 'install-transaction.json'
@@ -484,7 +513,7 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         if (Test-Path -LiteralPath $journal) { throw "An incomplete transaction exists. Keep its recovery files and repair it before a rerun: $journal" }
         $pending = @($Images | Where-Object { $_.Replace })
         if ($pending.Count -eq 0) { return }
-        $record = @($pending | ForEach-Object { @{ Path = $_.Path; Backup = $_.Backup; HadOriginal = $_.Exists } }) | ConvertTo-Json -Depth 4
+        $record = @($pending | ForEach-Object { @{ Path = $_.Path; Backup = $_.Backup; HadOriginal = $_.Exists; Digest = (Get-FileHash -LiteralPath $_.Stage -Algorithm SHA256).Hash } }) | ConvertTo-Json -Depth 4
         $journalStream = [IO.File]::Open($journal, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {
             $bytes = [Text.Encoding]::UTF8.GetBytes($record)
@@ -512,8 +541,7 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             } catch { throw "Replacement and rollback failed. Keep recovery files listed in $journal. $($_.Exception.Message)" }
             throw $failure
         }
-        # No running daemon is admitted until the lifecycle interface is available.
-        [IO.File]::Delete($journal)
+        # Keep the journal until alias and PATH setup finish.
     }
 
     function Complete-Onboarding {
@@ -574,28 +602,30 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             if ((Get-ImageVersion $image.Stage) -cne $tag.Substring(1)) { throw 'Downloaded executable version does not match the selected tag.' }
         }
         $transactionLock = Enter-InstallLock (Join-Path $root 'install.lock')
-        $journal = Join-Path $root 'install-transaction.json'
-        Assert-SafePath $journal
-        if (Test-Path -LiteralPath $journal) { throw "An incomplete transaction exists. Keep its recovery files: $journal" }
-        foreach ($image in $images) {
-            Assert-SafePath $image.Path
-            Assert-SafePath $image.Backup
-            if (Test-Path -LiteralPath $image.Backup) { throw "A recovery file exists: $($image.Backup)" }
-            if (Test-Path -LiteralPath $image.Path -PathType Container) { throw "Executable path is a directory: $($image.Path)" }
-            $image.Exists = [IO.File]::Exists($image.Path)
-            if ($image.Exists) {
-                try { $version = Get-ImageVersion $image.Path }
-                catch {
-                    Assert-ReplacementSupported @($image) -Diagnostic "Version probe failed for $($image.Path). $($_.Exception.Message)"
-                    throw
+        $completedTransaction = Test-CompletedInstallTransaction $root
+        if (-not $completedTransaction) {
+            foreach ($image in $images) {
+                Assert-SafePath $image.Path
+                Assert-SafePath $image.Backup
+                if (Test-Path -LiteralPath $image.Backup) { throw "A recovery file exists: $($image.Backup)" }
+                if (Test-Path -LiteralPath $image.Path -PathType Container) { throw "Executable path is a directory: $($image.Path)" }
+                $image.Exists = [IO.File]::Exists($image.Path)
+                if ($image.Exists) {
+                    try { $version = Get-ImageVersion $image.Path }
+                    catch {
+                        Assert-ReplacementSupported @($image) -Diagnostic "Version probe failed for $($image.Path). $($_.Exception.Message)"
+                        throw
+                    }
+                    if ((Compare-Version $version $tag.Substring(1)) -gt 0) { throw "Downgrade refused: $($image.Path) is $version." }
+                    $image.Replace = (Get-FileHash -LiteralPath $image.Path -Algorithm SHA256).Hash -ine $image.Digest
                 }
-                if ((Compare-Version $version $tag.Substring(1)) -gt 0) { throw "Downgrade refused: $($image.Path) is $version." }
-                $image.Replace = (Get-FileHash -LiteralPath $image.Path -Algorithm SHA256).Hash -ine $image.Digest
             }
+            Assert-ReplacementSupported $images
+            if (-not [IO.Directory]::Exists($bin)) { New-PrivateDirectory $bin }
+            Install-ImagePair $images $root
+        } else {
+            Write-Host 'The previous binary installation is complete. Finish its setup now. Run the installer again to select another release.'
         }
-        Assert-ReplacementSupported $images
-        if (-not [IO.Directory]::Exists($bin)) { New-PrivateDirectory $bin }
-        Install-ImagePair $images $root
         try {
             $alias = Join-Path $bin 'ollm.cmd'
             Assert-SafePath $alias
@@ -615,6 +645,7 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             }
             Set-ManagedPath $bin
         } catch { throw "Managed setup failed. Verified binaries were kept. Fix this error and rerun the installer: $($_.Exception.Message)" }
+        Remove-CompletedInstallJournal $root
         $transactionLock.Dispose()
         $transactionLock = $null
         # W1 must supply native input and distinct credential results first.
