@@ -133,7 +133,7 @@ export const startClaudeFacadeMcpServer = (params: {
               ...(tool.description !== undefined
                 ? { description: tool.description }
                 : {}),
-              inputSchema: tool.parameters ?? { type: "object" },
+              inputSchema: { type: "object", ...tool.parameters },
             })),
           });
         case "tools/call": {
