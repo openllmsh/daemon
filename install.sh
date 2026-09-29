@@ -2539,6 +2539,10 @@ write_env_file() {
 # write_env_file installs are scoped to that subshell and cannot replace an
 # outer EXIT trap — the generated dist installer relies on its staging cleanup
 # surviving ANY exit of ours, including a die while the lock is held.
+PRIOR_ENV_SHA=""
+if [ -n "$PRERELEASE_TAG" ] && [ -z "$INSTALLED_COMPONENTS" ] && [ -f "$ENV_FILE" ]; then
+  PRIOR_ENV_SHA="$(sha256_of "$ENV_FILE" || true)"
+fi
 API_KEY="$(write_env_file)" || exit 1
 echo "  gateway config written → $ENV_FILE"
 
@@ -2582,6 +2586,21 @@ reconcile_keyless_service() {
   esac
 }
 
+# Keep a healthy service when the prerelease binaries and config did not change.
+# The status command checks registration, the supervisor, and live health.
+prerelease_service_healthy() {
+  local status
+  [ -n "$PRIOR_ENV_SHA" ] || return 1
+  [ "$PRIOR_ENV_SHA" = "$(sha256_of "$ENV_FILE" || true)" ] || return 1
+  status="$("$BIN_DIR/openllmd" status 2>/dev/null)" || return 1
+  printf '%s\n' "$status" | awk '
+    $1 == "service:" && $2 == "registered" { registered=1 }
+    $1 == "supervisor:" && ($2 == "running" || ($2 == "active" && $3 == "(running)")) { supervised=1 }
+    $1 == "health:" && $2 == "serving" { serving=1 }
+    END { exit !(registered && supervised && serving) }
+  '
+}
+
 if [ -n "$API_KEY" ]; then
   if [ "$INSTALL_MODE" = update ]; then
     # Only bounce the daemon when its binary actually changed. `openllmd
@@ -2600,6 +2619,8 @@ if [ -n "$API_KEY" ]; then
         echo "  daemon already current — no restart needed"
         ;;
     esac
+  elif prerelease_service_healthy; then
+    echo "  daemon already current and healthy — no restart needed"
   else
     echo "Starting the daemon..."
     "$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"
