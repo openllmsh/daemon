@@ -445,6 +445,10 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                 $kind = $key.GetValueKind('Path')
                 if ($kind -notin @([Microsoft.Win32.RegistryValueKind]::String, [Microsoft.Win32.RegistryValueKind]::ExpandString)) { throw 'HKCU Environment Path must be REG_SZ or REG_EXPAND_SZ.' }
             }
+            if ($Bin.Contains('%') -and $kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                Write-Warning 'Installation finished. PATH was not changed because the bin directory contains a percent sign and the user PATH expands variables. Run the installed commands by their full paths. To use PATH, use a profile directory without a percent sign and run the installer again.'
+                return
+            }
             $updated = Add-ManagedPathEntry ([string]$value) $Bin ($kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString)
             if ($updated -cne $value) { $key.SetValue('Path', $updated, $kind); $key.Flush() }
             if ($key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $updated -or $key.GetValueKind('Path') -ne $kind) { throw 'The user PATH write could not be verified.' }
