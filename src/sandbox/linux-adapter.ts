@@ -35,8 +35,20 @@ export const prepareLinuxLaunch = (): string[] => {
   if (process.platform !== "linux")
     throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux host required");
   const { ptr } = require("bun:ffi") as typeof import("bun:ffi");
-  const { recordLinuxSandboxRejection } =
-    require("./linux-status") as typeof import("./linux-status");
+  const {
+    recordLinuxSandboxRejection,
+    getLinuxNamespaceFallbackReason,
+    recordLinuxNamespaceFallback,
+  } = require("./linux-status") as typeof import("./linux-status");
+  const fallback = getLinuxNamespaceFallbackReason();
+  if (fallback) return ["--sandbox-landlock-only", fallback];
+  try {
+    const { qualifyBubblewrap } =
+      require("./linux-launch") as typeof import("./linux-launch");
+    qualifyBubblewrap();
+  } catch (error) {
+    return ["--sandbox-landlock-only", recordLinuxNamespaceFallback(error)];
+  }
   const native = (() => {
     try {
       const { linuxNative } =

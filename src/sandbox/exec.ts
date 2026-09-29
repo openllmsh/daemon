@@ -273,8 +273,36 @@ export const runSandboxExec = async (
     return process.exit(await runWindowsConfinedTask());
   }
   if (process.platform === "linux") {
-    const { runLinuxSandbox } = await import("./linux-launch");
-    return runLinuxSandbox(tail, opts?.home);
+    const { qualifyBubblewrap, runLinuxSandbox } = await import(
+      "./linux-launch"
+    );
+    const {
+      getLinuxNamespaceFallbackReason,
+      recordLinuxNamespaceFallback,
+      runLinuxSandboxSelfTest,
+    } = await import("./linux-status");
+    const separator = process.argv.indexOf("--");
+    const flag = process.argv.indexOf("--sandbox-landlock-only");
+    let reason: string | null =
+      flag >= 0 && flag < separator
+        ? (process.argv[flag + 1] ?? "SETUP_FAILED")
+        : getLinuxNamespaceFallbackReason();
+    if (!reason) {
+      try {
+        qualifyBubblewrap();
+      } catch (error) {
+        reason = recordLinuxNamespaceFallback(error);
+      }
+    }
+    const control = process.argv.indexOf("--sandbox-control");
+    const isProbe =
+      tail[0] === process.execPath && tail.at(-1) === "--sandbox-probe";
+    if (!reason && !isProbe && !(control >= 0 && control < separator)) {
+      const result = await runLinuxSandboxSelfTest();
+      if (!result.passed) reason = result.reason;
+    }
+    if (!reason) return runLinuxSandbox(tail, opts?.home);
+    process.stderr.write(`sandbox: landlock-only reason=${reason}\n`);
   }
   // Build the working set from the DAEMON's home (see `HOME_FLAG`), NOT this
   // process's `HOME` — the shim inherits the child's isolated one. The tail's

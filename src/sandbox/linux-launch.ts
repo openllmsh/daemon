@@ -94,7 +94,13 @@ export const linuxProcessStart = (pid: number): string => {
   return start;
 };
 
-export const qualifyBubblewrap = (): string => {
+let bubblewrap: { readonly path: string; readonly version: string } | undefined;
+let bubblewrapFailure: LinuxSandboxError | undefined;
+export const qualifiedBubblewrapVersion = (): string | null =>
+  bubblewrap?.version ?? null;
+
+/** Version 0.5.0 adds --clearenv. The other required flags predate it. */
+const checkBubblewrap = (): { path: string; version: string } => {
   const path = ["/usr/bin/bwrap", "/bin/bwrap"].find(existsSync);
   if (!path) throw new LinuxSandboxError("BWRAP_UNAVAILABLE");
   const binary = realpathSync(path);
@@ -116,10 +122,13 @@ export const qualifyBubblewrap = (): string => {
     stderr: "pipe",
     timeout: 1000,
   });
+  const label = version.stdout.toString().trim();
+  const numbers = /^bubblewrap (\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(label);
   if (
     version.exitCode !== 0 ||
     version.signalCode != null ||
-    version.stdout.toString().trim() !== "bubblewrap 0.13.0"
+    !numbers ||
+    (Number(numbers[1]) === 0 && Number(numbers[2]) < 5)
   )
     throw new LinuxSandboxError("BWRAP_UNAVAILABLE");
   for (const name of [
@@ -129,7 +138,57 @@ export const qualifyBubblewrap = (): string => {
     if (existsSync(name) && Number(readFileSync(name, "utf8")) === 0)
       throw new LinuxSandboxError("USERNS_UNAVAILABLE");
   }
-  return binary;
+  const help = admittedSpawn([binary, "--help"], {
+    env: LINUX_SETUP_ENV,
+    cwd: "/",
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 1000,
+  });
+  const flags = new Set(help.stdout.toString().match(/--[a-z][a-z-]*/g));
+  if (
+    help.exitCode !== 0 ||
+    help.signalCode != null ||
+    [
+      "--args",
+      "--unshare-user",
+      "--unshare-pid",
+      "--die-with-parent",
+      "--cap-drop",
+      "--cap-add",
+      "--ro-bind",
+      "--bind",
+      "--proc",
+      "--tmpfs",
+      "--dev-bind",
+      "--dir",
+      "--symlink",
+      "--chdir",
+      "--clearenv",
+      "--setenv",
+      "--json-status-fd",
+      "--userns-block-fd",
+      "--info-fd",
+      "--lock-file",
+    ].some((flag) => !flags.has(flag))
+  )
+    throw new LinuxSandboxError("BWRAP_UNAVAILABLE");
+  return { path: binary, version: label };
+};
+
+export const qualifyBubblewrap = (): string => {
+  if (bubblewrapFailure) throw bubblewrapFailure;
+  if (bubblewrap) return bubblewrap.path;
+  try {
+    bubblewrap = checkBubblewrap();
+    return bubblewrap.path;
+  } catch (error) {
+    bubblewrapFailure =
+      error instanceof LinuxSandboxError
+        ? error
+        : new LinuxSandboxError("HELPER_RUNTIME_UNAVAILABLE");
+    throw bubblewrapFailure;
+  }
 };
 
 export const linuxVendorEnvironment = (

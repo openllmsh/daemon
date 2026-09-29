@@ -3,7 +3,11 @@ import { resolve } from "node:path";
 import type { TDaemonSandboxDetails } from "@openllmsh/protocol";
 import { DAEMON_VERSION } from "../version";
 import { spawn as admittedSpawn } from "../windows-process";
-import { LinuxSandboxError, qualifyBubblewrap } from "./linux-launch";
+import {
+  LinuxSandboxError,
+  qualifiedBubblewrapVersion,
+  qualifyBubblewrap,
+} from "./linux-launch";
 
 const LANDLOCK_CREATE_RULESET = 444;
 const LANDLOCK_CREATE_RULESET_VERSION = 1;
@@ -45,6 +49,17 @@ const initialDetails = (): TDaemonSandboxDetails => ({
 
 let details = initialDetails();
 let lastRejection: TReason | null = null;
+let namespaceFallbackReason: TReason | null = null;
+
+export const getLinuxNamespaceFallbackReason = (): TReason | null =>
+  namespaceFallbackReason;
+
+export const recordLinuxNamespaceFallback = (error: unknown): TReason => {
+  const reason = reasonFrom(error);
+  namespaceFallbackReason = reason;
+  recordLinuxSandboxRejection(reason);
+  return reason;
+};
 
 export const getLinuxSandboxDetails = (): TDaemonSandboxDetails => ({
   ...details,
@@ -269,6 +284,7 @@ export const probeLinuxSandboxCapability = async (): Promise<
     qualifyBubblewrap();
   } catch (error) {
     const reason = reasonFrom(error);
+    namespaceFallbackReason = reason;
     details = {
       ...details,
       reason,
@@ -282,7 +298,7 @@ export const probeLinuxSandboxCapability = async (): Promise<
   }
   details = {
     ...details,
-    bubblewrapVersion: "bubblewrap 0.13.0",
+    bubblewrapVersion: qualifiedBubblewrapVersion(),
     helperAvailable: true,
     userNamespace: "available",
   };
@@ -312,6 +328,7 @@ export const probeLinuxSandboxCapability = async (): Promise<
     lastRejection: result.reason,
   };
   lastRejection = result.reason;
+  namespaceFallbackReason = result.reason;
   if (result.reason === "USERNS_UNAVAILABLE") return "unsupported";
   if (result.reason === "BWRAP_UNAVAILABLE") return "unsupported";
   if (result.reason === "BWRAP_PRIVILEGED_INSTALL_UNSUPPORTED")
