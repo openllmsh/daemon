@@ -1268,7 +1268,10 @@ export const claudeCodeDelegate: TProviderDelegate = {
       // as a fallback if the CLI times out or fails.
       const readyMark = lifecycle.mark();
       lifecycle.record("readiness_wait", readyMark);
-      const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
+      const installed = await firstOfBudget(
+        budget,
+        cliInstallState(PROVIDER, { demand: true, signal: budget.signal }),
+      );
       if (installed.kind === "expired") {
         lifecycle.record("readiness", readyMark);
         terminalLedger = {

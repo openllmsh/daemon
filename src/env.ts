@@ -253,23 +253,23 @@ export const sharedEnvFilePath = (): string => join(stateDir(), ".env");
 export const serviceEnvFilePath = (): string =>
   daemonEnvFileOverride() ?? sharedEnvFilePath();
 
-/** Loader-owned values retain the caller value they shadowed. Before each load
- * we release only values we still own, so removed files/keys and mode changes
- * cannot leave a dev value impersonating a caller override. A caller mutation
- * to a different value (or deletion) transfers ownership back to the caller.
- * Assigning the identical value directly to process.env is unobservable; it
- * retains the existing ownership, rather than guessing that a reload is explicit.
+/** Keep the caller's port beneath dev-file overrides across repeated loads.
+ * Only the port needs provenance for installed-service selection; other env
+ * keys retain the loader's existing additive/override behavior. A different
+ * assignment or deletion transfers ownership back to the caller. Assigning an
+ * identical value is unobservable and retains its existing provenance.
  */
-const loadedEnvValues = new Map<string, {
-  readonly value: string;
-  readonly callerValue: string | undefined;
-}>();
+let loadedPort:
+  | {
+      readonly value: string;
+      readonly callerValue: string | undefined;
+    }
+  | undefined;
 
-const callerEnvValue = (key: string): string | undefined => {
-  const loaded = loadedEnvValues.get(key);
-  const current = process.env[key];
-  return loaded !== undefined && current === loaded.value
-    ? loaded.callerValue
+const callerPortValue = (): string | undefined => {
+  const current = process.env.OPENLLM_DAEMON_PORT;
+  return loadedPort !== undefined && current === loadedPort.value
+    ? loadedPort.callerValue
     : current;
 };
 
@@ -287,12 +287,10 @@ const callerEnvValue = (key: string): string | undefined => {
  * when the file is missing. Synchronous (boot-time, before anything reads env).
  */
 export const loadEnvFile = (): void => {
-  for (const [key, loaded] of loadedEnvValues) {
-    if (process.env[key] !== loaded.value) continue;
-    if (loaded.callerValue === undefined) delete process.env[key];
-    else process.env[key] = loaded.callerValue;
-  }
-  loadedEnvValues.clear();
+  const callerPort = callerPortValue();
+  if (callerPort === undefined) delete process.env.OPENLLM_DAEMON_PORT;
+  else process.env.OPENLLM_DAEMON_PORT = callerPort;
+  loadedPort = undefined;
   let text: string;
   try {
     text = readFileSync(envFilePath(), "utf-8");
@@ -304,7 +302,9 @@ export const loadEnvFile = (): void => {
   const devMode = isDevMode();
   for (const [key, value] of parseEnvLines(text)) {
     if (shouldWriteEnvVar(key, devMode)) {
-      loadedEnvValues.set(key, { value, callerValue: process.env[key] });
+      if (key === "OPENLLM_DAEMON_PORT") {
+        loadedPort = { value, callerValue: callerPort };
+      }
       process.env[key] = value;
     }
   }
@@ -533,10 +533,10 @@ export const daemonPort = (): number => {
  * value the dev file loader just wrote over it.
  */
 export const hasExplicitServicePortOverride = (): boolean =>
-  callerEnvValue("OPENLLM_DAEMON_PORT") !== undefined;
+  callerPortValue() !== undefined;
 
 export const servicePort = (): number => {
-  const explicit = callerEnvValue("OPENLLM_DAEMON_PORT");
+  const explicit = callerPortValue();
   if (explicit !== undefined && hasExplicitServicePortOverride()) {
     return parseOpenllmDaemonPort(explicit, DEFAULT_DAEMON_PORT);
   }

@@ -15,7 +15,12 @@
 #   OPENLLM_CLOUD_ORIGIN   gateway origin (env → existing ~/.openllm/.env →
 #                          default https://www.openllm.sh; a re-run keeps your origin)
 #   OPENLLM_API_KEY        pair the daemon now; otherwise pair from the dashboard
-#   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
+#   OPENLLM_DAEMON_PORT    local daemon port (default 8787; if unset AND
+#                          nothing is already persisted, and 8787 is taken on
+#                          this machine, the installer walks forward to the
+#                          next free port nearby and persists that instead —
+#                          an explicit or already-persisted port is never
+#                          probed or changed)
 #   OPENLLM_DAEMON_PTY_SESSIONS  enable remote terminal sessions (1/true; default off)
 #
 # This is the ONLY shell installer for the daemon. It also background-provisions
@@ -74,43 +79,52 @@ trim_whitespace() {
   printf '%s' "$value"
 }
 
-# Read one KEY's value from the shared env file (first match wins), trimming
-# whitespace and one layer of surrounding quotes so it matches how the CLI and
-# daemon parse the same file (packages/cli/src/env.ts). Used only to seed the
-# effective origin below; empty/absent → empty string.
-env_file_value() {
-  local wanted="$1" line key value
+# Read one KEY's LAST-occurrence value from the shared env file, mirroring
+# `parseEnvLines` (packages/daemon/src/env.ts): trim the whole line, skip
+# blank/`#` lines, split at the first `=`, trim both sides. `parseEnvLines`
+# folds lines into a `Map` via `.set(key, value)`, so a later duplicate
+# OVERWRITES an earlier one — the last matching line must win here too (the
+# bug this replaces: every reader below used to return on its first match).
+# No quote/comment stripping here — that's a per-caller decision below.
+env_file_lookup() {
+  local wanted="$1" line trimmed key value result="" found=0
   [ -f "$ENV_FILE" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ""|\#*) continue ;; esac
-    key="${line%%=*}"
+    trimmed="$(trim_whitespace "$line")"
+    case "$trimmed" in ""|\#*) continue ;; esac
+    case "$trimmed" in *=*) ;; *) continue ;; esac
+    key="$(trim_whitespace "${trimmed%%=*}")"
+    [ -n "$key" ] || continue
     [ "$key" = "$wanted" ] || continue
-    value="$(trim_whitespace "${line#*=}")"
-    value="${value#[\"\']}"
-    value="${value%[\"\']}"
-    printf '%s' "$value"
-    return 0
+    value="$(trim_whitespace "${trimmed#*=}")"
+    result="$value"
+    found=1
   done < "$ENV_FILE"
+  [ "$found" = 1 ] && printf '%s' "$result"
   return 0
 }
 
-# Read one KEY's RAW value from the shared env file (first match wins) —
-# outer-whitespace trimmed only, no quote or comment stripping. Used only for
-# the port, whose protocol-compatible parsing (`normalize_daemon_port`) needs
-# the untouched value: whether a comment sits inside or outside the quotes
+# Read one KEY's value from the shared env file (last match wins — see
+# `env_file_lookup`), additionally stripping one layer of surrounding quotes
+# so it matches how the CLI resolves the same file (`parseEnvFile` in
+# packages/cli/src/env.ts, which underlies `cliConfig()`). Used only to seed
+# the effective origin below; empty/absent → empty string.
+env_file_value() {
+  local wanted="$1" value
+  value="$(env_file_lookup "$wanted")"
+  value="${value#[\"\']}"
+  value="${value%[\"\']}"
+  printf '%s' "$value"
+}
+
+# Read one KEY's RAW value from the shared env file (last match wins) —
+# outer-whitespace trimmed only, no quote or comment stripping — for the
+# port, whose protocol-compatible parsing (`normalize_daemon_port`) needs the
+# untouched value: whether a comment sits inside or outside the quotes
 # changes the correct strip order, so `env_file_value`'s single fixed order
 # (quotes always stripped first) cannot be reused here.
 env_file_raw_value() {
-  local wanted="$1" line key
-  [ -f "$ENV_FILE" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ""|\#*) continue ;; esac
-    key="${line%%=*}"
-    [ "$key" = "$wanted" ] || continue
-    trim_whitespace "${line#*=}"
-    return 0
-  done < "$ENV_FILE"
-  return 0
+  env_file_lookup "$1"
 }
 
 is_usable_api_key() {
@@ -191,6 +205,123 @@ normalize_daemon_port() {
   { [ "$stripped" -ge 1 ] && [ "$stripped" -le 65535 ]; } || return 1
   printf '%s' "$stripped"
 }
+
+# Default port + the bounded range the auto-increment scan below may walk
+# into (8787-8796) — only reached when no explicit/persisted port exists yet
+# (see the DAEMON_PORT resolution below); an explicit or persisted port is
+# never probed or reassigned.
+DEFAULT_DAEMON_PORT=8787
+PORT_SCAN_LIMIT=10
+
+# Is 127.0.0.1:$port free to bind? Returns 0 free, 1 occupied, 2 unverifiable
+# — a tier returns 2 (rather than falling through) the moment it gets an
+# answer it cannot confidently classify, so a shaky result never gets
+# silently reinterpreted as "free" by a later tier. No single tool is
+# guaranteed present, so this tries, in order:
+#   1. python3 — an actual bind() attempt; the only reliable tier. Its exit
+#      code is explicit: 0 free, 1 EADDRINUSE (occupied), 2 any other error
+#      (permission denied, missing socket support, …) — never guessed.
+#   2. bash's /dev/tcp, bounded by `timeout` so a filtered/backlogged port
+#      can't hang the install — skipped outright without `timeout`, since an
+#      unbounded connect is not an acceptable fallback. A connect success or
+#      a reset both mean something is already there (occupied); "Connection
+#      refused" is the ordinary free-port result. Anything else (including a
+#      build without /dev/tcp support) falls through to the next tier.
+#   3. nc -z -v with a 1s timeout, tried only if 2 gave no answer. A ZERO
+#      exit always means connected (occupied) regardless of output. A
+#      nonzero exit is free ONLY on an explicit "Connection refused" in the
+#      (C-locale, so the text is predictable) output; a reset is occupied;
+#      anything else — timeout, an invalid flag this nc build rejected, a
+#      permission failure — is unverifiable, NOT free.
+#   4. no reliable probe at all — unverifiable; the caller refuses to
+#      install rather than silently gamble.
+# Every tier is TCP-only on 127.0.0.1 (never 0.0.0.0/UDP) and closes its probe
+# socket immediately, so nothing here holds a port — a bind/start race
+# against another process remains inherent to any check-then-act port pick.
+port_is_free() {
+  local port="$1"
+
+  if has_command python3; then
+    local py_rc
+    # The heredoc runs as the tested command of this `if` so a nonzero exit
+    # (1 = EADDRINUSE, 2 = any other error) is read via `$?` in the `else`
+    # branch instead of tripping `set -e` — bash exempts the whole command a
+    # conditional tests from errexit, including everything a function it
+    # calls (here, none — it's a direct external command) runs.
+    if python3 - "$port" >/dev/null 2>&1 <<'PY'
+import errno
+import socket
+import sys
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError as e:
+    sys.exit(1 if e.errno == errno.EADDRINUSE else 2)
+else:
+    sys.exit(0)
+finally:
+    s.close()
+PY
+    then
+      py_rc=0
+    else
+      py_rc=$?
+    fi
+    case "$py_rc" in
+      0) return 0 ;;
+      1) return 1 ;;
+      *) return 2 ;;
+    esac
+  fi
+
+  if has_command timeout; then
+    local probe
+    probe="$(timeout 1 bash -c "exec 3<>'/dev/tcp/127.0.0.1/$port' && printf OK" 2>&1)" || true
+    case "$probe" in
+      OK) return 1 ;;
+      *[Rr]efused*) return 0 ;;
+      *"eset"*) return 1 ;;
+    esac
+  fi
+
+  if has_command nc; then
+    local out
+    # Same if/else exit-code capture as the python3 tier above (a bare
+    # failing assignment would otherwise trip `set -e` on the common "nc
+    # exited nonzero because the port is free" case).
+    if out="$(LC_ALL=C LANG=C nc -z -v -w 1 127.0.0.1 "$port" 2>&1)"; then
+      return 1
+    fi
+    case "$out" in
+      *"Connection refused"*) return 0 ;;
+      *"onnection reset"*|*"eset by peer"*) return 1 ;;
+    esac
+    return 2
+  fi
+
+  return 2
+}
+
+# Bounded scan for a free port starting at $1, trying at most $2 candidates
+# ($start, $start+1, … capped at 65535). Prints the first free port and
+# returns 0; returns 1 once exhausted, or 2 the moment a probe can't verify.
+find_available_port() {
+  local start="$1" limit="$2" port attempt rc
+  port="$start"
+  attempt=0
+  while [ "$attempt" -lt "$limit" ]; do
+    port_is_free "$port"
+    rc=$?
+    [ "$rc" -eq 0 ] && { printf '%s' "$port"; return 0; }
+    [ "$rc" -eq 2 ] && return 2
+    attempt=$((attempt + 1))
+    port=$((port + 1))
+    [ "$port" -le 65535 ] || break
+  done
+  return 1
+}
+
 DAEMON_PORT="${OPENLLM_DAEMON_PORT:-}"
 if [ -n "$DAEMON_PORT" ]; then
   NORMALIZED_PORT="$(normalize_daemon_port "$DAEMON_PORT")" && DAEMON_PORT="$NORMALIZED_PORT" || DAEMON_PORT=""
@@ -201,7 +332,20 @@ if [ -z "$DAEMON_PORT" ]; then
     NORMALIZED_PORT="$(normalize_daemon_port "$RAW_PERSISTED_PORT")" && DAEMON_PORT="$NORMALIZED_PORT"
   fi
 fi
-[ -n "$DAEMON_PORT" ] || DAEMON_PORT=8787
+# Neither an explicit nor a persisted port exists yet — a genuinely
+# first-ever choice, never a reassignment. Probe the default and, only here,
+# walk forward to the next free port in a small bounded range.
+if [ -z "$DAEMON_PORT" ]; then
+  if RESOLVED_PORT="$(find_available_port "$DEFAULT_DAEMON_PORT" "$PORT_SCAN_LIMIT")"; then
+    DAEMON_PORT="$RESOLVED_PORT"
+  else
+    SCAN_RC=$?
+    if [ "$SCAN_RC" -eq 2 ]; then
+      die "could not verify any port's availability near $DEFAULT_DAEMON_PORT (no python3, no timeout+/dev/tcp, no nc) — set OPENLLM_DAEMON_PORT to choose one explicitly"
+    fi
+    die "no free port found for the daemon in $DEFAULT_DAEMON_PORT-$((DEFAULT_DAEMON_PORT + PORT_SCAN_LIMIT - 1)) — set OPENLLM_DAEMON_PORT to choose one"
+  fi
+fi
 case "$INSTALL_MODE" in
   install|update) ;;
   *) die "OPENLLM_INSTALL_MODE must be 'install' or 'update'" ;;
@@ -359,13 +503,12 @@ fi
 # Re-read under the same exclusive `$ENV_FILE.lock` protocol as the daemon's
 # writeEnvFileVars. Never rebuild this file from a pre-download snapshot: a daemon
 # can mint a device id or update credentials while binaries are downloading.
+# Delegates to `env_file_lookup` for the same last-match-wins, trim/skip
+# semantics as `parseEnvLines` (packages/daemon/src/env.ts) — the values read
+# here (API key, device id, PTY flag) are exactly what that parser resolves
+# on the daemon's own next boot.
 read_env_value() {
-  local wanted="$1" line key
-  [ -f "$ENV_FILE" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    key="${line%%=*}"
-    [ "$key" = "$wanted" ] && { printf '%s' "${line#*=}"; return 0; }
-  done < "$ENV_FILE"
+  env_file_lookup "$1"
 }
 
 write_env_file() {

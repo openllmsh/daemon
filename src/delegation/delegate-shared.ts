@@ -80,8 +80,12 @@ export const loginWiring = <
   installHint: opts.installHint,
   connectedDetail: opts.connectedDetail as TConnected,
   inProgressDetail: opts.inProgressDetail as TProgress,
+  // Demand: gates the CONNECT flow (a direct user action), so a manager-
+  // shimmed CLI that has never been resolved yet gets resolved now instead
+  // of failing closed forever — an absent cache must not be permanently
+  // unusable.
   isInstalled: async (): Promise<boolean> =>
-    (await cliInstallState(opts.provider)).installed,
+    (await cliInstallState(opts.provider, { demand: true })).installed,
   isConnected: async (): Promise<boolean> =>
     withRefreshCaller("login", async (): Promise<boolean> => {
       if (opts.isConnected !== undefined) return opts.isConnected();

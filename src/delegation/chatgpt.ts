@@ -597,7 +597,8 @@ export const chatgptDelegate: TProviderDelegate = {
       // (which would let the cloud's older-semver guard drop a freshly-fetched
       // list). `cliInstallState` already extracts the bare x.y.z; `0.0.0` fallback
       // keeps the query well-formed when the version can't be read.
-      const ver = (await cliInstallState(PROVIDER)).version ?? "0.0.0";
+      const ver =
+        (await cliInstallState(PROVIDER, { demand: true })).version ?? "0.0.0";
       return fetchModelList(
         await resolveProviderUrl(
           PROVIDER,
@@ -830,7 +831,7 @@ export const chatgptDelegate: TProviderDelegate = {
   logout: async () => {
     // `codex logout` revokes the token server-side; then ensure the isolated
     // auth.json is gone regardless of CLI version.
-    if ((await cliInstallState(PROVIDER)).installed) {
+    if ((await cliInstallState(PROVIDER, { demand: true })).installed) {
       await runCapture([bin(), "logout"], env());
     }
     await rm(join(cliConfigDir(PROVIDER), "auth.json"), {
