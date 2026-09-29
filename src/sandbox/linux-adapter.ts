@@ -29,6 +29,7 @@ export type TLinuxLaunchHandle = {
   readonly ready: Promise<void>;
   readonly cleanup: Promise<TLinuxCleanupResult>;
   readonly signal: (signal: 1 | 2 | 9 | 15) => void;
+  readonly shimExited: (code: number) => void;
 };
 const launches = new Map<string, TLinuxLaunchHandle>();
 
@@ -135,6 +136,7 @@ export const prepareLinuxLaunch = (): string[] => {
   const settle = (
     event: "ready" | "reject" | "finish",
     outcome?: TLinuxLaunchOutcome,
+    rejectionCode: SandboxLaunchError["code"] = "SANDBOX_UNAVAILABLE",
   ): void => {
     if (stopped()) return;
     if (state === "pending") {
@@ -144,7 +146,7 @@ export const prepareLinuxLaunch = (): string[] => {
       } else {
         state = "rejected";
         rejectReady(
-          new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux setup rejected"),
+          new SandboxLaunchError(rejectionCode, "Linux setup rejected"),
         );
       }
     }
@@ -391,7 +393,25 @@ export const prepareLinuxLaunch = (): string[] => {
       }
     });
   };
-  launches.set(name, { ready, cleanup, signal, completion });
+  const shimExited = (code: number): void => {
+    if (stopped() || registered || admitted) return;
+    // Drain a queued connection before classifying a pre-connect exit.
+    if (socket < 0) {
+      const accepted = native.sandboxAccept(listener);
+      if (accepted >= 0) socket = accepted;
+    }
+    if (socket >= 0) {
+      drive();
+      return;
+    }
+    settle(
+      "reject",
+      undefined,
+      code === 78 ? "POLICY_INVALID" : "SANDBOX_UNAVAILABLE",
+    );
+    finish();
+  };
+  launches.set(name, { ready, cleanup, signal, completion, shimExited });
   queueMicrotask(drive);
   return ["--sandbox-control", name];
 };

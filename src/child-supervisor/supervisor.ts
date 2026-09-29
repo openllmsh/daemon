@@ -446,6 +446,14 @@ export const superviseSpawn = (
     resolveReleased,
   };
   trackedChildren.set(pid, tracked);
+  if (handle.sandbox) {
+    const launch = handle.sandbox;
+    void subprocess.exited
+      .then((code) => launch.shimExited(code))
+      .catch((error) =>
+        logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
+      );
+  }
   // Read the shared process identity, then persist the record.
   // Linux reads /proc in-process. macOS uses an async ps helper.
   //
