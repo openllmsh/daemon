@@ -1565,7 +1565,17 @@ let shimTmpDirMinted = false;
  * root; its entries fall under the orphan report.
  */
 const mintShimChildTmpDir = (tmpRoot: string): void => {
-  if (process.platform === "linux") return;
+  if (process.platform === "linux") {
+    const flag = process.argv.indexOf("--sandbox-landlock-only");
+    const separator = process.argv.indexOf("--");
+    const { getLinuxNamespaceFallbackReason } =
+      require("../linux-status") as typeof import("../linux-status");
+    if (
+      !(flag > 0 && (separator < 0 || flag < separator)) &&
+      !getLinuxNamespaceFallbackReason()
+    )
+      return;
+  }
   if (shimTmpDirMinted) return;
   shimTmpDirMinted = true;
   const envTmp = process.env.TMPDIR;
