@@ -33,6 +33,7 @@ export type TLinuxLaunchHandle = {
   readonly cleanupStatus: "pending" | "confirmed" | "unconfirmed";
   readonly signal: (signal: 1 | 2 | 9 | 15) => void;
   readonly shimExited: (code: number) => void;
+  readonly bindShim?: (kill: () => void) => void;
 };
 const launches = new Map<string, TLinuxLaunchHandle>();
 
@@ -104,6 +105,8 @@ export const prepareLinuxLaunch = (): string[] => {
   let ownerFd = -1;
   let pendingSignal = 0;
   let admitted = false;
+  let shimExitObserved = false;
+  let killShim: (() => void) | undefined;
   let rejected = false;
   const fds = new Int32Array(3);
   const ownership = Buffer.alloc(4161);
@@ -192,13 +195,18 @@ export const prepareLinuxLaunch = (): string[] => {
   const fail = (): void => {
     recordLinuxSandboxRejection("SETUP_FAILED");
     settle("reject");
-    if (!admitted) finish();
-    else {
-      rejected = true;
-      cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+    rejected = true;
+    cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+    if (!admitted) {
+      if (shimExitObserved) {
+        finish();
+        return;
+      }
+      killShim?.();
+    } else {
       native.sandboxSignal(ownerFd, 15);
-      queueMicrotask(drive);
     }
+    queueMicrotask(drive);
   };
   const signal = (value: 1 | 2 | 9 | 15): void => {
     if (stopped()) return;
@@ -208,6 +216,7 @@ export const prepareLinuxLaunch = (): string[] => {
     if (!registered) {
       if (pendingSignal !== 9) pendingSignal = value;
       if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
+      else if (value === 9) killShim?.();
       return;
     }
     if (value === 9) {
@@ -218,6 +227,7 @@ export const prepareLinuxLaunch = (): string[] => {
   const step = (): void => {
     if (performance.now() >= cleanupDeadline) reportUnconfirmed();
     if (rejected) {
+      if (!admitted) return;
       try {
         const owner = new Int32Array([ownerFd, ownerFd, ownerFd]);
         if (native.sandboxDescriptorsExited(ptr(owner))) {
@@ -384,6 +394,7 @@ export const prepareLinuxLaunch = (): string[] => {
     if (fd < 0) {
       recordLinuxSandboxRejection("SETUP_FAILED");
       if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
+      else killShim?.();
       if (registered) {
         native.sandboxSignal(fds[2] as number, 9);
         native.sandboxSignal(fds[0] as number, 9);
@@ -405,8 +416,13 @@ export const prepareLinuxLaunch = (): string[] => {
   };
   const shimExited = (code: number): void => {
     if (stopped()) return;
+    shimExitObserved = true;
     if (registered || admitted) {
       drive();
+      return;
+    }
+    if (rejected) {
+      finish();
       return;
     }
     // Drain a queued connection before classifying a pre-connect exit.
@@ -434,6 +450,10 @@ export const prepareLinuxLaunch = (): string[] => {
     signal,
     completion,
     shimExited,
+    bindShim: (kill): void => {
+      killShim = kill;
+      if (rejected && !admitted) kill();
+    },
   });
   queueMicrotask(drive);
   return ["--sandbox-control", name];

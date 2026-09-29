@@ -280,6 +280,7 @@ const finishTrackedChild = async (
 ): Promise<TReapOutcome> => {
   if (tracked.handle.sandbox) {
     const result = await tracked.handle.sandbox.cleanup;
+    await waitChildExited(tracked.handle);
     return releaseSandboxChild(tracked, result.cleanup, "exited");
   }
   try {
@@ -325,9 +326,10 @@ const terminateTrackedChild = (
       if (first !== "exited") launch.signal(9);
       let timer: ReturnType<typeof setTimeout> | undefined;
       const outcome = await Promise.race([
-        launch.cleanup.then((result) =>
-          releaseSandboxChild(tracked, result.cleanup, "terminated"),
-        ),
+        launch.cleanup.then(async (result) => {
+          await waitChildExited(tracked.handle);
+          return releaseSandboxChild(tracked, result.cleanup, "terminated");
+        }),
         launch.completion.then((result) =>
           result.kind === "reap_unconfirmed"
             ? releaseSandboxChild(tracked, "unconfirmed", "terminated")
@@ -449,6 +451,7 @@ export const superviseSpawn = (
   trackedChildren.set(pid, tracked);
   if (handle.sandbox) {
     const launch = handle.sandbox;
+    launch.bindShim?.(() => signalGroup(pgid, "SIGKILL"));
     void subprocess.exited
       .then((code) => launch.shimExited(code))
       .catch((error) =>
