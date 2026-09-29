@@ -2938,6 +2938,12 @@ const walkPlan = async (
       // handroll, fleet, or advance to another provider for the same turn.
       const captureOwnership = native.captureOwnership;
       if (captureOwnership === "accepted" || captureOwnership === "uncertain") {
+        if (args.req.signal.aborted) {
+          return {
+            response: errorJson(499, "client aborted request"),
+            servedLocally: true,
+          };
+        }
         addHopFailure(hop, nativeDecline, undefined, nativeCooldownReason);
         lastError = nativeDecline;
         return {

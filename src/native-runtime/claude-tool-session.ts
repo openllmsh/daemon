@@ -802,8 +802,17 @@ export const continueToolTurn = async (
           captureOwnership: "accepted",
         };
       }
+      let inputTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        await h.streamInput(injectedContext);
+        await Promise.race([
+          h.streamInput(injectedContext),
+          new Promise<never>((_, reject) => {
+            inputTimer = setTimeout(
+              () => reject(new Error("client context delivery timed out")),
+              driveTimeoutMs,
+            );
+          }),
+        ]);
       } catch (err) {
         // May have partially sent — "uncertain" stops the walker from
         // retrying this hop over a different transport.
@@ -815,6 +824,8 @@ export const continueToolTurn = async (
           }`,
           captureOwnership: "uncertain",
         };
+      } finally {
+        clearTimeout(inputTimer);
       }
     }
     for (const r of matched) {
@@ -899,8 +910,9 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     }
     clearTimeout(deadlineTimer);
     if (step === "drive-timeout") {
-      // The in-flight next() (if any) is abandoned along with the session —
-      // there is nothing usable to retain once we've given up on it.
+      // Nothing usable remains once we've given up on the session. The race
+      // above still observes nextP's eventual rejection, even after timeout
+      // wins; dropping our local reference does not remove that handler.
       closeHeld(h);
       return { kind: "declined", reason: "tool turn drive timed out" };
     }
