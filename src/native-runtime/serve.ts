@@ -307,16 +307,14 @@ export type TNativeServeOutcome =
     };
 
 /**
- * Resolve this hop's EXPLICIT new-vocabulary selection (if any) against the
+ * Resolve this hop's concrete selection (configured or default) against the
  * registry, folding in the one request-shape gate this baseline defines
  * (Claude `stream-json` + caller tools). Callers use the result like this:
  *
- *   - `null` — no explicit selection was configured for this hop at all;
- *     keep the existing legacy `shouldActivateBridgeRequestCapture` dispatch
- *     below UNCHANGED. This is the common case today. A GLOBAL preference
- *     that this provider doesn't register is NOT folded into this case — it
- *     resolves through `{ ok: false, declined }` below like any other
- *     unsupported pairing (09-implementation-plan.md §4.2).
+ *   - `null` — preserve the legacy selector's request-shape-dependent dispatch.
+ *     The walker passes concrete provider defaults for unconfigured hops.
+ *     Unsupported concrete vendor preferences are not folded into this case;
+ *     they resolve through `{ ok: false, declined }` below.
  *   - `{ ok: true, captureActive, variant }` — the explicit selection was
  *     accepted; use ITS `capture` flag instead of the legacy heuristic.
  *     `claude_code` now declares TWO variants (`stream-json`, `sdk-facade` —
@@ -405,13 +403,10 @@ const resolveExplicitDispatch = (
     };
   }
   if (resolution.selection.kind === "handrolled") {
-    // Structurally unreachable in production: the walker samples the
-    // explicit selection from the SAME `ACTIVE_SUB_METHOD` env as the
-    // legacy selector, and a token that resolves to `handrolled` in the new
-    // grammar resolves to `handrolled` in the legacy grammar too — so the
-    // walker's outer branch (`methodsIncludeNativeBridge`) never enters the
-    // native-runtime path at all for that hop. Decline defensively rather
-    // than assume native dispatch is still the right transport.
+    // The walker reconciles both bootstrap projections in resolveHopExecution:
+    // handrolled stays outside native dispatch, or becomes a policy-eligible
+    // vendor default for a bridge-only caller/provider. Reject an unreconciled
+    // handrolled selection here rather than silently choose a different method.
     logExecutionSelectionResolution(provider, executionSelection, {
       effective: "refused",
       refusalKind: "handrolled_unreachable",
@@ -443,10 +438,9 @@ const resolveExplicitDispatch = (
  * (`resolveExplicitDispatch` above) covers all four migrated providers, so
  * this never duplicates per provider. Privacy-safe: provider/variant/
  * capture/outcome tags only — never the request body, prompt, or
- * credentials. Only fires for an EXPLICIT selection (the common no-
- * selection case returns `null` from `resolveExplicitDispatch` before this
- * is ever called, and stays silent here — it already keeps today's
- * unchanged legacy dispatch and its own existing diagnostics).
+ * credentials. Concrete provider defaults log here too; explicit legacy
+ * selectors return `null` from `resolveExplicitDispatch` and retain their
+ * own dispatch diagnostics.
  *
  * Every explicit selection resolves to exactly one of these two outcomes —
  * there is no scope-dependent third "ignored" outcome (09-implementation-
@@ -504,15 +498,10 @@ export type TNativeServeParams = {
    */
   readonly bridgeCapture?: boolean;
   /**
-   * The walker's sampled EXPLICIT new-vocabulary selection for this hop
-   * (per-provider override or global preference; see `walker.ts`), or
-   * `null`/omitted when none is configured — the common case, which keeps
-   * this function's unchanged legacy `bridgeCapture` dispatch below
-   * (09-implementation-plan.md phase 5). When non-null, `resolveExplicit
-   * Dispatch` below resolves it through `execution-registry.ts`'s
-   * `resolveExecutionSelection` and either declines this hop pre-dispatch
-   * (typed refusal — unsupported variant/shape/capture) or overrides the
-   * capture decision with the resolved selection's own `capture` flag.
+   * The walker's concrete provider selection (override, global preference or
+   * registry default). `null`/omitted preserves legacy `bridgeCapture`
+   * dispatch. Non-null selections validate through resolveExecutionSelection
+   * and either decline pre-dispatch or select their own variant/capture path.
    */
   readonly executionSelection?: TExecutionSelection | null;
   /** Catalog-gated client-output repair, resolved by the walker. */
@@ -621,13 +610,9 @@ export const tryServeNativeRuntime = async (
   if (unsupported !== null) {
     return { declined: `native runtime can't honor ${unsupported}` };
   }
-  // Resolve this hop's EXPLICIT new-vocabulary selection ONCE, ahead of the
-  // tool/text branch below — one resolution covers both, since `provider`
-  // here is already `claude_code`/`chatgpt` on either path (see
-  // `resolveExplicitDispatch`'s doc comment). `null` means no explicit
-  // selection was configured for this hop; every capture decision below
-  // keeps this function's unchanged legacy dispatch in that case
-  // (09-implementation-plan.md phase 5, "existing-path migration").
+  // Resolve the concrete selection ONCE, ahead of the tool/text branch.
+  // The walker supplies either an explicit variant or the provider default.
+  // `null` preserves request-shape-dependent legacy bridge selectors.
   const explicitDispatch = resolveExplicitDispatch(
     params.provider,
     params.executionSelection,
@@ -642,8 +627,8 @@ export const tryServeNativeRuntime = async (
   // module doc). It handles BOTH tool-bearing and plain-text requests
   // itself, so it branches BEFORE the `hasClientTools`/`nativeRequestOf`
   // split below, which is `stream-json`/`agent-sdk`-specific. Only reached
-  // for an EXPLICIT `sdk-facade` selection — the common case (no explicit
-  // selection) never enters this branch.
+  // for a concrete `sdk-facade` selection, either explicit or the registry's
+  // caller-policy default. Explicit legacy bridge selectors keep their paths.
   if (
     params.provider === "claude_code" &&
     explicitDispatch !== null &&

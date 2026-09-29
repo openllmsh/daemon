@@ -1,41 +1,13 @@
 /**
- * The provider execution registry — the ONE capability authority for the
- * named execution variants (`stream-json` / `agent-sdk` / `sdk-facade` /
- * `acp` / `app-server` / `msp`) and their composable capture forms.
+ * The capability and default authority for named execution methods.
+ * `defaultSelection` is policy; variants/captureVariants are supported sets,
+ * never priority lists. `sub-method.ts#resolveHopExecution` combines these
+ * defaults with both bootstrap vocabularies and caller policy before dispatch.
+ * Concrete vendor selections still validate strictly; selecting a default
+ * is not permission to substitute another method after dispatch fails.
  *
- * This is additive, new-vocabulary machinery living alongside (not
- * replacing) `sub-method.ts`'s legacy `bridge` / `bridge-capture` /
- * `handrolled` capability table and selection. `sub-method.ts` still owns
- * the OUTER per-hop branch (native-runtime vs handrolled vs fleet — see
- * `localMethodsForHop`), driven by the same `ACTIVE_SUB_METHOD` env through
- * its own legacy grammar; this module exists so:
- *
- *   - a provider's declared new-vocabulary variants and their capture
- *     eligibility have exactly one home (no parallel hand-maintained
- *     tables per provider), and
- *   - the cloud can look up, for an EXPLICIT new-vocabulary selection,
- *     whether an old daemon (one that never negotiated
- *     `EXECUTION_SELECTION2_CAP`) would behave identically if the
- *     selection were projected into the legacy `active_sub_method(s)`
- *     field — safe for `chatgpt`/`cursor`/`muse` (their shipped `bridge`
- *     already means exactly one thing each: `app-server` / `acp` / `msp`),
- *     never safe for `claude_code` (its `bridge` is request-shape-
- *     dependent: text→`stream-json`, tools→`agent-sdk` today) — see
- *     09-implementation-plan.md §8.2.
- *
- * `resolveExecutionSelection` below is the per-hop resolver for an
- * EXPLICIT new-vocabulary request against this registry, producing a typed
- * refusal rather than silently falling through to a provider default.
- * `native-runtime/serve.ts` calls it (09-implementation-plan.md phase 5,
- * "existing-path migration") whenever the walker samples a non-null
- * `execution_selection(s)` bootstrap field for the hop's provider — an
- * EXPLICIT admin choice through the SAME `ACTIVE_SUB_METHOD` env, decoded
- * into the richer wire grammar by `packages/api/lib/sub-method.ts` and
- * negotiated via `EXECUTION_SELECTION2_CAP`. When the walker has no such
- * explicit selection for a hop (the common case today), `serve.ts` keeps
- * its unchanged legacy `shouldActivateBridgeRequestCapture` dispatch —
- * this registry only ever governs an EXPLICIT selection, never silently
- * overrides the default.
+ * Historical legacy bridge equivalents are separate from current defaults:
+ * changing a default must never change what an older daemon's bridge means.
  */
 
 import type {
@@ -44,14 +16,22 @@ import type {
   TSubMethod,
   TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
+import {
+  executionSelectionBridge,
+  executionSelectionHandrolled,
+} from "@openllmsh/protocol";
 
 export type TExecutionVariant = TBridgeVariant | "handrolled";
 
 export type TProviderExecutionRegistration = {
   readonly provider: TSubscriptionProviderSlug;
-  /** Ordered, duplicate-free supported methods, including `handrolled`
-   *  where available. `variants[0]` remains the provider's default. */
+  /** Duplicate-free supported methods. Order does not select a default. */
   readonly variants: readonly TExecutionVariant[];
+  readonly defaultSelection: TExecutionSelection;
+  /** Caller-policy fallback only; never an inference-failure retry. */
+  readonly policyFallbackSelection?: TExecutionSelection;
+  /** Frozen meaning of old daemons' bridge selector, not a current default. */
+  readonly legacyBridgeVariant?: TBridgeVariant;
   /** Capture-capable subset of `variants`; the bridge-only type excludes
    *  `handrolled`, which never supports capture. */
   readonly captureVariants: readonly TBridgeVariant[];
@@ -73,54 +53,43 @@ export const PROVIDER_EXECUTION_REGISTRY: readonly TProviderExecutionRegistratio
   [
     {
       provider: "claude_code",
-      // `stream-json` (direct-CLI text) stays `variants[0]` — the ONE variant
-      // `legacySubMethodEquivalentFor` would even consider (it never actually
-      // reaches that comparison for claude_code — see that function's doc
-      // comment: claude_code's legacy `bridge` is request-shape-dependent and
-      // never gets a legacy-field projection for ANY explicit variant).
-      // `sdk-facade` (12-hermes-adoption-plan.md, H1-H4) is a SECOND,
-      // independently-selectable Claude variant: unlike `stream-json` it
-      // supports caller tools (no `requestShapeUnsupportedFor` gate — see
-      // that function's doc comment, which is `stream-json`-only) because it
-      // replays the full canonical history itself rather than relying on the
-      // held Agent SDK. Live-authenticated validation (H6) is still pending;
-      // registering it here only makes it a REACHABLE, typed-refusal-free
-      // selection for its PROVEN shape, never a claim that H6's gates passed.
-      // H1's real-CLI construction proof (`claude-sdk-facade.ts`'s module doc,
-      // `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`)
-      // now covers ordinary multi-turn and tool-continuation history too, not
-      // just a single first turn: the earlier "assistant frame never
-      // acknowledged" finding was a bug in this facade's own frame
-      // construction (it mis-assigned the ack-wait flag to assistant frames
-      // as well as user frames), not a genuine CLI limitation — the reference
-      // protocol, and the real CLI, only ever wait for an ack after a
-      // `type:"user"` frame. Fixed, there is no assistant-replay gap left to
-      // gate here.
+      // Other callers need a vendor runtime; the facade supports both tools
+      // and history replay (routing-variants-bench.md, run 1790691747528).
+      defaultSelection: executionSelectionHandrolled(),
+      policyFallbackSelection: executionSelectionBridge("sdk-facade", true),
       variants: ["stream-json", "sdk-facade", "handrolled"],
       captureVariants: ["stream-json", "sdk-facade"],
     },
     {
       provider: "chatgpt",
+      defaultSelection: executionSelectionHandrolled(),
+      legacyBridgeVariant: "app-server",
       variants: ["app-server", "handrolled"],
       captureVariants: ["app-server"],
     },
     {
       provider: "cursor",
+      defaultSelection: executionSelectionBridge("acp", false),
+      legacyBridgeVariant: "acp",
       variants: ["acp"],
       captureVariants: ["acp"],
     },
     {
       provider: "muse",
+      defaultSelection: executionSelectionBridge("msp", true),
+      legacyBridgeVariant: "msp",
       variants: ["msp"],
       captureVariants: ["msp"],
     },
     {
       provider: "kimi_code",
+      defaultSelection: executionSelectionHandrolled(),
       variants: ["handrolled"],
       captureVariants: [],
     },
     {
       provider: "grok",
+      defaultSelection: executionSelectionHandrolled(),
       variants: ["handrolled"],
       captureVariants: [],
     },
@@ -130,6 +99,19 @@ const registrationFor = (
   provider: string,
 ): TProviderExecutionRegistration | undefined =>
   PROVIDER_EXECUTION_REGISTRY.find((entry) => entry.provider === provider);
+
+/** Handrolled is not eligible for non-first-party Claude callers. */
+export const defaultExecutionSelectionFor = (
+  provider: string,
+  originator?: { readonly isClaudeCode: boolean },
+): TExecutionSelection | null => {
+  const registration = registrationFor(provider);
+  if (registration === undefined) return null;
+  if (provider === "claude_code" && originator?.isClaudeCode !== true) {
+    return registration.policyFallbackSelection ?? null;
+  }
+  return registration.defaultSelection;
+};
 
 export const registeredVariantsFor = (
   provider: string,
@@ -182,7 +164,7 @@ export const legacySubMethodEquivalentFor = (
   if (registration === undefined) return null;
   // Only the provider's OWN single already-shipped variant has a legacy
   // meaning to be equivalent to (not merely any registered variant).
-  if (registration.variants[0] !== selection.variant) return null;
+  if (registration.legacyBridgeVariant !== selection.variant) return null;
   if (!selection.capture) return "bridge";
   return providerSupportsCaptureFor(provider, selection.variant)
     ? "bridge-capture"

@@ -15,9 +15,11 @@
  * as `requested`, and selection resolves it against the provider's
  * declared methods:
  *
- *   selected = requested !== null && methods.includes(requested)
- *     ? requested
- *     : methods[0];               // provider default (array-index-0)
+ * Supported legacy preferences retain their meaning. An absent/unsupported
+ * preference uses execution-registry.ts's explicit defaultSelection (and its
+ * caller-policy fallback), never methods[0]. resolveHopExecution reconciles
+ * both bootstrap vocabularies before choosing the outer transport and the
+ * concrete vendor variant together.
  *
  * The walker samples the selection ONCE per hop, before local execution:
  * `handrolled` never probes or spawns the bridge; `bridge` /
@@ -29,16 +31,28 @@
  * Cursor's ACP/Connect capture, and Muse's native endpoint-transport capture.
  * Declaration enables selection; it does not certify every live scenario.
  * Only providers without that declaration normalize a capture override to
- * `methods[0]`; see the capture live-validation report for tested coverage.
+ * the explicit provider default; see the capture live-validation report for tested coverage.
  */
 
 import type {
+  TExecutionSelection,
   TSubMethod,
   TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
+import {
+  defaultExecutionSelectionFor,
+  effectiveExecutionSelectionForHop,
+} from "./execution-registry";
+
+const subMethodForSelection = (selection: TExecutionSelection): TSubMethod =>
+  selection.kind === "handrolled"
+    ? "handrolled"
+    : selection.capture
+      ? "bridge-capture"
+      : "bridge";
 
 export type TSubMethodCapability = {
-  /** Ordered, non-empty, duplicate-free; `methods[0]` is the default. */
+  /** Non-empty, duplicate-free supported set; order is not default policy. */
   readonly methods: readonly TSubMethod[];
 };
 
@@ -64,7 +78,7 @@ export const SUB_METHOD_CAPABILITIES: Readonly<
   // RunSSE+BidiAppend transaction via runCursorNativeCapture (HTTP/2 duplex
   // fail-closed post-accept with captureOwnership accepted/uncertain).
   cursor: { methods: ["bridge", "bridge-capture"] },
-  // Muse Code: MSP bridge by default. bridge-capture activates
+  // Muse Code: MSP capture by default. bridge-capture activates
   // settings.endpoint_transport plaintext redirect (Keychain-free durable
   // auth proven 2026-09-27). No handrolled Meta Model API path.
   muse: { methods: ["bridge", "bridge-capture"] },
@@ -86,7 +100,7 @@ export const isClaudeCodeOriginator = (headers: Headers): boolean =>
 /**
  * Resolve the effective method for one subscription hop. Deterministic:
  * a null/unsupported preference selects the provider default
- * (`methods[0]`). Unknown providers (not in the closed subscription set)
+ * (the registry's explicit selection). Unknown providers (not in the closed subscription set)
  * resolve to `handrolled` — the walker's `canWalkPlan`/`UPSTREAM_WIRE`
  * already decide whether such a hop is servable at all.
  *
@@ -112,9 +126,11 @@ export const selectSubMethod = (
   const capability =
     SUB_METHOD_CAPABILITIES[provider as TSubscriptionProviderSlug];
   if (capability === undefined) return "handrolled";
-  return requested !== null && capability.methods.includes(requested)
-    ? requested
-    : capability.methods[0];
+  if (requested !== null && capability.methods.includes(requested)) {
+    return requested;
+  }
+  const selection = defaultExecutionSelectionFor(provider, originator);
+  return selection === null ? "handrolled" : subMethodForSelection(selection);
 };
 
 /**
@@ -149,8 +165,13 @@ export const localMethodsForHop = (
   // policy.
   if (provider === "claude_code" && originator?.isClaudeCode !== true) {
     const selected = selectSubMethod(provider, requested, originator);
-    if (selected === "bridge-capture") return ["bridge-capture"];
-    return ["bridge"];
+    if (selected === "handrolled") {
+      const fallback = defaultExecutionSelectionFor(provider, originator);
+      return fallback?.kind === "bridge"
+        ? [subMethodForSelection(fallback)]
+        : [];
+    }
+    return [selected];
   }
 
   const capability =
@@ -173,6 +194,86 @@ export const localMethodsForHop = (
     return ["bridge", "handrolled"];
   }
   return ["bridge"];
+};
+
+export type ResolveHopExecutionParams = {
+  readonly provider: string;
+  readonly legacyPreference: TSubMethod | null;
+  readonly legacyOverrides: Readonly<Record<string, TSubMethod>>;
+  readonly executionPreference: TExecutionSelection | null;
+  readonly executionOverrides: Readonly<Record<string, TExecutionSelection>>;
+  readonly originator?: { readonly isClaudeCode: boolean };
+};
+
+/** Resolve both bootstrap projections once, before any local dispatch.
+ * A handrolled preference may need a vendor default; forwarding that original
+ * handrolled token into native dispatch would contradict the outer fallback.
+ * Explicit vendor selections stay exact, including their pre-dispatch refusals.
+ */
+export const resolveHopExecution = ({
+  provider,
+  legacyPreference,
+  legacyOverrides,
+  executionPreference,
+  executionOverrides,
+  originator,
+}: ResolveHopExecutionParams): {
+  readonly methods: readonly TSubMethod[];
+  readonly executionSelection: TExecutionSelection | null;
+} => {
+  const requested = legacyOverrides[provider] ?? legacyPreference;
+  if (provider === "claude_code" && originator?.isClaudeCode === true) {
+    return {
+      methods: localMethodsForHop(provider, requested, originator),
+      executionSelection: null,
+    };
+  }
+  const explicit = effectiveExecutionSelectionForHop(
+    provider,
+    executionOverrides,
+    legacyOverrides,
+    executionPreference,
+  );
+  if (explicit?.kind === "bridge") {
+    // Never turn a refused concrete variant into a successful handrolled call.
+    return {
+      methods: [subMethodForSelection(explicit)],
+      executionSelection: explicit,
+    };
+  }
+  if (explicit?.kind === "handrolled" || requested === "handrolled") {
+    const methods = localMethodsForHop(provider, "handrolled", originator);
+    if (methods.includes("handrolled")) {
+      return { methods, executionSelection: null };
+    }
+  }
+  const capability =
+    SUB_METHOD_CAPABILITIES[provider as TSubscriptionProviderSlug];
+  if (
+    explicit?.kind === "handrolled" ||
+    requested === null ||
+    requested === "handrolled" ||
+    !capability?.methods.includes(requested)
+  ) {
+    const selection = defaultExecutionSelectionFor(provider, originator);
+    return {
+      methods:
+        selection === null
+          ? []
+          : localMethodsForHop(
+              provider,
+              subMethodForSelection(selection),
+              originator,
+            ),
+      executionSelection: selection?.kind === "bridge" ? selection : null,
+    };
+  }
+  // Explicit legacy bridge selectors keep their historical shape-dependent
+  // dispatch and pre-accept fallback behavior, not the new concrete defaults.
+  return {
+    methods: localMethodsForHop(provider, requested, originator),
+    executionSelection: null,
+  };
 };
 
 /** Whether the capability table declares a serve-activated capture route. */

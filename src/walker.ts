@@ -200,7 +200,6 @@ import type { TRefreshErrorClass } from "./delegation/refresh";
 import { authReasonCodeForRefreshError } from "./delegation/refresh";
 import type { TProviderDelegate } from "./delegation/types";
 import { stateDir } from "./env";
-import { effectiveExecutionSelectionForHop } from "./execution-registry";
 import { forwardToCloud } from "./forward";
 import {
   clearHopCooldown,
@@ -221,8 +220,8 @@ import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
 import {
   isClaudeCodeOriginator,
-  localMethodsForHop,
   methodsIncludeNativeBridge,
+  resolveHopExecution,
 } from "./sub-method";
 import { tunnelToPeer } from "./tunnel-client";
 import {
@@ -2544,18 +2543,17 @@ const walkPlan = async (
   // overrides — sampled ONCE per request from the cached bootstrap
   // snapshot so it can never switch mid-hop (a bootstrap refresh landing
   // mid-walk applies to the NEXT request). Resolved per hop against the
-  // provider's declared methods in `localMethodsForHop` (capability table +
-  // preference + ToS: CC originator → handrolled-only; non-CC claude_code →
-  // bridge-only; cursor → bridge-only).
+  // provider's declared defaults in `resolveHopExecution` (both vocabularies +
+  // caller policy: first-party Claude → handrolled-only; other Claude callers
+  // and Cursor/Muse → vendor runtime only).
   const requestedSubMethod = activeSubMethod();
   const subMethodOverrides = activeSubMethodOverrides();
   const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
   // The same env's NEW-vocabulary projection (populated only when this
   // daemon negotiated `EXECUTION_SELECTION2_CAP` — see `cloud-client.ts`),
-  // sampled together so it can never switch mid-hop either. Null for a hop
-  // whose provider has no explicit new-vocabulary selection configured —
-  // `native-runtime/serve.ts` then keeps its unchanged legacy dispatch
-  // (09-implementation-plan.md phase 5).
+  // sampled together so it can never switch mid-hop either. Missing preferences
+  // resolve to registry defaults; explicit legacy selectors keep their old
+  // request-shape-dependent dispatch.
   const requestedExecutionSelection = activeExecutionSelection();
   const executionSelectionOverrides = activeExecutionSelectionOverrides();
 
@@ -2799,14 +2797,17 @@ const walkPlan = async (
       return HOP_CONTINUE;
     }
 
-    // Ordered local transports for THIS hop — capability table + preference
-    // + ToS policy (non-CC claude_code → bridge only; cursor → bridge only;
-    // handrolled preference → handrolled only). No per-slug branches here.
-    const methods = localMethodsForHop(
-      hop.provider,
-      subMethodOverrides[hop.provider] ?? requestedSubMethod,
-      { isClaudeCode: claudeCodeOriginator },
-    );
+    // Resolve the outer transport and concrete variant together: a global
+    // handrolled preference must not leak into a bridge-only provider's native
+    // dispatch after its outer selector has fallen back to the provider default.
+    const { methods, executionSelection } = resolveHopExecution({
+      provider: hop.provider,
+      legacyPreference: requestedSubMethod,
+      legacyOverrides: subMethodOverrides,
+      executionPreference: requestedExecutionSelection,
+      executionOverrides: executionSelectionOverrides,
+      originator: { isClaudeCode: claudeCodeOriginator },
+    });
     const wire = UPSTREAM_WIRE[hop.provider];
     const hasHandrolledFallback =
       methods.includes("handrolled") && wire !== undefined;
@@ -2836,16 +2837,7 @@ const walkPlan = async (
         // a precise wrong-owner/epoch decline rather than a misleading map miss.
         continuationToken: args.req.headers.get(TOOL_SESSION_HEADER),
         bridgeCapture: methods.includes("bridge-capture"),
-        // Per-provider override wins over the global preference, then no
-        // explicit selection at all (null) — same precedence as the legacy
-        // `subMethodOverrides[provider] ?? requestedSubMethod` above (
-        // 09-implementation-plan.md §4.2).
-        executionSelection: effectiveExecutionSelectionForHop(
-          hop.provider,
-          executionSelectionOverrides,
-          subMethodOverrides,
-          requestedExecutionSelection,
-        ),
+        executionSelection,
         stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>

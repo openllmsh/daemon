@@ -491,10 +491,33 @@ results as native compressed-envelope proof beyond what was captured through
 the production path. See `sub-method.ts`,
 `bridge-request-capture-readiness.ts`, and `docs/plan/bridge-request-capture/`.
 
+**Execution defaults (`execution-registry.ts` / `sub-method.ts`).**
+The registry's `defaultSelection` explicitly owns the default, including capture;
+`variants` and legacy `methods` are capability lists, not array-index priority.
+`resolveHopExecution` resolves the outer transport and the concrete native
+selection together, after applying caller policy and provider overrides.
+
+| Provider | Default | Caller-policy fallback |
+| --- | --- | --- |
+| `claude_code` | `handrolled` for eligible first-party callers | `sdk-facade-capture` for other callers |
+| `chatgpt` | `handrolled` | — |
+| `cursor` | `acp` | — |
+| `muse` | `msp-capture` | — |
+| `kimi_code`, `grok` | `handrolled` | — |
+
+An unset preference uses these defaults. Global `ACTIVE_SUB_METHOD=handrolled`
+uses handrolled only where supported/permitted; otherwise it uses the provider's
+own default. A provider override in either vocabulary beats the global preference;
+caller policy beats both. Explicit legacy `bridge`/`bridge-capture` selectors keep
+their historical dispatch, and explicit concrete vendor selections remain exact.
+The registry's `legacyBridgeVariant` freezes old-daemon projection independently
+of the current default. See [configuration examples](../../docs/proposals/active-sub-method.md)
+and the exploratory [benchmark](../../routing-variants-bench.md). Handrolled-first
+is a policy choice, not a claim that it won the Codex benchmark. Defaults require
+an updated daemon binary; older binaries retain their shipped defaults.
+
 **Named execution variants (`execution-registry.ts` / `execution-identity.ts`).**
-`sub-method.ts`'s legacy `bridge`/`bridge-capture`/`handrolled` selector still
-owns the OUTER per-hop branch (native-runtime vs handrolled vs fleet). Layered
-on top, an admin may configure an EXPLICIT provider-unprefixed integration id
+An admin may configure an EXPLICIT provider-unprefixed integration id
 through the SAME `ACTIVE_SUB_METHOD` env (`stream-json`/`app-server`/`acp`/
 `msp`/`sdk-facade`, each with an optional `-capture` suffix — `agent-sdk` is
 still reserved but unregistered). The cloud decodes both grammars from one env
@@ -506,9 +529,9 @@ legacy fields) and hands it to `native-runtime/serve.ts`, which resolves it
 through `execution-registry.ts`'s `PROVIDER_EXECUTION_REGISTRY` +
 `resolveExecutionSelection` for all four native-runtime providers (Claude
 direct `stream-json`, Codex `app-server`, Cursor `acp`, Muse `msp`) before
-either the tool or text dispatch branch. A hop with NO explicit selection
-(the common case) is untouched — `serve.ts` keeps its unchanged legacy
-`shouldActivateBridgeRequestCapture` dispatch. A hop WITH one either
+either the tool or text dispatch branch. With no preference, the walker supplies
+the provider's concrete default; explicit legacy selectors instead retain the
+`shouldActivateBridgeRequestCapture` dispatch. A concrete selection either
 dispatches through the SAME base integration (its `capture` flag replaces the
 legacy heuristic, still gated by the same dynamic capture-readiness table) or
 refuses pre-dispatch with a typed reason — never a silent fallback to another
@@ -525,10 +548,10 @@ Claude variant — `sdk-facade` alongside `stream-json`) can never collide. See
 **Claude `sdk-facade`/`sdk-facade-capture` (`claude-sdk-facade.ts` /
 `claude-sdk-facade-capture.ts` /`claude-facade-mcp-server.ts`, phase 6,
 `docs/plan/bridge-variants-and-capture-adapters/12-hermes-adoption-plan.md`
-H1-H4).** Only reachable through an EXPLICIT `sdk-facade`/`sdk-facade-capture`
-selection (`execution-registry.ts` now registers both for `claude_code`) — a
-SECOND, independently-selectable Claude integration, never a replacement for
-`stream-json` or the official Agent SDK. Unlike `stream-json` (single buffered
+H1-H4).** Reachable through an explicit `sdk-facade`/`sdk-facade-capture`
+selection or Claude's non-first-party default (`sdk-facade-capture`). It is an
+independently-selectable Claude integration; explicit `stream-json` and legacy
+Agent SDK dispatch remain available. Unlike `stream-json` (single buffered
 stdin write, `--resume`-based session persistence) or `agent-sdk` (a held
 `query()`), `sdk-facade` drives `claude -p --input-format stream-json
 --output-format stream-json` with the ENTIRE canonical history replayed as
@@ -589,9 +612,10 @@ wait for a nonexistent acknowledgment, so there is no hang to guard against
 and no unsupported shape to refuse. All of the above is CONSTRUCTION/SHAPE
 proof against a local mock upstream — never proof under genuine
 authenticated inference, a different CLI version, or real network
-conditions; live-authenticated validation (H6) remains separately pending —
-see `claude-sdk-facade.ts`'s module doc and 09-implementation-plan.md §13b
-for the exact evidenced status.
+conditions. Subsequent live-authenticated text, caller-tool, tool-result and
+three-turn measurements are recorded in [routing-variants-bench.md](../../routing-variants-bench.md),
+run `1790691747528`; those measurements, not the isolated construction proof,
+inform the new provider default.
 Capture turns force cold construction + full-history seed
 (`captureAwareTextBuilderPlan` / `historyTurnsFromCanonicalMessages` +
 `captureAwareHistoryBuilderPlan`) and never publish a warm resume handle.
@@ -614,7 +638,7 @@ observation. Accepted/uncertain capture ownership terminates the entire walk
 (no second send).
 
 **Execution-selection diagnostics and phase timing (plan phase 8,
-09-implementation-plan.md §8.3).** Every EXPLICIT new-vocabulary selection
+09-implementation-plan.md §8.3).** Every concrete selection (configured or default)
 `native-runtime/serve.ts`'s `resolveExplicitDispatch` resolves — for all four
 migrated providers, one shared call site — logs a `debug`-level "execution
 selection resolved" line with the requested token
@@ -622,8 +646,8 @@ selection resolved" line with the requested token
 with its resolved variant/capture, or `refused` with a typed refusal kind
 (`unsupported_execution_variant`/`unsupported_execution_shape`/
 `capture_not_supported`/`capture_not_ready`/`handrolled_unreachable`). The
-common no-explicit-selection hop (today's default) never logs this — it keeps
-its own existing diagnostics unchanged. Metadata-only: provider/variant/
+explicit legacy-selector hop has no concrete selection and retains its own
+diagnostics; concrete provider defaults use the same resolution diagnostics. Metadata-only: provider/variant/
 capture/outcome tags, never the request body, prompt, or credentials. Claude
 `sdk-facade`/`sdk-facade-capture` additionally share ONE phase-timing emitter
 (`claude-sdk-facade.ts#logSdkFacadePhaseTiming`, called by both the native
