@@ -962,7 +962,7 @@ static int addRule(int ruleset, char *path, u64 mask) {
     if (ERR != 20)
       return -1;
     fd = open(path, OPATH | CLOEXEC);
-    mask &= 0x4007;
+    mask &= 0x1c007;
   }
   if (fd < 0)
     return -1;
@@ -970,6 +970,20 @@ static int addRule(int ruleset, char *path, u64 mask) {
   int rc = (int)syscall(445, ruleset, 1, &rule, 0);
   close(fd);
   return rc;
+}
+static u64 landlockAccessFs(int abi) {
+  if (abi < 1)
+    return 0;
+  u64 mask = 0x1fff;
+  if (abi >= 2)
+    mask |= 1ULL << 13; /* REFER */
+  if (abi >= 3)
+    mask |= 1ULL << 14; /* TRUNCATE */
+  if (abi >= 5)
+    mask |= 1ULL << 15; /* IOCTL_DEV */
+  if (abi >= 9)
+    mask |= 1ULL << 16; /* RESOLVE_UNIX */
+  return mask;
 }
 int sandboxExecutableIdentity(const char *path, char *out) {
   unsigned long data[32] = {0};
@@ -1035,19 +1049,23 @@ static int helper(struct record *r) {
   int abi = (int)syscall(444, 0, 0, 1);
   if (abi < 1)
     die(fail(socket, r, 13));
-  u64 mask = 0x1fff;
-  if (abi >= 2)
-    mask |= 0x2000;
-  if (abi >= 3)
-    mask |= 0x4000;
-  int ruleset = (int)syscall(444, &mask, 8, 0);
+  u64 mask = landlockAccessFs(abi);
+  struct {
+    u64 handled_access_fs;
+  } attr = {mask};
+  int ruleset = (int)syscall(444, &attr, sizeof(attr), 0);
   if (ruleset < 0)
     die(fail(socket, r, 14));
   if (fault(r, "rule"))
     die(fail(socket, r, 15));
-  for (int i = 0; i < r->nro; i++)
-    if (addRule(ruleset, r->ro[i], 13))
+  for (int i = 0; i < r->nro; i++) {
+    u64 access = 13;
+    if (!strcmp(r->ro[i], "/run/systemd/resolve") ||
+        !strcmp(r->ro[i], "/run/resolvconf"))
+      access |= mask & (1ULL << 16);
+    if (addRule(ruleset, r->ro[i], access))
       die(fail(socket, r, 15));
+  }
   for (int i = 0; i < r->nrw; i++)
     if (addRule(ruleset, r->rw[i], mask))
       die(fail(socket, r, 15));
