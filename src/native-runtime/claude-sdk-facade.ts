@@ -711,6 +711,7 @@ const runClaudeSdkFacadeCore = async (
   }
 
   const kill = (): void => {
+    params.signal.removeEventListener("abort", kill);
     stopMcpServer?.();
     try {
       proc.kill("SIGTERM");

@@ -179,6 +179,7 @@ const runClaudeSdkFacadeCaptureCore = async (
   }
 
   const kill = (): void => {
+    params.signal.removeEventListener("abort", kill);
     stopMcpServer?.();
     killProc(proc);
   };
