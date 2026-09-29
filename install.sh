@@ -2587,17 +2587,23 @@ reconcile_keyless_service() {
 }
 
 # Keep a healthy service when the prerelease binaries and config did not change.
-# The status command checks registration, the supervisor, and live health.
+# Require live health and a running version that matches the installed binary.
 prerelease_service_healthy() {
-  local status
+  local status version
   [ -n "$PRIOR_ENV_SHA" ] || return 1
   [ "$PRIOR_ENV_SHA" = "$(sha256_of "$ENV_FILE" || true)" ] || return 1
   status="$("$BIN_DIR/openllmd" status 2>/dev/null)" || return 1
-  printf '%s\n' "$status" | awk '
+  run_version_probe "$BIN_DIR/openllmd"
+  [ "$PROBE_STATUS" -eq 0 ] || return 1
+  parse_probe_version "$PROBE_OUT"
+  version="$PARSED_VERSION"
+  [ -n "$version" ] || return 1
+  printf '%s\n' "$status" | awk -v version="$version" '
     $1 == "service:" && $2 == "registered" { registered=1 }
     $1 == "supervisor:" && ($2 == "running" || ($2 == "active" && $3 == "(running)")) { supervised=1 }
     $1 == "health:" && $2 == "serving" { serving=1 }
-    END { exit !(registered && supervised && serving) }
+    $1 == "running" && $2 == "version:" && NF == 3 && $3 == version { current=1 }
+    END { exit !(registered && supervised && serving && current) }
   '
 }
 

@@ -697,6 +697,10 @@ export const formatStatus = (fields: TStatusFields): string => {
           : `NOT responding on 127.0.0.1:${fields.port}`,
     },
     {
+      label: "running version",
+      value: fields.health?.version ?? unknown,
+    },
+    {
       label: "sandbox",
       value: fields.health !== null ? fields.health.sandbox : unknown,
     },
