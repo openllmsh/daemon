@@ -9,7 +9,7 @@ const LANDLOCK_CREATE_RULESET = 444;
 const LANDLOCK_CREATE_RULESET_VERSION = 1;
 const SELF_TEST_TIMEOUT_MS = 10_000;
 const EXPECTED_PROBE_RECORD =
-  '{"sandboxProbe":true,"pid":2,"maps":true,"globalProcAbsent":true,"capabilitiesEmpty":true}\n';
+  '{"sandboxProbe":true,"pid":2,"maps":true,"globalProcAbsent":true,"capabilitiesEmpty":true,"initEnvironment":"EACCES"}\n';
 
 export type TLinuxSandboxProbeOutcome = {
   readonly stdout: string;

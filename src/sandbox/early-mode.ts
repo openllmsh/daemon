@@ -16,6 +16,15 @@ if (process.platform === "linux" && internal === "--sandbox-probe") {
   try {
     const status = readFileSync("/proc/self/status", "utf8");
     const capabilities = status.match(/^Cap\w+:.*$/gm) ?? [];
+    let initEnvironment = "readable";
+    try {
+      readFileSync("/proc/1/environ");
+    } catch (error) {
+      initEnvironment =
+        typeof error === "object" && error !== null && "code" in error
+          ? String(error.code)
+          : "unknown";
+    }
     const result = {
       sandboxProbe: true,
       pid: process.pid,
@@ -32,13 +41,15 @@ if (process.platform === "linux" && internal === "--sandbox-probe") {
       capabilitiesEmpty:
         capabilities.length === 5 &&
         capabilities.every((line) => /:\s+0+$/.test(line)),
+      initEnvironment,
     };
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(
       result.pid === 2 &&
         result.maps &&
         result.globalProcAbsent &&
-        result.capabilitiesEmpty
+        result.capabilitiesEmpty &&
+        result.initEnvironment === "EACCES"
         ? 0
         : 1,
     );
