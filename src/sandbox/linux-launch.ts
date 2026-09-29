@@ -288,6 +288,9 @@ export const buildChildPolicy = (
         : []),
       "--tmpfs",
       "/tmp",
+      ...ro
+        .filter((path) => path.startsWith("/tmp/"))
+        .flatMap((path) => ["--ro-bind", path, path]),
       ...rw.flatMap((path) => ["--bind", path, path]),
       "--proc",
       "/proc",
