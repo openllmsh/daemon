@@ -378,7 +378,8 @@ export class AcpClient {
       () => this.failAllPending("cursor-agent acp stdout closed"),
       () => this.failAllPending("cursor-agent acp stdout failed"),
     );
-    void this.proc.exited.then(() => {
+    void this.proc.exited.then((code) => {
+      this.sandbox?.shimExited(code);
       clearTimeout(this.cancelTimer);
       this.failAllPending("cursor-agent acp exited");
     });

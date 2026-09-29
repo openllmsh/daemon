@@ -603,6 +603,13 @@ const wrapOfficialHost = async (
     ...(options.onStderr !== undefined ? { onStderr: options.onStderr } : {}),
     shutdownTimeoutMs: 1_000,
   });
+  const sandbox = linuxLaunchHandle([options.command, ...options.args]);
+  if (sandbox) {
+    void handshake.exited.then(
+      ({ code }) => sandbox.shimExited(code ?? 1),
+      () => sandbox.shimExited(1),
+    );
+  }
   const onAbort = (): void => {
     void handshake.close().catch(() => {});
   };
@@ -614,7 +621,7 @@ const wrapOfficialHost = async (
   }
   let spawned: Awaited<ReturnType<typeof handshake.initialize>>;
   try {
-    await linuxLaunchHandle([options.command, ...options.args])?.ready;
+    await sandbox?.ready;
     spawned = await handshake.initialize({
       clientInfo: { name: "openllm_daemon", version: DAEMON_VERSION },
       capabilities: MUSE_CLIENT_CAPABILITIES,
