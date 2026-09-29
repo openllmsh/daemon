@@ -53,9 +53,10 @@ export const linuxNative = (testing: boolean = false): TNative => {
     throw new Error("HELPER_RUNTIME_UNAVAILABLE");
   })();
   const name = Buffer.from("openllm-sandbox-source\0");
-  const fd = libc.symbols.memfd_create(ptr(name), 1);
-  if (fd < 0) throw new Error("HELPER_RUNTIME_UNAVAILABLE");
+  let fd = -1;
   try {
+    fd = libc.symbols.memfd_create(ptr(name), 1);
+    if (fd < 0) throw new Error("HELPER_RUNTIME_UNAVAILABLE");
     writeFileSync(fd, source);
     const library = cc({
       source: `/proc/self/fd/${fd}`,
@@ -65,7 +66,7 @@ export const linuxNative = (testing: boolean = false): TNative => {
     libraries.set(testing, library);
     return library.symbols;
   } finally {
-    closeSync(fd);
+    if (fd >= 0) closeSync(fd);
     libc.close();
   }
 };
