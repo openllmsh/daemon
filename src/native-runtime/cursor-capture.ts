@@ -470,6 +470,8 @@ export const openCursorCaptureBridge = async (args: {
   let lastCaptureId: string | null = null;
   /** @type {import('node:net').Socket | null} */
   let activeSocket: import("node:net").Socket | null = null;
+  const sockets = new Set<import("node:net").Socket>();
+  let disposed = false;
 
   const companions: TCursorCapturedCompanion[] = [];
   let companionsChanged: (() => void) | null = null;
@@ -506,9 +508,15 @@ export const openCursorCaptureBridge = async (args: {
   };
 
   const server = createServer((socket) => {
+    if (disposed) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
     activeSocket = socket;
     let buffer = "";
     socket.setEncoding("utf8");
+    socket.on("error", () => socket.destroy());
     socket.on("data", (chunk) => {
       buffer += chunk;
       for (;;) {
@@ -521,6 +529,7 @@ export const openCursorCaptureBridge = async (args: {
       }
     });
     socket.on("close", () => {
+      sockets.delete(socket);
       if (activeSocket === socket) activeSocket = null;
     });
   });
@@ -702,8 +711,6 @@ export const openCursorCaptureBridge = async (args: {
     token,
     externalOrigin: args.externalOrigin,
   });
-
-  let disposed = false;
 
   const assembleTransaction = (
     primary: TCapturedRequestEnvelope,
@@ -893,6 +900,8 @@ export const openCursorCaptureBridge = async (args: {
         );
       }
       session.dispose();
+      for (const socket of sockets) socket.destroy();
+      sockets.clear();
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
       });

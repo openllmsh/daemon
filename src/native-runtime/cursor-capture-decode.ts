@@ -486,37 +486,55 @@ type TProtoField = {
   readonly field: number;
   readonly wire: number;
   readonly bytes: Uint8Array;
-  readonly varint: number | null;
+  readonly varint: bigint | null;
 };
 
 const readVarint = (
   buf: Uint8Array,
   offset: number,
-): { readonly value: number; readonly next: number } => {
-  let result = 0;
-  let shift = 0;
-  let pos = offset;
-  while (pos < buf.byteLength) {
-    const byte = buf[pos] ?? 0;
-    pos += 1;
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) return { value: result >>> 0, next: pos };
-    shift += 7;
-    if (shift > 35) {
-      throw new CursorCaptureDecodeError("invalid_protobuf", "varint too long");
+): { readonly value: bigint; readonly next: number } => {
+  let value = 0n;
+  for (let index = 0; index < 10; index += 1) {
+    const byte = buf[offset + index];
+    if (byte === undefined) {
+      throw new CursorCaptureDecodeError(
+        "truncated_connect_frame",
+        "truncated protobuf varint",
+      );
     }
+    // A protobuf uint64 has only one value bit left in its tenth byte.
+    if (index === 9 && byte > 1) {
+      throw new CursorCaptureDecodeError(
+        "invalid_protobuf",
+        "varint exceeds uint64",
+      );
+    }
+    value |= BigInt(byte & 0x7f) << BigInt(index * 7);
+    if ((byte & 0x80) === 0) return { value, next: offset + index + 1 };
   }
-  throw new CursorCaptureDecodeError(
-    "truncated_connect_frame",
-    "truncated protobuf varint",
-  );
+  throw new CursorCaptureDecodeError("invalid_protobuf", "varint too long");
+};
+
+/** Tags and lengths must not wrap when an untrusted uint64 exceeds uint32. */
+const readUint32Varint = (
+  buf: Uint8Array,
+  offset: number,
+): { readonly value: number; readonly next: number } => {
+  const decoded = readVarint(buf, offset);
+  if (decoded.value > 0xffffffffn) {
+    throw new CursorCaptureDecodeError(
+      "invalid_protobuf",
+      "protobuf tag or length exceeds uint32",
+    );
+  }
+  return { value: Number(decoded.value), next: decoded.next };
 };
 
 const parseProtoFields = (buf: Uint8Array): ReadonlyArray<TProtoField> => {
   const fields: TProtoField[] = [];
   let offset = 0;
   while (offset < buf.byteLength) {
-    const key = readVarint(buf, offset);
+    const key = readUint32Varint(buf, offset);
     offset = key.next;
     const field = key.value >>> 3;
     const wire = key.value & 0x07;
@@ -532,7 +550,7 @@ const parseProtoFields = (buf: Uint8Array): ReadonlyArray<TProtoField> => {
       continue;
     }
     if (wire === 2) {
-      const len = readVarint(buf, offset);
+      const len = readUint32Varint(buf, offset);
       offset = len.next;
       const end = offset + len.value;
       if (end > buf.byteLength) {
@@ -615,7 +633,11 @@ const protoIntField = (
   field: number,
 ): number | null => {
   for (const f of fields) {
-    if (f.field === field && f.wire === 0 && f.varint !== null) return f.varint;
+    if (f.field === field && f.wire === 0 && f.varint !== null) {
+      return f.varint <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(f.varint)
+        : null;
+    }
   }
   return null;
 };
@@ -645,16 +667,14 @@ const protoUint32FieldOrDefault = (
         `field ${field} has wire type ${f.wire} — expected varint (0) for a uint32`,
       );
     }
-    // `readVarint` already returns an unsigned 32-bit value (`>>> 0`) and
-    // throws "varint too long" past 5 continuation bytes, so out-of-range
-    // encodings are already rejected upstream — this is a defensive re-check.
-    if (f.varint < 0 || f.varint > 0xffffffff) {
+    // Preserve all uint64 bits until this field's uint32 range is checked.
+    if (f.varint > 0xffffffffn) {
       throw new CursorCaptureDecodeError(
         "invalid_protobuf",
         `field ${field} varint ${f.varint} out of uint32 range`,
       );
     }
-    return f.varint;
+    return Number(f.varint);
   }
   // Proto3 implicit presence: absent means the zero default, not "unknown".
   return 0;
@@ -1127,7 +1147,7 @@ const decodeCursorMcpValue = (
       return num;
     }
     if (f.field === 3 && f.wire === 2) return textDecoder.decode(f.bytes);
-    if (f.field === 4 && f.wire === 0) return f.varint !== 0;
+    if (f.field === 4 && f.wire === 0) return f.varint !== 0n;
     if (f.field === 5 && f.wire === 2) {
       return decodeCursorMcpStruct(f.bytes, budget, depth + 1);
     }

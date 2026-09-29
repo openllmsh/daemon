@@ -948,10 +948,17 @@ export const openMuseBridgeCaptureHandle = (opts: {
     signal: opts.signal,
     captureTimeoutMs: opts.captureTimeoutMs ?? 60_000,
   });
-  const receiver = startMuseCaptureReceiver({
-    session,
-    signal: opts.signal,
-  });
+  let receiver: TMuseCaptureReceiver;
+  try {
+    receiver = startMuseCaptureReceiver({ session, signal: opts.signal });
+  } catch (error) {
+    try {
+      session.dispose();
+    } catch {
+      /* Preserve the receiver failure. */
+    }
+    throw error;
+  }
   const dispose = (): void => {
     try {
       session.dispose();
@@ -1108,19 +1115,27 @@ export const settleMuseCaptureTurn = async (args: {
   readonly completed: Promise<unknown>;
   readonly timeoutMs?: number;
 }): Promise<{ readonly status: string; readonly timedOut: boolean }> => {
+  const settled = (async (): Promise<"completed"> => {
+    try {
+      await args.cancel();
+    } catch {
+      // interrupt is best-effort
+    }
+    await args.completed;
+    return "completed";
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await args.cancel();
-  } catch {
-    // interrupt is best-effort
+    const outcome = await Promise.race([
+      settled,
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), args.timeoutMs ?? 5_000);
+      }),
+    ]);
+    return { status: outcome, timedOut: outcome === "timeout" };
+  } finally {
+    clearTimeout(timer);
   }
-  const timeoutMs = args.timeoutMs ?? 5_000;
-  const outcome = await Promise.race([
-    args.completed.then(() => "completed" as const),
-    new Promise<"timeout">((resolve) => {
-      setTimeout(() => resolve("timeout"), timeoutMs);
-    }),
-  ]);
-  return { status: outcome, timedOut: outcome === "timeout" };
 };
 
 export type TMuseNativeCaptureParams = {
@@ -1180,14 +1195,18 @@ export const runMuseNativeCapture = async (
    */
   let turnEndedBeforeCaptureReason: string | null = null;
   let sessionHandle: TMuseTurnSessionResult | null = null;
+  let turnSettled: Promise<unknown> = Promise.resolve();
+  let disposal: Promise<void> | null = null;
 
-  const disposeAll = async (): Promise<void> => {
-    handle.dispose();
-    if (sessionHandle !== null) {
+  const disposeAll = (): Promise<void> => {
+    disposal ??= (async (): Promise<void> => {
+      handle.dispose();
       const closing = sessionHandle;
       sessionHandle = null;
-      await closing.cleanup();
-    }
+      await turnSettled;
+      await closing?.cleanup();
+    })();
+    return disposal;
   };
 
   try {
@@ -1277,13 +1296,14 @@ export const runMuseNativeCapture = async (
     }
     captureOwnership = dispatched.response.ok ? "accepted" : "uncertain";
 
-    // Builder settlement: cancel + authoritative terminal. Do NOT treat process
-    // kill as success; local 204 settlement is not the client response.
-    await settleMuseCaptureTurn({
+    // The upstream response is already owned. Builder settlement must not
+    // delay its delivery or turn cleanup errors into a second-send opportunity.
+    // Teardown still waits for settlement before closing the host.
+    turnSettled = settleMuseCaptureTurn({
       cancel: () => turn.cancel(),
       completed: turn.completed,
       timeoutMs: 5_000,
-    });
+    }).catch(() => {});
 
     if (!dispatched.response.ok) {
       await disposeAll();
@@ -1325,7 +1345,7 @@ export const runMuseNativeCapture = async (
         }
       },
       cancel() {
-        void disposeAll();
+        return disposeAll();
       },
     });
 

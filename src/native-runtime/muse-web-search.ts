@@ -195,15 +195,12 @@ const pickChoice = (
  *
  * `nameMap` MUST be built by the shared {@link buildMuseToolNameMap} (from
  * `muse-mcp-server.ts`) over the SAME `params.tools` this turn actually
- * registered. An approval request's `toolName` may carry either the bare
- * caller name OR Meta's observed MCP wire form
+ * registered. Require Meta's observed namespaced MCP wire form
  * (`mcp__openllm_muse_client_tools.<leaf>` — {@link MUSE_MCP_WIRE_PREFIX} /
- * `museMcpWireToolName`, verified against the same server this daemon
- * itself started this turn); this checks EXACT membership in either form via
- * `nameMap.callerNames`/`nameMap.wireToCaller` — never a `startsWith`/
- * `endsWith`/substring match, which could let a differently-sourced tool
- * whose name merely ends in a registered leaf (e.g. a same-named tool from
- * an unrelated MCP server) pass as ours. Defense in depth mirrors
+ * `museMcpWireToolName`) via exact `wireToCaller` membership. A bare name
+ * proves registration, not provenance: it could also name a Muse built-in.
+ * Never use prefix/substring matching or accept a missing subject kind (the
+ * SDK requires it). Defense in depth mirrors
  * {@link isHostNativeWebSearchApproval}: a `protectedWrite` flag, or a
  * `subject.kind`/`path`/`command` naming a real execution surface (shell,
  * fileAccess, process), never approves even given a name match.
@@ -224,16 +221,10 @@ export const isRegisteredCallerToolApproval = (
   }
   const toolName = requestTool ?? subjectTool;
   if (toolName === null) return false;
-  const isOurRegisteredTool =
-    nameMap.callerNames.has(toolName) || nameMap.wireToCaller.has(toolName);
-  if (!isOurRegisteredTool) return false;
+  if (!nameMap.wireToCaller.has(toolName)) return false;
 
   const subjectKind = asString(request.subject?.kind);
-  if (
-    subjectKind !== null &&
-    subjectKind !== "tool" &&
-    subjectKind !== "network"
-  ) {
+  if (subjectKind !== "tool" && subjectKind !== "network") {
     return false;
   }
   if (asString(request.subject?.path) !== null) return false;

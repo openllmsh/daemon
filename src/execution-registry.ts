@@ -205,7 +205,7 @@ export type TExecutionSelectionRefusal =
   | {
       readonly kind: "unsupported_execution_variant";
       readonly provider: string;
-      readonly variant: TBridgeVariant;
+      readonly variant: TExecutionVariant;
     }
   | {
       readonly kind: "capture_not_supported";
@@ -259,18 +259,20 @@ export const resolveExecutionSelection = (
   if (provider === "claude_code" && originator?.isClaudeCode === true) {
     return { ok: true, selection: { kind: "handrolled" } };
   }
-  if (requested.kind === "handrolled") {
-    return { ok: true, selection: requested };
-  }
-  if (!providerSupportsVariant(provider, requested.variant)) {
+  const variant =
+    requested.kind === "handrolled" ? "handrolled" : requested.variant;
+  if (!providerSupportsVariant(provider, variant)) {
     return {
       ok: false,
       refusal: {
         kind: "unsupported_execution_variant",
         provider,
-        variant: requested.variant,
+        variant,
       },
     };
+  }
+  if (requested.kind === "handrolled") {
+    return { ok: true, selection: requested };
   }
   const shapeReason = requestShapeUnsupportedFor(
     provider,
