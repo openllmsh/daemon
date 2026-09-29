@@ -43,6 +43,9 @@ param([AllowEmptyString()][string] $Prerelease)
     }
 
     function Get-InstallRoot {
+        if (Test-Path Env:OPENLLM_DAEMON_STATE_DIR) {
+            throw 'OPENLLM_DAEMON_STATE_DIR selects isolated CLI state. Clear it before the user installation. No files were changed.'
+        }
         if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitProcess -or
             $env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') {
             throw 'This installer requires Windows x64 and a 64-bit PowerShell process.'
