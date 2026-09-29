@@ -1,4 +1,6 @@
 import { logError, logWarn, safeDiagnosticMessage } from "../logger";
+import type { TLinuxLaunchHandle } from "../sandbox/linux-adapter";
+import { linuxLaunchHandle } from "../sandbox/linux-adapter";
 import { spawn as admittedSpawn } from "../windows-process";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
 import type { TReapOutcome } from "./posix";
@@ -39,6 +41,7 @@ export type TTerminateOptions = {
 };
 
 export type TSupervisedChild = {
+  readonly sandbox?: TLinuxLaunchHandle;
   readonly subprocess: ReturnType<typeof Bun.spawn>;
   readonly pid: number;
   readonly pgid: number;
@@ -263,6 +266,11 @@ const finishTrackedChild = async (
   } catch {
     // Natural-exit waiter; terminate() owns cleanup if it already started.
   }
+  if (tracked.handle.sandbox) {
+    await tracked.handle.sandbox.cleanup;
+    releaseChild(tracked, "exited");
+    return "exited";
+  }
   if (tracked.terminating !== null) {
     const outcome = await tracked.terminating;
     if (
@@ -291,6 +299,28 @@ const terminateTrackedChild = (
   const finalReapMs = opts.finalReapMs ?? DEFAULT_FINAL_REAP_MS;
   const stillOwned = (): boolean => groupStillPresent(tracked.handle.pgid);
   tracked.terminating = (async (): Promise<TReapOutcome> => {
+    if (tracked.handle.sandbox) {
+      const launch = tracked.handle.sandbox;
+      launch.signal(15);
+      const first = await raceExitOrBudget(
+        tracked.handle,
+        Math.max(0, graceMs),
+      );
+      if (first !== "exited") launch.signal(9);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        launch.cleanup.then(() => "terminated" as const),
+        new Promise<"reap_unconfirmed">((resolve) => {
+          timer = setTimeout(
+            () => resolve("reap_unconfirmed"),
+            Math.max(0, finalReapMs),
+          );
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (outcome !== "reap_unconfirmed") releaseChild(tracked, outcome);
+      return outcome;
+    }
     signalGroup(tracked.handle.pgid, "SIGTERM");
     const first = await raceExitOrBudget(tracked.handle, Math.max(0, graceMs));
     let outcome: TReapOutcome;
@@ -375,6 +405,9 @@ export const superviseSpawn = (
     return activeTaskRelease(tracked);
   };
   handle = {
+    ...(process.platform === "linux" && linuxLaunchHandle(argv)
+      ? { sandbox: linuxLaunchHandle(argv) }
+      : {}),
     subprocess,
     pid,
     pgid,

@@ -2,6 +2,7 @@ import { dlopen, FFIType } from "bun:ffi";
 import { resolve } from "node:path";
 import type { TDaemonSandboxDetails } from "@openllmsh/protocol";
 import { DAEMON_VERSION } from "../version";
+import { spawn as admittedSpawn } from "../windows-process";
 import { LinuxSandboxError, qualifyBubblewrap } from "./linux-launch";
 
 const LANDLOCK_CREATE_RULESET = 444;
@@ -156,7 +157,7 @@ const spawnSelfTest: TLinuxSandboxSelfTestRunner = async (
 ): Promise<TLinuxSandboxSelfTestOutcome> => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn([...args], {
+    proc = admittedSpawn([...args], {
       cwd: "/",
       env: process.env,
       stdin: "ignore",

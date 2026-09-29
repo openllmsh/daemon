@@ -21,6 +21,7 @@
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
 
+import "./sandbox/early-mode";
 import "./scm-gate";
 import { windowsScmServiceMode } from "./scm-gate";
 

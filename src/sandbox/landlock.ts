@@ -1,35 +1,8 @@
 /**
- * The cross-platform OS-sandbox entry (`applyDaemonSandbox`) + the Linux
- * Landlock backend — `docs/proposals/daemon-os-sandbox-and-typed-control.md`
- * §3.3a. `applyDaemonSandbox` dispatches by platform: **Linux → Landlock**
- * (here), **macOS → Seatbelt** (`./seatbelt.ts`), other → unsupported. Both
- * backends are in-process, unprivileged, derived from the same working set
- * (`./working-set/`), and inherited across `execve`. The sandbox is
- * PER-CHILD, not process-wide: the daemon itself boots unconfined (so device
- * session PTYs can run the user's real CLI over their real files) and each
- * risky child is wrapped through the `--sandbox-exec` self-re-exec shim
- * (`./exec.ts`), whose re-exec'd process calls `applyDaemonSandbox({ force:
- * true })` before running the child — so `bash` running a SHA-gated
- * integration script, `curl`, and the vendor CLIs are confined, and
- * everything outside the working set (`~/.ssh`, `~/.aws`, the user's real
- * `~/.codex`, browser profiles) is unreachable from them. See
- * `docs/audits/daemon-sandbox-scoping.md`.
- *
- * Landlock (this file): a ruleset granting only the working-set paths, on
- * kernels ≥ 5.13. It can't restrict the network on the kernels we target —
- * the systemd user unit's `RestrictAddressFamilies` (`service.ts`) covers that
- * side; the two layers overlap deliberately (Landlock also confines a manual
- * foreground run with no systemd).
- *
- * Failure posture is FAIL-OPEN with a loud log: the daemon must keep serving
- * on a kernel/libc this shim can't drive (the state is surfaced on
- * `DaemonStatus.sandbox` so an unconfined daemon is visible, not silent).
- * Kill switch: `OPENLLM_DAEMON_NO_SANDBOX=1`. Dev source runs are OPT-IN via
- * `OPENLLM_DAEMON_SANDBOX=1` (§3.5) so the sandbox never impedes iteration.
- *
- * Landlock rules only ever NARROW and cannot be loosened in-process — a
- * future §3.4 consent grant takes effect via the self-updater's existing
- * drain-and-exit + supervisor relaunch, never by widening a live ruleset.
+ * Direct Landlock checks and the cross-platform sandbox dispatcher.
+ * Linux vendor launches use linux-launch.ts. The helper applies Landlock
+ * after it mounts private procfs. The daemon stays outside that domain.
+ * A failed restriction returns an error. The launch path rejects the child.
  */
 import { fstatSync } from "node:fs";
 import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
