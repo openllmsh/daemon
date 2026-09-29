@@ -778,21 +778,22 @@ static int reapChildren(int force, int target, int *result) {
 }
 static void cleanup(struct record *r, int guardian, int init, int initfd,
                     int monitorfd, int target, int *result) {
-  if (initfd >= 0 && !fault(r, "skip_init_kill"))
-    signalPid(initfd, 9);
-  if (monitorfd >= 0)
-    signalPid(monitorfd, 9);
   long limit = now() + REAP;
+  int reported = 0;
   for (;;) {
+    if (initfd >= 0 && !fault(r, "skip_init_kill"))
+      signalPid(initfd, 9);
+    if (monitorfd >= 0)
+      signalPid(monitorfd, 9);
     int done = reapChildren(1, target, result);
-    if (done == 1)
+    if (done == 1 && !alive(initfd) && !alive(monitorfd))
       break;
-    if (now() >= limit) {
+    if (!reported && now() >= limit) {
       const char *s = "SANDBOX_UNAVAILABLE: reap_unconfirmed\n";
       fullWrite(2, s, strlen(s));
-      return;
+      reported = 1;
     }
-    poll(0, 0, 20);
+    poll(0, 0, reported ? 100 : 20);
   }
   lease(r, guardian, init, 1);
 }
