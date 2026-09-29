@@ -1740,12 +1740,14 @@ prerelease_stage() {
     installed="$(sha256_of "$dest" || true)"
     if [ -n "$installed" ]; then
       if [ "$installed" = "$published" ]; then
+        probe_staged_version "$dest" "$version"
         echo "  $name is already up to date"
         return 0
       fi
       if [ -f "$stamp" ]; then
         read -r sp si < "$stamp" || true
         if [ "$sp" = "$published" ] && [ "$si" = "$installed" ]; then
+          probe_staged_version "$dest" "$version"
           echo "  $name is already up to date"
           return 0
         fi
