@@ -388,7 +388,7 @@ param([AllowEmptyString()][string] $Prerelease)
     }
 
     function Assert-ReplacementSupported {
-        param([object[]] $Images)
+        param([object[]] $Images, [string] $Diagnostic = '')
         foreach ($image in $Images) {
             if ($image.Exists -and $image.Replace) {
                 # Integration point: P design section 8, replacement transaction.
@@ -399,7 +399,7 @@ param([AllowEmptyString()][string] $Prerelease)
                 # Retain backups until restart and task restoration succeed.
                 # No public installer command is defined by the W1b design yet.
                 # A throw preserves interactive callers. File and CMD entry exit 1.
-                throw 'Replacement refused (exit code 1). Replacement requires the Windows installer lifecycle interface. This build does not provide it. Stop the running daemon and re-run with a build that provides this interface. The installed files and task state were kept.'
+                throw "$Diagnostic Replacement refused (exit code 1). Replacement requires the Windows installer lifecycle interface. This build does not provide it. Stop the running daemon and re-run with a build that provides this interface. The installed files and task state were kept."
             }
         }
     }
@@ -511,7 +511,11 @@ param([AllowEmptyString()][string] $Prerelease)
             if (Test-Path -LiteralPath $image.Path -PathType Container) { throw "Executable path is a directory: $($image.Path)" }
             $image.Exists = [IO.File]::Exists($image.Path)
             if ($image.Exists) {
-                $version = Get-ImageVersion $image.Path
+                try { $version = Get-ImageVersion $image.Path }
+                catch {
+                    Assert-ReplacementSupported @($image) -Diagnostic "Version probe failed for $($image.Path). $($_.Exception.Message)"
+                    throw
+                }
                 if ((Compare-Version $version $tag.Substring(1)) -gt 0) { throw "Downgrade refused: $($image.Path) is $version." }
                 $image.Replace = (Get-FileHash -LiteralPath $image.Path -Algorithm SHA256).Hash -ine $image.Digest
             }
