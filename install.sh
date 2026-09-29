@@ -234,6 +234,7 @@ refuse_downgrade() {
   To force the advertised version, remove $binary and re-run this installer."
 }
 
+ENV_LOCK_BINARY="$BIN_DIR/openllmd"
 # >>> openllm-env-lock/v3 >>>
 # The installed helper owns all lock metadata operations.
 env_lock_acquire() {
@@ -241,7 +242,7 @@ env_lock_acquire() {
   ENV_LOCK_DIR=""
   helper="${LOCKLAB_HELPER_BIN:-${OPENLLM_LOCK_HELPER:-}}"
   if [ -z "$helper" ]; then
-    if [ -n "${BIN_DIR:-}" ]; then helper="$BIN_DIR/openllmd"; else helper="${DEST:-}"; fi
+    helper="${ENV_LOCK_BINARY:-}"
   fi
   [ -n "$helper" ] && [ -x "$helper" ] || { echo 'lock helper is missing or incompatible' >&2; return 74; }
   ENV_LOCK_CHANNEL="$(mktemp -d "${TMPDIR:-/tmp}/openllm-lock.XXXXXXXX")" || return 74
