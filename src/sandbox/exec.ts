@@ -276,10 +276,8 @@ export const runSandboxExec = async (
     const { qualifyBubblewrap, runLinuxSandbox } = await import(
       "./linux-launch"
     );
-    const {
-      getLinuxNamespaceFallbackReason,
-      recordLinuxNamespaceFallback,
-    } = await import("./linux-status");
+    const { getLinuxNamespaceFallbackReason, recordLinuxNamespaceFallback } =
+      await import("./linux-status");
     const separator = process.argv.indexOf("--");
     const flag = process.argv.indexOf("--sandbox-landlock-only");
     let reason: string | null =

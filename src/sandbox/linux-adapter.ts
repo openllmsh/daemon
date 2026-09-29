@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { SandboxLaunchError } from "./exec";
 
 export type TLinuxLaunchOutcome =
@@ -117,6 +117,7 @@ export const prepareLinuxLaunch = (): string[] => {
     readiness = undefined;
   };
   let leaseWatcher: FSWatcher | undefined;
+  let leaseWatchAttempted = false;
   const finish = (confirmed: boolean = true): void => {
     if (stopped) return;
     stopped = true;
@@ -269,6 +270,7 @@ export const prepareLinuxLaunch = (): string[] => {
         );
         if (result === 1) {
           completed = true;
+          cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
           exitCode = status[0] ?? null;
         }
         if (result === 2) execFailed = true;
@@ -300,11 +302,19 @@ export const prepareLinuxLaunch = (): string[] => {
     cancelWait();
     step();
     if (stopped) return;
-    if (leasePath && !leaseWatcher) {
+    if (leasePath && !leaseWatchAttempted) {
+      leaseWatchAttempted = true;
       try {
-        leaseWatcher = watch(dirname(leasePath), { persistent: false }, drive);
+        leaseWatcher = watch(
+          dirname(leasePath),
+          { persistent: false },
+          (_event, file) => {
+            if (file === basename(leasePath)) drive();
+          },
+        );
         leaseWatcher.on("error", () => {
           leaseWatcher?.close();
+          fail();
         });
       } catch {
         fail();
