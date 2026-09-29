@@ -91,6 +91,7 @@ param([AllowEmptyString()][string] $Prerelease)
         $client = New-Object Net.Http.HttpClient($handler)
         $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
         $deadline = New-Object Threading.CancellationTokenSource
+        $timer = [Diagnostics.Stopwatch]::StartNew()
         $deadline.CancelAfter($Seconds * 1000)
         try {
             for ($redirect = 0; $redirect -le 5; $redirect++) {
@@ -110,7 +111,16 @@ param([AllowEmptyString()][string] $Prerelease)
                     try {
                         $buffer = New-Object byte[] 65536
                         [long] $total = 0
-                        while (($count = $inputStream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token).GetAwaiter().GetResult()) -gt 0) {
+                        while ($true) {
+                            $remaining = [int][Math]::Max(0, $Seconds * 1000 - $timer.ElapsedMilliseconds)
+                            if ($remaining -eq 0) { throw 'Release download timed out.' }
+                            $read = $inputStream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token)
+                            if (-not $read.Wait($remaining)) {
+                                $deadline.Cancel()
+                                throw 'Release download timed out.'
+                            }
+                            $count = $read.GetAwaiter().GetResult()
+                            if ($count -eq 0) { break }
                             $total += $count
                             if ($total -gt $Limit) { throw 'Release download is too large.' }
                             $outputStream.Write($buffer, 0, $count)
@@ -124,6 +134,9 @@ param([AllowEmptyString()][string] $Prerelease)
                     return
                 } finally { $response.Dispose() }
             }
+        } catch {
+            if ($deadline.IsCancellationRequested -or $timer.ElapsedMilliseconds -ge $Seconds * 1000) { throw 'Release download timed out.' }
+            throw
         } finally {
             $deadline.Dispose()
             $client.Dispose()
