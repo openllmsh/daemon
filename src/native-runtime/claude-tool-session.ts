@@ -229,9 +229,10 @@ export type TToolTurnResult =
        * partially gone out (its `streamInput` call threw) — the walker must
        * treat the hop as terminal (502) rather than retrying via handrolled or
        * fleet transport, which would resend this turn (tool result + context)
-       * a second time over a different transport. `"none"` (or omitted) is
-       * safe to retry: no send toward the live query was attempted at all
-       * (e.g. `streamInput` capability itself was missing before any attempt).
+       * a second time over a different transport. Closing an already-started
+       * held query on a missing capability is also terminal (`"accepted"`),
+       * because closeHeld resolves its pending handlers. `"none"` (or omitted)
+       * is reserved for declines before taking ownership of a live query.
        */
       readonly captureOwnership?: "none" | "accepted" | "uncertain";
     };
@@ -790,12 +791,15 @@ export const continueToolTurn = async (
     // walker from retrying this same turn over a different transport.
     if (injectedContext !== null) {
       if (h.streamInput === undefined) {
-        // No send was attempted — safe to leave unmarked (retryable).
+        // Closing an already-started query resolves its pending handlers.
+        // Even without a context send, it must not become a retryable decline
+        // that lets the walker start this turn again through another transport.
         closeHeld(h);
         return {
           kind: "declined",
           reason:
             "tool-session continuation cannot deliver client context: held session has no streamInput capability",
+          captureOwnership: "accepted",
         };
       }
       try {
