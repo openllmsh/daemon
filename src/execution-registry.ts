@@ -44,25 +44,17 @@ import type {
   TSubMethod,
   TSubscriptionProviderSlug,
 } from "@openllmsh/protocol";
-import { bridgeVariantSupportsCaptureForm } from "@openllmsh/protocol";
+
+export type TExecutionVariant = TBridgeVariant | "handrolled";
 
 export type TProviderExecutionRegistration = {
   readonly provider: TSubscriptionProviderSlug;
-  /**
-   * Ordered, duplicate-free new-vocabulary variants this provider's
-   * binding declares; `variants[0]` is the default when one exists. Empty
-   * for providers with no new-vocabulary integration yet (kimi_code,
-   * grok) — they stay `handrolled`-only in this vocabulary too.
-   */
-  readonly variants: readonly TBridgeVariant[];
-  /**
-   * Subset of `variants` this provider's binding declares CAPTURE
-   * readiness for — independent of (but never wider than) the protocol-
-   * level {@link bridgeVariantSupportsCaptureForm} grammar fact.
-   */
+  /** Ordered, duplicate-free supported methods, including `handrolled`
+   *  where available. `variants[0]` remains the provider's default. */
+  readonly variants: readonly TExecutionVariant[];
+  /** Capture-capable subset of `variants`; the bridge-only type excludes
+   *  `handrolled`, which never supports capture. */
   readonly captureVariants: readonly TBridgeVariant[];
-  /** Whether `handrolled` is a legitimate selection for this provider. */
-  readonly handrolledAvailable: boolean;
 };
 
 /**
@@ -77,112 +69,97 @@ export type TProviderExecutionRegistration = {
  * Adding a registration is how a reservation becomes a real, selectable
  * integration; it is never done by widening this file's literal set alone.
  */
-export const PROVIDER_EXECUTION_REGISTRY: Readonly<
-  Record<TSubscriptionProviderSlug, TProviderExecutionRegistration>
-> = {
-  claude_code: {
-    provider: "claude_code",
-    // `stream-json` (direct-CLI text) stays `variants[0]` — the ONE variant
-    // `legacySubMethodEquivalentFor` would even consider (it never actually
-    // reaches that comparison for claude_code — see that function's doc
-    // comment: claude_code's legacy `bridge` is request-shape-dependent and
-    // never gets a legacy-field projection for ANY explicit variant).
-    // `sdk-facade` (12-hermes-adoption-plan.md, H1-H4) is a SECOND,
-    // independently-selectable Claude variant: unlike `stream-json` it
-    // supports caller tools (no `requestShapeUnsupportedFor` gate — see
-    // that function's doc comment, which is `stream-json`-only) because it
-    // replays the full canonical history itself rather than relying on the
-    // held Agent SDK. Live-authenticated validation (H6) is still pending;
-    // registering it here only makes it a REACHABLE, typed-refusal-free
-    // selection for its PROVEN shape, never a claim that H6's gates passed.
-    // H1's real-CLI construction proof (`claude-sdk-facade.ts`'s module doc,
-    // `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`)
-    // found that "replays the full canonical history itself" is proven true
-    // only for a SINGLE first turn against this installed CLI — an
-    // assistant-typed replay frame (required by any multi-turn or
-    // tool-continuation history) is never acknowledged by the real CLI.
-    // This registration does NOT narrow to single-turn-only at the registry
-    // level (the correct fix is a protocol-shape qualification, not a
-    // registry-level capability change) because the multi-turn shape is
-    // instead BLOCKED one layer down, structurally, before any spawn: both
-    // `runClaudeSdkFacade` and `runClaudeSdkFacadeCapture`
-    // (`claude-sdk-facade.ts`/`claude-sdk-facade-capture.ts`) call the SAME
-    // shared `sdkFacadeRequiresUnsupportedAssistantReplay` guard immediately
-    // after planning the turn and refuse pre-dispatch — no spawn, no
-    // capture resource, no send — rather than reaching the CLI and
-    // exhausting the replay deadline. That guard runs unconditionally
-    // inside those two functions themselves, so it holds even for a caller
-    // that reaches them without going through this registry's
-    // `resolveExecutionSelection` first. Treat multi-turn `sdk-facade` as an
-    // evidenced, actively BLOCKED gap — not merely "pending" and not a
-    // runtime timeout — until the underlying protocol-shape investigation
-    // resolves it.
-    variants: ["stream-json", "sdk-facade"],
-    captureVariants: ["stream-json", "sdk-facade"],
-    handrolledAvailable: true,
-  },
-  chatgpt: {
-    provider: "chatgpt",
-    variants: ["app-server"],
-    captureVariants: ["app-server"],
-    handrolledAvailable: true,
-  },
-  cursor: {
-    provider: "cursor",
-    variants: ["acp"],
-    captureVariants: ["acp"],
-    handrolledAvailable: false,
-  },
-  muse: {
-    provider: "muse",
-    variants: ["msp"],
-    captureVariants: ["msp"],
-    handrolledAvailable: false,
-  },
-  kimi_code: {
-    provider: "kimi_code",
-    variants: [],
-    captureVariants: [],
-    handrolledAvailable: true,
-  },
-  grok: {
-    provider: "grok",
-    variants: [],
-    captureVariants: [],
-    handrolledAvailable: true,
-  },
-};
+export const PROVIDER_EXECUTION_REGISTRY: readonly TProviderExecutionRegistration[] =
+  [
+    {
+      provider: "claude_code",
+      // `stream-json` (direct-CLI text) stays `variants[0]` — the ONE variant
+      // `legacySubMethodEquivalentFor` would even consider (it never actually
+      // reaches that comparison for claude_code — see that function's doc
+      // comment: claude_code's legacy `bridge` is request-shape-dependent and
+      // never gets a legacy-field projection for ANY explicit variant).
+      // `sdk-facade` (12-hermes-adoption-plan.md, H1-H4) is a SECOND,
+      // independently-selectable Claude variant: unlike `stream-json` it
+      // supports caller tools (no `requestShapeUnsupportedFor` gate — see
+      // that function's doc comment, which is `stream-json`-only) because it
+      // replays the full canonical history itself rather than relying on the
+      // held Agent SDK. Live-authenticated validation (H6) is still pending;
+      // registering it here only makes it a REACHABLE, typed-refusal-free
+      // selection for its PROVEN shape, never a claim that H6's gates passed.
+      // H1's real-CLI construction proof (`claude-sdk-facade.ts`'s module doc,
+      // `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`)
+      // found that "replays the full canonical history itself" is proven true
+      // only for a SINGLE first turn against this installed CLI — an
+      // assistant-typed replay frame (required by any multi-turn or
+      // tool-continuation history) is never acknowledged by the real CLI.
+      // This registration does NOT narrow to single-turn-only at the registry
+      // level (the correct fix is a protocol-shape qualification, not a
+      // registry-level capability change) because the multi-turn shape is
+      // instead BLOCKED one layer down, structurally, before any spawn: both
+      // `runClaudeSdkFacade` and `runClaudeSdkFacadeCapture`
+      // (`claude-sdk-facade.ts`/`claude-sdk-facade-capture.ts`) call the SAME
+      // shared `sdkFacadeRequiresUnsupportedAssistantReplay` guard immediately
+      // after planning the turn and refuse pre-dispatch — no spawn, no
+      // capture resource, no send — rather than reaching the CLI and
+      // exhausting the replay deadline. That guard runs unconditionally
+      // inside those two functions themselves, so it holds even for a caller
+      // that reaches them without going through this registry's
+      // `resolveExecutionSelection` first. Treat multi-turn `sdk-facade` as an
+      // evidenced, actively BLOCKED gap — not merely "pending" and not a
+      // runtime timeout — until the underlying protocol-shape investigation
+      // resolves it.
+      variants: ["stream-json", "sdk-facade", "handrolled"],
+      captureVariants: ["stream-json", "sdk-facade"],
+    },
+    {
+      provider: "chatgpt",
+      variants: ["app-server", "handrolled"],
+      captureVariants: ["app-server"],
+    },
+    {
+      provider: "cursor",
+      variants: ["acp"],
+      captureVariants: ["acp"],
+    },
+    {
+      provider: "muse",
+      variants: ["msp"],
+      captureVariants: ["msp"],
+    },
+    {
+      provider: "kimi_code",
+      variants: ["handrolled"],
+      captureVariants: [],
+    },
+    {
+      provider: "grok",
+      variants: ["handrolled"],
+      captureVariants: [],
+    },
+  ];
+
+const registrationFor = (
+  provider: string,
+): TProviderExecutionRegistration | undefined =>
+  PROVIDER_EXECUTION_REGISTRY.find((entry) => entry.provider === provider);
 
 export const registeredVariantsFor = (
   provider: string,
-): readonly TBridgeVariant[] =>
-  PROVIDER_EXECUTION_REGISTRY[provider as TSubscriptionProviderSlug]
-    ?.variants ?? [];
+): readonly TExecutionVariant[] => registrationFor(provider)?.variants ?? [];
 
 export const providerSupportsVariant = (
   provider: string,
-  variant: TBridgeVariant,
+  variant: TExecutionVariant,
 ): boolean => registeredVariantsFor(provider).includes(variant);
 
-/**
- * Whether `provider` declares CAPTURE readiness for `variant` — the
- * provider-level fact AND the protocol-level naming-grammar fact must both
- * hold (defense in depth: a provider table can never widen what the
- * public vocabulary allows).
- */
+/** Capture support is declared by the provider's captureVariants subset. */
 export const providerSupportsCaptureFor = (
   provider: string,
-  variant: TBridgeVariant,
-): boolean => {
-  if (!bridgeVariantSupportsCaptureForm(variant)) return false;
-  const registration =
-    PROVIDER_EXECUTION_REGISTRY[provider as TSubscriptionProviderSlug];
-  return registration?.captureVariants.includes(variant) ?? false;
-};
-
-export const providerHandrolledAvailable = (provider: string): boolean =>
-  PROVIDER_EXECUTION_REGISTRY[provider as TSubscriptionProviderSlug]
-    ?.handrolledAvailable ?? false;
+  variant: TExecutionVariant,
+): boolean =>
+  registrationFor(provider)?.captureVariants.some(
+    (captureVariant) => captureVariant === variant,
+  ) ?? false;
 
 /**
  * The legacy `SubMethod` an old daemon (one that never negotiated
@@ -208,11 +185,12 @@ export const legacySubMethodEquivalentFor = (
   selection: TExecutionSelection,
 ): TSubMethod | null => {
   if (selection.kind === "handrolled") {
-    return providerHandrolledAvailable(provider) ? "handrolled" : null;
+    return providerSupportsVariant(provider, "handrolled")
+      ? "handrolled"
+      : null;
   }
   if (provider === "claude_code") return null;
-  const registration =
-    PROVIDER_EXECUTION_REGISTRY[provider as TSubscriptionProviderSlug];
+  const registration = registrationFor(provider);
   if (registration === undefined) return null;
   // Only the provider's OWN single already-shipped variant has a legacy
   // meaning to be equivalent to (not merely any registered variant).
