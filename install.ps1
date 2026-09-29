@@ -47,6 +47,11 @@ param([AllowEmptyString()][string] $Prerelease)
             $env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') {
             throw 'This installer requires Windows x64 and a 64-bit PowerShell process.'
         }
+        # Query the platform. An emulated process can report AMD64 on ARM64.
+        $processors = @(Get-CimInstance -ClassName Win32_Processor -Property Architecture -OperationTimeoutSec 5 -ErrorAction Stop)
+        if ($processors.Count -eq 0 -or @($processors | Where-Object { $_.Architecture -ne 9 }).Count -ne 0) {
+            throw 'This installer requires a native Windows x64 host. ARM64 is not supported.'
+        }
         if (-not $env:USERPROFILE -or -not [IO.Path]::IsPathRooted($env:USERPROFILE)) { throw 'USERPROFILE must be an absolute path.' }
         $profile = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
         if ($profile.StartsWith('\\')) { throw 'A local user profile is required.' }
