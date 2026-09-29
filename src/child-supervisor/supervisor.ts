@@ -400,23 +400,31 @@ export const superviseSpawn = (
   argv: ReadonlyArray<string>,
   opts: TSuperviseSpawnOptions,
 ): TSupervisedChild => {
-  if (argv.length === 0 || argv[0] === undefined || argv[0].length === 0)
-    throw new Error("superviseSpawn requires a command");
-  // Linux hard-crash guarantee: re-exec through the PDEATHSIG wrapper so the
-  // child dies if the daemon is SIGKILLed (no macOS equivalent — Darwin relies
-  // on the process group + launchd cleanup + the boot sweep). Darwin argv is
-  // left byte-identical.
-  const selfInvocation =
-    process.platform === "linux" ? daemonSelfInvocation() : null;
-  const spawnArgv =
-    selfInvocation === null
-      ? argv
-      : linuxPdeathsigArgv(argv, selfInvocation, process.pid);
-  const subprocess = admittedSpawn([...spawnArgv], {
-    ...opts,
-    // POSIX: lead an independently killable process group (pgid === pid).
-    detached: true,
-  });
+  const sandbox =
+    process.platform === "linux" ? linuxLaunchHandle(argv) : undefined;
+  let subprocess: ReturnType<typeof admittedSpawn>;
+  try {
+    if (argv.length === 0 || argv[0] === undefined || argv[0].length === 0)
+      throw new Error("superviseSpawn requires a command");
+    // Linux hard-crash guarantee: re-exec through the PDEATHSIG wrapper so the
+    // child dies if the daemon is SIGKILLed (no macOS equivalent — Darwin relies
+    // on the process group + launchd cleanup + the boot sweep). Darwin argv is
+    // left byte-identical.
+    const selfInvocation =
+      process.platform === "linux" ? daemonSelfInvocation() : null;
+    const spawnArgv =
+      selfInvocation === null
+        ? argv
+        : linuxPdeathsigArgv(argv, selfInvocation, process.pid);
+    subprocess = admittedSpawn([...spawnArgv], {
+      ...opts,
+      // POSIX: lead an independently killable process group (pgid === pid).
+      detached: true,
+    });
+  } catch (error) {
+    sandbox?.cancelBeforeSpawn?.();
+    throw error;
+  }
   const pid = subprocess.pid;
   const pgid = pid;
   let handle: TSupervisedChild;
@@ -430,9 +438,7 @@ export const superviseSpawn = (
     return activeTaskRelease(tracked);
   };
   handle = {
-    ...(process.platform === "linux" && linuxLaunchHandle(argv)
-      ? { sandbox: linuxLaunchHandle(argv) }
-      : {}),
+    ...(sandbox ? { sandbox } : {}),
     subprocess,
     pid,
     pgid,

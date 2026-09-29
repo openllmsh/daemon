@@ -34,6 +34,8 @@ export type TLinuxLaunchHandle = {
   readonly signal: (signal: 1 | 2 | 9 | 15) => void;
   readonly shimExited: (code: number) => void;
   readonly bindShim?: (kill: () => void) => void;
+  /** Release the prepared launch only when no shim was created. */
+  readonly cancelBeforeSpawn?: () => void;
 };
 const launches = new Map<string, TLinuxLaunchHandle>();
 
@@ -450,6 +452,7 @@ export const prepareLinuxLaunch = (): string[] => {
     signal,
     completion,
     shimExited,
+    cancelBeforeSpawn: finish,
     bindShim: (kill): void => {
       killShim = kill;
       if (rejected && !admitted) kill();
