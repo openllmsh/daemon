@@ -17,13 +17,18 @@ export type TLinuxSandboxProbeOutcome = {
   readonly timedOut: boolean;
 };
 
-type TProbeResult = "passed" | "failed";
-
 type TReason = TDaemonSandboxDetails["reason"];
 type TSelfTestResult = {
   readonly passed: boolean;
   readonly reason: TReason;
 };
+export type TLinuxSandboxSelfTestOutcome = TLinuxSandboxProbeOutcome & {
+  readonly stderr: string;
+};
+export type TLinuxSandboxSelfTestRunner = (
+  args: readonly string[],
+  timeoutMs: number,
+) => Promise<TLinuxSandboxSelfTestOutcome>;
 
 const initialDetails = (): TDaemonSandboxDetails => ({
   backend: "linux-bubblewrap",
@@ -54,13 +59,27 @@ export const recordLinuxSandboxRejection = (reason: TReason): void => {
 /** Require every expected probe field, a zero exit, and no signal or timeout. */
 export const classifyLinuxSandboxProbe = (
   outcome: TLinuxSandboxProbeOutcome,
-): TProbeResult =>
+): boolean =>
   outcome.stdout === EXPECTED_PROBE_RECORD &&
   outcome.exitCode === 0 &&
   outcome.signal === null &&
-  !outcome.timedOut
-    ? "passed"
-    : "failed";
+  !outcome.timedOut;
+
+export const buildLinuxSandboxSelfTestArgs = (
+  executable: string,
+  sourceEntry?: string,
+): string[] => {
+  const selfArgs = sourceEntry === undefined ? [] : [resolve(sourceEntry)];
+  return [
+    executable,
+    ...selfArgs,
+    "--sandbox-exec",
+    "--",
+    executable,
+    ...selfArgs,
+    "--sandbox-probe",
+  ];
+};
 
 const landlockAbi = (): number | null => {
   if (process.platform !== "linux" || !["x64", "arm64"].includes(process.arch))
@@ -114,6 +133,7 @@ const readBounded = async (
       size += result.value.byteLength;
       if (size > limit) {
         onOverflow();
+        await reader.cancel();
         return "";
       }
       chunks.push(result.value);
@@ -130,27 +150,13 @@ const readBounded = async (
   return new TextDecoder().decode(output);
 };
 
-const runSelfTest = async (): Promise<TSelfTestResult> => {
-  const sourceEntry =
-    DAEMON_VERSION === "0.0.0-dev" ? process.argv[1] : undefined;
-  if (DAEMON_VERSION === "0.0.0-dev" && !sourceEntry)
-    return { passed: false, reason: "SELF_TEST_FAILED" };
-  const resolvedSourceEntry =
-    sourceEntry === undefined ? undefined : resolve(sourceEntry);
-  const selfArgs =
-    resolvedSourceEntry === undefined ? [] : [resolvedSourceEntry];
-  const args = [
-    ...selfArgs,
-    "--sandbox-exec",
-    "--",
-    process.execPath,
-    ...selfArgs,
-    "--sandbox-probe",
-  ];
-
+const spawnSelfTest: TLinuxSandboxSelfTestRunner = async (
+  args,
+  timeoutMs,
+): Promise<TLinuxSandboxSelfTestOutcome> => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(args, {
+    proc = Bun.spawn([...args], {
       cwd: "/",
       env: process.env,
       stdin: "ignore",
@@ -158,7 +164,13 @@ const runSelfTest = async (): Promise<TSelfTestResult> => {
       stderr: "pipe",
     });
   } catch {
-    return { passed: false, reason: "SELF_TEST_FAILED" };
+    return {
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+    };
   }
 
   let timedOut = false;
@@ -168,7 +180,7 @@ const runSelfTest = async (): Promise<TSelfTestResult> => {
     timedOut = true;
     proc.kill("SIGTERM");
     killTimer = setTimeout(() => proc.kill("SIGKILL"), 500);
-  }, SELF_TEST_TIMEOUT_MS);
+  }, timeoutMs);
   const [stdout, stderr, exitCode] = await Promise.all([
     readBounded(proc.stdout, 4096, () => {
       overflow = true;
@@ -182,16 +194,33 @@ const runSelfTest = async (): Promise<TSelfTestResult> => {
   ]);
   clearTimeout(timer);
   if (killTimer !== undefined) clearTimeout(killTimer);
-  const passed =
-    !overflow &&
-    classifyLinuxSandboxProbe({
-      stdout: overflow ? "" : stdout,
-      exitCode,
-      signal: proc.signalCode,
-      timedOut,
-    });
-  if (passed) return { passed: true, reason: "READY" };
-  const reason = stderr.match(/SANDBOX_UNAVAILABLE: ([A-Z_]+)\n?/)?.[1];
+  return {
+    stdout: overflow ? "" : stdout,
+    stderr: overflow ? "" : stderr,
+    exitCode,
+    signal: proc.signalCode,
+    timedOut,
+  };
+};
+
+/** Run the same daemon entry through its normal Linux confinement shim. */
+export const runLinuxSandboxSelfTest = async (
+  runner: TLinuxSandboxSelfTestRunner = spawnSelfTest,
+): Promise<TSelfTestResult> => {
+  const sourceEntry =
+    DAEMON_VERSION === "0.0.0-dev" ? process.argv[1] : undefined;
+  if (DAEMON_VERSION === "0.0.0-dev" && !sourceEntry)
+    return { passed: false, reason: "SELF_TEST_FAILED" };
+  const args = buildLinuxSandboxSelfTestArgs(process.execPath, sourceEntry);
+  let outcome: TLinuxSandboxSelfTestOutcome;
+  try {
+    outcome = await runner(args, SELF_TEST_TIMEOUT_MS);
+  } catch {
+    return { passed: false, reason: "SELF_TEST_FAILED" };
+  }
+  if (classifyLinuxSandboxProbe(outcome))
+    return { passed: true, reason: "READY" };
+  const reason = outcome.stderr.match(/SANDBOX_UNAVAILABLE: ([A-Z_]+)\n?/)?.[1];
   if (
     reason === "USERNS_UNAVAILABLE" ||
     reason === "BWRAP_UNAVAILABLE" ||
@@ -264,7 +293,7 @@ export const probeLinuxSandboxCapability = async (): Promise<
     return "unsupported";
   }
 
-  const result = await runSelfTest();
+  const result = await runLinuxSandboxSelfTest();
   if (result.passed) {
     details = {
       ...details,
