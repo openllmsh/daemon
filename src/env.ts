@@ -91,6 +91,7 @@ import {
   stealDirLock,
   sweepDirLockResidue,
 } from "../../tunnel/session/dir-lock";
+import { LegacyLockError } from "../../tunnel/session/dir-lock-control";
 import type {
   TProcessIdentity,
   TProcessStartIdentityReader,
@@ -1057,7 +1058,10 @@ const withEnvFileLock = (
   const release = acquireDirLockSync(lockDir, envDirLockCodec, {
     ...envDirLockOptions(),
     waitMs: waitMs ?? envLockWaitMs(),
-    legacyHeld: (): boolean => envLockLegacyHeld(stem, nonce),
+    legacyHeld:
+      process.platform === "win32"
+        ? (): boolean => envLockLegacyHeld(stem, nonce)
+        : undefined,
   });
   if (release === null) return false;
   try {
@@ -1211,7 +1215,8 @@ export const writePrivateFileAtomic = (
         isSafeEnvTarget(targetPath) &&
         replaceFileAtomic0600(targetPath, content),
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof LegacyLockError) throw error;
     return false;
   }
 };
@@ -1240,7 +1245,8 @@ export const writeEnvFileVars = (
       const content = `${updatedEnvLines(existing, updates).join("\n")}\n`;
       return replaceFileAtomic0600(targetPath, content);
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof LegacyLockError) throw error;
     return false;
   }
 };
