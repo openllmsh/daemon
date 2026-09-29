@@ -490,6 +490,95 @@ the live results above depend on it — do not read Cursor's Connect-path
 results as native compressed-envelope proof beyond what was captured through
 the production path. See `sub-method.ts`,
 `bridge-request-capture-readiness.ts`, and `docs/plan/bridge-request-capture/`.
+
+**Named execution variants (`execution-registry.ts` / `execution-identity.ts`).**
+`sub-method.ts`'s legacy `bridge`/`bridge-capture`/`handrolled` selector still
+owns the OUTER per-hop branch (native-runtime vs handrolled vs fleet). Layered
+on top, an admin may configure an EXPLICIT provider-unprefixed integration id
+through the SAME `ACTIVE_SUB_METHOD` env (`stream-json`/`app-server`/`acp`/
+`msp`/`sdk-facade`, each with an optional `-capture` suffix — `agent-sdk` is
+still reserved but unregistered). The cloud decodes both grammars from one env
+string (`packages/api/lib/sub-method.ts`) and ships the explicit selection as
+versioned bootstrap fields (`execution_selection`/`execution_selections`) only
+to a daemon that negotiated `EXECUTION_SELECTION2_CAP`. `walker.ts` samples it
+once per request (same per-provider-override-then-global precedence as the
+legacy fields) and hands it to `native-runtime/serve.ts`, which resolves it
+through `execution-registry.ts`'s `PROVIDER_EXECUTION_REGISTRY` +
+`resolveExecutionSelection` for all four native-runtime providers (Claude
+direct `stream-json`, Codex `app-server`, Cursor `acp`, Muse `msp`) before
+either the tool or text dispatch branch. A hop with NO explicit selection
+(the common case) is untouched — `serve.ts` keeps its unchanged legacy
+`shouldActivateBridgeRequestCapture` dispatch. A hop WITH one either
+dispatches through the SAME base integration (its `capture` flag replaces the
+legacy heuristic, still gated by the same dynamic capture-readiness table) or
+refuses pre-dispatch with a typed reason — never a silent fallback to another
+variant/provider. The one request-shape gate this baseline defines: explicit
+Claude `stream-json`(`-capture`) refuses a caller-tool-bearing turn rather
+than silently invoking the held Agent SDK (`agent-sdk`) behind the
+`stream-json` label — legacy `bridge`/`bridge-capture` is unaffected and keeps
+its existing text→CLI / tools→SDK split. `execution-identity.ts` partitions
+native session/continuation state by `(provider, variant, capture)` so an
+explicit selection and a legacy dispatch for the same provider (or a sibling
+Claude variant — `sdk-facade` alongside `stream-json`) can never collide. See
+`docs/plan/bridge-variants-and-capture-adapters/09-implementation-plan.md`.
+
+**Claude `sdk-facade`/`sdk-facade-capture` (`claude-sdk-facade.ts` /
+`claude-sdk-facade-capture.ts` /`claude-facade-mcp-server.ts`, phase 6,
+`docs/plan/bridge-variants-and-capture-adapters/12-hermes-adoption-plan.md`
+H1-H4).** Only reachable through an EXPLICIT `sdk-facade`/`sdk-facade-capture`
+selection (`execution-registry.ts` now registers both for `claude_code`) — a
+SECOND, independently-selectable Claude integration, never a replacement for
+`stream-json` or the official Agent SDK. Unlike `stream-json` (single buffered
+stdin write, `--resume`-based session persistence) or `agent-sdk` (a held
+`query()`), `sdk-facade` drives `claude -p --input-format stream-json
+--output-format stream-json` with the ENTIRE canonical history replayed as
+framed input lines every turn — `--no-session-persistence`, no vendor session
+at all. Every historical frame carries `shouldQuery: false` and must receive a
+zero-turn `result` acknowledgment before the next one is sent (Hermes-inspired
+structured full-history replay); the final frame is the turn's one real model
+call. This makes the variant STATELESS at the daemon level — no session-store
+lease, no new conversation identifier (00-requirements.md req. 5) — the
+client's own message history already correlates the turn, exactly like an
+ordinary completion call. History → frames reuses the SAME exact decomposition
+every other Claude tool path already uses
+(`request-capture-history.ts#historyTurnsFromCanonicalMessages` +
+`claude-tool-capture.ts#anthropicMessagesFromHistoryTurns`/
+`buildClaudeToolNameMap`) rather than a parallel planner, and caller tools are
+declared (schema only, never executed) via a dedicated loopback MCP server
+(`claude-facade-mcp-server.ts`) — `--max-turns 1` means the model's `tool_use`
+ends the turn before the CLI would ever invoke it. `sdk-facade-capture`
+attaches interception BEFORE spawning the SAME base runtime and reuses the
+existing Claude capture loopback/session/commit machinery
+(`claude-capture.ts#startClaudeCaptureLoopback`/`commitFromChunkStream`/
+`declinedForNonOkCapturedResponse`, `request-capture.ts`) rather than a
+duplicated relay — replay itself makes no network request, so only the final
+frame's one real `/v1/messages` POST is ever intercepted. Hermetic protocol
+fixture: `tests/transport/native-runtime-fixtures/fake-claude-facade.ts`
+(`tests/transport/claude-sdk-facade{,-capture}.test.ts`). REAL-CLI construction
+proof (H1, opt-in `RUN_DAEMON_LIVE=1`, no login —
+`tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`) found
+the `shouldQuery`/zero-turn-acknowledgment contract MIXED, not uniformly
+proven or unproven: a `type:"user"` replay frame IS acknowledged by the
+installed CLI (a single first-turn `sdk-facade`/`sdk-facade-capture` request
+reaches exactly one real `/v1/messages` POST end to end), but a
+`type:"assistant"` replay frame — the shape any multi-turn or
+tool-continuation history requires — is NEVER acknowledged by the real CLI.
+**This is now enforced as a pre-spawn refusal, not a runtime timeout:**
+`claude-sdk-facade.ts#sdkFacadeRequiresUnsupportedAssistantReplay` inspects
+the planned frames for any assistant-typed replay frame, and both
+`runClaudeSdkFacadeCore` and `runClaudeSdkFacadeCaptureCore` call that SAME
+shared guard immediately after `planClaudeSdkFacadeTurn` and decline — before
+spawning the CLI, before starting the loopback MCP server, and (capture only)
+before opening the capture session/loopback — whenever it fires. Only
+single-turn `sdk-facade` traffic is construction-proven safe AND reachable
+today; multi-turn/tool-continuation `sdk-facade` traffic is BLOCKED
+structurally, pending the underlying protocol-shape investigation (a
+different replay frame encoding, an undiscovered CLI flag, or a
+version-specific gap) — this is a required correctness gate, not a "planned
+capability" and not a fallback to another variant. Live-authenticated
+validation (H6) for the single-turn shape remains separately pending — see
+`claude-sdk-facade.ts`'s module doc and 09-implementation-plan.md §13 for the
+exact evidenced status.
 Capture turns force cold construction + full-history seed
 (`captureAwareTextBuilderPlan` / `historyTurnsFromCanonicalMessages` +
 `captureAwareHistoryBuilderPlan`) and never publish a warm resume handle.
@@ -510,6 +599,26 @@ carries a warm-session or cache-ID stability claim, and no number in the live
 report is a statistical or speedup claim — every measurement is a single
 observation. Accepted/uncertain capture ownership terminates the entire walk
 (no second send).
+
+**Execution-selection diagnostics and phase timing (plan phase 8,
+09-implementation-plan.md §8.3).** Every EXPLICIT new-vocabulary selection
+`native-runtime/serve.ts`'s `resolveExplicitDispatch` resolves — for all four
+migrated providers, one shared call site — logs a `debug`-level "execution
+selection resolved" line with the requested token
+(`formatActiveExecutionToken`) alongside the effective outcome: `accepted`
+with its resolved variant/capture, or `refused` with a typed refusal kind
+(`unsupported_execution_variant`/`unsupported_execution_shape`/
+`capture_not_supported`/`capture_not_ready`/`handrolled_unreachable`). The
+common no-explicit-selection hop (today's default) never logs this — it keeps
+its own existing diagnostics unchanged. Metadata-only: provider/variant/
+capture/outcome tags, never the request body, prompt, or credentials. Claude
+`sdk-facade`/`sdk-facade-capture` additionally share ONE phase-timing emitter
+(`claude-sdk-facade.ts#logSdkFacadePhaseTiming`, called by both the native
+runner and `claude-sdk-facade-capture.ts` rather than a second
+implementation) that logs elapsed milliseconds and the run's closed
+`committed`/`declined` outcome — the same numbers-plus-outcome convention
+`muse-runtime.ts`'s existing phase timings already use, common to both base
+and capture mode so neither variant's timing signal drifts from the other's.
 
 **Claude tool-passthrough (`claude-tool-session.ts` + `claude-tool-serve.ts`).**
 A tool-bearing `claude_code` request (client function tools present) is served

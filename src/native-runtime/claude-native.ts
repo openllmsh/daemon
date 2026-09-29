@@ -454,8 +454,11 @@ export const runClaudeNative = async (
   return { kind: "committed", chunks, sessionId: () => capturedSessionId };
 };
 
-/** Split a byte stream into NDJSON lines (no trailing-newline loss). */
-const ndjsonLines = (
+/** Split a byte stream into NDJSON lines (no trailing-newline loss). Exported
+ *  for `claude-sdk-facade.ts` — the ONE NDJSON line-splitter both Claude
+ *  stdout decoders use; the facade's own decode loop differs (framed replay,
+ *  tool_use handling) but must not re-implement this framing primitive. */
+export const ndjsonLines = (
   raw: ReadableStream<Uint8Array>,
 ): ReadableStream<string> => {
   const decoder = new TextDecoder();

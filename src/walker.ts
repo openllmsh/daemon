@@ -184,6 +184,8 @@ import {
 } from "./client-encode";
 import { recordRequest } from "./cloud-client";
 import {
+  activeExecutionSelection,
+  activeExecutionSelectionOverrides,
   activeSubMethod,
   activeSubMethodOverrides,
   contextOverflowStrategy as bootstrapContextOverflowStrategy,
@@ -2528,6 +2530,14 @@ const walkPlan = async (
   const requestedSubMethod = activeSubMethod();
   const subMethodOverrides = activeSubMethodOverrides();
   const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
+  // The same env's NEW-vocabulary projection (populated only when this
+  // daemon negotiated `EXECUTION_SELECTION2_CAP` — see `cloud-client.ts`),
+  // sampled together so it can never switch mid-hop either. Null for a hop
+  // whose provider has no explicit new-vocabulary selection configured —
+  // `native-runtime/serve.ts` then keeps its unchanged legacy dispatch
+  // (09-implementation-plan.md phase 5).
+  const requestedExecutionSelection = activeExecutionSelection();
+  const executionSelectionOverrides = activeExecutionSelectionOverrides();
 
   let lastError: string | null = null;
   let firstTerminalResponse: Response | null = null;
@@ -2806,6 +2816,14 @@ const walkPlan = async (
         // a precise wrong-owner/epoch decline rather than a misleading map miss.
         continuationToken: args.req.headers.get(TOOL_SESSION_HEADER),
         bridgeCapture: methods.includes("bridge-capture"),
+        // Per-provider override wins over the global preference, then no
+        // explicit selection at all (null) — same precedence as the legacy
+        // `subMethodOverrides[provider] ?? requestedSubMethod` above (
+        // 09-implementation-plan.md §4.2).
+        executionSelection:
+          executionSelectionOverrides[hop.provider] ??
+          requestedExecutionSelection ??
+          null,
         stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>

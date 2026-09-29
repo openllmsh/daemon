@@ -29,6 +29,7 @@ import type {
   TServerSearchCall,
 } from "@openllmsh/protocol";
 import { z } from "zod";
+import { CLAUDE_TOOL_PASSTHROUGH_SCOPE } from "../execution-identity";
 import type {
   TToolContinuationIdentity,
   TValidatedToolContinuation,
@@ -312,7 +313,9 @@ const sameContinuationScope = (
 ): boolean =>
   left.subject === right.subject &&
   left.ownerDaemonKey === right.ownerDaemonKey &&
-  left.ownerDaemonEpoch === right.ownerDaemonEpoch;
+  left.ownerDaemonEpoch === right.ownerDaemonEpoch &&
+  (left.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE) ===
+    (right.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE);
 
 const fingerprintOf = (
   continuationIdentity: TToolContinuationIdentity,
@@ -325,6 +328,8 @@ const fingerprintOf = (
       subject: continuationIdentity.subject,
       ownerDaemonKey: continuationIdentity.ownerDaemonKey,
       ownerDaemonEpoch: continuationIdentity.ownerDaemonEpoch,
+      executionScope:
+        continuationIdentity.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE,
     },
     tokenId: validatedToken.tokenId,
     results: toolResults

@@ -461,7 +461,11 @@ const readBoundedErrorBody = async (
  * delay the decline (and the ownership cleanup that follows it) past the
  * caller's own abort or the shared pre-commit deadline.
  */
-const declinedForNonOkCapturedResponse = async (
+/** Exported so `claude-sdk-facade-capture.ts` (`sdk-facade-capture`) shares
+ *  this EXACT non-2xx-captured-response decline instead of a duplicate —
+ *  both variants intercept the same `/v1/messages` shape via the same
+ *  loopback (`startClaudeCaptureLoopback`). */
+export const declinedForNonOkCapturedResponse = async (
   response: Response,
   signal: AbortSignal,
 ): Promise<Extract<TNativeRunResult, { readonly kind: "declined" }>> => {
@@ -503,7 +507,11 @@ const declinedForNonOkCapturedResponse = async (
  * translated here, never allowed to propagate out of this function (its
  * callers do not wrap it in try/catch and would otherwise lose ownership).
  */
-const commitFromChunkStream = async (args: {
+/** Exported so `claude-sdk-facade-capture.ts` (`sdk-facade-capture`) reuses
+ *  this EXACT pre-commit-buffered commit/decline machinery — same ownership
+ *  tagging (`captureOwnership: "accepted"` on every decline here), same
+ *  refusal/pre-commit-timeout handling — instead of a parallel copy. */
+export const commitFromChunkStream = async (args: {
   readonly chunks: ReadableStream<TChatCompletionChunk>;
   readonly signal: AbortSignal;
   readonly kill: () => void;

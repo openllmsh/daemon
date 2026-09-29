@@ -5,6 +5,7 @@ import {
   randomBytes,
   randomUUID,
 } from "node:crypto";
+import { CLAUDE_TOOL_PASSTHROUGH_SCOPE } from "../execution-identity";
 
 const TOKEN_VERSION = 1;
 const TOKEN_PREFIX = "ots1";
@@ -20,7 +21,24 @@ export type TToolContinuationIdentity = {
   readonly ownerDaemonEpoch: string;
   /** Shared per-user secret from bootstrap, or process-local development fallback. */
   readonly secret: string;
+  /**
+   * Normalized execution-identity key (see `../execution-identity.ts`) this
+   * continuation capability is scoped to. Defaults to
+   * {@link CLAUDE_TOOL_PASSTHROUGH_SCOPE} — the sole production owner of
+   * this token family today — so every caller/test that predates variant
+   * partitioning keeps its exact current behavior unchanged. A held
+   * session's minted token can only be redeemed by a continuation request
+   * carrying the SAME scope: it must resolve to its original
+   * integration/adapter owner, never "whichever global mode happens to be
+   * selected now" (09-implementation-plan.md §7).
+   */
+  readonly executionScope?: string;
 };
+
+/** Resolve the effective scope for comparison/claims — the identity's own
+ *  scope, or the single legacy owner when it predates partitioning. */
+const executionScopeOf = (identity: TToolContinuationIdentity): string =>
+  identity.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE;
 
 type TToolContinuationClaims = {
   readonly v: number;
@@ -28,6 +46,7 @@ type TToolContinuationClaims = {
   readonly sub: string;
   readonly owner: string;
   readonly epoch: string;
+  readonly scope: string;
   readonly ids: ReadonlyArray<string>;
   readonly exp: number;
 };
@@ -58,6 +77,7 @@ const claimsOf = (plain: string): TToolContinuationClaims | null => {
       typeof candidate.sub !== "string" ||
       typeof candidate.owner !== "string" ||
       typeof candidate.epoch !== "string" ||
+      typeof candidate.scope !== "string" ||
       !Array.isArray(candidate.ids) ||
       !candidate.ids.every((id) => typeof id === "string") ||
       typeof candidate.exp !== "number"
@@ -70,6 +90,7 @@ const claimsOf = (plain: string): TToolContinuationClaims | null => {
       sub: candidate.sub,
       owner: candidate.owner,
       epoch: candidate.epoch,
+      scope: candidate.scope,
       ids: candidate.ids,
       exp: candidate.exp,
     };
@@ -90,6 +111,7 @@ export const mintToolContinuation = (
     sub: identity.subject,
     owner: identity.ownerDaemonKey,
     epoch: identity.ownerDaemonEpoch,
+    scope: executionScopeOf(identity),
     ids: [...pendingIds].sort(),
     exp: expiresAt,
   };
@@ -167,6 +189,13 @@ export const validateToolContinuation = (
         kind: "invalid",
         reason:
           "tool-session continuation belongs to a different daemon or daemon epoch",
+      };
+    }
+    if (claims.scope !== executionScopeOf(identity)) {
+      return {
+        kind: "invalid",
+        reason:
+          "tool-session continuation token belongs to a different execution variant",
       };
     }
     const ids = new Set(claims.ids);

@@ -17,10 +17,13 @@
 
 import { randomUUID } from "node:crypto";
 import type {
+  TBridgeVariant,
   TChatCompletionChunk,
   TChatCompletionRequest,
   TCooldownReason,
+  TExecutionSelection,
 } from "@openllmsh/protocol";
+import { formatActiveExecutionToken } from "@openllmsh/protocol";
 import { declaresAnthropicServerSearchTool } from "@openllmsh/wire/adapters/messages/request";
 import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumulate";
 import { partialUsageFrom } from "@openllmsh/wire/lib/streaming/upstream-error";
@@ -34,12 +37,28 @@ import {
 import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
+import type { TExecutionIdentity } from "../execution-identity";
+import {
+  CLAUDE_TOOL_PASSTHROUGH_SCOPE,
+  cursorExecutionIdentity,
+  executionIdentityKey,
+  museExecutionIdentity,
+  nativeTextExecutionIdentity,
+  nativeToolExecutionIdentity,
+} from "../execution-identity";
+import {
+  describeExecutionSelectionRefusal,
+  providerSupportsCaptureFor,
+  resolveExecutionSelection,
+} from "../execution-registry";
 import { logDebug, logWarn, safeDiagnosticMessage } from "../logger";
 import {
   bridgeRequestCaptureReadiness,
   shouldActivateBridgeRequestCapture,
 } from "./bridge-request-capture-readiness";
 import { runClaudeNative } from "./claude-native";
+import { runClaudeSdkFacade } from "./claude-sdk-facade";
+import { runClaudeSdkFacadeCapture } from "./claude-sdk-facade-capture";
 import type {
   TClaudeToolCaptureBuilder,
   TClaudeToolCaptureHistoryFeed,
@@ -103,6 +122,10 @@ export type TNativeServeOverrides = {
   readonly bin?: string;
   readonly env?: Record<string, string>;
   readonly captureTool?: TNativeServeCaptureToolOverrides;
+  /** Hermetic `sdk-facade-capture` sender (production omits → real fetch
+   *  once), mirroring `captureTool.captureSender`'s role for the tool
+   *  capture path but for `serveClaudeSdkFacadeHop`. */
+  readonly claudeSdkFacadeCaptureSender?: TCapturedDispatchSender;
   /** Hermetic Cursor capture sender (production omits → real fetch once). */
   readonly cursorCaptureSender?: TCursorTransactionSender;
   /** Hermetic Cursor ACP runner injected into {@link runCursorNativeCapture}. */
@@ -119,18 +142,40 @@ export type TNativeServeOverrides = {
   >[0]["destinationPolicy"];
 };
 
-/** One conversation→session map per native provider (daemon-resident; the
- *  live resume files/threads are daemon-local, so the map is too). */
-const stores: Record<TNativeRuntimeProvider, NativeSessionStore> = {
-  claude_code: new NativeSessionStore(),
-  chatgpt: new NativeSessionStore(),
-  // cursor runs COLD sessions in v1 (`runCursorNative` never yields a
-  // resumable id, so this store stays empty); every prior-history turn takes
-  // the renderSeed path. TODO(cursor-resume): ACP `session/load` follow-up.
-  cursor: new NativeSessionStore(),
-  // muse also runs COLD sessions in v1 (`runMuseNative`); store stays empty.
-  muse: new NativeSessionStore(),
+/**
+ * One conversation→session map PER EXECUTION IDENTITY (provider + variant +
+ * capture — see `../execution-identity.ts`), not merely per provider.
+ * Lazily created on first use. Today only one variant is dispatched per
+ * provider (the sole registration each provider declares in
+ * `../execution-registry.ts`), so this produces exactly the same
+ * store-per-provider partitioning as the previous `Record`; the split is by
+ * IDENTITY (not bare provider) so a future sibling variant for the SAME
+ * provider — Claude's planned `sdk-facade` alongside `stream-json`, or the
+ * held-SDK `agent-sdk` tool engine alongside either — can never resume
+ * another variant's native session state
+ * (09-implementation-plan.md §7, phase 3 exit gate: "sibling variant state
+ * cannot collide"). `cursor`/`muse` never lease a store in v1 (both run COLD
+ * sessions — see their serve functions below; `runCursorNative` and
+ * `runMuseNative` never yield a resumable id), so those entries are simply
+ * never created, matching the previous always-empty stub entries.
+ */
+const storesByExecutionIdentity = new Map<string, NativeSessionStore>();
+
+const storeFor = (identity: TExecutionIdentity): NativeSessionStore => {
+  const key = executionIdentityKey(identity);
+  let store = storesByExecutionIdentity.get(key);
+  if (store === undefined) {
+    store = new NativeSessionStore();
+    storesByExecutionIdentity.set(key, store);
+  }
+  return store;
 };
+
+/** Test/introspection: the session store for one execution identity — lazily
+ *  created, matching production lookup exactly (see `storeFor` above). */
+export const nativeSessionStoreFor = (
+  identity: TExecutionIdentity,
+): NativeSessionStore => storeFor(identity);
 
 const toolContinuationEpoch = randomUUID();
 const localContinuationSecret = randomUUID();
@@ -144,6 +189,12 @@ const toolContinuationIdentity = (): TToolContinuationIdentity => {
     ownerDaemonKey,
     ownerDaemonEpoch: toolContinuationEpoch,
     secret: planSigningKey() ?? localContinuationSecret,
+    // The only production owner of this token family — the non-captured held
+    // Agent SDK tool-passthrough engine (see `../execution-identity.ts`).
+    // Threading it explicitly (rather than relying on the module's implicit
+    // default) means a future sibling scope for this same call site is a
+    // one-line change here, not a silent default drift.
+    executionScope: CLAUDE_TOOL_PASSTHROUGH_SCOPE,
   };
 };
 
@@ -209,6 +260,7 @@ export const resetNativeResumeStats = (): void => {
  */
 const recordResumeOutcome = (
   provider: TNativeRuntimeProvider,
+  variant: TBridgeVariant,
   outcome: "firstTurn" | "resumeHit" | "resumeMiss",
   turnCount: number,
   seedChars: number,
@@ -217,6 +269,11 @@ const recordResumeOutcome = (
   s[outcome]++;
   const meta = {
     provider,
+    // The resolved execution identity's variant — instrumentation only
+    // (see `../execution-identity.ts`); today always the provider's sole
+    // registered text variant, carried through so a future sibling variant
+    // is visible in these logs instead of silently folding into `provider`.
+    variant,
     outcome,
     turnCount,
     firstTurn: s.firstTurn,
@@ -248,6 +305,171 @@ export type TNativeServeOutcome =
       readonly cooldownReason?: TCooldownReason;
       readonly captureOwnership?: "none" | "accepted" | "uncertain";
     };
+
+/**
+ * Resolve this hop's EXPLICIT new-vocabulary selection (if any) against the
+ * registry, folding in the one request-shape gate this baseline defines
+ * (Claude `stream-json` + caller tools). Callers use the result like this:
+ *
+ *   - `null` — no explicit selection was configured for this hop at all;
+ *     keep the existing legacy `shouldActivateBridgeRequestCapture` dispatch
+ *     below UNCHANGED. This is the common case today. A GLOBAL preference
+ *     that this provider doesn't register is NOT folded into this case — it
+ *     resolves through `{ ok: false, declined }` below like any other
+ *     unsupported pairing (09-implementation-plan.md §4.2).
+ *   - `{ ok: true, captureActive, variant }` — the explicit selection was
+ *     accepted; use ITS `capture` flag instead of the legacy heuristic.
+ *     `claude_code` now declares TWO variants (`stream-json`, `sdk-facade` —
+ *     `../execution-registry.ts`), so callers MUST branch on `variant`
+ *     rather than assume "the one variant this function is already about
+ *     to dispatch through" (true for chatgpt/cursor/muse, no longer true for
+ *     claude_code since phase 6 registered `sdk-facade` alongside
+ *     `stream-json`).
+ *   - `{ ok: false, declined }` — a typed refusal (unsupported variant,
+ *     unsupported request shape, or capture not supported). Decline this
+ *     hop pre-dispatch; never substitute a different variant/provider for
+ *     an explicit choice the admin made (09-implementation-plan.md §4.1).
+ *
+ * A bare GLOBAL preference (`activeExecutionSelection()`, applied uniformly
+ * to every subscription hop via `walker.ts`: `overrides[hop.provider] ??
+ * requestedExecutionSelection`) carries the SAME concrete meaning for every
+ * provider as an explicit PER-PROVIDER override
+ * (`executionSelectionOverrides[hop.provider]`) — 09-implementation-plan.md
+ * §4.2: "A bare global method keeps the same concrete meaning for every
+ * provider; it is not a category that expands into different integrations."
+ * A provider that does not register the globally-selected variant (e.g. a
+ * GLOBAL `sdk-facade` preference reaching a `muse`/`cursor`/`chatgpt` hop,
+ * `sdk-facade` being claude_code-only) is therefore refused pre-dispatch
+ * exactly like an unambiguous per-provider override would be — §4.2 requires
+ * the admin to either override that provider explicitly or accept the
+ * refusal, never a silent, unrequested fall-through to the legacy `bridge`
+ * dispatch. There is no scope-dependent softening here: every refusal kind
+ * (`unsupported_execution_variant`, `capture_not_supported`,
+ * `unsupported_execution_shape`) is a hard pre-dispatch decline regardless
+ * of whether the selection came from the global preference or a per-
+ * provider override.
+ */
+const resolveExplicitDispatch = (
+  provider: string,
+  executionSelection: TExecutionSelection | null | undefined,
+  requestShape: { readonly hasClientTools: boolean },
+):
+  | null
+  | {
+      readonly ok: true;
+      readonly captureActive: boolean;
+      readonly variant: TBridgeVariant;
+    }
+  | { readonly ok: false; readonly declined: string } => {
+  if (executionSelection === null || executionSelection === undefined) {
+    return null;
+  }
+  const resolution = resolveExecutionSelection(
+    provider,
+    executionSelection,
+    undefined,
+    requestShape,
+  );
+  // `resolveExecutionSelection` itself returns `null` only for a `null`
+  // `requested` (excluded just above), so this is unreachable — narrows the
+  // type for the checks below without a non-null assertion.
+  if (resolution === null) return null;
+  if (!resolution.ok) {
+    const declined = describeExecutionSelectionRefusal(resolution.refusal);
+    logExecutionSelectionResolution(provider, executionSelection, {
+      effective: "refused",
+      refusalKind: resolution.refusal.kind,
+    });
+    return { ok: false, declined };
+  }
+  // The registry's `providerSupportsCaptureFor` is a STATIC declaration
+  // (this provider's binding is capture-eligible AT ALL); the readiness
+  // table below is the dynamic kill switch the legacy
+  // `shouldActivateBridgeRequestCapture` path already consults on every
+  // capture activation. An explicit selection must not bypass that switch —
+  // if a provider's readiness ever flips to `ready: false`, an explicit
+  // `<variant>-capture` selection refuses rather than silently forcing
+  // capture on anyway.
+  if (
+    resolution.selection.kind === "bridge" &&
+    resolution.selection.capture &&
+    !bridgeRequestCaptureReadiness(provider as TNativeRuntimeProvider).ready
+  ) {
+    logExecutionSelectionResolution(provider, executionSelection, {
+      effective: "refused",
+      refusalKind: "capture_not_ready",
+    });
+    return {
+      ok: false,
+      declined: `${provider} bridge-capture is not ready: ${bridgeRequestCaptureReadiness(provider as TNativeRuntimeProvider).reason}`,
+    };
+  }
+  if (resolution.selection.kind === "handrolled") {
+    // Structurally unreachable in production: the walker samples the
+    // explicit selection from the SAME `ACTIVE_SUB_METHOD` env as the
+    // legacy selector, and a token that resolves to `handrolled` in the new
+    // grammar resolves to `handrolled` in the legacy grammar too — so the
+    // walker's outer branch (`methodsIncludeNativeBridge`) never enters the
+    // native-runtime path at all for that hop. Decline defensively rather
+    // than assume native dispatch is still the right transport.
+    logExecutionSelectionResolution(provider, executionSelection, {
+      effective: "refused",
+      refusalKind: "handrolled_unreachable",
+    });
+    return {
+      ok: false,
+      declined:
+        "explicit selection resolved to handrolled; native runtime does not serve handrolled dispatch",
+    };
+  }
+  logExecutionSelectionResolution(provider, executionSelection, {
+    effective: "accepted",
+    variant: resolution.selection.variant,
+    capture: resolution.selection.capture,
+  });
+  return {
+    ok: true,
+    captureActive: resolution.selection.capture,
+    variant: resolution.selection.variant,
+  };
+};
+
+/**
+ * Shared admin/log diagnostic for EVERY explicit new-vocabulary selection
+ * this hop resolves — requested token versus effective outcome (accepted
+ * variant+capture, or a typed refusal kind), per
+ * 09-implementation-plan.md §8.3 ("Add admin/log diagnostics for requested
+ * versus effective selection and refusal reason"). ONE call site
+ * (`resolveExplicitDispatch` above) covers all four migrated providers, so
+ * this never duplicates per provider. Privacy-safe: provider/variant/
+ * capture/outcome tags only — never the request body, prompt, or
+ * credentials. Only fires for an EXPLICIT selection (the common no-
+ * selection case returns `null` from `resolveExplicitDispatch` before this
+ * is ever called, and stays silent here — it already keeps today's
+ * unchanged legacy dispatch and its own existing diagnostics).
+ *
+ * Every explicit selection resolves to exactly one of these two outcomes —
+ * there is no scope-dependent third "ignored" outcome (09-implementation-
+ * plan.md §4.2: a global preference carries the same concrete meaning as a
+ * per-provider override, so an unsupported pairing is refused either way).
+ */
+const logExecutionSelectionResolution = (
+  provider: string,
+  requested: TExecutionSelection,
+  effective:
+    | { readonly effective: "refused"; readonly refusalKind: string }
+    | {
+        readonly effective: "accepted";
+        readonly variant: TBridgeVariant;
+        readonly capture: boolean;
+      },
+): void => {
+  logDebug("native-runtime", "execution selection resolved", {
+    provider,
+    requested: formatActiveExecutionToken(requested),
+    ...effective,
+  });
+};
 
 const declinedOutcome = (
   declined: string,
@@ -281,6 +503,18 @@ export type TNativeServeParams = {
    * capture env flag.
    */
   readonly bridgeCapture?: boolean;
+  /**
+   * The walker's sampled EXPLICIT new-vocabulary selection for this hop
+   * (per-provider override or global preference; see `walker.ts`), or
+   * `null`/omitted when none is configured — the common case, which keeps
+   * this function's unchanged legacy `bridgeCapture` dispatch below
+   * (09-implementation-plan.md phase 5). When non-null, `resolveExplicit
+   * Dispatch` below resolves it through `execution-registry.ts`'s
+   * `resolveExecutionSelection` and either declines this hop pre-dispatch
+   * (typed refusal — unsupported variant/shape/capture) or overrides the
+   * capture decision with the resolved selection's own `capture` flag.
+   */
+  readonly executionSelection?: TExecutionSelection | null;
   /** Catalog-gated client-output repair, resolved by the walker. */
   readonly stripSubagentIsolation: boolean;
   readonly signal: AbortSignal;
@@ -387,6 +621,41 @@ export const tryServeNativeRuntime = async (
   if (unsupported !== null) {
     return { declined: `native runtime can't honor ${unsupported}` };
   }
+  // Resolve this hop's EXPLICIT new-vocabulary selection ONCE, ahead of the
+  // tool/text branch below — one resolution covers both, since `provider`
+  // here is already `claude_code`/`chatgpt` on either path (see
+  // `resolveExplicitDispatch`'s doc comment). `null` means no explicit
+  // selection was configured for this hop; every capture decision below
+  // keeps this function's unchanged legacy dispatch in that case
+  // (09-implementation-plan.md phase 5, "existing-path migration").
+  const explicitDispatch = resolveExplicitDispatch(
+    params.provider,
+    params.executionSelection,
+    { hasClientTools: hasClientTools(params.canonical) },
+  );
+  if (explicitDispatch !== null && !explicitDispatch.ok) {
+    return { declined: explicitDispatch.declined };
+  }
+  // `sdk-facade`/`sdk-facade-capture` (phase 6, H1-H4): a SELF-CONTAINED,
+  // stateless completion facade — full canonical history replay every turn,
+  // no `--resume`, no session-store lease (see `claude-sdk-facade.ts`'s
+  // module doc). It handles BOTH tool-bearing and plain-text requests
+  // itself, so it branches BEFORE the `hasClientTools`/`nativeRequestOf`
+  // split below, which is `stream-json`/`agent-sdk`-specific. Only reached
+  // for an EXPLICIT `sdk-facade` selection — the common case (no explicit
+  // selection) never enters this branch.
+  if (
+    params.provider === "claude_code" &&
+    explicitDispatch !== null &&
+    explicitDispatch.ok &&
+    explicitDispatch.variant === "sdk-facade"
+  ) {
+    return serveClaudeSdkFacadeHop(
+      params,
+      overrides,
+      explicitDispatch.captureActive,
+    );
+  }
   // Tool-bearing requests: when `bridge-capture` is selected AND readiness
   // admits the provider, use capture (inert schemas / refused item/tool/call)
   // — NEVER the ordinary held SDK / app-server execution path. Otherwise keep
@@ -400,13 +669,15 @@ export const tryServeNativeRuntime = async (
         : params.provider === "claude_code"
           ? "claude_code"
           : null;
-    if (
-      toolProvider !== null &&
-      shouldActivateBridgeRequestCapture(
-        toolProvider,
-        params.bridgeCapture === true,
-      )
-    ) {
+    const activateToolCapture =
+      explicitDispatch !== null
+        ? explicitDispatch.captureActive
+        : toolProvider !== null &&
+          shouldActivateBridgeRequestCapture(
+            toolProvider,
+            params.bridgeCapture === true,
+          );
+    if (toolProvider !== null && activateToolCapture) {
       return serveCapturedToolTurn(params, overrides, toolProvider);
     }
     return tryServeNativeToolTurn({
@@ -437,12 +708,22 @@ export const tryServeNativeRuntime = async (
   // Text path is Claude/Codex only (cursor/muse returned above).
   const textProvider: "claude_code" | "chatgpt" =
     params.provider === "chatgpt" ? "chatgpt" : "claude_code";
-  // Correlate to a persisted session and compute the delta turn to feed.
-  const store = stores[textProvider];
-  const captureActive = shouldActivateBridgeRequestCapture(
+  const captureActive =
+    explicitDispatch !== null
+      ? explicitDispatch.captureActive
+      : shouldActivateBridgeRequestCapture(
+          textProvider,
+          params.bridgeCapture === true,
+        );
+  // Normalized identity for THIS hop's engine (see `../execution-identity.ts`)
+  // — partitions the session store so a future sibling text variant for the
+  // same provider can never resume this variant's native session state.
+  const executionIdentity = nativeTextExecutionIdentity(
     textProvider,
-    params.bridgeCapture === true,
+    captureActive,
   );
+  // Correlate to a persisted session and compute the delta turn to feed.
+  const store = storeFor(executionIdentity);
   const { prefixHash, deltaText, hasPrior } = deriveConversation(
     params.providerModelId,
     req.systemText,
@@ -471,6 +752,7 @@ export const tryServeNativeRuntime = async (
   // (includes capture-forced cold starts).
   recordResumeOutcome(
     textProvider,
+    executionIdentity.variant,
     builderResumeId !== null
       ? "resumeHit"
       : hasPrior
@@ -491,6 +773,21 @@ export const tryServeNativeRuntime = async (
       provider: textProvider,
       readiness: bridgeRequestCaptureReadiness(textProvider).mode,
       coldBuilder: true,
+      // Cross-reference against the phase-1/2 capability authority
+      // (`../execution-registry.ts`) so a capture activation is always
+      // visible against BOTH the legacy readiness table and the new
+      // registry's independent capability declaration — see
+      // 09-implementation-plan.md §8.3 ("Add admin/log diagnostics for
+      // requested versus effective selection"). For this text engine the
+      // two are expected to always agree (`stream-json`/`app-server` are
+      // both registered AND capture-eligible); a `false` here would be a
+      // real, actionable divergence worth investigating before phase 5
+      // migrates this dispatch onto the registry.
+      executionIdentity: executionIdentityKey(executionIdentity),
+      registryDeclaresCapture: providerSupportsCaptureFor(
+        textProvider,
+        executionIdentity.variant,
+      ),
     });
   }
   let run: TNativeRunResult;
@@ -610,6 +907,116 @@ export const tryServeNativeRuntime = async (
 };
 
 /**
+ * `claude_code` `sdk-facade`/`sdk-facade-capture` hop (phase 6, H1-H4) — only
+ * reached for an EXPLICIT `sdk-facade` selection (see `tryServeNativeRuntime`
+ * above). Unlike the `stream-json`/`agent-sdk` split above, this ONE runner
+ * serves BOTH tool-bearing and plain-text requests, and has no session-store
+ * lease to advance: `claude-sdk-facade.ts` replays the client's full
+ * canonical history every turn instead of resuming a vendor session
+ * (00-requirements.md req. 5 — no new conversation identifier; the client's
+ * own message history already IS the correlation), so `settle` below only
+ * records tokens.
+ */
+const serveClaudeSdkFacadeHop = async (
+  params: TNativeServeParams,
+  overrides: TNativeServeOverrides | undefined,
+  captureActive: boolean,
+): Promise<TNativeServeOutcome> => {
+  const bin = overrides?.bin ?? cliBin("claude_code");
+  const env = overrides?.env ?? cliEnv("claude_code");
+
+  logDebug("native-runtime", "sdk-facade hop active", {
+    captureActive,
+    hasClientTools: hasClientTools(params.canonical),
+  });
+
+  let run: TNativeRunResult;
+  try {
+    run = captureActive
+      ? await runClaudeSdkFacadeCapture({
+          bin,
+          env,
+          providerModelId: params.providerModelId,
+          canonical: params.canonical,
+          signal: params.signal,
+          captureSender:
+            overrides?.claudeSdkFacadeCaptureSender ?? defaultCaptureSender,
+        })
+      : await runClaudeSdkFacade({
+          bin,
+          env,
+          providerModelId: params.providerModelId,
+          canonical: params.canonical,
+          signal: params.signal,
+        });
+  } catch (error) {
+    return {
+      declined: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (run.kind === "declined") {
+    return declinedOutcome(
+      run.reason,
+      run.cooldownReason,
+      run.captureOwnership,
+    );
+  }
+
+  const committed = run;
+  const settle = (
+    resp: Awaited<ReturnType<typeof accumulateChunksToResponse>>,
+  ): void => {
+    params.record(tokensFromResponse(resp), "success");
+  };
+  const fail = (err: unknown): void => {
+    if (params.signal.aborted || isClientHangUp(err)) return;
+    const usage = partialUsageFrom(err);
+    params.record(
+      usage === null ? ZERO_TOKENS : tokensFromResponse({ usage }),
+      "error",
+    );
+  };
+
+  const clientWire = clientWireOf(params.surface);
+  if (params.wantsStream) {
+    return deliverChunkStream(committed.chunks, {
+      surface: params.surface,
+      clientWire,
+      providerModelId: params.providerModelId,
+      onResponse: settle,
+      onError: fail,
+      stripSubagentIsolation: params.stripSubagentIsolation,
+    });
+  }
+
+  let canonical: Awaited<ReturnType<typeof accumulateChunksToResponse>>;
+  try {
+    canonical = await accumulateChunksToResponse(
+      committed.chunks,
+      params.providerModelId,
+    );
+  } catch (err) {
+    fail(err);
+    const reason =
+      partialUsageFrom(err) === null
+        ? "sdk-facade stream ended before output"
+        : "sdk-facade stream failed after output began";
+    if (captureActive) {
+      return declinedOutcome(reason, undefined, "accepted");
+    }
+    return errorJson(502, reason);
+  }
+  settle(canonical);
+  return deliverJsonResponse(
+    canonical,
+    params.surface,
+    clientWire,
+    undefined,
+    params.stripSubagentIsolation,
+  );
+};
+
+/**
  * Tool-bearing bridge-capture route for Claude/Codex. Caller tools are
  * registered so schemas appear in the vendor envelope; MCP / item/tool/call
  * execution is NOT the capture boundary. True response stays daemon-owned.
@@ -642,11 +1049,28 @@ const serveCapturedToolTurn = async (
   const captureTool = overrides?.captureTool;
   const captureSender = captureTool?.captureSender ?? defaultCaptureSender;
 
+  // Tool-bearing capture runs through the held Agent SDK / app-server engine
+  // (`agent-sdk` for claude_code, `app-server` for chatgpt) — NOT the text
+  // path's `stream-json` — see `nativeToolExecutionIdentity`'s doc comment.
+  // For claude_code this deliberately logs `registryDeclaresCapture: false`:
+  // `agent-sdk` has no `<variant>-capture` form in the approved public
+  // vocabulary (@openllmsh/protocol's `BRIDGE_VARIANTS_WITH_CAPTURE_FORM`),
+  // so the NEW registry correctly refuses it, even while today's LEGACY
+  // `bridge-capture` selector still attaches capture to that exact engine
+  // (09-implementation-plan.md §8.2, "Old Claude `bridge` cannot represent
+  // explicit `stream-json` across tool-bearing requests"). That is an
+  // expected, documented divergence — not a bug this log should chase.
+  const toolExecutionIdentity = nativeToolExecutionIdentity(provider, true);
   logDebug("native-runtime", "bridge request capture tool turn active", {
     provider,
     readiness: bridgeRequestCaptureReadiness(provider).mode,
     toolCount: tools.length,
     hasPrior: decomposed.hasPrior,
+    executionIdentity: executionIdentityKey(toolExecutionIdentity),
+    registryDeclaresCapture: providerSupportsCaptureFor(
+      provider,
+      toolExecutionIdentity.variant,
+    ),
   });
 
   let run: TNativeRunResult;
@@ -776,10 +1200,26 @@ const serveCursorHop = async (
   params: TNativeServeParams,
   overrides?: TNativeServeOverrides,
 ): Promise<TNativeServeOutcome> => {
-  const captureActive = shouldActivateBridgeRequestCapture(
+  // cursor's ACP shape refusal (`n>1`/`logprobs`) already ran in the caller;
+  // `hasClientTools` is irrelevant to cursor's ONE registered variant (`acp`
+  // accepts tools over its native loopback MCP), so the shared shape gate in
+  // `resolveExecutionSelection` never fires for it — passed through anyway
+  // for a uniform call shape across all four migrated providers.
+  const explicitDispatch = resolveExplicitDispatch(
     "cursor",
-    params.bridgeCapture === true,
+    params.executionSelection,
+    { hasClientTools: hasClientTools(params.canonical) },
   );
+  if (explicitDispatch !== null && !explicitDispatch.ok) {
+    return { declined: explicitDispatch.declined };
+  }
+  const captureActive =
+    explicitDispatch !== null
+      ? explicitDispatch.captureActive
+      : shouldActivateBridgeRequestCapture(
+          "cursor",
+          params.bridgeCapture === true,
+        );
   if (params.bridgeCapture === true && !captureActive) {
     const readiness = bridgeRequestCaptureReadiness("cursor");
     logDebug("native-runtime", "cursor bridge request capture not activated", {
@@ -792,6 +1232,8 @@ const serveCursorHop = async (
       provider: "cursor",
       readiness: bridgeRequestCaptureReadiness("cursor").mode,
       coldBuilder: true,
+      executionIdentity: executionIdentityKey(cursorExecutionIdentity(true)),
+      registryDeclaresCapture: providerSupportsCaptureFor("cursor", "acp"),
     });
   }
   const req = cursorRequestOf(params.canonical);
@@ -893,10 +1335,24 @@ const serveMuseHop = async (
   params: TNativeServeParams,
   overrides?: TNativeServeOverrides,
 ): Promise<TNativeServeOutcome> => {
-  const captureActive = shouldActivateBridgeRequestCapture(
+  // Muse's ONE registered variant (`msp`) is caller-tool-capable and native
+  // hosted-search-owning regardless — the shared shape gate never fires for
+  // it; passed through for a uniform call shape (see `serveCursorHop`).
+  const explicitDispatch = resolveExplicitDispatch(
     "muse",
-    params.bridgeCapture === true,
+    params.executionSelection,
+    { hasClientTools: hasClientTools(params.canonical) },
   );
+  if (explicitDispatch !== null && !explicitDispatch.ok) {
+    return { declined: explicitDispatch.declined };
+  }
+  const captureActive =
+    explicitDispatch !== null
+      ? explicitDispatch.captureActive
+      : shouldActivateBridgeRequestCapture(
+          "muse",
+          params.bridgeCapture === true,
+        );
   if (params.bridgeCapture === true && !captureActive) {
     const readiness = bridgeRequestCaptureReadiness("muse");
     logDebug("native-runtime", "muse bridge request capture not activated", {
@@ -909,6 +1365,8 @@ const serveMuseHop = async (
       provider: "muse",
       readiness: bridgeRequestCaptureReadiness("muse").mode,
       coldBuilder: true,
+      executionIdentity: executionIdentityKey(museExecutionIdentity(true)),
+      registryDeclaresCapture: providerSupportsCaptureFor("muse", "msp"),
     });
   }
 

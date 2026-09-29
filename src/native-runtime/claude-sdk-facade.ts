@@ -1,0 +1,760 @@
+/**
+ * Claude `sdk-facade` — the Hermes-inspired native stream-json completion
+ * facade (plan phase 6 / H1-H3,
+ * `docs/plan/bridge-variants-and-capture-adapters/12-hermes-adoption-plan.md`).
+ * Distinct from BOTH existing Claude paths:
+ *
+ *   - `stream-json` (`claude-native.ts`) feeds ONE text turn via `--resume`
+ *     and a single buffered stdin write; no caller tools.
+ *   - `agent-sdk` (`claude-tool-session.ts`) drives the official
+ *     `@anthropic-ai/claude-agent-sdk` `query()` and HOLDS it open across
+ *     tool round-trips.
+ *
+ * `sdk-facade` instead replays the ENTIRE canonical history as FRAMED
+ * `--input-format stream-json` lines on every turn (Hermes §3.B: "structured
+ * full-history replay") and spawns a FRESH, STATELESS `claude` child each
+ * time — `--no-session-persistence`, no `--resume`. There is no vendor
+ * session and no daemon-held query to partition by execution identity
+ * (00-requirements.md req. 5: no new conversation identifier) — the
+ * client's own full message history IS the correlation, exactly like an
+ * ordinary OpenAI-shaped completion call.
+ *
+ * History → frames reuses the SAME exact, non-lossy decomposition every
+ * other Claude tool path already uses — `request-capture-history.ts`'s
+ * `historyTurnsFromCanonicalMessages` and `claude-tool-capture.ts`'s
+ * `anthropicMessagesFromHistoryTurns`/`buildClaudeToolNameMap` — rather than
+ * a parallel history planner (00-requirements.md req. 3).
+ *
+ * Replay protocol (Hermes §3.B, adapted — see `replayClaudeSdkFacadeHistory`):
+ * every frame but the last is written with `shouldQuery: false` and MUST be
+ * acknowledged by a zero-turn `result` line before the next frame is sent.
+ * The final frame omits `shouldQuery` (defaults to triggering generation)
+ * and is the turn's ONE real model call — replay itself makes no network
+ * request (Hermes §3.E: admission is a transport invariant;
+ * `sdk-facade-capture` in `claude-sdk-facade-capture.ts` relies on exactly
+ * this to intercept only that one call).
+ *
+ * **H1 real-CLI construction proof (verified, not merely `--help`-inferred):**
+ * `tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`
+ * (opt-in, `RUN_DAEMON_LIVE=1`, real installed `claude` binary, dummy API
+ * key, no login) is the concrete evidence, and it is MIXED:
+ *
+ *   - PROVEN: a `type:"user"` `shouldQuery:false` frame DOES receive a
+ *     zero-turn `result` line (`num_turns: 0`) before the next write — the
+ *     single-turn (no prior assistant message) case this facade needs for
+ *     plain first-turn text is genuinely safe for real traffic. The SAME
+ *     test proves a single-turn `sdk-facade-capture` request reaches
+ *     exactly one real `/v1/messages` POST end to end through the actual
+ *     production dispatch function.
+ *   - DISPROVEN, not merely unproven: a `type:"assistant"` `shouldQuery:
+ *     false` frame — the exact shape `anthropicMessagesFromHistoryTurns`
+ *     emits for ANY prior assistant turn (`{role: turn.role, ...}`, role
+ *     `"assistant"`) — receives NO acknowledgment at all from the real
+ *     installed CLI within any bounded wait; it is silently dropped, not
+ *     acked and not errored. The same test proves this end to end too: a
+ *     multi-turn (system + user + assistant + user) `sdk-facade-capture`
+ *     request through the real production function never reaches the
+ *     upstream and exhausts the full replay deadline before declining.
+ *
+ * Consequence: EVERY multi-turn or tool-continuation `sdk-facade`/
+ * `sdk-facade-capture` request — anything needing at least one assistant-
+ * typed replay frame — is UNQUALIFIED for real traffic against this
+ * installed CLI version; the real CLI would occupy a full
+ * `PRE_COMMIT_TIMEOUT_MS` (60s) before declining if it were ever asked to
+ * replay one. Only a single first-turn request (caller tools included —
+ * the model's OWN `tool_use` on that first turn needs no assistant REPLAY
+ * frame) is construction-proven safe today.
+ *
+ * **BLOCKED, enforced pre-spawn (this is the required gate, not a runtime
+ * timeout):** {@link planClaudeSdkFacadeTurn} still plans the full
+ * multi-turn shape (it stays the one shared, exact history decomposition —
+ * 00-requirements.md req. 3 — and its own frame-construction unit tests in
+ * `claude-sdk-facade.test.ts` keep exercising it as a protocol-mechanism
+ * experiment, independent of whether a plan is ever dispatched). What
+ * changed: {@link sdkFacadeRequiresUnsupportedAssistantReplay} inspects that
+ * plan for any frame that would require the disproven acknowledgment (a
+ * `shouldQuery: false` frame with `type: "assistant"` — i.e. any frame
+ * decomposed from a genuine prior assistant/tool-continuation turn, never a
+ * naive `messages.length` check, which both under-refuses a system-message-
+ * padded first turn and over-refuses nothing it shouldn't), and BOTH
+ * `runClaudeSdkFacadeCore` (this file) and `runClaudeSdkFacadeCaptureCore`
+ * (`claude-sdk-facade-capture.ts`) call it immediately after `plan.ok` and
+ * refuse with {@link SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON} BEFORE
+ * either spawns the CLI, starts the loopback MCP server, or (capture only)
+ * opens the capture session/loopback — no process, no capture resource, no
+ * network activity for a request this gate refuses. Because the check lives
+ * in the ONE shared plan-refusal step both production entry points already
+ * call first, it applies no matter which of the two functions a caller
+ * invokes directly — it is not contingent on `execution-registry.ts`'s
+ * pre-dispatch resolution being consulted first. Multi-turn `sdk-facade` is
+ * therefore a documented, evidenced-and-BLOCKED capability gap, not a
+ * silently "ready" registration and not a request that would hang until a
+ * runtime timeout — see 09-implementation-plan.md §13's execution-status
+ * update for the exact wording.
+ *
+ * Streaming output reuses `@openllmsh/wire`'s
+ * `fromAnthropicStreamEvent`/`newAnthropicStreamState` UNCHANGED — the same
+ * `--include-partial-messages` NDJSON shape `claude-native.ts` already
+ * decodes — with `toolNameMap` wired so a caller `tool_use` block decodes
+ * under its ORIGINAL name, never the MCP-prefixed one. Caller tools are
+ * declared (schema only) via `claude-facade-mcp-server.ts`'s loopback MCP
+ * server; the model's `tool_use` block ends the turn (`--max-turns 1`)
+ * before the CLI would ever actually invoke a tool — caller tools stay
+ * caller-owned (00-requirements.md req. 6).
+ */
+
+import { existsSync } from "node:fs";
+import type {
+  TChatCompletionChunk,
+  TChatCompletionRequest,
+} from "@openllmsh/protocol";
+import { AnthropicStreamEvent } from "@openllmsh/protocol";
+import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
+import { isMeaningfulChunk } from "@openllmsh/wire/lib/streaming/peek";
+import {
+  fromAnthropicStreamEvent,
+  newAnthropicStreamState,
+  type TAnthropicStreamState,
+} from "@openllmsh/wire/providers/anthropic/streaming";
+import { Schema } from "effect";
+import { logDebug, logError, safeDiagnosticMessage } from "../logger";
+import { startClaudeFacadeMcpServer } from "./claude-facade-mcp-server";
+import { ndjsonLines } from "./claude-native";
+import type { TClaudeFacadeMcpServerRef } from "./claude-spawn";
+import { spawnClaudeFacadeCli } from "./claude-spawn";
+import type {
+  TClaudeAnthropicMessage,
+  TClaudeToolNameMap,
+} from "./claude-tool-capture";
+import {
+  anthropicMessagesFromHistoryTurns,
+  buildClaudeToolNameMap,
+} from "./claude-tool-capture";
+import { clientToolsOf } from "./claude-tool-serve";
+import type { TClientTool } from "./claude-tool-session";
+import { historyTurnsFromCanonicalMessages } from "./request-capture-history";
+import type { TNativeRunResult } from "./types";
+import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+
+const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
+
+/** One framed `--input-format stream-json` input line. `shouldQuery: false`
+ *  marks every historical turn (see module doc); the final frame omits it. */
+export type TClaudeSdkFacadeFrame = {
+  readonly type: "user" | "assistant";
+  readonly message: TClaudeAnthropicMessage;
+  readonly shouldQuery?: false;
+};
+
+export type TClaudeSdkFacadeTurnPlan =
+  | {
+      readonly ok: true;
+      readonly systemText: string | null;
+      readonly frames: ReadonlyArray<TClaudeSdkFacadeFrame>;
+      readonly tools: ReadonlyArray<TClientTool>;
+      readonly toolNameMap: TClaudeToolNameMap;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Decompose a canonical request into the facade's framed history. Refuses
+ * (never lossy-seeds) exactly when the shared history planner or
+ * {@link anthropicMessagesFromHistoryTurns} refuses — non-text content,
+ * missing trailing user/tool-result turn, or (today) reasoning artifacts in
+ * history, which Claude Messages encoding cannot carry without a proven
+ * thinking-block mapping (same restriction `claude-tool-capture.ts` already
+ * documents).
+ */
+export const planClaudeSdkFacadeTurn = (
+  canonical: TChatCompletionRequest,
+): TClaudeSdkFacadeTurnPlan => {
+  const decomposed = historyTurnsFromCanonicalMessages(canonical.messages);
+  if (decomposed === null) {
+    return {
+      ok: false,
+      reason:
+        "sdk-facade: conversation shape unsupported (non-text parts, or no trailing user/tool-result turn)",
+    };
+  }
+  if (
+    decomposed.deltaText.length === 0 &&
+    decomposed.deltaKind !== "tool_results"
+  ) {
+    return { ok: false, reason: "no user turn to answer" };
+  }
+  const tools = clientToolsOf(canonical);
+  const toolNameMap = buildClaudeToolNameMap(tools);
+  let messages: ReadonlyArray<TClaudeAnthropicMessage>;
+  try {
+    messages = anthropicMessagesFromHistoryTurns(
+      decomposed.historyTurns,
+      decomposed.deltaText,
+      toolNameMap,
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `sdk-facade: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (messages.length === 0) {
+    return { ok: false, reason: "no user turn to answer" };
+  }
+  const frames: TClaudeSdkFacadeFrame[] = messages.map((message, i) => ({
+    type: message.role,
+    message,
+    ...(i < messages.length - 1 ? { shouldQuery: false as const } : {}),
+  }));
+  return {
+    ok: true,
+    systemText: decomposed.systemText,
+    frames,
+    tools,
+    toolNameMap,
+  };
+};
+
+/**
+ * Typed refusal reason shared verbatim by both `runClaudeSdkFacadeCore`
+ * (below) and `runClaudeSdkFacadeCaptureCore`
+ * (`claude-sdk-facade-capture.ts`) — one string, not two independently
+ * worded guard implementations.
+ */
+export const SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON =
+  "sdk-facade: this history requires replaying a prior assistant turn " +
+  "(multi-turn or tool-continuation), which the installed claude CLI never " +
+  "acknowledges — refusing before spawn rather than occupying the full " +
+  "replay deadline (see 12-hermes-adoption-plan.md H1 and this module's " +
+  "doc comment)";
+
+/**
+ * Whether `plan`'s frames would require the CLI to acknowledge a REPLAYED
+ * frame decomposed from a prior ASSISTANT turn — the exact shape H1's
+ * real-CLI construction proof found the installed CLI silently drops,
+ * never acknowledging it (this module's doc comment).
+ *
+ * Deliberately NOT a `canonical.messages.length` check: a leading system
+ * message inflates length without adding assistant history (would
+ * over-refuse a genuine first turn), and this module's own decomposition
+ * — {@link historyTurnsFromCanonicalMessages} /
+ * {@link anthropicMessagesFromHistoryTurns} — is what actually determines
+ * which frames are replayed and which of those are assistant-typed; a
+ * length heuristic would drift from that decomposition the moment either
+ * function's shape rules change. A prior tool call is itself an assistant
+ * turn (`anthropicMessagesFromHistoryTurns` emits `{role: "assistant", ...}`
+ * for it — see `claude-tool-capture.ts`), so tool-result continuation is
+ * caught by this same check; it is never confused with a first-turn
+ * `tools` declaration alone (which adds no history frames and leaves
+ * `plan.frames` exactly the single final query frame).
+ *
+ * Only a `shouldQuery: false` frame needs an acknowledgment at all
+ * ({@link replayClaudeSdkFacadeHistory}) — the final frame never carries
+ * that flag — so checking `frame.type === "assistant"` on every frame is
+ * equivalent to, and clearer than, excluding the last frame by index.
+ */
+export const sdkFacadeRequiresUnsupportedAssistantReplay = (
+  plan: Extract<TClaudeSdkFacadeTurnPlan, { readonly ok: true }>,
+): boolean => plan.frames.some((frame) => frame.type === "assistant");
+
+/** Bun's writable stdin pipe, narrowed to the subset every framed writer in
+ *  this codebase uses (matches `codex-app-server.ts`'s own narrowing). */
+export type TClaudeFacadeStdinWriter = {
+  readonly write: (s: string) => void;
+  readonly flush?: () => void;
+  readonly end?: () => void;
+};
+
+type TFacadeLine = Readonly<Record<string, unknown>>;
+
+const parseFacadeLine = (raw: string): TFacadeLine | null => {
+  try {
+    return JSON.parse(raw) as TFacadeLine;
+  } catch {
+    return null;
+  }
+};
+
+/** Read stdout lines until a `result` line (the zero-turn ack, or noise in
+ *  between) or end-of-stream (`null`). Non-`result`, non-JSON lines are
+ *  skipped — mirrors `claude-native.ts`'s tolerance of debug/system noise. */
+const nextResultLine = async (
+  reader: ReadableStreamDefaultReader<string>,
+): Promise<TFacadeLine | null> => {
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return null;
+    const line = parseFacadeLine(value);
+    if (line === null) continue;
+    if (line.type === "result") return line;
+  }
+};
+
+/**
+ * `nextResultLine`, bounded by {@link PRE_COMMIT_TIMEOUT_MS} — the SAME
+ * "no output before deadline" budget `runFacadeDecode`'s own pre-commit race
+ * already uses, and the same pattern `codex-app-server.ts#request` bounds
+ * every JSON-RPC round trip with (`RPC_TIMEOUT_MS`). Without this, a `claude`
+ * child that never emits the expected zero-turn `result` line for a
+ * historical frame (rather than emitting a wrong one, which
+ * {@link replayClaudeSdkFacadeHistory} already handles) would hang the
+ * whole request — and the spawned child — indefinitely instead of declining
+ * cleanly. This is not a hypothetical: the real installed CLI genuinely
+ * never emits a `result` line for a `type:"assistant"` replay frame (this
+ * module's doc comment, H1's real-CLI construction proof) — every multi-turn
+ * request hits exactly this timeout in production today, rather than
+ * hanging forever thanks to this bound.
+ */
+const nextResultLineOrTimeout = async (
+  reader: ReadableStreamDefaultReader<string>,
+  timeoutMs: number,
+): Promise<TFacadeLine | null | "timeout"> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      nextResultLine(reader),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+export type TClaudeSdkFacadeReplayResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Write every frame, waiting for a zero-turn acknowledgment after each
+ * `shouldQuery: false` one (Hermes §3.B). Refuses — rather than guessing —
+ * the moment an ack is missing/non-zero-turn/erroring: history replay is
+ * version-sensitive vendor protocol, never silently assumed supported (H1).
+ * Leaves `reader` positioned exactly after the last ack, ready for the
+ * caller's own decode of the FINAL (query) frame's response.
+ */
+export const replayClaudeSdkFacadeHistory = async (params: {
+  readonly stdin: TClaudeFacadeStdinWriter;
+  readonly reader: ReadableStreamDefaultReader<string>;
+  readonly frames: ReadonlyArray<TClaudeSdkFacadeFrame>;
+  readonly signal: AbortSignal;
+  /** Override for tests — production omits this and gets
+   *  {@link PRE_COMMIT_TIMEOUT_MS} (same `precommitMs` convention as
+   *  `codex-app-server.ts`/`cursor-acp.ts`). */
+  readonly precommitMs?: number;
+}): Promise<TClaudeSdkFacadeReplayResult> => {
+  const ackTimeoutMs = params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS;
+  for (let i = 0; i < params.frames.length; i += 1) {
+    if (params.signal.aborted) {
+      return { ok: false, reason: "client aborted" };
+    }
+    const frame = params.frames[i];
+    if (frame === undefined) continue;
+    params.stdin.write(`${JSON.stringify(frame)}\n`);
+    params.stdin.flush?.();
+    if (frame.shouldQuery === false) {
+      const ack = await nextResultLineOrTimeout(params.reader, ackTimeoutMs);
+      if (ack === "timeout") {
+        return {
+          ok: false,
+          reason:
+            "sdk-facade: no replay acknowledgment before deadline — native runtime may be hung",
+        };
+      }
+      if (ack === null) {
+        return {
+          ok: false,
+          reason:
+            "sdk-facade: native runtime exited before a replay acknowledgment",
+        };
+      }
+      if (ack.num_turns !== 0 || ack.is_error === true) {
+        return {
+          ok: false,
+          reason:
+            "sdk-facade: native history replay is not supported by this claude CLI (expected a zero-turn acknowledgment) — see 12-hermes-adoption-plan.md H1",
+        };
+      }
+    }
+  }
+  params.stdin.end?.();
+  return { ok: true };
+};
+
+export type TClaudeSdkFacadeParams = {
+  readonly bin: string;
+  readonly env: Record<string, string>;
+  readonly providerModelId: string;
+  readonly canonical: TChatCompletionRequest;
+  readonly signal: AbortSignal;
+  /** Forwarded to {@link replayClaudeSdkFacadeHistory}'s `precommitMs` —
+   *  tests only; production omits this. */
+  readonly precommitMs?: number;
+};
+
+const assistantMessageChunk = (
+  message: unknown,
+  providerModelId: string,
+  toolNameMap: ReadonlyMap<string, string>,
+): TChatCompletionChunk | null => {
+  if (typeof message !== "object" || message === null) return null;
+  const content = (message as { content?: unknown }).content;
+  const blocks = Array.isArray(content) ? content : [];
+  const textParts: string[] = [];
+  const toolCalls: Array<{
+    index: number;
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }> = [];
+  for (const block of blocks) {
+    if (typeof block !== "object" || block === null) continue;
+    const b = block as { type?: unknown };
+    if (
+      b.type === "text" &&
+      typeof (block as { text?: unknown }).text === "string"
+    ) {
+      textParts.push((block as { text: string }).text);
+    } else if (b.type === "tool_use") {
+      const tb = block as { id?: unknown; name?: unknown; input?: unknown };
+      if (typeof tb.id === "string" && typeof tb.name === "string") {
+        toolCalls.push({
+          index: toolCalls.length,
+          id: tb.id,
+          type: "function",
+          function: {
+            name: toolNameMap.get(tb.name) ?? tb.name,
+            arguments: JSON.stringify(tb.input ?? {}),
+          },
+        });
+      }
+    }
+  }
+  const text = textParts.join("");
+  if (text.length === 0 && toolCalls.length === 0) return null;
+  const m = message as { id?: unknown };
+  return {
+    id: typeof m.id === "string" ? m.id : "msg_sdk_facade",
+    object: "chat.completion.chunk",
+    created: 0,
+    model: providerModelId,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          ...(text.length > 0 ? { content: text } : {}),
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+      },
+    ],
+  };
+};
+
+/**
+ * Drive the decode loop for the FINAL frame's response (native mode only —
+ * `sdk-facade-capture` never decodes this stdout as model output). Structure
+ * mirrors `claude-native.ts`'s `nextChunk`/`pump` (pre-commit buffering,
+ * assistant-line fallback when partials carried no output) but is a
+ * SEPARATE implementation: it must also decode `tool_use` blocks and never
+ * captures/publishes a `session_id` (the facade has no vendor session).
+ */
+const runFacadeDecode = (args: {
+  readonly reader: ReadableStreamDefaultReader<string>;
+  readonly providerModelId: string;
+  readonly toolNameMap: ReadonlyMap<string, string>;
+  readonly state: TAnthropicStreamState;
+  readonly kill: () => void;
+}): Promise<TNativeRunResult> => {
+  let emittedContent = false;
+  let terminalSucceeded = false;
+
+  const nextChunk = async (): Promise<
+    TChatCompletionChunk | "end" | { error: string }
+  > => {
+    for (;;) {
+      const { value, done } = await args.reader.read();
+      if (done) {
+        return terminalSucceeded
+          ? "end"
+          : {
+              error:
+                "sdk-facade: native runtime ended without a successful terminal result",
+            };
+      }
+      const line = parseFacadeLine(value);
+      if (line === null) continue;
+      if (line.type === "stream_event" && line.event !== undefined) {
+        const event = decodeStreamEvent(line.event);
+        if (event._tag !== "Some") continue;
+        const chunk = fromAnthropicStreamEvent(event.value, args.state, {
+          providerModelId: args.providerModelId,
+        });
+        if (chunk === null) continue;
+        if (isMeaningfulChunk(chunk)) emittedContent = true;
+        return chunk;
+      }
+      if (line.type === "assistant" && !emittedContent) {
+        const chunk = assistantMessageChunk(
+          line.message,
+          args.providerModelId,
+          args.toolNameMap,
+        );
+        if (chunk !== null) {
+          emittedContent = true;
+          return chunk;
+        }
+        continue;
+      }
+      if (line.type === "result") {
+        const isError = line.is_error === true;
+        if (isError && !emittedContent) {
+          const reason =
+            typeof line.result === "string" && line.result.length > 0
+              ? line.result
+              : "sdk-facade: native runtime reported an unsuccessful terminal result";
+          return { error: reason };
+        }
+        terminalSucceeded = true;
+        return "end";
+      }
+    }
+  };
+
+  const buffered: TChatCompletionChunk[] = [];
+  const pump = async (): Promise<
+    | { kind: "meaningful"; chunk: TChatCompletionChunk }
+    | { kind: "exit" }
+    | { kind: "error"; reason: string }
+  > => {
+    for (;;) {
+      const next = await nextChunk();
+      if (next === "end") return { kind: "exit" };
+      if (typeof next === "object" && "error" in next) {
+        return { kind: "error", reason: next.error };
+      }
+      const chunk = next;
+      if (isMeaningfulChunk(chunk)) {
+        if (isRefusalChunk(chunk)) {
+          return {
+            kind: "error",
+            reason:
+              "sdk-facade: claude runtime refused the request (content filter)",
+          };
+        }
+        return { kind: "meaningful", chunk };
+      }
+      buffered.push(chunk);
+    }
+  };
+
+  return (async (): Promise<TNativeRunResult> => {
+    let precommitTimer: ReturnType<typeof setTimeout> | undefined;
+    const first = await Promise.race([
+      pump(),
+      new Promise<"timeout">((resolve) => {
+        precommitTimer = setTimeout(
+          () => resolve("timeout"),
+          PRE_COMMIT_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    clearTimeout(precommitTimer);
+    if (first === "timeout" || first.kind === "exit") {
+      args.kill();
+      const reason =
+        first === "timeout"
+          ? "sdk-facade: claude runtime produced no output before the pre-commit deadline"
+          : "sdk-facade: claude runtime exited before producing output";
+      logError(
+        "native-runtime",
+        safeDiagnosticMessage`sdk-facade hop declined pre-commit`,
+        { reason },
+      );
+      return { kind: "declined", reason };
+    }
+    if (first.kind === "error") {
+      args.kill();
+      logError(
+        "native-runtime",
+        safeDiagnosticMessage`sdk-facade hop declined pre-commit`,
+        { reason: first.reason },
+      );
+      return { kind: "declined", reason: first.reason };
+    }
+    const firstMeaningful = first.chunk;
+    const chunks = new ReadableStream<TChatCompletionChunk>({
+      start(controller) {
+        for (const c of buffered) controller.enqueue(c);
+        controller.enqueue(firstMeaningful);
+      },
+      async pull(controller) {
+        const next = await nextChunk();
+        if (next === "end" || typeof next !== "object" || "error" in next) {
+          if (typeof next === "object" && next !== null && "error" in next) {
+            logError(
+              "native-runtime",
+              safeDiagnosticMessage`sdk-facade stream failed post-commit`,
+              { reason: next.error },
+            );
+          }
+          controller.close();
+          args.kill();
+          return;
+        }
+        controller.enqueue(next);
+      },
+      cancel() {
+        args.kill();
+      },
+    });
+    return { kind: "committed", chunks, sessionId: () => null };
+  })();
+};
+
+/**
+ * Privacy-safe phase timing shared by BOTH `sdk-facade` (native, below) and
+ * `sdk-facade-capture` (`claude-sdk-facade-capture.ts`, which imports and
+ * calls this SAME function rather than a second implementation) — see
+ * `09-implementation-plan.md` §8 ("Diagnostics + documentation... Effective
+ * selection and phase timings truthful, privacy-safe and common to
+ * base/capture"). Metadata-only: elapsed milliseconds and the run's closed
+ * `kind` outcome — never prompt text, tool arguments, tokens, or
+ * credentials, matching `muse-runtime.ts`'s existing phase-timing
+ * convention (numbers + outcome only).
+ */
+export const logSdkFacadePhaseTiming = (params: {
+  readonly capture: boolean;
+  readonly startedAt: number;
+  readonly outcome: TNativeRunResult["kind"];
+}): void => {
+  logDebug("native-runtime", "sdk-facade phase timing", {
+    provider: "claude_code",
+    variant: "sdk-facade",
+    capture: params.capture,
+    outcome: params.outcome,
+    elapsed_ms: Math.max(0, Math.round(performance.now() - params.startedAt)),
+  });
+};
+
+/** Run one `sdk-facade` completion turn — native mode (no capture; see
+ *  `claude-sdk-facade-capture.ts` for `sdk-facade-capture`). A thin timing
+ *  wrapper around {@link runClaudeSdkFacadeCore} — see
+ *  {@link logSdkFacadePhaseTiming}'s doc comment. */
+export const runClaudeSdkFacade = async (
+  params: TClaudeSdkFacadeParams,
+): Promise<TNativeRunResult> => {
+  const startedAt = performance.now();
+  const result = await runClaudeSdkFacadeCore(params);
+  logSdkFacadePhaseTiming({
+    capture: false,
+    startedAt,
+    outcome: result.kind,
+  });
+  return result;
+};
+
+const runClaudeSdkFacadeCore = async (
+  params: TClaudeSdkFacadeParams,
+): Promise<TNativeRunResult> => {
+  if (!existsSync(params.bin)) {
+    return { kind: "declined", reason: "claude CLI not installed" };
+  }
+  const plan = planClaudeSdkFacadeTurn(params.canonical);
+  if (!plan.ok) {
+    return { kind: "declined", reason: plan.reason };
+  }
+  if (sdkFacadeRequiresUnsupportedAssistantReplay(plan)) {
+    return {
+      kind: "declined",
+      reason: SDK_FACADE_ASSISTANT_REPLAY_UNSUPPORTED_REASON,
+    };
+  }
+
+  let mcpServer: TClaudeFacadeMcpServerRef | null = null;
+  let stopMcpServer: (() => void) | null = null;
+  if (plan.tools.length > 0) {
+    const server = startClaudeFacadeMcpServer({
+      tools: plan.tools,
+      onForbiddenCall: (name) => {
+        logError(
+          "native-runtime",
+          safeDiagnosticMessage`sdk-facade inert MCP handler was invoked`,
+          { name },
+        );
+      },
+    });
+    mcpServer = { url: server.url, headers: server.headers };
+    stopMcpServer = server.stop;
+  }
+
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = spawnClaudeFacadeCli({
+      bin: params.bin,
+      providerModelId: params.providerModelId,
+      systemText: plan.systemText,
+      mcpServer,
+      finalEnv: cleanNativeSpawnEnv(params.env),
+    });
+  } catch (error) {
+    stopMcpServer?.();
+    return {
+      kind: "declined",
+      reason: `spawn failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const kill = (): void => {
+    stopMcpServer?.();
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      // already exited
+    }
+  };
+  if (params.signal.aborted) {
+    kill();
+    return { kind: "declined", reason: "client aborted" };
+  }
+  params.signal.addEventListener("abort", kill, { once: true });
+
+  const stdin = proc.stdin as unknown as TClaudeFacadeStdinWriter;
+  const reader = ndjsonLines(
+    proc.stdout as ReadableStream<Uint8Array>,
+  ).getReader();
+
+  const replay = await replayClaudeSdkFacadeHistory({
+    stdin,
+    reader,
+    frames: plan.frames,
+    signal: params.signal,
+    ...(params.precommitMs !== undefined
+      ? { precommitMs: params.precommitMs }
+      : {}),
+  });
+  if (!replay.ok) {
+    kill();
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`sdk-facade hop declined during history replay`,
+      { reason: replay.reason },
+    );
+    return { kind: "declined", reason: replay.reason };
+  }
+
+  const state = newAnthropicStreamState({
+    providerModelId: params.providerModelId,
+    ...(plan.toolNameMap.mcpToCaller.size > 0
+      ? { toolNameMap: plan.toolNameMap.mcpToCaller }
+      : {}),
+  });
+  return runFacadeDecode({
+    reader,
+    providerModelId: params.providerModelId,
+    toolNameMap: plan.toolNameMap.mcpToCaller,
+    state,
+    kill,
+  });
+};
