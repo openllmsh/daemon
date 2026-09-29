@@ -297,6 +297,15 @@ export const runSandboxExec = async (
     const { getLinuxNamespaceFallbackReason, recordLinuxNamespaceFallback } =
       await import("./linux-status");
     const separator = process.argv.indexOf("--");
+    // `--sandbox-control` in argv means the daemon already qualified
+    // namespaces and opened the registration socket for THIS launch. The shim
+    // must not re-qualify: a transient probe failure would silently switch the
+    // launch to landlock-only while the daemon waits for a registration that
+    // never comes. Follow the daemon's decision — `runLinuxSandbox` exits 78
+    // (closed) on any setup error.
+    const control = process.argv.indexOf("--sandbox-control");
+    if (control >= 0 && (separator < 0 || control < separator))
+      return runLinuxSandbox(tail, opts?.home);
     const flag = process.argv.indexOf("--sandbox-landlock-only");
     let reason: string | null =
       flag >= 0 && flag < separator
