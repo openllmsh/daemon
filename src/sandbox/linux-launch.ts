@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { TCliProvider } from "../cli-paths";
-import { CLI_PROVIDERS, cliHome } from "../cli-paths";
+import { CLI_PROVIDERS, cliEnv } from "../cli-paths";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { DAEMON_VERSION } from "../version";
 import { spawnSync as admittedSpawn } from "../windows-process";
@@ -200,23 +200,21 @@ export const qualifyBubblewrap = (): string => {
 
 export const linuxVendorEnvironment = (
   scratch: string,
-  home?: string,
+  _home?: string,
 ): Record<string, string> => {
-  const selected = process.env.HOME;
-  const provider = CLI_PROVIDERS.find(
-    (name) => selected === cliHome(name, home),
-  );
   const overlay: Record<string, string> = {};
-  if (provider) {
-    const { captureChildEnv } =
-      require("../delegation/auth-config") as typeof import("../delegation/auth-config");
-    const approvedKeys = new Set(Object.keys(captureChildEnv(provider, "")));
-    for (const key of LINUX_VENDOR_ENV_ALLOWLIST[provider] ?? [])
-      approvedKeys.add(key);
-    for (const key of approvedKeys) {
-      const value = process.env[key];
-      if (value !== undefined) overlay[key] = value;
-    }
+  const { captureChildEnv } =
+    require("../delegation/auth-config") as typeof import("../delegation/auth-config");
+  const approvedKeys = new Set(
+    CLI_PROVIDERS.flatMap((provider) => [
+      ...Object.keys(cliEnv(provider)),
+      ...Object.keys(captureChildEnv(provider, "")),
+      ...(LINUX_VENDOR_ENV_ALLOWLIST[provider] ?? []),
+    ]),
+  );
+  for (const key of approvedKeys) {
+    const value = process.env[key];
+    if (value !== undefined) overlay[key] = value;
   }
   const env = cleanNativeSpawnEnv(overlay);
   for (const key of Object.keys(env)) {
