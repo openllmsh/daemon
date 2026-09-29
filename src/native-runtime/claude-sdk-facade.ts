@@ -509,7 +509,7 @@ const runFacadeDecode = (args: {
       }
       if (line.type === "result") {
         const isError = line.is_error === true;
-        if (isError && !emittedContent) {
+        if (isError) {
           const reason =
             typeof line.result === "string" && line.result.length > 0
               ? line.result
@@ -590,20 +590,24 @@ const runFacadeDecode = (args: {
         controller.enqueue(firstMeaningful);
       },
       async pull(controller) {
-        const next = await nextChunk();
-        if (next === "end" || typeof next !== "object" || "error" in next) {
-          if (typeof next === "object" && next !== null && "error" in next) {
-            logError(
-              "native-runtime",
-              safeDiagnosticMessage`sdk-facade stream failed post-commit`,
-              { reason: next.error },
-            );
+        try {
+          const next = await nextChunk();
+          if (next === "end") {
+            controller.close();
+            args.kill();
+            return;
           }
-          controller.close();
+          if ("error" in next) throw new Error(next.error);
+          controller.enqueue(next);
+        } catch (error) {
+          logError(
+            "native-runtime",
+            safeDiagnosticMessage`sdk-facade stream failed post-commit`,
+            { reason: error instanceof Error ? error.message : String(error) },
+          );
           args.kill();
-          return;
+          controller.error(error);
         }
-        controller.enqueue(next);
       },
       cancel() {
         args.kill();
