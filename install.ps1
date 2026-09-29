@@ -361,7 +361,7 @@ param([AllowEmptyString()][string] $Prerelease)
     function Add-ManagedPathEntry {
         param([AllowEmptyString()][string] $Value, [string] $Bin)
         $wanted = $Bin.TrimEnd('\', '/')
-        foreach ($entry in $Value.Split(';')) {
+        foreach ($entry in @($Value.Split(';'))) {
             $candidate = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"')).TrimEnd('\', '/')
             if ([string]::Equals($candidate, $wanted, [StringComparison]::OrdinalIgnoreCase)) { return $Value }
         }
