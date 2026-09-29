@@ -1549,7 +1549,7 @@ int sandboxAccept(int listener) {
   }
   return fd;
 }
-int sandboxRegister(int socket, int *out, char *ownership) {
+int sandboxRegister(int socket, int *out, char *ownership, int cancelled) {
   struct message peek;
   long n = recv(socket, &peek, sizeof(peek), 2 | 0x40);
   if (n < 0 && (ERR == 11 || ERR == 4))
@@ -1579,7 +1579,7 @@ int sandboxRegister(int socket, int *out, char *ownership) {
     out[7] = owner;
     memcpy(ownership, m.lease, 4096);
     memcpy(ownership + 4096, m.id, 65);
-    if (sendRecord(socket, &r, IDENTITY_OK, 0, 0, 0, 0)) {
+    if (sendRecord(socket, &r, cancelled ? CANCEL : IDENTITY_OK, 0, 0, 0, 0)) {
       close(owner);
       return -1;
     }
@@ -1615,7 +1615,7 @@ int sandboxRegister(int socket, int *out, char *ownership) {
   }
   memcpy(ownership, m.lease, 4096);
   memcpy(ownership + 4096, m.id, 65);
-  if (sendRecord(socket, &r, COMMIT, 0, 0, 0, 0)) {
+  if (cancelled || sendRecord(socket, &r, COMMIT, 0, 0, 0, 0)) {
     for (int i = 0; i < 3; i++)
       close(fds[i]);
     return -1;

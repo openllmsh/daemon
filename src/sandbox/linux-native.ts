@@ -14,7 +14,7 @@ const symbols = {
   sandboxListen: { args: [FFIType.ptr], returns: FFIType.i32 },
   sandboxAccept: { args: [FFIType.i32], returns: FFIType.i32 },
   sandboxRegister: {
-    args: [FFIType.i32, FFIType.ptr, FFIType.ptr],
+    args: [FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.i32],
     returns: FFIType.i32,
   },
   sandboxDescriptorsExited: { args: [FFIType.ptr], returns: FFIType.i32 },

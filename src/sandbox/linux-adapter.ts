@@ -66,6 +66,7 @@ export const prepareLinuxLaunch = (): string[] => {
   let completed = false;
   const out = new Int32Array(8);
   let ownerFd = -1;
+  let pendingSignal = 0;
   let admitted = false;
   let rejected = false;
   const fds = new Int32Array(3);
@@ -108,7 +109,8 @@ export const prepareLinuxLaunch = (): string[] => {
   };
   const signal = (value: 1 | 2 | 9 | 15): void => {
     if (!registered) {
-      if (ownerFd >= 0) native.sandboxSignal(ownerFd, value);
+      if (pendingSignal !== 9) pendingSignal = value;
+      if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
       return;
     }
     if (value === 9) {
@@ -150,7 +152,12 @@ export const prepareLinuxLaunch = (): string[] => {
         }
         socket = accepted;
       }
-      const result = native.sandboxRegister(socket, ptr(out), ptr(ownership));
+      const result = native.sandboxRegister(
+        socket,
+        ptr(out),
+        ptr(ownership),
+        pendingSignal,
+      );
       if (result < 0) {
         fail();
         return;
