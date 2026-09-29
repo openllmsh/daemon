@@ -361,6 +361,63 @@ param([AllowEmptyString()][string] $Prerelease)
         return "$Value;$Bin"
     }
 
+    function Send-EnvironmentNotification {
+        $childScript = @'
+try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'User'); exit 0 } catch { exit 1 }
+'@
+        $process = New-Object Diagnostics.Process
+        $started = $false
+        $process.StartInfo.FileName = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+        $process.StartInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        try {
+            $started = $process.Start()
+            if (-not $started) { return $false }
+            $handle = $process.Handle
+            if (-not $process.WaitForExit(5000)) { return $false }
+            return $process.ExitCode -eq 0
+        } catch { return $false }
+        finally {
+            try {
+                if ($started -and -not $process.HasExited) {
+                    $grace = [Diagnostics.Stopwatch]::StartNew()
+                    $killer = New-Object Diagnostics.Process
+                    $killerStarted = $false
+                    $killer.StartInfo.FileName = Join-Path ([Environment]::SystemDirectory) 'taskkill.exe'
+                    $killer.StartInfo.Arguments = '/T /F /PID ' + $process.Id
+                    $killer.StartInfo.UseShellExecute = $false
+                    $killer.StartInfo.CreateNoWindow = $true
+                    $killer.StartInfo.RedirectStandardOutput = $true
+                    $killer.StartInfo.RedirectStandardError = $true
+                    try {
+                        try {
+                            $killerStarted = $killer.Start()
+                            if ($killerStarted) {
+                                $killerHandle = $killer.Handle
+                                [void] $killer.WaitForExit(500)
+                            }
+                        } catch {
+                            # Use the retained handle if taskkill cannot start.
+                        } finally {
+                            try {
+                                if ($killerStarted -and -not $killer.HasExited) {
+                                    try { $killer.Kill() } catch { if (-not $killer.HasExited) { throw } }
+                                }
+                            } finally {
+                                if (-not $process.HasExited) {
+                                    try { $process.Kill() } catch { if (-not $process.HasExited) { throw } }
+                                }
+                            }
+                        }
+                        if (-not $process.WaitForExit([int][Math]::Max(0, 1000 - $grace.ElapsedMilliseconds))) { throw 'Environment notification cleanup is unconfirmed.' }
+                        if ($killerStarted -and -not $killer.WaitForExit([int][Math]::Max(0, 1000 - $grace.ElapsedMilliseconds))) { throw 'Environment notification cleanup is unconfirmed.' }
+                    } finally { $killer.Dispose() }
+                }
+            } finally { $process.Dispose() }
+        }
+    }
+
     function Set-ManagedPath {
         param([string] $Bin)
         $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
@@ -374,16 +431,14 @@ param([AllowEmptyString()][string] $Prerelease)
             }
             $updated = Add-ManagedPathEntry ([string]$value) $Bin
             if ($updated -cne $value) { $key.SetValue('Path', $updated, $kind); $key.Flush() }
-        } finally { $key.Dispose() }
-        $env:Path = Add-ManagedPathEntry $env:Path $Bin
-        try {
-            # .NET broadcasts WM_SETTINGCHANGE("Environment") for User writes.
-            # .NET uses SendMessageTimeout to bound the wait.
-            # Keep the PATH value kind. Use a temporary value for the broadcast.
-            try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', '1', 'User') }
-            finally { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'User') }
-        } catch {
-            Write-Warning 'Environment notification failed. The PATH was kept. Sign out and sign in if a new shell cannot find openllm.'
+            if ($key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $updated -or $key.GetValueKind('Path') -ne $kind) { throw 'The user PATH write could not be verified.' }
+            $env:Path = Add-ManagedPathEntry $env:Path $Bin
+            if (-not (Send-EnvironmentNotification)) {
+                Write-Warning 'Environment notification did not complete. The install is complete. Open a new terminal to see the new PATH. Sign out and sign in if the command is still unavailable.'
+            }
+        } finally {
+            try { $key.DeleteValue('OPENLLM_ENV_BROADCAST', $false) }
+            finally { $key.Dispose() }
         }
     }
 
