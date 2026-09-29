@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
-import { CLI_PROVIDERS, cliEnv, cliHome } from "../cli-paths";
+import { CLI_PROVIDERS, cliHome } from "../cli-paths";
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { DAEMON_VERSION } from "../version";
 import { spawnSync as admittedSpawn } from "../windows-process";
@@ -201,21 +201,9 @@ export const linuxVendorEnvironment = (
   );
   const overlay: Record<string, string> = {};
   if (provider) {
-    const operationKeys: Readonly<
-      Partial<Record<typeof provider, readonly string[]>>
-    > = {
-      claude_code: ["ANTHROPIC_BASE_URL"],
-      kimi_code: [
-        "KIMI_MODEL_NAME",
-        "KIMI_MODEL_API_KEY",
-        "KIMI_MODEL_BASE_URL",
-      ],
-      grok: ["GROK_CLI_CHAT_PROXY_BASE_URL"],
-    };
-    for (const key of [
-      ...Object.keys(cliEnv(provider)),
-      ...(operationKeys[provider] ?? []),
-    ]) {
+    const { captureChildEnv } =
+      require("../delegation/auth-config") as typeof import("../delegation/auth-config");
+    for (const key of Object.keys(captureChildEnv(provider, ""))) {
       const value = process.env[key];
       if (value !== undefined) overlay[key] = value;
     }
