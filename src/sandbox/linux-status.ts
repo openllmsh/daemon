@@ -8,6 +8,7 @@ import {
   LinuxSandboxError,
   qualifiedBubblewrapVersion,
   qualifyBubblewrap,
+  resetBubblewrapQualification,
 } from "./linux-launch";
 
 const LANDLOCK_CREATE_RULESET = 444;
@@ -330,6 +331,9 @@ export const probeLinuxSandboxCapability = async (): Promise<TSandboxState> => {
     return landlock.state;
   }
 
+  // A status probe re-qualifies the helper: an earlier definitive verdict
+  // (package removed, sysctl flipped) must not outlive the host change.
+  resetBubblewrapQualification();
   try {
     qualifyBubblewrap();
   } catch (error) {

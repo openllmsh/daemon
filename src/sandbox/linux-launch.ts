@@ -44,7 +44,12 @@ export type TLinuxSandboxReason =
   | "SETUP_FAILED";
 
 export class LinuxSandboxError extends Error {
-  constructor(readonly reason: TLinuxSandboxReason) {
+  /** `transient`: the probe could not run (timeout, EAGAIN, spawn error);
+   *  the verdict says nothing about the host and must never be cached. */
+  constructor(
+    readonly reason: TLinuxSandboxReason,
+    readonly transient = false,
+  ) {
     super(`SANDBOX_UNAVAILABLE: ${reason}`);
     this.name = "LinuxSandboxError";
   }
@@ -102,9 +107,46 @@ export const linuxProcessStart = (pid: number): string => {
 };
 
 let bubblewrap: { readonly path: string; readonly version: string } | undefined;
+/** Only a DEFINITIVE verdict lives here (binary missing, privileged install,
+ *  sysctl zero, version too old, flag absent). A probe that could not run is
+ *  transient and is re-probed on the next qualification. */
 let bubblewrapFailure: LinuxSandboxError | undefined;
 export const qualifiedBubblewrapVersion = (): string | null =>
   bubblewrap?.version ?? null;
+
+export const BWRAP_PROBE_ATTEMPTS = 3;
+export const BWRAP_PROBE_TIMEOUT_MS = 1000;
+export const BWRAP_PROBE_BACKOFF_MS = 100;
+
+/** Run one `bwrap <flag>` probe. A timeout, a signal, a starved fork or a
+ *  spawn error is transient: retry with backoff, then throw a transient
+ *  BWRAP_UNAVAILABLE. A clean run that exits non-zero is definitive. */
+const probeBubblewrap = (binary: string, flag: string): string => {
+  for (let attempt = 0; attempt < BWRAP_PROBE_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) Bun.sleepSync(BWRAP_PROBE_BACKOFF_MS * 2 ** (attempt - 1));
+    let result: ReturnType<typeof admittedSpawn>;
+    try {
+      result = admittedSpawn([binary, flag], {
+        env: LINUX_SETUP_ENV,
+        cwd: "/",
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: BWRAP_PROBE_TIMEOUT_MS * (attempt + 1),
+      });
+    } catch {
+      continue; // EAGAIN / ENOMEM / posix_spawn failure: the host, not bwrap
+    }
+    if (
+      result.signalCode != null ||
+      result.exitCode == null ||
+      result.exitCode < 0
+    )
+      continue; // killed by the timeout or never started
+    if (result.exitCode !== 0) throw new LinuxSandboxError("BWRAP_UNAVAILABLE");
+    return result.stdout?.toString() ?? "";
+  }
+  throw new LinuxSandboxError("BWRAP_UNAVAILABLE", true);
+};
 
 /** Version 0.5.0 adds --clearenv. The other required flags predate it. */
 const checkBubblewrap = (): { path: string; version: string } => {
@@ -122,21 +164,9 @@ const checkBubblewrap = (): { path: string; version: string } => {
   const encoded = Buffer.from(`${binary}\0`);
   if (linuxNative().sandboxFileCapabilities(ptr(encoded)) !== 0)
     throw new LinuxSandboxError("BWRAP_PRIVILEGED_INSTALL_UNSUPPORTED");
-  const version = admittedSpawn([binary, "--version"], {
-    env: LINUX_SETUP_ENV,
-    cwd: "/",
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: 1000,
-  });
-  const label = version.stdout.toString().trim();
+  const label = probeBubblewrap(binary, "--version").trim();
   const numbers = /^bubblewrap (\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(label);
-  if (
-    version.exitCode !== 0 ||
-    version.signalCode != null ||
-    !numbers ||
-    (Number(numbers[1]) === 0 && Number(numbers[2]) < 5)
-  )
+  if (!numbers || (Number(numbers[1]) === 0 && Number(numbers[2]) < 5))
     throw new LinuxSandboxError("BWRAP_UNAVAILABLE");
   for (const name of [
     "/proc/sys/kernel/unprivileged_userns_clone",
@@ -145,17 +175,10 @@ const checkBubblewrap = (): { path: string; version: string } => {
     if (existsSync(name) && Number(readFileSync(name, "utf8")) === 0)
       throw new LinuxSandboxError("USERNS_UNAVAILABLE");
   }
-  const help = admittedSpawn([binary, "--help"], {
-    env: LINUX_SETUP_ENV,
-    cwd: "/",
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: 1000,
-  });
-  const flags = new Set(help.stdout.toString().match(/--[a-z][a-z-]*/g));
+  const flags = new Set(
+    probeBubblewrap(binary, "--help").match(/--[a-z][a-z-]*/g),
+  );
   if (
-    help.exitCode !== 0 ||
-    help.signalCode != null ||
     [
       "--args",
       "--unshare-user",
@@ -184,18 +207,28 @@ const checkBubblewrap = (): { path: string; version: string } => {
 };
 
 export const qualifyBubblewrap = (): string => {
-  if (bubblewrapFailure) throw bubblewrapFailure;
   if (bubblewrap) return bubblewrap.path;
+  if (bubblewrapFailure) throw bubblewrapFailure;
   try {
     bubblewrap = checkBubblewrap();
     return bubblewrap.path;
   } catch (error) {
-    bubblewrapFailure =
-      error instanceof LinuxSandboxError
-        ? error
-        : new LinuxSandboxError("HELPER_RUNTIME_UNAVAILABLE");
-    throw bubblewrapFailure;
+    if (error instanceof LinuxSandboxError) {
+      // A transient probe failure is never remembered: the next launch,
+      // status or self-test probes again instead of staying landlock-only.
+      if (!error.transient) bubblewrapFailure = error;
+      throw error;
+    }
+    // An unexpected runtime error is not a verdict about the host either.
+    throw new LinuxSandboxError("HELPER_RUNTIME_UNAVAILABLE", true);
   }
+};
+
+/** Forget a cached definitive verdict so a status probe or self-test
+ *  re-qualifies the helper. `all` also forgets a qualified helper (tests). */
+export const resetBubblewrapQualification = (all = false): void => {
+  bubblewrapFailure = undefined;
+  if (all) bubblewrap = undefined;
 };
 
 export const linuxVendorEnvironment = (
