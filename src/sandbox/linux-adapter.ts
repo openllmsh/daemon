@@ -91,6 +91,7 @@ export const prepareLinuxLaunch = (): string[] => {
   });
   let socket = -1;
   let registered = false;
+  let readySettled = false;
   let completed = false;
   const out = new Int32Array(8);
   let ownerFd = -1;
@@ -118,6 +119,13 @@ export const prepareLinuxLaunch = (): string[] => {
   };
   let leaseWatcher: FSWatcher | undefined;
   let leaseWatchAttempted = false;
+  const rejectPendingReady = (): void => {
+    if (readySettled) return;
+    readySettled = true;
+    rejectReady(
+      new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux setup rejected"),
+    );
+  };
   const finish = (confirmed: boolean = true): void => {
     if (stopped) return;
     stopped = true;
@@ -129,24 +137,22 @@ export const prepareLinuxLaunch = (): string[] => {
     if (registered) for (const fd of fds) native.sandboxClose(fd);
     if (ownerFd >= 0) native.sandboxClose(ownerFd);
     launches.delete(name);
+    rejectPendingReady();
+    const outcome: TLinuxLaunchOutcome = !confirmed
+      ? { kind: "reap_unconfirmed", code: null }
+      : rejected || !registered
+        ? { kind: "setup_rejected", code: 78 }
+        : execFailed
+          ? { kind: "exec_failed", code: 127 }
+          : exitCode === null
+            ? { kind: "owner_lost", code: null }
+            : { kind: "exited", code: exitCode };
     if (confirmed) resolveCleanup();
-    resolveCompletion(
-      !confirmed
-        ? { kind: "reap_unconfirmed", code: null }
-        : !registered
-          ? { kind: "setup_rejected", code: 78 }
-          : execFailed
-            ? { kind: "exec_failed", code: 127 }
-            : exitCode === null
-              ? { kind: "owner_lost", code: null }
-              : { kind: "exited", code: exitCode },
-    );
+    resolveCompletion(outcome);
   };
   const fail = (): void => {
     recordLinuxSandboxRejection("SETUP_FAILED");
-    rejectReady(
-      new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux setup rejected"),
-    );
+    rejectPendingReady();
     if (!admitted) finish();
     else {
       rejected = true;
@@ -157,7 +163,8 @@ export const prepareLinuxLaunch = (): string[] => {
   };
   const signal = (value: 1 | 2 | 9 | 15): void => {
     if (stopped) return;
-    cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+    if (registered)
+      cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
     queueMicrotask(drive);
     if (!registered) {
       if (pendingSignal !== 9) pendingSignal = value;
@@ -254,7 +261,9 @@ export const prepareLinuxLaunch = (): string[] => {
         registered = true;
         leasePath = ownership.subarray(0, ownership.indexOf(0)).toString();
         launchId = ownership.subarray(4096, 4160).toString();
+        readySettled = true;
         resolveReady();
+        if (pendingSignal) signal(pendingSignal as 1 | 2 | 9 | 15);
       } else if (result === 2) {
         admitted = true;
         ownerFd = out[7] as number;
@@ -337,6 +346,11 @@ export const prepareLinuxLaunch = (): string[] => {
     const fd = native.sandboxWatch(ptr(descriptors), targets.length, timeout);
     if (fd < 0) {
       recordLinuxSandboxRejection("SETUP_FAILED");
+      if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
+      if (registered) {
+        native.sandboxSignal(fds[2] as number, 9);
+        native.sandboxSignal(fds[0] as number, 9);
+      }
       finish(false);
       return;
     }
@@ -351,7 +365,7 @@ export const prepareLinuxLaunch = (): string[] => {
     });
   };
   launches.set(name, { ready, cleanup, signal, completion });
-  drive();
+  queueMicrotask(drive);
   return ["--sandbox-control", name];
 };
 
