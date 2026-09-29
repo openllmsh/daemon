@@ -1,5 +1,6 @@
 @echo off
 setlocal DisableDelayedExpansion
+set "ERRORLEVEL="
 set "OPENLLM_PRERELEASE_TAG="
 if not "%~1"=="" (
   echo This wrapper takes no arguments. Use the tagged installer. 1>&2
