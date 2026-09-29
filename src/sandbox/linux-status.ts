@@ -28,6 +28,11 @@ type TReason = TDaemonSandboxDetails["reason"];
 type TSelfTestResult = {
   readonly passed: boolean;
   readonly reason: TReason;
+  /** The run never reached a verdict on the namespace path: the runner threw,
+   *  timed out, died on a signal, or the shim itself fell back to Landlock
+   *  before the confined probe ran. Not a definitive verdict — the result is
+   *  reported but never stored as the namespace fallback. */
+  readonly transient?: boolean;
 };
 export type TLinuxSandboxSelfTestOutcome = TLinuxSandboxProbeOutcome & {
   readonly stderr: string;
@@ -58,7 +63,12 @@ export const getLinuxNamespaceFallbackReason = (): TReason | null =>
 
 export const recordLinuxNamespaceFallback = (error: unknown): TReason => {
   const reason = reasonFrom(error);
-  namespaceFallbackReason = reason;
+  // Only a DEFINITIVE verdict is stored: a transient probe failure applies to
+  // this attempt alone. The next launch or status probe re-qualifies instead
+  // of staying landlock-only until a restart. The caller still gets the
+  // reason for the current launch's `--sandbox-landlock-only` flag.
+  if (!(error instanceof LinuxSandboxError && error.transient))
+    namespaceFallbackReason = reason;
   recordLinuxSandboxRejection(reason);
   return reason;
 };
@@ -273,7 +283,7 @@ export const runLinuxSandboxSelfTest = async (
   try {
     outcome = await runner(args, SELF_TEST_TIMEOUT_MS);
   } catch {
-    return { passed: false, reason: "SELF_TEST_FAILED" };
+    return { passed: false, reason: "SELF_TEST_FAILED", transient: true };
   }
   if (classifyLinuxSandboxProbe(outcome))
     return { passed: true, reason: "READY" };
@@ -289,6 +299,15 @@ export const runLinuxSandboxSelfTest = async (
   ) {
     return { passed: false, reason };
   }
+  // No verdict on the namespace path when the run could not finish — or when
+  // the shim's own re-qualification fell back to Landlock, so the confined
+  // probe never ran inside the namespaces.
+  if (
+    outcome.timedOut ||
+    outcome.exitCode === null ||
+    outcome.stderr.includes("sandbox: landlock-only ")
+  )
+    return { passed: false, reason: "SELF_TEST_FAILED", transient: true };
   return { passed: false, reason: "SELF_TEST_FAILED" };
 };
 
@@ -337,8 +356,7 @@ export const probeLinuxSandboxCapability = async (): Promise<TSandboxState> => {
   try {
     qualifyBubblewrap();
   } catch (error) {
-    const reason = reasonFrom(error);
-    namespaceFallbackReason = reason;
+    const reason = recordLinuxNamespaceFallback(error);
     details = {
       ...details,
       backend: "linux-landlock",
@@ -348,7 +366,6 @@ export const probeLinuxSandboxCapability = async (): Promise<TSandboxState> => {
         : {}),
       lastRejection: reason,
     };
-    lastRejection = reason;
     return "landlock-only";
   }
   details = {
@@ -381,6 +398,6 @@ export const probeLinuxSandboxCapability = async (): Promise<TSandboxState> => {
     lastRejection: result.reason,
   };
   lastRejection = result.reason;
-  namespaceFallbackReason = result.reason;
+  if (!result.transient) namespaceFallbackReason = result.reason;
   return "landlock-only";
 };
