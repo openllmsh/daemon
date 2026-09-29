@@ -5,13 +5,14 @@
  * A failed restriction returns an error. The launch path rejects the child.
  */
 import { fstatSync } from "node:fs";
+import type { TDaemonStatus } from "@openllmsh/protocol";
 import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { childWorkingSet } from "./child-policy";
 import { daemonWorkingSet } from "./working-set";
 
 /** The sandbox posture this process ended up with, for `DaemonStatus`. */
-export type TSandboxState = "enforced" | "off" | "unsupported" | "error";
+export type TSandboxState = NonNullable<TDaemonStatus["sandbox"]>;
 
 // ─── Landlock ABI (uapi/linux/landlock.h) ────────────────────────────
 // Syscall numbers are uniform across architectures (allocated post-table-

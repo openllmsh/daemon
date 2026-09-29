@@ -326,6 +326,14 @@ export const runSandboxExec = async (
     );
     return process.exit(78);
   }
+  if (
+    process.platform === "linux" &&
+    tail.length === 1 &&
+    tail[0] === "--sandbox-landlock-probe"
+  ) {
+    process.stdout.write('{"landlockProbe":true}\n');
+    return process.exit(0);
+  }
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = admittedSpawn([...tail], {

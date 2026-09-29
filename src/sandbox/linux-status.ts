@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { TDaemonSandboxDetails } from "@openllmsh/protocol";
 import { DAEMON_VERSION } from "../version";
 import { spawn as admittedSpawn } from "../windows-process";
+import type { TSandboxState } from "./landlock";
 import {
   LinuxSandboxError,
   qualifiedBubblewrapVersion,
@@ -219,6 +220,45 @@ const spawnSelfTest: TLinuxSandboxSelfTestRunner = async (
   };
 };
 
+/** Test the Landlock shim without bubblewrap or user namespaces. */
+export const probeLinuxLandlockCapability = async (
+  runner: TLinuxSandboxSelfTestRunner = spawnSelfTest,
+): Promise<{
+  readonly abi: number | null;
+  readonly state: "enforced" | "unsupported" | "error";
+}> => {
+  const abi = landlockAbi();
+  if (abi === null) return { abi, state: "unsupported" };
+  const sourceEntry =
+    DAEMON_VERSION === "0.0.0-dev" ? process.argv[1] : undefined;
+  if (DAEMON_VERSION === "0.0.0-dev" && !sourceEntry)
+    return { abi, state: "error" };
+  const args = [
+    process.execPath,
+    ...(sourceEntry === undefined ? [] : [resolve(sourceEntry)]),
+    "--sandbox-exec",
+    "--sandbox-landlock-only",
+    "SELF_TEST_FAILED",
+    "--",
+    "--sandbox-landlock-probe",
+  ];
+  try {
+    const outcome = await runner(args, SELF_TEST_TIMEOUT_MS);
+    return {
+      abi,
+      state:
+        outcome.stdout === '{"landlockProbe":true}\n' &&
+        outcome.exitCode === 0 &&
+        outcome.signal === null &&
+        !outcome.timedOut
+          ? "enforced"
+          : "error",
+    };
+  } catch {
+    return { abi, state: "error" };
+  }
+};
+
 /** Run the same daemon entry through its normal Linux confinement shim. */
 export const runLinuxSandboxSelfTest = async (
   runner: TLinuxSandboxSelfTestRunner = spawnSelfTest,
@@ -262,11 +302,10 @@ const reasonFrom = (error: unknown): TReason => {
 };
 
 /** Probe the launch admission and the complete confined self-test once. */
-export const probeLinuxSandboxCapability = async (): Promise<
-  "enforced" | "off" | "unsupported" | "error"
-> => {
+export const probeLinuxSandboxCapability = async (): Promise<TSandboxState> => {
   details = initialDetails();
   lastRejection = null;
+  namespaceFallbackReason = null;
   if (process.platform !== "linux") return "unsupported";
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {
     details = { ...details, reason: "DISABLED" };
@@ -280,6 +319,17 @@ export const probeLinuxSandboxCapability = async (): Promise<
     return "off";
   }
 
+  const landlock = await probeLinuxLandlockCapability();
+  details = { ...details, landlockAbi: landlock.abi };
+  if (landlock.state !== "enforced") {
+    details = {
+      ...details,
+      backend: "linux-landlock",
+      reason: "LANDLOCK_UNAVAILABLE",
+    };
+    return landlock.state;
+  }
+
   try {
     qualifyBubblewrap();
   } catch (error) {
@@ -287,6 +337,7 @@ export const probeLinuxSandboxCapability = async (): Promise<
     namespaceFallbackReason = reason;
     details = {
       ...details,
+      backend: "linux-landlock",
       reason,
       ...(reason === "USERNS_UNAVAILABLE"
         ? { userNamespace: "unavailable" as const }
@@ -294,7 +345,7 @@ export const probeLinuxSandboxCapability = async (): Promise<
       lastRejection: reason,
     };
     lastRejection = reason;
-    return reason === "HELPER_RUNTIME_UNAVAILABLE" ? "error" : "unsupported";
+    return "landlock-only";
   }
   details = {
     ...details,
@@ -302,13 +353,6 @@ export const probeLinuxSandboxCapability = async (): Promise<
     helperAvailable: true,
     userNamespace: "available",
   };
-
-  const abi = landlockAbi();
-  details = { ...details, landlockAbi: abi };
-  if (abi === null) {
-    details = { ...details, reason: "LANDLOCK_UNAVAILABLE" };
-    return "unsupported";
-  }
 
   const result = await runLinuxSandboxSelfTest();
   if (result.passed) {
@@ -322,18 +366,17 @@ export const probeLinuxSandboxCapability = async (): Promise<
   }
   details = {
     ...details,
+    backend: "linux-landlock",
     guardian: "failed",
     selfTest: "failed",
+    userNamespace:
+      result.reason === "USERNS_UNAVAILABLE"
+        ? "unavailable"
+        : details.userNamespace,
     reason: result.reason,
     lastRejection: result.reason,
   };
   lastRejection = result.reason;
   namespaceFallbackReason = result.reason;
-  if (result.reason === "USERNS_UNAVAILABLE") return "unsupported";
-  if (result.reason === "BWRAP_UNAVAILABLE") return "unsupported";
-  if (result.reason === "BWRAP_PRIVILEGED_INSTALL_UNSUPPORTED")
-    return "unsupported";
-  if (result.reason === "HELPER_RUNTIME_UNAVAILABLE") return "error";
-  if (result.reason === "GUARDIAN_UNAVAILABLE") return "error";
-  return "error";
+  return "landlock-only";
 };
