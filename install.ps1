@@ -230,6 +230,7 @@ param([AllowEmptyString()][string] $Prerelease)
 
     function Expand-VerifiedImage {
         param([string] $Archive, [string] $Output, [string] $Digest)
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
         $inputStream = [IO.File]::OpenRead($Archive)
         try {
             if ($inputStream.Length -lt 18 -or $inputStream.ReadByte() -ne 0x1f -or $inputStream.ReadByte() -ne 0x8b -or $inputStream.ReadByte() -ne 8) { throw 'Invalid gzip header.' }
