@@ -1035,9 +1035,11 @@ export const envLockReleaseDir = (lockDir: string, nonce: string): void => {
 const envDirLockOptions = (): TDirLockOptions => ({
   waitMs: envLockWaitMs(),
   reclaimMs: envLockStaleMs(),
+  ownerlessMs: envLockOrphanMs(),
   pollMs: 10,
   inode: envLockDirIno,
   startIdentity: envLockStartIdentity,
+  ownerStartIdentity: envLockStartIdentity,
   legacyStartIdentity: envLockLegacyStartIdentityProbe,
   isStale: envLockDirIsStale,
   onStep: (step, path): void => {
