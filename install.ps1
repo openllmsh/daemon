@@ -375,10 +375,13 @@ param([AllowEmptyString()][string] $Prerelease)
     }
 
     function Add-ManagedPathEntry {
-        param([AllowEmptyString()][string] $Value, [string] $Bin)
+        param([AllowEmptyString()][string] $Value, [string] $Bin, [bool] $ExpandVariables = $false)
         $wanted = $Bin.TrimEnd('\', '/')
         foreach ($entry in @($Value.Split(';'))) {
-            $candidate = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"')).TrimEnd('\', '/')
+            $candidate = $entry.Trim().Trim('"').TrimEnd('\', '/')
+            if ([string]::Equals($candidate, $wanted, [StringComparison]::OrdinalIgnoreCase)) { return $Value }
+            if ($ExpandVariables) { $candidate = [Environment]::ExpandEnvironmentVariables($candidate) }
+            $candidate = $candidate.TrimEnd('\', '/')
             if ([string]::Equals($candidate, $wanted, [StringComparison]::OrdinalIgnoreCase)) { return $Value }
         }
         if (-not $Value) { return $Bin }
@@ -438,8 +441,10 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                 $kind = $key.GetValueKind('Path')
                 if ($kind -notin @([Microsoft.Win32.RegistryValueKind]::String, [Microsoft.Win32.RegistryValueKind]::ExpandString)) { throw 'HKCU Environment Path must be REG_SZ or REG_EXPAND_SZ.' }
             }
-            $updated = Add-ManagedPathEntry ([string]$value) $Bin
-            if ($updated -cne $value) { $key.SetValue('Path', $updated, $kind); $key.Flush() }
+            $storedKind = $kind
+            $updated = Add-ManagedPathEntry ([string]$value) $Bin ($kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            if ($updated -match '%[^%]+%') { $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString }
+            if ($updated -cne $value -or $kind -ne $storedKind) { $key.SetValue('Path', $updated, $kind); $key.Flush() }
             if ($key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $updated -or $key.GetValueKind('Path') -ne $kind) { throw 'The user PATH write could not be verified.' }
             $env:Path = Add-ManagedPathEntry $env:Path $Bin
             if (-not (Send-EnvironmentNotification)) {
