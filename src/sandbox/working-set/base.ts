@@ -75,9 +75,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { TProcessStartIdentityReader } from "../../../../tunnel/session/local-runtime";
 import {
+  isBootScopedStartIdentity,
   normalizeProcessStartIdentity,
   processIdentityStatus,
   processStartCommand,
@@ -430,11 +431,20 @@ const sweepNow = (): number => sweepNowImpl();
 type TTmpLease = {
   readonly pid: number;
   readonly startIdentity: string;
+  readonly version?: 1 | 2;
+  readonly guardianPid?: number;
+  readonly guardianStartIdentity?: string;
+  readonly initPid?: number;
+  readonly initStartIdentity?: string;
+  readonly cleanupComplete?: boolean;
+  readonly cleanupPending?: boolean;
 };
 
 /** Read + validate a dir's lease file. `null` = absent/invalid → orphan. */
 const readTmpLease = (dir: string): TTmpLease | null => {
-  const path = join(dir, TMP_LEASE_FILE);
+  const path = basename(dir).startsWith("linux-")
+    ? join(dirname(dirname(dir)), "sandbox-leases", `${basename(dir)}.json`)
+    : join(dir, TMP_LEASE_FILE);
   let raw: string;
   try {
     const st = lstatSync(path);
@@ -455,9 +465,24 @@ const readTmpLease = (dir: string): TTmpLease | null => {
     ) {
       return null;
     }
-    const { pid, startIdentity } = value as {
+    const {
+      pid,
+      startIdentity,
+      v,
+      guardianPid,
+      guardianStartIdentity,
+      initPid,
+      initStartIdentity,
+      cleanupComplete,
+    } = value as {
       pid: unknown;
       startIdentity: unknown;
+      v?: unknown;
+      guardianPid?: unknown;
+      guardianStartIdentity?: unknown;
+      initPid?: unknown;
+      initStartIdentity?: unknown;
+      cleanupComplete?: unknown;
     };
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
       return null;
@@ -465,7 +490,30 @@ const readTmpLease = (dir: string): TTmpLease | null => {
     if (typeof startIdentity !== "string" || startIdentity.length === 0) {
       return null;
     }
-    return { pid, startIdentity };
+    const cleanupPending = v === 2 && cleanupComplete !== true;
+    const parsedPid = (candidate: unknown): number | undefined =>
+      typeof candidate === "number" &&
+      Number.isSafeInteger(candidate) &&
+      candidate > 0
+        ? candidate
+        : undefined;
+    return {
+      pid,
+      startIdentity,
+      ...(v === 1 || v === 2 ? { version: v } : {}),
+      ...(parsedPid(guardianPid) !== undefined
+        ? { guardianPid: parsedPid(guardianPid) }
+        : {}),
+      ...(typeof guardianStartIdentity === "string"
+        ? { guardianStartIdentity }
+        : {}),
+      ...(parsedPid(initPid) !== undefined
+        ? { initPid: parsedPid(initPid) }
+        : {}),
+      ...(typeof initStartIdentity === "string" ? { initStartIdentity } : {}),
+      ...(cleanupComplete === true ? { cleanupComplete: true } : {}),
+      ...(cleanupPending ? { cleanupPending } : {}),
+    };
   } catch {
     return null;
   }
@@ -650,13 +698,64 @@ export const setDaemonTmpSweepIdentityReaderForTests = (
 };
 
 /**
- * Lease verdict WITHOUT a `ps` subprocess (rework-8): the sweep runs on the
- * daemon event loop, and a sync `ps` per entry could block it for seconds.
- * `kill(pid, 0)` answering ESRCH proves the owner is dead. Any live pid is
- * "unknown" (it may be the owner or a reused pid), so the dir is kept: a
- * reused pid can only delay a cleanup, never delete a live owner's dir.
+ * Resolve a lease only when every process that may own an unfinished Linux
+ * launch is proven gone. An older boot proves all of its host PIDs are gone.
+ * Same-boot recovery needs valid identities for the outer shim, guardian,
+ * and namespace init.
  */
 const tmpLeaseStatus = (lease: TTmpLease): "alive" | "dead" | "unknown" => {
+  if (lease.version === 2) {
+    const bootId = isBootScopedStartIdentity(lease.startIdentity)
+      ? lease.startIdentity.split(":")[1]
+      : undefined;
+    if (bootId === undefined) return "unknown";
+    let currentBootId: string | undefined;
+    try {
+      const candidate = readFileSync("/proc/sys/kernel/random/boot_id", "utf8")
+        .trim()
+        .toLowerCase();
+      if (/^[0-9a-f-]{36}$/.test(candidate)) currentBootId = candidate;
+    } catch {
+      // Without the host boot id, use process identities below.
+    }
+    if (currentBootId !== undefined && currentBootId !== bootId) return "dead";
+
+    const identities: { pid: number; startIdentity: string }[] = [
+      { pid: lease.pid, startIdentity: lease.startIdentity },
+    ];
+    if (lease.cleanupPending) {
+      const lifecycle = [
+        {
+          pid: lease.guardianPid,
+          startIdentity: lease.guardianStartIdentity,
+        },
+        { pid: lease.initPid, startIdentity: lease.initStartIdentity },
+      ];
+      for (const owner of lifecycle) {
+        if (
+          owner.pid === undefined ||
+          owner.startIdentity === undefined ||
+          !isBootScopedStartIdentity(owner.startIdentity) ||
+          owner.startIdentity.split(":")[1] !== bootId
+        ) {
+          return "unknown";
+        }
+        identities.push({ pid: owner.pid, startIdentity: owner.startIdentity });
+      }
+    }
+    let unknown = false;
+    for (const owner of identities) {
+      const status = processIdentityStatus(
+        owner.pid,
+        owner.startIdentity,
+        identityReaderForTests ?? processStartIdentity,
+      );
+      if (status === "alive") return "alive";
+      if (status === "unknown") unknown = true;
+    }
+    return unknown ? "unknown" : "dead";
+  }
+  if (lease.cleanupPending) return "unknown";
   if (identityReaderForTests !== null) {
     return processIdentityStatus(
       lease.pid,
@@ -922,6 +1021,19 @@ const advanceTmpTreeDelete = (
       del.frames.pop();
       try {
         rmdirSync(top.path);
+        if (isRoot && basename(top.path).startsWith("linux-")) {
+          try {
+            unlinkSync(
+              join(
+                dirname(dirname(top.path)),
+                "sandbox-leases",
+                `${basename(top.path)}.json`,
+              ),
+            );
+          } catch {
+            // The scratch tree is gone. Keep failed metadata cleanup visible.
+          }
+        }
       } catch {
         // Non-empty remnant (a racing writer) or raced perms — re-open the
         // dir and retry rather than dropping a half-deleted frame. The same
@@ -1453,6 +1565,7 @@ let shimTmpDirMinted = false;
  * root; its entries fall under the orphan report.
  */
 const mintShimChildTmpDir = (tmpRoot: string): void => {
+  if (process.platform === "linux") return;
   if (shimTmpDirMinted) return;
   shimTmpDirMinted = true;
   const envTmp = process.env.TMPDIR;
