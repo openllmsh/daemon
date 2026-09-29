@@ -487,7 +487,11 @@ param([AllowEmptyString()][string] $Prerelease)
             Assert-SafePath $alias
             $aliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b %errorlevel%`r`n"
             if ([IO.File]::Exists($alias) -and [IO.File]::ReadAllText($alias) -cne $aliasText) { throw "An unmanaged alias exists: $alias" }
-            [IO.File]::WriteAllText($alias, $aliasText, [Text.Encoding]::ASCII)
+            if (-not [IO.File]::Exists($alias)) {
+                $aliasStage = Join-Path $stage 'ollm.cmd'
+                [IO.File]::WriteAllText($aliasStage, $aliasText, [Text.Encoding]::ASCII)
+                [IO.File]::Move($aliasStage, $alias)
+            }
             Set-ManagedPath $bin
         } catch { throw "Managed setup failed. Verified binaries were kept. Fix this error and rerun the installer: $($_.Exception.Message)" }
         $transactionLock.Dispose()
