@@ -886,6 +886,9 @@ static int capabilities(void) {
 static int finalMount(struct record *r) {
   if (mount(0, "/", 0, (1UL << 18) | 16384, 0))
     return -1;
+  if (mount("devpts", "/dev/pts", "devpts", 2 | 8,
+            "newinstance,ptmxmode=0666,mode=0620"))
+    return -1;
   for (int i = 0; i < r->naliases; i++) {
     if (r->aliases[i][0] != '/' || !strcmp(r->aliases[i], "/proc") ||
         umount2(r->aliases[i], 2))
