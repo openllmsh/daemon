@@ -333,7 +333,7 @@ static int parse(char *data, int length, struct record *r) {
   if (r->ntests != 0)
     return -1;
 #endif
-  return p == end && r->nself > 0 && r->nargs > 0 && r->nenv > 0 &&
+  return p == end && r->nself > 0 && r->nargs > 1 && r->nenv > 0 &&
                  r->nro >= 0 && r->nrw >= 0 && r->nbwrap > 0 &&
                  r->naliases >= 0 && (r->ntests == 0 || r->ntests == 6)
              ? 0
@@ -1113,7 +1113,7 @@ static int helper(struct record *r) {
   sigemptyset(empty);
   if (pthread_sigmask(2, empty, 0))
     die(fail(socket, r, 21));
-  execve(r->args[0], r->args, r->env);
+  execve(r->args[0], r->args + 1, r->env);
   sendRecord(socket, r, EXEC_ERROR, 127, 0, 0, 0);
   die(127);
   return 127;

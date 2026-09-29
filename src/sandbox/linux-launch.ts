@@ -336,7 +336,7 @@ export const buildChildPolicy = (
     ];
     const vectors = [
       self,
-      [executablePath, ...tail.slice(1)],
+      [executablePath, ...tail],
       Object.entries(env).map(([key, value]) => `${key}=${value}`),
       ro,
       rw,
