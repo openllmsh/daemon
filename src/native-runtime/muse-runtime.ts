@@ -1680,6 +1680,13 @@ export const runMuseNative = async (
           : "failure",
     );
     await cleanup();
+    if (
+      typeof first === "object" &&
+      first !== null &&
+      "error" in first &&
+      first.error instanceof SandboxLaunchError
+    )
+      throw first.error;
     const reason =
       first === "timeout"
         ? "muse SDK produced no output before the pre-commit deadline"

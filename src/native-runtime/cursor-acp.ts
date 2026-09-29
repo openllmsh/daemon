@@ -327,7 +327,7 @@ export const createAcpTurnState = (params: {
  * caller kills it via `dispose()` when the turn (or the model-list probe)
  * completes. No dependency — ~80 lines beats shipping a protocol package.
  */
-class AcpClient {
+export class AcpClient {
   private nextId: TJsonRpcId = 1;
   private readonly pending = new Map<
     TJsonRpcId,
@@ -1025,7 +1025,11 @@ export const runCursorNative = async (
       }
     })
     .catch((error: unknown) => {
-      failStream(new Error(acpFailureMessage(error)));
+      failStream(
+        error instanceof SandboxLaunchError
+          ? error
+          : new Error(acpFailureMessage(error)),
+      );
     });
   void promptDone;
 
@@ -1081,6 +1085,8 @@ export const runCursorNative = async (
   }
   if (first === "end" || "error" in first) {
     cleanup(true);
+    if (first !== "end" && first.error instanceof SandboxLaunchError)
+      throw first.error;
     return {
       kind: "declined",
       reason:

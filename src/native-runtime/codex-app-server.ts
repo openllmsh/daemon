@@ -603,7 +603,10 @@ export const runCodexNative = async (
             threadId: params.resumeThreadId,
             ...startParams,
           })
-          .catch(() => client.request("thread/start", startParams))
+          .catch((error: unknown) => {
+            if (error instanceof SandboxLaunchError) throw error;
+            return client.request("thread/start", startParams);
+          })
       : client.request("thread/start", startParams))) as {
       thread?: { id?: string };
     };
@@ -709,6 +712,8 @@ export const runCodexNative = async (
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {
     client.removeSink(threadId);
+    params.signal.removeEventListener("abort", abort);
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       kind: "declined",
       reason: error instanceof Error ? error.message : String(error),
