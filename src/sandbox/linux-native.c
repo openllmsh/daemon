@@ -38,6 +38,7 @@ extern int umount2(const char *, int);
 extern int execve(const char *, char *const *, char *const *);
 extern int socketpair(int, int, int, int *);
 extern int setsockopt(int, int, int, const void *, unsigned int);
+extern int getsockopt(int, int, int, void *, unsigned int *);
 extern int pipe2(int *, int);
 extern int rename(const char *, const char *);
 extern int fsync(int);
@@ -1521,11 +1522,11 @@ extern int connect(int, const void *, unsigned int);
 extern int accept4(int, void *, unsigned int *, int);
 static int address(struct address *a, const char *name) {
   usize n = strlen(name);
-  if (n < 16 || n > 100)
+  if (n < 1 || n >= sizeof(a->path) || name[0] != '/')
     return -1;
   memset(a, 0, sizeof(*a));
   a->family = 1;
-  memcpy(a->path + 1, name, n);
+  memcpy(a->path, name, n);
   return (int)n + 3;
 }
 static int registerDaemon(struct record *r, int *fds, int monitor, int vendor,
@@ -1580,6 +1581,16 @@ int sandboxAccept(int listener) {
   int fd = accept4(listener, 0, 0, CLOEXEC | NONBLOCK);
   if (fd < 0)
     return ERR == 11 ? -2 : -1;
+  struct cred peer;
+  unsigned int length = sizeof(peer);
+  int parent;
+  char start[32];
+  if (getsockopt(fd, 1, 17, &peer, &length) || length != sizeof(peer) ||
+      peer.uid != getuid() || identity(peer.pid, &parent, start) ||
+      parent != getpid()) {
+    close(fd);
+    return -2;
+  }
   int yes = 1;
   if (setsockopt(fd, 1, 16, &yes, 4)) {
     close(fd);

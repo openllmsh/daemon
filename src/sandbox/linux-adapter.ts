@@ -1,5 +1,13 @@
-import { randomBytes } from "node:crypto";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SandboxLaunchError } from "./exec";
 
 export type TLinuxLaunchOutcome =
@@ -38,14 +46,18 @@ export const prepareLinuxLaunch = (): string[] => {
       );
     }
   })();
-  const name = `openllm-sbx-${randomBytes(32).toString("hex")}`;
+  const directory = mkdtempSync(join(tmpdir(), "sbx-"));
+  chmodSync(directory, 0o700);
+  const name = join(directory, "control");
   const encoded = Buffer.from(`${name}\0`);
   const listener = native.sandboxListen(ptr(encoded));
-  if (listener < 0)
+  if (listener < 0) {
+    rmSync(directory, { recursive: true, force: true });
     throw new SandboxLaunchError(
       "SANDBOX_UNAVAILABLE",
       "registration unavailable",
     );
+  }
   let resolveReady: () => void = () => {};
   let rejectReady: (error: Error) => void = () => {};
   let resolveCleanup: () => void = () => {};
@@ -81,6 +93,7 @@ export const prepareLinuxLaunch = (): string[] => {
   const finish = (): void => {
     clearInterval(timer);
     native.sandboxClose(listener);
+    rmSync(directory, { recursive: true, force: true });
     if (socket >= 0) native.sandboxClose(socket);
     if (registered) for (const fd of fds) native.sandboxClose(fd);
     if (ownerFd >= 0) native.sandboxClose(ownerFd);
