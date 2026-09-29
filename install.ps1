@@ -386,37 +386,13 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             try {
                 if ($started -and -not $process.HasExited) {
                     $grace = [Diagnostics.Stopwatch]::StartNew()
-                    $killer = New-Object Diagnostics.Process
-                    $killerStarted = $false
-                    $killer.StartInfo.FileName = Join-Path ([Environment]::SystemDirectory) 'taskkill.exe'
-                    $killer.StartInfo.Arguments = '/T /F /PID ' + $process.Id
-                    $killer.StartInfo.UseShellExecute = $false
-                    $killer.StartInfo.CreateNoWindow = $true
-                    $killer.StartInfo.RedirectStandardOutput = $true
-                    $killer.StartInfo.RedirectStandardError = $true
+                    # Keep the process handle until the child exits.
+                    # Windows PowerShell 5.1 has no tree overload.
                     try {
-                        try {
-                            $killerStarted = $killer.Start()
-                            if ($killerStarted) {
-                                $killerHandle = $killer.Handle
-                                [void] $killer.WaitForExit(500)
-                            }
-                        } catch {
-                            # Use the retained handle if taskkill cannot start.
-                        } finally {
-                            try {
-                                if ($killerStarted -and -not $killer.HasExited) {
-                                    try { $killer.Kill() } catch { if (-not $killer.HasExited) { throw } }
-                                }
-                            } finally {
-                                if (-not $process.HasExited) {
-                                    try { $process.Kill() } catch { if (-not $process.HasExited) { throw } }
-                                }
-                            }
-                        }
-                        if (-not $process.WaitForExit([int][Math]::Max(0, 1000 - $grace.ElapsedMilliseconds))) { throw 'Environment notification cleanup is unconfirmed.' }
-                        if ($killerStarted -and -not $killer.WaitForExit([int][Math]::Max(0, 1000 - $grace.ElapsedMilliseconds))) { throw 'Environment notification cleanup is unconfirmed.' }
-                    } finally { $killer.Dispose() }
+                        if ($PSVersionTable.PSVersion.Major -ge 7) { $process.Kill($true) }
+                        else { $process.Kill() }
+                    } catch { if (-not $process.HasExited) { throw } }
+                    if (-not $process.WaitForExit([int][Math]::Max(0, 2000 - $grace.ElapsedMilliseconds))) { throw 'Environment notification cleanup is unconfirmed.' }
                 }
             } catch {
                 # PATH and binaries are committed. Report failed cleanup as a warning.
