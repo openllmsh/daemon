@@ -387,10 +387,15 @@ param([AllowEmptyString()][string] $Prerelease)
         param([object[]] $Images)
         foreach ($image in $Images) {
             if ($image.Exists -and $image.Replace) {
-                # W integration: inspect task ownership, suspend starts, and stop the daemon.
-                # Require confirmed cleanup. Preserve durable sessions and prior task state.
-                # Retain rollback files through the required restart and state restoration.
-                throw 'Replacement requires the Windows installer lifecycle interface. This build does not provide it. The installed files were kept.'
+                # Integration point: P design section 8, replacement transaction.
+                # Under the install lock, verify and save task and daemon state.
+                # Disable task starts. Stop only the verified daemon.
+                # W1b section 9.1: reap_unconfirmed must block replacement.
+                # Keep durable sessions alive. Refuse locked images.
+                # Retain backups until restart and task restoration succeed.
+                # No public installer command is defined by the W1b design yet.
+                # A throw preserves interactive callers. File and CMD entry exit 1.
+                throw 'Replacement refused (exit code 1). Replacement requires the Windows installer lifecycle interface. This build does not provide it. Stop the running daemon and re-run with a build that provides this interface. The installed files and task state were kept.'
             }
         }
     }
