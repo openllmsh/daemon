@@ -44,6 +44,9 @@ extern int rename(const char *, const char *);
 extern int fsync(int);
 extern int flock(int, int);
 extern int unlink(const char *);
+extern void *fdopen(int, const char *);
+extern int fscanf(void *, const char *, ...);
+extern int fclose(void *);
 extern long readlink(const char *, char *, usize);
 extern long getxattr(const char *, const char *, void *, usize);
 extern int posix_spawn(int *, const char *, const void *, const void *,
@@ -717,19 +720,18 @@ static int lease(struct record *r, int guardian, int init, int complete) {
 }
 /* Inspect each child before reaping. Adoption supplies the launch boundary. */
 static int reapChildren(int force, int target, int *result) {
-  char path[96], buf[65536];
+  char path[96];
   snprintf(path, sizeof(path), "/proc/self/task/%d/children", getpid());
-  if (textFile(path, buf, sizeof(buf)) < 0)
+  int children = open(path, CLOEXEC);
+  if (children < 0)
     return -1;
-  char *p = buf;
-  while (*p) {
-    char *end;
-    int child = (int)strtol(p, &end, 10);
-    if (end == p)
-      break;
-    p = end;
-    while (*p == ' ')
-      p++;
+  void *stream = fdopen(children, "r");
+  if (!stream) {
+    close(children);
+    return -1;
+  }
+  int child;
+  while (fscanf(stream, "%d", &child) == 1) {
     char start[32], check[32];
     int parent;
     int fd = pidfd(child);
@@ -738,6 +740,7 @@ static int reapChildren(int force, int target, int *result) {
     if (identity(child, &parent, start) || parent != getpid() ||
         identity(child, &parent, check) || strcmp(start, check)) {
       close(fd);
+      fclose(stream);
       return -1;
     }
     int suppress = 0;
@@ -754,6 +757,7 @@ static int reapChildren(int force, int target, int *result) {
     unsigned long observed[16] = {0};
     if (waitid(1, child, observed, 4 | 1 | 0x1000000)) {
       close(fd);
+      fclose(stream);
       return -1;
     }
     int status;
@@ -762,6 +766,7 @@ static int reapChildren(int force, int target, int *result) {
     if (got == child && child == target)
       *result = (status & 127) ? 128 + (status & 127) : (status >> 8) & 255;
   }
+  fclose(stream);
   int status;
   int got = waitpid(-1, &status, 1);
   if (got > 0 && got == target)
@@ -775,15 +780,14 @@ static void cleanup(struct record *r, int guardian, int init, int initfd,
   if (monitorfd >= 0)
     signalPid(monitorfd, 9);
   long limit = now() + REAP;
-  int reported = 0;
   for (;;) {
     int done = reapChildren(1, target, result);
     if (done == 1)
       break;
-    if (now() >= limit && !reported) {
+    if (now() >= limit) {
       const char *s = "SANDBOX_UNAVAILABLE: reap_unconfirmed\n";
       fullWrite(2, s, strlen(s));
-      reported = 1;
+      return;
     }
     poll(0, 0, 20);
   }
