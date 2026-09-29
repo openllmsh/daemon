@@ -1496,6 +1496,64 @@ if [ -n "$SUPPLIED_KEY" ]; then
 fi
 API_KEY=""
 
+# Keep the caller's traps while the binary transaction owns the install lock.
+install_lock_acquire() {
+  local saved_exit
+  INSTALL_SAVED_TRAPS="$(trap -p EXIT INT TERM)"
+  saved_exit="$(trap -p EXIT)"
+  INSTALL_SAVED_EXIT=""
+  INSTALL_ROLLBACK=""
+  if [ -n "$saved_exit" ]; then
+    saved_exit="${saved_exit#trap -- }"
+    saved_exit="${saved_exit% EXIT}"
+    # Bash supplies this quoted command. It does not come from a manifest.
+    eval "INSTALL_SAVED_EXIT=$saved_exit"
+  fi
+  env_lock_acquire "$OPENLLM_DIR/install" \
+    || die "could not acquire install lock: $OPENLLM_DIR/install.lock.d"
+  trap 'install_lock_exit $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+install_lock_exit() {
+  local status="$1"
+  trap - EXIT
+  if [ -n "$INSTALL_ROLLBACK" ]; then "$INSTALL_ROLLBACK"; fi
+  env_lock_release
+  # Supply the original exit status to the caller's saved EXIT command.
+  (exit "$status") && :
+  eval "$INSTALL_SAVED_EXIT"
+  exit "$status"
+}
+
+install_lock_release() {
+  env_lock_release
+  trap - EXIT INT TERM
+  eval "$INSTALL_SAVED_TRAPS"
+}
+
+# The lock excludes other installers. The version checks validate each destination.
+# Remove files left by an interrupted transaction only after those checks pass.
+prerelease_discard_stale() {
+  local name file
+  for name in openllmd openllm; do
+    for file in "$BIN_DIR/.$name.pr-dl."* "$BIN_DIR/.$name.pr-bin."* \
+                "$BIN_DIR/.$name.pr-staged."* "$BIN_DIR/.$name.pr-old."*; do
+      [ -e "$file" ] || [ -L "$file" ] || continue
+      case "$file" in
+        *.pr-old.*)
+          [ -x "$BIN_DIR/$name" ] \
+            || die "restore $file to $BIN_DIR/$name before you retry this install" ;;
+      esac
+      rm -f "$file" || die "could not remove interrupted install file: $file"
+    done
+  done
+}
+
+mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
+install_lock_acquire
+
 # --- the ONE install entry point ------------------------------------------
 # /api/install validates the committed daemon + CLI release pins in TypeScript
 # (allow-listed repo, well-formed digests, a published tag for this target) and
@@ -1515,6 +1573,7 @@ if [ -n "$PRERELEASE_TAG" ]; then
   refuse_downgrade "$BIN_DIR/openllmd" "$DAEMON_VERSION"
   refuse_downgrade "$BIN_DIR/openllm" "$CLI_VERSION"
   refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
+  prerelease_discard_stale
   echo "Resolving the OpenLLM prerelease $PRERELEASE_TAG..."
   PRE_SHA_DAEMON="$(prerelease_manifest_digest openllmsh/daemon DAEMON_RELEASE)" || exit 1
   PRE_SHA_CLI="$(prerelease_manifest_digest openllmsh/cli CLI_RELEASE)" || exit 1
@@ -1705,20 +1764,39 @@ prerelease_cleanup() {
 # Commit helpers return failure so the caller can restore the saved binaries.
 PR_ASIDE=""
 PR_PLACED=""
-prerelease_abort() {
-  local name
-  # Restore the saved binaries. Keep a backup if its restore fails.
-  for name in $PR_ASIDE; do
-    mv -f "$BIN_DIR/.$name.pr-old.$$" "$BIN_DIR/$name" 2>/dev/null \
-      || echo "Error: rollback failed — the previous $name is still at $BIN_DIR/.$name.pr-old.$$" >&2
-  done
-  # A placed component with no predecessor was a fresh install — remove it.
+PR_HASH_DAEMON=""
+PR_HASH_CLI=""
+prerelease_abort() { exit 1; }
+
+prerelease_rollback() {
+  local name expected actual backup
   for name in $PR_PLACED; do
-    case " $PR_ASIDE " in *" $name "*) continue ;; esac
-    rm -f "$BIN_DIR/$name" 2>/dev/null || true
+    backup="$BIN_DIR/.$name.pr-old.$$"
+    case "$name" in
+      openllmd) expected="$PR_HASH_DAEMON" ;;
+      openllm) expected="$PR_HASH_CLI" ;;
+    esac
+    actual="$(sha256_of "$BIN_DIR/$name" 2>/dev/null || true)"
+    if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then
+      case " $PR_ASIDE " in
+        *" $name "*)
+          mv -f "$backup" "$BIN_DIR/$name" 2>/dev/null \
+            || echo "Error: rollback failed — the previous $name is still at $backup" >&2 ;;
+        *) rm -f "$BIN_DIR/$name" 2>/dev/null || true ;;
+      esac
+    elif [ -n "$actual" ]; then
+      # Another writer changed this path, or placement failed before the rename.
+      # Keep the canonical binary. It does not belong to this transaction.
+      rm -f "$backup"
+    else
+      echo "Error: could not verify $name for rollback; keep $backup for recovery" >&2
+    fi
+  done
+  for name in $PR_ASIDE; do
+    case " $PR_PLACED " in *" $name "*) continue ;; esac
+    rm -f "$BIN_DIR/.$name.pr-old.$$"
   done
   prerelease_cleanup
-  exit 1
 }
 
 # Download + verify one component into $BIN_DIR/.$name.pr-staged.$$ — every
@@ -1822,7 +1900,14 @@ prerelease_commit_place() {
   local name="$1"
   local staged="$BIN_DIR/.$name.pr-staged.$$" dest="$BIN_DIR/$name"
   local backup="$BIN_DIR/.$name.pr-old.$$"
+  local expected
   [ -f "$staged" ] || return 0
+  expected="$(sha256_of "$staged")" || return 1
+  [ -n "$expected" ] || return 1
+  case "$name" in
+    openllmd) PR_HASH_DAEMON="$expected" ;;
+    openllm) PR_HASH_CLI="$expected" ;;
+  esac
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     if ! ln "$dest" "$backup" 2>/dev/null; then
       echo "Error: could not back up $dest — refusing to replace it" >&2
@@ -1830,19 +1915,18 @@ prerelease_commit_place() {
     fi
     PR_ASIDE="$PR_ASIDE $name"
   fi
+  # Record the digest before the rename so a signal can also roll it back.
+  PR_PLACED="$PR_PLACED $name"
   if ! mv -f "$staged" "$dest"; then
     echo "Error: could not install $name → $dest" >&2
     return 1
   fi
-  PR_PLACED="$PR_PLACED $name"
   echo "  $name installed → $dest"
   INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
 }
 
 if [ -n "$PRERELEASE_TAG" ]; then
-  trap prerelease_abort EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  INSTALL_ROLLBACK=prerelease_rollback
   prerelease_stage openllmd "$PRE_SHA_DAEMON" \
     "$(prerelease_asset_url openllmsh/daemon "openllmd-$TARGET.gz")" "$DAEMON_VERSION" \
     || prerelease_abort
@@ -1854,7 +1938,7 @@ if [ -n "$PRERELEASE_TAG" ]; then
   prerelease_commit_check openllm "$CLI_VERSION" || prerelease_abort
   prerelease_commit_place openllmd || prerelease_abort
   prerelease_commit_place openllm || prerelease_abort
-  trap - EXIT INT TERM
+  INSTALL_ROLLBACK=""
   # Both renames succeeded. Remove the backups.
   rm -f "$BIN_DIR"/.openllmd.pr-old.$$ "$BIN_DIR"/.openllm.pr-old.$$
 else
@@ -1871,6 +1955,8 @@ else
     echo "  note: no --cli-from-file given — leaving any installed CLI untouched"
   fi
 fi
+
+install_lock_release
 
 # The native PTY backend is compiled into the daemon binary in v2.8 (G1), so
 # there is no third component to install.
