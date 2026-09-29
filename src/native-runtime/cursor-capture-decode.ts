@@ -2917,7 +2917,10 @@ export const chunksStreamFromCursorConnectResponseBody = (
   // underlying connection happened to close on its own. Declared here,
   // above both `start` and `cancel`, so both can act on the SAME reader.
   const reader = body.getReader();
+  let readerCancelled = false;
   const cancelReader = (reason: unknown): void => {
+    if (readerCancelled) return;
+    readerCancelled = true;
     try {
       // `.cancel()` returns a promise; a caller/consumer cancel is fire-
       // and-forget from this source's perspective — never await it here,
@@ -2936,6 +2939,7 @@ export const chunksStreamFromCursorConnectResponseBody = (
             ? args.signal.reason
             : new Error("aborted");
         cancelReader(reason);
+        reader.releaseLock();
         controller.error(reason);
         return;
       }
@@ -3140,11 +3144,13 @@ export const chunksStreamFromCursorConnectResponseBody = (
       // duplex path, but this HTTP1/general decode path had no equivalent
       // guard. `sawEndStream` closes that gap.
       let sawEndStream = false;
+      let transportEof = false;
       try {
         readLoop: for (;;) {
           if (args.signal?.aborted) throw new Error("aborted");
           const { value, done } = await reader.read();
           if (done) {
+            transportEof = true;
             if (!turnEndedSeen && !sawEndStream) {
               throw new Error(
                 "cursor capture upstream closed without a terminal Connect end-stream marker or turn_ended",
@@ -3246,6 +3252,10 @@ export const chunksStreamFromCursorConnectResponseBody = (
         }
       } finally {
         args.signal?.removeEventListener("abort", onAbort);
+        if (!transportEof)
+          cancelReader(
+            new Error("cursor capture decoder finished before transport EOF"),
+          );
         try {
           reader.releaseLock();
         } catch {

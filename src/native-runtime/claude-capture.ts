@@ -37,6 +37,7 @@ import type {
   TChatCompletionRequest,
   TErrorEnvelope,
 } from "@openllmsh/protocol";
+import type { TClassifierInput } from "@openllmsh/wire/lib/error-class";
 import { classifyHopError } from "@openllmsh/wire/lib/error-class";
 import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
 import { isMeaningfulChunk } from "@openllmsh/wire/lib/streaming/peek";
@@ -470,24 +471,29 @@ const readBoundedErrorBody = async (
 /** Exported so `claude-sdk-facade-capture.ts` (`sdk-facade-capture`) shares
  *  this EXACT non-2xx-captured-response decline instead of a duplicate —
  *  both variants intercept the same `/v1/messages` shape via the same
- *  loopback (`startClaudeCaptureLoopback`). */
+ *  loopback (`startClaudeCaptureLoopback`). Cursor's capture paths also reuse
+ *  this bounded reader/classifier with their provider label and wire format. */
 export const declinedForNonOkCapturedResponse = async (
   response: Response,
   signal: AbortSignal,
+  options: {
+    readonly provider: string;
+    readonly providerFormat: TClassifierInput["providerFormat"];
+  } = { provider: "claude", providerFormat: "anthropic" },
 ): Promise<Extract<TNativeRunResult, { readonly kind: "declined" }>> => {
   const raw = await readBoundedErrorBody(response, signal);
   const envelope = errorEnvelopeFromBoundedBody(raw);
   const classified = classifyHopError({
     status: response.status,
     envelope,
-    providerFormat: "anthropic",
+    providerFormat: options.providerFormat,
     aborted: false,
   });
   const retryAfter = response.headers.get("retry-after");
   const detail =
     envelope?.error?.message ?? raw.slice(0, MAX_ERROR_DETAIL_CHARS);
   const reason = [
-    `claude capture upstream HTTP ${response.status}`,
+    `${options.provider} capture upstream HTTP ${response.status}`,
     detail.length > 0 ? `: ${detail}` : "",
     retryAfter !== null ? ` (retry-after: ${retryAfter})` : "",
   ].join("");

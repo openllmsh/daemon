@@ -58,6 +58,7 @@ import { logInfo, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
+import { declinedForNonOkCapturedResponse } from "./claude-capture";
 import type {
   TCursorCaptureBridge,
   TCursorTransactionSender,
@@ -1281,6 +1282,11 @@ export type TCursorNativeCaptureParams = {
  * stream Connect→chunks to the CALLER, then settle/cancel the builder locally.
  * Never feeds the true model stream back into ACP.
  */
+const CURSOR_CAPTURE_ERROR_OPTIONS = {
+  provider: "cursor",
+  providerFormat: "openai",
+} as const;
+
 export const runCursorNativeCapture = async (
   params: TCursorNativeCaptureParams,
 ): Promise<TNativeRunResult> => {
@@ -1429,6 +1435,19 @@ export const runCursorNativeCapture = async (
       );
       bridge.session.markUpstreamAccepted();
       ownershipAtAccept = captureOwnershipFromSession(bridge.session);
+      if (!http2.response.ok) {
+        try {
+          return await declinedForNonOkCapturedResponse(
+            http2.response,
+            params.signal,
+            CURSOR_CAPTURE_ERROR_OPTIONS,
+          );
+        } finally {
+          http2.close();
+          builderAbort.abort();
+          await bridge.dispose();
+        }
+      }
       if (http2.response.body === null) {
         http2.close();
         builderAbort.abort();
@@ -2403,6 +2422,17 @@ export const runCursorNativeCapture = async (
       },
     });
 
+    if (!dispatched.response.ok) {
+      try {
+        return await declinedForNonOkCapturedResponse(
+          dispatched.response,
+          params.signal,
+          CURSOR_CAPTURE_ERROR_OPTIONS,
+        );
+      } finally {
+        await bridge.dispose();
+      }
+    }
     if (dispatched.response.body === null) {
       const ownership = captureOwnershipFromSession(bridge.session);
       await bridge.dispose();
