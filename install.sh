@@ -1047,6 +1047,27 @@ sha256_of() {
   fi
 }
 
+# Limit each output to 512 MiB. Release binaries are about 100 MiB.
+is_gzip_asset() {
+  LC_ALL=C head -c 2 "$1" | LC_ALL=C grep -q $'\x1f\x8b'
+}
+
+decompress_asset() {
+  local input="$1" output="$2" name="$3"
+  local max_bytes=536870912 status=0 size
+  gzip -dc "$input" | head -c "$max_bytes" > "$output" || status=$?
+  size="$(stat -c %s "$output" 2>/dev/null || stat -f %z "$output")" \
+    || die "could not measure the decompressed $name"
+  if [ "$size" -ge "$max_bytes" ]; then
+    rm -f "$output"
+    die "$name decompressed asset reaches the 512 MiB limit — refusing to install"
+  fi
+  if [ "$status" -ne 0 ]; then
+    rm -f "$output"
+    die "could not decompress $name: invalid gzip asset or output write failure"
+  fi
+}
+
 # >>> openllm-prerelease/v1 (identical block in both shell installers) >>>>>>>
 # Public-prerelease resolution. The manifest and the asset come from the SAME
 # tag on the component's own repository: the manifest is tagged source, the
@@ -2129,8 +2150,8 @@ install_component() {
     # Assets are gzipped; the pinned digest is over the DECOMPRESSED binary, so
     # the integrity gate is independent of gzip's non-determinism. A local
     # digest was already checked over the supplied file bytes.
-    if gzip -t "$dl" >/dev/null 2>&1; then
-      gzip -dc "$dl" > "$bin" || die "could not decompress $name"
+    if is_gzip_asset "$dl"; then
+      decompress_asset "$dl" "$bin" "$name"
     else
       mv "$dl" "$bin"
     fi
@@ -2271,8 +2292,8 @@ prerelease_stage() {
       curl "${PR_SCHEME[@]}" "${CURL_GET[@]}" -fsSL "$url" -o "$dl" || die "download failed: $url"
     fi
     # The published asset is ALWAYS a gzip member — there is no raw fallback.
-    gzip -t "$dl" >/dev/null 2>&1 || die "downloaded $name is not a valid gzip asset"
-    gzip -dc "$dl" > "$bin" || die "could not decompress $name"
+    is_gzip_asset "$dl" || die "downloaded $name is not a valid gzip asset"
+    decompress_asset "$dl" "$bin" "$name"
     rm -f "$dl"
     actual="$(sha256_of "$bin")"
     [ -n "$actual" ] || die "could not hash the downloaded $name"
