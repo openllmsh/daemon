@@ -18,6 +18,7 @@
  * stays guarded across both methods.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
 import {
@@ -61,11 +62,17 @@ export type TLoginFlowCtx = {
   readonly keyId: string;
   readonly slug: string;
   readonly mode: TAuthLoginMode;
+  readonly localOnly?: boolean;
 };
 
 // ─── Per-command flow identity (threaded from control-relay) ─────────────
 
-let commandCtx: { flowId: string; keyId: string } | null = null;
+type TLoginCommandContext = {
+  readonly flowId: string;
+  readonly keyId: string;
+  readonly localOnly?: boolean;
+};
+const commandContext = new AsyncLocalStorage<TLoginCommandContext>();
 
 /**
  * Bind the current control-command's id as `flow_id` for the duration of
@@ -74,31 +81,24 @@ let commandCtx: { flowId: string; keyId: string } | null = null;
  * when `run()` returns.
  */
 export const runWithLoginCommand = async <T>(
-  ctx: { readonly flowId: string; readonly keyId: string },
+  ctx: TLoginCommandContext,
   run: () => Promise<T>,
-): Promise<T> => {
-  const prev = commandCtx;
-  commandCtx = ctx;
-  try {
-    return await run();
-  } finally {
-    commandCtx = prev;
-  }
-};
+): Promise<T> => commandContext.run(ctx, run);
 
 export const resolveLoginFlow = (
   slug: string,
   mode: TAuthLoginMode,
 ): TLoginFlowCtx => ({
-  flowId: commandCtx?.flowId ?? crypto.randomUUID(),
-  keyId: commandCtx?.keyId ?? "local",
+  flowId: commandContext.getStore()?.flowId ?? crypto.randomUUID(),
+  keyId: commandContext.getStore()?.keyId ?? "local",
+  ...(commandContext.getStore()?.localOnly === true ? { localOnly: true } : {}),
   slug,
   mode,
 });
 
 /** Opaque doctor correlation for logout; omit when unbound or untrusted. */
 export const currentLoginCommandCorrelation = (): string | undefined =>
-  opaqueDoctorCorrelation(commandCtx?.flowId);
+  opaqueDoctorCorrelation(commandContext.getStore()?.flowId);
 
 // ─── Per-provider single-flight slot ─────────────────────────────────────
 
@@ -335,6 +335,8 @@ export const emitLoginPrompt = (
   flow: TLoginFlowCtx,
   pending: { readonly url: string; readonly code: string },
 ): void => {
+  // Local login prompts belong only to the authenticated initiating flow.
+  if (flow.localOnly === true) return;
   emitAuth({
     event: "auth.login.prompt",
     flow_id: flow.flowId,
@@ -364,6 +366,7 @@ export const publishPendingAuth = (
     code: pending.code,
     ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
     flowId: flow.flowId,
+    ...(flow.localOnly === true ? { localOnly: true } : {}),
   });
   emitLoginPrompt(flow, { url: pending.url, code: pending.code });
 };

@@ -16,6 +16,8 @@
 import { PENDING_AUTH_TTL_MS } from "@openllmsh/protocol";
 
 export type TPendingAuth = {
+  /** Local initiation: never include prompt material in shared status or relay events. */
+  readonly localOnly?: boolean;
   /** Absent/empty on a marker-only owner snapshot — never a fake prompt. */
   readonly url?: string;
   readonly code?: string;
@@ -118,7 +120,11 @@ export const hasPendingAuth = (): boolean => {
  *  enter it in the browser; the browser-OAuth flow (codex) has none (the
  *  localhost callback completes it), so the code clause is omitted. */
 export const pendingAuthDetail = (auth: TPendingAuth): string => {
-  if (!isPromptPending(auth) || auth.url === undefined) {
+  if (
+    auth.localOnly === true ||
+    !isPromptPending(auth) ||
+    auth.url === undefined
+  ) {
     return "Sign-in is running on this machine.";
   }
   if (auth.mode === "paste_code") {
@@ -141,7 +147,7 @@ export const pendingAuthWire = (
   readonly started_at_ms?: number;
   readonly cancel_requested?: boolean;
 } => {
-  const prompt = isPromptPending(auth);
+  const prompt = auth.localOnly !== true && isPromptPending(auth);
   return {
     ...(prompt && auth.url !== undefined
       ? { url: auth.url }

@@ -244,6 +244,14 @@ const applyAuthLiteral = (
   slug: string,
   conn: TDaemonProviderConnection,
 ): TDaemonProviderConnection => {
+  const localPending = getPendingAuth(slug);
+  if (localPending?.localOnly === true) {
+    conn = {
+      ...conn,
+      detail: "Sign-in is running on this machine.",
+      pending_auth: pendingAuthWire(localPending),
+    };
+  }
   const last = lastKnownConnections.get(slug);
   const inFlight = providerAuthOwned(slug);
   const normalized = normalizeProviderConnection(conn);

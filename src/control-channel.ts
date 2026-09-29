@@ -35,11 +35,8 @@ import {
   notifyQuotaStatus,
   notifySessionLost,
 } from "./cloud-client";
-import type { TScheduleResult } from "./command-scheduler";
-import { daemonCommandScheduler } from "./command-scheduler";
 import { runCommandInner } from "./control-relay";
 import { logKeychainWatcherTick } from "./delegation/keychain";
-import { loginSlot } from "./delegation/login-flow";
 import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
@@ -84,6 +81,7 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
+import { scheduleDaemonCommand } from "./scheduled-command";
 import { computeStatusFresh, setStatusPublishQueueSnapshot } from "./status";
 import type { TStatusPublishTrigger } from "./status-publish-coalesce";
 import { createStatusPublishCoalescer } from "./status-publish-coalesce";
@@ -747,7 +745,6 @@ const startMigrationCheck = (): void => {
 // — by design (the command never completed; the cloud's stale reaper is the
 // give-up bound).
 const commandResults = new Map<string, TDaemonCommandAck | null>();
-const commandScheduler = daemonCommandScheduler;
 /** Per-kind read admission (F7 generation fence). Hung list_local must not block status. */
 let statusReadTail: Promise<void> = Promise.resolve();
 let listLocalReadTail: Promise<void> = Promise.resolve();
@@ -1021,34 +1018,8 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
     await listLocalReadTail;
     return;
   }
-  const scheduled: TScheduleResult = await commandScheduler.schedule(
-    command.command,
-    run,
-  );
-  if (!scheduled.admitted) {
-    const slug = scheduled.slug;
-    const flow = slug !== undefined ? loginSlot(slug).flow() : null;
-    const ack: TDaemonCommandAck =
-      scheduled.reason === "resurface"
-        ? {
-            id,
-            status: "done",
-            result: {
-              connected: false,
-              pending: true,
-              ...(flow !== null ? { flow_id: flow.flowId } : {}),
-              detail: "sign-in already in progress",
-            },
-          }
-        : {
-            id,
-            status: "error",
-            result: {
-              error: scheduled.reason,
-              retryable: true,
-              ...(slug !== undefined ? { slug } : {}),
-            },
-          };
+  const ack = await scheduleDaemonCommand(command.command, run);
+  if (ack !== null) {
     commandResults.set(id, ack);
     send({ type: "ack", ack: { id, status: "ack" } });
     send({ type: "ack", ack });
