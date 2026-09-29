@@ -25,9 +25,12 @@ export type TLinuxCleanupResult = {
 };
 
 export type TLinuxLaunchHandle = {
+  /** Report the launch outcome or a bounded cleanup failure. */
   readonly completion: Promise<TLinuxLaunchOutcome>;
   readonly ready: Promise<void>;
+  /** Keep ownership until descendant exit is confirmed. */
   readonly cleanup: Promise<TLinuxCleanupResult>;
+  readonly cleanupStatus: "pending" | "confirmed" | "unconfirmed";
   readonly signal: (signal: 1 | 2 | 9 | 15) => void;
   readonly shimExited: (code: number) => void;
 };
@@ -112,6 +115,8 @@ export const prepareLinuxLaunch = (): string[] => {
   const status = new Int32Array(1);
   const deadline = performance.now() + 10000;
   let cleanupDeadline = Number.POSITIVE_INFINITY;
+  let cleanupStatus: TLinuxLaunchHandle["cleanupStatus"] = "pending";
+  let watchUnavailable = false;
   let state: "pending" | "ready" | "rejected" | "finished" = "pending";
   const stopped = (): boolean => state === "finished";
   let readiness: ReadStream | undefined;
@@ -129,8 +134,8 @@ export const prepareLinuxLaunch = (): string[] => {
    * Event       | Pending ready | Ready or rejected | Completion | Cleanup
    * ready       | resolve       | no change         | pending    | pending
    * reject      | reject        | no change         | pending    | pending
-   * finish true | reject        | no change         | outcome    | confirmed
-   * finish false| reject        | no change         | unconfirmed| unconfirmed
+   * finish      | reject        | no change         | outcome    | confirmed
+   * unconfirmed | reject        | no change         | unconfirmed| pending
    * finished    | no change     | no change         | no change  | no change
    */
   const settle = (
@@ -152,15 +157,29 @@ export const prepareLinuxLaunch = (): string[] => {
     }
     if (event === "finish" && outcome) {
       state = "finished";
-      resolveCleanup({
-        cleanup:
-          outcome.kind === "reap_unconfirmed" ? "unconfirmed" : "confirmed",
-      });
+      cleanupStatus = "confirmed";
+      resolveCleanup({ cleanup: "confirmed" });
       resolveCompletion(outcome);
     }
   };
-  const finish = (confirmed: boolean = true): void => {
+  const reportUnconfirmed = (): void => {
+    if (cleanupStatus !== "pending") return;
+    cleanupStatus = "unconfirmed";
+    settle("reject");
+    resolveCompletion({ kind: "reap_unconfirmed", code: null });
+    process.stderr.write("SANDBOX_UNAVAILABLE: reap_unconfirmed\n");
+  };
+  const finish = (): void => {
     if (stopped()) return;
+    const outcome: TLinuxLaunchOutcome =
+      rejected || !registered
+        ? { kind: "setup_rejected", code: 78 }
+        : execFailed
+          ? { kind: "exec_failed", code: 127 }
+          : exitCode === null
+            ? { kind: "owner_lost", code: null }
+            : { kind: "exited", code: exitCode };
+    settle("finish", outcome);
     cancelWait();
     leaseWatcher?.close();
     native.sandboxClose(listener);
@@ -169,16 +188,6 @@ export const prepareLinuxLaunch = (): string[] => {
     if (registered) for (const fd of fds) native.sandboxClose(fd);
     if (ownerFd >= 0) native.sandboxClose(ownerFd);
     launches.delete(name);
-    const outcome: TLinuxLaunchOutcome = !confirmed
-      ? { kind: "reap_unconfirmed", code: null }
-      : rejected || !registered
-        ? { kind: "setup_rejected", code: 78 }
-        : execFailed
-          ? { kind: "exec_failed", code: 127 }
-          : exitCode === null
-            ? { kind: "owner_lost", code: null }
-            : { kind: "exited", code: exitCode };
-    settle("finish", outcome);
   };
   const fail = (): void => {
     recordLinuxSandboxRejection("SETUP_FAILED");
@@ -207,11 +216,7 @@ export const prepareLinuxLaunch = (): string[] => {
     } else native.sandboxSignal(fds[1] as number, value);
   };
   const step = (): void => {
-    if (performance.now() >= cleanupDeadline) {
-      process.stderr.write("SANDBOX_UNAVAILABLE: reap_unconfirmed\n");
-      finish(false);
-      return;
-    }
+    if (performance.now() >= cleanupDeadline) reportUnconfirmed();
     if (rejected) {
       try {
         const owner = new Int32Array([ownerFd, ownerFd, ownerFd]);
@@ -331,7 +336,10 @@ export const prepareLinuxLaunch = (): string[] => {
           /* Keep the descriptors until cleanup is confirmed. */
         }
       }
-      if (completed && native.sandboxDescriptorsExited(ptr(fds)) === 1)
+      if (
+        (completed || cleanupStatus === "unconfirmed") &&
+        native.sandboxDescriptorsExited(ptr(fds)) === 1
+      )
         finish();
     }
   };
@@ -352,13 +360,13 @@ export const prepareLinuxLaunch = (): string[] => {
         );
         leaseWatcher.on("error", () => {
           leaseWatcher?.close();
-          fail();
+          reportUnconfirmed();
         });
       } catch {
-        fail();
+        reportUnconfirmed();
       }
     }
-    if (stopped()) return;
+    if (stopped() || watchUnavailable) return;
     const targets: number[] = [];
     if (!rejected && !lostOuter && !completed)
       targets.push(socket < 0 ? listener : socket);
@@ -366,7 +374,7 @@ export const prepareLinuxLaunch = (): string[] => {
       if (fd >= 0 && native.sandboxAlive(fd)) targets.push(fd);
     const until = Math.min(
       registered || rejected ? Infinity : deadline,
-      cleanupDeadline,
+      cleanupStatus === "unconfirmed" ? Infinity : cleanupDeadline,
     );
     const timeout = Number.isFinite(until)
       ? Math.max(0, Math.ceil(until - performance.now()))
@@ -380,7 +388,8 @@ export const prepareLinuxLaunch = (): string[] => {
         native.sandboxSignal(fds[2] as number, 9);
         native.sandboxSignal(fds[0] as number, 9);
       }
-      finish(false);
+      watchUnavailable = true;
+      reportUnconfirmed();
       return;
     }
     readinessFd = fd;
@@ -388,13 +397,18 @@ export const prepareLinuxLaunch = (): string[] => {
     readiness.once("data", drive);
     readiness.once("error", () => {
       if (!stopped()) {
-        fail();
+        watchUnavailable = true;
+        reportUnconfirmed();
         drive();
       }
     });
   };
   const shimExited = (code: number): void => {
-    if (stopped() || registered || admitted) return;
+    if (stopped()) return;
+    if (registered || admitted) {
+      drive();
+      return;
+    }
     // Drain a queued connection before classifying a pre-connect exit.
     if (socket < 0) {
       const accepted = native.sandboxAccept(listener);
@@ -411,7 +425,16 @@ export const prepareLinuxLaunch = (): string[] => {
     );
     finish();
   };
-  launches.set(name, { ready, cleanup, signal, completion, shimExited });
+  launches.set(name, {
+    ready,
+    cleanup,
+    get cleanupStatus() {
+      return cleanupStatus;
+    },
+    signal,
+    completion,
+    shimExited,
+  });
   queueMicrotask(drive);
   return ["--sandbox-control", name];
 };

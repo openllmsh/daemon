@@ -50,7 +50,7 @@ export type TSupervisedChild = {
   readonly pgid: number;
   readonly terminate: (opts?: TTerminateOptions) => Promise<TReapOutcome>;
   readonly beginTask: () => () => void;
-  /** Settle when tracking ends. Report sandbox cleanup failures explicitly. */
+  /** Settle only after process-tree cleanup is confirmed. */
   readonly whenReleased: Promise<TReapOutcome>;
 };
 
@@ -269,14 +269,7 @@ const releaseSandboxChild = (
   const outcome =
     cleanup === "confirmed" ? confirmedOutcome : "reap_unconfirmed";
   if (cleanup === "unconfirmed") {
-    logWarn(
-      "child-supervisor",
-      safeDiagnosticMessage`sandbox cleanup is unconfirmed`,
-      {
-        pid: tracked.handle.pid,
-        pgid: tracked.handle.pgid,
-      },
-    );
+    return outcome;
   }
   releaseChild(tracked, outcome);
   return outcome;
@@ -334,6 +327,11 @@ const terminateTrackedChild = (
       const outcome = await Promise.race([
         launch.cleanup.then((result) =>
           releaseSandboxChild(tracked, result.cleanup, "terminated"),
+        ),
+        launch.completion.then((result) =>
+          result.kind === "reap_unconfirmed"
+            ? releaseSandboxChild(tracked, "unconfirmed", "terminated")
+            : tracked.handle.whenReleased,
         ),
         new Promise<"reap_unconfirmed">((resolve) => {
           timer = setTimeout(
