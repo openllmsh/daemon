@@ -872,14 +872,6 @@ export const runCapturedDispatch = async (args: {
     throw new RequestCaptureError("invalid_destination", dest.reason);
   }
 
-  session.markDispatchStarted();
-  session.settleBuilder({
-    kind: "suppressed",
-    reason:
-      args.suppressReason ??
-      "original external send suppressed; daemon owns the exchange",
-  });
-
   const dispatchSignal =
     args.signal === undefined
       ? session.signal
@@ -887,6 +879,13 @@ export const runCapturedDispatch = async (args: {
 
   try {
     const request = requestFromCapturedEnvelope(envelope);
+    session.markDispatchStarted();
+    session.settleBuilder({
+      kind: "suppressed",
+      reason:
+        args.suppressReason ??
+        "original external send suppressed; daemon owns the exchange",
+    });
     const response = await sender(request, envelope, dispatchSignal);
     // A response object means the remote accepted the TCP/HTTP exchange far
     // enough to answer. Stream body may still fail later; usage ownership
