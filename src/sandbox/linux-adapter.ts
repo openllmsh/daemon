@@ -362,6 +362,12 @@ export const prepareLinuxLaunch = (): string[] => {
     if (stopped()) return;
     if (leasePath && !leaseWatchAttempted) {
       leaseWatchAttempted = true;
+      const watchFailed = (): void => {
+        if (stopped()) return;
+        leaseWatcher?.close();
+        if (!registered) fail();
+        else reportUnconfirmed();
+      };
       try {
         leaseWatcher = watch(
           dirname(leasePath),
@@ -370,12 +376,9 @@ export const prepareLinuxLaunch = (): string[] => {
             if (file === basename(leasePath)) drive();
           },
         );
-        leaseWatcher.on("error", () => {
-          leaseWatcher?.close();
-          reportUnconfirmed();
-        });
+        leaseWatcher.on("error", watchFailed);
       } catch {
-        reportUnconfirmed();
+        watchFailed();
       }
     }
     if (stopped() || watchUnavailable) return;
