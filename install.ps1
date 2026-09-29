@@ -512,6 +512,22 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         } catch { Write-Warning "Installation finished. The completed journal could not be removed: $journal. Rerun the installer to retry cleanup." }
     }
 
+    function Remove-StaleInstallStages {
+        param([string] $Root, [string] $Current)
+        # A stopped installer can leave .install-* stage directories behind.
+        # Remove them while the install lock is held. Keep the current stage.
+        $currentPath = [IO.Path]::GetFullPath($Current)
+        foreach ($stale in @([IO.Directory]::EnumerateDirectories($Root, '.install-*'))) {
+            if ([string]::Equals([IO.Path]::GetFullPath($stale), $currentPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            try {
+                Assert-SafePath $stale
+                [IO.Directory]::Delete($stale, $true)
+            } catch {
+                Write-Warning "A leftover install directory could not be removed: $stale. $($_.Exception.Message)"
+            }
+        }
+    }
+
     function Install-ImagePair {
         param([object[]] $Images, [string] $Root)
         $journal = Join-Path $Root 'install-transaction.json'
@@ -608,6 +624,7 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             if ((Get-ImageVersion $image.Stage) -cne $tag.Substring(1)) { throw 'Downloaded executable version does not match the selected tag.' }
         }
         $transactionLock = Enter-InstallLock (Join-Path $root 'install.lock')
+        Remove-StaleInstallStages $root $stage
         $completedTransaction = Test-CompletedInstallTransaction $root
         if (-not $completedTransaction) {
             foreach ($image in $images) {
