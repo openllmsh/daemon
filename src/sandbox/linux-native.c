@@ -360,6 +360,7 @@ static int readRecord(int fd, struct record *r) {
     return -1;
   return parse(data, (int)length, r);
 }
+static int fault(struct record *, const char *);
 static int sendRecord(int socket, struct record *r, int stage, int value,
                       int pid, const int *fds, int count) {
   if (count < 0 || count > 3)
@@ -383,6 +384,17 @@ static int sendRecord(int socket, struct record *r, int stage, int value,
     memcpy((char *)control + 16, fds, count * sizeof(int));
     h.control = control;
     h.controllen = (c->length + 7) & ~7;
+  }
+  if (stage == IDENTITY && fault(r, "identity_credentials")) {
+    usize offset = h.controllen;
+    struct cmsghdr *c = (void *)((char *)control + offset);
+    c->length = 28;
+    c->level = 1;
+    c->type = 2;
+    struct cred forged = {getpid() + 1000000, getuid(), getgid()};
+    memcpy((char *)c + 16, &forged, 12);
+    h.control = control;
+    h.controllen = offset + 32;
   }
   return sendmsg(socket, &h, 0x4000) == sizeof(m) ? 0 : -1;
 }
@@ -752,7 +764,11 @@ static int fail(int socket, struct record *r, int reason) {
 }
 static int failEmpty(int socket, struct record *r, int reason) {
   lease(r, 0, 0, 1);
-  return socket >= 0 ? fail(socket, r, reason) : 78;
+  if (socket >= 0)
+    return fail(socket, r, reason);
+  const char *message = "SANDBOX_UNAVAILABLE: SETUP_FAILED\n";
+  fullWrite(2, message, strlen(message));
+  return 78;
 }
 int sandboxFileCapabilities(const char *path) {
   char buf[128];
@@ -951,9 +967,13 @@ static int helper(struct record *r) {
     fds[0] = fds[1];
     fds[1] = fd;
   }
+  if (fault(r, "setup_timeout"))
+    poll(0, 0, DEADLINE + 1000);
   if (fds[0] < 0 || fds[1] < 0 ||
       sendRecord(socket, r, IDENTITY, 0, 2, fds, descriptorCount))
     die(78);
+  if (fault(r, "identity_duplicate"))
+    sendRecord(socket, r, IDENTITY, 0, 2, fds, descriptorCount);
   close(fds[0]);
   close(fds[1]);
   if (fds[2] >= 0)
@@ -1213,6 +1233,8 @@ int sandboxOuter(char *data, unsigned int length) {
   if (syscall(NR_TID) != getpid() || getpid() != r.outer || signal < 0 ||
       prctl(36, 1, 0, 0, 0))
     return failEmpty(-1, &r, 0);
+  if (fault(&r, "stale_identity"))
+    r.callerStart = "0";
   int caller = checkOwner(r.caller, r.callerStart);
   if (caller < 0)
     return failEmpty(-1, &r, 0);
