@@ -1707,3 +1707,66 @@ int sandboxCompletion(int socket, int outer, int *status) {
   }
   return m.stage == EXEC_ERROR && m.value == 127 ? 2 : -1;
 }
+
+/* Wait off the JavaScript thread. Closing the stream cancels this wait. */
+extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
+extern int pthread_detach(unsigned long);
+extern long send(int, const void *, usize, int);
+extern int shutdown(int, int);
+struct readiness {
+  struct pollfd fds[6];
+  int count;
+  int timeout;
+};
+static void *waitReady(void *data) {
+  struct readiness *w = data;
+  long limit = w->timeout < 0 ? -1 : now() + w->timeout;
+  int rc;
+  do {
+    int remaining = limit < 0 ? -1 : (int)(limit - now());
+    rc = poll(w->fds, w->count, limit >= 0 && remaining < 0 ? 0 : remaining);
+  } while (rc < 0 && ERR == 4);
+  for (int i = 1; i < w->count; i++)
+    close(w->fds[i].fd);
+  send(w->fds[0].fd, "r", 1, 0x4000);
+  close(w->fds[0].fd);
+  free(w);
+  return 0;
+}
+int sandboxWatch(int *fds, int count, int timeout) {
+  if (count < 0 || count > 5 || timeout < -1)
+    return -1;
+  struct readiness *w = malloc(sizeof(*w));
+  if (!w)
+    return -1;
+  int channel[2];
+  if (socketpair(1, 1 | CLOEXEC, 0, channel)) {
+    free(w);
+    return -1;
+  }
+  memset(w, 0, sizeof(*w));
+  w->fds[0].fd = channel[1];
+  w->fds[0].events = 1;
+  w->count = 1;
+  w->timeout = timeout;
+  for (int i = 0; i < count; i++) {
+    int fd = fcntl(fds[i], 1030, 3);
+    if (fd < 0)
+      goto failed;
+    w->fds[w->count].fd = fd;
+    w->fds[w->count++].events = 1;
+  }
+  unsigned long thread;
+  if (pthread_create(&thread, 0, waitReady, w))
+    goto failed;
+  pthread_detach(thread);
+  return channel[0];
+failed:
+  for (int i = 0; i < w->count; i++)
+    close(w->fds[i].fd);
+  close(channel[0]);
+  free(w);
+  return -1;
+}
+int sandboxAlive(int fd) { return alive(fd); }
+int sandboxWatchCancel(int fd) { return shutdown(fd, 2); }

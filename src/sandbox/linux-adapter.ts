@@ -1,19 +1,23 @@
+import type { FSWatcher, ReadStream } from "node:fs";
 import {
   chmodSync,
+  createReadStream,
   mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SandboxLaunchError } from "./exec";
 
 export type TLinuxLaunchOutcome =
   | { readonly kind: "setup_rejected"; readonly code: 78 }
   | { readonly kind: "exec_failed"; readonly code: 127 }
   | { readonly kind: "exited"; readonly code: number }
+  | { readonly kind: "reap_unconfirmed"; readonly code: null }
   | { readonly kind: "owner_lost"; readonly code: null };
 
 export type TLinuxLaunchHandle = {
@@ -90,23 +94,39 @@ export const prepareLinuxLaunch = (): string[] => {
   let exitCode: number | null = null;
   const status = new Int32Array(1);
   const deadline = performance.now() + 10000;
-  const finish = (): void => {
-    clearInterval(timer);
+  let cleanupDeadline = Number.POSITIVE_INFINITY;
+  let stopped = false;
+  let readiness: ReadStream | undefined;
+  let readinessFd = -1;
+  const cancelWait = (): void => {
+    if (readinessFd >= 0) native.sandboxWatchCancel(readinessFd);
+    readinessFd = -1;
+    readiness?.destroy();
+    readiness = undefined;
+  };
+  let leaseWatcher: FSWatcher | undefined;
+  const finish = (confirmed: boolean = true): void => {
+    if (stopped) return;
+    stopped = true;
+    cancelWait();
+    leaseWatcher?.close();
     native.sandboxClose(listener);
     rmSync(directory, { recursive: true, force: true });
     if (socket >= 0) native.sandboxClose(socket);
     if (registered) for (const fd of fds) native.sandboxClose(fd);
     if (ownerFd >= 0) native.sandboxClose(ownerFd);
     launches.delete(name);
-    resolveCleanup();
+    if (confirmed) resolveCleanup();
     resolveCompletion(
-      !registered
-        ? { kind: "setup_rejected", code: 78 }
-        : execFailed
-          ? { kind: "exec_failed", code: 127 }
-          : exitCode === null
-            ? { kind: "owner_lost", code: null }
-            : { kind: "exited", code: exitCode },
+      !confirmed
+        ? { kind: "reap_unconfirmed", code: null }
+        : !registered
+          ? { kind: "setup_rejected", code: 78 }
+          : execFailed
+            ? { kind: "exec_failed", code: 127 }
+            : exitCode === null
+              ? { kind: "owner_lost", code: null }
+              : { kind: "exited", code: exitCode },
     );
   };
   const fail = (): void => {
@@ -117,10 +137,15 @@ export const prepareLinuxLaunch = (): string[] => {
     if (!admitted) finish();
     else {
       rejected = true;
+      cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
       native.sandboxSignal(ownerFd, 15);
+      queueMicrotask(drive);
     }
   };
   const signal = (value: 1 | 2 | 9 | 15): void => {
+    if (stopped) return;
+    cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+    queueMicrotask(drive);
     if (!registered) {
       if (pendingSignal !== 9) pendingSignal = value;
       if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
@@ -131,7 +156,12 @@ export const prepareLinuxLaunch = (): string[] => {
       native.sandboxSignal(fds[0] as number, 9);
     } else native.sandboxSignal(fds[1] as number, value);
   };
-  const timer = setInterval(() => {
+  const step = (): void => {
+    if (performance.now() >= cleanupDeadline) {
+      process.stderr.write("SANDBOX_UNAVAILABLE: reap_unconfirmed\n");
+      finish(false);
+      return;
+    }
     if (rejected) {
       try {
         const owner = new Int32Array([ownerFd, ownerFd, ownerFd]);
@@ -252,9 +282,54 @@ export const prepareLinuxLaunch = (): string[] => {
       if (completed && native.sandboxDescriptorsExited(ptr(fds)) === 1)
         finish();
     }
-  }, 10);
-  timer.unref();
+  };
+  const drive = (): void => {
+    if (stopped) return;
+    cancelWait();
+    step();
+    if (stopped) return;
+    if (leasePath && !leaseWatcher) {
+      try {
+        leaseWatcher = watch(dirname(leasePath), { persistent: false }, drive);
+        leaseWatcher.on("error", () => {
+          leaseWatcher?.close();
+        });
+      } catch {
+        fail();
+      }
+    }
+    if (stopped) return;
+    const targets: number[] = [];
+    if (!rejected && !lostOuter && !completed)
+      targets.push(socket < 0 ? listener : socket);
+    for (const fd of registered ? [ownerFd, ...fds] : [ownerFd])
+      if (fd >= 0 && native.sandboxAlive(fd)) targets.push(fd);
+    const until = Math.min(
+      registered || rejected ? Infinity : deadline,
+      cleanupDeadline,
+    );
+    const timeout = Number.isFinite(until)
+      ? Math.max(0, Math.ceil(until - performance.now()))
+      : -1;
+    const descriptors = new Int32Array(targets.length ? targets : [-1]);
+    const fd = native.sandboxWatch(ptr(descriptors), targets.length, timeout);
+    if (fd < 0) {
+      recordLinuxSandboxRejection("SETUP_FAILED");
+      finish(false);
+      return;
+    }
+    readinessFd = fd;
+    readiness = createReadStream("", { fd, autoClose: true, highWaterMark: 1 });
+    readiness.once("data", drive);
+    readiness.once("error", () => {
+      if (!stopped) {
+        fail();
+        drive();
+      }
+    });
+  };
   launches.set(name, { ready, cleanup, signal, completion });
+  drive();
   return ["--sandbox-control", name];
 };
 
