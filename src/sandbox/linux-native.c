@@ -71,13 +71,14 @@ extern int clock_gettime(int, void *);
 #define CLOEXEC 02000000
 #define NONBLOCK 04000
 #define OPATH 010000000
-#define DIRECTORY 0200000
 #define MAX_RECORD 1048576
 #define MAX_ITEMS 2048
 #define DEADLINE 10000
 #define GRACE 2000
 #define REAP 1000
 #if defined(__x86_64__)
+/* O_DIRECTORY. The value depends on the architecture. */
+#define DIRECTORY 0200000
 #define NR_TID 186
 #define NR_EXIT 231
 #define NR_SECCOMP 317
@@ -90,6 +91,8 @@ extern int clock_gettime(int, void *);
 #define NR_CHROOT 161
 #define ARCH 0xc000003e
 #elif defined(__aarch64__)
+/* O_DIRECTORY. The value 0200000 is O_DIRECT on this architecture. */
+#define DIRECTORY 040000
 #define NR_TID 178
 #define NR_EXIT 94
 #define NR_SECCOMP 277
