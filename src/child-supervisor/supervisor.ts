@@ -1,5 +1,8 @@
 import { logError, logWarn, safeDiagnosticMessage } from "../logger";
-import type { TLinuxLaunchHandle } from "../sandbox/linux-adapter";
+import type {
+  TLinuxCleanupResult,
+  TLinuxLaunchHandle,
+} from "../sandbox/linux-adapter";
 import { linuxLaunchHandle } from "../sandbox/linux-adapter";
 import { spawn as admittedSpawn } from "../windows-process";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
@@ -260,7 +263,7 @@ const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
 
 const releaseSandboxChild = (
   tracked: TTrackedChild,
-  cleanup: "confirmed" | "unconfirmed",
+  cleanup: TLinuxCleanupResult["cleanup"],
   confirmedOutcome: "exited" | "terminated",
 ): TReapOutcome => {
   const outcome =
