@@ -215,6 +215,9 @@ param([AllowEmptyString()][string] $Prerelease)
         foreach ($key in @('repo', 'tag', 'targets', 'sha256')) {
             if (-not $record.ContainsKey($key)) { throw "Missing manifest field: $key" }
         }
+        foreach ($key in @('repo', 'tag')) {
+            if ($record[$key] -isnot [string] -or [string]::IsNullOrWhiteSpace($record[$key])) { throw "Invalid manifest identity: $key must be a non-empty string." }
+        }
         if ($record['repo'] -cne "openllmsh/$Component" -or $record['tag'] -cne $Tag) { throw 'Manifest repository or tag mismatch.' }
         if ($record['targets'] -isnot [object[]] -or $record['sha256'] -isnot [Collections.Generic.Dictionary[string,object]]) { throw 'Invalid manifest targets or digests.' }
         $targets = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
