@@ -14,6 +14,7 @@
  *
  * Targets include macOS, Linux, and Windows.
  * Windows targets require a native Windows host.
+ * Default builds include Windows only on a Windows host.
  * Select each host partition with --targets for prerelease builds.
  * Stable releases select the four non-Windows targets.
  * x64 uses the `baseline` (Nehalem) tier — no AVX/AVX2/FMA required, runs on
@@ -178,13 +179,6 @@ const resolveCloudOrigin = (): string => {
   return raw;
 };
 
-/** Bun `--target` spellings for the DEFAULT (no-args) build, derived from the
- *  release list so the compiler set can never drift from what ships.
- *  `DAEMON_TARGETS` remains the accepted domain for explicit `--target(s)`. */
-const TARGETS = DAEMON_RELEASE_TARGETS.map(
-  (t) => DAEMON_COMPILE_TARGET[t],
-) as readonly string[];
-
 // Accept BOTH the release key (`win32-x64`) and the Bun spelling
 // (`bun-windows-x64-baseline`); normalize through the typed mapping.
 const isDaemonTarget = (raw: string): raw is TDaemonTarget =>
@@ -223,6 +217,7 @@ export type TCompileSelection = {
 /** Parse compile target modes while keeping all parallel builds on one path. */
 export const resolveCompileSelection = (
   args: readonly string[],
+  hostPlatform: NodeJS.Platform = process.platform,
 ): TCompileSelection => {
   const hostOnly = args.includes("--host");
   const targetIdx = args.indexOf("--target");
@@ -238,8 +233,13 @@ export const resolveCompileSelection = (
     throw invalidCompileTarget(selectedTarget);
   }
 
-  const targetSubset =
+  let targetSubset =
     targetsIdx < 0 ? null : resolveTargets(args[targetsIdx + 1] ?? "");
+  if (targetSubset === null && resolvedTarget === null && !hostOnly) {
+    targetSubset = DAEMON_RELEASE_TARGETS.filter(
+      (target) => hostPlatform === "win32" || target !== "win32-x64",
+    ).map((target) => DAEMON_COMPILE_TARGET[target]);
+  }
   return { hostOnly, resolvedTarget, targetSubset };
 };
 
@@ -356,8 +356,8 @@ const main = async (): Promise<void> => {
   // A Windows target must be built ON Windows (native build + execution is the
   // qualification route). This check runs before creating output directories
   // or entering any compiler task, including the all-target request.
-  const buildTargets = targetSubset ?? TARGETS;
-  const guardTarget = hostOnly ? "host" : (resolvedTarget ?? targetSubset);
+  const buildTargets = targetSubset ?? [];
+  const guardTarget = hostOnly ? "host" : (resolvedTarget ?? buildTargets);
   assertNativeWindowsBuild(guardTarget, process.platform);
   await $`mkdir -p ${OUT_DIR}`;
   if (resolvedTarget) {
