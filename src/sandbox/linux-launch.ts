@@ -309,9 +309,6 @@ export const buildChildPolicy = (
       "--symlink",
       "pts/ptmx",
       "/dev/ptmx",
-      "--dev-bind",
-      "/dev/tty",
-      "/dev/tty",
       ...["null", "zero", "random", "urandom"].flatMap((name) => [
         "--dev-bind",
         `/dev/${name}`,
