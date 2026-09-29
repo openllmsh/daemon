@@ -1456,6 +1456,9 @@ export const spawnLogin = async (
     };
   } catch (error) {
     const reap = await requestTerminate();
+    // Readiness can fail before the temp dir is bound to the child.
+    // Keep the dir until the supervisor confirms process-tree release.
+    discardMintedTmpDirAfter(leased, child.whenReleased);
     if (error instanceof SandboxLaunchError) throw error;
     return {
       code: -1,
