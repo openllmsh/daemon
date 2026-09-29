@@ -301,6 +301,7 @@ const runClaudeSdkFacadeCaptureCore = async (
   const rawChunks = chunksFromCapturedAnthropicResponse(
     dispatchResult.response,
     params.providerModelId,
+    plan.toolNameMap.mcpToCaller,
   );
   // Same EOF-without-terminal-finish-reason guard `stream-json-capture` uses
   // — a clean upstream close with no observed finish reason must not

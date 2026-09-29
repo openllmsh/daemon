@@ -114,6 +114,7 @@
 
 import { existsSync } from "node:fs";
 import type {
+  TAnthropicStreamEvent,
   TChatCompletionChunk,
   TChatCompletionRequest,
 } from "@openllmsh/protocol";
@@ -439,15 +440,143 @@ const assistantMessageChunk = (
  * SEPARATE implementation: it must also decode `tool_use` blocks and never
  * captures/publishes a `session_id` (the facade has no vendor session).
  */
+/** How long we'll wait for the already-exited (or about-to-exit) child's
+ *  real exit code before giving up on the `error_max_turns` boundary below
+ *  — the process has already written its terminal `result` line by the
+ *  time we check this, so it is either already exited or exiting; this is
+ *  a safety bound, never an expected wait. */
+const EXIT_CODE_WAIT_MS = 5_000;
+
+/** In-flight `tool_use` content-block builder — accumulated from the RAW
+ *  Anthropic stream events (never the already-decoded canonical chunk,
+ *  which the wire layer intentionally forwards even while a call's JSON
+ *  argument text is still only partially buffered). */
+type TPendingToolCall = {
+  readonly id: string;
+  readonly name: string;
+  argsText: string;
+};
+
+/**
+ * Tracks whether the turn produced at least one COMPLETE, VALIDATED caller
+ * tool call — never satisfied by a bare name delta. "Complete" here means:
+ * a `content_block_start` of type `tool_use` with a non-empty id AND a name
+ * that resolves through the plan's OWN `toolNameMap` (i.e. a KNOWN declared
+ * caller tool, not an unrecognized or malformed one), followed by zero or
+ * more `input_json_delta` deltas, followed by that SAME index's
+ * `content_block_stop` with the accumulated argument text parsing as valid
+ * JSON. A tool block that never reaches `content_block_stop`, whose name
+ * never matches a declared tool, or whose accumulated arguments don't parse
+ * is never counted — matching Hermes's own validation
+ * (`tmp/hermes-claude-sdk-reference/directsdk.py:645-649`) before it will
+ * accept the `error_max_turns` boundary.
+ */
+class TFacadeToolCallTracker {
+  private readonly pending = new Map<number, TPendingToolCall>();
+  private completedValid = 0;
+  private invalidTool = false;
+  sawMessageStop = false;
+  lastStopReason: string | null = null;
+
+  constructor(private readonly toolNameMap: ReadonlyMap<string, string>) {}
+
+  observe(event: TAnthropicStreamEvent): void {
+    if (event.type === "content_block_start") {
+      if (event.content_block.type !== "tool_use") return;
+      this.pending.set(event.index, {
+        id: event.content_block.id,
+        name: event.content_block.name,
+        argsText: "",
+      });
+      return;
+    }
+    if (event.type === "content_block_delta") {
+      if (event.delta.type !== "input_json_delta") return;
+      const p = this.pending.get(event.index);
+      if (p === undefined) return;
+      p.argsText += event.delta.partial_json;
+      return;
+    }
+    if (event.type === "content_block_stop") {
+      const p = this.pending.get(event.index);
+      this.pending.delete(event.index);
+      if (p === undefined) return;
+      // One valid tool must never hide another invalid tool in the same turn.
+      if (p.id.length === 0 || !this.toolNameMap.has(p.name)) {
+        this.invalidTool = true;
+        return;
+      }
+      const args = p.argsText.trim().length === 0 ? "{}" : p.argsText;
+      try {
+        const input: unknown = JSON.parse(args);
+        if (
+          typeof input !== "object" ||
+          input === null ||
+          Array.isArray(input)
+        ) {
+          this.invalidTool = true;
+          return;
+        }
+      } catch {
+        this.invalidTool = true;
+        return;
+      }
+      this.completedValid += 1;
+      return;
+    }
+    if (event.type === "message_delta") {
+      this.lastStopReason = event.delta.stop_reason;
+      return;
+    }
+    if (event.type === "message_stop") {
+      this.sawMessageStop = true;
+    }
+  }
+
+  /** At least one genuinely complete, validated caller tool call — AND the
+   *  message actually ended on it (`message_stop` observed, terminal
+   *  `stop_reason: "tool_use"`), never a partial/malformed/unknown one. */
+  hasCompleteValidatedToolCall(): boolean {
+    return (
+      this.completedValid > 0 &&
+      !this.invalidTool &&
+      this.pending.size === 0 &&
+      this.sawMessageStop &&
+      this.lastStopReason === "tool_use"
+    );
+  }
+}
+
 const runFacadeDecode = (args: {
   readonly reader: ReadableStreamDefaultReader<string>;
   readonly providerModelId: string;
   readonly toolNameMap: ReadonlyMap<string, string>;
   readonly state: TAnthropicStreamState;
   readonly kill: () => void;
+  /** Resolves to the child's real exit code — required to confirm the
+   *  `error_max_turns` boundary below the same way Hermes's reference does
+   *  (`p.returncode == 1`). Every production caller passes it; bounded by
+   *  {@link EXIT_CODE_WAIT_MS} so a process that somehow never settles can
+   *  never hang the boundary check. */
+  readonly exitCode: Promise<number>;
 }): Promise<TNativeRunResult> => {
   let emittedContent = false;
   let terminalSucceeded = false;
+  const toolTracker = new TFacadeToolCallTracker(args.toolNameMap);
+
+  const boundedExitCode = async (): Promise<number | "timeout"> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        args.exitCode,
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), EXIT_CODE_WAIT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   const nextChunk = async (): Promise<
     TChatCompletionChunk | "end" | { error: string }
@@ -467,6 +596,7 @@ const runFacadeDecode = (args: {
       if (line.type === "stream_event" && line.event !== undefined) {
         const event = decodeStreamEvent(line.event);
         if (event._tag !== "Some") continue;
+        toolTracker.observe(event.value);
         const chunk = fromAnthropicStreamEvent(event.value, args.state, {
           providerModelId: args.providerModelId,
         });
@@ -488,6 +618,28 @@ const runFacadeDecode = (args: {
       }
       if (line.type === "result") {
         const isError = line.is_error === true;
+        const subtype = typeof line.subtype === "string" ? line.subtype : null;
+        // Hermes's exact carved-out boundary
+        // (`tmp/hermes-claude-sdk-reference/directsdk.py:653`): a genuine
+        // `error_max_turns` terminal result that produced at least one
+        // COMPLETE, VALIDATED new tool call (known name, real id, parseable
+        // args — never a bare name delta), on the CLI's own
+        // `error_max_turns` exit code (1), is a successful caller-tool
+        // boundary — never a broad "ignore is_error because something
+        // arrived" carve-out. Every other `is_error: true` shape (no
+        // completed tool call, no message_stop, wrong stop_reason, wrong
+        // subtype, wrong/unavailable exit code) still fails.
+        if (
+          isError &&
+          subtype === "error_max_turns" &&
+          toolTracker.hasCompleteValidatedToolCall()
+        ) {
+          const exitCode = await boundedExitCode();
+          if (exitCode === 1) {
+            terminalSucceeded = true;
+            return "end";
+          }
+        }
         if (isError) {
           const reason =
             typeof line.result === "string" && line.result.length > 0
@@ -732,6 +884,7 @@ const runClaudeSdkFacadeCore = async (
     reader,
     providerModelId: params.providerModelId,
     toolNameMap: plan.toolNameMap.mcpToCaller,
+    exitCode: proc.exited,
     state,
     kill,
   });

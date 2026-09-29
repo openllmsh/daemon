@@ -310,6 +310,7 @@ const killProc = (proc: ReturnType<typeof Bun.spawn>): void => {
 export const chunksFromCapturedAnthropicResponse = (
   response: Response,
   providerModelId: string,
+  toolNameMap?: ReadonlyMap<string, string>,
 ): ReadableStream<TChatCompletionChunk> => {
   const body = response.body;
   if (body === null) {
@@ -319,7 +320,12 @@ export const chunksFromCapturedAnthropicResponse = (
       },
     });
   }
-  return decodeAnthropicEventStream(body, { providerModelId });
+  return decodeAnthropicEventStream(body, {
+    providerModelId,
+    ...(toolNameMap !== undefined && toolNameMap.size > 0
+      ? { toolNameMap }
+      : {}),
+  });
 };
 
 /** Hard cap on how much of a non-2xx error body we read into memory. Vendor
