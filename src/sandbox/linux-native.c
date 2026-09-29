@@ -201,6 +201,7 @@ struct record {
   char **tests;
   int ntests;
   int nself, nargs, nenv, nro, nrw, nbwrap;
+  int cleanupUnconfirmed;
 };
 static char *minimal[] = {"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "PWD=/",
                           0};
@@ -404,6 +405,11 @@ static int sendRecord(int socket, struct record *r, int stage, int value,
     h.controllen = offset + 32;
   }
   return sendmsg(socket, &h, 0x4000) == sizeof(m) ? 0 : -1;
+}
+static int sendComplete(struct record *r, int socket, int value, int pid) {
+  if (r->cleanupUnconfirmed)
+    return -1;
+  return sendRecord(socket, r, COMPLETE, value, pid, 0, 0);
 }
 static int receive(int socket, struct record *r, struct message *m, int *fds,
                    int expected, struct cred *credential) {
@@ -793,8 +799,10 @@ static void cleanup(struct record *r, int guardian, int init, int initfd,
       fullWrite(2, s, strlen(s));
       reported = 1;
     }
-    if (reported && done < 0)
+    if (reported && done < 0) {
+      r->cleanupUnconfirmed = 1;
       return;
+    }
     poll(0, 0, reported ? 100 : 20);
   }
   lease(r, guardian, init, 1);
@@ -1292,7 +1300,7 @@ static int guardian(struct record *r) {
   cleanup(r, getpid(), init, initfd, monitorfd, monitor, &result);
   if (!committed)
     result = 78;
-  sendRecord(socket, r, COMPLETE, result, init, 0, 0);
+  sendComplete(r, socket, result, init);
   return result;
 }
 int sandboxInternal(int isGuardian) {
@@ -1549,7 +1557,7 @@ int sandboxOuter(char *data, unsigned int length) {
   cleanup(&r, guard, init, failed ? initfd : -1, failed ? monitorfd : -1, guard,
           &guardResult);
   if (daemonSocket >= 0) {
-    sendRecord(daemonSocket, &r, COMPLETE, result, init, 0, 0);
+    sendComplete(&r, daemonSocket, result, init);
     close(daemonSocket);
   }
   if (complete && guardResult != result)
