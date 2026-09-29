@@ -76,6 +76,7 @@ CLI_SHA=""
 OPENLLM_PRERELEASE_TAG=''
 PRERELEASE_OPT=""
 PRERELEASE_SEEN=0
+LOCAL_FILE_SEEN=0
 usage() {
   cat <<'USAGE'
 Usage: install.sh [options]
@@ -90,29 +91,33 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-file)
+      LOCAL_FILE_SEEN=1
       FROM_FILE="${2:-}"
       [ -n "$FROM_FILE" ] || die "--from-file needs a path"
       shift 2
       ;;
-    --from-file=*) FROM_FILE="${1#*=}"; shift ;;
+    --from-file=*) LOCAL_FILE_SEEN=1; FROM_FILE="${1#*=}"; shift ;;
     --sha256)
+      LOCAL_FILE_SEEN=1
       FROM_SHA="${2:-}"
       [ -n "$FROM_SHA" ] || die "--sha256 needs a hex digest"
       shift 2
       ;;
-    --sha256=*) FROM_SHA="${1#*=}"; shift ;;
+    --sha256=*) LOCAL_FILE_SEEN=1; FROM_SHA="${1#*=}"; shift ;;
     --cli-from-file)
+      LOCAL_FILE_SEEN=1
       CLI_FROM_FILE="${2:-}"
       [ -n "$CLI_FROM_FILE" ] || die "--cli-from-file needs a path"
       shift 2
       ;;
-    --cli-from-file=*) CLI_FROM_FILE="${1#*=}"; shift ;;
+    --cli-from-file=*) LOCAL_FILE_SEEN=1; CLI_FROM_FILE="${1#*=}"; shift ;;
     --cli-sha256)
+      LOCAL_FILE_SEEN=1
       CLI_SHA="${2:-}"
       [ -n "$CLI_SHA" ] || die "--cli-sha256 needs a hex digest"
       shift 2
       ;;
-    --cli-sha256=*) CLI_SHA="${1#*=}"; shift ;;
+    --cli-sha256=*) LOCAL_FILE_SEEN=1; CLI_SHA="${1#*=}"; shift ;;
     --prerelease)
       [ "$PRERELEASE_SEEN" = 0 ] || die "--prerelease must not be repeated"
       PRERELEASE_SEEN=1
@@ -131,6 +136,9 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1 (supported: --from-file, --sha256, --cli-from-file, --cli-sha256, --prerelease)" ;;
   esac
 done
+if [ "$PRERELEASE_SEEN" = 1 ] && [ "$LOCAL_FILE_SEEN" = 1 ]; then
+  die "--prerelease cannot be combined with --from-file/--sha256/--cli-from-file/--cli-sha256"
+fi
 if [ -n "$FROM_FILE" ] || [ -n "$FROM_SHA" ]; then
   [ -n "$FROM_FILE" ] && [ -n "$FROM_SHA" ] \
     || die "--from-file and --sha256 must be given together"
@@ -155,8 +163,6 @@ is_prerelease_tag() {
 # Local-file mode never selects the marker.
 PRERELEASE_TAG=""
 if [ "$PRERELEASE_SEEN" = 1 ]; then
-  [ -z "$FROM_FILE" ] && [ -z "$FROM_SHA" ] && [ -z "$CLI_FROM_FILE" ] && [ -z "$CLI_SHA" ] \
-    || die "--prerelease cannot be combined with --from-file/--sha256/--cli-from-file/--cli-sha256"
   is_prerelease_tag "$PRERELEASE_OPT" \
     || die "not a prerelease tag: $PRERELEASE_OPT (want vMAJOR.MINOR.PATCH-LABEL.N, e.g. v2.8.0-beta.3)"
   if [ -n "$OPENLLM_PRERELEASE_TAG" ]; then
