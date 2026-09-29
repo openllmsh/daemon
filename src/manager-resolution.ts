@@ -190,6 +190,8 @@ export const resolveManagerCandidate = async (
       target === null
         ? { kind: "unresolved", target: null, identity: adapter.name }
         : { kind: "resolved", target, identity: `${adapter.name}:${target}` };
+    // Cancellation is not evidence that the installation stopped resolving.
+    if (opts?.signal?.aborted) return resolution;
     // Populate the passive-read cache as a side effect of this demand call,
     // fingerprinted against the candidate's current on-disk shape AND the
     // adapter's own selection-state signal, so a later bounded change (the
