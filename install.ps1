@@ -365,6 +365,7 @@ param([AllowEmptyString()][string] $Prerelease)
         param([string] $Bin)
         $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
         try {
+            $key.DeleteValue('OPENLLM_ENV_BROADCAST', $false)
             $value = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
             $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
             if ($null -ne $value) {
