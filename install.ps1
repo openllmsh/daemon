@@ -579,8 +579,15 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         try {
             $alias = Join-Path $bin 'ollm.cmd'
             Assert-SafePath $alias
-            $aliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b %errorlevel%`r`n"
-            if ([IO.File]::Exists($alias) -and [IO.File]::ReadAllText($alias) -cne $aliasText) { throw "An unmanaged alias exists: $alias" }
+            # A bare `exit /b` returns the real exit code of openllm.exe; `%errorlevel%`
+            # could expand an inherited ERRORLEVEL variable instead.
+            $aliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b`r`n"
+            $previousAliasText = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n`"%~dp0openllm.exe`" %*`r`nexit /b %errorlevel%`r`n"
+            if ([IO.File]::Exists($alias)) {
+                $current = [IO.File]::ReadAllText($alias)
+                if ($current -ceq $previousAliasText) { [IO.File]::Delete($alias) }
+                elseif ($current -cne $aliasText) { throw "An unmanaged alias exists: $alias" }
+            }
             if (-not [IO.File]::Exists($alias)) {
                 $aliasStage = Join-Path $stage 'ollm.cmd'
                 [IO.File]::WriteAllText($aliasStage, $aliasText, [Text.Encoding]::ASCII)
