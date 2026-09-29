@@ -158,24 +158,30 @@ export const publishCapturedDirectOutput = (args: {
     args.onRelease();
   };
 
+  const reader = args.chunks.getReader();
   const chunks = new ReadableStream<TChatCompletionChunk>({
-    async start(controller) {
-      const reader = args.chunks.getReader();
+    async pull(controller) {
       try {
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
+        const { value, done } = await reader.read();
+        if (done) {
+          reader.releaseLock();
+          controller.close();
+          release();
+          return;
         }
-        controller.close();
+        controller.enqueue(value);
       } catch (err) {
-        controller.error(err);
-      } finally {
         reader.releaseLock();
+        controller.error(err);
         release();
       }
     },
-    cancel() {
+    cancel(reason) {
+      // Release ownership promptly even if the source's cancellation hangs.
+      void reader
+        .cancel(reason)
+        .finally(() => reader.releaseLock())
+        .catch(() => undefined);
       release();
     },
   });

@@ -377,8 +377,18 @@ export const captureAwareHistoryBuilderPlan = (args: {
     builderResumeId: null,
     publishResumeSession: false,
     systemText: args.systemText,
+    // `renderSeed` drops its LAST input turn on the assumption that it is
+    // the trailing delta (true for session-store's own full-turns caller,
+    // whose `turns` always ends on the delta user turn). `textTurns` here
+    // is `historyTurns` from `historyTurnsFromCanonicalMessages`, which
+    // already EXCLUDES the trailing delta — so the delta must be appended
+    // back on before calling `renderSeed`, or its real last turn (typically
+    // the latest assistant reply) would be silently dropped instead.
     userText: args.hasPrior
-      ? renderSeed(textTurns, args.deltaText)
+      ? renderSeed(
+          [...textTurns, { role: "user" as const, text: args.deltaText }],
+          args.deltaText,
+        )
       : args.deltaText,
     textTurns,
   };

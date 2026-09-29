@@ -1181,10 +1181,25 @@ export const runMuseNativeCapture = async (
 
   const captureTimeoutMs = params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS;
   const rpcTimeoutMs = params.rpcTimeoutMs ?? MUSE_CAPTURE_RPC_TIMEOUT_MS;
-  const handle = openMuseBridgeCaptureHandle({
-    signal: params.signal,
-    captureTimeoutMs,
-  });
+  // Receiver bind pre-send decline: a `Bun.serve` throw here disposes its
+  // own internal session before ever offering an envelope, so ownership
+  // stays "none" — resolve `declined`, never reject.
+  let handle: TMuseBridgeCaptureHandle;
+  try {
+    handle = openMuseBridgeCaptureHandle({
+      signal: params.signal,
+      captureTimeoutMs,
+    });
+  } catch (error) {
+    if (params.signal.aborted) {
+      return { kind: "declined", reason: "client aborted" };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      kind: "declined",
+      reason: `muse capture receiver failed to start: ${message}`,
+    };
+  }
 
   let captureOwnership: "none" | "accepted" | "uncertain" = "none";
   /**
@@ -1327,9 +1342,11 @@ export const runMuseNativeCapture = async (
     // silently become a synthesized "stop" — see request-capture-output.ts.
     const chunks = requireCaptureTerminalFinishReason(nameMapped);
 
+    // Held reader lets cancel propagate: acquired once so `cancel()` can
+    // reach the same locked reader `start()` uses, instead of only disposing.
+    const reader = chunks.getReader();
     const stream = new ReadableStream<TChatCompletionChunk>({
       async start(controller) {
-        const reader = chunks.getReader();
         try {
           for (;;) {
             const { value, done } = await reader.read();
@@ -1344,7 +1361,9 @@ export const runMuseNativeCapture = async (
           await disposeAll();
         }
       },
-      cancel() {
+      cancel(reason) {
+        // Best-effort; swallow so a rejection here isn't unhandled.
+        void reader.cancel(reason).catch(() => {});
         return disposeAll();
       },
     });

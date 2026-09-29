@@ -720,10 +720,21 @@ export const startCodexCaptureReceiver = (
     try {
       externalUrl = resolveExternalUrl(observedUrl, headers);
     } catch (err) {
-      return new Response(
-        err instanceof Error ? err.message : "workspace route unresolved",
-        { status: 502 },
-      );
+      const reason =
+        err instanceof Error ? err.message : "workspace route unresolved";
+      // Pre-send failure — no envelope was ever offered, so nothing else
+      // will ever settle this session. Complete it now (usage: none) rather
+      // than leaving `takeCaptured()` to hang until the capture timeout.
+      try {
+        opts.session.complete({
+          kind: "failed",
+          reason,
+          usage: { kind: "none" },
+        });
+      } catch {
+        // session may already be terminal/disposed
+      }
+      return new Response(reason, { status: 502 });
     }
     await offerEnvelope({
       transport: "http",
@@ -855,7 +866,23 @@ export const startCodexCaptureReceiver = (
             ws.data.observedUrl,
             ws.data.headers,
           );
-        } catch {
+        } catch (err) {
+          // Pre-send failure — no envelope was ever offered, so nothing else
+          // will ever settle this session. Complete it now (usage: none)
+          // rather than leaving `takeCaptured()` to hang until the capture
+          // timeout.
+          try {
+            opts.session.complete({
+              kind: "failed",
+              reason:
+                err instanceof Error
+                  ? err.message
+                  : "workspace route unresolved",
+              usage: { kind: "none" },
+            });
+          } catch {
+            // session may already be terminal/disposed
+          }
           try {
             ws.close(1011, "workspace-route-unresolved");
           } catch {
