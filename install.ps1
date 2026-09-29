@@ -370,17 +370,18 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
 '@
         $process = New-Object Diagnostics.Process
         $started = $false
+        $notified = $false
         $process.StartInfo.FileName = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
         $process.StartInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.CreateNoWindow = $true
         try {
             $started = $process.Start()
-            if (-not $started) { return $false }
-            $handle = $process.Handle
-            if (-not $process.WaitForExit(5000)) { return $false }
-            return $process.ExitCode -eq 0
-        } catch { return $false }
+            if ($started) {
+                $handle = $process.Handle
+                if ($process.WaitForExit(5000)) { $notified = $process.ExitCode -eq 0 }
+            }
+        } catch { $notified = $false }
         finally {
             try {
                 if ($started -and -not $process.HasExited) {
@@ -417,8 +418,12 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                         if ($killerStarted -and -not $killer.WaitForExit([int][Math]::Max(0, 1000 - $grace.ElapsedMilliseconds))) { throw 'Environment notification cleanup is unconfirmed.' }
                     } finally { $killer.Dispose() }
                 }
+            } catch {
+                # PATH and binaries are committed. Report failed cleanup as a warning.
+                $notified = $false
             } finally { $process.Dispose() }
         }
+        return $notified
     }
 
     function Set-ManagedPath {
