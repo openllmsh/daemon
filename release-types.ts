@@ -28,6 +28,15 @@ export type TDaemonTarget = (typeof DAEMON_TARGETS)[number];
  */
 export const DAEMON_RELEASE_TARGETS: readonly TDaemonTarget[] = DAEMON_TARGETS;
 
+/** Windows distribution is limited to prereleases. */
+export const DAEMON_STABLE_TARGETS: readonly TDaemonTarget[] =
+  DAEMON_RELEASE_TARGETS.filter((target) => target !== "win32-x64");
+
+export const daemonReleaseTargets = (
+  version: string,
+): readonly TDaemonTarget[] =>
+  version.includes("-") ? DAEMON_RELEASE_TARGETS : DAEMON_STABLE_TARGETS;
+
 /**
  * The checked-in input closure for a compiled daemon. Release, CI receipt,
  * and merge-gate code all consume this list; it deliberately excludes the
