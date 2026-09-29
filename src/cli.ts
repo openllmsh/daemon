@@ -155,7 +155,7 @@ export const runCli = (): boolean => {
         await doctor.runLegacyLockDoctor(
           args.slice(1),
           [env.envFilePath(), env.sharedEnvFilePath()],
-          [],
+          doctor.clientRestoreLockDomains(),
           doctor.stateLockParents(env.stateDir()),
         ),
       ),
