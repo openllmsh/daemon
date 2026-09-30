@@ -116,8 +116,8 @@ curl -fsSL https://www.openllm.sh/install | bash
 
 The `rm` step removes only the preview binaries. Your settings in
 `~/.openllm/.env` stay. The install step installs the stable daemon and
-CLI and starts the daemon again. Windows has no stable release. Stable
-releases support macOS and Linux only.
+CLI. With a saved key, it starts the daemon again. Windows has no stable
+release. Stable releases support macOS and Linux only.
 
 A key is optional when you download the binaries. On macOS and Linux, the
 installer can start credential setup in an interactive terminal.
