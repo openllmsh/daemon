@@ -664,9 +664,10 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                     }
                     if ((Compare-Version $version $tag.Substring(1)) -gt 0) { throw "Downgrade refused: $($image.Path) is $version." }
                     $image.Replace = (Get-FileHash -LiteralPath $image.Path -Algorithm SHA256).Hash -ine $image.Digest
-                    if (Test-Path -LiteralPath $image.Backup) {
-                        # The executable verified. The recovery file is
-                        # residue from a finished move. Remove it.
+                    if (-not $image.Replace -and (Test-Path -LiteralPath $image.Backup)) {
+                        # The installed file already matches the download. The
+                        # recovery file is residue from a finished move.
+                        # Remove it. A pending replacement still needs it.
                         try { [IO.File]::Delete($image.Backup) }
                         catch { Write-Warning "A leftover recovery file could not be removed: $($image.Backup). $($_.Exception.Message)" }
                     }
