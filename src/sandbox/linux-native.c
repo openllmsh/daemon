@@ -916,6 +916,19 @@ static int capabilities(void) {
   }
   return 0;
 }
+/* Match one comma-separated mount option as a whole token. A substring scan
+ * misses `ro` as the last field (no comma follows it) and can match inside a
+ * longer token. */
+static int mountOption(const char *options, const char *name) {
+  usize n = strlen(name);
+  const char *p = options;
+  while ((p = strstr(p, name)) != 0) {
+    if ((p == options || p[-1] == ',') && (p[n] == 0 || p[n] == ','))
+      return 1;
+    p += n;
+  }
+  return 0;
+}
 static int finalMount(struct record *r) {
   if (mount(0, "/", 0, (1UL << 18) | 16384, 0))
     return -1;
@@ -977,9 +990,9 @@ static int finalMount(struct record *r) {
     p = end + 1;
   }
   free(buf);
-  if (!found || !subset || !strstr(options, "ro,") ||
-      !strstr(options, "nosuid") || !strstr(options, "nodev") ||
-      !strstr(options, "noexec"))
+  if (!found || !subset || !mountOption(options, "ro") ||
+      !mountOption(options, "nosuid") || !mountOption(options, "nodev") ||
+      !mountOption(options, "noexec"))
     return -1;
   const char *absent[] = {"/proc/sys",     "/proc/net",  "/proc/cpuinfo",
                           "/proc/meminfo", "/proc/stat", "/proc/uptime",
