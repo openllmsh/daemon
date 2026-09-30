@@ -54,6 +54,21 @@ compiled and SHA-256-verified during installation; Bun is not required to run
 them. Vendor clients have their own requirements; follow the installer or
 provider-connect guidance for any missing client.
 
+### Preview install
+
+The current preview is `v2.8.0-beta.3`. The installer script at the tag
+installs only that tag:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.sh | bash
+```
+
+Or download the script and name the tag yourself:
+`bash install.sh --prerelease v2.8.0-beta.3`. The preview also ships a
+`win32-x64` build (unsigned; no PTY). A prerelease never moves `main` and
+never overwrites an earlier prerelease's branch or tag. Do not use
+`openllm update` to move a stable install to the preview.
+
 A key is optional when downloading the binaries. In an interactive terminal,
 the installer can hand off to `openllm start` to guide sign-in and key entry.
 If setup did not run, continue with:
