@@ -707,7 +707,9 @@ vendor_cli_json_escape() {
 }
 
 vendor_cli_attempt_id() {
-  printf 'vci-%s-%s-%s' "$$" "$(date +%s)" "${RANDOM:-0}"
+  # This id reaches the cloud; process identity belongs only in local fields.
+  printf 'vci-%s-%s-%s-%s-%s' "$(date +%s)" \
+    "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
 }
 
 vendor_cli_process_start() {
@@ -1132,10 +1134,10 @@ launch_vendor_cli_install() {
   fi
 
   echo "  $name CLI: installing in the background…"
-  # Handshake file is published ONLY after the pid-bearing JSON is on disk.
-  # Worker waits for it and must NOT fall back to PPID / launch without it.
-  worker_pid_file="$(vendor_cli_state_dir)/.${slug}.worker_pid"
-  handshake_file="$(vendor_cli_state_dir)/.${slug}.handshake"
+  # Handshake/pid files are attempt-scoped. A completed older worker must not
+  # `rm` a newer attempt's handshake (provider-only paths caused that race).
+  worker_pid_file="$(vendor_cli_state_dir)/.${slug}.${attempt_id}.worker_pid"
+  handshake_file="$(vendor_cli_state_dir)/.${slug}.${attempt_id}.handshake"
   rm -f "$worker_pid_file" "$handshake_file"
   # Capture the launching shell's pid for the worker's parent-liveness guard
   # (Bash 3.2: `$$` inside `( )&` is still this value — pass it explicitly).

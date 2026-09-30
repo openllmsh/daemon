@@ -147,13 +147,7 @@ const workerIsLive = (record: TLocalRecord): boolean => {
   return true;
 };
 
-const toWire = (record: {
-  readonly attempt_id: string;
-  readonly stage: TVendorCliInstall["stage"];
-  readonly started_at_ms: number;
-  readonly updated_at_ms: number;
-  readonly reason?: TVendorCliInstall["reason"];
-}): TVendorCliInstall | undefined => {
+const toWire = (record: TVendorCliInstall): TVendorCliInstall | undefined => {
   const candidate: TVendorCliInstall = {
     attempt_id: record.attempt_id,
     stage: record.stage,
