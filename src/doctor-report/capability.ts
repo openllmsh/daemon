@@ -1,5 +1,12 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+import {
   DOCTOR_LOCAL_CAPABILITY_FILENAME,
   DOCTOR_LOCAL_CAPABILITY_HEADER,
 } from "@openllmsh/protocol";
@@ -55,6 +62,31 @@ export const capabilityMatches = (presented: string | null): boolean => {
   const presentedBytes = Buffer.from(presented);
   if (expectedBytes.length !== presentedBytes.length) return false;
   return timingSafeEqual(expectedBytes, presentedBytes);
+};
+
+/** CLI read: owner-only regular file, never a symlink or an unbounded read. */
+export const readOwnerDoctorCapability = (): string | null => {
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      doctorCapabilityPath(),
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.size > 256 ||
+      (stat.mode & 0o077) !== 0 ||
+      (process.getuid !== undefined && stat.uid !== process.getuid())
+    )
+      return null;
+    const token = readFileSync(fd, "utf8").trim();
+    return /^[a-f0-9]{64}$/.test(token) ? token : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 };
 
 export const resetDoctorCapabilityForTests = (): void => {

@@ -8,6 +8,8 @@
  * Descriptions are deliberately free of `:` and `'` so they embed into the
  * zsh/bash/fish completion grammars without escaping.
  */
+import { AUTH_COMMANDS } from "@openllmsh/protocol";
+
 export type TCommand = {
   readonly name: string;
   /** Positional-arg hint shown in help, e.g. `<provider> <token>`. */
@@ -16,6 +18,11 @@ export type TCommand = {
 };
 
 export const COMMANDS: readonly TCommand[] = [
+  {
+    name: "auth",
+    args: `<${AUTH_COMMANDS.map((item) => item.name).join("|")}>`,
+    description: "Manage provider authentication on this machine",
+  },
   { name: "start", description: "Register and start in self-restore mode" },
   { name: "stop", description: "Stop and disable all self-restore" },
   { name: "status", description: "Show service registration and run status" },
@@ -79,6 +86,7 @@ export const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;
  * This powers shell completion for subcommand arguments.
  */
 export const COMMAND_ARGS: Readonly<Record<string, readonly string[]>> = {
+  auth: AUTH_COMMANDS.map((item) => item.name),
   completion: [...COMPLETION_SHELLS, "install"],
   "auto-update": [...AUTO_UPDATE_ACTIONS],
   sessions: [...AUTO_UPDATE_ACTIONS],

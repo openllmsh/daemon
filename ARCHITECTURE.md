@@ -6,8 +6,8 @@
 > runs the **subscription** data plane on the user's
 > machine. It delegates to the official vendor CLIs' own credentials +
 > identity (never minting, storing, or forging a subscription token),
-> records request metadata to the cloud, and is driven by the openllm.sh
-> dashboard directly over a localhost control surface.
+> records request metadata to the cloud, and accepts management commands from
+> the dashboard over the relay or from owner-authorized local CLI/MCP control.
 >
 > Compliance rationale lives in
 > [`docs/proposals/subscription-oauth-terms-compliance.md`](../../docs/proposals/subscription-oauth-terms-compliance.md).
@@ -141,7 +141,11 @@ daemon/
     client-encode.ts        client-wire encoders + the SHARED DELIVERY TAIL both execution methods
                             end in (deliverChunkStream: tee → meter → encode + heartbeat;
                             deliverJsonResponse; sseResponseForClient for pre-metered turns)
-    control.ts              localhost control surface (/status,/events,/connect,/usage,/config)
+    auth-cli.ts             openllmd auth command adapter; protected local calls, JSON/human output
+    local-auth.ts           /local/auth — runtime discovery, local flow handles, existing scheduled handlers
+    local-http.ts           shared CLI-only loopback authorization and bounded request parsing
+    scheduled-command.ts    shared scheduler admission for relay and local commands
+    control-relay.ts        transport-independent command executor
     control-channel.ts      outbound relay WebSocket (partysocket) — hello/status/ack frames, heartbeat, and migrateIfRelayMoved (bootstrap-tick channel re-fetch: reconnect when a deploy moved the relay to a new content-addressed box)
     status.ts               computeStatus() — shared snapshot for relay status_push (cheap local store/metadata; not token refresh)
     usage-cache.ts          per-provider TTL cache over delegate.usage() (rate-limit safe)
@@ -600,64 +604,52 @@ The session PTY spawn remains deliberately outside the per-child sandbox: it
 runs the user's real vendor CLI against the user's real `$HOME`; only its
 standalone host owns lifecycle and transport fan-out.
 
-## Two localhost surfaces
+## Localhost surfaces and provider auth
 
 `Bun.serve` on `127.0.0.1:<port>` (default 8787; 8788 in dev mode) routes
 by path:
 
-- **`/v1/*` — inference.** Mirrors the cloud's OpenAI/Anthropic surface.
-  `listener.ts` validates the request, obtains/verifies the cloud-signed plan
-  (from the redirect, cache, or local-first plan fetch), then invokes the
-  coreless `walker.ts` (or the image/video walkers). The walker serves
-  subscription hops with the delegate's credential and forwards an API-key hop
-  in a mixed chain to the cloud (`forward.ts`) rather than decrypting it
-  locally. It fire-and-forget records inference metadata to the cloud; explicit
-  locally generated media may additionally be uploaded to the media library.
-- **Control surface** — called DIRECTLY by the dashboard browser. Reads
-  (`GET /status`, `GET /events`, `GET /usage/:slug`) and writes
-  (`POST /config/api-key`, `POST /connect/:slug`) are served to the
-  dashboard origin. Access control is the localhost bind + the CORS
-  origin lock (`allowOrigin` reflects the configured dashboard origin and
-  its loopback sibling; any loopback origin in dev) — there is no
-  separate control token at this stage; revisit if the daemon ever binds
-  beyond loopback. All answer the Chrome Private-Network-Access preflight
-  (`Access-Control-Allow-Private-Network: true`).
+- **`/v1/*` — inference.** `listener.ts` validates the request, verifies the
+  cloud-signed plan and invokes the coreless walker. Subscription hops run
+  locally; API-key hops in mixed chains go to the cloud (`forward.ts`) rather
+  than decrypting credentials locally. Inference recording is metadata-only;
+  generated media may separately be uploaded to the media library.
+- **Public local diagnostics.** `/status` returns the secret-free health
+  snapshot (`buildHealth`), not provider auth/usage. `/whoami` returns an opaque
+  device ID. Their browser CORS/PNA grant is not authorization for management.
+- **CLI-only control.** Local auth and doctor routes require loopback Host,
+  reject browser Origin, and authenticate an owner-only per-boot capability.
+  These are not cloud-forwarded endpoints or dashboard CORS mutations.
 
-  `GET /status` reports `key_configured` + `cloud_state` (`ok` / `no_key`
-  / `invalid_key` / `unreachable`) so the dashboard's Providers tab can
-  render its 3-state flow: offline → install command; online + no usable
-  key → API-key picker; online + `ok` → provider connect cards.
+`openllmd auth` invokes the running daemon; `openllm auth` is a thin mirror,
+with local stdio MCP tools layered on the same command contract. The daemon
+registry supplies provider names and available primary/alternate login methods.
+Login, code submission, cancellation, logout and explicit refresh reuse
+`control-relay.ts` handlers and the same scheduler as relay-originated commands.
+No provider login runs independently in a CLI subprocess. Pending auth remains
+in the running daemon, and originator-specific prompts stay out of shared status.
 
-  **`GET /events` is the live channel** (`events.ts`, SSE). The dashboard
-  subscribes once; the daemon pushes a fresh `status` snapshot on
-  connect, after every control mutation (`broadcastStatus()`), and when a
-  client-gated watcher detects an OUT-OF-BAND change — the case polling
-  handled worst, e.g. the user signing into Kimi via its in-terminal
-  `/login`. SSE (not WebSocket) so it reuses the same CORS + PNA preflight
-  as the rest of the surface; `/status` stays as the initial snapshot +
-  SSE-blocked fallback (the dashboard also keeps a slow 30s fallback
-  poll). `computeStatus()` (`status.ts`) is the shared snapshot logic.
+Provider status and cached usage reads are observational. Explicit `refresh`
+requests new usage with the existing manual/deferral semantics. A command ACK
+or pending login is not proof of connection. Flow IDs scope continuation and
+cancellation; code input is passed through stdin, never shell arguments.
 
-## API key — set at runtime, not install time
+Dashboard management still travels through the relay WebSocket and retains
+its device-grant checks. Local control does not select remote devices or mutate
+the browser's “this machine” preference, and it needs no recovery phrase.
 
-The daemon installs **keyless**. The dashboard authenticates it afterwards
-via `POST /config/api-key` — but it does NOT make the user pick/paste a
-key: the Providers tab AUTO-PROVISIONS a dedicated daemon key (the browser
-mints a fresh `sk-llm` under the unlocked vault, named "OpenLLM Daemon",
-and sends the one-time plaintext to localhost — never to the cloud; revoke
-it on the Keys page). The daemon still needs this DEK-bearing key for its
-cloud control-plane calls AND for forwarding API-key hops — the `?__plan=`
-HMAC secures the plan, not the daemon's identity. `env.ts` persists it as
-`OPENLLM_API_KEY` in `~/.openllm/.env` (`0600`) — the single config
-file — so it
-survives restarts / HMR, and re-bootstraps in-request so a valid key
-flips `cloud_state` to `ok` immediately. Until a key is set the daemon
-runs and serves its control surface so the dashboard can set one. The
-bootstrap poll uses a short retry interval until `cloud_state === "ok"`,
-then relaxes to the 5-minute TTL — so a just-set key (or a `next dev`
-that just finished compiling) is picked up within seconds. This also
-makes dev fast: `bun run dev` boots the daemon keyless and you set a key
-once from the UI.
+## API key — onboarding and the shared configuration
+
+The installer accepts `OPENLLM_API_KEY` and persists it in the shared
+`~/.openllm/.env` before starting the service. Without a usable key it can
+install the binaries without starting a keyless service; interactive
+`openllm start` prompts for the key obtained through web onboarding or Keys.
+The CLI and daemon share this configuration rather than maintaining separate
+pairings. Do not send API keys to a browser-facing localhost config route.
+
+The key remains the daemon's identity for cloud control-plane requests and
+BYOK forwarding. It is distinct from the per-boot local capability used for
+owner-authorized CLI management and from vault-derived remote device grants.
 
 **Dev-mode config isolation.** With `OPENLLM_DAEMON_DEV=1` the daemon's
 config file is `~/.openllm/.dev.env` (not the shared `.env`), the default
@@ -666,8 +658,8 @@ so a source-run dev daemon coexists with the installed daemon without
 clobbering its config. The ONLY dev read of the shared `.env` is a live,
 read-only `OPENLLM_API_KEY` fallback when `.dev.env` is keyless (dev
 reuses the paired key without forking it); every dev write — key, origin,
-minted device id, auto-update pref — lands in `.dev.env`. The dashboard
-probes both 8787 and 8788 for `/whoami` (`lib/hooks/use-this-device.ts`).
+minted device id, auto-update pref — lands in `.dev.env`. Local auth follows
+the configured daemon port; it does not infer or change browser device selection.
 
 ## Isolated CLIs (install + run)
 

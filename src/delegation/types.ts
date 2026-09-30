@@ -58,6 +58,8 @@ export type TModelDiscoveryResult =
 
 export type TProviderDelegate = {
   readonly slug: string;
+  /** Primary native login is browser unless the provider is device-code only. */
+  readonly primaryLoginMethod?: "browser" | "device";
 
   /** Current connection state for the status snapshot (`cli_installed`).
    *  HTTP `GET /status` is `buildHealth` and does not call this. */
