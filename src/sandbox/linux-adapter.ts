@@ -27,8 +27,10 @@ export type TLinuxCleanupResult = {
 /**
  * The bounded shim exits with this code when it cannot confirm that every
  * sandboxed descendant reaped (`REAP_UNCONFIRMED_EXIT` in `linux-native.c`).
- * The shim suppresses COMPLETE on that path, so `drive()` cannot produce a
- * confirmed settlement before this maps the exit to `reap_unconfirmed`.
+ * The code collides with a workload status of 75. The shim sends COMPLETE
+ * only on the confirmed path, and always before it exits, so `shimExited`
+ * drains the socket first and maps a bare 75 to `reap_unconfirmed` only
+ * when COMPLETE never arrived.
  */
 export const REAP_UNCONFIRMED_EXIT = 75;
 
@@ -234,6 +236,27 @@ export const prepareLinuxLaunch = (): string[] => {
       native.sandboxSignal(fds[0] as number, 9);
     } else native.sandboxSignal(fds[1] as number, value);
   };
+  /* Read one queued completion record. The shim sends COMPLETE only when
+   * its cleanup was confirmed, so a received record settles the workload
+   * status and proves the pending exit code is not the unconfirmed code. */
+  const readCompletion = (): void => {
+    if (completed || lostOuter || !registered || socket < 0) return;
+    const result = native.sandboxCompletion(
+      socket,
+      out[0] as number,
+      ptr(status),
+    );
+    if (result === 1) {
+      completed = true;
+      cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+      exitCode = status[0] ?? null;
+    }
+    if (result === 2) execFailed = true;
+    if (result < 0) {
+      lostOuter = true;
+      signal(9);
+    }
+  };
   const step = (): void => {
     if (performance.now() >= cleanupDeadline) reportUnconfirmed();
     if (rejected) {
@@ -325,23 +348,7 @@ export const prepareLinuxLaunch = (): string[] => {
         launchId = ownership.subarray(4096, 4160).toString();
       }
     } else {
-      if (!completed && !lostOuter) {
-        const result = native.sandboxCompletion(
-          socket,
-          out[0] as number,
-          ptr(status),
-        );
-        if (result === 1) {
-          completed = true;
-          cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
-          exitCode = status[0] ?? null;
-        }
-        if (result === 2) execFailed = true;
-        if (result < 0) {
-          lostOuter = true;
-          signal(9);
-        }
-      }
+      readCompletion();
       if (lostOuter && !completed) {
         try {
           const lease: unknown = JSON.parse(readFileSync(leasePath, "utf8"));
@@ -431,8 +438,14 @@ export const prepareLinuxLaunch = (): string[] => {
     if (stopped()) return;
     shimExitObserved = true;
     if (registered || admitted) {
-      // The verdict lands first: a confirmed `finish()` must not mask it.
-      if (code === REAP_UNCONFIRMED_EXIT) reportUnconfirmed();
+      /* The verdict lands first: a confirmed `finish()` must not mask it.
+       * A confirmed cleanup still exits 75 when that is the workload status,
+       * so drain a queued COMPLETE before mapping the code. The shim sends
+       * COMPLETE only on the confirmed path, always before it exits. */
+      if (code === REAP_UNCONFIRMED_EXIT) {
+        readCompletion();
+        if (!completed) reportUnconfirmed();
+      }
       drive();
       return;
     }
