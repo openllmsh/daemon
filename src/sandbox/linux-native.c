@@ -1575,10 +1575,11 @@ int sandboxOuter(char *data, unsigned int length) {
   }
   cleanup(&r, guard, init, failed ? initfd : -1, failed ? monitorfd : -1, guard,
           &guardResult);
-  /* A guardian exit with the unconfirmed code means its own reap gave up.
-   * COMPLETE still carries the workload result; the exit code carries the
-   * cleanup verdict. */
-  if (guardResult == REAP_UNCONFIRMED_EXIT)
+  /* A guardian exit 75 is the unconfirmed verdict only when no COMPLETE
+   * record arrived. sendComplete suppresses COMPLETE on the unconfirmed
+   * path, so a received COMPLETE proves a confirmed reap. The exit code is
+   * then the workload status, which can also be 75. */
+  if (guardResult == REAP_UNCONFIRMED_EXIT && !complete)
     r.cleanupUnconfirmed = 1;
   if (daemonSocket >= 0) {
     sendComplete(&r, daemonSocket, result, init);
