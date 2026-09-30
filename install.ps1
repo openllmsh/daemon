@@ -14,6 +14,7 @@ param([AllowEmptyString()][string] $Prerelease)
     Set-StrictMode -Version 2.0
     $savedTls = [Net.ServicePointManager]::SecurityProtocol
     $stage = $null
+    $stageLock = $null
     $transactionLock = $null
 
     function Resolve-PrereleaseTag {
@@ -516,11 +517,26 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         param([string] $Root, [string] $Current)
         # A stopped installer can leave .install-* stage directories behind.
         # Remove them while the install lock is held. Keep the current stage.
+        # A live stage holds owner.lock open for the stage lifetime. A stage
+        # younger than the lock wait can still be in creation. Keep both.
         $currentPath = [IO.Path]::GetFullPath($Current)
         foreach ($stale in @([IO.Directory]::EnumerateDirectories($Root, '.install-*'))) {
             if ([string]::Equals([IO.Path]::GetFullPath($stale), $currentPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
             try {
                 Assert-SafePath $stale
+                $owner = Join-Path $stale 'owner.lock'
+                if ([IO.File]::Exists($owner)) {
+                    $live = $false
+                    try {
+                        $probe = [IO.File]::Open($owner, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                        $probe.Dispose()
+                    } catch [IO.FileNotFoundException] {
+                    } catch [IO.DirectoryNotFoundException] {
+                    } catch [IO.IOException] { $live = $true }
+                    if ($live) { continue }
+                } elseif ([DateTime]::UtcNow - [IO.Directory]::GetCreationTimeUtc($stale) -lt [TimeSpan]::FromSeconds(10)) {
+                    continue
+                }
                 [IO.Directory]::Delete($stale, $true)
             } catch {
                 Write-Warning "A leftover install directory could not be removed: $stale. $($_.Exception.Message)"
@@ -604,6 +620,9 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         if (-not [IO.Directory]::Exists($root)) { New-PrivateDirectory $root }
         $stage = Join-Path $root ('.install-' + [Guid]::NewGuid().ToString('N'))
         New-PrivateDirectory $stage
+        # A concurrent installer sweeps stale stage directories. Hold an
+        # exclusive lock in this stage so the sweep keeps it.
+        $stageLock = [IO.File]::Open((Join-Path $stage 'owner.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         [Net.ServicePointManager]::SecurityProtocol = $savedTls -bor [Net.SecurityProtocolType]::Tls12
         Add-Type -AssemblyName System.Net.Http
         $images = @()
@@ -677,6 +696,8 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
     } finally {
         if ($null -ne $transactionLock) { $transactionLock.Dispose() }
         [Net.ServicePointManager]::SecurityProtocol = $savedTls
+        # Release the owner lock before the stage directory can be removed.
+        if ($null -ne $stageLock) { $stageLock.Dispose(); $stageLock = $null }
         if ($null -ne $stage -and [IO.Directory]::Exists($stage)) {
             Assert-SafePath $stage
             [IO.Directory]::Delete($stage, $true)
