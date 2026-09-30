@@ -385,12 +385,18 @@ const MISE_SELECTOR_ENV_KEYS = [
 const trustedGlobalMiseEnvOverrides = (): Record<
   string,
   string | undefined
-> => {
+> | null => {
   // mise excludes the ceiling directory itself and every ancestor from local
-  // config discovery. A neutral cwd alone is insufficient when state lives
-  // beneath a project; global config remains independently discoverable.
+  // config discovery. Match the child's physical cwd, including when the
+  // state directory has a symlinked ancestor (e.g. macOS /var → /private/var).
+  let ceiling: string;
+  try {
+    ceiling = realpathSync(spawnCwd(undefined));
+  } catch {
+    return null; // No verified ceiling: do not query potentially local config.
+  }
   const overrides: Record<string, string | undefined> = {
-    MISE_CEILING_PATHS: spawnCwd(undefined),
+    MISE_CEILING_PATHS: ceiling,
   };
   for (const key of MISE_SELECTOR_ENV_KEYS) {
     if (key in process.env) overrides[key] = undefined;
@@ -445,16 +451,14 @@ const resolveMiseShim = async (
   // preserving valid custom global roots), but it can never walk UP from a
   // project-scoped working directory to pick up ancestry config, because it
   // never starts in one.
-  const result = await runCapture(
-    [mise, "which", cmd],
-    trustedGlobalMiseEnvOverrides(),
-    {
-      probe: true,
-      timeoutMs: miseResolveTimeoutMs(),
-      maxBytes: 4_096,
-      ...(signal !== undefined ? { signal } : {}),
-    },
-  );
+  const env = trustedGlobalMiseEnvOverrides();
+  if (env === null) return null;
+  const result = await runCapture([mise, "which", cmd], env, {
+    probe: true,
+    timeoutMs: miseResolveTimeoutMs(),
+    maxBytes: 4_096,
+    ...(signal !== undefined ? { signal } : {}),
+  });
   if (result === null) return null;
   const answer = result.trim();
   if (answer.length === 0 || /[\r\n\0]/.test(answer)) return null;
