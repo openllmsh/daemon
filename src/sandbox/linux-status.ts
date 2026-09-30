@@ -67,8 +67,16 @@ export const recordLinuxNamespaceFallback = (error: unknown): TReason => {
   // this attempt alone. The next launch or status probe re-qualifies instead
   // of staying landlock-only until a restart. The caller still gets the
   // reason for the current launch's `--sandbox-landlock-only` flag.
-  if (!(error instanceof LinuxSandboxError && error.transient))
+  if (!(error instanceof LinuxSandboxError && error.transient)) {
     namespaceFallbackReason = reason;
+    details = {
+      ...details,
+      guardian: "not_run",
+      selfTest: "not_run",
+      userNamespace:
+        reason === "USERNS_UNAVAILABLE" ? "unavailable" : "not_run",
+    };
+  }
   recordLinuxSandboxRejection(reason);
   return reason;
 };
