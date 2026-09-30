@@ -223,60 +223,31 @@ export const renderPlist = (binPath: string): string => {
 };
 
 /**
- * OS-sandbox half of the unit (`docs/proposals/daemon-os-sandbox-and-typed-
- * control.md` §3.3b) — the directives that are SAFE in a `systemctl --user`
- * unit, which is the only kind the daemon registers (it installs without root).
- *
- * The daemon runs UNPRIVILEGED, so the systemd layer here is **seccomp/prctl
- * only**. The earlier set included capability- and mount-namespace directives
- * (`ProtectKernelModules`, `ProtectKernelTunables`, `ProtectControlGroups`,
- * `ProtectHome`, `ProtectSystem`, `ReadWritePaths`, `PrivateTmp`) — but a user
- * manager has no `CAP_SETPCAP`, so any directive that drops a capability makes
- * the unit fail at the CAPABILITIES exec step with `218/CAPABILITIES`
- * ("Failed to drop capabilities: Operation not permitted") and the daemon
- * crash-loops, never starting. The mount directives are likewise privilege-
- * dependent (they fail on distros that restrict unprivileged user namespaces,
- * e.g. Ubuntu 24.04's AppArmor default).
- *
- * So FILESYSTEM confinement is **Landlock's** job (`sandbox/landlock.ts`):
- * in-process, unprivileged, inherited across `execve` — it needs no systemd
- * mount/capability privileges and is the real FS boundary on Linux (proven by
- * `tests/sandbox`). The directives kept below all apply per-process via seccomp
- * filters / prctl, which an unprivileged user unit CAN do. Omitted entirely
- * when the kill switch (`OPENLLM_DAEMON_NO_SANDBOX=1`) is set at registration.
- *
- * NOTE: we deliberately do NOT set `MemoryDenyWriteExecute=` — Bun's JIT needs
- * writable-executable pages, so W^X must stay off; never add it.
+ * Render systemd restrictions for the daemon and trusted sandbox setup.
+ * The setup needs mount and namespace calls before the helper installs its
+ * stricter inherited filter. The helper denies those calls after setup.
+ * The kill switch omits this block when OPENLLM_DAEMON_NO_SANDBOX is 1.
+ * Keep MemoryDenyWriteExecute off because Bun and TinyCC need writable code.
  */
 export const renderUnitHardening = (): string => {
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") return "";
-  return `# --- OS sandbox: seccomp/prctl only (a --user unit can't drop caps
-# or set up mount namespaces; FS confinement is Landlock's job — see
-# packages/daemon/src/sandbox/landlock.ts). ---
+  return `# --- OS sandbox: service restrictions and trusted setup calls. ---
 NoNewPrivileges=yes
 # AF_NETLINK: glibc getaddrinfo enumerates interfaces over netlink.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-RestrictNamespaces=yes
+RestrictNamespaces=user mnt pid
 LockPersonality=yes
 RestrictRealtime=yes
 # Do not enable RestrictSUIDSGID here: on Ubuntu systemd 259 it makes GNU tar's
 # openat2(RESOLVE_BENEATH) extraction path fail with ENOSYS. Landlock remains
 # the daemon's filesystem boundary.
-# The daemon self-restricts via Landlock at boot, so the seccomp allow-list MUST
-# keep those syscalls callable. The \`@sandbox\` GROUP only exists on systemd
-# >= 257 — on Debian 12 / Ubuntu 22.04|24.04 (systemd <= 256, most production
-# Linux) it is silently ignored ("Unknown system call group, ignoring: @sandbox"),
-# so the daemon's landlock_create_ruleset() hit the default action and was
-# SIGSYS-KILLED at boot → an endless Restart=always crash loop, killed before any
-# log flushed. Whitelist the three Landlock syscalls BY NAME (resolves on every
-# systemd) AND keep @sandbox for forward-compat. SystemCallErrorNumber=EPERM is
-# the belt-and-braces: a blocked syscall returns EPERM (the daemon's sandbox
-# apply fails OPEN) instead of crash-looping — so a future syscall gap degrades,
-# never kills.
+# The setup builds a private mount tree, applies Landlock, and starts a confined
+# helper. Keep the Landlock and mount calls explicit for older systemd versions.
+# The helper installs a stricter filter before it starts the vendor process.
 # GNU tar on current glibc uses openat2() while extracting verified integration
 # bundles. Name it explicitly because @system-service on supported systemd
 # releases does not consistently include it.
-SystemCallFilter=@system-service @sandbox landlock_create_ruleset landlock_add_rule landlock_restrict_self openat2
+SystemCallFilter=@system-service @sandbox @mount landlock_create_ruleset landlock_add_rule landlock_restrict_self openat2 mount mount_setattr open_tree move_mount fsopen fsconfig fsmount fspick pivot_root umount2 unshare setns clone clone3 pidfd_open pidfd_send_signal memfd_create close_range seccomp prctl capget capset sendmsg recvmsg wait4 waitid
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 `;

@@ -39,7 +39,7 @@ import {
   setPendingAuth,
   setPendingAuthOwnerLive,
 } from "../pending-auth";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { withSandboxSpawn } from "../sandbox/exec";
 import { KEYCHAIN_NOT_READY_DETAIL } from "./login-readiness";
 import type { TChildCleanupOutcome } from "./spawn";
 import {
@@ -1097,16 +1097,21 @@ export const spawnStreamLogin = async <T>(
   // the spawn itself fails (rework-7 / RG-2).
   const leased = spawnEnvLeased(opts.env);
   try {
-    child = superviseSpawn(sandboxSpawnArgs(opts.argv, { probe: opts.probe }), {
-      kind: "login",
-      stdin: "ignore",
-      // Always pipe BOTH fds: the prompt may be on stdout (device-code) while
-      // the `--sandbox-exec` shim writes inner posix_spawn EPERM to stderr.
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: spawnCwd(opts.env),
-      env: leased.env,
-    });
+    child = withSandboxSpawn(
+      opts.argv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "login",
+          stdin: "ignore",
+          // Always pipe BOTH fds: the prompt may be on stdout (device-code) while
+          // the `--sandbox-exec` shim writes inner posix_spawn EPERM to stderr.
+          stdout: "pipe",
+          stderr: "pipe",
+          cwd: spawnCwd(opts.env),
+          env: leased.env,
+        }),
+      { probe: opts.probe },
+    );
   } catch (error) {
     discardMintedTmpDir(leased);
     opts.slot.end(flow.flowId);

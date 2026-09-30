@@ -20,7 +20,7 @@ import { join } from "node:path";
 import type { TReapOutcome, TSupervisedChild } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
 import { createDeadlineBudget, splitReapBudget } from "../deadline-budget";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { withSandboxSpawn } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
 import type { TChildCleanupOutcome } from "./spawn";
 import {
@@ -155,14 +155,19 @@ export const spawnHeadlessLogin = async (
   const budget = createDeadlineBudget(timeoutMs, opts?.signal);
   let child: TSupervisedChild;
   try {
-    child = superviseSpawn(sandboxSpawnArgs(argv, { probe: opts?.probe }), {
-      kind: "login",
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: spawnCwd(env),
-      env: childEnv,
-    });
+    child = withSandboxSpawn(
+      argv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "login",
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+          cwd: spawnCwd(env),
+          env: childEnv,
+        }),
+      { probe: opts?.probe },
+    );
   } catch (error) {
     discardMintedTmpDir(leased);
     budget.release();

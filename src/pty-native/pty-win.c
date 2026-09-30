@@ -171,6 +171,8 @@ typedef char PtyAssertWchar[(sizeof(pty_wchar_t) == 2) ? 1 : -1];
  * (Input ? 0x20000 : 0). HandleList is ProcThreadAttribute number 3, so
  * 3 | 0x20000 = 0x20003; PSEUDOCONSOLE is number 22, so 22 | 0x20000. */
 #define PTY_WIN_STARTF_USESTDHANDLES 0x00000100UL
+#define PTY_WIN_STARTF_USESHOWWINDOW 0x00000001UL
+#define PTY_WIN_SW_HIDE 0
 
 /* PROC_THREAD_ATTRIBUTE_HANDLE_LIST (0x00020003ULL) intentionally unused:
  * see the P3-3 guest finding at the spawn site below. */
@@ -1415,6 +1417,8 @@ int32_t ptySpawn(
      * stdio — so nothing in the daemon's handle table can leak into it. */
     scratch->startupInfo.startupInfo.cb = sizeof(PtyStartupInfoExW);
     scratch->startupInfo.startupInfo.dwFlags = PTY_WIN_STARTF_USESTDHANDLES;
+    scratch->startupInfo.startupInfo.dwFlags |= PTY_WIN_STARTF_USESHOWWINDOW;
+    scratch->startupInfo.startupInfo.wShowWindow = PTY_WIN_SW_HIDE;
     scratch->startupInfo.lpAttributeList = attributeList;
 
     memset(&scratch->processInfo, 0, sizeof(PtyProcessInformation));

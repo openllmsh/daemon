@@ -1,23 +1,8 @@
 /**
- * Per-child OS sandboxing — the ONE module that knows about the
- * `openllmd --sandbox-exec -- <argv…>` self-re-exec shim
- * (`docs/audits/daemon-sandbox-scoping.md` §2). It owns three things:
- *
- *   - `sandboxSpawnArgs()` — the call-site entry point: wrap a child argv so
- *     the child runs confined. Pure argv-in/argv-out; call sites contain no
- *     platform checks, no gate checks, no verb knowledge.
- *   - `runSandboxExec()` — the `--sandbox-exec` verb handler (`cli.ts`
- *     delegates here): apply the working-set sandbox to THIS re-exec'd
- *     process (`applyDaemonSandbox({ force: true })` — inherited by the tail
- *     command), spawn the tail with inherited stdio, and mirror its exit.
- *   - the env-gate logic (kill switch + dev-source opt-in), resolved in one
- *     place.
- *
- * The daemon process itself is NOT sandboxed (device-session PTYs must run
- * the user's real CLI over their real files); each risky child is confined at
- * spawn time instead. Windows risky spawns and explicitly required policies
- * fail closed before launch. The explicit shim always requires enforcement.
- * Existing POSIX development/exemption routing is retained.
+ * Wrap risky vendor launches with required platform confinement.
+ * Linux uses a private PID namespace and a trusted native handoff.
+ * The daemon remains outside the vendor sandbox.
+ * Fixed probes and user session PTYs keep their existing exemptions.
  */
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
@@ -26,11 +11,9 @@ import { DAEMON_VERSION } from "../version";
 import { spawn as admittedSpawn } from "../windows-process";
 import { childEnvironment } from "./child-policy";
 import type { TSandboxState } from "./landlock";
-import {
-  applyDaemonSandbox,
-  probeLandlockSupport,
-  sandboxAppliedInProcess,
-} from "./landlock";
+import { applyDaemonSandbox, sandboxAppliedInProcess } from "./landlock";
+import type { TLinuxLaunchHandle } from "./linux-adapter";
+import { linuxLaunchHandle, prepareLinuxLaunch } from "./linux-adapter";
 import { runWindowsConfinedTask } from "./windows-task";
 
 export type TSandboxSpawnOpts = {
@@ -69,12 +52,23 @@ export class SandboxLaunchError extends Error {
 // An internal identity, not a client-controlled header. The walker must surface
 // these responses without cooldown, retry, manual transport or fleet fallback.
 const terminalRejections = new WeakSet<Response>();
-export const sandboxUnavailableResponse = (): Response => {
+export const sandboxUnavailableResponse = (
+  code: SandboxLaunchError["code"] = "SANDBOX_UNAVAILABLE",
+): Response => {
+  const platform =
+    process.platform === "win32"
+      ? "Windows"
+      : process.platform === "darwin"
+        ? "macOS"
+        : "Linux";
   const response = Response.json(
     {
       error: {
-        code: "SANDBOX_UNAVAILABLE",
-        message: "Required Windows vendor confinement is unavailable",
+        code,
+        message:
+          code === "PROFILE_UNSUPPORTED"
+            ? "The vendor operation is not supported by the required sandbox profile"
+            : `Required ${platform} vendor confinement is unavailable`,
       },
     },
     { status: 503 },
@@ -120,15 +114,10 @@ const DEV_ENTRY: string | undefined =
     : undefined;
 
 /**
- * Wrap a child argv for sandboxed execution via the `--sandbox-exec` shim.
- * INVARIANTS:
- *  - Windows non-probe and explicitly required policies throw on unavailable
- *    enforcement; callers must not downgrade a security rejection;
- *  - POSIX legacy development gates and fixed probe exemptions are retained;
- *  - pure argv-in/argv-out: no spawn, no I/O — callers keep their own
- *    `Bun.spawn` options (cwd, env, stdio) unchanged.
- *
- * Unsupported per-child grants/network policy are rejected, never ignored.
+ * Prepare the platform shim and its private launch channel.
+ * Keep source-run gates and fixed probe exemptions.
+ * Reject unsupported grants and network policies.
+ * Callers must preserve terminal sandbox errors.
  */
 export const sandboxSpawnArgs = (
   argv: readonly string[],
@@ -226,11 +215,36 @@ export const sandboxSpawnArgs = (
       DEV_ENTRY,
       "--sandbox-exec",
       ...HOME_FLAG(),
+      ...(process.platform === "linux" ? prepareLinuxLaunch() : []),
       "--",
       ...argv,
     ];
   }
-  return [process.execPath, "--sandbox-exec", ...HOME_FLAG(), "--", ...argv];
+  return [
+    process.execPath,
+    "--sandbox-exec",
+    ...HOME_FLAG(),
+    ...(process.platform === "linux" ? prepareLinuxLaunch() : []),
+    "--",
+    ...argv,
+  ];
+};
+
+/** Prepare and start one child. The callback must return after synchronous spawn. */
+export const withSandboxSpawn = <TChild>(
+  argv: readonly string[],
+  spawn: (argv: string[], sandbox: TLinuxLaunchHandle | undefined) => TChild,
+  opts?: TSandboxSpawnOpts,
+): TChild => {
+  const prepared = linuxLaunchHandle(argv);
+  const wrapped = prepared ? [...argv] : sandboxSpawnArgs(argv, opts);
+  const sandbox = prepared ?? linuxLaunchHandle(wrapped);
+  try {
+    return spawn(wrapped, sandbox);
+  } catch (error) {
+    sandbox?.cancelBeforeSpawn?.();
+    throw error;
+  }
 };
 
 /**
@@ -276,6 +290,37 @@ export const runSandboxExec = async (
     });
     return process.exit(await runWindowsConfinedTask());
   }
+  if (process.platform === "linux") {
+    const { qualifyBubblewrap, runLinuxSandbox } = await import(
+      "./linux-launch"
+    );
+    const { getLinuxNamespaceFallbackReason, recordLinuxNamespaceFallback } =
+      await import("./linux-status");
+    const separator = process.argv.indexOf("--");
+    // `--sandbox-control` in argv means the daemon already qualified
+    // namespaces and opened the registration socket for THIS launch. The shim
+    // must not re-qualify: a transient probe failure would silently switch the
+    // launch to landlock-only while the daemon waits for a registration that
+    // never comes. Follow the daemon's decision — `runLinuxSandbox` exits 78
+    // (closed) on any setup error.
+    const control = process.argv.indexOf("--sandbox-control");
+    if (control >= 0 && (separator < 0 || control < separator))
+      return runLinuxSandbox(tail, opts?.home);
+    const flag = process.argv.indexOf("--sandbox-landlock-only");
+    let reason: string | null =
+      flag >= 0 && flag < separator
+        ? (process.argv[flag + 1] ?? "SETUP_FAILED")
+        : getLinuxNamespaceFallbackReason();
+    if (!reason) {
+      try {
+        qualifyBubblewrap();
+      } catch (error) {
+        reason = recordLinuxNamespaceFallback(error);
+      }
+    }
+    if (!reason) return runLinuxSandbox(tail, opts?.home);
+    process.stderr.write(`sandbox: landlock-only reason=${reason}\n`);
+  }
   // Build the working set from the DAEMON's home (see `HOME_FLAG`), NOT this
   // process's `HOME` — the shim inherits the child's isolated one. The tail's
   // env is untouched, so the child still gets its isolated `HOME`.
@@ -289,6 +334,14 @@ export const runSandboxExec = async (
       `openllmd --sandbox-exec: SANDBOX_UNAVAILABLE: confinement not applied (${state}); child rejected\n`,
     );
     return process.exit(78);
+  }
+  if (
+    process.platform === "linux" &&
+    tail.length === 1 &&
+    tail[0] === "--sandbox-landlock-probe"
+  ) {
+    process.stdout.write('{"landlockProbe":true}\n');
+    return process.exit(0);
   }
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -366,12 +419,9 @@ const signalNumber = (signal: string): number | null => {
 };
 
 /**
- * Boot-time capability probe for `DaemonStatus.sandbox` / `/health` — the
- * posture-reporting replacement for the removed process-wide boot apply.
- * Computes what a wrapped child WILL get without restricting anything:
- * platform supported, kill switch off, dev gate satisfied — and on Linux the
- * cheap Landlock ABI probe so `"unsupported"` stays accurate. `"enforced"`
- * now means "risky children are wrapped", not "this process is confined".
+ * Probe the launch profile in the current service context.
+ * Linux reports enforcement only after a complete confined self-test.
+ * The daemon remains outside the child sandbox.
  */
 export const probeSandboxCapability = async (): Promise<TSandboxState> => {
   if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") {
@@ -386,5 +436,6 @@ export const probeSandboxCapability = async (): Promise<TSandboxState> => {
   }
   if (process.platform === "darwin") return "enforced";
   if (process.platform !== "linux") return "unsupported";
-  return probeLandlockSupport();
+  const { probeLinuxSandboxCapability } = await import("./linux-status");
+  return probeLinuxSandboxCapability();
 };

@@ -139,6 +139,29 @@ const runSessions = (args: readonly string[]): never => {
 
 export const runCli = (): boolean => {
   const args = userArgs();
+  if (args[0] === "--internal-lock-control") {
+    void import("../../tunnel/session/lock-command").then(
+      async ({ runInternalLockControl }) =>
+        process.exit(await runInternalLockControl(args.slice(1))),
+    );
+    return true;
+  }
+  if (args[0] === "doctor" && args.includes("--clear-legacy-locks")) {
+    void Promise.all([
+      import("../../tunnel/session/dir-lock-doctor"),
+      import("./env"),
+    ]).then(async ([doctor, env]) =>
+      process.exit(
+        await doctor.runLegacyLockDoctor(
+          args.slice(1),
+          [env.envFilePath(), env.sharedEnvFilePath()],
+          doctor.clientRestoreLockDomains(),
+          doctor.stateLockParents(env.stateDir()),
+        ),
+      ),
+    );
+    return true;
+  }
   if (args.length === 0) return false; // bare invocation → boot the server
 
   if (args[0] === "--confined-task") {

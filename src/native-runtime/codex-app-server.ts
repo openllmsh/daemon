@@ -33,7 +33,7 @@ import type {
 } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
@@ -162,16 +162,22 @@ class CodexAppServerClient {
         if (waitTimer !== undefined) clearTimeout(waitTimer);
       }
     }
-    const child = superviseSpawn(sandboxSpawnArgs([this.bin, "app-server"]), {
-      kind: "native-runtime",
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "ignore",
-      cwd: spawnCwd(this.env),
-      env: cleanNativeSpawnEnv(this.env),
-    });
+    const child = withSandboxSpawn(
+      [this.bin, "app-server"],
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "native-runtime",
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "ignore",
+          cwd: spawnCwd(this.env),
+          env: cleanNativeSpawnEnv(this.env),
+        }),
+      undefined,
+    );
     this.child = child;
     const proc = child.subprocess;
+    await child.sandbox?.ready;
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -602,7 +608,10 @@ export const runCodexNative = async (
             threadId: params.resumeThreadId,
             ...startParams,
           })
-          .catch(() => client.request("thread/start", startParams))
+          .catch((error: unknown) => {
+            if (error instanceof SandboxLaunchError) throw error;
+            return client.request("thread/start", startParams);
+          })
       : client.request("thread/start", startParams))) as {
       thread?: { id?: string };
     };
@@ -611,6 +620,7 @@ export const runCodexNative = async (
     }
     threadId = opened.thread.id;
   } catch (error) {
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       kind: "declined",
       reason: error instanceof Error ? error.message : String(error),
@@ -707,6 +717,8 @@ export const runCodexNative = async (
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {
     client.removeSink(threadId);
+    params.signal.removeEventListener("abort", abort);
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       kind: "declined",
       reason: error instanceof Error ? error.message : String(error),
