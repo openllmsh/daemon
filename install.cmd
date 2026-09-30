@@ -6,6 +6,10 @@ if not "%~1"=="" (
   echo This wrapper takes no arguments. Use the tagged installer. 1>&2
   exit /b 1
 )
+if not "%1"=="" (
+  echo This wrapper takes no arguments. Use the tagged installer. 1>&2
+  exit /b 1
+)
 if not defined OPENLLM_PRERELEASE_TAG (
   echo This wrapper has no release tag. Use the tagged prerelease command. 1>&2
   exit /b 1

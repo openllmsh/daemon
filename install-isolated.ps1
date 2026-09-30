@@ -20,7 +20,24 @@ if (-not $PSBoundParameters.ContainsKey("Destination") -or [string]::IsNullOrWhi
 function ConvertTo-NormalizedPath {
     param([Parameter(Mandatory = $true)][string] $Path)
 
-    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path).Replace([char]'/', [char]'\')
+    if ($expanded.StartsWith('\\?\') -or $expanded.StartsWith('\\.\')) {
+        $expanded = $expanded.Substring(4)
+        if ($expanded -notmatch '^[A-Za-z]:\\') {
+            throw "Unsupported device path: $Path"
+        }
+    }
+    $segments = $expanded.Split('\')
+    for ($i = 0; $i -lt $segments.Count; $i++) {
+        $raw = $segments[$i]
+        $trimmed = $raw.TrimEnd(' ')
+        if ($trimmed -ne '.' -and $trimmed -ne '..') { $trimmed = $trimmed.TrimEnd(' ', '.') }
+        if ($raw.Length -gt 0 -and $trimmed.Length -eq 0) {
+            throw "Unsupported path segment: $Path"
+        }
+        $segments[$i] = $trimmed
+    }
+    $expanded = $segments -join '\'
     if (-not [IO.Path]::IsPathRooted($expanded)) {
         $expanded = Join-Path -Path (Get-Location).Path -ChildPath $expanded
     }

@@ -15,6 +15,7 @@ param([AllowEmptyString()][string] $Prerelease)
     $savedTls = [Net.ServicePointManager]::SecurityProtocol
     $stage = $null
     $stageLock = $null
+    $stageHasTransaction = $false
     $transactionLock = $null
 
     function Resolve-PrereleaseTag {
@@ -184,14 +185,14 @@ param([AllowEmptyString()][string] $Prerelease)
             if ($token.StartsWith('"')) { return ConvertFrom-Json -InputObject $token }
             if ($token -eq '{') {
                 $result = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
-                while ($tokens[$cursor.Index] -ne '}') {
+                while ($cursor.Index -lt $tokens.Count -and $tokens[$cursor.Index] -ne '}') {
                     $key = Read-Token
                     if ($key.StartsWith('"')) { $key = ConvertFrom-Json -InputObject $key }
                     elseif ($key -cnotmatch '^[A-Za-z_][A-Za-z_0-9]*$') { throw 'Invalid manifest key.' }
                     if ($result.ContainsKey($key)) { throw "Duplicate manifest key: $key" }
                     Require-Token ':'
                     $result.Add($key, (Read-Data ($Depth + 1)))
-                    if ($tokens[$cursor.Index] -eq '}') { break }
+                    if ($cursor.Index -lt $tokens.Count -and $tokens[$cursor.Index] -eq '}') { break }
                     Require-Token ','
                 }
                 Require-Token '}'
@@ -199,9 +200,9 @@ param([AllowEmptyString()][string] $Prerelease)
             }
             if ($token -eq '[') {
                 $items = New-Object 'Collections.Generic.List[object]'
-                while ($tokens[$cursor.Index] -ne ']') {
+                while ($cursor.Index -lt $tokens.Count -and $tokens[$cursor.Index] -ne ']') {
                     $items.Add((Read-Data ($Depth + 1)))
-                    if ($tokens[$cursor.Index] -eq ']') { break }
+                    if ($cursor.Index -lt $tokens.Count -and $tokens[$cursor.Index] -eq ']') { break }
                     Require-Token ','
                 }
                 Require-Token ']'
@@ -220,7 +221,7 @@ param([AllowEmptyString()][string] $Prerelease)
             Require-Token ';'
         }
         Require-Token 'export'; Require-Token 'const'; Require-Token $exportName
-        if ($tokens[$cursor.Index] -eq ':') { Require-Token ':'; Require-Token $typeName }
+        if ($cursor.Index -lt $tokens.Count -and $tokens[$cursor.Index] -eq ':') { Require-Token ':'; Require-Token $typeName }
         Require-Token '='
         $record = Read-Data
         Require-Token ';'
@@ -451,9 +452,14 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                 return
             }
             $updated = Add-ManagedPathEntry ([string]$value) $Bin ($kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            $processPath = Add-ManagedPathEntry $env:Path $Bin
+            if ($updated.Length -gt 32767 -or $processPath.Length -ge 32767) {
+                Write-Warning 'Installation finished. PATH was not changed because it exceeds a Windows length limit. Keep the user PATH at 32767 characters or fewer and the process PATH below 32767 characters. Shorten PATH and run the installer again. Run the installed commands by their full paths.'
+                return
+            }
             if ($updated -cne $value) { $key.SetValue('Path', $updated, $kind); $key.Flush() }
             if ($key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $updated -or $key.GetValueKind('Path') -ne $kind) { throw 'The user PATH write could not be verified.' }
-            $env:Path = Add-ManagedPathEntry $env:Path $Bin
+            $env:Path = $processPath
             if (-not (Send-EnvironmentNotification)) {
                 Write-Warning 'Environment notification failed or exceeded the child deadline. The install is complete. Open a new terminal to see the new PATH. Windows does not report recipient timeouts through this API. Sign out and sign in if the command is still unavailable.'
             } else {
@@ -483,24 +489,63 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
     }
 
     function Test-CompletedInstallTransaction {
-        param([string] $Root)
+        param([string] $Root, [object[]] $Images = @(), [string] $Current = '')
         $journal = Join-Path $Root 'install-transaction.json'
         Assert-SafePath $journal
         if (-not (Test-Path -LiteralPath $journal)) { return $false }
+        $invalidJournal = "An incomplete transaction exists. Remove only the invalid journal file and run the installer again. The installed binaries and staged files were kept: $journal"
+        try { $journalText = [IO.File]::ReadAllText($journal) }
+        catch { throw "An incomplete transaction exists. Keep its recovery files: $journal. $($_.Exception.Message)" }
         try {
             # Windows PowerShell 5.1 sends a JSON array as one object.
             # Write-Output sends each record so the count and the loop see all of them.
-            $records = @([IO.File]::ReadAllText($journal) | ConvertFrom-Json | Write-Output)
+            $records = @($journalText | ConvertFrom-Json | Write-Output)
+        } catch { throw "$invalidJournal. $($_.Exception.Message)" }
+        try {
             if ($records.Count -lt 1 -or $records.Count -gt 2) { throw 'Invalid move count.' }
             $seen = @()
+            $allowed = @((Join-Path $Root 'bin\openllmd.exe'), (Join-Path $Root 'bin\openllm.exe'))
             foreach ($record in $records) {
-                $allowed = @((Join-Path $Root 'bin\openllmd.exe'), (Join-Path $Root 'bin\openllm.exe'))
                 if ($record.Path -notin $allowed -or $record.Path -in $seen -or $record.Digest -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid move record.' }
                 Assert-SafePath $record.Path
-                if ((Get-FileHash -LiteralPath $record.Path -Algorithm SHA256).Hash -ine $record.Digest) { throw 'Installed digest differs.' }
                 $seen += $record.Path
             }
+        } catch { throw "$invalidJournal. $($_.Exception.Message)" }
+        try {
+            foreach ($record in $records) {
+                if (-not [IO.File]::Exists($record.Path)) {
+                    foreach ($candidate in @([IO.Directory]::EnumerateDirectories($Root, '.install-*'))) {
+                        if ($Current -and [string]::Equals([IO.Path]::GetFullPath($candidate), [IO.Path]::GetFullPath($Current), [StringComparison]::OrdinalIgnoreCase)) { continue }
+                        Assert-SafePath $candidate
+                        $owner = Join-Path $candidate 'owner.lock'
+                        Assert-SafePath $owner
+                        if (-not [IO.File]::Exists($owner)) { continue }
+                        $ownerLock = $null
+                        try {
+                            try {
+                                $ownerLock = [IO.File]::Open($owner, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                            } catch [IO.IOException] { continue }
+                            $bytes = Join-Path $candidate ([IO.Path]::GetFileName($record.Path))
+                            Assert-SafePath $bytes
+                            if ([IO.File]::Exists($bytes) -and -not [IO.File]::Exists($record.Path) -and
+                                (Get-FileHash -LiteralPath $bytes -Algorithm SHA256).Hash -ieq $record.Digest) {
+                                [IO.File]::Move($bytes, $record.Path)
+                                break
+                            }
+                        } finally { if ($null -ne $ownerLock) { $ownerLock.Dispose() } }
+                    }
+                }
+                if ((Get-FileHash -LiteralPath $record.Path -Algorithm SHA256).Hash -ine $record.Digest) { throw 'Installed digest differs.' }
+            }
         } catch { throw "An incomplete transaction exists. Keep its recovery files: $journal. $($_.Exception.Message)" }
+        foreach ($image in $Images) {
+            Assert-SafePath $image.Path
+            if (-not [IO.File]::Exists($image.Path)) { throw "An incomplete transaction exists. Keep its recovery files: $journal. The installed file is missing: $($image.Path)" }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $image.Path).Hash -ine $image.Digest) {
+                $version = Get-ImageVersion -Path $image.Path
+                throw "An incomplete transaction exists for another release. $($image.Path) is $version, not the selected image. Rerun the installer for that installed release first. Keep its recovery files: $journal"
+            }
+        }
         return $true
     }
 
@@ -515,6 +560,9 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
 
     function Remove-StaleInstallStages {
         param([string] $Root, [string] $Current)
+        $journal = Join-Path $Root 'install-transaction.json'
+        Assert-SafePath $journal
+        if (Test-Path -LiteralPath $journal) { return }
         # A stopped installer can leave .install-* stage directories behind.
         # Remove them while the install lock is held. Keep the current stage.
         # A live stage holds owner.lock open for the stage lifetime. A stage
@@ -619,10 +667,13 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         Assert-SafePath $bin
         if (-not [IO.Directory]::Exists($root)) { New-PrivateDirectory $root }
         $stage = Join-Path $root ('.install-' + [Guid]::NewGuid().ToString('N'))
-        New-PrivateDirectory $stage
-        # A concurrent installer sweeps stale stage directories. Hold an
-        # exclusive lock in this stage so the sweep keeps it.
-        $stageLock = [IO.File]::Open((Join-Path $stage 'owner.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $creationLock = Enter-InstallLock (Join-Path $root 'install.lock')
+        try {
+            New-PrivateDirectory $stage
+            # A concurrent installer sweeps stale stage directories. Hold an
+            # exclusive lock in this stage so the sweep keeps it.
+            $stageLock = [IO.File]::Open((Join-Path $stage 'owner.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } finally { $creationLock.Dispose() }
         [Net.ServicePointManager]::SecurityProtocol = $savedTls -bor [Net.SecurityProtocolType]::Tls12
         Add-Type -AssemblyName System.Net.Http
         $images = @()
@@ -644,7 +695,7 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         }
         $transactionLock = Enter-InstallLock (Join-Path $root 'install.lock')
         Remove-StaleInstallStages $root $stage
-        $completedTransaction = Test-CompletedInstallTransaction $root
+        $completedTransaction = Test-CompletedInstallTransaction $root $images $stage
         if (-not $completedTransaction) {
             foreach ($image in $images) {
                 Assert-SafePath $image.Path
@@ -675,6 +726,7 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             }
             Assert-ReplacementSupported $images
             if (-not [IO.Directory]::Exists($bin)) { New-PrivateDirectory $bin }
+            $stageHasTransaction = $true
             Install-ImagePair $images $root
         } else {
             Write-Host 'The previous binary installation is complete. Finish its setup now. Run the installer again to select another release.'
@@ -699,17 +751,19 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             Set-ManagedPath $bin
         } catch { throw "Managed setup failed. Verified binaries were kept. Fix this error and rerun the installer: $($_.Exception.Message)" }
         Remove-CompletedInstallJournal $root
+        Remove-StaleInstallStages $root $stage
         $transactionLock.Dispose()
         $transactionLock = $null
         # W1 must supply native input and distinct credential results first.
         # The current start command returns 1 for both cancellation and errors.
         Complete-Onboarding -Status 'deferred' -Diagnostic 'Native Windows credential setup is unavailable in this build.'
     } finally {
+        $preserveStage = $stageHasTransaction -and $null -ne $stage -and [IO.File]::Exists((Join-Path $root 'install-transaction.json'))
         if ($null -ne $transactionLock) { $transactionLock.Dispose() }
         [Net.ServicePointManager]::SecurityProtocol = $savedTls
         # Release the owner lock before the stage directory can be removed.
         if ($null -ne $stageLock) { $stageLock.Dispose(); $stageLock = $null }
-        if ($null -ne $stage -and [IO.Directory]::Exists($stage)) {
+        if ($null -ne $stage -and -not $preserveStage -and [IO.Directory]::Exists($stage)) {
             try {
                 Assert-SafePath $stage
                 [IO.Directory]::Delete($stage, $true)
