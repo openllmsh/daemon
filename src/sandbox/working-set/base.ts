@@ -119,13 +119,14 @@ export type TWorkingSet = {
  *  and `~/.claude/.credentials.json` (the §5-A Linux OAuth token). Shared by
  *  `existing()` (no-climb into a root when a scoped leaf is missing) and
  *  `resolveCliExecDirs()` (never grant a bare root a symlink chain resolves
- *  into). `~/.cache`/`~/.local` are deliberately NOT here — `~/.cache/openllm`
- *  legitimately climbs to `~/.cache` (documented + tested, no secrets). */
+ *  into). On Linux, `~/.local` can hold keyrings. `~/.cache/openllm`
+ *  can still use the `~/.cache` grant. */
 export const SENSITIVE_ROOTS = (home: string): readonly string[] => [
   join(home, ".bun"),
   join(home, ".grok"),
   join(home, ".config"),
   join(home, ".claude"),
+  ...(process.platform === "linux" ? [join(home, ".local")] : []),
 ];
 
 /**
