@@ -279,16 +279,18 @@ const finishTrackedChild = async (
 ): Promise<TReapOutcome> => {
   if (tracked.handle.sandbox) {
     const launch = tracked.handle.sandbox;
-    // `cleanup` settles only on a confirmed reap; an unconfirmed verdict
-    // arrives first on `completion`. Race them so an unconfirmed cleanup
-    // still hands the record to the group watcher.
-    const unconfirmed: Promise<TLinuxCleanupResult> = launch.completion.then(
-      (outcome) =>
-        outcome.kind === "reap_unconfirmed"
-          ? { cleanup: "unconfirmed" }
-          : launch.cleanup,
-    );
-    const result = await Promise.race([launch.cleanup, unconfirmed]);
+    /* `completion` is the verdict channel: it resolves `reap_unconfirmed` the
+     * moment the shim cannot confirm its reap, while `cleanup` can settle
+     * "confirmed" in the same turn when the launch finishes its own teardown.
+     * A race between the two prefers the earlier-settled source — the shim's
+     * confirmed teardown then masks the unconfirmed verdict. Read the verdict
+     * first; only a verdict other than `reap_unconfirmed` may defer to the
+     * cleanup result. */
+    const outcome = await launch.completion;
+    const result: TLinuxCleanupResult =
+      outcome.kind === "reap_unconfirmed"
+        ? { cleanup: "unconfirmed" }
+        : await launch.cleanup;
     if (result.cleanup === "confirmed") await waitChildExited(tracked.handle);
     return releaseSandboxChild(tracked, result.cleanup, "exited");
   }
