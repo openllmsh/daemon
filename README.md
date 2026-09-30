@@ -71,26 +71,31 @@ Or download the script and name the tag yourself:
 never overwrites an earlier prerelease's branch or tag. Do not use
 `openllm update` to move a stable install to the preview.
 
-A key is optional when downloading the binaries. In an interactive terminal,
-the installer can hand off to `openllm start` to guide sign-in and key entry.
-If setup did not run, continue with:
+A key is optional when you download the binaries. On macOS and Linux, the
+installer can start credential setup in an interactive terminal.
+If setup did not run on these platforms, continue with:
 
 ```sh
 openllm start
 ```
 
-For automation, provide `OPENLLM_API_KEY` in the installer's environment—not a
+For automation on macOS and Linux, provide `OPENLLM_API_KEY` in the installer's environment—not a
 `--key` argument. For example, if the variable is already set in your shell:
 
 ```sh
 curl -fsSL https://www.openllm.sh/install | OPENLLM_API_KEY="$OPENLLM_API_KEY" bash
 ```
 
-The installer saves shared configuration in `~/.openllm/.env`. Set
-`OPENLLM_CLOUD_ORIGIN` as well to select a different gateway. With a usable key,
-the installer starts the daemon; a separate `openllmd start` is not normally
-needed after installation. Service management uses launchd or systemd where
-supported.
+On macOS and Linux, the installer saves shared configuration in
+`~/.openllm/.env`. Set `OPENLLM_CLOUD_ORIGIN` as well to select a different
+gateway. With a usable key, the installer starts the daemon.
+A separate `openllmd start` is not normally needed on these platforms.
+Service management uses launchd or systemd where supported.
+
+On Windows, the beta.3 installer installs the binaries, alias and user PATH.
+Native Windows credential entry is not available in this build.
+The installer reports incomplete startup; it does not start the daemon.
+The installer defers credential setup even in an interactive terminal.
 
 > If the commands are not on PATH, run `~/.openllm/bin/openllm setup` and open a
 > new terminal. Both binaries live under `~/.openllm/bin`.
@@ -106,7 +111,7 @@ provides daemon-specific controls; every command accepts `-h` / `--help`.
 
 | Command | What |
 | --- | --- |
-| `openllm start` / `restart` | Start/restart, with credential setup when needed |
+| `openllm start` / `restart` | Start/restart; on macOS and Linux, guide credential setup when needed |
 | `openllmd start` / `stop` / `restart` | Manage the daemon service |
 | `openllmd status` | Show daemon status |
 | `openllmd logs` | Read daemon logs |
