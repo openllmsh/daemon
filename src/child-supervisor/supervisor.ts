@@ -172,14 +172,6 @@ const releaseChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
 
 const forgetChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
   if (outcome === "reap_unconfirmed") {
-    logWarn(
-      "child-supervisor",
-      safeDiagnosticMessage`process group unreaped after bounded TERM/KILL`,
-      {
-        pid: tracked.handle.pid,
-        pgid: tracked.handle.pgid,
-      },
-    );
     void watchUnconfirmedExit(tracked).catch((error) =>
       logError("child-supervisor", error, {
         pid: tracked.handle.pid,
@@ -229,6 +221,14 @@ const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
     ac.signal.aborted || !trackedChildren.has(child.pid);
   try {
     if (maybeReleaseIfGroupGone(tracked) || aborted()) return;
+    logWarn(
+      "child-supervisor",
+      safeDiagnosticMessage`process group unreaped after bounded TERM/KILL`,
+      {
+        pid: child.pid,
+        pgid: child.pgid,
+      },
+    );
     let rootPending: Promise<"root"> | null = waitChildExited(child).then(
       () => "root" as const,
       () => "root" as const,
@@ -268,10 +268,9 @@ const releaseSandboxChild = (
 ): TReapOutcome => {
   const outcome =
     cleanup === "confirmed" ? confirmedOutcome : "reap_unconfirmed";
-  if (cleanup === "unconfirmed") {
-    return outcome;
-  }
-  releaseChild(tracked, outcome);
+  // Confirmed cleanup releases the record now. An unconfirmed cleanup hands
+  // the record to the bounded group watcher. Both paths must not leak it.
+  forgetChild(tracked, outcome);
   return outcome;
 };
 
@@ -279,8 +278,18 @@ const finishTrackedChild = async (
   tracked: TTrackedChild,
 ): Promise<TReapOutcome> => {
   if (tracked.handle.sandbox) {
-    const result = await tracked.handle.sandbox.cleanup;
-    await waitChildExited(tracked.handle);
+    const launch = tracked.handle.sandbox;
+    // `cleanup` settles only on a confirmed reap; an unconfirmed verdict
+    // arrives first on `completion`. Race them so an unconfirmed cleanup
+    // still hands the record to the group watcher.
+    const unconfirmed: Promise<TLinuxCleanupResult> = launch.completion.then(
+      (outcome) =>
+        outcome.kind === "reap_unconfirmed"
+          ? { cleanup: "unconfirmed" }
+          : launch.cleanup,
+    );
+    const result = await Promise.race([launch.cleanup, unconfirmed]);
+    if (result.cleanup === "confirmed") await waitChildExited(tracked.handle);
     return releaseSandboxChild(tracked, result.cleanup, "exited");
   }
   try {
@@ -335,15 +344,18 @@ const terminateTrackedChild = (
             ? releaseSandboxChild(tracked, "unconfirmed", "terminated")
             : tracked.handle.whenReleased,
         ),
-        new Promise<"reap_unconfirmed">((resolve) => {
+        new Promise<TReapOutcome>((resolve) => {
           timer = setTimeout(
-            () => resolve("reap_unconfirmed"),
+            () =>
+              resolve(
+                releaseSandboxChild(tracked, "unconfirmed", "terminated"),
+              ),
             Math.max(0, finalReapMs),
           );
         }),
       ]);
       if (timer) clearTimeout(timer);
-      if (outcome !== "reap_unconfirmed") releaseChild(tracked, outcome);
+      tracked.lastReap = outcome;
       return outcome;
     }
     signalGroup(tracked.handle.pgid, "SIGTERM");
