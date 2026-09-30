@@ -185,6 +185,14 @@ export const resolveManagerCandidate = async (
 ): Promise<TManagerResolution> => {
   for (const adapter of adapters) {
     if (!adapter.recognizes(candidate)) continue;
+    // Captured BEFORE the await: this is the candidate's shape at the moment
+    // we committed to resolving it. Reading it only AFTER `adapter.resolve`
+    // returns would fingerprint whatever the candidate looks like NOW, which
+    // can silently mismatch what it looked like when resolution actually ran
+    // — a shim re-created, or an interpreter/version switch, WHILE we were
+    // awaiting would otherwise get masked, letting an answer computed for the
+    // OLD state get cached and served as valid for the NEW one.
+    const fingerprintBeforeResolve = compositeFingerprint(adapter, candidate);
     const target = await adapter.resolve(candidate, opts?.signal);
     const resolution: TManagerResolution =
       target === null
@@ -192,16 +200,21 @@ export const resolveManagerCandidate = async (
         : { kind: "resolved", target, identity: `${adapter.name}:${target}` };
     // Cancellation is not evidence that the installation stopped resolving.
     if (opts?.signal?.aborted) return resolution;
-    // Populate the passive-read cache as a side effect of this demand call,
-    // fingerprinted against the candidate's current on-disk shape AND the
-    // adapter's own selection-state signal, so a later bounded change (the
-    // shim re-created, a different symlink target, OR an interpreter/version
-    // switch that never touched the shim file) is not served this now-stale
-    // answer.
-    peekCache.set(candidate, {
-      fingerprint: compositeFingerprint(adapter, candidate),
-      resolution,
-    });
+    // Populate the passive-read cache as a side effect of this demand call —
+    // but ONLY if the candidate's composite fingerprint (its own on-disk
+    // shape AND the adapter's selection-state signal) is still identical to
+    // what it was right before we started resolving. Any mutation observed
+    // during the await means this resolution no longer describes the
+    // candidate's current state, so it must not be cached at all (the
+    // aborted-cache guard above is preserved unchanged: this check runs
+    // strictly after it, never in place of it).
+    const fingerprintAfterResolve = compositeFingerprint(adapter, candidate);
+    if (fingerprintAfterResolve === fingerprintBeforeResolve) {
+      peekCache.set(candidate, {
+        fingerprint: fingerprintAfterResolve,
+        resolution,
+      });
+    }
     return resolution;
   }
   return { kind: "ordinary", target: candidate, identity: null };

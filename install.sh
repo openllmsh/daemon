@@ -324,7 +324,15 @@ find_available_port() {
 
 DAEMON_PORT="${OPENLLM_DAEMON_PORT:-}"
 if [ -n "$DAEMON_PORT" ]; then
-  NORMALIZED_PORT="$(normalize_daemon_port "$DAEMON_PORT")" && DAEMON_PORT="$NORMALIZED_PORT" || DAEMON_PORT=""
+  if NORMALIZED_PORT="$(normalize_daemon_port "$DAEMON_PORT")"; then
+    DAEMON_PORT="$NORMALIZED_PORT"
+  else
+    # Warn, but never echo the raw value: it is untrusted external input
+    # (env var content) and could carry control/escape sequences into the
+    # user's terminal.
+    echo "Warning: ignoring an invalid OPENLLM_DAEMON_PORT (must be a plain port number 1-65535); falling back" >&2
+    DAEMON_PORT=""
+  fi
 fi
 if [ -z "$DAEMON_PORT" ]; then
   RAW_PERSISTED_PORT="$(env_file_raw_value OPENLLM_DAEMON_PORT)"

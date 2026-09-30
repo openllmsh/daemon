@@ -414,6 +414,15 @@ export const cliInstallState = async (
   opts?: TCliInstallStateOpts,
 ): Promise<TCliInstallState> => {
   if (opts?.demand === true) {
+    // A caller carrying its OWN AbortSignal must never join (or replace) the
+    // shared no-signal demand promise: aborting one signaled caller would
+    // otherwise abort every other caller sharing that singleflight entry,
+    // including unrelated no-signal callers. Run it as its own independent
+    // probe instead — it still shares nothing, but its cancellation is its
+    // own.
+    if (opts.signal !== undefined) {
+      return probeCliInstallState(provider, opts);
+    }
     const existingDemand = cliInstallStateDemandInFlight.get(provider);
     if (existingDemand !== undefined) return existingDemand;
     const pending = probeCliInstallState(provider, opts).finally(() => {
