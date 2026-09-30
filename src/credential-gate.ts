@@ -81,6 +81,8 @@ export const restoreEchoOnSignal = (
 };
 
 const readHiddenLine = (): string | null => {
+  // Windows has no /dev/tty or stty. Do not run a POSIX input helper.
+  if (process.platform === "win32") return null;
   let fd: number | null = null;
   try {
     fd = openSync("/dev/tty", "r+");

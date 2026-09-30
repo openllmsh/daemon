@@ -6,7 +6,7 @@
  * to the same state-dir files for from-source and non-systemd installations.
  */
 
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import {
   daemonStderrLogFilePath,
@@ -65,7 +65,8 @@ export const resolveLogSource = (
   journalIsAvailable: boolean,
   exists: (path: string) => boolean = existsSync,
 ): TLogSource => {
-  if (platform !== "darwin" && journalIsAvailable) return { kind: "journal" };
+  if (platform !== "darwin" && platform !== "win32" && journalIsAvailable)
+    return { kind: "journal" };
   // stdout/stderr are the supervisor-owned logs. The structured app log remains
   // a useful fallback for foreground/from-source runs that have not created them.
   const candidates = [
@@ -81,6 +82,7 @@ export const resolveLogSource = (
 
 /** journalctl present AND the unit known to the user manager (exit 0). */
 const journalAvailable = (): boolean => {
+  if (process.platform === "win32") return false;
   try {
     const unitRegistered =
       spawnSync(
@@ -281,10 +283,54 @@ const journalArgs = (opts: TLogsOpts): readonly string[] => {
   return args;
 };
 
+const WINDOWS_LOG_TAIL_MAX_BYTES = 1024 * 1024;
+
+export const readWindowsLogTail = (
+  paths: readonly string[],
+  maxLines: number,
+): readonly string[] => {
+  if (maxLines <= 0) return [];
+  const out: string[] = [];
+  const multi = paths.length > 1;
+  for (const path of paths) {
+    let fd: number | null = null;
+    try {
+      fd = openSync(path, "r");
+      const size = fstatSync(fd).size;
+      const length = Math.min(size, WINDOWS_LOG_TAIL_MAX_BYTES);
+      const offset = size - length;
+      const buffer = Buffer.alloc(length);
+      const read = length === 0 ? 0 : readSync(fd, buffer, 0, length, offset);
+      let text = buffer.subarray(0, read).toString("utf8");
+      if (offset > 0) {
+        const firstBreak = text.indexOf("\n");
+        text = firstBreak === -1 ? "" : text.slice(firstBreak + 1);
+      }
+      const lines = text.split(/\r?\n/);
+      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+      const tail = lines.slice(-maxLines).filter((line) => line.length > 0);
+      if (tail.length > 0) {
+        if (multi) out.push(`==> ${path} <==`);
+        for (const line of tail) out.push(line);
+      }
+    } catch {
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {}
+      }
+    }
+  }
+  return out;
+};
+
 /** Read the tail of locally available daemon log files for non-interactive diagnostics. */
 export const readRecentLogLines = (maxLines = 300): readonly string[] => {
   const source = resolveLogSource(process.platform, false);
   if (source.kind !== "files") return [];
+  if (process.platform === "win32")
+    return readWindowsLogTail(source.paths, maxLines);
   const output = spawnSync("tail", ["-n", String(maxLines), ...source.paths], {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "ignore"],
@@ -307,6 +353,16 @@ export const runLogs = (args: readonly string[]): void => {
       `no daemon logs found; looked in:\n${source.paths.map((path) => `  ${path}`).join("\n")}\n`,
     );
     process.exit(1);
+  }
+  if (process.platform === "win32" && source.kind === "files") {
+    if (opts.follow) {
+      process.stderr.write(
+        "Windows log follow is unavailable. Run logs without -f to read the current log tail.\n",
+      );
+      process.exit(1);
+    }
+    writeFormatted(readWindowsLogTail(source.paths, opts.lines).join("\n"));
+    process.exit(0);
   }
   const command = source.kind === "journal" ? "journalctl" : "tail";
   const commandArgs =
