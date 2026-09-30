@@ -149,7 +149,7 @@ export const prepareLinuxLaunch = (): string[] => {
    * Event       | Pending ready | Ready or rejected | Completion | Cleanup
    * ready       | resolve       | no change         | pending    | pending
    * reject      | reject        | no change         | pending    | pending
-   * finish      | reject        | no change         | outcome    | confirmed
+   * finish      | reject        | no change         | outcome    | unconfirmed stays, else confirmed
    * unconfirmed | reject        | no change         | unconfirmed| pending
    * finished    | no change     | no change         | no change  | no change
    */
@@ -172,8 +172,8 @@ export const prepareLinuxLaunch = (): string[] => {
     }
     if (event === "finish" && outcome) {
       state = "finished";
-      cleanupStatus = "confirmed";
-      resolveCleanup({ cleanup: "confirmed" });
+      if (cleanupStatus !== "unconfirmed") cleanupStatus = "confirmed";
+      resolveCleanup({ cleanup: cleanupStatus });
       resolveCompletion(outcome);
     }
   };

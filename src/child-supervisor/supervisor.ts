@@ -279,13 +279,9 @@ const finishTrackedChild = async (
 ): Promise<TReapOutcome> => {
   if (tracked.handle.sandbox) {
     const launch = tracked.handle.sandbox;
-    /* `completion` is the verdict channel: it resolves `reap_unconfirmed` the
-     * moment the shim cannot confirm its reap, while `cleanup` can settle
-     * "confirmed" in the same turn when the launch finishes its own teardown.
-     * A race between the two prefers the earlier-settled source — the shim's
-     * confirmed teardown then masks the unconfirmed verdict. Read the verdict
-     * first; only a verdict other than `reap_unconfirmed` may defer to the
-     * cleanup result. */
+    /* Read the completion verdict before the cleanup result. Keep tracking
+     * after an unconfirmed verdict. A later cleanup result must not replace
+     * that verdict. Only other outcomes can use the cleanup result. */
     const outcome = await launch.completion;
     const result: TLinuxCleanupResult =
       outcome.kind === "reap_unconfirmed"
@@ -337,15 +333,14 @@ const terminateTrackedChild = (
       if (first !== "exited") launch.signal(9);
       let timer: ReturnType<typeof setTimeout> | undefined;
       const outcome = await Promise.race([
-        launch.cleanup.then(async (result) => {
-          await waitChildExited(tracked.handle);
-          return releaseSandboxChild(tracked, result.cleanup, "terminated");
+        launch.completion.then(async (result) => {
+          const cleanup =
+            result.kind === "reap_unconfirmed"
+              ? "unconfirmed"
+              : (await launch.cleanup).cleanup;
+          if (cleanup === "confirmed") await waitChildExited(tracked.handle);
+          return releaseSandboxChild(tracked, cleanup, "terminated");
         }),
-        launch.completion.then((result) =>
-          result.kind === "reap_unconfirmed"
-            ? releaseSandboxChild(tracked, "unconfirmed", "terminated")
-            : tracked.handle.whenReleased,
-        ),
         new Promise<TReapOutcome>((resolve) => {
           timer = setTimeout(
             () =>
