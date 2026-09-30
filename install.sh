@@ -800,11 +800,76 @@ vendor_cli_lock_dir() {
   printf '%s/%s.lock.d' "$(vendor_cli_state_dir)" "$1"
 }
 
-vendor_cli_lock_age_sec() {
+# Capture a single portable `stat` field without mixing Darwin/Linux stdout.
+# GNU `stat -f %m` can print filesystem prose to stdout AND exit nonzero; a
+# naive `stat -f … || stat -c …` then concatenates junk + epoch in one
+# substitution. Try each form alone; accept only a pure positive integer.
+vendor_cli_stat_uint() {
+  local path="$1" darwin_fmt="$2" linux_fmt="$3" raw
+  raw="$(stat -f "$darwin_fmt" "$path" 2>/dev/null)" && {
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+      printf '%s' "$raw"
+      return 0
+    fi
+  }
+  raw="$(stat -c "$linux_fmt" "$path" 2>/dev/null)" && {
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+      printf '%s' "$raw"
+      return 0
+    fi
+  }
+  return 1
+}
+
+# Fail-closed: unavailable/invalid mtime → age 0 (still in grace; never steal).
+# (A literal mtime of 0 previously made age≈epoch and stole locks.)
+vendor_cli_path_mtime_age_sec() {
   local path="$1" mtime now
-  mtime="$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || echo 0)"
+  mtime="$(vendor_cli_stat_uint "$path" %m %Y || true)"
+  if [ -z "$mtime" ] || ! [ "$mtime" -gt 0 ] 2>/dev/null; then
+    echo 0
+    return 0
+  fi
   now="$(date +%s)"
   echo $((now - mtime))
+}
+
+# Init age for the lock dir: prefer immutable `$lock/created` epoch (survives
+# child mkdir/rmdir mtime refresh). Missing/invalid → fail-closed age 0.
+vendor_cli_lock_init_age_sec() {
+  local lock="$1" created raw now
+  created="$lock/created"
+  if [ -f "$created" ]; then
+    raw="$(head -n 1 "$created" 2>/dev/null || true)"
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+      now="$(date +%s)"
+      echo $((now - raw))
+      return 0
+    fi
+  fi
+  echo 0
+}
+
+# Portable inode identity; empty on failure (caller must not reclaim).
+vendor_cli_lock_inode() {
+  local path="$1"
+  vendor_cli_stat_uint "$path" %i %i || true
+}
+
+# Drop an orphan `$lock/reclaim` left by a crashed reclaimer (mkdir succeeded,
+# then SIGKILL before mv). Only when the reclaim dir itself is aged — never
+# steal a live reclaimer's young sublock.
+vendor_cli_clear_orphan_reclaim() {
+  local lock="$1" reclaim_dir age
+  reclaim_dir="$lock/reclaim"
+  [ -d "$reclaim_dir" ] || return 0
+  age="$(vendor_cli_path_mtime_age_sec "$reclaim_dir")"
+  if [ "$age" -ge "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+    rm -rf "$reclaim_dir" 2>/dev/null || true
+  fi
 }
 
 # True when owner file has pid + token (lstart may be empty on odd hosts).
@@ -818,7 +883,7 @@ vendor_cli_owner_complete() {
 
 vendor_cli_acquire_lock() {
   local slug="$1" dir lock owner_file attempt=0
-  local owner_pid owner_start reclaim age
+  local owner_pid owner_start reclaim age pre_age pre_inode post_inode
   local my_start my_token
   dir="$(vendor_cli_state_dir)"
   mkdir -p "$dir" || return 1
@@ -830,6 +895,12 @@ vendor_cli_acquire_lock() {
   VENDOR_CLI_LOCK_TOKEN="$my_token"
   while [ "$attempt" -lt 400 ]; do
     if mkdir "$lock" 2>/dev/null; then
+      # Immutable birth timestamp — reclaim/child ops must not reset init age.
+      if ! printf '%s\n' "$(date +%s)" >"$lock/created"; then
+        rm -rf "$lock" 2>/dev/null || true
+        VENDOR_CLI_LOCK_TOKEN=""
+        return 1
+      fi
       # Optional test hook: widen the window after mkdir before owner exists.
       if [ -n "${OPENLLM_TEST_VENDOR_LOCK_PAUSE:-}" ]; then
         sleep 0.2
@@ -861,8 +932,8 @@ vendor_cli_acquire_lock() {
         return 1
       fi
     else
-      # Missing/partial owner: INITIALIZING while lock dir is young.
-      age="$(vendor_cli_lock_age_sec "$lock")"
+      # Missing/partial owner: INITIALIZING while birth age is young.
+      age="$(vendor_cli_lock_init_age_sec "$lock")"
       if [ "$age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
         attempt=$((attempt + 1))
         sleep 0.05
@@ -870,15 +941,42 @@ vendor_cli_acquire_lock() {
       fi
     fi
 
-    # Candidate stale — take inner reclaim sublock before any destructive move.
-    # If mkdir lands inside a FRESH replacement dir, revalidation below aborts.
+    # Clear aged orphan reclaim sublock (crashed reclaimer) before retrying.
+    vendor_cli_clear_orphan_reclaim "$lock"
+
+    # Snapshot birth-age + inode BEFORE mkdir reclaim (dir mtime may refresh).
+    pre_age="$(vendor_cli_lock_init_age_sec "$lock")"
+    pre_inode="$(vendor_cli_lock_inode "$lock")"
+    if [ -z "$pre_inode" ]; then
+      attempt=$((attempt + 1))
+      sleep 0.05
+      continue
+    fi
+    if ! vendor_cli_owner_complete "$owner_file"; then
+      if [ "$pre_age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+        attempt=$((attempt + 1))
+        sleep 0.05
+        continue
+      fi
+    fi
+
+    # Inner reclaim sublock. If this lands in a replacement dir, inode check aborts.
     if ! mkdir "$lock/reclaim" 2>/dev/null; then
+      vendor_cli_clear_orphan_reclaim "$lock"
       attempt=$((attempt + 1))
       sleep 0.05
       continue
     fi
 
-    # Re-validate after winning reclaim sublock.
+    post_inode="$(vendor_cli_lock_inode "$lock")"
+    if [ -z "$post_inode" ] || [ "$post_inode" != "$pre_inode" ]; then
+      rmdir "$lock/reclaim" 2>/dev/null || true
+      attempt=$((attempt + 1))
+      sleep 0.02
+      continue
+    fi
+
+    # Re-validate owner liveness; use PRE-reclaim birth age for incomplete grace.
     if vendor_cli_owner_complete "$owner_file"; then
       owner_pid="$(head -n 1 "$owner_file" 2>/dev/null || true)"
       owner_start="$(sed -n '2p' "$owner_file" 2>/dev/null || true)"
@@ -887,21 +985,17 @@ vendor_cli_acquire_lock() {
         VENDOR_CLI_LOCK_TOKEN=""
         return 1
       fi
-    else
-      age="$(vendor_cli_lock_age_sec "$lock")"
-      if [ "$age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
-        rmdir "$lock/reclaim" 2>/dev/null || true
-        attempt=$((attempt + 1))
-        sleep 0.05
-        continue
-      fi
+    elif [ "$pre_age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+      rmdir "$lock/reclaim" 2>/dev/null || true
+      attempt=$((attempt + 1))
+      sleep 0.05
+      continue
     fi
 
     reclaim="${lock}.stale.$$.${RANDOM:-0}"
     if mv "$lock" "$reclaim" 2>/dev/null; then
       rm -rf "$reclaim" 2>/dev/null || true
     else
-      # Lost the race to a replacement — drop our reclaim if still present.
       rmdir "$lock/reclaim" 2>/dev/null || true
     fi
     attempt=$((attempt + 1))
@@ -1043,21 +1137,33 @@ launch_vendor_cli_install() {
   worker_pid_file="$(vendor_cli_state_dir)/.${slug}.worker_pid"
   handshake_file="$(vendor_cli_state_dir)/.${slug}.handshake"
   rm -f "$worker_pid_file" "$handshake_file"
+  # Capture the launching shell's pid for the worker's parent-liveness guard
+  # (Bash 3.2: `$$` inside `( )&` is still this value — pass it explicitly).
+  local launcher_pid=$$
   (
     # Background worker: parent may exit; this job continues and owns terminal
     # state transitions. pipefail so a nonzero curl fails the pipeline.
     set -euo pipefail
     my_pid=""
-    for _vci_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+    # Bounded wall deadline (~10s), not a fixed short iteration count — slow
+    # parent `ps`/JSON write under load must still complete the handshake.
+    _hs_deadline=$(($(date +%s) + 10))
+    while [ "$(date +%s)" -lt "$_hs_deadline" ]; do
       if [ -f "$handshake_file" ] && [ -f "$worker_pid_file" ]; then
         my_pid="$(head -n 1 "$worker_pid_file" 2>/dev/null || true)"
         [ -n "$my_pid" ] && break
       fi
-      sleep 0.02
+      # Abort early only when the launcher is gone AND handshake never arrived.
+      # If handshake already landed, a later parent exit is fine.
+      if [ -z "$my_pid" ] && ! kill -0 "$launcher_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
     done
     if [ -z "$my_pid" ]; then
       # No handshake — parent failed or died. Do NOT run the vendor installer
       # untracked, and do NOT invent a PPID identity.
+      echo "$name CLI: missing handshake — worker exiting without vendor start." >&2
       exit 1
     fi
     my_start="$(vendor_cli_process_start "$my_pid" || true)"

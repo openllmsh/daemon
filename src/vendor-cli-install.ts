@@ -23,13 +23,8 @@ const MAX_RECORD_BYTES = 4_096;
 
 const decodeWire = Schema.decodeUnknownEither(VendorCliInstall);
 
-type TLocalRecord = {
-  readonly attempt_id: string;
+type TLocalRecord = TVendorCliInstall & {
   readonly provider: string;
-  readonly stage: TVendorCliInstall["stage"];
-  readonly started_at_ms: number;
-  readonly updated_at_ms: number;
-  readonly reason?: TVendorCliInstall["reason"];
   readonly pid?: number;
   readonly process_start?: string;
 };
