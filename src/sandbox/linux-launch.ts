@@ -1,10 +1,13 @@
 import { ptr } from "bun:ffi";
 import { createHash, randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmdirSync,
   rmSync,
@@ -269,6 +272,51 @@ export const linuxVendorEnvironment = (
   return env;
 };
 
+/** The interpreter a `#!` script names needs the same read+exec reach as the
+ *  launcher: the private `/tmp` tmpfs hides a host path that the working set
+ *  did not grant, and deny-by-default Landlock rejects the exec read. Parse
+ *  the shebang chain — the kernel recurses (BINPRM_MAX_RECURSION is 4) — and
+ *  emit the literal path (the mount bind lands there) plus its realpath
+ *  (Landlock rules bind to the resolved file). */
+const shebangInterpreters = (executable: string): string[] => {
+  const interpreters: string[] = [];
+  const seen = new Set<string>([executable]);
+  let current = executable;
+  for (let depth = 0; depth < 4; depth += 1) {
+    let head: Buffer;
+    try {
+      const fd = openSync(current, "r");
+      try {
+        const buf = Buffer.alloc(256);
+        head = buf.subarray(0, readSync(fd, buf, 0, 256, 0));
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      break;
+    }
+    const newline = head.indexOf(0x0a);
+    const line = head
+      .subarray(0, newline < 0 ? head.length : newline)
+      .toString("utf8");
+    const token = /^#![ \t]*(\S+)/.exec(line)?.[1] ?? "";
+    // A relative or missing interpreter fails the exec the same way it does
+    // without a sandbox — keep the policy, do not reject it.
+    if (!isAbsolute(token) || token.includes("\0") || seen.has(token)) break;
+    seen.add(token);
+    let resolved: string;
+    try {
+      resolved = realpathSync(token);
+    } catch {
+      break;
+    }
+    interpreters.push(token, resolved);
+    seen.add(resolved);
+    current = resolved;
+  }
+  return [...new Set(interpreters)];
+};
+
 /** Build the policy in the host namespace. The helper must not build it again. */
 export const buildChildPolicy = (
   tail: readonly string[],
@@ -309,7 +357,12 @@ export const buildChildPolicy = (
       }),
       { mode: 0o600 },
     );
-    const ro = [...new Set(ws.readOnly.filter(existsSync).map(checkedPath))];
+    const ro = [
+      ...new Set([
+        ...ws.readOnly.filter(existsSync).map(checkedPath),
+        ...shebangInterpreters(executablePath),
+      ]),
+    ];
     const rw = [...new Set(ws.readWrite.filter(existsSync).map(checkedPath))];
     const env = linuxVendorEnvironment(scratch, home);
     const self = [
