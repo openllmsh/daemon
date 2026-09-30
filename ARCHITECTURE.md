@@ -103,12 +103,12 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 
 ```
 daemon/
-  release-types.ts         DAEMON_TARGETS (5 keys; 2.8.0 releases the 4 macOS/Linux keys) + DAEMON_BINARY_SOURCES build-input closure
-  scripts/compile.ts        bun build --compile --minify --bytecode (4 release targets in 2.8.0; NODE_ENV bake; src/pty-native C bundled)
+  release-types.ts         DAEMON_TARGETS (5 keys; prereleases ship all 5, stable ships the 4 macOS/Linux keys via DAEMON_STABLE_TARGETS) + DAEMON_BINARY_SOURCES build-input closure
+  scripts/compile.ts        bun build --compile --minify --bytecode (the release targets for the channel; NODE_ENV bake; src/pty-native C bundled)
   scripts/verify.ts         download each published binary → sha256 → assert == manifest.ts pin (bun run verify)
   scripts/dist.ts           compile + emit a self-contained installer per POSIX target (daemon:dist)
   scripts/dist-install.ts   run an emitted installer by target on this host (daemon:dist:install)
-  scripts/package-windows.ts  package a win32-x64 build (ZIP). Not used in 2.8.0: Windows releases start in 2.8.1
+  scripts/package-windows.ts  package a win32-x64 build (ZIP). Used for the 2.8.0 prerelease preview; a supported Windows stable release is 2.8.1 work
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
     cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
@@ -1149,10 +1149,12 @@ auto-links its isolated run-view to whatever the user-run installer lands.
 
 `scripts/compile.ts` → `bun build --compile --minify --bytecode
 --target=bun-<os>-<arch>` for the release keys in
-`packages/daemon/release-types.ts`. Version 2.8.0 releases 4 targets:
-darwin-arm64, darwin-x64-baseline, linux-x64-baseline and linux-arm64. The
-win32-x64 code stays in the tree, but 2.8.0 does not build it. Windows releases
-start in 2.8.1. `DAEMON_BINARY_SOURCES`
+`packages/daemon/release-types.ts`. A 2.8.0 stable release ships 4 targets:
+darwin-arm64, darwin-x64-baseline, linux-x64-baseline and linux-arm64. A 2.8.0
+prerelease (for example 2.8.0-beta.3) ships all five, with win32-x64 as an
+unsigned preview — `releaseTargetsFor` selects by channel. A supported Windows
+stable release is 2.8.1 work (the ACL/policy confinement lands there, O8).
+`DAEMON_BINARY_SOURCES`
 in the same file pins the compiled daemon's checked-in input closure —
 `src/`, `install.sh`, `release-types.ts`, `package.json`,
 `scripts/compile.ts`, plus the `protocol`, `tunnel` and `wire` packages. The

@@ -84,9 +84,9 @@ The shim reaps the child itself. It keeps two states: "reaped" and "lost". It do
 
 | Item | Value |
 |---|---|
-| Release targets in 2.8.0 | darwin-arm64, darwin-x64-baseline, linux-x64-baseline, linux-arm64 |
+| Release targets in 2.8.0 | darwin-arm64, darwin-x64-baseline, linux-x64-baseline, linux-arm64, and win32-x64 on prereleases |
 | Other platforms | The shim stops with an error. |
-| Windows | The ConPTY code (`src/pty-native/pty-win.c`) is in the tree. Windows releases start in 2.8.1. |
+| Windows | The ConPTY code (`src/pty-native/pty-win.c`) is in the tree. The `win32-x64` build ships in 2.8.0 prereleases as a preview. The PTY status stays `unavailable-until-phase3`: no ConPTY claim in this release. A supported Windows stable release is 2.8.1 work. |
 | Backend variable | `OPENLLM_PTY_BACKEND`. The default on POSIX is `native`. The daemon stops with an error for an unknown value. |
 
 ## Where the code is
