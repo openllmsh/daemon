@@ -24,6 +24,14 @@ export type TLinuxCleanupResult = {
   readonly cleanup: "confirmed" | "unconfirmed";
 };
 
+/**
+ * The bounded shim exits with this code when it cannot confirm that every
+ * sandboxed descendant reaped (`REAP_UNCONFIRMED_EXIT` in `linux-native.c`).
+ * The shim suppresses COMPLETE on that path, so `drive()` cannot produce a
+ * confirmed settlement before this maps the exit to `reap_unconfirmed`.
+ */
+export const REAP_UNCONFIRMED_EXIT = 75;
+
 export type TLinuxLaunchHandle = {
   /** Report the launch outcome or a bounded cleanup failure. */
   readonly completion: Promise<TLinuxLaunchOutcome>;
@@ -423,6 +431,8 @@ export const prepareLinuxLaunch = (): string[] => {
     if (stopped()) return;
     shimExitObserved = true;
     if (registered || admitted) {
+      // The verdict lands first: a confirmed `finish()` must not mask it.
+      if (code === REAP_UNCONFIRMED_EXIT) reportUnconfirmed();
       drive();
       return;
     }
