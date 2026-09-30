@@ -1,4 +1,9 @@
 import { logError, logWarn, safeDiagnosticMessage } from "../logger";
+import type {
+  TLinuxCleanupResult,
+  TLinuxLaunchHandle,
+} from "../sandbox/linux-adapter";
+import { linuxLaunchHandle } from "../sandbox/linux-adapter";
 import { spawn as admittedSpawn } from "../windows-process";
 import { linuxPdeathsigArgv } from "./linux-pdeathsig";
 import type { TReapOutcome } from "./posix";
@@ -39,12 +44,13 @@ export type TTerminateOptions = {
 };
 
 export type TSupervisedChild = {
+  readonly sandbox?: TLinuxLaunchHandle;
   readonly subprocess: ReturnType<typeof Bun.spawn>;
   readonly pid: number;
   readonly pgid: number;
   readonly terminate: (opts?: TTerminateOptions) => Promise<TReapOutcome>;
   readonly beginTask: () => () => void;
-  /** Settles when tracking is dropped (confirmed exit). Pending while unconfirmed. */
+  /** Settle only after process-tree cleanup is confirmed. */
   readonly whenReleased: Promise<TReapOutcome>;
 };
 
@@ -166,14 +172,6 @@ const releaseChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
 
 const forgetChild = (tracked: TTrackedChild, outcome: TReapOutcome): void => {
   if (outcome === "reap_unconfirmed") {
-    logWarn(
-      "child-supervisor",
-      safeDiagnosticMessage`process group unreaped after bounded TERM/KILL`,
-      {
-        pid: tracked.handle.pid,
-        pgid: tracked.handle.pgid,
-      },
-    );
     void watchUnconfirmedExit(tracked).catch((error) =>
       logError("child-supervisor", error, {
         pid: tracked.handle.pid,
@@ -223,6 +221,14 @@ const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
     ac.signal.aborted || !trackedChildren.has(child.pid);
   try {
     if (maybeReleaseIfGroupGone(tracked) || aborted()) return;
+    logWarn(
+      "child-supervisor",
+      safeDiagnosticMessage`process group unreaped after bounded TERM/KILL`,
+      {
+        pid: child.pid,
+        pgid: child.pgid,
+      },
+    );
     let rootPending: Promise<"root"> | null = waitChildExited(child).then(
       () => "root" as const,
       () => "root" as const,
@@ -255,9 +261,35 @@ const watchUnconfirmedExit = async (tracked: TTrackedChild): Promise<void> => {
   }
 };
 
+const releaseSandboxChild = (
+  tracked: TTrackedChild,
+  cleanup: TLinuxCleanupResult["cleanup"],
+  confirmedOutcome: "exited" | "terminated",
+): TReapOutcome => {
+  const outcome =
+    cleanup === "confirmed" ? confirmedOutcome : "reap_unconfirmed";
+  // Confirmed cleanup releases the record now. An unconfirmed cleanup hands
+  // the record to the bounded group watcher. Both paths must not leak it.
+  forgetChild(tracked, outcome);
+  return outcome;
+};
+
 const finishTrackedChild = async (
   tracked: TTrackedChild,
 ): Promise<TReapOutcome> => {
+  if (tracked.handle.sandbox) {
+    const launch = tracked.handle.sandbox;
+    /* Read the completion verdict before the cleanup result. Keep tracking
+     * after an unconfirmed verdict. A later cleanup result must not replace
+     * that verdict. Only other outcomes can use the cleanup result. */
+    const outcome = await launch.completion;
+    const result: TLinuxCleanupResult =
+      outcome.kind === "reap_unconfirmed"
+        ? { cleanup: "unconfirmed" }
+        : await launch.cleanup;
+    if (result.cleanup === "confirmed") await waitChildExited(tracked.handle);
+    return releaseSandboxChild(tracked, result.cleanup, "exited");
+  }
   try {
     await waitChildExited(tracked.handle);
   } catch {
@@ -291,6 +323,38 @@ const terminateTrackedChild = (
   const finalReapMs = opts.finalReapMs ?? DEFAULT_FINAL_REAP_MS;
   const stillOwned = (): boolean => groupStillPresent(tracked.handle.pgid);
   tracked.terminating = (async (): Promise<TReapOutcome> => {
+    if (tracked.handle.sandbox) {
+      const launch = tracked.handle.sandbox;
+      launch.signal(15);
+      const first = await raceExitOrBudget(
+        tracked.handle,
+        Math.max(0, graceMs),
+      );
+      if (first !== "exited") launch.signal(9);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        launch.completion.then(async (result) => {
+          const cleanup =
+            result.kind === "reap_unconfirmed"
+              ? "unconfirmed"
+              : (await launch.cleanup).cleanup;
+          if (cleanup === "confirmed") await waitChildExited(tracked.handle);
+          return releaseSandboxChild(tracked, cleanup, "terminated");
+        }),
+        new Promise<TReapOutcome>((resolve) => {
+          timer = setTimeout(
+            () =>
+              resolve(
+                releaseSandboxChild(tracked, "unconfirmed", "terminated"),
+              ),
+            Math.max(0, finalReapMs),
+          );
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      tracked.lastReap = outcome;
+      return outcome;
+    }
     signalGroup(tracked.handle.pgid, "SIGTERM");
     const first = await raceExitOrBudget(tracked.handle, Math.max(0, graceMs));
     let outcome: TReapOutcome;
@@ -345,23 +409,31 @@ export const superviseSpawn = (
   argv: ReadonlyArray<string>,
   opts: TSuperviseSpawnOptions,
 ): TSupervisedChild => {
-  if (argv.length === 0 || argv[0] === undefined || argv[0].length === 0)
-    throw new Error("superviseSpawn requires a command");
-  // Linux hard-crash guarantee: re-exec through the PDEATHSIG wrapper so the
-  // child dies if the daemon is SIGKILLed (no macOS equivalent — Darwin relies
-  // on the process group + launchd cleanup + the boot sweep). Darwin argv is
-  // left byte-identical.
-  const selfInvocation =
-    process.platform === "linux" ? daemonSelfInvocation() : null;
-  const spawnArgv =
-    selfInvocation === null
-      ? argv
-      : linuxPdeathsigArgv(argv, selfInvocation, process.pid);
-  const subprocess = admittedSpawn([...spawnArgv], {
-    ...opts,
-    // POSIX: lead an independently killable process group (pgid === pid).
-    detached: true,
-  });
+  const sandbox =
+    process.platform === "linux" ? linuxLaunchHandle(argv) : undefined;
+  let subprocess: ReturnType<typeof admittedSpawn>;
+  try {
+    if (argv.length === 0 || argv[0] === undefined || argv[0].length === 0)
+      throw new Error("superviseSpawn requires a command");
+    // Linux hard-crash guarantee: re-exec through the PDEATHSIG wrapper so the
+    // child dies if the daemon is SIGKILLed (no macOS equivalent — Darwin relies
+    // on the process group + launchd cleanup + the boot sweep). Darwin argv is
+    // left byte-identical.
+    const selfInvocation =
+      process.platform === "linux" ? daemonSelfInvocation() : null;
+    const spawnArgv =
+      selfInvocation === null
+        ? argv
+        : linuxPdeathsigArgv(argv, selfInvocation, process.pid);
+    subprocess = admittedSpawn([...spawnArgv], {
+      ...opts,
+      // POSIX: lead an independently killable process group (pgid === pid).
+      detached: true,
+    });
+  } catch (error) {
+    sandbox?.cancelBeforeSpawn?.();
+    throw error;
+  }
   const pid = subprocess.pid;
   const pgid = pid;
   let handle: TSupervisedChild;
@@ -375,6 +447,7 @@ export const superviseSpawn = (
     return activeTaskRelease(tracked);
   };
   handle = {
+    ...(sandbox ? { sandbox } : {}),
     subprocess,
     pid,
     pgid,
@@ -391,6 +464,15 @@ export const superviseSpawn = (
     resolveReleased,
   };
   trackedChildren.set(pid, tracked);
+  if (handle.sandbox) {
+    const launch = handle.sandbox;
+    launch.bindShim?.(() => signalGroup(pgid, "SIGKILL"));
+    void subprocess.exited
+      .then((code) => launch.shimExited(code))
+      .catch((error) =>
+        logError("child-supervisor", error, { pid, pgid, kind: opts.kind }),
+      );
+  }
   // Read the shared process identity, then persist the record.
   // Linux reads /proc in-process. macOS uses an async ps helper.
   //

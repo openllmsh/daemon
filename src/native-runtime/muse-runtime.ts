@@ -70,7 +70,7 @@ import {
 } from "../delegation/muse";
 import { spawnCwd } from "../delegation/util";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
 import type {
   TMuseFoldedItem,
@@ -167,18 +167,9 @@ export type TMuseSpawnTarget = {
   readonly args: ReadonlyArray<string>;
 };
 
-/** Wrap official `muse serve` argv with the daemon sandbox shim. Pure. */
+/** Build the Muse command. Prepare confinement only when the SDK starts it. */
 export const wrapMuseServeSpawn = (museBin: string): TMuseSpawnTarget => {
-  const wrapped = sandboxSpawnArgs([
-    museBin,
-    "serve",
-    ...MUSE_SERVE_SAFETY_ARGS,
-  ]);
-  const command = wrapped[0];
-  if (command === undefined) {
-    throw new Error("sandboxSpawnArgs returned an empty argv");
-  }
-  return { command, args: wrapped.slice(1) };
+  return { command: museBin, args: ["serve", ...MUSE_SERVE_SAFETY_ARGS] };
 };
 
 /** Drop documented metered-key overrides, OpenLLM recursion knobs, and user
@@ -594,14 +585,29 @@ const approvalModeOf = (
 const wrapOfficialHost = async (
   options: TMuseHostSpawnOptions,
 ): Promise<TMuseHost> => {
-  const handshake = spawnMspConnection({
-    command: options.command,
-    args: [...options.args],
-    cwd: options.cwd,
-    env: options.env,
-    ...(options.onStderr !== undefined ? { onStderr: options.onStderr } : {}),
-    shutdownTimeoutMs: 1_000,
-  });
+  const spawnedHost = withSandboxSpawn(
+    [options.command, ...options.args],
+    (argv, sandbox) => ({
+      sandbox,
+      handshake: spawnMspConnection({
+        command: argv[0] ?? "",
+        args: argv.slice(1),
+        cwd: options.cwd,
+        env: options.env,
+        ...(options.onStderr !== undefined
+          ? { onStderr: options.onStderr }
+          : {}),
+        shutdownTimeoutMs: 1_000,
+      }),
+    }),
+  );
+  const { handshake, sandbox } = spawnedHost;
+  if (sandbox) {
+    void handshake.exited.then(
+      ({ code }) => sandbox.shimExited(code ?? 1),
+      () => sandbox.shimExited(1),
+    );
+  }
   const onAbort = (): void => {
     void handshake.close().catch(() => {});
   };
@@ -613,6 +619,7 @@ const wrapOfficialHost = async (
   }
   let spawned: Awaited<ReturnType<typeof handshake.initialize>>;
   try {
+    await sandbox?.ready;
     spawned = await handshake.initialize({
       clientInfo: { name: "openllm_daemon", version: DAEMON_VERSION },
       capabilities: MUSE_CLIENT_CAPABILITIES,
@@ -757,6 +764,7 @@ const setupDecline = (
   error: unknown,
   signal: AbortSignal,
 ): TNativeRunResult => {
+  if (error instanceof SandboxLaunchError) throw error;
   if (signal.aborted) {
     return { kind: "declined", reason: "client aborted" };
   }
@@ -1677,6 +1685,13 @@ export const runMuseNative = async (
           : "failure",
     );
     await cleanup();
+    if (
+      typeof first === "object" &&
+      first !== null &&
+      "error" in first &&
+      first.error instanceof SandboxLaunchError
+    )
+      throw first.error;
     const reason =
       first === "timeout"
         ? "muse SDK produced no output before the pre-commit deadline"

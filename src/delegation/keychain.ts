@@ -92,7 +92,7 @@ import {
   safeDiagnosticMessage,
 } from "../logger";
 import { currentTickId } from "../op-context";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { classifyStatError } from "./observation-cache";
 import { redactSensitiveArgv } from "./redact-sensitive-argv";
@@ -469,16 +469,18 @@ const spawnSecurityNow = async (
   const configuredTimeoutMs = securitySpawnTimeoutMs();
   const preSpawnMs = performance.now();
   try {
-    const child = superviseSpawn(
-      sandboxSpawnArgs(["security", ...argv], { probe: unwrapKeychainSpawn() }),
-      {
-        kind: "probe",
-        stdin: "ignore",
-        stdout: opts.stdout,
-        stderr: opts.stderr,
-        cwd: spawnCwd({ HOME: home }),
-        env: securitySpawnEnv(home),
-      },
+    const child = withSandboxSpawn(
+      ["security", ...argv],
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "probe",
+          stdin: "ignore",
+          stdout: opts.stdout,
+          stderr: opts.stderr,
+          cwd: spawnCwd({ HOME: home }),
+          env: securitySpawnEnv(home),
+        }),
+      { probe: unwrapKeychainSpawn() },
     );
     if (securitySpawnSetupHookForTests !== null) {
       await securitySpawnSetupHookForTests();

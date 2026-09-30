@@ -1,44 +1,18 @@
 /**
- * The cross-platform OS-sandbox entry (`applyDaemonSandbox`) + the Linux
- * Landlock backend — `docs/proposals/daemon-os-sandbox-and-typed-control.md`
- * §3.3a. `applyDaemonSandbox` dispatches by platform: **Linux → Landlock**
- * (here), **macOS → Seatbelt** (`./seatbelt.ts`), other → unsupported. Both
- * backends are in-process, unprivileged, derived from the same working set
- * (`./working-set/`), and inherited across `execve`. The sandbox is
- * PER-CHILD, not process-wide: the daemon itself boots unconfined (so device
- * session PTYs can run the user's real CLI over their real files) and each
- * risky child is wrapped through the `--sandbox-exec` self-re-exec shim
- * (`./exec.ts`), whose re-exec'd process calls `applyDaemonSandbox({ force:
- * true })` before running the child — so `bash` running a SHA-gated
- * integration script, `curl`, and the vendor CLIs are confined, and
- * everything outside the working set (`~/.ssh`, `~/.aws`, the user's real
- * `~/.codex`, browser profiles) is unreachable from them. See
- * `docs/audits/daemon-sandbox-scoping.md`.
- *
- * Landlock (this file): a ruleset granting only the working-set paths, on
- * kernels ≥ 5.13. It can't restrict the network on the kernels we target —
- * the systemd user unit's `RestrictAddressFamilies` (`service.ts`) covers that
- * side; the two layers overlap deliberately (Landlock also confines a manual
- * foreground run with no systemd).
- *
- * Failure posture is FAIL-OPEN with a loud log: the daemon must keep serving
- * on a kernel/libc this shim can't drive (the state is surfaced on
- * `DaemonStatus.sandbox` so an unconfined daemon is visible, not silent).
- * Kill switch: `OPENLLM_DAEMON_NO_SANDBOX=1`. Dev source runs are OPT-IN via
- * `OPENLLM_DAEMON_SANDBOX=1` (§3.5) so the sandbox never impedes iteration.
- *
- * Landlock rules only ever NARROW and cannot be loosened in-process — a
- * future §3.4 consent grant takes effect via the self-updater's existing
- * drain-and-exit + supervisor relaunch, never by widening a live ruleset.
+ * Direct Landlock checks and the cross-platform sandbox dispatcher.
+ * Linux vendor launches use linux-launch.ts. The helper applies Landlock
+ * after it mounts private procfs. The daemon stays outside that domain.
+ * A failed restriction returns an error. The launch path rejects the child.
  */
 import { fstatSync } from "node:fs";
+import type { TDaemonStatus } from "@openllmsh/protocol";
 import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { childWorkingSet } from "./child-policy";
 import { daemonWorkingSet } from "./working-set";
 
 /** The sandbox posture this process ended up with, for `DaemonStatus`. */
-export type TSandboxState = "enforced" | "off" | "unsupported" | "error";
+export type TSandboxState = NonNullable<TDaemonStatus["sandbox"]>;
 
 // ─── Landlock ABI (uapi/linux/landlock.h) ────────────────────────────
 // Syscall numbers are uniform across architectures (allocated post-table-
@@ -222,7 +196,14 @@ let appliedState: TSandboxState = "off";
  *  daemon server it is fed by the boot-time capability probe
  *  (`exec.ts` `probeSandboxCapability`) — "enforced" means risky CHILDREN are
  *  wrapped via the `--sandbox-exec` shim, not that this process is confined. */
-export const sandboxState = (): TSandboxState => appliedState;
+export const sandboxState = (): TSandboxState => {
+  if (process.platform === "linux" && appliedState === "enforced") {
+    const { getLinuxNamespaceFallbackReason } =
+      require("./linux-status") as typeof import("./linux-status");
+    if (getLinuxNamespaceFallbackReason()) return "landlock-only";
+  }
+  return appliedState;
+};
 
 /** Record the posture for {@link sandboxState} — used by the boot-time
  *  capability probe, which computes the posture without applying anything. */

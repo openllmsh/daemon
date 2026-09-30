@@ -1,0 +1,507 @@
+import type { FSWatcher, ReadStream } from "node:fs";
+import {
+  chmodSync,
+  createReadStream,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { SandboxLaunchError } from "./exec";
+
+export type TLinuxLaunchOutcome =
+  | { readonly kind: "setup_rejected"; readonly code: 78 }
+  | { readonly kind: "exec_failed"; readonly code: 127 }
+  | { readonly kind: "exited"; readonly code: number }
+  | { readonly kind: "reap_unconfirmed"; readonly code: null }
+  | { readonly kind: "owner_lost"; readonly code: null };
+
+export type TLinuxCleanupResult = {
+  readonly cleanup: "confirmed" | "unconfirmed";
+};
+
+/**
+ * The bounded shim exits with this code when it cannot confirm that every
+ * sandboxed descendant reaped (`REAP_UNCONFIRMED_EXIT` in `linux-native.c`).
+ * The code collides with a workload status of 75. The shim sends COMPLETE
+ * only on the confirmed path, and always before it exits, so `shimExited`
+ * drains the socket first and maps a bare 75 to `reap_unconfirmed` only
+ * when COMPLETE never arrived.
+ */
+export const REAP_UNCONFIRMED_EXIT = 75;
+
+export type TLinuxLaunchHandle = {
+  /** Report the launch outcome or a bounded cleanup failure. */
+  readonly completion: Promise<TLinuxLaunchOutcome>;
+  readonly ready: Promise<void>;
+  /** Keep ownership until descendant exit is confirmed. */
+  readonly cleanup: Promise<TLinuxCleanupResult>;
+  readonly cleanupStatus: "pending" | "confirmed" | "unconfirmed";
+  readonly signal: (signal: 1 | 2 | 9 | 15) => void;
+  readonly shimExited: (code: number) => void;
+  readonly bindShim?: (kill: () => void) => void;
+  /** Release the prepared launch only when no shim was created. */
+  readonly cancelBeforeSpawn?: () => void;
+};
+const launches = new Map<string, TLinuxLaunchHandle>();
+
+/** Create a private registration channel before the caller starts the shim. */
+export const prepareLinuxLaunch = (): string[] => {
+  if (launches.size >= 256)
+    throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "launch limit reached");
+  if (process.platform !== "linux")
+    throw new SandboxLaunchError("SANDBOX_UNAVAILABLE", "Linux host required");
+  const { ptr } = require("bun:ffi") as typeof import("bun:ffi");
+  const {
+    recordLinuxSandboxRejection,
+    getLinuxNamespaceFallbackReason,
+    recordLinuxNamespaceFallback,
+  } = require("./linux-status") as typeof import("./linux-status");
+  const fallback = getLinuxNamespaceFallbackReason();
+  if (fallback) return ["--sandbox-landlock-only", fallback];
+  try {
+    const { qualifyBubblewrap } =
+      require("./linux-launch") as typeof import("./linux-launch");
+    qualifyBubblewrap();
+  } catch (error) {
+    return ["--sandbox-landlock-only", recordLinuxNamespaceFallback(error)];
+  }
+  const native = (() => {
+    try {
+      const { linuxNative } =
+        require("./linux-native") as typeof import("./linux-native");
+      return linuxNative();
+    } catch {
+      recordLinuxSandboxRejection("HELPER_RUNTIME_UNAVAILABLE");
+      throw new SandboxLaunchError(
+        "SANDBOX_UNAVAILABLE",
+        "helper runtime unavailable",
+      );
+    }
+  })();
+  const directory = mkdtempSync(join(tmpdir(), "sbx-"));
+  chmodSync(directory, 0o700);
+  const name = join(directory, "control");
+  const encoded = Buffer.from(`${name}\0`);
+  const listener = native.sandboxListen(ptr(encoded));
+  if (listener < 0) {
+    rmSync(directory, { recursive: true, force: true });
+    throw new SandboxLaunchError(
+      "SANDBOX_UNAVAILABLE",
+      "registration unavailable",
+    );
+  }
+  let resolveReady: () => void = () => {};
+  let rejectReady: (error: Error) => void = () => {};
+  let resolveCleanup: (result: TLinuxCleanupResult) => void = () => {};
+  let resolveCompletion: (outcome: TLinuxLaunchOutcome) => void = () => {};
+  const completion = new Promise<TLinuxLaunchOutcome>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  void ready.catch(() => {});
+  const cleanup = new Promise<TLinuxCleanupResult>((resolve) => {
+    resolveCleanup = resolve;
+  });
+  let socket = -1;
+  let registered = false;
+  let completed = false;
+  const out = new Int32Array(8);
+  let ownerFd = -1;
+  let pendingSignal = 0;
+  let admitted = false;
+  let shimExitObserved = false;
+  let killShim: (() => void) | undefined;
+  let rejected = false;
+  const fds = new Int32Array(3);
+  const ownership = Buffer.alloc(4161);
+  let leasePath = "";
+  let launchId = "";
+  let lostOuter = false;
+  let execFailed = false;
+  let exitCode: number | null = null;
+  const status = new Int32Array(1);
+  const deadline = performance.now() + 10000;
+  let cleanupDeadline = Number.POSITIVE_INFINITY;
+  let cleanupStatus: TLinuxLaunchHandle["cleanupStatus"] = "pending";
+  let watchUnavailable = false;
+  let state: "pending" | "ready" | "rejected" | "finished" = "pending";
+  const stopped = (): boolean => state === "finished";
+  let readiness: ReadStream | undefined;
+  let readinessFd = -1;
+  const cancelWait = (): void => {
+    if (readinessFd >= 0) native.sandboxWatchCancel(readinessFd);
+    readinessFd = -1;
+    readiness?.destroy();
+    readiness = undefined;
+  };
+  let leaseWatcher: FSWatcher | undefined;
+  let leaseWatchAttempted = false;
+  /*
+   * Settle all launch promises through this table. Ignore late events.
+   * Event       | Pending ready | Ready or rejected | Completion | Cleanup
+   * ready       | resolve       | no change         | pending    | pending
+   * reject      | reject        | no change         | pending    | pending
+   * finish      | reject        | no change         | outcome    | unconfirmed stays, else confirmed
+   * unconfirmed | reject        | no change         | unconfirmed| pending
+   * finished    | no change     | no change         | no change  | no change
+   */
+  const settle = (
+    event: "ready" | "reject" | "finish",
+    outcome?: TLinuxLaunchOutcome,
+    rejectionCode: SandboxLaunchError["code"] = "SANDBOX_UNAVAILABLE",
+  ): void => {
+    if (stopped()) return;
+    if (state === "pending") {
+      if (event === "ready") {
+        state = "ready";
+        resolveReady();
+      } else {
+        state = "rejected";
+        rejectReady(
+          new SandboxLaunchError(rejectionCode, "Linux setup rejected"),
+        );
+      }
+    }
+    if (event === "finish" && outcome) {
+      state = "finished";
+      if (cleanupStatus !== "unconfirmed") cleanupStatus = "confirmed";
+      resolveCleanup({ cleanup: cleanupStatus });
+      resolveCompletion(outcome);
+    }
+  };
+  const reportUnconfirmed = (): void => {
+    if (cleanupStatus !== "pending") return;
+    cleanupStatus = "unconfirmed";
+    settle("reject");
+    resolveCompletion({ kind: "reap_unconfirmed", code: null });
+    process.stderr.write("SANDBOX_UNAVAILABLE: reap_unconfirmed\n");
+  };
+  const finish = (): void => {
+    if (stopped()) return;
+    const outcome: TLinuxLaunchOutcome =
+      rejected || !registered
+        ? { kind: "setup_rejected", code: 78 }
+        : execFailed
+          ? { kind: "exec_failed", code: 127 }
+          : exitCode === null
+            ? { kind: "owner_lost", code: null }
+            : { kind: "exited", code: exitCode };
+    settle("finish", outcome);
+    cancelWait();
+    leaseWatcher?.close();
+    native.sandboxClose(listener);
+    rmSync(directory, { recursive: true, force: true });
+    if (socket >= 0) native.sandboxClose(socket);
+    if (registered) for (const fd of fds) native.sandboxClose(fd);
+    if (ownerFd >= 0) native.sandboxClose(ownerFd);
+    launches.delete(name);
+  };
+  const fail = (): void => {
+    recordLinuxSandboxRejection("SETUP_FAILED");
+    settle("reject");
+    rejected = true;
+    cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+    if (!admitted) {
+      if (shimExitObserved) {
+        finish();
+        return;
+      }
+      killShim?.();
+      /* No shim process exists when bindShim never ran (the wrapped argv was
+       * dropped or the spawn failed): nothing can fire shimExited later, so
+       * this launch finishes its own teardown or the map entry, listener and
+       * scratch dir leak until the process exits. */
+      if (killShim === undefined) {
+        finish();
+        return;
+      }
+    } else {
+      native.sandboxSignal(ownerFd, 15);
+    }
+    queueMicrotask(drive);
+  };
+  const signal = (value: 1 | 2 | 9 | 15): void => {
+    if (stopped()) return;
+    if (registered)
+      cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+    queueMicrotask(drive);
+    if (!registered) {
+      if (pendingSignal !== 9) pendingSignal = value;
+      if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
+      else if (value === 9) killShim?.();
+      return;
+    }
+    if (value === 9) {
+      native.sandboxSignal(fds[2] as number, 9);
+      native.sandboxSignal(fds[0] as number, 9);
+    } else native.sandboxSignal(fds[1] as number, value);
+  };
+  /* Read one queued completion record. The shim sends COMPLETE only when
+   * its cleanup was confirmed, so a received record settles the workload
+   * status and proves the pending exit code is not the unconfirmed code. */
+  const readCompletion = (): void => {
+    if (completed || lostOuter || !registered || socket < 0) return;
+    const result = native.sandboxCompletion(
+      socket,
+      out[0] as number,
+      ptr(status),
+    );
+    if (result === 1) {
+      completed = true;
+      cleanupDeadline = Math.min(cleanupDeadline, performance.now() + 5000);
+      exitCode = status[0] ?? null;
+    }
+    if (result === 2) execFailed = true;
+    if (result === 3) reportUnconfirmed();
+    if (result < 0) {
+      lostOuter = true;
+      signal(9);
+    }
+  };
+  const step = (): void => {
+    if (performance.now() >= cleanupDeadline) reportUnconfirmed();
+    if (rejected) {
+      if (!admitted) return;
+      try {
+        const owner = new Int32Array([ownerFd, ownerFd, ownerFd]);
+        if (native.sandboxDescriptorsExited(ptr(owner))) {
+          const lock = native.sandboxLeaseLock(
+            ptr(Buffer.from(`${leasePath}\0`)),
+            0,
+          );
+          if (lock >= 0) {
+            try {
+              const lease: unknown = JSON.parse(
+                readFileSync(leasePath, "utf8"),
+              );
+              if (
+                typeof lease === "object" &&
+                lease !== null &&
+                "launchId" in lease &&
+                lease.launchId === launchId &&
+                "guardianPid" in lease &&
+                lease.guardianPid === 0
+              ) {
+                const temp = `${leasePath}.recover`;
+                writeFileSync(
+                  temp,
+                  JSON.stringify({ ...lease, cleanupComplete: true }),
+                  { mode: 0o600 },
+                );
+                renameSync(temp, leasePath);
+              }
+            } finally {
+              native.sandboxClose(lock);
+            }
+          }
+        }
+        const lease: unknown = JSON.parse(readFileSync(leasePath, "utf8"));
+        if (
+          typeof lease === "object" &&
+          lease !== null &&
+          "launchId" in lease &&
+          lease.launchId === launchId &&
+          "cleanupComplete" in lease &&
+          lease.cleanupComplete === true &&
+          native.sandboxDescriptorsExited(ptr(owner))
+        )
+          finish();
+      } catch {
+        /* Keep ownership until the outer shim confirms cleanup. */
+      }
+      return;
+    }
+    if (!registered) {
+      if (performance.now() >= deadline) {
+        fail();
+        return;
+      }
+      if (socket < 0) {
+        const accepted = native.sandboxAccept(listener);
+        if (accepted === -2) return;
+        if (accepted < 0) {
+          fail();
+          return;
+        }
+        socket = accepted;
+      }
+      const result = native.sandboxRegister(
+        socket,
+        ptr(out),
+        ptr(ownership),
+        pendingSignal,
+      );
+      if (result < 0) {
+        fail();
+        return;
+      }
+      if (result === 1) {
+        fds.set(out.subarray(1, 4));
+        registered = true;
+        leasePath = ownership.subarray(0, ownership.indexOf(0)).toString();
+        launchId = ownership.subarray(4096, 4160).toString();
+        settle("ready");
+        if (pendingSignal) signal(pendingSignal as 1 | 2 | 9 | 15);
+      } else if (result === 2) {
+        admitted = true;
+        ownerFd = out[7] as number;
+        leasePath = ownership.subarray(0, ownership.indexOf(0)).toString();
+        launchId = ownership.subarray(4096, 4160).toString();
+      }
+    } else {
+      readCompletion();
+      if (lostOuter && !completed) {
+        try {
+          const lease: unknown = JSON.parse(readFileSync(leasePath, "utf8"));
+          completed =
+            typeof lease === "object" &&
+            lease !== null &&
+            "launchId" in lease &&
+            lease.launchId === launchId &&
+            "cleanupComplete" in lease &&
+            lease.cleanupComplete === true;
+        } catch {
+          /* Keep the descriptors until cleanup is confirmed. */
+        }
+      }
+      if (
+        (completed || cleanupStatus === "unconfirmed") &&
+        native.sandboxDescriptorsExited(ptr(fds)) === 1
+      )
+        finish();
+    }
+  };
+  const drive = (): void => {
+    if (stopped()) return;
+    cancelWait();
+    step();
+    if (stopped()) return;
+    if (leasePath && !leaseWatchAttempted) {
+      leaseWatchAttempted = true;
+      const watchFailed = (): void => {
+        if (stopped()) return;
+        leaseWatcher?.close();
+        if (!registered) fail();
+        else reportUnconfirmed();
+      };
+      try {
+        leaseWatcher = watch(
+          dirname(leasePath),
+          { persistent: false },
+          (_event, file) => {
+            if (file === basename(leasePath)) drive();
+          },
+        );
+        leaseWatcher.on("error", watchFailed);
+      } catch {
+        watchFailed();
+      }
+    }
+    if (stopped() || watchUnavailable) return;
+    const targets: number[] = [];
+    if (!rejected && !lostOuter && !completed)
+      targets.push(socket < 0 ? listener : socket);
+    for (const fd of registered ? [ownerFd, ...fds] : [ownerFd])
+      if (fd >= 0 && native.sandboxAlive(fd)) targets.push(fd);
+    const until = Math.min(
+      registered || rejected ? Infinity : deadline,
+      cleanupStatus === "unconfirmed" ? Infinity : cleanupDeadline,
+    );
+    const timeout = Number.isFinite(until)
+      ? Math.max(0, Math.ceil(until - performance.now()))
+      : -1;
+    const descriptors = new Int32Array(targets.length ? targets : [-1]);
+    const fd = native.sandboxWatch(ptr(descriptors), targets.length, timeout);
+    if (fd < 0) {
+      recordLinuxSandboxRejection("SETUP_FAILED");
+      if (ownerFd >= 0) native.sandboxSignal(ownerFd, 15);
+      else killShim?.();
+      if (registered) {
+        native.sandboxSignal(fds[2] as number, 9);
+        native.sandboxSignal(fds[0] as number, 9);
+      }
+      watchUnavailable = true;
+      reportUnconfirmed();
+      return;
+    }
+    readinessFd = fd;
+    readiness = createReadStream("", { fd, autoClose: true, highWaterMark: 1 });
+    readiness.once("data", drive);
+    readiness.once("error", () => {
+      if (!stopped()) {
+        watchUnavailable = true;
+        reportUnconfirmed();
+        drive();
+      }
+    });
+  };
+  const shimExited = (code: number): void => {
+    if (stopped()) return;
+    shimExitObserved = true;
+    if (registered || admitted) {
+      /* The verdict lands first: a confirmed `finish()` must not mask it.
+       * A confirmed cleanup still exits 75 when that is the workload status,
+       * so drain a queued COMPLETE before mapping the code. The shim sends
+       * COMPLETE only on the confirmed path, always before it exits. */
+      if (code === REAP_UNCONFIRMED_EXIT) {
+        readCompletion();
+        if (!completed) reportUnconfirmed();
+      }
+      drive();
+      return;
+    }
+    if (rejected) {
+      finish();
+      return;
+    }
+    // Drain a queued connection before classifying a pre-connect exit.
+    if (socket < 0) {
+      const accepted = native.sandboxAccept(listener);
+      if (accepted >= 0) socket = accepted;
+    }
+    if (socket >= 0) {
+      drive();
+      return;
+    }
+    settle(
+      "reject",
+      undefined,
+      code === 78 ? "POLICY_INVALID" : "SANDBOX_UNAVAILABLE",
+    );
+    finish();
+  };
+  launches.set(name, {
+    ready,
+    cleanup,
+    get cleanupStatus() {
+      return cleanupStatus;
+    },
+    signal,
+    completion,
+    shimExited,
+    cancelBeforeSpawn: finish,
+    bindShim: (kill): void => {
+      killShim = kill;
+      if (rejected && !admitted) kill();
+    },
+  });
+  queueMicrotask(drive);
+  return ["--sandbox-control", name];
+};
+
+export const linuxLaunchHandle = (
+  argv: readonly string[],
+): TLinuxLaunchHandle | undefined => {
+  const index = argv.indexOf("--sandbox-control");
+  const separator = argv.indexOf("--");
+  if (index < 0 || (separator >= 0 && index > separator)) return undefined;
+  return launches.get(argv[index + 1] ?? "");
+};

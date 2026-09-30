@@ -751,6 +751,10 @@ const computeStatusFreshInner = async (
       cli_installed: true,
     });
   }
+  const sandboxDetails =
+    process.platform === "linux"
+      ? (await import("./sandbox/linux-status")).getLinuxSandboxDetails()
+      : undefined;
   return {
     daemon_version: DAEMON_VERSION,
     key_configured: hasApiKey(),
@@ -761,6 +765,7 @@ const computeStatusFreshInner = async (
     identity_conflict: hasIdentityConflict() || undefined,
     port: daemonPort(),
     sandbox: sandboxState(),
+    ...(sandboxDetails !== undefined ? { sandboxDetails } : {}),
     caps: currentDaemonCaps(),
     control_caps: ["refresh_models_due"],
     connections,

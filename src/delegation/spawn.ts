@@ -50,7 +50,7 @@ import {
 import { cleanNativeSpawnEnv } from "../native-runtime/types";
 import { currentTickId } from "../op-context";
 import { childEnvironment } from "../sandbox/child-policy";
-import { sandboxSpawnArgs } from "../sandbox/exec";
+import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import {
   daemonTempDir,
   leaseDaemonTmpDirWithIdentity,
@@ -566,14 +566,16 @@ export const runCaptureResult = async (
       cwd: spawnCwd(env),
       env: leased.env,
     };
-    const child = superviseSpawn(
-      sandboxSpawnArgs(command, { probe: opts?.probe }),
-      spawnOptions,
+    const child = withSandboxSpawn(
+      command,
+      (wrapped) => superviseSpawn(wrapped, spawnOptions),
+      { probe: opts?.probe },
     );
     spawned = child;
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
+    await child.sandbox?.ready;
     // Tie the minted tmp dir to the real child — the lease upgrade is async
     // off the spawn path, and the exit watcher removes the dir outright when
     // the child dies (rework-7 / RG-2).
@@ -824,10 +826,11 @@ export const runCaptureResult = async (
       if (timer !== null) clearTimeout(timer);
       budget.release();
     }
-  } catch {
+  } catch (error) {
     // A throw after spawn (stdout read, budget setup) must not leave the
     // child running with its scratch dir deleted under it.
     if (spawned !== null) await spawned.terminate().catch(() => undefined);
+    if (error instanceof SandboxLaunchError) throw error;
     return { kind: "failed" };
   } finally {
     // Removes the dir only when no child was bound to it (setup or spawn
@@ -1040,16 +1043,18 @@ export const spawnLogin = async (
   const leased = spawnEnvLeased(env);
   let child: TSupervisedChild;
   try {
-    child = superviseSpawn(
-      sandboxSpawnArgs(argv, { probe: loginOpts?.probe }),
-      {
-        kind: "login",
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: spawnCwd(env),
-        env: leased.env,
-      },
+    child = withSandboxSpawn(
+      argv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "login",
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          cwd: spawnCwd(env),
+          env: leased.env,
+        }),
+      { probe: loginOpts?.probe },
     );
   } catch (error) {
     // Spawn never produced a child — the minted dir is ours to remove
@@ -1066,6 +1071,7 @@ export const spawnLogin = async (
     return terminatePromise;
   };
   try {
+    await child.sandbox?.ready;
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
@@ -1451,8 +1457,12 @@ export const spawnLogin = async (
       whenReleased: child.whenReleased,
       ...stamp,
     };
-  } catch {
+  } catch (error) {
     const reap = await requestTerminate();
+    // Readiness can fail before the temp dir is bound to the child.
+    // Keep the dir until the supervisor confirms process-tree release.
+    discardMintedTmpDirAfter(leased, child.whenReleased);
+    if (error instanceof SandboxLaunchError) throw error;
     return {
       code: -1,
       output: "",
@@ -1581,19 +1591,22 @@ export const spawnLoginPty = async (
     // was already gated to darwin/linux above. We POLL `tsFile` for
     // `opts.until`.
     const scriptArgv = ptyScriptArgv(argv, tsFile) ?? [...argv];
-    const child = superviseSpawn(
-      sandboxSpawnArgs(scriptArgv, { probe: opts?.probe }),
-      {
-        kind: "login",
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-        cwd: spawnCwd(env),
-        env: leased.env,
-      },
+    const child = withSandboxSpawn(
+      scriptArgv,
+      (wrapped) =>
+        superviseSpawn(wrapped, {
+          kind: "login",
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          cwd: spawnCwd(env),
+          env: leased.env,
+        }),
+      { probe: opts?.probe },
     );
     const proc = child.subprocess;
     released = Promise.allSettled([proc.exited, child.whenReleased]);
+    await child.sandbox?.ready;
     // Lease upgrade only — NOT the exit watcher: the typescript lives inside
     // the minted dir and is read once more after the child exits, so removal
     // must wait for the function's own cleanup (the finally below removes the
