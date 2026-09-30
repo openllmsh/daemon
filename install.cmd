@@ -16,6 +16,7 @@ if not "%OPENLLM_INSTALL_STATUS%"=="0" exit /b %OPENLLM_INSTALL_STATUS%
 set "OPENLLM_PATH_STATUS="
 set "OPENLLM_PATH_BIN="
 if defined USERPROFILE set "OPENLLM_PATH_BIN=%USERPROFILE:/=\%"
+if defined OPENLLM_PATH_BIN for %%I in ("%OPENLLM_PATH_BIN%") do set "OPENLLM_PATH_BIN=%%~fI"
 :normalize_profile_sep
 if "%OPENLLM_PATH_BIN:~-1%"=="\" if not "%OPENLLM_PATH_BIN:~-2,1%"==":" set "OPENLLM_PATH_BIN=%OPENLLM_PATH_BIN:~0,-1%"
 if "%OPENLLM_PATH_BIN:~-1%"=="\" if not "%OPENLLM_PATH_BIN:~-2,1%"==":" goto normalize_profile_sep
