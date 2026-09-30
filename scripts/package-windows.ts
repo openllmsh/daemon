@@ -28,13 +28,13 @@ const PACKAGE_TARGET = "win32-x64" as const;
 const DAEMON_ENTRY = "bin/openllmd.exe" as const;
 const PACKAGE_ENTRY_NAMES = [
   DAEMON_ENTRY,
-  "install.ps1",
+  "install-isolated.ps1",
   "manifest.json",
   "SHA256SUMS",
 ] as const;
 const MAX_UINT32 = 0xffff_ffff;
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const INSTALL_SCRIPT = resolve(SCRIPT_DIR, "..", "install.ps1");
+const INSTALL_SCRIPT = resolve(SCRIPT_DIR, "..", "install-isolated.ps1");
 
 export type TWindowsPackageManifest = {
   readonly target: typeof PACKAGE_TARGET;
@@ -306,7 +306,7 @@ export const packageWindows = (
   const sumsBytes = Buffer.from(`${actualSha}  ${DAEMON_ENTRY}\n`, "utf8");
   const entries: readonly TWindowsZipEntry[] = [
     { name: DAEMON_ENTRY, bytes: daemonBytes },
-    { name: "install.ps1", bytes: installBytes },
+    { name: "install-isolated.ps1", bytes: installBytes },
     { name: "manifest.json", bytes: manifestBytes },
     { name: "SHA256SUMS", bytes: sumsBytes },
   ];
