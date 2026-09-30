@@ -1152,8 +1152,9 @@ auto-links its isolated run-view to whatever the user-run installer lands.
 `packages/daemon/release-types.ts`. A 2.8.0 stable release ships 4 targets:
 darwin-arm64, darwin-x64-baseline, linux-x64-baseline and linux-arm64. A 2.8.0
 prerelease (for example 2.8.0-beta.3) ships all five, with win32-x64 as an
-unsigned preview — `releaseTargetsFor` selects by channel. A supported Windows
-stable release is 2.8.1 work (the ACL/policy confinement lands there, O8).
+unsigned preview. `daemonReleaseTargets` selects five targets when the version
+contains `-`. It selects the four POSIX targets for a stable release.
+A supported Windows stable release is 2.8.1 work (ACL/policy confinement, O8).
 `DAEMON_BINARY_SOURCES`
 in the same file pins the compiled daemon's checked-in input closure —
 `src/`, `install.sh`, `release-types.ts`, `package.json`,

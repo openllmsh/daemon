@@ -10,7 +10,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="License: BUSL-1.1" src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg"></a>
   <img alt="source-available" src="https://img.shields.io/badge/source-available-informational.svg">
-  <img alt="targets" src="https://img.shields.io/badge/targets-darwin%20%C2%B7%20linux%20(arm64%2Fx64)-lightgrey.svg">
+  <img alt="stable targets" src="https://img.shields.io/badge/stable_targets-darwin%20%C2%B7%20linux%20(arm64%2Fx64)-lightgrey.svg">
 </p>
 
 ---
@@ -49,7 +49,9 @@ openllm version
 openllm status
 ```
 
-Supported targets are **macOS and Linux, arm64 and x64**. Published binaries are
+Stable releases support **macOS and Linux, arm64 and x64**.
+Prereleases add an unsigned `win32-x64` build.
+Published binaries are
 compiled and SHA-256-verified during installation; Bun is not required to run
 them. Vendor clients have their own requirements; follow the installer or
 provider-connect guidance for any missing client.
@@ -135,8 +137,12 @@ cd daemon
 bun install
 bun run compile:host        # → dist/openllmd (this machine's target)
 ./dist/openllmd version
-bun run compile             # darwin/linux × arm64/x64 (+ .gz sidecars)
+bun run compile             # build the default targets for this host
 ```
+
+The default build selects the four POSIX targets on Linux and macOS.
+On Windows, it also selects `win32-x64`.
+Windows targets require a native Windows host.
 
 Bun is required for these build commands. Compiling does not install the service
 or register credentials. Run `--help` on the resulting binary before using it;
