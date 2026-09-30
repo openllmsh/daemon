@@ -15,6 +15,12 @@
 
 ---
 
+> [!WARNING]
+> **Beta software.** OpenLLM 2.8.0-beta.3 is a prerelease. It can contain bugs.
+> Its behavior can change before the stable 2.8.0 release. The Windows build is
+> not signed. For production use, install the stable release with the stable
+> installer in this README.
+
 The local service for OpenLLM's **subscription providers**. Requests run on your
 machine through the vendors' official clients and their local credentials:
 
