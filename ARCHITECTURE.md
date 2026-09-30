@@ -809,9 +809,10 @@ Two orthogonal hardenings from
   UNCONFINED (device-session PTYs must run the user's real CLI over their real
   files), and each risky child argv is wrapped by
   `sandboxSpawnArgs()` (`sandbox/exec.ts`) into the
-  `openllmd --sandbox-exec -- <argv…>` self-re-exec shim, which applies
-  `applyDaemonSandbox({ force: true })` to itself before running the child
-  (inheritance across `execve` does the rest). Wrapped: delegation capture /
+  `openllmd --sandbox-exec -- <argv…>` shim. On Linux, the shim uses the
+  namespace launch path below. On macOS, it calls
+  `applyDaemonSandbox({ force: true })` before it runs the child.
+  Wrapped: delegation capture /
   login / keychain spawns, the `open`/`xdg-open` browser launch, and the
   long-lived native runtimes. NOT wrapped: the session-host PTY spawn (the
   exemption), read-only diagnostics (`ps`, `journalctl`/`tail`), and CLI-verb
@@ -820,17 +821,16 @@ Two orthogonal hardenings from
   (the state dir — which contains the binary, CLI homes, and logs — plus the
   claude-code integration footprint `~/.claude`/`~/.claude.json` read-write;
   system trees read-only; everything else, notably `~/.ssh`/`~/.aws`/the
-  user's real CLI homes, implicitly denied). `applyDaemonSandbox()`
-  (`sandbox/landlock.ts`) dispatches by platform to one of two in-process,
-  unprivileged, self-applied backends — applied in the SHIM process, both
-  inherited across `execve` (so `bash` running a SHA-gated
-  integration script, `curl`, and the vendor CLIs are confined too):
-  - **Linux → Landlock** (`sandbox/landlock.ts`) — a deny-by-default Landlock
-    ruleset over the working set (kernel ≥ 5.13, `bun:ffi` → `syscall(2)`).
-    Landlock is file-only, so non-file ops are untouched; `/dev` is in the
-    working set because every `Bun.spawn` with `stdout:"ignore"` opens
-    `/dev/null` (without it `posix_spawn` of `bash`/the vendor CLIs fails
-    `EACCES` and connect/integrations silently break).
+  user's real CLI homes, implicitly denied). The platform backends apply
+  these rules before a vendor starts:
+  - **Linux → namespaces and Landlock.** `sandbox/linux-launch.ts` uses
+    bubblewrap to create private PID and mount namespaces. The native
+    `--sandbox-helper` installs private procfs with `subset=pid` and a
+    Landlock ruleset before the vendor starts. Bun compiles the C helper at
+    run time through `bun:ffi`. The namespace has private temporary files
+    and a private device set. If the host cannot provide the namespace
+    path, the shim uses Landlock and reports `landlock-only` with a reason.
+    A launch setup failure exits 78 before the vendor starts.
   - **macOS → Seatbelt** (`sandbox/seatbelt.ts`) — an SBPL profile applied via
     `sandbox_init()` (`bun:ffi` → `libsandbox`), deprecated-but-functional, no
     Developer ID signing (App Sandbox is Phase C). BOTH WRITES and READS are
@@ -851,21 +851,21 @@ Two orthogonal hardenings from
   The **systemd user unit** (`renderUnitHardening()` in `service.ts`) adds a
   defense-in-depth SECCOMP layer ONLY — `NoNewPrivileges`,
   `RestrictAddressFamilies`, `SystemCallFilter=@system-service @sandbox`, etc.
-  It deliberately carries no capability/mount directives: a `systemctl --user`
-  unit runs unprivileged and can't drop capabilities (`218/CAPABILITIES`) or
-  set up mount namespaces, so FS confinement is Landlock's job, not systemd's.
+  The unit does not create the vendor mount namespaces. The child launch
+  path owns those namespaces and Landlock. The system call filter permits
+  `mount_setattr` for namespace setup.
   W^X stays off (`MemoryDenyWriteExecute` is absent — Bun's JIT needs it).
 
-  Posture rides every status push as `DaemonStatus.sandbox`
-  (`enforced`/`off`/`unsupported`/`error` — fail-open with a loud log, never
-  silent). Under the per-child model it comes from a boot-time CAPABILITY
-  probe (`probeSandboxCapability` in `sandbox/exec.ts` — gates + platform +
-  Linux Landlock ABI, restricting nothing): `enforced` means "risky children
-  are wrapped", not "this process is confined". Kill switch
-  `OPENLLM_DAEMON_NO_SANDBOX=1` (children spawn unwrapped); dev source runs
-  opt in via `OPENLLM_DAEMON_SANDBOX=1` (wraps via `bun <entry>
-  --sandbox-exec`). CLI verbs run unconfined (service registration/uninstall
-  touch paths outside the working set).
+  Status reports use `DaemonStatus.sandbox`: `enforced`, `landlock-only`,
+  `off`, `unsupported` or `error`. `sandboxDetails` reports the Linux
+  backend, qualification result and rejection reason.
+  On Linux, `enforced` means the confined namespace self-test passed.
+  On macOS, `enforced` means child wrapping is enabled.
+  Neither status means that the daemon itself is confined.
+  A required vendor launch fails closed if confinement cannot be applied.
+  `OPENLLM_DAEMON_NO_SANDBOX=1` disables optional wrapping; it cannot bypass
+  a required launch. POSIX source runs opt in with
+  `OPENLLM_DAEMON_SANDBOX=1`. CLI verbs stay outside the vendor sandbox.
 
 ## Delegation (the compliance core)
 
@@ -1144,6 +1144,27 @@ auto-links its isolated run-view to whatever the user-run installer lands.
 > real browser login. `chatgpt`/`kimi_code` install knobs are confirmed
 > from the vendor scripts but the full connect→usage path still wants a
 > live pass; each carries `RESEARCH` notes + `⚠️` markers.
+
+## Install locks
+
+On POSIX, update, environment and vendor locks use the shared directory-lock
+runtime in `packages/tunnel/session/`. It pins directory descriptors and
+uses one versioned claim format. Both POSIX installers call the shared
+lock helper before they change protected state.
+
+A legacy hold stays in place after its process exits. Stop the older
+installer and its workers. Then run `openllm doctor --clear-legacy-locks`
+or `openllmd doctor --clear-legacy-locks`. On Windows, this command reports
+`not-applicable` and does not change locks. Windows update locks keep the
+JSON owner format.
+
+The Windows user installer is `install.ps1`; `install.cmd` is its CMD
+wrapper. It takes an exclusive transaction lock before it checks installed
+versions. It verifies both downloaded binaries against the selected tag.
+It keeps the recovery journal until the alias and user PATH setup finish.
+Native Windows credential entry is not available in this build.
+The installer reports incomplete startup; it does not start the daemon.
+The isolated test installer is `install-isolated.ps1`.
 
 ## Build + distribution
 
