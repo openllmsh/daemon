@@ -266,6 +266,15 @@ export const runCli = (): boolean => {
     return runSessionHostProcess(args.slice(1));
   }
 
+  if (args[0] === "auth") {
+    void import("./auth-cli")
+      .then(async ({ runAuthCli }) =>
+        process.exit(await runAuthCli(args.slice(1))),
+      )
+      .catch(() => process.exit(1));
+    return true;
+  }
+
   if (args.includes("-h") || args.includes("--help") || args[0] === "help") {
     process.stdout.write(HELP);
     process.exit(0);

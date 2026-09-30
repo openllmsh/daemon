@@ -4,8 +4,9 @@
  *
  * It is transport-agnostic: the WebSocket control channel (`control-channel.ts`)
  * pulls a command off the relay socket, runs it through `runCommandInner`, and
- * acks + pushes a fresh status snapshot back over the same socket. There is no
- * long-poll anymore — the relay socket is the daemon's only control transport.
+ * acks + pushes a fresh status snapshot back over the same socket. The private
+ * local auth adapter reuses this executor and the same scheduler; neither the
+ * short-lived CLI nor MCP executes provider delegates itself.
  */
 
 import type {
@@ -53,6 +54,8 @@ const listLocalSessionsCache = new Map<
 >();
 
 export type TRunCommandOptions = {
+  readonly localOnly?: boolean;
+  readonly expectedLoginFlowId?: string;
   /**
    * Owned by the caller's `onCommand` closure. Explicit `update` registers
    * reexec here so the terminal ack can be sent first while the apply lease
@@ -84,7 +87,11 @@ export const runCommandInner = async (
           };
         }
         const r = await runWithLoginCommand(
-          { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+          {
+            flowId: cmd.id,
+            keyId: daemonApiKeyId() ?? "local",
+            localOnly: opts?.localOnly,
+          },
           () => delegate.connect(),
         );
         // A login that just landed is the freshest moment to report this
@@ -126,7 +133,11 @@ export const runCommandInner = async (
           };
         }
         const r = await runWithLoginCommand(
-          { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+          {
+            flowId: cmd.id,
+            keyId: daemonApiKeyId() ?? "local",
+            localOnly: opts?.localOnly,
+          },
           () =>
             delegate.connectDeviceCode !== undefined
               ? delegate.connectDeviceCode()
@@ -150,6 +161,16 @@ export const runCommandInner = async (
         const requestedFlow = cmd.payload.flow_id;
         const liveFlow = slot.flow();
         if (
+          opts?.expectedLoginFlowId !== undefined &&
+          liveFlow?.flowId !== opts.expectedLoginFlowId
+        ) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "flow_mismatch" },
+          };
+        }
+        if (
           requestedFlow !== undefined &&
           liveFlow !== null &&
           requestedFlow !== liveFlow.flowId
@@ -164,7 +185,11 @@ export const runCommandInner = async (
         const cancelConnect = delegate?.cancelConnect;
         if (cancelConnect !== undefined) {
           const r = await runWithLoginCommand(
-            { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+            {
+              flowId: cmd.id,
+              keyId: daemonApiKeyId() ?? "local",
+              localOnly: opts?.localOnly,
+            },
             () => cancelConnect(),
           );
           return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
@@ -213,7 +238,11 @@ export const runCommandInner = async (
         let r: Awaited<ReturnType<typeof delegate.logout>>;
         try {
           r = await runWithLoginCommand(
-            { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+            {
+              flowId: cmd.id,
+              keyId: daemonApiKeyId() ?? "local",
+              localOnly: opts?.localOnly,
+            },
             () =>
               runWithAuthOperation(cmd.payload.slug, () => delegate.logout()),
           );
@@ -245,6 +274,17 @@ export const runCommandInner = async (
             result: { error: "no in-flight login to receive a code" },
           };
         }
+        if (
+          opts?.expectedLoginFlowId !== undefined &&
+          loginSlot(cmd.payload.slug).flow()?.flowId !==
+            opts.expectedLoginFlowId
+        ) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "flow_mismatch" },
+          };
+        }
         const code = openSealed(cmd.payload.sealed);
         if (code === null) {
           return {
@@ -255,7 +295,11 @@ export const runCommandInner = async (
         }
         const submitLoginCode = delegate.submitLoginCode;
         const r = await runWithLoginCommand(
-          { flowId: cmd.id, keyId: daemonApiKeyId() ?? "local" },
+          {
+            flowId: cmd.id,
+            keyId: daemonApiKeyId() ?? "local",
+            localOnly: opts?.localOnly,
+          },
           () => submitLoginCode(code),
         );
         if (r.ok) {

@@ -8,7 +8,6 @@ import type {
   TDoctorLocalReportRequest,
 } from "@openllmsh/protocol";
 import {
-  DOCTOR_LOCAL_CAPABILITY_HEADER,
   DOCTOR_LOCAL_PREFERENCE_PATH,
   DOCTOR_LOCAL_REPORT_PATH,
   DOCTOR_LOCAL_STATUS_PATH,
@@ -16,7 +15,15 @@ import {
   parseDoctorLocalPreference,
   parseDoctorLocalReportRequest,
 } from "@openllmsh/protocol";
-import { capabilityMatches } from "./capability";
+import {
+  isLoopbackLocalHost,
+  localJson as json,
+  localAccessFailure,
+  readBoundedLocalJson,
+} from "../local-http";
+
+export const isLoopbackDoctorHost = isLoopbackLocalHost;
+
 import {
   applyLocalPreferenceAndMaybePurge,
   flushDoctorReport,
@@ -24,45 +31,6 @@ import {
   reportingStatus,
 } from "./engine";
 import { writeLocalPreference } from "./preference";
-
-const json = (status: number, body: unknown): Response =>
-  new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": "no-store",
-    },
-  });
-
-const portOk = (port: string): boolean => {
-  if (!/^\d{1,5}$/.test(port)) return false;
-  const n = Number(port);
-  return n >= 1 && n <= 65535;
-};
-
-/** Strict Host allow-list: loopback only. Rejects userinfo, extras, remotes. */
-export const isLoopbackDoctorHost = (host: string | null): boolean => {
-  if (host === null) return false;
-  const raw = host.trim().toLowerCase();
-  if (raw === "" || raw.includes("@") || /\s/.test(raw)) return false;
-  if (raw.startsWith("[")) {
-    const close = raw.indexOf("]");
-    if (close <= 1) return false;
-    const name = raw.slice(1, close);
-    const rest = raw.slice(close + 1);
-    if (name !== "::1") return false;
-    if (rest === "") return true;
-    return rest.startsWith(":") && portOk(rest.slice(1));
-  }
-  if (raw.includes("]")) return false;
-  const parts = raw.split(":");
-  if (parts.length > 2) return false;
-  const name = parts[0] ?? "";
-  if (name !== "127.0.0.1" && name !== "localhost") return false;
-  const port = parts[1];
-  if (port === undefined) return true;
-  return portOk(port);
-};
 
 const capabilityDeniedBody = (pathname: string): Record<string, unknown> => {
   if (pathname === DOCTOR_LOCAL_STATUS_PATH) {
@@ -90,38 +58,19 @@ const authorizeLocalDoctor = (
   req: Request,
   pathname: string,
 ): Response | null => {
-  if (!isLoopbackDoctorHost(req.headers.get("host"))) {
-    return json(403, { error: "forbidden" });
-  }
-  if (req.headers.get("origin") !== null) {
-    return json(403, { error: "forbidden" });
-  }
-  const presented = req.headers.get(DOCTOR_LOCAL_CAPABILITY_HEADER);
-  if (!capabilityMatches(presented)) {
-    return json(403, capabilityDeniedBody(pathname));
-  }
-  return null;
+  const failure = localAccessFailure(req);
+  return failure === null
+    ? null
+    : json(
+        403,
+        failure === "capability_missing"
+          ? capabilityDeniedBody(pathname)
+          : { error: failure },
+      );
 };
 
-const readJsonBody = async (req: Request): Promise<unknown | Response> => {
-  const len = Number(req.headers.get("content-length") ?? "0");
-  if (Number.isFinite(len) && len > DOCTOR_REPORT_MAX_BODY_BYTES) {
-    return json(413, { error: "oversize" });
-  }
-  const ct = req.headers.get("content-type") ?? "";
-  if (!ct.toLowerCase().startsWith("application/json")) {
-    return json(415, { error: "unsupported_media_type" });
-  }
-  const buf = Buffer.from(await req.arrayBuffer());
-  if (buf.byteLength > DOCTOR_REPORT_MAX_BODY_BYTES) {
-    return json(413, { error: "oversize" });
-  }
-  try {
-    return JSON.parse(buf.toString("utf8")) as unknown;
-  } catch {
-    return json(400, { error: "invalid" });
-  }
-};
+const readJsonBody = (req: Request): Promise<unknown | Response> =>
+  readBoundedLocalJson(req, DOCTOR_REPORT_MAX_BODY_BYTES);
 
 export const isDoctorLocalPath = (pathname: string): boolean =>
   pathname === DOCTOR_LOCAL_REPORT_PATH ||

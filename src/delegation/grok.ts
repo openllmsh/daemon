@@ -1083,7 +1083,7 @@ export const grokDelegate: TProviderDelegate = {
   logout: async () => {
     // `grok logout` clears the cached credentials; then ensure the isolated
     // auth.json is gone regardless of CLI version.
-    if ((await cliInstallState(PROVIDER)).installed) {
+    if ((await cliInstallState(PROVIDER, { demand: true })).installed) {
       await runCapture([bin(), "logout"], env());
     }
     await rm(authPath(), { force: true }).catch(() => {});

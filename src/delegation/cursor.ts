@@ -856,7 +856,7 @@ export const cursorDelegate: TProviderDelegate = {
 
   logout: async () => {
     clearCursorStatusObservationCache();
-    if ((await cliInstallState(PROVIDER)).installed) {
+    if ((await cliInstallState(PROVIDER, { demand: true })).installed) {
       const launchEnv = env();
       const store = await ensureVendorKeychainReady(launchEnv);
       if (store.kind !== "present") {

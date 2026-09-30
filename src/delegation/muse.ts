@@ -592,7 +592,7 @@ export const museDelegate: TProviderDelegate = {
 
   logout: async () => {
     clearMuseStatusObservationCache();
-    if ((await cliInstallState(PROVIDER)).installed) {
+    if ((await cliInstallState(PROVIDER, { demand: true })).installed) {
       await runCapture([bin(), "logout"], env(), {
         probe: unwrapKeychainSpawn(PROVIDER),
       });

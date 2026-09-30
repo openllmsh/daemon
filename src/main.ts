@@ -6,11 +6,11 @@
  * `packages/core`'s pipeline for SUBSCRIPTION hops, credentials delegated to
  * the official vendor CLIs) plus a tiny read-only `/whoami` that returns this
  * daemon's opaque `device_id` so the dashboard can tell which key's daemon is
- * on THIS host (`docs/proposals/this-machine-detection-audit.md`). CONTROL
- * (status / connect / integrations) is NOT served on localhost: the daemon
- * dials OUT to the cloud relay over a WebSocket (`control-channel.ts`) and the
- * dashboard drives it from there. Both loopback routes share one cross-origin
- * CORS/PNA grant. See `docs/proposals/daemon-relay-websocket-push.md`.
+ * on THIS host (`docs/proposals/this-machine-detection-audit.md`). Dashboard
+ * control travels through the outbound relay WebSocket (`control-channel.ts`).
+ * The CLI-only `/local/auth` and doctor routes instead require this boot's
+ * owner-only capability and reject browser Origin; they do not share the
+ * public inference/health CORS grant. See `local-auth.ts` and `local-http.ts`.
  *
  * It holds NO DEK and decrypts NO vault credential. The only secret it
  * carries is the user's `sk-llm-...` key, used to authenticate cloud

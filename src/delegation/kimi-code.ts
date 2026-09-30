@@ -781,6 +781,7 @@ const cancelConnect = makeCancelConnect(PROVIDER, slot, {
 
 export const kimiCodeDelegate: TProviderDelegate = {
   slug: PROVIDER,
+  primaryLoginMethod: "device",
   statusCancellable: false,
 
   // Moonshot's endpoint rejects tool-schema `$ref`s not based at `#/$defs/`

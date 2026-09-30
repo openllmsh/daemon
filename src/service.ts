@@ -33,8 +33,10 @@ import {
   daemonEnv,
   daemonStderrLogFilePath,
   daemonStdoutLogFilePath,
+  hasExplicitServicePortOverride,
   logFilePath,
   serviceEnvFilePath,
+  servicePort,
   stateDir,
   writeEnvFileVars,
 } from "./env";
@@ -50,7 +52,6 @@ import {
 } from "./windows-service";
 
 const LABEL = "sh.openllm.daemon";
-const DEFAULT_PORT = 8787;
 const isMac = process.platform === "darwin";
 
 const plistPath = (): string =>
@@ -61,13 +62,6 @@ const unitPath = (): string => join(unitDir(), "openllmd.service");
 const uid = (): number => (process.getuid ? process.getuid() : 0);
 const guiDomain = (): string => `gui/${uid()}`;
 const guiTarget = (): string => `${guiDomain()}/${LABEL}`;
-
-const daemonPort = (): number => {
-  const raw = process.env.OPENLLM_DAEMON_PORT;
-  if (raw === undefined) return DEFAULT_PORT;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_PORT;
-};
 
 /** Run a command, swallowing failure; returns whether it exited 0. */
 const tryRun = (cmd: string, args: readonly string[]): boolean => {
@@ -106,9 +100,15 @@ const writeEnvFileIfNeeded = (): void => {
   // Either var set explicitly re-points an existing install — otherwise
   // `OPENLLM_DAEMON_PORT=9000 openllmd start` would report :9000 while the
   // persisted env file (what the service actually boots with) kept the old one.
+  // The port half uses `hasExplicitServicePortOverride()` rather than a bare
+  // `process.env` presence check: earlier code in the same command (e.g.
+  // `requireServiceApiKey` -> `daemonEnv()`) may already have loaded
+  // `.dev.env` and written its own port into `process.env.OPENLLM_DAEMON_PORT`,
+  // which must never be mistaken for a genuine caller override of the
+  // installed (prod) service's port.
   const explicitOverride =
     process.env.OPENLLM_CLOUD_ORIGIN !== undefined ||
-    process.env.OPENLLM_DAEMON_PORT !== undefined;
+    hasExplicitServicePortOverride();
   // Seed the PROD `.env` the installed service actually boots from — NEVER the
   // dev-resolved `.dev.env`, even under `OPENLLM_DAEMON_DEV=1` (installing is a
   // production action; see `serviceEnvFilePath`).
@@ -118,7 +118,7 @@ const writeEnvFileIfNeeded = (): void => {
   writeEnvFileVars(
     {
       OPENLLM_CLOUD_ORIGIN: env.cloudOrigin,
-      OPENLLM_DAEMON_PORT: String(daemonPort()),
+      OPENLLM_DAEMON_PORT: String(servicePort()),
     },
     target,
   );
@@ -552,7 +552,7 @@ const startServiceAfterCredentialGate = (
   else if (process.platform === "win32") startWindowsService(binPath);
   else startLinux(binPath);
   process.stdout.write(
-    `openllmd v${DAEMON_VERSION} started in self-restore mode (listening on http://127.0.0.1:${daemonPort()}).\n`,
+    `openllmd v${DAEMON_VERSION} started in self-restore mode (listening on http://127.0.0.1:${servicePort()}).\n`,
   );
   return true;
 };
@@ -732,7 +732,7 @@ export const serviceStatus = async (): Promise<void> => {
       : isMac
         ? existsSync(plistPath())
         : existsSync(unitPath());
-  const port = daemonPort();
+  const port = servicePort();
   const supervisor = supervisorState();
   const health = await probeHealth(port);
   const logs = serviceLogPaths();
