@@ -76,6 +76,14 @@ extern int clock_gettime(int, void *);
 #define DEADLINE 10000
 #define GRACE 2000
 #define REAP 1000
+/* Extra reap budget in milliseconds after the `reap_unconfirmed` notice.
+ * The shim reports an unconfirmed cleanup and exits when it expires. */
+#define REAP_HOLD 5000
+/* Iteration bound for the reap loop. It also stops the loop when the
+ * monotonic clock fails. */
+#define REAP_MAX_ROUNDS 1000
+/* Exit code for an unconfirmed descendant reap. */
+#define REAP_UNCONFIRMED_EXIT 75
 #if defined(__x86_64__)
 /* O_DIRECTORY. The value depends on the architecture. */
 #define DIRECTORY 0200000
@@ -788,7 +796,9 @@ static int reapChildren(int force, int target, int *result) {
 static void cleanup(struct record *r, int guardian, int init, int initfd,
                     int monitorfd, int target, int *result) {
   long limit = now() + REAP;
+  long giveUp = limit + REAP_HOLD;
   int reported = 0;
+  int rounds = 0;
   for (;;) {
     if (initfd >= 0 && !fault(r, "skip_init_kill"))
       signalPid(initfd, 9);
@@ -802,7 +812,13 @@ static void cleanup(struct record *r, int guardian, int init, int initfd,
       fullWrite(2, s, strlen(s));
       reported = 1;
     }
-    if (reported && done < 0) {
+    /* A child that survives SIGKILL must not pin the shim. */
+    if (++rounds > REAP_MAX_ROUNDS ||
+        (reported && (done < 0 || now() >= giveUp))) {
+      if (!reported) {
+        const char *s = "SANDBOX_UNAVAILABLE: reap_unconfirmed\n";
+        fullWrite(2, s, strlen(s));
+      }
       r->cleanupUnconfirmed = 1;
       return;
     }
@@ -1304,7 +1320,7 @@ static int guardian(struct record *r) {
   if (!committed)
     result = 78;
   sendComplete(r, socket, result, init);
-  return result;
+  return r->cleanupUnconfirmed ? REAP_UNCONFIRMED_EXIT : result;
 }
 int sandboxInternal(int isGuardian) {
   struct record r;
@@ -1559,10 +1575,17 @@ int sandboxOuter(char *data, unsigned int length) {
   }
   cleanup(&r, guard, init, failed ? initfd : -1, failed ? monitorfd : -1, guard,
           &guardResult);
+  /* A guardian exit with the unconfirmed code means its own reap gave up.
+   * COMPLETE still carries the workload result; the exit code carries the
+   * cleanup verdict. */
+  if (guardResult == REAP_UNCONFIRMED_EXIT)
+    r.cleanupUnconfirmed = 1;
   if (daemonSocket >= 0) {
     sendComplete(&r, daemonSocket, result, init);
     close(daemonSocket);
   }
+  if (r.cleanupUnconfirmed)
+    return REAP_UNCONFIRMED_EXIT;
   if (complete && guardResult != result)
     return committed ? 137 : 78;
   return result;
