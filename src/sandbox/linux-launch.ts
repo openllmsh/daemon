@@ -34,6 +34,13 @@ const LINUX_VENDOR_ENV_ALLOWLIST: Readonly<
   chatgpt: new Set(["OPENAI_BASE_URL"]),
 };
 
+/** Caller-set keys that are neither ambient (`cleanNativeSpawnEnv` already
+ *  carries PATH, SHELL, locale and proxy from `process.env`) nor provider
+ *  knobs (`cliEnv`/`captureChildEnv` cover those). `cleanMuseSpawnEnv` pins
+ *  NODE_ENV on every Muse spawn — a confined child must see the same mode
+ *  contract the unwrapped spawn had. */
+const LINUX_VENDOR_CALLER_KEYS: ReadonlySet<string> = new Set(["NODE_ENV"]);
+
 export type TLinuxSandboxReason =
   | "READY"
   | "BWRAP_UNAVAILABLE"
@@ -238,13 +245,14 @@ export const linuxVendorEnvironment = (
   const overlay: Record<string, string> = {};
   const { captureChildEnv } =
     require("../delegation/auth-config") as typeof import("../delegation/auth-config");
-  const approvedKeys = new Set(
-    CLI_PROVIDERS.flatMap((provider) => [
+  const approvedKeys = new Set([
+    ...LINUX_VENDOR_CALLER_KEYS,
+    ...CLI_PROVIDERS.flatMap((provider) => [
       ...Object.keys(cliEnv(provider)),
       ...Object.keys(captureChildEnv(provider, "")),
       ...(LINUX_VENDOR_ENV_ALLOWLIST[provider] ?? []),
     ]),
-  );
+  ]);
   for (const key of approvedKeys) {
     const value = process.env[key];
     if (value !== undefined) overlay[key] = value;
