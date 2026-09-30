@@ -712,6 +712,13 @@ vendor_cli_attempt_id() {
     "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
 }
 
+# Remove only the attempt-scoped handshake/pid pair passed in. Never a
+# provider-wide path or glob — a completed worker must not wipe a newer attempt.
+vendor_cli_cleanup_attempt_files() {
+  local worker_pid_file="$1" handshake_file="$2"
+  rm -f "$worker_pid_file" "$handshake_file" 2>/dev/null || true
+}
+
 vendor_cli_process_start() {
   local pid="$1"
   # Portable PID-reuse guard (same idea as daemon child-supervisor lstart).
@@ -1138,7 +1145,7 @@ launch_vendor_cli_install() {
   # `rm` a newer attempt's handshake (provider-only paths caused that race).
   worker_pid_file="$(vendor_cli_state_dir)/.${slug}.${attempt_id}.worker_pid"
   handshake_file="$(vendor_cli_state_dir)/.${slug}.${attempt_id}.handshake"
-  rm -f "$worker_pid_file" "$handshake_file"
+  vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
   # Capture the launching shell's pid for the worker's parent-liveness guard
   # (Bash 3.2: `$$` inside `( )&` is still this value — pass it explicitly).
   local launcher_pid=$$
@@ -1190,7 +1197,7 @@ launch_vendor_cli_install() {
         done
       fi
       write_progress interrupted interrupted
-      rm -f "$worker_pid_file" "$handshake_file" 2>/dev/null || true
+      vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
       exit 130
     }
     trap on_signal HUP INT TERM
@@ -1212,7 +1219,7 @@ launch_vendor_cli_install() {
     else
       write_progress failed installer_failed "$rc"
     fi
-    rm -f "$worker_pid_file" "$handshake_file" 2>/dev/null || true
+    vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
   ) >>"$OPENLLM_DIR/cli-install.log" 2>&1 &
   worker_pid=$!
 
@@ -1226,7 +1233,7 @@ launch_vendor_cli_install() {
     vendor_cli_reap_tree "$worker_pid"
     json="$(vendor_cli_build_json "$attempt_id" "$slug" interrupted "$started" "$(vendor_cli_now_ms)" interrupted)"
     vendor_cli_write_state "$slug" "$json" || true
-    rm -f "$worker_pid_file" "$handshake_file" 2>/dev/null || true
+    vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
     vendor_cli_release_lock "$slug"
     return 0
   fi
@@ -1242,7 +1249,7 @@ launch_vendor_cli_install() {
     vendor_cli_reap_tree "$worker_pid"
     json="$(vendor_cli_build_json "$attempt_id" "$slug" interrupted "$started" "$(vendor_cli_now_ms)" interrupted)"
     vendor_cli_write_state "$slug" "$json" || true
-    rm -f "$worker_pid_file" 2>/dev/null || true
+    vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
     vendor_cli_release_lock "$slug"
     return 0
   }
