@@ -2215,7 +2215,9 @@ for ((ready_attempt=0; ready_attempt<200; ready_attempt++)); do
   sleep 0.05 2>/dev/null || sleep 1
 done
 if [ ! -f "$ready" ] || [ "$(cat "$ready" 2>/dev/null || true)" != '{"version":3,"code":0}' ]; then
+  ( set -C; printf 'release\n' > "$request" ) 2>/dev/null || { kill "$leasepid" 2>/dev/null || true; }
   wait "$leasepid" 2>/dev/null || true
+  rm -f "$request" 2>/dev/null || true
   printf 'vendor lock helper could not verify the launch handoff for %s; preserving evidence\n' "$pidfile" >&2
   exit 74
 fi
@@ -2233,7 +2235,7 @@ trap 'if [ "${group_confirmed_gone:-0}" = 1 ] || { \
 else
   action=preserve
 fi
-( set -C; printf "%s\n" "$action" > "$request" ) 2>/dev/null || true
+( set -C; printf "%s\n" "$action" > "$request" ) 2>/dev/null || { kill "$leasepid" 2>/dev/null || true; }
 wait "$leasepid" 2>/dev/null || true
 rm -f "$request" 2>/dev/null || true' EXIT
 pipeline='"$2" --internal-lock-control vendor-group "$3" "$4" || exit 74
