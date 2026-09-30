@@ -59,17 +59,65 @@ provider-connect guidance for any missing client.
 ### Preview install
 
 The current preview is `v2.8.0-beta.3`. The installer script at the tag
-installs only that tag:
+installs only that tag. The preview also ships a `win32-x64` build
+(unsigned; no PTY). A prerelease never moves `main` and never overwrites
+an earlier prerelease's branch or tag. Do not use `openllm update` to
+move a stable install to the preview.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.sh | bash
-```
+#### Install the preview on macOS or Linux
+
+1. Install the daemon and the CLI:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.sh | bash
+   ```
+
+2. Check the version:
+
+   ```sh
+   openllm version
+   ```
+
+3. If credential setup did not run, start it:
+
+   ```sh
+   openllm start
+   ```
 
 Or download the script and name the tag yourself:
-`bash install.sh --prerelease v2.8.0-beta.3`. The preview also ships a
-`win32-x64` build (unsigned; no PTY). A prerelease never moves `main` and
-never overwrites an earlier prerelease's branch or tag. Do not use
-`openllm update` to move a stable install to the preview.
+`bash install.sh --prerelease v2.8.0-beta.3`.
+
+#### Install the preview on Windows (unsigned)
+
+PowerShell:
+
+```powershell
+iex (irm https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.ps1)
+```
+
+Command Prompt (CMD):
+
+```bat
+curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.cmd
+install.cmd
+```
+
+The CMD commands download `install.cmd` from the release tag and run it.
+
+#### Go back to stable
+
+On macOS and Linux:
+
+```sh
+openllm stop
+rm -f ~/.openllm/bin/openllmd ~/.openllm/bin/openllm
+curl -fsSL https://www.openllm.sh/install | bash
+```
+
+The `rm` step removes only the preview binaries. Your settings in
+`~/.openllm/.env` stay. The install step installs the stable daemon and
+CLI and starts the daemon again. Windows has no stable release. Stable
+releases support macOS and Linux only.
 
 A key is optional when you download the binaries. On macOS and Linux, the
 installer can start credential setup in an interactive terminal.
@@ -133,7 +181,8 @@ service.
 
 The public source mirror pins its shared packages to published GitHub refs;
 the monorepo uses workspace dependencies instead. `main` tracks stable releases;
-for a prerelease, check out its `v...` tag (or the rolling `prerelease` branch)
+for a prerelease, check out its `v...` tag or its own bare-version branch
+(for example `v2.8.0-beta.3` or `2.8.0-beta.3`)
 before installing dependencies. From the public mirror:
 
 ```sh
