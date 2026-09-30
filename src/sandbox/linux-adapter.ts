@@ -215,6 +215,14 @@ export const prepareLinuxLaunch = (): string[] => {
         return;
       }
       killShim?.();
+      /* No shim process exists when bindShim never ran (the wrapped argv was
+       * dropped or the spawn failed): nothing can fire shimExited later, so
+       * this launch finishes its own teardown or the map entry, listener and
+       * scratch dir leak until the process exits. */
+      if (killShim === undefined) {
+        finish();
+        return;
+      }
     } else {
       native.sandboxSignal(ownerFd, 15);
     }
