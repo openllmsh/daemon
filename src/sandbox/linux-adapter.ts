@@ -260,6 +260,7 @@ export const prepareLinuxLaunch = (): string[] => {
       exitCode = status[0] ?? null;
     }
     if (result === 2) execFailed = true;
+    if (result === 3) reportUnconfirmed();
     if (result < 0) {
       lostOuter = true;
       signal(9);

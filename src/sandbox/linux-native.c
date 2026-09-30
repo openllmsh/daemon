@@ -184,7 +184,8 @@ enum {
   COMPLETE,
   ERROR,
   EXEC_ERROR,
-  CANCEL
+  CANCEL,
+  CLEANUP_UNCONFIRMED
 };
 struct record {
   char *memory;
@@ -1595,7 +1596,11 @@ int sandboxOuter(char *data, unsigned int length) {
   if (guardResult == REAP_UNCONFIRMED_EXIT && !complete)
     r.cleanupUnconfirmed = 1;
   if (daemonSocket >= 0) {
-    sendComplete(&r, daemonSocket, result, init);
+    if (r.cleanupUnconfirmed)
+      sendRecord(daemonSocket, &r, CLEANUP_UNCONFIRMED,
+                 REAP_UNCONFIRMED_EXIT, init, 0, 0);
+    else
+      sendComplete(&r, daemonSocket, result, init);
     close(daemonSocket);
   }
   if (r.cleanupUnconfirmed)
@@ -1792,6 +1797,8 @@ int sandboxCompletion(int socket, int outer, int *status) {
     *status = m.value;
     return 1;
   }
+  if (m.stage == CLEANUP_UNCONFIRMED && m.value == REAP_UNCONFIRMED_EXIT)
+    return 3;
   return m.stage == EXEC_ERROR && m.value == 127 ? 2 : -1;
 }
 
