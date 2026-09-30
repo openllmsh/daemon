@@ -75,6 +75,9 @@ export const recordLinuxNamespaceFallback = (error: unknown): TReason => {
 
 export const getLinuxSandboxDetails = (): TDaemonSandboxDetails => ({
   ...details,
+  ...(namespaceFallbackReason
+    ? { backend: "linux-landlock" as const, reason: namespaceFallbackReason }
+    : {}),
   lastRejection,
 });
 

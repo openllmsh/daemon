@@ -196,7 +196,14 @@ let appliedState: TSandboxState = "off";
  *  daemon server it is fed by the boot-time capability probe
  *  (`exec.ts` `probeSandboxCapability`) — "enforced" means risky CHILDREN are
  *  wrapped via the `--sandbox-exec` shim, not that this process is confined. */
-export const sandboxState = (): TSandboxState => appliedState;
+export const sandboxState = (): TSandboxState => {
+  if (process.platform === "linux" && appliedState === "enforced") {
+    const { getLinuxNamespaceFallbackReason } =
+      require("./linux-status") as typeof import("./linux-status");
+    if (getLinuxNamespaceFallbackReason()) return "landlock-only";
+  }
+  return appliedState;
+};
 
 /** Record the posture for {@link sandboxState} — used by the boot-time
  *  capability probe, which computes the posture without applying anything. */
