@@ -70,6 +70,13 @@ FROM_FILE=""
 FROM_SHA=""
 CLI_FROM_FILE=""
 CLI_SHA=""
+# Publish-time tag binding: the release pipeline stamps the ONE literal below
+# into the published copy of this script before it serves a prerelease tag.
+# It is a fixed per-invocation assignment, NOT an environment default.
+OPENLLM_PRERELEASE_TAG=''
+PRERELEASE_OPT=""
+PRERELEASE_SEEN=0
+LOCAL_FILE_SEEN=0
 usage() {
   cat <<'USAGE'
 Usage: install.sh [options]
@@ -77,39 +84,61 @@ Usage: install.sh [options]
   --sha256 <hex>         sha256 digest of the --from-file file (required with it)
   --cli-from-file <path> install the openllm CLI binary from a local file too
   --cli-sha256 <hex>     sha256 digest of the --cli-from-file file (required with it)
+  --prerelease <tag>     install the published prerelease tag (vX.Y.Z-label.N)
   -h, --help             show this text
 USAGE
 }
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-file)
+      LOCAL_FILE_SEEN=1
       FROM_FILE="${2:-}"
       [ -n "$FROM_FILE" ] || die "--from-file needs a path"
       shift 2
       ;;
-    --from-file=*) FROM_FILE="${1#*=}"; shift ;;
+    --from-file=*) LOCAL_FILE_SEEN=1; FROM_FILE="${1#*=}"; shift ;;
     --sha256)
+      LOCAL_FILE_SEEN=1
       FROM_SHA="${2:-}"
       [ -n "$FROM_SHA" ] || die "--sha256 needs a hex digest"
       shift 2
       ;;
-    --sha256=*) FROM_SHA="${1#*=}"; shift ;;
+    --sha256=*) LOCAL_FILE_SEEN=1; FROM_SHA="${1#*=}"; shift ;;
     --cli-from-file)
+      LOCAL_FILE_SEEN=1
       CLI_FROM_FILE="${2:-}"
       [ -n "$CLI_FROM_FILE" ] || die "--cli-from-file needs a path"
       shift 2
       ;;
-    --cli-from-file=*) CLI_FROM_FILE="${1#*=}"; shift ;;
+    --cli-from-file=*) LOCAL_FILE_SEEN=1; CLI_FROM_FILE="${1#*=}"; shift ;;
     --cli-sha256)
+      LOCAL_FILE_SEEN=1
       CLI_SHA="${2:-}"
       [ -n "$CLI_SHA" ] || die "--cli-sha256 needs a hex digest"
       shift 2
       ;;
-    --cli-sha256=*) CLI_SHA="${1#*=}"; shift ;;
+    --cli-sha256=*) LOCAL_FILE_SEEN=1; CLI_SHA="${1#*=}"; shift ;;
+    --prerelease)
+      [ "$PRERELEASE_SEEN" = 0 ] || die "--prerelease must not be repeated"
+      PRERELEASE_SEEN=1
+      PRERELEASE_OPT="${2:-}"
+      [ -n "$PRERELEASE_OPT" ] || die "--prerelease needs a tag"
+      shift 2
+      ;;
+    --prerelease=*)
+      [ "$PRERELEASE_SEEN" = 0 ] || die "--prerelease must not be repeated"
+      PRERELEASE_SEEN=1
+      PRERELEASE_OPT="${1#*=}"
+      [ -n "$PRERELEASE_OPT" ] || die "--prerelease needs a tag"
+      shift
+      ;;
     -h|--help) usage; exit 0 ;;
-    *) die "unknown argument: $1 (supported: --from-file, --sha256, --cli-from-file, --cli-sha256)" ;;
+    *) die "unknown argument: $1 (supported: --from-file, --sha256, --cli-from-file, --cli-sha256, --prerelease)" ;;
   esac
 done
+if [ "$PRERELEASE_SEEN" = 1 ] && [ "$LOCAL_FILE_SEEN" = 1 ]; then
+  die "--prerelease cannot be combined with --from-file/--sha256/--cli-from-file/--cli-sha256"
+fi
 if [ -n "$FROM_FILE" ] || [ -n "$FROM_SHA" ]; then
   [ -n "$FROM_FILE" ] && [ -n "$FROM_SHA" ] \
     || die "--from-file and --sha256 must be given together"
@@ -121,6 +150,35 @@ if [ -n "$CLI_FROM_FILE" ] || [ -n "$CLI_SHA" ]; then
     || die "--cli-from-file requires --from-file (this installer must always install the daemon)"
 fi
 
+# --- prerelease tag selection ----------------------------------------------
+# Tag grammar: vMAJOR.MINOR.PATCH-LABEL.N. Numeric fields are `0` or digits
+# with NO leading zero. LABEL starts with a letter and holds only ASCII
+# letters, digits or hyphens. A stable tag (vX.Y.Z) is NOT a prerelease tag —
+# grammar and shape reject whitespace, paths, queries and shell syntax too.
+is_prerelease_tag() {
+  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[A-Za-z][A-Za-z0-9-]*\.(0|[1-9][0-9]*)$ ]]
+}
+# The selected prerelease tag, or "" for the normal stable flow. A resolved
+# embedded marker supplies the default; an explicit --prerelease must equal it.
+# Local-file mode never selects the marker.
+PRERELEASE_TAG=""
+if [ "$PRERELEASE_SEEN" = 1 ]; then
+  is_prerelease_tag "$PRERELEASE_OPT" \
+    || die "not a prerelease tag: $PRERELEASE_OPT (want vMAJOR.MINOR.PATCH-LABEL.N, e.g. v2.8.0-beta.3)"
+  if [ -n "$OPENLLM_PRERELEASE_TAG" ]; then
+    is_prerelease_tag "$OPENLLM_PRERELEASE_TAG" \
+      || die "this script's embedded prerelease tag is invalid: $OPENLLM_PRERELEASE_TAG"
+    [ "$PRERELEASE_OPT" = "$OPENLLM_PRERELEASE_TAG" ] \
+      || die "--prerelease $PRERELEASE_OPT does not match this script's published tag $OPENLLM_PRERELEASE_TAG"
+  fi
+  PRERELEASE_TAG="$PRERELEASE_OPT"
+elif [ -z "$FROM_FILE" ] && [ -z "$FROM_SHA" ] && [ -z "$CLI_FROM_FILE" ] && [ -z "$CLI_SHA" ] \
+  && [ -n "$OPENLLM_PRERELEASE_TAG" ]; then
+  is_prerelease_tag "$OPENLLM_PRERELEASE_TAG" \
+    || die "this script's embedded prerelease tag is invalid: $OPENLLM_PRERELEASE_TAG"
+  PRERELEASE_TAG="$OPENLLM_PRERELEASE_TAG"
+fi
+
 # Replacement policy: the version advertised by /api/install is the release of
 # record — an advertised PRERELEASE is installable, and a prerelease install may
 # move to a newer stable (or newer prerelease). The only refusal left is a
@@ -130,9 +188,11 @@ fi
 # installer.
 PROBE_TIMEOUT_S=10
 PROBE_KILL_GRACE_S=2
-installed_version() {
-  local binary="$1" output version probe_file pid watchdog status
-  [ -x "$binary" ] || return 1
+# Bounded --version probe: TERM after PROBE_TIMEOUT_S, then KILL after
+# PROBE_KILL_GRACE_S more. Sets PROBE_STATUS (the probe's exit code) and
+# PROBE_OUT (its stdout). Never dies — the caller chooses the failure.
+run_version_probe() {
+  local binary="$1" probe_file pid watchdog
   probe_file="${TMPDIR:-/tmp}/openllmd-version-probe.$$"
   "$binary" --version >"$probe_file" 2>/dev/null &
   pid=$!
@@ -149,20 +209,34 @@ installed_version() {
     kill -KILL "$pid" 2>/dev/null || true
   ) &
   watchdog=$!
-  if wait "$pid"; then status=0; else status=$?; fi
+  if wait "$pid"; then PROBE_STATUS=0; else PROBE_STATUS=$?; fi
   kill -TERM "$watchdog" 2>/dev/null || true
   wait "$watchdog" 2>/dev/null || true
-  output="$(cat "$probe_file" 2>/dev/null || true)"
+  PROBE_OUT="$(cat "$probe_file" 2>/dev/null || true)"
   rm -f "$probe_file"
-  [ "$status" -eq 0 ] \
+}
+
+# Extract the first dotted semver from probe output into PARSED_VERSION
+# ("" when nothing parses).
+parse_probe_version() {
+  if [[ "$1" =~ (^|[^[:alnum:].+_-])v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?)([^[:alnum:].+-]|$) ]]; then
+    PARSED_VERSION="${BASH_REMATCH[2]}"
+  else
+    PARSED_VERSION=""
+  fi
+}
+
+installed_version() {
+  local binary="$1"
+  [ -x "$binary" ] || return 1
+  run_version_probe "$binary"
+  [ "$PROBE_STATUS" -eq 0 ] \
     || die "version probe timed out or failed at $binary; refusing to overwrite it.
   To repair by hand: move the binary aside ('mv \"$binary\" \"$binary.bak\"') and re-run this installer."
-  if [[ "$output" =~ (^|[^[:alnum:].+_-])v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?)([^[:alnum:].+-]|$) ]]; then
-    version="${BASH_REMATCH[2]}"
-  else
-    die "could not parse a version from $binary; refusing to overwrite"
-  fi
-  INSTALLED_VERSION="$version"
+  parse_probe_version "$PROBE_OUT"
+  [ -n "$PARSED_VERSION" ] \
+    || die "could not parse a version from $binary; refusing to overwrite"
+  INSTALLED_VERSION="$PARSED_VERSION"
 }
 
 # SemVer numeric-identifier predicate: a numeric identifier is `0` or digits
@@ -973,6 +1047,355 @@ sha256_of() {
   fi
 }
 
+# Limit each output to 512 MiB. Release binaries are about 100 MiB.
+is_gzip_asset() {
+  LC_ALL=C head -c 2 "$1" | LC_ALL=C grep -q $'\x1f\x8b'
+}
+
+decompress_asset() {
+  local input="$1" output="$2" name="$3"
+  local max_bytes=536870912 status=0 size
+  gzip -dc "$input" | head -c "$max_bytes" > "$output" || status=$?
+  size="$(stat -c %s "$output" 2>/dev/null || stat -f %z "$output")" \
+    || die "could not measure the decompressed $name"
+  if [ "$size" -ge "$max_bytes" ]; then
+    rm -f "$output"
+    die "$name decompressed asset reaches the 512 MiB limit — refusing to install"
+  fi
+  if [ "$status" -ne 0 ]; then
+    rm -f "$output"
+    die "could not decompress $name: invalid gzip asset or output write failure"
+  fi
+}
+
+# >>> openllm-prerelease/v1 (identical block in both shell installers) >>>>>>>
+# Public-prerelease resolution. The manifest and the asset come from the SAME
+# tag on the component's own repository: the manifest is tagged source, the
+# asset is that tag's published release file. The digest gate is the manifest
+# sha256 of the DECOMPRESSED bytes.
+#
+#   manifest:  https://raw.githubusercontent.com/<repo>/<tag>/manifest.ts
+#   asset:     https://github.com/<repo>/releases/download/<tag>/<asset>
+#
+# OPENLLM_PRERELEASE_BASE_URL is a test-only override: it must parse to an
+# http URL on a loopback host (127.0.0.1, localhost or [::1]); redirects are
+# refused and the value is never persisted. The scheme list carries the
+# redirect bound: production follows at most five, loopback follows none.
+PRE_BASE=""
+PR_SCHEME=(--proto "=https" --proto-redir "=https" --max-redirs 5)
+
+# $1 = repository (openllmsh/daemon or openllmsh/cli), $2 = file in the tag's
+# source tree. Prints the URL for that tagged file.
+prerelease_repo_url() {
+  if [ -n "$PRE_BASE" ]; then
+    printf '%s/%s/%s/%s' "$PRE_BASE" "$1" "$PRERELEASE_TAG" "$2"
+  else
+    printf 'https://raw.githubusercontent.com/%s/%s/%s' "$1" "$PRERELEASE_TAG" "$2"
+  fi
+}
+
+# $1 = repository, $2 = asset basename. Prints the release-asset URL.
+prerelease_asset_url() {
+  if [ -n "$PRE_BASE" ]; then
+    prerelease_repo_url "$1" "$2"
+  else
+    printf 'https://github.com/%s/releases/download/%s/%s' "$1" "$PRERELEASE_TAG" "$2"
+  fi
+}
+
+# Fetch one repository's tagged manifest and print the sha256 digest it pins
+# for the host TARGET. Dies on any fetch, parse or content failure — the
+# caller never picks another tag to recover.
+prerelease_manifest_digest() {
+  local repo="$1" export_name="$2" url body digest body_end
+  url="$(prerelease_repo_url "$repo" manifest.ts)"
+  # The trailing 'x' sentinel keeps command substitution from stripping the
+  # manifest's final newlines, so the parser sees the exact served bytes.
+  # Cap the pipe before Bash reads it. Older curl cannot cap chunked bodies.
+  body="$(curl "${PR_SCHEME[@]}" "${CURL_META[@]}" --max-filesize 65536 -fsSL "$url" 2>/dev/null | head -c 65537 || exit; printf x)" \
+    || die "could not fetch the $repo manifest for $PRERELEASE_TAG (manifest limit: 64 KiB)"
+  body="${body%x}"
+  [ "$(printf %s "$body" | LC_ALL=C wc -c)" -le 65536 ] \
+    || die "manifest exceeds 64 KiB"
+  # body_end tells the lexer whether the input ended in a newline — the
+  # per-record buffer rebuild below hides one, which would let a `//` comment
+  # cut off at EOF pass as terminated.
+  body_end=0
+  case "$body" in *$'\n') body_end=1 ;; esac
+  digest="$(printf '%s' "$body" | LC_ALL=C awk \
+    -v want_export="$export_name" -v want_repo="$repo" \
+    -v want_tag="$PRERELEASE_TAG" -v want_target="$TARGET" \
+    -v body_end="$body_end" '
+function die(m) { printf "manifest: %s\n", m > "/dev/stderr"; exit 1 }
+function hex2num(h,   i, v) {
+  v = 0
+  for (i = 1; i <= length(h); i++)
+    v = v * 16 + index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+  return v
+}
+function parse_object(   key, k2) {
+  if (typ[p] != "{") die("release must be an object")
+  p++
+  while (1) {
+    if (p > nt) die("unterminated object")
+    if (typ[p] == "}") { p++; break }
+    if (typ[p] != "id" && typ[p] != "str") die("bad field name")
+    key = val[p]; p++
+    if (typ[p] != ":") die("field " key " needs :")
+    p++
+    if (key == "repo" || key == "tag") {
+      if (typ[p] != "str") die(key " must be a string")
+      if (key == "repo") { if (f_repo++) die("duplicate repo"); v_repo = val[p] }
+      else { if (f_tag++) die("duplicate tag"); v_tag = val[p] }
+      p++
+    } else if (key == "targets") {
+      if (f_targets++) die("duplicate targets")
+      if (typ[p] != "[") die("targets must be an array")
+      p++
+      while (1) {
+        if (p > nt) die("unterminated targets")
+        if (typ[p] == "]") { p++; break }
+        if (typ[p] != "str") die("target must be a string")
+        if (val[p] in targ) die("duplicate target " val[p])
+        targ[val[p]] = 1; p++
+        if (typ[p] == ",") { p++; continue }
+        if (typ[p] == "]") { p++; break }
+        die("bad targets array")
+      }
+    } else if (key == "sha256") {
+      if (f_sha++) die("duplicate sha256")
+      if (typ[p] != "{") die("sha256 must be an object")
+      p++
+      while (1) {
+        if (p > nt) die("unterminated sha256")
+        if (typ[p] == "}") { p++; break }
+        if (typ[p] != "str") die("sha256 keys must be strings")
+        k2 = val[p]; p++
+        if (typ[p] != ":") die("sha256 field needs :")
+        p++
+        if (typ[p] != "str") die("sha256 value must be a string")
+        if (k2 in dig) die("duplicate sha256 key " k2)
+        if (length(val[p]) != 64 || val[p] !~ /^[0-9A-Fa-f]+$/)
+          die("bad sha256 for " k2)
+        dig[k2] = tolower(val[p]); p++
+        if (typ[p] == ",") { p++; continue }
+        if (typ[p] == "}") { p++; break }
+        die("bad sha256 object")
+      }
+    } else die("unknown field " key)
+    if (p > nt) die("unterminated object")
+    if (typ[p] == ",") { p++; continue }
+    if (typ[p] == "}") { p++; break }
+    die("expected , or } after " key)
+  }
+}
+{ buf = buf (NR == 1 ? "" : "\n") $0 }
+END {
+  s = buf
+  if (body_end) s = s "\n"
+  if (length(s) > 65536) die("manifest exceeds 64 KiB")
+  if (substr(s, 1, 3) == sprintf("%c%c%c", 239, 187, 191)) s = substr(s, 4)
+  n = length(s); i = 1; nt = 0
+  while (i <= n) {
+    c = substr(s, i, 1)
+    if (c ~ /[[:space:]]/) { i++; continue }
+    if (c == "/") {
+      d = substr(s, i + 1, 1)
+      if (d == "/") {
+        j = index(substr(s, i + 2), "\n")
+        if (j == 0) die("unterminated comment")
+        i += j + 2; continue
+      }
+      if (d == "*") {
+        j = index(substr(s, i + 2), "*/")
+        if (j == 0) die("unterminated comment")
+        i += j + 3; continue
+      }
+      die("unexpected /")
+    }
+    if (c == "\"") {
+      i++; v = ""
+      while (1) {
+        if (i > n) die("unterminated string")
+        c = substr(s, i, 1)
+        if (c == "\"") { i++; break }
+        if (c == "\n" || c == "\r") die("unterminated string")
+        if (c == "\\") {
+          e = substr(s, i + 1, 1)
+          if (index("\"\\/", e) > 0) { v = v e; i += 2; continue }
+          if (e == "n") { v = v "\n"; i += 2; continue }
+          if (e == "t") { v = v "\t"; i += 2; continue }
+          if (e == "r") { v = v "\r"; i += 2; continue }
+          if (e == "b") { v = v "\b"; i += 2; continue }
+          if (e == "f") { v = v "\f"; i += 2; continue }
+          if (e == "u") {
+            h = substr(s, i + 2, 4)
+            if (length(h) != 4 || h !~ /^[0-9a-fA-F]+$/) die("bad \\u escape")
+            cp = hex2num(h)
+            if (cp < 32 || cp > 126) die("unsupported \\u escape")
+            v = v sprintf("%c", cp); i += 6; continue
+          }
+          die("bad string escape")
+        }
+        v = v c; i++
+      }
+      nt++; typ[nt] = "str"; val[nt] = v; continue
+    }
+    if (c ~ /[A-Za-z_$]/) {
+      j = i
+      while (j <= n && substr(s, j, 1) ~ /[A-Za-z0-9_$]/) j++
+      nt++; typ[nt] = "id"; val[nt] = substr(s, i, j - i); i = j; continue
+    }
+    if (index("{}[]:,;=", c) > 0) { nt++; typ[nt] = c; val[nt] = ""; i++; continue }
+    die("unexpected character")
+  }
+  p = 1; seen = 0
+  while (p <= nt) {
+    if (typ[p] == "id" && val[p] == "import") {
+      p++
+      if (!(typ[p] == "id" && val[p] == "type")) die("only type imports are allowed")
+      p++
+      if (typ[p] == "{") {
+        p++
+        while (1) {
+          if (p > nt) die("unterminated import")
+          if (typ[p] == "}") { p++; break }
+          if (typ[p] != "id") die("bad import")
+          p++
+          if (typ[p] == ",") { p++; continue }
+          if (typ[p] == "}") { p++; break }
+          die("bad import")
+        }
+      } else if (typ[p] == "id") {
+        p++
+      } else die("bad import")
+      if (!(typ[p] == "id" && val[p] == "from")) die("import needs from")
+      p++
+      if (typ[p] != "str") die("import path must be a string")
+      p++
+      if (typ[p] == ";") p++
+      continue
+    }
+    if (typ[p] == "id" && val[p] == "export") {
+      p++
+      if (!(typ[p] == "id" && val[p] == "const")) die("only const exports are allowed")
+      p++
+      if (typ[p] != "id") die("export needs a name")
+      if (val[p] != want_export) die("unexpected export " val[p])
+      p++
+      if (seen) die("duplicate " want_export)
+      seen = 1
+      if (typ[p] != ":") die("export needs a type annotation")
+      p++
+      if (typ[p] != "id") die("export type must be a name")
+      p++
+      if (typ[p] != "=") die("export needs a value")
+      p++
+      parse_object()
+      if (typ[p] == ";") p++
+      continue
+    }
+    die("unexpected statement")
+  }
+  if (!seen) die("no " want_export " export")
+  if (!f_repo || !f_tag || !f_targets || !f_sha) die("incomplete release record")
+  if (v_repo != want_repo) die("repo is " v_repo ", want " want_repo)
+  if (v_tag != want_tag) die("tag is " v_tag ", want " want_tag)
+  if (!(want_target in targ)) die("no target " want_target " in targets")
+  if (!(want_target in dig)) die("no sha256 for " want_target)
+  for (k in dig) if (!(k in targ)) die("sha256 for undeclared target " k)
+  print dig[want_target]
+}')" || die "the $repo manifest for $PRERELEASE_TAG has no usable $TARGET digest"
+  printf '%s' "$digest"
+}
+
+# Read 4 bytes at offset $2 of file $1 as a hex string, then as a number.
+_pr_hex4() { od -An -tx1 -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' \n'; }
+_be32() {
+  local h; h="$(_pr_hex4 "$1" "$2")"
+  [[ "$h" =~ ^[0-9a-f]{8}$ ]] || die "short read checking the executable format"
+  printf '%d' "$((16#$h))"
+}
+_le32() {
+  local h; h="$(_pr_hex4 "$1" "$2")"
+  [[ "$h" =~ ^[0-9a-f]{8}$ ]] || die "short read checking the executable format"
+  printf '%d' "$((16#${h:6:2}${h:4:2}${h:2:2}${h:0:2}))"
+}
+
+# Executable-format check for a verified staged download: the published POSIX
+# assets are 64-bit ELF (Linux/WSL2) or 64-bit Mach-O (macOS) matching the host
+# architecture. Anything else — a script, a PE file, a truncated download — is
+# refused before it is ever executed. On macOS this gate is also what makes the
+# codesign step safe: only a Mach-O file ever reaches it.
+verify_exec_format() {
+  local file="$1" magic cls enc lo hi machine want_m ct ct_want nfat i esz
+  magic="$(od -An -tx1 -N4 "$file" 2>/dev/null | tr -d ' \n')"
+  case "$OS" in
+    linux)
+      [ "$magic" = "7f454c46" ] || die "downloaded $file is not an ELF executable for $TARGET"
+      cls="$(od -An -tx1 -j4 -N1 "$file" 2>/dev/null | tr -d ' \n')"
+      [ "$cls" = "02" ] || die "downloaded $file is not a 64-bit executable"
+      enc="$(od -An -tx1 -j5 -N1 "$file" 2>/dev/null | tr -d ' \n')"
+      lo="$(od -An -tx1 -j18 -N1 "$file" 2>/dev/null | tr -d ' \n')"
+      hi="$(od -An -tx1 -j19 -N1 "$file" 2>/dev/null | tr -d ' \n')"
+      case "$enc" in
+        01) machine=$((16#${hi}${lo})) ;;
+        02) machine=$((16#${lo}${hi})) ;;
+        *) die "downloaded $file has an invalid ELF encoding" ;;
+      esac
+      # e_machine: x86-64 = 62, AArch64 = 183.
+      if [ "$ARCH" = "x64-baseline" ]; then want_m=62; else want_m=183; fi
+      [ "$machine" = "$want_m" ] \
+        || die "downloaded $file is built for ELF machine $machine, not $TARGET"
+      ;;
+    darwin)
+      # cputype: x86_64 = 0x01000007, arm64 = 0x0100000c.
+      if [ "$ARCH" = "x64-baseline" ]; then ct_want=16777223; else ct_want=16777228; fi
+      case "$magic" in
+        cffaedfe) ct="$(_le32 "$file" 4)" ;;   # 64-bit Mach-O, little-endian
+        feedfacf) ct="$(_be32 "$file" 4)" ;;   # 64-bit Mach-O, big-endian
+        cafebabe|cafebabf)
+          # Fat/universal header: scan the arch list for the host slice.
+          nfat="$(_be32 "$file" 4)"
+          ct=-1; i=0; esz=20
+          [ "$magic" = "cafebabf" ] && esz=32
+          while [ "$i" -lt "$nfat" ] && [ "$i" -lt 64 ]; do
+            ct="$(_be32 "$file" $((8 + i * esz)))"
+            [ "$ct" = "$ct_want" ] && break
+            i=$((i + 1))
+          done
+          ;;
+        bebafeca|bfbafeca)
+          nfat="$(_le32 "$file" 4)"
+          ct=-1; i=0; esz=20
+          [ "$magic" = "bfbafeca" ] && esz=32
+          while [ "$i" -lt "$nfat" ] && [ "$i" -lt 64 ]; do
+            ct="$(_le32 "$file" $((8 + i * esz)))"
+            [ "$ct" = "$ct_want" ] && break
+            i=$((i + 1))
+          done
+          ;;
+        *) die "downloaded $file is not a Mach-O executable for $TARGET" ;;
+      esac
+      [ "$ct" = "$ct_want" ] \
+        || die "downloaded $file has no $TARGET slice"
+      ;;
+  esac
+}
+# <<< openllm-prerelease/v1 <<<
+
+# Bounded --version probe for a staged prerelease download: the binary must
+# exit 0 and report EXACTLY the selected version — never an older manifest pin.
+probe_staged_version() {
+  local binary="$1" want="$2"
+  run_version_probe "$binary"
+  [ "$PROBE_STATUS" -eq 0 ] \
+    || die "the downloaded $binary failed its --version probe — refusing to install"
+  parse_probe_version "$PROBE_OUT"
+  [ "$PARSED_VERSION" = "$want" ] \
+    || die "the downloaded $binary reports '${PARSED_VERSION:-no parseable version}', not $want — refusing to install"
+}
+
 # --- preflight -------------------------------------------------------------
 # A custom env-file override must be absolute: the daemon + CLI only honour
 # OPENLLM_DAEMON_ENV_FILE when it is absolute (see packages/cli/src/env.ts), so a
@@ -1028,6 +1451,37 @@ fi
 # tiny, so they get the short bound; binary downloads get the long one.
 CURL_META=(--connect-timeout 10 --max-time 60)
 CURL_GET=(--connect-timeout 10 --max-time 300)
+# Public-prerelease transport (P): fixed GitHub URLs over HTTPS with at most
+# five redirects. OPENLLM_PRERELEASE_BASE_URL is a test-only override — it must
+# parse to an http URL on a loopback host, refuses redirects, and is never
+# persisted. Checked BEFORE the first fetch so a bad value fails early.
+if [ -n "$PRERELEASE_TAG" ]; then
+  has_command awk || die "awk is required to parse the release manifest"
+  has_command gzip || die "gzip is required to unpack the release asset"
+  has_command od || die "od is required to check the executable format"
+  if [ -n "${OPENLLM_PRERELEASE_BASE_URL:-}" ]; then
+    pre_authority="${OPENLLM_PRERELEASE_BASE_URL#http://}"
+    [ "$pre_authority" != "$OPENLLM_PRERELEASE_BASE_URL" ] \
+      || die "OPENLLM_PRERELEASE_BASE_URL must be an http:// URL on a loopback host (127.0.0.1, localhost or [::1])"
+    pre_authority="${pre_authority%%[/?#]*}"
+    case "$pre_authority" in
+      127.0.0.1|localhost|\[::1\]) ;;
+      \[::1\]:*)
+        # The port follows `]:` — ${var#*:} would stop at the first ':' INSIDE
+        # the brackets and reject the documented [::1]:port form.
+        pre_port="${pre_authority#*\]:}"
+        [[ "$pre_port" =~ ^[0-9]+$ ]] \
+          || die "OPENLLM_PRERELEASE_BASE_URL has a bad port" ;;
+      127.0.0.1:*|localhost:*)
+        pre_port="${pre_authority#*:}"
+        [[ "$pre_port" =~ ^[0-9]+$ ]] \
+          || die "OPENLLM_PRERELEASE_BASE_URL has a bad port" ;;
+      *) die "OPENLLM_PRERELEASE_BASE_URL must be an http:// URL on a loopback host (127.0.0.1, localhost or [::1])" ;;
+    esac
+    PRE_BASE="${OPENLLM_PRERELEASE_BASE_URL%/}"
+    PR_SCHEME=(--proto "=http" --proto-redir "=http" --max-redirs 0)
+  fi
+fi
 case "$INSTALL_MODE" in
   install|update) ;;
   *) die "OPENLLM_INSTALL_MODE must be 'install' or 'update'" ;;
@@ -1069,14 +1523,514 @@ if [ -n "$SUPPLIED_KEY" ]; then
 fi
 API_KEY=""
 
+# Use a separate lock for binary replacement. Keep config lock state unchanged.
+# >>> openllm-binary-lock/v1 >>>
+BINARY_LOCK_STALE_SECS="${OPENLLM_BINARY_LOCK_STALE_SECS:-600}"
+BINARY_LOCK_WAIT_SECS="${OPENLLM_BINARY_LOCK_WAIT_SECS:-10}"
+BINARY_LOCK_ORPHAN_SECS="${OPENLLM_BINARY_LOCK_ORPHAN_SECS:-30}"
+[[ "$BINARY_LOCK_STALE_SECS" =~ ^[0-9]+$ ]] || BINARY_LOCK_STALE_SECS=0
+BINARY_LOCK_STALE_SECS=$((10#$BINARY_LOCK_STALE_SECS))
+[ "$BINARY_LOCK_STALE_SECS" -gt 0 ] || BINARY_LOCK_STALE_SECS=600
+[[ "$BINARY_LOCK_WAIT_SECS" =~ ^[0-9]+$ ]] || BINARY_LOCK_WAIT_SECS=0
+BINARY_LOCK_WAIT_SECS=$((10#$BINARY_LOCK_WAIT_SECS))
+[ "$BINARY_LOCK_WAIT_SECS" -gt 0 ] || BINARY_LOCK_WAIT_SECS=10
+[[ "$BINARY_LOCK_ORPHAN_SECS" =~ ^[0-9]+$ ]] || BINARY_LOCK_ORPHAN_SECS=0
+BINARY_LOCK_ORPHAN_SECS=$((10#$BINARY_LOCK_ORPHAN_SECS))
+[ "$BINARY_LOCK_ORPHAN_SECS" -gt 0 ] || BINARY_LOCK_ORPHAN_SECS=30
+BINARY_LOCK_DIR=""
+BINARY_LOCK_NONCE=""
+BINARY_LOCK_QSEQ=0
+BINARY_LOCK_OWNER_STATE="" BINARY_LOCK_OWNER_PID=""
+BINARY_LOCK_OWNER_START="" BINARY_LOCK_OWNER_NONCE=""
+
+binary_lock_pid_alive() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  local pid=$((10#$1)) stat state
+  if [ -r "/proc/$pid/stat" ]; then
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    stat="${stat##*) }"
+    read -r state _ <<< "$stat"
+    [ "$state" = "Z" ] && return 1
+  fi
+  [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null
+}
+
+binary_lock_legacy_start_identity() {
+  local out
+  out="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || out=""
+  out="$(printf '%s' "$out" | tr -s '[:space:]' ' ')"
+  out="${out# }"
+  out="${out% }"
+  printf '%s' "$out"
+}
+
+binary_lock_is_boot_identity() {
+  local re='^boot:[0-9a-f-]{36}:[0-9]+$'
+  [[ "$1" =~ $re ]]
+}
+
+binary_lock_normalize_identity() {
+  local out
+  out="$(printf '%s' "$1" | tr -s '[:space:]' ' ')"
+  out="${out# }"
+  out="${out% }"
+  printf '%s' "$out"
+}
+
+binary_lock_start_identity() {
+  local pid="$1" boot stat rest ticks
+  if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    boot="$(printf '%s' "$boot" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    local re='^[0-9a-f-]{36}$'
+    [[ "$boot" =~ $re ]] || return 0
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    [ -n "$stat" ] || return 0
+    rest="${stat##*) }"
+    [ "$rest" = "$stat" ] && rest="${stat:1}"
+    local -a f
+    read -r -a f <<< "$rest"
+    ticks="${f[19]:-}"
+    [[ "$ticks" =~ ^[0-9]+$ && "$ticks" =~ [1-9] ]] || return 0
+    printf 'boot:%s:%s' "$boot" "$((10#$ticks))"
+    return 0
+  fi
+  binary_lock_legacy_start_identity "$pid"
+}
+
+binary_lock_read_owner() {
+  local dir="$1" line rest
+  BINARY_LOCK_OWNER_STATE="unmarked"
+  BINARY_LOCK_OWNER_PID="" BINARY_LOCK_OWNER_START="" BINARY_LOCK_OWNER_NONCE=""
+  line="$(cat "$dir/owner" 2>/dev/null || true)"
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  case "$line" in
+    kind=openllm-binary-lock/v1\ pid=*\ start=*\ nonce=*)
+      rest="${line#kind=openllm-binary-lock/v1 pid=}"
+      BINARY_LOCK_OWNER_PID="${rest%% *}"
+      BINARY_LOCK_OWNER_START="${rest#* start=}"
+      BINARY_LOCK_OWNER_START="${BINARY_LOCK_OWNER_START% nonce=*}"
+      BINARY_LOCK_OWNER_NONCE="${rest##* nonce=}"
+      if [[ "$BINARY_LOCK_OWNER_PID" =~ ^[0-9]+$ ]] \
+        && [ -n "$BINARY_LOCK_OWNER_START" ] \
+        && [[ "$BINARY_LOCK_OWNER_START" != *$'\n'* \
+          && "$BINARY_LOCK_OWNER_START" != *$'\r'* ]] \
+        && [[ "$BINARY_LOCK_OWNER_NONCE" =~ ^[0-9a-fA-F]+$ ]]; then
+        BINARY_LOCK_OWNER_PID=$((10#$BINARY_LOCK_OWNER_PID))
+        BINARY_LOCK_OWNER_STATE="marked"
+      fi
+      ;;
+  esac
+  if [ "$BINARY_LOCK_OWNER_STATE" != "marked" ]; then
+    BINARY_LOCK_OWNER_PID="" BINARY_LOCK_OWNER_START="" BINARY_LOCK_OWNER_NONCE=""
+    if [[ "$line" =~ (^|[[:space:]])pid=([0-9]+)([[:space:]]|$) ]]; then
+      BINARY_LOCK_OWNER_PID="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ ^([0-9]+)([[:space:]]|$) ]]; then
+      BINARY_LOCK_OWNER_PID="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$BINARY_LOCK_OWNER_PID" ]; then
+      BINARY_LOCK_OWNER_PID=$((10#$BINARY_LOCK_OWNER_PID))
+      [ "$BINARY_LOCK_OWNER_PID" -gt 0 ] || BINARY_LOCK_OWNER_PID=""
+    fi
+  fi
+}
+
+binary_lock_dir_age_secs() {
+  local mtime="${2:-}" now
+  [[ "$mtime" =~ ^[0-9]+$ ]] || \
+    mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)"
+  now="$(date +%s 2>/dev/null || true)"
+  if [[ "$mtime" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' $((10#$now - 10#$mtime))
+  else
+    printf '%s\n' -1
+  fi
+}
+
+binary_lock_path_ino() {
+  stat -c %d:%i "$1" 2>/dev/null || stat -f %d:%i "$1" 2>/dev/null || true
+}
+
+binary_lock_is_stale_dir() {
+  local dir="$1" as_of="${2:-}" current bridged recorded age
+  binary_lock_read_owner "$dir"
+  age="$(binary_lock_dir_age_secs "$dir" "$as_of")"
+  if [ "$BINARY_LOCK_OWNER_STATE" = "marked" ]; then
+    binary_lock_pid_alive "$BINARY_LOCK_OWNER_PID" || return 0
+    recorded="$(binary_lock_normalize_identity "$BINARY_LOCK_OWNER_START")"
+    if [ "$recorded" = "-" ]; then
+      return 1
+    fi
+    current="$(binary_lock_start_identity "$BINARY_LOCK_OWNER_PID")"
+    if [ -z "$current" ]; then
+      if binary_lock_pid_alive "$BINARY_LOCK_OWNER_PID"; then return 1; else return 0; fi
+    fi
+    [ "$current" = "$recorded" ] && return 1
+    binary_lock_is_boot_identity "$current" || return 0
+    binary_lock_is_boot_identity "$recorded" && return 0
+    bridged="$(binary_lock_legacy_start_identity "$BINARY_LOCK_OWNER_PID")"
+    if [ -z "$bridged" ]; then
+      if binary_lock_pid_alive "$BINARY_LOCK_OWNER_PID"; then return 1; else return 0; fi
+    fi
+    if [ "$bridged" = "$recorded" ]; then return 1; else return 0; fi
+  fi
+  { [ "$age" -ge 0 ] && [ "$age" -ge "$BINARY_LOCK_ORPHAN_SECS" ]; } || return 1
+  if [[ "$BINARY_LOCK_OWNER_PID" =~ ^[0-9]+$ ]] && binary_lock_pid_alive "$BINARY_LOCK_OWNER_PID"; then
+    return 1
+  fi
+  return 0
+}
+
+binary_lock_steal() {
+  local lockdir="$1" stem="$2" marker q ino_before ino_after q_ino mtime before_owner after_owner
+  ino_before="$(binary_lock_path_ino "$lockdir")"
+  mtime="$(stat -c %Y "$lockdir" 2>/dev/null || stat -f %m "$lockdir" 2>/dev/null || true)"
+  [ -n "$ino_before" ] || return 0  # vanished — the outer acquire retries
+  before_owner="$(cat "$lockdir/owner" 2>/dev/null || true)"
+  marker="$lockdir/steal.$$.$BINARY_LOCK_NONCE"
+  [ "$(binary_lock_path_ino "$lockdir")" = "$ino_before" ] || return 0
+  if ! (set -C; : > "$marker") 2>/dev/null; then
+    if [ -f "$lockdir" ]; then
+      BINARY_LOCK_QSEQ=$((BINARY_LOCK_QSEQ + 1))
+      mv "$lockdir" "$stem.stale.$$.$BINARY_LOCK_NONCE.$BINARY_LOCK_QSEQ" \
+        2>/dev/null || true
+    fi
+    return 0
+  fi
+  ino_after="$(binary_lock_path_ino "$lockdir")"
+  after_owner="$(cat "$lockdir/owner" 2>/dev/null || true)"
+  if [ -n "$ino_after" ] && [ "$ino_after" = "$ino_before" ] \
+    && [ "$after_owner" = "$before_owner" ] \
+    && binary_lock_is_stale_dir "$lockdir" "$mtime"; then
+    BINARY_LOCK_QSEQ=$((BINARY_LOCK_QSEQ + 1))
+    q="$stem.stale.$$.$BINARY_LOCK_NONCE.$BINARY_LOCK_QSEQ"
+    if mv "$lockdir" "$q" 2>/dev/null; then
+      q_ino="$(binary_lock_path_ino "$q")"
+      if [ "$q_ino" != "$ino_before" ] \
+        || { [ -e "$q/owner" ] \
+          && [ "$(cat "$q/owner" 2>/dev/null || true)" != "$before_owner" ]; }; then
+        binary_lock_restore_dir "$q" "$lockdir"
+        rm -f "$marker" "$q/steal.$$.$BINARY_LOCK_NONCE" 2>/dev/null || true
+        return 0  # Retry acquisition. This steal did not claim the lock.
+      fi
+      return 0  # committed — the marker (and dir) are parked with it
+    fi
+  fi
+  rm -f "$marker" 2>/dev/null || true
+  return 0
+}
+
+binary_lock_sweep() {
+  local stem="$1" entry child age ok has_owner
+  for entry in "$stem".stale.* "$stem".rel.*; do
+    [ -d "$entry" ] || continue
+    age="$(binary_lock_dir_age_secs "$entry")"
+    { [ "$age" -ge 0 ] && [ "$age" -ge "$BINARY_LOCK_STALE_SECS" ]; } || continue
+    ok=1
+    has_owner=0
+    for child in "$entry"/*; do
+      [ -e "$child" ] || continue
+      case "${child##*/}" in
+        owner) has_owner=1 ;;
+        owner.tmp.*|steal.*) ;;
+        *) ok=0 ;;
+      esac
+    done
+    [ "$ok" = 1 ] || continue
+    if [ "$has_owner" = 1 ]; then
+      binary_lock_read_owner "$entry"
+      [ "$BINARY_LOCK_OWNER_STATE" = "marked" ] || continue
+    fi
+    for child in "$entry"/*; do rm -f "$child" 2>/dev/null || true; done
+    rmdir "$entry" 2>/dev/null || true
+  done
+  return 0
+}
+
+binary_lock_legacy_resolve() {
+  local q="$1" legacy="$2" moved rest age
+  moved=""
+  read -r moved rest < "$q" 2>/dev/null || moved=""
+  if [[ "$moved" =~ ^[0-9]+$ ]] && binary_lock_pid_alive "$moved"; then
+    age="$(binary_lock_dir_age_secs "$q")"
+    if [ "$age" -lt 0 ] || [ "$age" -lt "$BINARY_LOCK_ORPHAN_SECS" ]; then
+      if ln "$q" "$legacy" 2>/dev/null; then
+        rm -f "$q" 2>/dev/null || true
+      elif (set -C; : > "$legacy") 2>/dev/null; then
+        local l_sz q_sz
+        cat "$q" >> "$legacy" 2>/dev/null || true
+        l_sz="$(stat -c %s "$legacy" 2>/dev/null || stat -f %z "$legacy" 2>/dev/null || true)"
+        q_sz="$(stat -c %s "$q" 2>/dev/null || stat -f %z "$q" 2>/dev/null || true)"
+        if [ -n "$q_sz" ] && [ "$q_sz" = "$l_sz" ] \
+          && [ "$(cat "$legacy" 2>/dev/null)" = "$(cat "$q" 2>/dev/null)" ]; then
+          rm -f "$q" 2>/dev/null || true
+        else
+          rm -f "$legacy" 2>/dev/null || true
+        fi
+      elif [ -e "$legacy" ] || [ -L "$legacy" ]; then
+        rm -f "$q" 2>/dev/null || true
+      fi
+      return 0
+    fi
+  fi
+  rm -f "$q" 2>/dev/null || true
+  return 1
+}
+
+binary_lock_legacy_held() {
+  local legacy="$1" lpid rest q attempt=0 age
+  while [ -f "$legacy" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -gt 4 ] && return 0
+    lpid=""
+    read -r lpid rest < "$legacy" 2>/dev/null || lpid=""
+    if [[ "$lpid" =~ ^[0-9]+$ ]] && ! binary_lock_pid_alive "$lpid"; then
+      : # a proven-dead pid is reclaimed regardless of the lock's age
+    else
+      age="$(binary_lock_dir_age_secs "$legacy")"
+      if [ "$age" -lt 0 ] || [ "$age" -lt "$BINARY_LOCK_ORPHAN_SECS" ]; then
+        return 0
+      fi
+    fi
+    BINARY_LOCK_QSEQ=$((BINARY_LOCK_QSEQ + 1))
+    q="$legacy.stale.$$.$BINARY_LOCK_NONCE.$BINARY_LOCK_QSEQ"
+    mv "$legacy" "$q" 2>/dev/null || continue
+    binary_lock_legacy_resolve "$q" "$legacy" && return 0
+  done
+  return 1
+}
+
+binary_lock_publish_owner() {
+  local lockdir="$1" want_ino="${2:-}" start stolen same_gen marker now_ino
+  for marker in "$lockdir"/steal.*; do
+    [ -e "$marker" ] && return 1
+  done
+  start="$(binary_lock_start_identity "$$")"
+  if [ -z "$start" ]; then
+    if [ -n "$want_ino" ] \
+      && [ "$(binary_lock_path_ino "$lockdir")" = "$want_ino" ]; then
+      rmdir "$lockdir" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  printf 'kind=openllm-binary-lock/v1 pid=%s start=%s nonce=%s\n' \
+    "$$" "$start" "$BINARY_LOCK_NONCE" > "$lockdir/owner.tmp.$$" 2>/dev/null \
+    || return 2
+  if ln "$lockdir/owner.tmp.$$" "$lockdir/owner" 2>/dev/null \
+    || (set -C; cat "$lockdir/owner.tmp.$$" > "$lockdir/owner") 2>/dev/null; then
+    rm -f "$lockdir/owner.tmp.$$" 2>/dev/null
+    stolen=1
+    same_gen=0
+    if [ -d "$lockdir" ]; then
+      now_ino="$(binary_lock_path_ino "$lockdir")"
+      if [ -z "$want_ino" ] \
+        || { [ -n "$now_ino" ] && [ "$now_ino" = "$want_ino" ]; }; then
+        same_gen=1
+        stolen=0
+        for marker in "$lockdir"/steal.*; do
+          if [ -e "$marker" ]; then stolen=1; break; fi
+        done
+      fi
+    fi
+    if [ "$stolen" = 1 ]; then
+      binary_lock_read_owner "$lockdir"
+      if [ "$BINARY_LOCK_OWNER_STATE" = "marked" ] \
+        && [ "$BINARY_LOCK_OWNER_NONCE" = "$BINARY_LOCK_NONCE" ]; then
+        rm -f "$lockdir/owner" 2>/dev/null
+      fi
+      [ "$same_gen" = 1 ] && rmdir "$lockdir" 2>/dev/null || true
+      return 1
+    fi
+    binary_lock_read_owner "$lockdir"
+    [ "$BINARY_LOCK_OWNER_STATE" = "marked" ] \
+      && [ "$BINARY_LOCK_OWNER_NONCE" = "$BINARY_LOCK_NONCE" ]
+    return
+  fi
+  rm -f "$lockdir/owner.tmp.$$" 2>/dev/null
+  return 1
+}
+
+binary_lock_acquire() {
+  local envfile="$1" stem lockdir deadline attempts pub_rc ino
+  stem="$envfile.lock"
+  lockdir="$stem.d"
+  deadline=$((SECONDS + BINARY_LOCK_WAIT_SECS))
+  BINARY_LOCK_NONCE="$(printf '%x%x%x' "$$" "$RANDOM" "$(date +%s 2>/dev/null || echo 0)")"
+  attempts=0
+  binary_lock_sweep "$stem"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! binary_lock_legacy_held "$stem"; then
+      if mkdir "$lockdir" 2>/dev/null; then
+        ino="$(binary_lock_path_ino "$lockdir")"
+        if [ -z "$ino" ]; then
+          rmdir "$lockdir" 2>/dev/null || true
+          continue
+        fi
+        binary_lock_publish_owner "$lockdir" "$ino"
+        pub_rc=$?
+        if [ "$pub_rc" = 0 ]; then
+          BINARY_LOCK_DIR="$lockdir"
+          return 0
+        elif [ "$pub_rc" = 2 ]; then
+          if [ -n "$ino" ] && [ "$(binary_lock_path_ino "$lockdir")" = "$ino" ]; then
+            rm -f "$lockdir/owner.tmp.$$" 2>/dev/null
+            rmdir "$lockdir" 2>/dev/null || true
+          fi
+          return 1
+        fi
+      fi
+      attempts=$((attempts + 1))
+      [ $((attempts % 25)) -eq 0 ] && binary_lock_sweep "$stem"
+      if binary_lock_is_stale_dir "$lockdir"; then
+        binary_lock_steal "$lockdir" "$stem"
+      fi
+    fi
+    sleep 0.01 2>/dev/null || sleep 1
+  done
+  return 1
+}
+
+binary_lock_restore_dir() {
+  local rel="$1" lockdir="$2" child base dst ok=1 l_sz q_sz
+  set --
+  mkdir "$lockdir" 2>/dev/null || return 0
+  for child in "$rel"/*; do
+    [ -f "$child" ] || continue
+    base="${child##*/}"
+    dst="$lockdir/$base"
+    if (set -C; : > "$dst") 2>/dev/null; then
+      cat "$child" >> "$dst" 2>/dev/null || true
+      l_sz="$(stat -c %s "$dst" 2>/dev/null || stat -f %z "$dst" 2>/dev/null || true)"
+      q_sz="$(stat -c %s "$child" 2>/dev/null || stat -f %z "$child" 2>/dev/null || true)"
+      if [ -n "$q_sz" ] && [ "$q_sz" = "$l_sz" ] \
+        && [ "$(cat "$child" 2>/dev/null)" = "$(cat "$dst" 2>/dev/null)" ]; then
+        set -- "$@" "$base"
+        continue
+      fi
+      rm -f "$dst" 2>/dev/null || true
+    fi
+    ok=0
+    break
+  done
+  if [ "$ok" = 1 ]; then
+    command -v sync >/dev/null 2>&1 && sync 2>/dev/null || true
+  else
+    for base in "$@"; do rm -f "$lockdir/$base" 2>/dev/null || true; done
+    rmdir "$lockdir" 2>/dev/null || true
+    return 0
+  fi
+  for base in "$@"; do rm -f "$rel/$base" 2>/dev/null || true; done
+  rmdir "$rel" 2>/dev/null || true
+  return 0
+}
+
+binary_lock_release() {
+  local lockdir="${BINARY_LOCK_DIR:-}" stem rel
+  [ -n "$lockdir" ] || return 0
+  BINARY_LOCK_DIR=""
+  stem="${lockdir%.d}"
+  rel="$stem.rel.$$.$BINARY_LOCK_NONCE"
+  binary_lock_read_owner "$lockdir"
+  if [ "$BINARY_LOCK_OWNER_STATE" = "marked" ] \
+    && [ "$BINARY_LOCK_OWNER_NONCE" = "$BINARY_LOCK_NONCE" ]; then
+    if mv "$lockdir" "$rel" 2>/dev/null; then
+      binary_lock_read_owner "$rel"
+      if [ "$BINARY_LOCK_OWNER_STATE" = "marked" ] && [ "$BINARY_LOCK_OWNER_NONCE" = "$BINARY_LOCK_NONCE" ]; then
+        local child
+        for child in "$rel"/*; do rm -f "$child" 2>/dev/null || true; done
+        rmdir "$rel" 2>/dev/null || true
+      else
+        binary_lock_restore_dir "$rel" "$lockdir"
+      fi
+    fi
+  fi
+  return 0
+}
+# <<< openllm-binary-lock/v1 <<<
+
+# Keep the caller's traps while the binary transaction owns the install lock.
+install_lock_acquire() {
+  local saved_exit
+  INSTALL_SAVED_TRAPS="$(trap -p EXIT INT TERM)"
+  saved_exit="$(trap -p EXIT)"
+  INSTALL_SAVED_EXIT=""
+  INSTALL_ROLLBACK=""
+  if [ -n "$saved_exit" ]; then
+    saved_exit="${saved_exit#trap -- }"
+    saved_exit="${saved_exit% EXIT}"
+    # Bash supplies this quoted command. It does not come from a manifest.
+    eval "INSTALL_SAVED_EXIT=$saved_exit"
+  fi
+  binary_lock_acquire "$OPENLLM_DIR/install" \
+    || die "could not acquire install lock: $OPENLLM_DIR/install.lock.d"
+  trap 'install_lock_exit $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+install_lock_exit() {
+  local status="$1"
+  trap - EXIT
+  if [ -n "$INSTALL_ROLLBACK" ]; then "$INSTALL_ROLLBACK"; fi
+  binary_lock_release
+  # Supply the original exit status to the caller's saved EXIT command.
+  (exit "$status") && :
+  eval "$INSTALL_SAVED_EXIT"
+  exit "$status"
+}
+
+install_lock_release() {
+  binary_lock_release
+  trap - EXIT INT TERM
+  eval "$INSTALL_SAVED_TRAPS"
+}
+
+# The lock excludes other installers. The version checks validate each destination.
+# Remove files left by an interrupted transaction only after those checks pass.
+prerelease_discard_stale() {
+  local name file
+  for name in openllmd openllm; do
+    for file in "$BIN_DIR/.$name.pr-dl."* "$BIN_DIR/.$name.pr-bin."* \
+                "$BIN_DIR/.$name.pr-staged."* "$BIN_DIR/.$name.pr-old."*; do
+      [ -e "$file" ] || [ -L "$file" ] || continue
+      case "$file" in
+        *.pr-old.*)
+          [ -x "$BIN_DIR/$name" ] \
+            || die "restore $file to $BIN_DIR/$name before you retry this install" ;;
+      esac
+      rm -f "$file" || die "could not remove interrupted install file: $file"
+    done
+  done
+}
+
+mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
+install_lock_acquire
+
 # --- the ONE install entry point ------------------------------------------
 # /api/install validates the committed daemon + CLI release pins in TypeScript
 # (allow-listed repo, well-formed digests, a published tag for this target) and
 # fails closed. Hitting it first means a mis-pinned or half-published release is
 # refused BEFORE we download anything. No query parameters.
+# Prerelease mode does NOT call it: the selected tag's own manifests pin both
+# digests, and --prerelease never requests a stable checksum route.
 DAEMON_VERSION=""
 CLI_VERSION=""
-if [ -z "$FROM_FILE" ]; then
+PRE_SHA_DAEMON=""
+PRE_SHA_CLI=""
+if [ -n "$PRERELEASE_TAG" ]; then
+  DAEMON_VERSION="${PRERELEASE_TAG#v}"
+  CLI_VERSION="$DAEMON_VERSION"
+  # The requested version is known without the network — refuse a downgrade of
+  # any managed component before any fetch.
+  refuse_downgrade "$BIN_DIR/openllmd" "$DAEMON_VERSION"
+  refuse_downgrade "$BIN_DIR/openllm" "$CLI_VERSION"
+  refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
+  prerelease_discard_stale
+  echo "Resolving the OpenLLM prerelease $PRERELEASE_TAG..."
+  PRE_SHA_DAEMON="$(prerelease_manifest_digest openllmsh/daemon DAEMON_RELEASE)" || exit 1
+  PRE_SHA_CLI="$(prerelease_manifest_digest openllmsh/cli CLI_RELEASE)" || exit 1
+elif [ -z "$FROM_FILE" ]; then
   echo "Resolving the current OpenLLM release..."
   MANIFEST="$(curl "${CURL_SCHEME[@]}" "${CURL_META[@]}" -fsSL "$ORIGIN/api/install" 2>/dev/null)" \
     || die "could not reach $ORIGIN/api/install — check OPENLLM_CLOUD_ORIGIN and your network"
@@ -1196,8 +2150,8 @@ install_component() {
     # Assets are gzipped; the pinned digest is over the DECOMPRESSED binary, so
     # the integrity gate is independent of gzip's non-determinism. A local
     # digest was already checked over the supplied file bytes.
-    if gzip -t "$dl" >/dev/null 2>&1; then
-      gzip -dc "$dl" > "$bin" || die "could not decompress $name"
+    if is_gzip_asset "$dl"; then
+      decompress_asset "$dl" "$bin" "$name"
     else
       mv "$dl" "$bin"
     fi
@@ -1248,18 +2202,214 @@ install_component() {
   INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
 }
 
-install_component openllmd api/daemon/binary "$DAEMON_VERSION" "$FROM_FILE" "$FROM_SHA"
-# The CLI rides the same install: one command gets you both, and the daemon's
-# auto-update loop keeps them both current from here on.
-if [ -n "$CLI_FROM_FILE" ]; then
-  install_component openllm api/cli/binary "$CLI_VERSION" "$CLI_FROM_FILE" "$CLI_SHA"
-elif [ -n "$CLI_VERSION" ]; then
-  install_component openllm api/cli/binary "$CLI_VERSION"
-elif [ -z "$FROM_FILE" ]; then
-  echo "  note: no CLI release published yet — skipping openllm"
+# --- prerelease: stage BOTH components, then commit -------------------------
+# The published tag is single-shot: a missing manifest, missing asset, bad
+# digest or wrong target fails the run. Both components are downloaded,
+# digested, format-checked and version-probed into staging BEFORE either one
+# replaces an installed file, so a failure never leaves a half-swapped pair.
+prerelease_cleanup() {
+  rm -f "$BIN_DIR"/.openllmd.pr-dl.$$ "$BIN_DIR"/.openllmd.pr-bin.$$ \
+        "$BIN_DIR"/.openllmd.pr-staged.$$ \
+        "$BIN_DIR"/.openllm.pr-dl.$$ "$BIN_DIR"/.openllm.pr-bin.$$ \
+        "$BIN_DIR"/.openllm.pr-staged.$$
+}
+# PR_ASIDE lists saved binaries. PR_PLACED lists installed replacements.
+# Commit helpers return failure so the caller can restore the saved binaries.
+PR_ASIDE=""
+PR_PLACED=""
+PR_HASH_DAEMON=""
+PR_HASH_CLI=""
+prerelease_abort() { exit 1; }
+
+prerelease_rollback() {
+  local name expected actual backup
+  for name in $PR_PLACED; do
+    backup="$BIN_DIR/.$name.pr-old.$$"
+    case "$name" in
+      openllmd) expected="$PR_HASH_DAEMON" ;;
+      openllm) expected="$PR_HASH_CLI" ;;
+    esac
+    actual="$(sha256_of "$BIN_DIR/$name" 2>/dev/null || true)"
+    if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then
+      case " $PR_ASIDE " in
+        *" $name "*)
+          mv -f "$backup" "$BIN_DIR/$name" 2>/dev/null \
+            || echo "Error: rollback failed — the previous $name is still at $backup" >&2 ;;
+        *) rm -f "$BIN_DIR/$name" 2>/dev/null || true ;;
+      esac
+    elif [ -n "$actual" ]; then
+      # Another writer changed this path, or placement failed before the rename.
+      # Keep the canonical binary. It does not belong to this transaction.
+      rm -f "$backup"
+    else
+      echo "Error: could not verify $name for rollback; keep $backup for recovery" >&2
+    fi
+  done
+  for name in $PR_ASIDE; do
+    case " $PR_PLACED " in *" $name "*) continue ;; esac
+    rm -f "$BIN_DIR/.$name.pr-old.$$"
+  done
+  prerelease_cleanup
+}
+
+# Download + verify one component into $BIN_DIR/.$name.pr-staged.$$ — every
+# gate runs inside a subshell whose EXIT trap removes its own temp files.
+prerelease_stage() {
+  local name="$1" published="$2" url="$3" version="$4"
+  local dest="$BIN_DIR/$name" stamp="$BIN_DIR/.$name.sha256.stamp"
+  local staged="$BIN_DIR/.$name.pr-staged.$$"
+  local dl="$BIN_DIR/.$name.pr-dl.$$" bin="$BIN_DIR/.$name.pr-bin.$$"
+  local installed sp si
+
+  # Same skip rule as the stable path: identical bytes already in place mean a
+  # tag re-run does no binary work — only missing managed setup is repaired.
+  if [ -x "$dest" ]; then
+    installed="$(sha256_of "$dest" || true)"
+    if [ -n "$installed" ]; then
+      if [ "$installed" = "$published" ]; then
+        probe_staged_version "$dest" "$version"
+        echo "  $name is already up to date"
+        return 0
+      fi
+      if [ -f "$stamp" ]; then
+        read -r sp si < "$stamp" || true
+        if [ "$sp" = "$published" ] && [ "$si" = "$installed" ]; then
+          probe_staged_version "$dest" "$version"
+          echo "  $name is already up to date"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  echo "Downloading $name $version ($TARGET)..."
+  (
+    trap 'rm -f "$dl" "$bin"' EXIT
+    local actual
+    if [ -t 2 ]; then
+      curl "${PR_SCHEME[@]}" "${CURL_GET[@]}" -fL --progress-bar "$url" -o "$dl" || die "download failed: $url"
+    else
+      curl "${PR_SCHEME[@]}" "${CURL_GET[@]}" -fsSL "$url" -o "$dl" || die "download failed: $url"
+    fi
+    # The published asset is ALWAYS a gzip member — there is no raw fallback.
+    is_gzip_asset "$dl" || die "downloaded $name is not a valid gzip asset"
+    decompress_asset "$dl" "$bin" "$name"
+    rm -f "$dl"
+    actual="$(sha256_of "$bin")"
+    [ -n "$actual" ] || die "could not hash the downloaded $name"
+    [ "$actual" = "$published" ] \
+      || die "checksum mismatch for $name (expected $published, got $actual) — refusing to install"
+    verify_exec_format "$bin"
+    chmod 0755 "$bin"
+    # macOS: verify the digest BEFORE signature handling, then keep the stable
+    # path's rules — a valid Developer ID signature survives, otherwise ad-hoc.
+    if [ "$OS" = "darwin" ]; then
+      xattr -d com.apple.quarantine "$bin" >/dev/null 2>&1 || true
+      if ! codesign --verify --strict "$bin" >/dev/null 2>&1; then
+        codesign --force --sign - "$bin" >/dev/null 2>&1 \
+          || die "could not sign $name — refusing to install"
+        codesign --verify --strict "$bin" >/dev/null 2>&1 \
+          || die "signature verification failed for $name — refusing to install"
+        printf '%s %s\n' "$published" "$(sha256_of "$bin")" > "$stamp" 2>/dev/null || true
+      fi
+    fi
+    probe_staged_version "$bin" "$version"
+    mv -f "$bin" "$staged" || die "could not stage $name"
+  ) || return 1
+}
+
+# Pre-commit re-probe of the destination (same rule as the stable path): the
+# installed binary may have changed while the downloads were in flight. This
+# is installed_version() minus the die()s — the commit phase must return so
+# prerelease_abort can roll back and clean up.
+prerelease_commit_check() {
+  local name="$1" check_version="$2"
+  local staged="$BIN_DIR/.$name.pr-staged.$$" dest="$BIN_DIR/$name" installed
+  [ -f "$staged" ] || return 0
+  [ -x "$dest" ] || return 0
+  run_version_probe "$dest"
+  if [ "$PROBE_STATUS" -ne 0 ]; then
+    echo "Error: version probe timed out or failed at $dest; refusing to overwrite it.
+  To repair by hand: move the binary aside ('mv \"$dest\" \"$dest.bak\"') and re-run this installer." >&2
+    return 1
+  fi
+  parse_probe_version "$PROBE_OUT"
+  if [ -z "$PARSED_VERSION" ]; then
+    echo "Error: could not parse a version from $dest; refusing to overwrite" >&2
+    return 1
+  fi
+  installed="$PARSED_VERSION"
+  if [ "$(semver_cmp "$installed" "$check_version")" = "1" ]; then
+    echo "Error: installed $name is $installed, newer than the install target $check_version — refusing to downgrade.
+  To force this version, remove $dest and re-run this installer." >&2
+    return 1
+  fi
+  return 0
+}
+
+# Save a hard link to the old binary. Rename the new binary over the old path.
+# A crash before or after the rename leaves the canonical path in place.
+prerelease_commit_place() {
+  local name="$1"
+  local staged="$BIN_DIR/.$name.pr-staged.$$" dest="$BIN_DIR/$name"
+  local backup="$BIN_DIR/.$name.pr-old.$$"
+  local expected
+  [ -f "$staged" ] || return 0
+  expected="$(sha256_of "$staged")" || return 1
+  [ -n "$expected" ] || return 1
+  case "$name" in
+    openllmd) PR_HASH_DAEMON="$expected" ;;
+    openllm) PR_HASH_CLI="$expected" ;;
+  esac
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    if ! ln "$dest" "$backup" 2>/dev/null; then
+      echo "Error: could not back up $dest — refusing to replace it" >&2
+      return 1
+    fi
+    PR_ASIDE="$PR_ASIDE $name"
+  fi
+  # Record the digest before the rename so a signal can also roll it back.
+  PR_PLACED="$PR_PLACED $name"
+  if ! mv -f "$staged" "$dest"; then
+    echo "Error: could not install $name → $dest" >&2
+    return 1
+  fi
+  echo "  $name installed → $dest"
+  INSTALLED_COMPONENTS="$INSTALLED_COMPONENTS $name"
+}
+
+if [ -n "$PRERELEASE_TAG" ]; then
+  INSTALL_ROLLBACK=prerelease_rollback
+  prerelease_stage openllmd "$PRE_SHA_DAEMON" \
+    "$(prerelease_asset_url openllmsh/daemon "openllmd-$TARGET.gz")" "$DAEMON_VERSION" \
+    || prerelease_abort
+  prerelease_stage openllm "$PRE_SHA_CLI" \
+    "$(prerelease_asset_url openllmsh/cli "openllm-$TARGET.gz")" "$CLI_VERSION" \
+    || prerelease_abort
+  # Both components verified in staging — check both destinations, then place.
+  prerelease_commit_check openllmd "$DAEMON_VERSION" || prerelease_abort
+  prerelease_commit_check openllm "$CLI_VERSION" || prerelease_abort
+  prerelease_commit_place openllmd || prerelease_abort
+  prerelease_commit_place openllm || prerelease_abort
+  INSTALL_ROLLBACK=""
+  # Both renames succeeded. Remove the backups.
+  rm -f "$BIN_DIR"/.openllmd.pr-old.$$ "$BIN_DIR"/.openllm.pr-old.$$
 else
-  echo "  note: no --cli-from-file given — leaving any installed CLI untouched"
+  install_component openllmd api/daemon/binary "$DAEMON_VERSION" "$FROM_FILE" "$FROM_SHA"
+  # The CLI rides the same install: one command gets you both, and the daemon's
+  # auto-update loop keeps them both current from here on.
+  if [ -n "$CLI_FROM_FILE" ]; then
+    install_component openllm api/cli/binary "$CLI_VERSION" "$CLI_FROM_FILE" "$CLI_SHA"
+  elif [ -n "$CLI_VERSION" ]; then
+    install_component openllm api/cli/binary "$CLI_VERSION"
+  elif [ -z "$FROM_FILE" ]; then
+    echo "  note: no CLI release published yet — skipping openllm"
+  else
+    echo "  note: no --cli-from-file given — leaving any installed CLI untouched"
+  fi
 fi
+
+install_lock_release
 
 # The native PTY backend is compiled into the daemon binary in v2.8 (G1), so
 # there is no third component to install.
@@ -1410,6 +2560,10 @@ write_env_file() {
 # write_env_file installs are scoped to that subshell and cannot replace an
 # outer EXIT trap — the generated dist installer relies on its staging cleanup
 # surviving ANY exit of ours, including a die while the lock is held.
+PRIOR_ENV_SHA=""
+if [ -n "$PRERELEASE_TAG" ] && [ -z "$INSTALLED_COMPONENTS" ] && [ -f "$ENV_FILE" ]; then
+  PRIOR_ENV_SHA="$(sha256_of "$ENV_FILE" || true)"
+fi
 API_KEY="$(write_env_file)" || exit 1
 echo "  gateway config written → $ENV_FILE"
 
@@ -1453,6 +2607,27 @@ reconcile_keyless_service() {
   esac
 }
 
+# Keep a healthy service when the prerelease binaries and config did not change.
+# Require live health and a running version that matches the installed binary.
+prerelease_service_healthy() {
+  local status version
+  [ -n "$PRIOR_ENV_SHA" ] || return 1
+  [ "$PRIOR_ENV_SHA" = "$(sha256_of "$ENV_FILE" || true)" ] || return 1
+  status="$("$BIN_DIR/openllmd" status 2>/dev/null)" || return 1
+  run_version_probe "$BIN_DIR/openllmd"
+  [ "$PROBE_STATUS" -eq 0 ] || return 1
+  parse_probe_version "$PROBE_OUT"
+  version="$PARSED_VERSION"
+  [ -n "$version" ] || return 1
+  printf '%s\n' "$status" | awk -v version="$version" '
+    $1 == "service:" && $2 == "registered" { registered=1 }
+    $1 == "supervisor:" && ($2 == "running" || ($2 == "active" && $3 == "(running)")) { supervised=1 }
+    $1 == "health:" && $2 == "serving" { serving=1 }
+    $1 == "running" && $2 == "version:" && NF == 3 && $3 == version { current=1 }
+    END { exit !(registered && supervised && serving && current) }
+  '
+}
+
 if [ -n "$API_KEY" ]; then
   if [ "$INSTALL_MODE" = update ]; then
     # Only bounce the daemon when its binary actually changed. `openllmd
@@ -1471,6 +2646,8 @@ if [ -n "$API_KEY" ]; then
         echo "  daemon already current — no restart needed"
         ;;
     esac
+  elif prerelease_service_healthy; then
+    echo "  daemon already current and healthy — no restart needed"
   else
     echo "Starting the daemon..."
     "$BIN_DIR/openllmd" start || die "openllmd start failed — run '$BIN_DIR/openllmd status' to diagnose"
