@@ -551,7 +551,10 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         if (Test-Path -LiteralPath $journal) { throw "An incomplete transaction exists. Keep its recovery files and repair it before a rerun: $journal" }
         $pending = @($Images | Where-Object { $_.Replace })
         if ($pending.Count -eq 0) { return }
-        $record = @($pending | ForEach-Object { @{ Path = $_.Path; Backup = $_.Backup; HadOriginal = $_.Exists; Digest = (Get-FileHash -LiteralPath $_.Stage -Algorithm SHA256).Hash } }) | ConvertTo-Json -Depth 4
+        # Assert-ReplacementSupported refused every existing executable that
+        # differs. A pending image never has an installed file, so each move
+        # only puts a staged file in place.
+        $record = @($pending | ForEach-Object { @{ Path = $_.Path; Digest = (Get-FileHash -LiteralPath $_.Stage -Algorithm SHA256).Hash } }) | ConvertTo-Json -Depth 4
         $journalStream = [IO.File]::Open($journal, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {
             $bytes = [Text.Encoding]::UTF8.GetBytes($record)
@@ -562,10 +565,8 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         try {
             foreach ($image in $pending) {
                 Assert-SafePath $image.Path
-                Assert-SafePath $image.Backup
-                if ($image.Exists) { [IO.File]::Move($image.Path, $image.Backup) }
-                $moved.Add($image)
                 [IO.File]::Move($image.Stage, $image.Path)
+                $moved.Add($image)
             }
         } catch {
             $failure = $_
@@ -573,7 +574,6 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                 for ($i = $moved.Count - 1; $i -ge 0; $i--) {
                     $image = $moved[$i]
                     if ([IO.File]::Exists($image.Path)) { [IO.File]::Delete($image.Path) }
-                    if ($image.Exists) { [IO.File]::Move($image.Backup, $image.Path) }
                 }
                 [IO.File]::Delete($journal)
             } catch { throw "Replacement and rollback failed. Keep recovery files listed in $journal. $($_.Exception.Message)" }
@@ -649,7 +649,11 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
             foreach ($image in $images) {
                 Assert-SafePath $image.Path
                 Assert-SafePath $image.Backup
-                if (Test-Path -LiteralPath $image.Backup) { throw "A recovery file exists: $($image.Backup)" }
+                if (-not [IO.File]::Exists($image.Path) -and (Test-Path -LiteralPath $image.Backup)) {
+                    # An interrupted replacement kept the recovery file and
+                    # lost the executable. Put the recovery file back.
+                    [IO.File]::Move($image.Backup, $image.Path)
+                }
                 if (Test-Path -LiteralPath $image.Path -PathType Container) { throw "Executable path is a directory: $($image.Path)" }
                 $image.Exists = [IO.File]::Exists($image.Path)
                 if ($image.Exists) {
@@ -660,6 +664,12 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
                     }
                     if ((Compare-Version $version $tag.Substring(1)) -gt 0) { throw "Downgrade refused: $($image.Path) is $version." }
                     $image.Replace = (Get-FileHash -LiteralPath $image.Path -Algorithm SHA256).Hash -ine $image.Digest
+                    if (Test-Path -LiteralPath $image.Backup) {
+                        # The executable verified. The recovery file is
+                        # residue from a finished move. Remove it.
+                        try { [IO.File]::Delete($image.Backup) }
+                        catch { Write-Warning "A leftover recovery file could not be removed: $($image.Backup). $($_.Exception.Message)" }
+                    }
                 }
             }
             Assert-ReplacementSupported $images
