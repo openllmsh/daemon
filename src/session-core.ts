@@ -320,6 +320,8 @@ const probeActivity = async (
   rootPids: ReadonlySet<number>,
 ): Promise<Set<number>> => {
   if (activityProbe !== null) return activityProbe(rootPids);
+  // Windows uses ConPTY exit events and output timestamps. It has no ps CPU probe.
+  if (process.platform === "win32") return new Set();
   const proc = admittedSpawn(["ps", "-Ao", "pid=,ppid=,pcpu="], {
     stdout: "pipe",
     stderr: "ignore",

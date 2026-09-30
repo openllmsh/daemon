@@ -51,6 +51,8 @@ const pidAlive = (pid: number): boolean => {
  */
 const commandMap = (pids: ReadonlySet<number>): Map<number, string> | null => {
   if (pids.size === 0) return new Map();
+  // Windows uses the PID liveness check above. Command inspection needs POSIX ps.
+  if (process.platform === "win32") return null;
   try {
     const out = admittedSpawnSync(
       ["ps", "-o", "pid=,command=", ...[...pids].map((p) => String(p))],

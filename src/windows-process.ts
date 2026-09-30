@@ -135,34 +135,65 @@ export const ensureWindowsProcessAdmission = (): void => {
   }
 };
 
+const hiddenLaunchArgs = (args: unknown[], bun: boolean): unknown[] => {
+  if (process.platform !== "win32") return args;
+  const index = bun
+    ? Array.isArray(args[0])
+      ? 1
+      : 0
+    : Array.isArray(args[1]) || (args[1] == null && args.length > 2)
+      ? 2
+      : 1;
+  const options = args[index];
+  const hidden = {
+    ...(typeof options === "object" && options !== null ? options : {}),
+    windowsHide: true,
+  };
+  const next = [...args];
+  next[index] = hidden;
+  return next;
+};
+
 /** Keep Bun's overloads and POSIX behavior; admission is never optional. */
 export const spawn: typeof Bun.spawn = ((...args: unknown[]) => {
   ensureWindowsProcessAdmission();
-  return Reflect.apply(Bun.spawn, Bun, args);
+  return Reflect.apply(Bun.spawn, Bun, hiddenLaunchArgs(args, true));
 }) as typeof Bun.spawn;
 
 export const spawnSync: typeof Bun.spawnSync = ((...args: unknown[]) => {
   ensureWindowsProcessAdmission();
-  return Reflect.apply(Bun.spawnSync, Bun, args);
+  return Reflect.apply(Bun.spawnSync, Bun, hiddenLaunchArgs(args, true));
 }) as typeof Bun.spawnSync;
 
 export const nodeSpawn: typeof childProcess.spawn = ((...args: unknown[]) => {
   ensureWindowsProcessAdmission();
-  return Reflect.apply(childProcess.spawn, childProcess, args);
+  return Reflect.apply(
+    childProcess.spawn,
+    childProcess,
+    hiddenLaunchArgs(args, false),
+  );
 }) as typeof childProcess.spawn;
 
 export const nodeSpawnSync: typeof childProcess.spawnSync = ((
   ...args: unknown[]
 ) => {
   ensureWindowsProcessAdmission();
-  return Reflect.apply(childProcess.spawnSync, childProcess, args);
+  return Reflect.apply(
+    childProcess.spawnSync,
+    childProcess,
+    hiddenLaunchArgs(args, false),
+  );
 }) as typeof childProcess.spawnSync;
 
 export const nodeExecFileSync: typeof childProcess.execFileSync = ((
   ...args: unknown[]
 ) => {
   ensureWindowsProcessAdmission();
-  return Reflect.apply(childProcess.execFileSync, childProcess, args);
+  return Reflect.apply(
+    childProcess.execFileSync,
+    childProcess,
+    hiddenLaunchArgs(args, false),
+  );
 }) as typeof childProcess.execFileSync;
 
 /** Worker protocol codes are signed int32; Bun can return either signed int32
