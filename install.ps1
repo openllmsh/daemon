@@ -710,8 +710,14 @@ try { [Environment]::SetEnvironmentVariable('OPENLLM_ENV_BROADCAST', $null, 'Use
         # Release the owner lock before the stage directory can be removed.
         if ($null -ne $stageLock) { $stageLock.Dispose(); $stageLock = $null }
         if ($null -ne $stage -and [IO.Directory]::Exists($stage)) {
-            Assert-SafePath $stage
-            [IO.Directory]::Delete($stage, $true)
+            try {
+                Assert-SafePath $stage
+                [IO.Directory]::Delete($stage, $true)
+            } catch {
+                # The install result is already decided. A failed removal
+                # keeps that result. The next run sweeps the leftover stage.
+                Write-Warning "A leftover install directory could not be removed: $stage. $($_.Exception.Message)"
+            }
         }
     }
 } $Prerelease ($PSBoundParameters.ContainsKey('Prerelease'))
