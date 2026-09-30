@@ -31,6 +31,10 @@ echo Otherwise, add the .openllm\bin directory under your user profile to PATH. 
 exit /b 0
 :append_path
 if not defined PATH goto empty_path
+:strip_path_separator
+if "%PATH:~-1%"==";" set "PATH=%PATH:~0,-1%"
+if not defined PATH goto empty_path
+if "%PATH:~-1%"==";" goto strip_path_separator
 endlocal & set "PATH=%PATH%;%OPENLLM_PATH_BIN%"
 exit /b 0
 :empty_path
