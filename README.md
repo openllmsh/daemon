@@ -16,7 +16,7 @@
 ---
 
 > [!WARNING]
-> **Beta software.** OpenLLM 2.8.0-beta.3 is a prerelease. It can contain bugs.
+> **Beta software.** OpenLLM 2.8.0-beta.4 is a prerelease. It can contain bugs.
 > Its behavior can change before the stable 2.8.0 release. The Windows build is
 > not signed. For production use, install the stable release with the stable
 > installer in this README.
@@ -64,7 +64,7 @@ provider-connect guidance for any missing client.
 
 ### Preview install
 
-The current preview is `v2.8.0-beta.3`. The installer script at the tag
+The current preview is `v2.8.0-beta.4`. The installer script at the tag
 installs only that tag. The preview also ships a `win32-x64` build
 (unsigned; no PTY). A prerelease never moves `main` and never overwrites
 an earlier prerelease's branch or tag. Do not use `openllm update` to
@@ -75,7 +75,7 @@ move a stable install to the preview.
 1. Install the daemon and the CLI:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.4/install.sh | bash
    ```
 
 2. Check the version:
@@ -91,20 +91,20 @@ move a stable install to the preview.
    ```
 
 Or download the script and name the tag yourself:
-`bash install.sh --prerelease v2.8.0-beta.3`.
+`bash install.sh --prerelease v2.8.0-beta.4`.
 
 #### Install the preview on Windows (unsigned)
 
 PowerShell:
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.ps1)
+iex (irm https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.4/install.ps1)
 ```
 
 Command Prompt (CMD):
 
 ```bat
-curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.3/install.cmd
+curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/openllmsh/daemon/v2.8.0-beta.4/install.cmd
 install.cmd
 ```
 
@@ -146,7 +146,7 @@ gateway. With a usable key, the installer starts the daemon.
 A separate `openllmd start` is not normally needed on these platforms.
 Service management uses launchd or systemd where supported.
 
-On Windows, the beta.3 installer installs the binaries, alias and user PATH.
+On Windows, the beta.4 installer installs the binaries, alias and user PATH.
 Native Windows credential entry is not available in this build.
 The installer reports incomplete startup; it does not start the daemon.
 The installer defers credential setup even in an interactive terminal.
@@ -188,7 +188,7 @@ service.
 The public source mirror pins its shared packages to published GitHub refs;
 the monorepo uses workspace dependencies instead. `main` tracks stable releases;
 for a prerelease, check out its `v...` tag or its own bare-version branch
-(for example `v2.8.0-beta.3` or `2.8.0-beta.3`)
+(for example `v2.8.0-beta.4` or `2.8.0-beta.4`)
 before installing dependencies. From the public mirror:
 
 ```sh
