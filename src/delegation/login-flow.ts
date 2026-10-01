@@ -19,7 +19,11 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
+import type {
+  TAuthLoginFailedCode,
+  TAuthLoginMode,
+  TDaemonProviderReasonCode,
+} from "@openllmsh/protocol";
 import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
 import {
   admitVerifiedLogin,
@@ -392,6 +396,7 @@ export const emitLoginFailed = (
     readonly code: TAuthLoginFailedCode;
     readonly message: string;
     readonly retryable: boolean;
+    readonly reason_code?: TDaemonProviderReasonCode;
   },
 ): void => {
   emitAuth({
@@ -402,6 +407,9 @@ export const emitLoginFailed = (
     code: fail.code,
     message: fail.message,
     retryable: fail.retryable,
+    ...(fail.reason_code !== undefined
+      ? { reason_code: fail.reason_code }
+      : {}),
   });
 };
 
@@ -419,6 +427,7 @@ export type TLoginTerminalEvent =
       readonly code: TAuthLoginFailedCode;
       readonly message: string;
       readonly retryable: boolean;
+      readonly reason_code?: TDaemonProviderReasonCode;
     }
   | { readonly kind: "none" };
 
@@ -444,6 +453,9 @@ export const finalizeLoginTerminal = (opts: {
         code: opts.event.code,
         message: opts.event.message,
         retryable: opts.event.retryable,
+        ...(opts.event.reason_code !== undefined
+          ? { reason_code: opts.event.reason_code }
+          : {}),
       });
     }
     const correlation_id = opaqueDoctorCorrelation(opts.flow.flowId);
@@ -467,6 +479,12 @@ export const finalizeLoginTerminal = (opts: {
       phase: "terminal",
       ...(outcome !== undefined ? { outcome } : {}),
       ...(admitted ? { observation: "connected" } : {}),
+      ...(opts.event.kind === "failed" && opts.event.reason_code !== undefined
+        ? {
+            reason_code: opts.event.reason_code,
+            observation: "unknown",
+          }
+        : {}),
     });
     try {
       logInfo(
@@ -838,6 +856,7 @@ export const finishInBackground = async (opts: {
             code: "spawn_denied",
             message: KEYCHAIN_NOT_READY_DETAIL,
             retryable: true,
+            reason_code: "keychain_unavailable",
           }
         : sampled.state === "connected"
           ? { kind: "succeeded" }
