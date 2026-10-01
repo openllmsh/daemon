@@ -722,7 +722,8 @@ vendor_cli_cleanup_attempt_files() {
 vendor_cli_process_start() {
   local pid="$1"
   # Portable PID-reuse guard (same idea as daemon child-supervisor lstart).
-  ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  # Locale/TZ pinned: daemon processStartTime compares this from another env.
+  LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 vendor_cli_pid_live() {
