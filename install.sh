@@ -845,8 +845,8 @@ vendor_cli_path_mtime_age_sec() {
   echo $((now - mtime))
 }
 
-# Init age for the lock dir: prefer immutable `$lock/created` epoch (survives
-# child mkdir/rmdir mtime refresh). Missing/invalid → fail-closed age 0.
+# Prefer immutable birth time; a parent may die before writing it. Fall back
+# to directory mtime, whose unavailable/invalid value still fails closed.
 vendor_cli_lock_init_age_sec() {
   local lock="$1" created raw now
   created="$lock/created"
@@ -859,7 +859,7 @@ vendor_cli_lock_init_age_sec() {
       return 0
     fi
   fi
-  echo 0
+  vendor_cli_path_mtime_age_sec "$lock"
 }
 
 # Portable inode identity; empty on failure (caller must not reclaim).
