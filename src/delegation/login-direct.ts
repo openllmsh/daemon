@@ -492,6 +492,7 @@ export const makeStreamConnect = (
               message: KEYCHAIN_NOT_READY_DETAIL,
               retryable: true,
               reason_code: "keychain_unavailable",
+              failedAt: "readiness",
             },
             provider: cfg.provider,
             clearPending: true,

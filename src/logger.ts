@@ -31,6 +31,8 @@
  */
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
+import type { TDoctorOutcomeLedger } from "@openllmsh/protocol";
+import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
 import { observeDoctorEvent } from "./doctor-report/engine";
 import type { TSafeDiagnosticMessage } from "./doctor-report/message";
 import {
@@ -170,18 +172,8 @@ const appendCombined = (line: string, sync: boolean): boolean => {
  */
 export const flushLogs = (): Promise<void> => appendTail;
 
-type TLogObservation = Pick<
-  TDoctorObservationInput,
-  | "timings"
-  | "correlation_id"
-  | "provider"
-  | "operation_kind"
-  | "phase"
-  | "outcome"
-  | "observation"
-  | "reason_code"
-  | "status_seq"
->;
+type TLogObservation = TDoctorOutcomeLedger &
+  Pick<TDoctorObservationInput, "timings" | "correlation_id">;
 
 const write = (
   level: TLevel,
@@ -199,27 +191,7 @@ const write = (
         timings: observation?.timings,
         correlation_id: observation?.correlation_id,
         replay_session_id: currentCommandReplaySessionId(),
-        ...(observation?.provider !== undefined
-          ? { provider: observation.provider }
-          : {}),
-        ...(observation?.operation_kind !== undefined
-          ? { operation_kind: observation.operation_kind }
-          : {}),
-        ...(observation?.phase !== undefined
-          ? { phase: observation.phase }
-          : {}),
-        ...(observation?.outcome !== undefined
-          ? { outcome: observation.outcome }
-          : {}),
-        ...(observation?.observation !== undefined
-          ? { observation: observation.observation }
-          : {}),
-        ...(observation?.reason_code !== undefined
-          ? { reason_code: observation.reason_code }
-          : {}),
-        ...(observation?.status_seq !== undefined
-          ? { status_seq: observation.status_seq }
-          : {}),
+        ...projectDoctorOutcomeLedger(observation ?? {}),
       });
     } catch {
       // Reporting must never throw or log recursively.

@@ -1,10 +1,13 @@
 /**
  * The daemon's ONE AsyncLocalStorage module. Refresh spawn metadata and the
  * status-tick correlation bag and bounded command replay lease live here so
- * a later reader never has to hunt a second ALS module.
+ * a later reader never has to hunt a second ALS module. Login-command flow
+ * identity also lives here so keychain/store diagnostics can read opaque
+ * correlation without importing login-flow.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isReplaySessionId } from "@openllmsh/protocol";
+import { opaqueDoctorCorrelation } from "./doctor-report/correlation";
 
 type TCommandReplayContext = {
   active: boolean;
@@ -39,10 +42,13 @@ export const withCommandReplayContext = async <TResult>(
   });
 };
 
-/** Shared workers and event subscribers are not owned by the triggering command. */
+/** Shared workers and event subscribers inherit neither replay nor login ownership. */
 export const withoutCommandReplayContext = <TResult>(
   work: () => TResult,
-): TResult => commandReplayContext.run(undefined, work);
+): TResult =>
+  commandReplayContext.run(undefined, () =>
+    loginCommandContext.run(undefined, work),
+  );
 
 export type TRefreshSpawnBag = {
   meta:
@@ -108,3 +114,33 @@ export const nextStatusTickId = (): number => {
 /** `null` off a status tick (e.g. a request-path refresh). */
 export const currentTickId = (): number | null =>
   opTickContext.getStore()?.tick_id ?? null;
+
+// ─── Login-command flow identity (control-relay → login adaptors / keychain) ─
+
+export type TLoginCommandContext = {
+  readonly flowId: string;
+  readonly keyId: string;
+  readonly localOnly?: boolean;
+};
+
+const loginCommandContext = new AsyncLocalStorage<
+  TLoginCommandContext | undefined
+>();
+
+/**
+ * Bind the current control-command's id as `flow_id` for the duration of
+ * `run()`. Background work must capture the resolved flow — this binding is
+ * restored when `run()` returns.
+ */
+export const runWithLoginCommand = async <T>(
+  ctx: TLoginCommandContext,
+  run: () => Promise<T>,
+): Promise<T> => loginCommandContext.run(ctx, run);
+
+export const currentLoginCommandContext = ():
+  | TLoginCommandContext
+  | undefined => loginCommandContext.getStore();
+
+/** Opaque doctor correlation for the bound login command; omit when unbound. */
+export const currentLoginCommandCorrelation = (): string | undefined =>
+  opaqueDoctorCorrelation(loginCommandContext.getStore()?.flowId);
