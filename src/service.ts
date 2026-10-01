@@ -351,7 +351,7 @@ const startLinux = (binPath: string): void => {
   mkdirSync(unitDir(), { recursive: true });
   // systemd opens the `append:` log targets (renderUnitLogging) at exec time —
   // the state dir must exist first or the unit fails to start.
-  mkdirSync(stateDir(), { recursive: true });
+  mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
   writeFileSync(unitPath(), renderUnit(binPath));
   if (!tryRun("systemctl", ["--version"])) {
     throw new Error("systemctl not found — cannot register a systemd unit");

@@ -6,6 +6,7 @@
  */
 import { fstatSync } from "node:fs";
 import type { TDaemonStatus } from "@openllmsh/protocol";
+import type { TLibcVariadic } from "../../../tunnel/session/libc-variadic";
 import { logDebug, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { childWorkingSet } from "./child-policy";
@@ -87,76 +88,43 @@ type TLibc = {
 };
 
 /**
- * Bind the libc entry points through `bun:ffi`. `syscall(2)` is variadic;
- * declaring it with fixed integer signatures is sound on the Linux x86_64
- * SysV and aarch64 AAPCS ABIs (integer varargs ride the same registers as
- * named args). Imported lazily so non-Linux platforms never load `bun:ffi`.
+ * Bind the libc entry points. `syscall(2)`, `open(2)` and `prctl(2)` are
+ * variadic: they go through the libc-variadic TinyCC shim, which declares the
+ * real prototypes so the ABI cannot drop or misplace an argument, and return
+ * `-errno` instead of leaving errno to be read afterwards. `close` is
+ * non-variadic and stays on `bun:ffi`. Imported lazily so non-Linux
+ * platforms never load `bun:ffi`.
  */
 const bindLibc = async (): Promise<TLibc | null> => {
   const { dlopen, FFIType, ptr } = await import("bun:ffi");
+  const { libcVariadic } = await import(
+    "../../../tunnel/session/libc-variadic"
+  );
+  let shim: TLibcVariadic;
+  try {
+    shim = libcVariadic();
+  } catch {
+    return null;
+  }
+  const syscall = shim.libcSyscall;
+  const prctl = shim.libcPrctl;
+  if (syscall === undefined || prctl === undefined) return null;
   for (const lib of ["libc.so.6", "libc.so"]) {
     try {
       const { symbols } = dlopen(lib, {
-        syscall: {
-          args: [
-            FFIType.i64,
-            FFIType.i64,
-            FFIType.i64,
-            FFIType.i64,
-            FFIType.i64,
-          ],
-          returns: FFIType.i64,
-        },
-        open: {
-          args: [FFIType.ptr, FFIType.i32],
-          returns: FFIType.i32,
-        },
         close: { args: [FFIType.i32], returns: FFIType.i32 },
-        prctl: {
-          args: [
-            FFIType.i32,
-            FFIType.i64,
-            FFIType.i64,
-            FFIType.i64,
-            FFIType.i64,
-          ],
-          returns: FFIType.i32,
-        },
       });
       // Bun maps `FFIType.i64` to a `bigint` in BOTH directions, so `sys`
       // takes + returns bigints. The wrappers convert the `number` syscall
       // NUMBER `n` to bigint once and return the raw bigint result unwrapped.
-      const sys = symbols.syscall as unknown as (
-        n: bigint,
-        a: bigint,
-        b: bigint,
-        c: bigint,
-        d: bigint,
-      ) => bigint;
+      const sys = syscall;
       return {
-        syscall3: (n, a, b, c) => sys(BigInt(n), a, b, c, 0n),
-        syscall4: (n, a, b, c, d) => sys(BigInt(n), a, b, c, d),
-        open: (path, flags) =>
-          Number(
-            (symbols.open as unknown as (p: number, f: number) => number)(
-              ptr(path),
-              flags,
-            ),
-          ),
+        syscall3: (n, a, b, c) => sys(BigInt(n), a, b, c, 0n, 0n, 0n),
+        syscall4: (n, a, b, c, d) => sys(BigInt(n), a, b, c, d, 0n, 0n),
+        open: (path, flags) => shim.libcOpen(ptr(path), flags, 0),
         close: (fd) =>
           Number((symbols.close as unknown as (f: number) => number)(fd)),
-        prctl: (op, a, b, c, d) =>
-          Number(
-            (
-              symbols.prctl as unknown as (
-                o: number,
-                a: bigint,
-                b: bigint,
-                c: bigint,
-                d: bigint,
-              ) => number
-            )(op, a, b, c, d),
-          ),
+        prctl: (op, a, b, c, d) => prctl(op, a, b, c, d),
       };
     } catch {
       // try the next libc name (glibc vs musl)

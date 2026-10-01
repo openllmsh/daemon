@@ -1545,6 +1545,20 @@ binary_lock_release() {
 }
 # <<< openllm-binary-lock/v1 <<<
 
+# Installer-owned directories are private state. A permissive caller umask
+# (or a group-writable ~/.openllm left by an older build) would otherwise make
+# the lock parent writable by another user, which the lock protocol refuses.
+# Create under a private umask; with repair=1 (the default) also chmod a
+# directory the invoking user owns — never a symlink or a foreign directory.
+private_dir() {
+  local d="$1" repair="${2:-1}"
+  [ -d "$d" ] || (umask 077 && mkdir -p "$d") \
+    || die "could not create directory: $d"
+  if [ "$repair" = "1" ] && [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ]; then
+    chmod 700 "$d" || die "could not secure directory: $d"
+  fi
+}
+
 # Keep the caller's traps while the binary transaction owns the install lock.
 install_lock_acquire() {
   local saved_exit
@@ -1600,7 +1614,12 @@ prerelease_discard_stale() {
   done
 }
 
-mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
+private_dir "$OPENLLM_DIR"
+private_dir "$BIN_DIR"
+env_dir="$(dirname "$ENV_FILE")"
+# A custom OPENLLM_DAEMON_ENV_FILE directory is the operator's, not ours:
+# create it private when missing, but never chmod a pre-existing custom dir.
+[ "$env_dir" = "$OPENLLM_DIR" ] || private_dir "$env_dir" 0
 install_lock_acquire
 
 # --- the ONE install entry point ------------------------------------------
@@ -1651,7 +1670,12 @@ elif [ -z "$FROM_FILE" ]; then
   refuse_downgrade "$BIN_DIR/openllmc" "$CLI_VERSION"
 fi
 
-mkdir -p "$BIN_DIR" "$(dirname "$ENV_FILE")"
+private_dir "$OPENLLM_DIR"
+private_dir "$BIN_DIR"
+env_dir="$(dirname "$ENV_FILE")"
+# A custom OPENLLM_DAEMON_ENV_FILE directory is the operator's, not ours:
+# create it private when missing, but never chmod a pre-existing custom dir.
+[ "$env_dir" = "$OPENLLM_DIR" ] || private_dir "$env_dir" 0
 
 # --- fetch + verify + install one component -------------------------------
 # Bytes come from the per-component binary routes, which 302 to the pinned
@@ -2632,7 +2656,7 @@ OPENLLM_VENDOR_JOB
       VENDOR_MISSING_PRINTED=$((VENDOR_MISSING_PRINTED + 1))
       continue
     fi
-    mkdir -p "$job_dir" 2>/dev/null || true
+    (umask 077 && mkdir -p "$job_dir") 2>/dev/null || true
     pidfile="$job_dir/$cmd.pid"
     job_log="$job_dir/$cmd.log"
     [ -x "$BIN_DIR/openllmd" ] || {

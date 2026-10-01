@@ -183,7 +183,7 @@ const writePersistAtomic = (records: readonly TPersistRecord[]): void => {
   );
   const body: TPersistFile = { v: SCHEMA_V, records };
   try {
-    mkdirSync(stateDir(), { recursive: true });
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
     writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
     renameSync(tmp, cliVersionCacheFilePath());
   } catch {

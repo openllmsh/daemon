@@ -45,11 +45,12 @@ export const runLinuxPdeathsigWrapper = async (
   if (argv.length === 0 || argv[0] === undefined)
     throw new Error("PDEATHSIG wrapper requires a command");
   const { dlopen, FFIType, ptr } = await import("bun:ffi");
+  // prctl is variadic — it goes through the libc-variadic TinyCC shim, which
+  // declares the real prototype and reports failure as -errno.
+  const { libcVariadic } = await import(
+    "../../../tunnel/session/libc-variadic"
+  );
   const libcSymbols = {
-    prctl: {
-      args: [FFIType.i32, FFIType.i32, FFIType.i64, FFIType.i64, FFIType.i64],
-      returns: FFIType.i32,
-    },
     getppid: { args: [], returns: FFIType.i32 },
     execvp: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
   } as const;
@@ -77,13 +78,8 @@ export const runLinuxPdeathsigWrapper = async (
     }
   }
   if (symbols === null) throw new Error("PDEATHSIG: no loadable libc found");
-  const prctl = symbols.prctl as unknown as (
-    option: number,
-    argument2: number,
-    argument3: bigint,
-    argument4: bigint,
-    argument5: bigint,
-  ) => number;
+  const prctl = libcVariadic().libcPrctl;
+  if (prctl === undefined) throw new Error("PDEATHSIG: libc shim unavailable");
   const getppid = symbols.getppid as unknown as () => number;
   const execvp = symbols.execvp as unknown as (
     file: number,
@@ -91,7 +87,7 @@ export const runLinuxPdeathsigWrapper = async (
   ) => number;
   const PR_SET_PDEATHSIG = 1;
   const SIGTERM = 15;
-  if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0n, 0n, 0n) !== 0)
+  if (prctl(PR_SET_PDEATHSIG, BigInt(SIGTERM), 0n, 0n, 0n) !== 0)
     throw new Error("prctl(PR_SET_PDEATHSIG) failed");
   if (getppid() !== expectedParentPid) process.exit(1);
   const encoded = argv.map(cString);

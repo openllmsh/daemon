@@ -123,36 +123,49 @@ export const buildLinuxSandboxSelfTestArgs = (
 const landlockAbi = (): number | null => {
   if (process.platform !== "linux" || !["x64", "arm64"].includes(process.arch))
     return null;
-  const syscall = {
-    args: [FFIType.i64, FFIType.i64, FFIType.i64, FFIType.i64],
-    returns: FFIType.i64,
-  } as const;
-  const libraryNames = [
-    "libc.so.6",
-    `libc.musl-${process.arch === "arm64" ? "aarch64" : "x86_64"}.so.1`,
-    "libc.so",
-  ];
-  for (const name of libraryNames) {
-    try {
-      const libc = dlopen(name, { syscall });
+  try {
+    // No loadable libc means no Landlock. `close` is non-variadic, so the
+    // availability probe stays a plain dlopen; only the variadic syscall(2)
+    // goes through the libc-variadic shim (real prototype, -errno result).
+    const close = {
+      args: [FFIType.i32],
+      returns: FFIType.i32,
+    } as const;
+    const libraryNames = [
+      "libc.so.6",
+      `libc.musl-${process.arch === "arm64" ? "aarch64" : "x86_64"}.so.1`,
+      "libc.so",
+    ];
+    let loadable = false;
+    for (const name of libraryNames) {
       try {
-        const abi = Number(
-          libc.symbols.syscall(
-            BigInt(LANDLOCK_CREATE_RULESET),
-            0n,
-            0n,
-            BigInt(LANDLOCK_CREATE_RULESET_VERSION),
-          ),
-        );
-        return abi > 0 ? abi : null;
-      } finally {
-        libc.close();
+        dlopen(name, { close }).close();
+        loadable = true;
+        break;
+      } catch {
+        // Try the next supported libc name.
       }
-    } catch {
-      // Try the next supported libc name.
     }
+    if (!loadable) return null;
+    const { libcVariadic } =
+      require("../../../tunnel/session/libc-variadic") as typeof import("../../../tunnel/session/libc-variadic");
+    const syscall = libcVariadic().libcSyscall;
+    if (syscall === undefined) return null;
+    const abi = Number(
+      syscall(
+        BigInt(LANDLOCK_CREATE_RULESET),
+        0n,
+        0n,
+        BigInt(LANDLOCK_CREATE_RULESET_VERSION),
+        0n,
+        0n,
+        0n,
+      ),
+    );
+    return abi > 0 ? abi : null;
+  } catch {
+    return null;
   }
-  return null;
 };
 
 const readBounded = async (

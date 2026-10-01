@@ -365,7 +365,7 @@ const persist = (): void => {
     }
   }
   try {
-    mkdirSync(persistDir, { recursive: true });
+    mkdirSync(persistDir, { recursive: true, mode: 0o700 });
     writeFileSync(cacheFile(), JSON.stringify(out), { mode: 0o600 });
   } catch {
     // best-effort — losing the cache only costs a cold start next time

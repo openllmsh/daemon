@@ -146,7 +146,7 @@ const ownPrivate = (): KeyObject => {
   const { privateKey } = generateKeyPairSync("x25519");
   const tmpPath = `${path}.${process.pid}.tmp`;
   try {
-    mkdirSync(stateDir(), { recursive: true });
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
     writeFileSync(
       tmpPath,
       privateKey.export({ format: "der", type: "pkcs8" }),

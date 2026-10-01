@@ -19,7 +19,6 @@
  * read failure yields defaults, a write failure is swallowed — the in-memory
  * guards in the callers still prevent tight loops.
  */
-import { dlopen, FFIType } from "bun:ffi";
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
@@ -34,6 +33,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { libcVariadic } from "../../tunnel/session/libc-variadic";
 import {
   processIdentityStatus,
   processStartIdentity,
@@ -57,15 +57,11 @@ let cachedDarwinFullSync: TDarwinFullSync | null | undefined;
 const loadDarwinFullSync = (): TDarwinFullSync | null => {
   if (cachedDarwinFullSync !== undefined) return cachedDarwinFullSync;
   try {
-    const lib = dlopen("/usr/lib/libSystem.B.dylib", {
-      fcntl: {
-        // fcntl is variadic; F_FULLFSYNC ignores the third argument.
-        args: [FFIType.i32, FFIType.i32, FFIType.i32],
-        returns: FFIType.i32,
-      },
-    });
-    const fcntl = lib.symbols.fcntl;
-    cachedDarwinFullSync = (fd) => fcntl(fd, DARWIN_F_FULLFSYNC, 0);
+    // fcntl is variadic; the libc-variadic shim declares the real prototype
+    // so the ABI cannot drop or misplace the argument. F_FULLFSYNC ignores
+    // the third argument.
+    const libc = libcVariadic();
+    cachedDarwinFullSync = (fd) => libc.libcFcntl(fd, DARWIN_F_FULLFSYNC, 0n);
   } catch {
     cachedDarwinFullSync = null;
   }
@@ -387,7 +383,7 @@ const coerceState = (v: unknown): TDaemonState => {
 const writeStateAtomic = (state: TDaemonState): boolean => {
   const tmp = join(stateDir(), `.state.json.${process.pid}.tmp`);
   try {
-    mkdirSync(stateDir(), { recursive: true });
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
     writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
     fsyncFileSync(tmp);
     renameSync(tmp, stateFilePath());
@@ -669,8 +665,8 @@ export const acquireStateLock = (opts?: {
   let swept = false;
   for (;;) {
     try {
-      mkdirSync(stateDir(), { recursive: true });
-      mkdirSync(lockDir);
+      mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+      mkdirSync(lockDir, { mode: 0o700 });
       try {
         writeFileSync(
           join(lockDir, STATE_LOCK_OWNER_FILE),
