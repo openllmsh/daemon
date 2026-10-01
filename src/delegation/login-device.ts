@@ -127,10 +127,18 @@ export const makePasteBackDevice = (
         const flow = resolveLoginFlow(cfg.provider, "paste_code");
         const ready = await cfg.beforeLogin?.();
         if (!loginReady(ready)) {
-          emitLoginFailed(flow, {
-            code: "spawn_denied",
-            message: KEYCHAIN_NOT_READY_DETAIL,
-            retryable: true,
+          finalizeLoginTerminal({
+            flow,
+            event: {
+              kind: "failed",
+              code: "spawn_denied",
+              message: KEYCHAIN_NOT_READY_DETAIL,
+              retryable: true,
+              reason_code: "keychain_unavailable",
+              failedAt: "readiness",
+            },
+            provider: cfg.provider,
+            clearPending: true,
           });
           return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
         }
@@ -263,8 +271,11 @@ export const makePasteBackDevice = (
         // Cancel-after-URL still uses this terminal so a late connected verify
         // cannot emit succeeded (finishInBackground fences wasCancelled).
         void login.done.then(async () => {
-          handle = null;
-          if (submitting !== null) await submitting.catch(() => {});
+          // Only clear if we still own the paste handle — an older completion
+          // must not null a newer flow's login.
+          if (handle === login) handle = null;
+          // Cancel/abort release runs without awaiting shared submitting so an
+          // older done cannot wait on a newer flow's grant/submit work.
           if (cfg.slot.wasCancelled() || abort.signal.aborted) {
             await login.whenReleased.catch(() => {});
             if (
@@ -273,6 +284,25 @@ export const makePasteBackDevice = (
             ) {
               cfg.slot.end(flow.flowId);
             }
+            return;
+          }
+          if (cfg.slot.flow()?.flowId !== flow.flowId) {
+            return;
+          }
+          if (submitting !== null) await submitting.catch(() => {});
+          // Re-check after the awaited grant/submit: cancel, abort, or a newer
+          // flow must not reach finishInBackground.
+          if (cfg.slot.wasCancelled() || abort.signal.aborted) {
+            await login.whenReleased.catch(() => {});
+            if (
+              cfg.slot.flow()?.flowId === flow.flowId &&
+              cfg.slot.inFlight()
+            ) {
+              cfg.slot.end(flow.flowId);
+            }
+            return;
+          }
+          if (cfg.slot.flow()?.flowId !== flow.flowId) {
             return;
           }
           await finishInBackground({
@@ -313,10 +343,49 @@ export const makePasteBackDevice = (
       readonly ok: boolean;
       readonly detail?: string;
     }> => {
+      // Capture the submitting flow BEFORE any await. A cancel/new-flow during
+      // grant must never finalize or end whatever currently owns the slot.
+      const submittingFlow = cfg.slot.flow();
+      if (submittingFlow === null || cfg.slot.wasCancelled()) {
+        return { ok: false, detail: "sign-in cancelled" };
+      }
+      const stillSubmittingFlow = (): boolean =>
+        !cfg.slot.wasCancelled() &&
+        cfg.slot.flow()?.flowId === submittingFlow.flowId;
       const r = await current.submitCode(code);
       if (!r.ok) return { ok: false, detail: r.detail };
+      if (!stillSubmittingFlow()) {
+        return { ok: false, detail: "sign-in cancelled" };
+      }
       const granted = await cfg.onCodeAccepted?.();
+      if (!stillSubmittingFlow()) {
+        // Cancel already emitted its terminal, or a newer flow owns the slot —
+        // do not emit spawn_denied / clearPending / end against the live flow.
+        return {
+          ok: false,
+          detail:
+            granted === false ? KEYCHAIN_NOT_READY_DETAIL : "sign-in cancelled",
+        };
+      }
       if (granted === false) {
+        finalizeLoginTerminal({
+          flow: submittingFlow,
+          event: {
+            kind: "failed",
+            code: "spawn_denied",
+            message: KEYCHAIN_NOT_READY_DETAIL,
+            retryable: true,
+            reason_code: "keychain_unavailable",
+            failedAt: "prep",
+          },
+          provider: cfg.provider,
+          clearPending: true,
+        });
+        // End this flow so login.done's finishInBackground is stale and cannot
+        // emit succeeded after preparation refusal.
+        if (cfg.slot.flow()?.flowId === submittingFlow.flowId) {
+          cfg.slot.end(submittingFlow.flowId);
+        }
         return { ok: false, detail: KEYCHAIN_NOT_READY_DETAIL };
       }
       const submitted = await cfg.verifyAfterSubmit();

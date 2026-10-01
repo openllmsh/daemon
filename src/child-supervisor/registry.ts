@@ -74,6 +74,18 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
 };
 
 /**
+ * `ps -o lstart=` follows LC_TIME and TZ. Installer writes and daemon reads
+ * must share one pin or a live worker looks PID-reused. Keep sync + async
+ * helpers on the same env.
+ */
+const processStartTimePsEnv = (): NodeJS.ProcessEnv => ({
+  ...process.env,
+  LC_ALL: "C",
+  LANG: "C",
+  TZ: "UTC",
+});
+
+/**
  * darwin start identity through the daemon's ADMITTED spawn path (the same
  * `ps -o lstart=` probe as before XS-2). The shared local-runtime reader runs
  * `ps` through node:child_process, which bypasses the admission seam and the
@@ -96,7 +108,7 @@ const darwinPsStartTime = (pid: number): string | null | undefined => {
       {
         stdout: "pipe",
         stderr: "ignore",
-        env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+        env: processStartTimePsEnv(),
         // A stalled ps must not block the daemon (review P2): same bound as
         // the shared reader. A timeout gives a null exit code → "unknown".
         timeout: 1500,
@@ -171,7 +183,7 @@ const defaultProcessStartTimeHelperSpawn: TProcessStartTimeHelperSpawn = (
   admittedSpawn(["ps", "-o", "lstart=", "-p", String(pid)], {
     stdout: "pipe",
     stderr: "ignore",
-    env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+    env: processStartTimePsEnv(),
     // Own process group so reap can SIGKILL descendants without touching
     // the daemon group. Test fakes must also set detached: true.
     detached: true,

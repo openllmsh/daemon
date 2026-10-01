@@ -73,8 +73,16 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { link, rename, rm } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import type {
+  TDoctorOutcomeLedger,
+  TDoctorStoreClassifier,
+  TDoctorStoreOperation,
+  TDoctorStoreResult,
+  TDoctorStoreStage,
+} from "@openllmsh/protocol";
 import { superviseSpawn } from "../child-supervisor";
 import type { TDeadlineBudget } from "../deadline-budget";
 import {
@@ -91,7 +99,7 @@ import {
   logWarn,
   safeDiagnosticMessage,
 } from "../logger";
-import { currentTickId } from "../op-context";
+import { currentLoginCommandCorrelation, currentTickId } from "../op-context";
 import { withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { classifyStatError } from "./observation-cache";
@@ -234,6 +242,87 @@ type TSecurityResult = {
   readonly stderr: string;
   readonly timedOut: boolean;
   readonly aborted: boolean;
+};
+
+/** Accept a native exit only when it is already an integer in 0..255; omit
+ *  otherwise (fail-closed — never synthesize or truncate a fractional code). */
+const storeExitCodeOf = (code: number): number | undefined => {
+  if (!Number.isInteger(code) || code < 0 || code > 255) return undefined;
+  return code;
+};
+
+const storeClassifierOf = (
+  token: string | null | undefined,
+): TDoctorStoreClassifier | undefined => {
+  if (token === "-25293") return "auth_failed";
+  if (token === "-25295") return "invalid_keychain";
+  if (
+    token === "passphrase you entered" ||
+    token === "username or passphrase"
+  ) {
+    return "passphrase_refused";
+  }
+  return undefined;
+};
+
+const storeResultOf = (
+  res: Pick<TSecurityResult, "code" | "timedOut" | "aborted">,
+): TDoctorStoreResult => {
+  if (res.aborted) return "aborted";
+  if (res.timedOut) return "timed_out";
+  return res.code === 0 ? "succeeded" : "failed";
+};
+
+const completedStoreExitCodeOf = (
+  res: Pick<TSecurityResult, "code" | "timedOut" | "aborted">,
+): number | undefined =>
+  res.timedOut || res.aborted ? undefined : storeExitCodeOf(res.code);
+
+type TStoreObservationInput = {
+  readonly operation: TDoctorStoreOperation;
+  readonly stage: TDoctorStoreStage;
+  readonly result: TDoctorStoreResult;
+  readonly exitCode?: number;
+  readonly classifier?: TDoctorStoreClassifier;
+  readonly recovery?: {
+    readonly created: boolean;
+    readonly unlocked: boolean;
+    readonly replaced: boolean;
+  };
+};
+
+type TStoreLogObservation = TDoctorOutcomeLedger & {
+  readonly correlation_id?: string;
+};
+
+/** Fourth-arg observation for `logWarn`/`logError`/`logInfo` — projected by
+ *  the logger onto the doctor ledger. Never put paths, stderr, or tokens here.
+ *  Opaque login-flow correlation is attached only when a login command ALS is
+ *  bound (via op-context); invalid/unbound ids are omitted. */
+const toStoreObservation = (
+  input: TStoreObservationInput,
+): TStoreLogObservation => {
+  const ledger: {
+    -readonly [K in keyof TStoreLogObservation]?: TStoreLogObservation[K];
+  } = {
+    store_operation: input.operation,
+    store_stage: input.stage,
+    store_result: input.result,
+  };
+  if (input.exitCode !== undefined) {
+    const exit = storeExitCodeOf(input.exitCode);
+    if (exit !== undefined) ledger.store_exit_code = exit;
+  }
+  if (input.classifier !== undefined)
+    ledger.store_classifier = input.classifier;
+  if (input.recovery !== undefined) {
+    ledger.recovery_created = input.recovery.created;
+    ledger.recovery_unlocked = input.recovery.unlocked;
+    ledger.recovery_replaced = input.recovery.replaced;
+  }
+  const correlation_id = currentLoginCommandCorrelation();
+  if (correlation_id !== undefined) ledger.correlation_id = correlation_id;
+  return ledger;
 };
 
 type TKeychainCounters = {
@@ -886,17 +975,25 @@ const logKeychainFailure = (kc: string): void => {
   )
     return;
   lastKeychainFailureLogMs.set(kc, now);
+  // Summary only — createIsolatedKeychain may have failed at staging, install,
+  // or final unlock; stage-accurate store_* fields are already emitted there.
+  // Do not invent create/staging here.
+  const correlation_id = currentLoginCommandCorrelation();
   logError(
     "keychain",
-    safeDiagnosticMessage`failed to create the isolated login keychain — claude login will pop the 'Keychain Not Found' dialog and hang`,
+    safeDiagnosticMessage`failed to create the isolated login keychain; sign-in will be blocked until the store is ready`,
     { keychain: kc },
+    {
+      reason_code: "keychain_unavailable",
+      ...(correlation_id !== undefined ? { correlation_id } : {}),
+    },
   );
 };
 
 const logSelfHeal = (kc: string): void =>
   logError(
     "keychain",
-    safeDiagnosticMessage`recreated a drifted isolated login keychain (empty-password unlock failed); the provider will require re-login`,
+    safeDiagnosticMessage`recreated a drifted isolated login keychain; the provider will require re-login`,
     { keychain: kc },
   );
 
@@ -1478,59 +1575,272 @@ const repairIsolatedKeychainPermissions = (home: string): boolean => {
   return ok;
 };
 
-type TPreparedStaging = {
-  readonly path: string;
-  readonly unlocked: boolean;
+type TStoreFingerprint = {
+  readonly present: boolean;
+  readonly ino: number | null;
+  readonly mtimeMs: number | null;
+  readonly size: number | null;
+};
+
+const storeFingerprint = (kc: string): TStoreFingerprint => {
+  try {
+    const st = statSync(kc);
+    return {
+      present: true,
+      ino: Number(st.ino),
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+    };
+  } catch {
+    return { present: false, ino: null, mtimeMs: null, size: null };
+  }
+};
+
+const sameStoreFingerprint = (
+  a: TStoreFingerprint,
+  b: TStoreFingerprint,
+): boolean =>
+  a.present === b.present &&
+  a.ino === b.ino &&
+  a.mtimeMs === b.mtimeMs &&
+  a.size === b.size;
+
+const isExistError = (err: unknown): boolean =>
+  typeof err === "object" &&
+  err !== null &&
+  "code" in err &&
+  (err as { code?: unknown }).code === "EEXIST";
+
+/**
+ * Atomic create-only install: hard-link staging onto the vacant final path,
+ * then drop the owned staging name. Only `EEXIST` means a peer won — leave
+ * their store untouched. Other link errors are failures even if `kc` happens
+ * to exist afterward (that is not a reliable peer-adoption signal).
+ * Same-directory staging/final keeps this off the EXDEV path. `link` itself
+ * is the atomic create; residual races live in repair's fingerprint recheck /
+ * aside micro-window, not in first-time create-only install.
+ */
+const installStagingCreateOnly = async (
+  staging: string,
+  kc: string,
+): Promise<"installed" | "peer-exists" | "failed"> => {
+  try {
+    await link(staging, kc);
+    removeOwnedPath(staging);
+    return "installed";
+  } catch (err) {
+    removeOwnedPath(staging);
+    if (isExistError(err)) return "peer-exists";
+    return "failed";
+  }
+};
+
+type TPreparedStaging =
+  | { readonly ok: true; readonly path: string }
+  | {
+      readonly ok: false;
+      readonly operation: "create" | "settings" | "unlock";
+      /** Present only for a real `security` spawn result — never fabricated. */
+      readonly exitCode?: number;
+      readonly timedOut: boolean;
+      readonly aborted: boolean;
+    };
+
+const spawnSecurityQuiet = (
+  argv: ReadonlyArray<string>,
+  home: string,
+  signal?: AbortSignal,
+): Promise<TSecurityResult> =>
+  spawnSecurity(argv, home, {
+    stdout: "ignore",
+    stderr: "ignore",
+    ...(signal !== undefined ? { signal } : {}),
+  });
+
+/**
+ * Create-only restore of an aside onto a vacant final path. Uses `link` so a
+ * peer that reoccupied `kc` is not overwritten; aside is retained on conflict.
+ */
+const restoreAsideCreateOnly = async (
+  aside: string,
+  kc: string,
+  classifier?: TDoctorStoreClassifier,
+): Promise<"restored" | "peer-exists" | "failed"> => {
+  try {
+    await link(aside, kc);
+    removeOwnedPath(aside);
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain restore completed`,
+      undefined,
+      toStoreObservation({
+        operation: "restore",
+        stage: "recovery",
+        result: "succeeded",
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    return "restored";
+  } catch (err) {
+    if (isExistError(err)) {
+      logWarn(
+        "keychain",
+        safeDiagnosticMessage`keychain restore peer won`,
+        undefined,
+        toStoreObservation({
+          operation: "restore",
+          stage: "recovery",
+          result: "peer_won",
+          ...(classifier !== undefined ? { classifier } : {}),
+        }),
+      );
+      return "peer-exists";
+    }
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain restore failed`,
+      undefined,
+      toStoreObservation({
+        operation: "restore",
+        stage: "recovery",
+        result: "failed",
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    return "failed";
+  }
+};
+
+/** Filesystem refusal before any security spawn — dedicated staging
+ *  observation with no store_exit_code (never fabricate a native exit). */
+const refusePrivateStaging = (
+  classifier: TDoctorStoreClassifier | undefined,
+): TPreparedStaging => {
+  logWarn(
+    "keychain",
+    safeDiagnosticMessage`keychain staging directory was refused`,
+    undefined,
+    toStoreObservation({
+      operation: "create",
+      stage: "staging",
+      result: "failed",
+      ...(classifier !== undefined ? { classifier } : {}),
+    }),
+  );
+  return { ok: false, operation: "create", timedOut: false, aborted: false };
 };
 
 /** Create + settings + unlock a unique owned staging keychain. Never touches
- *  the final path. Failure removes only this process's staging. */
+ *  the final path. Failure removes only this process's staging and
+ *  emits a stage-specific closed store observation (no paths/stderr). */
 const prepareStagingKeychain = async (
   home: string,
   dir: string,
   signal?: AbortSignal,
-): Promise<TPreparedStaging | null> => {
+  classifier?: TDoctorStoreClassifier,
+): Promise<TPreparedStaging> => {
   // FSS-11: refuse to stage a chain on a path that is not private. The
   // first check runs BEFORE mkdir so a refused path is never created
   // through (e.g. onto the target of a symlinked component); the second
   // re-proves the dirs mkdir just materialised.
-  if (!repairIsolatedKeychainPermissions(home)) return null;
+  if (!repairIsolatedKeychainPermissions(home)) {
+    return refusePrivateStaging(classifier);
+  }
   try {
     mkdirSync(dir, { recursive: true, mode: KEYCHAIN_DIR_MODE });
   } catch {
-    return null;
+    return refusePrivateStaging(classifier);
   }
-  if (!repairIsolatedKeychainPermissions(home)) return null;
+  if (!repairIsolatedKeychainPermissions(home)) {
+    return refusePrivateStaging(classifier);
+  }
   sweepOwnedStaging(dir);
   const staging = ownedStagingPath(dir);
-  const created = await runSecurity(
+  const created = await spawnSecurityQuiet(
     ["create-keychain", "-p", "", staging],
     home,
     signal,
   );
-  if (!created) {
+  if (created.code !== 0 || created.timedOut || created.aborted) {
     removeOwnedPath(staging);
-    return null;
+    const createdExit = completedStoreExitCodeOf(created);
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain staging create was refused`,
+      undefined,
+      toStoreObservation({
+        operation: "create",
+        stage: "staging",
+        result: storeResultOf(created),
+        ...(createdExit !== undefined ? { exitCode: createdExit } : {}),
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    return {
+      ok: false,
+      operation: "create",
+      exitCode: createdExit,
+      timedOut: created.timedOut,
+      aborted: created.aborted,
+    };
   }
-  const settings = await runSecurity(
+  const settings = await spawnSecurityQuiet(
     ["set-keychain-settings", staging],
     home,
     signal,
   );
-  if (!settings) {
+  if (settings.code !== 0 || settings.timedOut || settings.aborted) {
     removeOwnedPath(staging);
-    return null;
+    const settingsExit = completedStoreExitCodeOf(settings);
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain staging settings failed`,
+      undefined,
+      toStoreObservation({
+        operation: "settings",
+        stage: "staging",
+        result: storeResultOf(settings),
+        ...(settingsExit !== undefined ? { exitCode: settingsExit } : {}),
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    return {
+      ok: false,
+      operation: "settings",
+      exitCode: settingsExit,
+      timedOut: settings.timedOut,
+      aborted: settings.aborted,
+    };
   }
-  const unlocked = await runSecurity(
+  const unlocked = await spawnSecurityQuiet(
     ["unlock-keychain", "-p", "", staging],
     home,
     signal,
   );
-  if (!unlocked) {
+  if (unlocked.code !== 0 || unlocked.timedOut || unlocked.aborted) {
     removeOwnedPath(staging);
-    return null;
+    const unlockedExit = completedStoreExitCodeOf(unlocked);
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain staging unlock failed`,
+      undefined,
+      toStoreObservation({
+        operation: "unlock",
+        stage: "staging",
+        result: storeResultOf(unlocked),
+        ...(unlockedExit !== undefined ? { exitCode: unlockedExit } : {}),
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    return {
+      ok: false,
+      operation: "unlock",
+      exitCode: unlockedExit,
+      timedOut: unlocked.timedOut,
+      aborted: unlocked.aborted,
+    };
   }
-  return { path: staging, unlocked: true };
+  return { ok: true, path: staging };
 };
 
 /** Create + configure the isolated keychain at `kc`. Staging keeps a failed
@@ -1538,7 +1848,8 @@ const prepareStagingKeychain = async (
  *  name-sensitive securityd handling — `create-keychain` at the
  *  `login.keychain-db` name inside $HOME under Seatbelt is refused).
  *  Staging is owner-pid unique; settings must succeed before install.
- *  Returns whether `kc` now exists and unlocks. */
+ *  Final install is create-only (`link`); a peer that already occupies `kc`
+ *  is adopted and unlocked, never overwritten. */
 const createIsolatedKeychain = async (
   home: string,
   kc: string,
@@ -1546,24 +1857,62 @@ const createIsolatedKeychain = async (
 ): Promise<boolean> => {
   const dir = dirname(kc);
   const prepared = await prepareStagingKeychain(home, dir, signal);
-  if (prepared === null) return false;
-  try {
-    renameSync(prepared.path, kc);
-  } catch {
-    removeOwnedPath(prepared.path);
-    return existsSync(kc);
-  }
-  try {
-    // The staging file keeps the mode `create-keychain` gave it. Force 0600 —
-    // the "" password makes a world-readable chain file a credential leak.
-    chmodSync(kc, KEYCHAIN_FILE_MODE);
-  } catch {
+  if (!prepared.ok) return false;
+  const installed = await installStagingCreateOnly(prepared.path, kc);
+  if (installed === "failed") {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain install failed`,
+      undefined,
+      toStoreObservation({
+        operation: "install",
+        stage: "final",
+        result: "failed",
+      }),
+    );
     return false;
   }
-  return (
-    existsSync(kc) &&
-    (await runSecurity(["unlock-keychain", "-p", "", kc], home, signal))
+  if (installed === "installed") {
+    try {
+      // The staging file keeps the mode `create-keychain` gave it. Force 0600 —
+      // the "" password makes a world-readable chain file a credential leak.
+      chmodSync(kc, KEYCHAIN_FILE_MODE);
+    } catch {
+      return false;
+    }
+  }
+  if (installed === "peer-exists") {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain install peer won`,
+      undefined,
+      toStoreObservation({
+        operation: "install",
+        stage: "final",
+        result: "peer_won",
+      }),
+    );
+  }
+  const unlock = await spawnSecurityQuiet(
+    ["unlock-keychain", "-p", "", kc],
+    home,
+    signal,
   );
+  if (unlock.code !== 0 || unlock.timedOut || unlock.aborted) {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain final unlock failed`,
+      undefined,
+      toStoreObservation({
+        operation: "unlock",
+        stage: "final",
+        result: storeResultOf(unlock),
+        exitCode: unlock.code,
+      }),
+    );
+    return false;
+  }
+  return existsSync(kc);
 };
 
 type TRecreateOutcome = {
@@ -1572,76 +1921,288 @@ type TRecreateOutcome = {
   readonly replaced: boolean;
 };
 
-/** Build and verify staging while the original remains. Move the original
- *  aside only immediately before install; restore it if install/verify fails.
- *  Timeout/cancel/ambiguous errors never authorize replacement (caller). */
-const recreateIsolatedKeychain = async (
+const logSelfHealOutcome = (
+  meta: {
+    readonly created: boolean;
+    readonly unlocked: boolean;
+  },
+  observation: TStoreObservationInput,
+): void => {
+  logWarn(
+    "keychain",
+    safeDiagnosticMessage`keychain self-heal outcome`,
+    meta,
+    toStoreObservation(observation),
+  );
+};
+
+const adoptPeerStore = async (
   home: string,
   kc: string,
-  signal?: AbortSignal,
+  staging: string,
+  signal: AbortSignal | undefined,
+  classifier: TDoctorStoreClassifier | undefined,
 ): Promise<TRecreateOutcome> => {
-  invalidateUnlockSkip(kc);
-  autoLockOffByKc.delete(kc);
-  const dir = dirname(kc);
-  const prepared = await prepareStagingKeychain(home, dir, signal);
-  if (prepared === null) {
-    logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
-      created: false,
-      unlocked: false,
-    });
-    return { created: false, unlocked: false, replaced: false };
-  }
-  const aside = `${kc}.broken-${process.pid}-${Date.now()}`;
-  let originalMoved = false;
-  try {
-    if (existsSync(kc)) {
-      renameSync(kc, aside);
-      originalMoved = true;
-    }
-    renameSync(prepared.path, kc);
-    chmodAfterRenameHookForTests?.(kc);
-    chmodSync(kc, KEYCHAIN_FILE_MODE);
-  } catch {
-    removeOwnedPath(prepared.path);
-    if (originalMoved) {
-      // The failure can be post-rename (the chmod), leaving the staged file
-      // on `kc`. Remove whatever sits there so the original is restored —
-      // a staged file left in place would strand the credential at `aside`.
-      removeOwnedPath(kc);
-      try {
-        renameSync(aside, kc);
-      } catch {}
-    }
-    logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
-      created: true,
-      unlocked: false,
-    });
-    return { created: true, unlocked: false, replaced: false };
-  }
-  const unlocked = await runSecurity(
+  removeOwnedPath(staging);
+  const unlock = await spawnSecurityQuiet(
     ["unlock-keychain", "-p", "", kc],
     home,
     signal,
   );
-  if (!unlocked && originalMoved) {
-    try {
-      rmSync(kc, { force: true });
-    } catch {}
-    try {
-      renameSync(aside, kc);
-    } catch {}
-    logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
-      created: true,
-      unlocked: false,
-    });
+  const unlocked = unlock.code === 0 && !unlock.timedOut && !unlock.aborted;
+  logSelfHealOutcome(
+    { created: false, unlocked },
+    {
+      operation: "recreate",
+      stage: "final",
+      result: "peer_won",
+      exitCode: unlock.code,
+      ...(classifier !== undefined ? { classifier } : {}),
+      recovery: { created: false, unlocked, replaced: false },
+    },
+  );
+  return { created: false, unlocked, replaced: false };
+};
+
+/** Build and verify staging while the original remains. Snapshot identity
+ *  before the long staging work; if a peer changes the final store, discard
+ *  owned staging and adopt theirs instead of moving their credential aside.
+ *  Move the original aside only immediately before create-only install;
+ *  restore it if install/verify fails, without deleting a peer-owned final.
+ *  Timeout/cancel/ambiguous errors never authorize replacement (caller).
+ *  Identity recheck narrows the race; it does not close the FS micro-window. */
+const recreateIsolatedKeychain = async (
+  home: string,
+  kc: string,
+  signal: AbortSignal | undefined,
+  classifier: TDoctorStoreClassifier | undefined,
+): Promise<TRecreateOutcome> => {
+  invalidateUnlockSkip(kc);
+  autoLockOffByKc.delete(kc);
+  const dir = dirname(kc);
+  const before = storeFingerprint(kc);
+  const prepared = await prepareStagingKeychain(home, dir, signal, classifier);
+  if (!prepared.ok) {
+    const prepResult: TDoctorStoreResult = prepared.aborted
+      ? "aborted"
+      : prepared.timedOut
+        ? "timed_out"
+        : "failed";
+    logSelfHealOutcome(
+      { created: false, unlocked: false },
+      {
+        operation: "recreate",
+        stage: "staging",
+        result: prepResult,
+        ...(prepared.exitCode !== undefined
+          ? { exitCode: prepared.exitCode }
+          : {}),
+        ...(classifier !== undefined ? { classifier } : {}),
+        recovery: { created: false, unlocked: false, replaced: false },
+      },
+    );
+    return { created: false, unlocked: false, replaced: false };
+  }
+  const afterStaging = storeFingerprint(kc);
+  // Peer installed or replaced the final store during staging — adopt it.
+  if (
+    afterStaging.present &&
+    (!before.present || !sameStoreFingerprint(before, afterStaging))
+  ) {
+    return adoptPeerStore(home, kc, prepared.path, signal, classifier);
+  }
+
+  const aside = `${kc}.broken-${process.pid}-${Date.now()}`;
+  let originalMoved = false;
+  let installedFingerprint: TStoreFingerprint | null = null;
+  let installedHere = false;
+  try {
+    const preAside = storeFingerprint(kc);
+    if (preAside.present) {
+      if (before.present && !sameStoreFingerprint(before, preAside)) {
+        return adoptPeerStore(home, kc, prepared.path, signal, classifier);
+      }
+      await rename(kc, aside);
+      originalMoved = true;
+    }
+    const installed = await installStagingCreateOnly(prepared.path, kc);
+    if (installed === "peer-exists") {
+      // Peer reoccupied final after our aside (or won the vacant slot).
+      // Do not restore aside over a live peer store.
+      logWarn(
+        "keychain",
+        safeDiagnosticMessage`keychain install peer won`,
+        undefined,
+        toStoreObservation({
+          operation: "install",
+          stage: "final",
+          result: "peer_won",
+          ...(classifier !== undefined ? { classifier } : {}),
+        }),
+      );
+      const unlock = await spawnSecurityQuiet(
+        ["unlock-keychain", "-p", "", kc],
+        home,
+        signal,
+      );
+      const unlocked = unlock.code === 0 && !unlock.timedOut && !unlock.aborted;
+      logSelfHealOutcome(
+        { created: false, unlocked },
+        {
+          operation: "recreate",
+          stage: "final",
+          result: "peer_won",
+          exitCode: unlock.code,
+          ...(classifier !== undefined ? { classifier } : {}),
+          recovery: { created: false, unlocked, replaced: false },
+        },
+      );
+      return { created: false, unlocked, replaced: false };
+    }
+    if (installed === "failed") {
+      logWarn(
+        "keychain",
+        safeDiagnosticMessage`keychain install failed`,
+        undefined,
+        toStoreObservation({
+          operation: "install",
+          stage: "final",
+          result: "failed",
+          ...(classifier !== undefined ? { classifier } : {}),
+        }),
+      );
+      if (originalMoved && !existsSync(kc)) {
+        await restoreAsideCreateOnly(aside, kc, classifier);
+      }
+      logSelfHealOutcome(
+        { created: true, unlocked: false },
+        {
+          operation: "recreate",
+          stage: "final",
+          result: "failed",
+          ...(classifier !== undefined ? { classifier } : {}),
+          recovery: { created: true, unlocked: false, replaced: false },
+        },
+      );
+      return { created: true, unlocked: false, replaced: false };
+    }
+    installedHere = true;
+    chmodAfterRenameHookForTests?.(kc);
+    // The staging file keeps the mode `create-keychain` gave it. Force 0600 —
+    // the "" password makes a world-readable chain file a credential leak.
+    chmodSync(kc, KEYCHAIN_FILE_MODE);
+    installedFingerprint = storeFingerprint(kc);
+  } catch {
+    removeOwnedPath(prepared.path);
+    // The failure can be post-install (the chmod), leaving the staged file
+    // on `kc`. Remove it so the original can be restored — a staged file
+    // left in place would strand the credential at `aside`.
+    if (installedHere) removeOwnedPath(kc);
+    if (originalMoved && !existsSync(kc)) {
+      await restoreAsideCreateOnly(aside, kc, classifier);
+    }
+    logSelfHealOutcome(
+      { created: true, unlocked: false },
+      {
+        operation: "recreate",
+        stage: "final",
+        result: "failed",
+        ...(classifier !== undefined ? { classifier } : {}),
+        recovery: { created: true, unlocked: false, replaced: false },
+      },
+    );
     return { created: true, unlocked: false, replaced: false };
   }
+  const unlock = await spawnSecurityQuiet(
+    ["unlock-keychain", "-p", "", kc],
+    home,
+    signal,
+  );
+  const unlocked = unlock.code === 0 && !unlock.timedOut && !unlock.aborted;
+  if (!unlocked && originalMoved) {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain final unlock failed`,
+      undefined,
+      toStoreObservation({
+        operation: "unlock",
+        stage: "final",
+        result: storeResultOf(unlock),
+        exitCode: unlock.code,
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    const current = storeFingerprint(kc);
+    // Roll back only while final still matches the full installed fingerprint
+    // (ino + mtime + size). Inode alone is not enough: a peer can write in
+    // place into our staged file during the failed final unlock. If metadata
+    // drifted (including conservative native unlock side-effects), keep the
+    // final bytes and retain the original aside rather than delete peer data.
+    if (
+      current.present &&
+      installedFingerprint !== null &&
+      sameStoreFingerprint(installedFingerprint, current)
+    ) {
+      await rm(kc, { force: true }).catch(() => {});
+      if (!existsSync(kc)) {
+        await restoreAsideCreateOnly(aside, kc, classifier);
+      }
+    }
+    logSelfHealOutcome(
+      { created: true, unlocked: false },
+      {
+        operation: "recreate",
+        stage: "final",
+        result: storeResultOf(unlock),
+        exitCode: unlock.code,
+        ...(classifier !== undefined ? { classifier } : {}),
+        recovery: { created: true, unlocked: false, replaced: false },
+      },
+    );
+    return { created: true, unlocked: false, replaced: false };
+  }
+  if (!unlocked) {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain final unlock failed`,
+      undefined,
+      toStoreObservation({
+        operation: "unlock",
+        stage: "final",
+        result: storeResultOf(unlock),
+        exitCode: unlock.code,
+        ...(classifier !== undefined ? { classifier } : {}),
+      }),
+    );
+    // Vacancy / missing-original install still records replaced:true so the
+    // process-lifetime one-shot latch holds (deep-recovery characterization).
+    logSelfHeal(kc);
+    logSelfHealOutcome(
+      { created: true, unlocked: false },
+      {
+        operation: "recreate",
+        stage: "final",
+        result: storeResultOf(unlock),
+        exitCode: unlock.code,
+        ...(classifier !== undefined ? { classifier } : {}),
+        recovery: { created: true, unlocked: false, replaced: true },
+      },
+    );
+    return { created: true, unlocked: false, replaced: true };
+  }
   logSelfHeal(kc);
-  logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
-    created: true,
-    unlocked,
-  });
-  return { created: true, unlocked, replaced: true };
+  logSelfHealOutcome(
+    { created: true, unlocked: true },
+    {
+      operation: "recreate",
+      stage: "final",
+      result: "succeeded",
+      exitCode: 0,
+      ...(classifier !== undefined ? { classifier } : {}),
+      recovery: { created: true, unlocked: true, replaced: true },
+    },
+  );
+  return { created: true, unlocked: true, replaced: true };
 };
 
 /** True only when THIS PROCESS has verified (by read-back) that the isolated
@@ -2319,32 +2880,109 @@ const ensureKeychainNow = async (
   // Caller abort (status-race cancel) is not a keychain fault — skip timeout
   // accounting so a healthy chain is never marked unusable.
   if (res.aborted) {
+    logInfo(
+      "keychain",
+      safeDiagnosticMessage`keychain final unlock aborted`,
+      undefined,
+      toStoreObservation({
+        operation: "unlock",
+        stage: "final",
+        result: "aborted",
+        exitCode: res.code,
+      }),
+    );
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
   }
   if (res.timedOut) {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain final unlock timed out`,
+      undefined,
+      toStoreObservation({
+        operation: "unlock",
+        stage: "final",
+        result: "timed_out",
+        exitCode: res.code,
+      }),
+    );
     return noteTransientFailure(kc, "keychain_unlock_transient");
   }
 
   const failureToken = matchUnlockFailureToken(res.stderr);
   if (failureToken !== null) {
     invalidateUnlockSkip(kc);
+    const classifier = storeClassifierOf(failureToken);
     if (!healedKeychains.has(kc)) {
       const metadata = keychainMetadata(kc);
-      logWarn("keychain", safeDiagnosticMessage`keychain auth-drift evidence`, {
-        classifier_token: failureToken,
-        exit_code: res.code,
-        stderr_length: res.stderr.length,
-        stderr_excerpt: redactSecurityStderr(res.stderr),
-        keychain_mtime_ms: metadata.mtimeMs,
-        keychain_size: metadata.size,
-        broken_count: brokenKeychainCount(kc),
-      });
-      const outcome = await recreateIsolatedKeychain(home, kc, signal);
+      // Local meta kept for existing GUI-guard assertions; doctor fields ride
+      // the fourth-arg observation (no paths/stderr/tokens on that ledger).
+      logWarn(
+        "keychain",
+        safeDiagnosticMessage`keychain auth-drift evidence`,
+        {
+          classifier_token: failureToken,
+          exit_code: res.code,
+          stderr_length: res.stderr.length,
+          stderr_excerpt: redactSecurityStderr(res.stderr),
+          keychain_mtime_ms: metadata.mtimeMs,
+          keychain_size: metadata.size,
+          broken_count: brokenKeychainCount(kc),
+        },
+        toStoreObservation({
+          operation: "recreate",
+          stage: "recovery",
+          result: "failed",
+          exitCode: res.code,
+          ...(classifier !== undefined ? { classifier } : {}),
+          recovery: {
+            created: false,
+            unlocked: false,
+            replaced: false,
+          },
+        }),
+      );
+      const outcome = await recreateIsolatedKeychain(
+        home,
+        kc,
+        signal,
+        classifier,
+      );
       if (outcome.replaced) healedKeychains.add(kc);
       if (outcome.unlocked) return noteUnlockSuccess(kc);
+    } else {
+      // Process-lifetime one-shot: searchable skip, not a synthetic success.
+      logWarn(
+        "keychain",
+        safeDiagnosticMessage`keychain recovery skipped; already healed`,
+        undefined,
+        toStoreObservation({
+          operation: "recreate",
+          stage: "recovery",
+          result: "skipped",
+          exitCode: res.code,
+          ...(classifier !== undefined ? { classifier } : {}),
+          recovery: {
+            created: false,
+            unlocked: false,
+            replaced: false,
+          },
+        }),
+      );
     }
     return noteTransientFailure(kc, "keychain_unlock_transient");
   }
+  // Unclassified unlock failure (exact-dialog cases without auth-drift tokens).
+  logWarn(
+    "keychain",
+    safeDiagnosticMessage`keychain final unlock failed`,
+    undefined,
+    toStoreObservation({
+      operation: "unlock",
+      stage: "final",
+      result: "failed",
+      exitCode: res.code,
+    }),
+  );
   return noteTransientFailure(kc, "keychain_unlock_transient");
 };
 
@@ -2364,6 +3002,18 @@ export const ensureKeychainReady = async (
   const kc = isolatedKeychainPath(home);
   const backoff = transientTimeouts.get(kc);
   if (backoff !== undefined && backoff.nextAtMs > Date.now()) {
+    const correlation_id = currentLoginCommandCorrelation();
+    logInfo(
+      "keychain",
+      safeDiagnosticMessage`keychain readiness deferred by backoff`,
+      undefined,
+      {
+        phase: "readiness",
+        reason_code: "keychain_unavailable",
+        outcome: "unknown",
+        ...(correlation_id !== undefined ? { correlation_id } : {}),
+      },
+    );
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
   }
   let op = inFlightKeychains.get(kc);
@@ -2586,17 +3236,48 @@ export const grantKeychainToolAccess = async (
     { stdout: "ignore", stderr: "pipe" },
   );
   noteKeychainIoResult(kc, res);
-  if (res.code === 0) return true;
-  if (noKeyToPartition(res.stderr)) {
-    logInfo("keychain", "no key to partition — grant not needed", {
-      keychain_path: isolatedKeychainPath(home),
-    });
+  if (res.code === 0) {
+    logInfo(
+      "keychain",
+      safeDiagnosticMessage`keychain grant succeeded`,
+      undefined,
+      toStoreObservation({
+        operation: "grant",
+        stage: "final",
+        result: "succeeded",
+        exitCode: res.code,
+      }),
+    );
     return true;
   }
-  logWarn("keychain", safeDiagnosticMessage`partition-list grant failed`, {
-    exit_code: res.code,
-    stderr_excerpt: redactSecurityStderr(res.stderr),
-  });
+  if (noKeyToPartition(res.stderr)) {
+    logInfo(
+      "keychain",
+      safeDiagnosticMessage`keychain grant skipped; no key to partition`,
+      undefined,
+      toStoreObservation({
+        operation: "grant",
+        stage: "final",
+        result: "skipped",
+        exitCode: res.code,
+      }),
+    );
+    return true;
+  }
+  logWarn(
+    "keychain",
+    safeDiagnosticMessage`partition-list grant failed`,
+    {
+      exit_code: res.code,
+      stderr_excerpt: redactSecurityStderr(res.stderr),
+    },
+    toStoreObservation({
+      operation: "grant",
+      stage: "final",
+      result: storeResultOf(res),
+      exitCode: res.code,
+    }),
+  );
   return false;
 };
 

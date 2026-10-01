@@ -775,6 +775,18 @@ runs its OWN copy of each CLI under `<stateDir>/cli/<provider>/`
   missing but the host binary exists (`hostCliCandidates`), it links it before
   probing `--version`, so a newly-installed CLI shows up on the next status
   push with no command.
+- **`vendor-cli-install.ts`** — a passive reader of installer-owned progress
+  under `<state>/vendor-cli-install/<provider>.json`. First-run `install.sh`
+  runs the official installers in the background and records each attempt
+  independently. The reader verifies process identity for running attempts and
+  attaches safe optional `cli_install` metadata **after** provider/auth overlays,
+  including when a vendor status probe times out. Success means
+  `awaiting_detection`, not readiness; actual `cli_installed: true` clears the
+  progress. No installer output, PIDs, or host paths leave the machine. Existing
+  status change detection + the 15-second observer relay/persist the metadata;
+  no new cloud endpoint, table, diagnostics consent, or sandbox grant is needed.
+  `openllm update` still does not start vendor installs, and externally managed
+  installs never acquire progress records.
 
 ## OS sandbox + typed control vocabulary (hardening)
 
@@ -1120,11 +1132,15 @@ connected/failed directly — the dashboard's Connect button stays in its
   connect / refresh invalidate via `clearCursorStatusObservationCache`. The
   walker still uses the ACP bridge for native-runtime inference.
 
-The dashboard's `/providers` OAuth tab drives a flow off `/status`'s
-per-provider `cli_installed` + `connected`: CLI missing (prompt to re-run
-the daemon installer, which background-installs it) → **Connect** (sign in)
-→ connected (usage panel). The daemon never installs the CLI itself — it
-auto-links its isolated run-view to whatever the user-run installer lands.
+The dashboard's `/providers` subscription tab drives a flow off `/status`'s
+per-provider `cli_installed`, optional `cli_install`, and auth observation:
+OpenLLM-started install → indeterminate progress → binary detected → **Connect**
+(sign in) → connected (usage panel). A failed/interrupted install has recovery
+copy; an offline or cached active report is **unconfirmed**, not proof of failure,
+and cannot offer a duplicate install command. Older daemons and external installs
+retain presence-only behavior without fabricated progress. Onboarding uses the
+same presentation. The daemon never installs the CLI itself — it auto-links its
+isolated run-view to whatever the user-run installer lands.
 
 > ⚠️ The delegates are **research-derived**. `claude_code` install +
 > isolation is validated (binary in the isolated dir; `auth status` reads
