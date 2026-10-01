@@ -9,7 +9,7 @@ param([AllowEmptyString()][string] $Prerelease)
 & {
     param([string] $RequestedTag, [bool] $HasRequestedTag)
 
-    $OpenLlmPrereleaseTag = ''
+    $OpenLlmPrereleaseTag = 'v2.8.0-beta.3'
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version 2.0
     $savedTls = [Net.ServicePointManager]::SecurityProtocol
