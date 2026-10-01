@@ -31,8 +31,8 @@
  * See docs/plan/2026-08-22-daemon-keychain-gui-prompt-wedge-fix.md.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { mkdir, readdir, rename, rm } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { link, mkdir, readdir, rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { superviseSpawn } from "../child-supervisor";
@@ -65,8 +65,27 @@ const MAC = platform() === "darwin";
  *  there is nothing to gate, so it is always `present`. */
 const READY: TStoreRead<void> = { kind: "present", value: undefined };
 
+/**
+ * Resolve an existing HOME to its real path so symlink aliases share one
+ * readiness / in-flight / identity key. Missing or unresolvable HOMEs keep the
+ * caller spelling — first-create still needs a usable path, and maps stay keyed
+ * by whatever `loginKeychainPath` returns for that call.
+ */
+const canonicalizeHome = (home: string): string => {
+  try {
+    return realpathSync(home);
+  } catch {
+    return home;
+  }
+};
+
 const loginKeychainPath = (home: string): string =>
-  join(home, "Library", "Keychains", "login.keychain-db");
+  join(
+    canonicalizeHome(home),
+    "Library",
+    "Keychains",
+    "login.keychain-db",
+  );
 
 type TSpawnMode = "ignore" | "pipe";
 
@@ -912,6 +931,66 @@ const removeOwnedPath = async (path: string): Promise<void> => {
   await rm(path, { force: true }).catch(() => {});
 };
 
+type TStoreFingerprint = {
+  readonly present: boolean;
+  readonly ino: number | null;
+  readonly mtimeMs: number | null;
+  readonly size: number | null;
+};
+
+const storeFingerprint = (kc: string): TStoreFingerprint => {
+  try {
+    const st = statSync(kc);
+    return {
+      present: true,
+      ino: Number(st.ino),
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+    };
+  } catch {
+    return { present: false, ino: null, mtimeMs: null, size: null };
+  }
+};
+
+const sameStoreFingerprint = (
+  a: TStoreFingerprint,
+  b: TStoreFingerprint,
+): boolean =>
+  a.present === b.present &&
+  a.ino === b.ino &&
+  a.mtimeMs === b.mtimeMs &&
+  a.size === b.size;
+
+const isExistError = (err: unknown): boolean =>
+  typeof err === "object" &&
+  err !== null &&
+  "code" in err &&
+  (err as { code?: unknown }).code === "EEXIST";
+
+/**
+ * Atomic create-only install: hard-link staging onto the vacant final path,
+ * then drop the owned staging name. Only `EEXIST` means a peer won — leave
+ * their store untouched. Other link errors are failures even if `kc` happens
+ * to exist afterward (that is not a reliable peer-adoption signal).
+ * Same-directory staging/final keeps this off the EXDEV path. `link` itself
+ * is the atomic create; residual races live in repair's fingerprint recheck /
+ * aside micro-window, not in first-time create-only install.
+ */
+const installStagingCreateOnly = async (
+  staging: string,
+  kc: string,
+): Promise<"installed" | "peer-exists" | "failed"> => {
+  try {
+    await link(staging, kc);
+    await removeOwnedPath(staging);
+    return "installed";
+  } catch (err) {
+    await removeOwnedPath(staging);
+    if (isExistError(err)) return "peer-exists";
+    return "failed";
+  }
+};
+
 type TPreparedStaging = {
   readonly path: string;
   readonly unlocked: boolean;
@@ -964,7 +1043,8 @@ const prepareStagingKeychain = async (
 /** Create + configure the isolated login keychain at `kc`. macOS `securityd`
  *  REFUSES `create-keychain` at the RESERVED `login.keychain-db` name inside
  *  the $HOME subtree under Seatbelt. Staging is owner-pid unique; settings
- *  must succeed before install. Returns whether `kc` now exists and unlocks. */
+ *  must succeed before install. Final install is create-only (`link`); a peer
+ *  that already occupies `kc` is adopted and unlocked, never overwritten. */
 const createIsolatedKeychain = async (
   home: string,
   kc: string,
@@ -973,12 +1053,8 @@ const createIsolatedKeychain = async (
   const dir = dirname(kc);
   const prepared = await prepareStagingKeychain(home, dir, signal);
   if (prepared === null) return false;
-  try {
-    await rename(prepared.path, kc);
-  } catch {
-    await removeOwnedPath(prepared.path);
-    return existsSync(kc);
-  }
+  const installed = await installStagingCreateOnly(prepared.path, kc);
+  if (installed === "failed") return false;
   return (
     existsSync(kc) &&
     (await runSecurity(["unlock-keychain", "-p", "", kc], home, signal))
@@ -991,9 +1067,32 @@ type TRecreateOutcome = {
   readonly replaced: boolean;
 };
 
-/** Build and verify staging while the original remains. Move the original
- *  aside only immediately before install; restore it if install/verify fails.
- *  Timeout/cancel/ambiguous errors never authorize replacement (caller). */
+const adoptPeerStore = async (
+  home: string,
+  kc: string,
+  staging: string,
+  signal?: AbortSignal,
+): Promise<TRecreateOutcome> => {
+  await removeOwnedPath(staging);
+  const unlocked = await runSecurity(
+    ["unlock-keychain", "-p", "", kc],
+    home,
+    signal,
+  );
+  logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
+    created: false,
+    unlocked,
+  });
+  return { created: false, unlocked, replaced: false };
+};
+
+/** Build and verify staging while the original remains. Snapshot identity
+ *  before the long staging work; if a peer changes the final store, discard
+ *  owned staging and adopt theirs instead of moving their credential aside.
+ *  Move the original aside only immediately before create-only install;
+ *  restore it if install/verify fails, without deleting a peer-owned final.
+ *  Timeout/cancel/ambiguous errors never authorize replacement (caller).
+ *  Identity recheck narrows the race; it does not close the FS micro-window. */
 const recreateIsolatedKeychain = async (
   home: string,
   kc: string,
@@ -1002,6 +1101,7 @@ const recreateIsolatedKeychain = async (
   invalidateUnlockSkip(kc);
   autoLockOffByKc.delete(kc);
   const dir = dirname(kc);
+  const before = storeFingerprint(kc);
   const prepared = await prepareStagingKeychain(home, dir, signal);
   if (prepared === null) {
     logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
@@ -1010,14 +1110,53 @@ const recreateIsolatedKeychain = async (
     });
     return { created: false, unlocked: false, replaced: false };
   }
+  const afterStaging = storeFingerprint(kc);
+  // Peer installed or replaced the final store during staging — adopt it.
+  if (
+    afterStaging.present &&
+    (!before.present || !sameStoreFingerprint(before, afterStaging))
+  ) {
+    return adoptPeerStore(home, kc, prepared.path, signal);
+  }
+
   const aside = `${kc}.broken-${process.pid}-${Date.now()}`;
   let originalMoved = false;
+  let installedFingerprint: TStoreFingerprint | null = null;
   try {
-    if (existsSync(kc)) {
+    const preAside = storeFingerprint(kc);
+    if (preAside.present) {
+      if (before.present && !sameStoreFingerprint(before, preAside)) {
+        return adoptPeerStore(home, kc, prepared.path, signal);
+      }
       await rename(kc, aside);
       originalMoved = true;
     }
-    await rename(prepared.path, kc);
+    const installed = await installStagingCreateOnly(prepared.path, kc);
+    if (installed === "peer-exists") {
+      // Peer reoccupied final after our aside (or won the vacant slot).
+      // Do not restore aside over a live peer store.
+      const unlocked = await runSecurity(
+        ["unlock-keychain", "-p", "", kc],
+        home,
+        signal,
+      );
+      logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
+        created: false,
+        unlocked,
+      });
+      return { created: false, unlocked, replaced: false };
+    }
+    if (installed === "failed") {
+      if (originalMoved && !existsSync(kc)) {
+        await rename(aside, kc).catch(() => {});
+      }
+      logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
+        created: true,
+        unlocked: false,
+      });
+      return { created: true, unlocked: false, replaced: false };
+    }
+    installedFingerprint = storeFingerprint(kc);
   } catch {
     await removeOwnedPath(prepared.path);
     if (originalMoved && !existsSync(kc)) {
@@ -1035,8 +1174,20 @@ const recreateIsolatedKeychain = async (
     signal,
   );
   if (!unlocked && originalMoved) {
-    await rm(kc, { force: true }).catch(() => {});
-    await rename(aside, kc).catch(() => {});
+    const current = storeFingerprint(kc);
+    // Roll back only while final still matches the full installed fingerprint
+    // (ino + mtime + size). Inode alone is not enough: a peer can write in
+    // place into our staged file during the failed final unlock. If metadata
+    // drifted (including conservative native unlock side-effects), keep the
+    // final bytes and retain the original aside rather than delete peer data.
+    if (
+      current.present &&
+      installedFingerprint !== null &&
+      sameStoreFingerprint(installedFingerprint, current)
+    ) {
+      await rm(kc, { force: true }).catch(() => {});
+      await rename(aside, kc).catch(() => {});
+    }
     logWarn("keychain", safeDiagnosticMessage`keychain self-heal outcome`, {
       created: true,
       unlocked: false,
