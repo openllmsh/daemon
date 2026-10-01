@@ -64,12 +64,24 @@ const isRecord = (value: unknown): value is TChildRegistryRecord => {
   );
 };
 
+/**
+ * `ps -o lstart=` follows LC_TIME and TZ. Installer writes and daemon reads
+ * must share one pin or a live worker looks PID-reused. Keep sync + async
+ * helpers on the same env.
+ */
+const processStartTimePsEnv = (): NodeJS.ProcessEnv => ({
+  ...process.env,
+  LC_ALL: "C",
+  TZ: "UTC",
+});
+
 /** PID-reuse-safe process identity. Mirrors the durable session-host lstart check. */
 export const processStartTime = (pid: number): string | null => {
   try {
     const output = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
       stdout: "pipe",
       stderr: "ignore",
+      env: processStartTimePsEnv(),
     });
     if (output.exitCode !== 0) return null;
     const value = new TextDecoder().decode(output.stdout).trim();
@@ -111,6 +123,7 @@ const defaultProcessStartTimeHelperSpawn: TProcessStartTimeHelperSpawn = (
   Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
     stdout: "pipe",
     stderr: "ignore",
+    env: processStartTimePsEnv(),
     // Own process group so reap can SIGKILL descendants without touching
     // the daemon group. Test fakes must also set detached: true.
     detached: true,

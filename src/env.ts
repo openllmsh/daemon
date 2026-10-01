@@ -253,6 +253,26 @@ export const sharedEnvFilePath = (): string => join(stateDir(), ".env");
 export const serviceEnvFilePath = (): string =>
   daemonEnvFileOverride() ?? sharedEnvFilePath();
 
+/** Keep the caller's port beneath dev-file overrides across repeated loads.
+ * Only the port needs provenance for installed-service selection; other env
+ * keys retain the loader's existing additive/override behavior. A different
+ * assignment or deletion transfers ownership back to the caller. Assigning an
+ * identical value is unobservable and retains its existing provenance.
+ */
+let loadedPort:
+  | {
+      readonly value: string;
+      readonly callerValue: string | undefined;
+    }
+  | undefined;
+
+const callerPortValue = (): string | undefined => {
+  const current = process.env.OPENLLM_DAEMON_PORT;
+  return loadedPort !== undefined && current === loadedPort.value
+    ? loadedPort.callerValue
+    : current;
+};
+
 /**
  * Load the daemon's `KEY=value` env file into `process.env`.
  *
@@ -267,6 +287,10 @@ export const serviceEnvFilePath = (): string =>
  * when the file is missing. Synchronous (boot-time, before anything reads env).
  */
 export const loadEnvFile = (): void => {
+  const callerPort = callerPortValue();
+  if (callerPort === undefined) delete process.env.OPENLLM_DAEMON_PORT;
+  else process.env.OPENLLM_DAEMON_PORT = callerPort;
+  loadedPort = undefined;
   let text: string;
   try {
     text = readFileSync(envFilePath(), "utf-8");
@@ -277,7 +301,12 @@ export const loadEnvFile = (): void => {
   // apply, so its ordering cannot change whether later ordinary keys override.
   const devMode = isDevMode();
   for (const [key, value] of parseEnvLines(text)) {
-    if (shouldWriteEnvVar(key, devMode)) process.env[key] = value;
+    if (shouldWriteEnvVar(key, devMode)) {
+      if (key === "OPENLLM_DAEMON_PORT") {
+        loadedPort = { value, callerValue: callerPort };
+      }
+      process.env[key] = value;
+    }
   }
 };
 
@@ -485,6 +514,35 @@ export const daemonPort = (): number => {
   const raw = process.env.OPENLLM_DAEMON_PORT;
   if (raw === undefined) return fallback;
   return parseOpenllmDaemonPort(raw, fallback);
+};
+
+/**
+ * The port an *installed service* (launch agent / systemd unit) should bind
+ * and report — always resolved against `serviceEnvFilePath()` (the prod
+ * `.env`, never `.dev.env`) and the normal (non-dev) default, regardless of
+ * `OPENLLM_DAEMON_DEV`. Installing/starting the service is a production
+ * action; `service.ts` must never report or persist the dev port. An
+ * explicit `OPENLLM_DAEMON_PORT` supplied by the actual caller still wins
+ * (re-pointing an existing install), matching `daemonPort()`'s override
+ * precedence — but ONLY when that value in `process.env` wasn't just written
+ * by `loadEnvFile()` itself (`hasExplicitServicePortOverride()`): in dev mode
+ * `.dev.env` overwrites any pre-set `OPENLLM_DAEMON_PORT`, and by the time
+ * this runs `loadEnvFile()` may already have run elsewhere in the same
+ * command (e.g. `requireServiceApiKey` -> `daemonEnv()`), so a live
+ * `process.env` read alone cannot tell a genuine caller override from a
+ * value the dev file loader just wrote over it.
+ */
+export const hasExplicitServicePortOverride = (): boolean =>
+  callerPortValue() !== undefined;
+
+export const servicePort = (): number => {
+  const explicit = callerPortValue();
+  if (explicit !== undefined && hasExplicitServicePortOverride()) {
+    return parseOpenllmDaemonPort(explicit, DEFAULT_DAEMON_PORT);
+  }
+  const persisted = envFileValue(serviceEnvFilePath(), "OPENLLM_DAEMON_PORT");
+  if (persisted === null) return DEFAULT_DAEMON_PORT;
+  return parseOpenllmDaemonPort(persisted, DEFAULT_DAEMON_PORT);
 };
 
 let cachedDeviceId: string | null = null;

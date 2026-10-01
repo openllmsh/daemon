@@ -35,6 +35,10 @@ import {
 } from "./cli-paths";
 import { cliVersion } from "./delegation/util";
 import { logWarn, safeDiagnosticMessage } from "./logger";
+import {
+  peekManagerResolution,
+  resolveManagerCandidate,
+} from "./manager-resolution";
 
 export type TCliInstallState = {
   readonly installed: boolean;
@@ -162,19 +166,38 @@ const linkSidecars = (isolatedBin: string): void => {
  * Returns `true` when the link was re-pointed (the caller must then recompute the
  * binary signature, since the resolved target changed).
  */
-const reconcileIsolatedLink = async (
+/**
+ * Resolve the preferred host candidate through the manager-resolution
+ * coordinator. With zero adapters registered (default), this returns the
+ * first existing candidate unchanged — identical to the pre-coordinator
+ * behavior. A candidate recognized as a manager shim that cannot be
+ * resolved is treated as absent (never linked, never version-probed),
+ * rather than silently falling through to a lower-priority candidate.
+ *
+ * `demand` gates whether this may actually SPAWN the manager adapter:
+ *   - `demand: true` (an explicit user/system action — connect, logout,
+ *     inference preparation) runs the real resolution and populates the
+ *     passive-read cache for later callers.
+ *   - `demand` false/absent (a passive status read, including the
+ *     TTL-throttled periodic reconcile below) NEVER spawns — it only
+ *     consults the cache a prior demand call left behind. An ordinary
+ *     (non-manager) candidate is unaffected either way, since
+ *     `peekManagerResolution` answers it without ever needing a cache entry.
+ */
+const resolveHostBinary = async (
   provider: TCliProvider,
-  bin: string,
-): Promise<boolean> => {
+  opts?: { readonly demand?: boolean; readonly signal?: AbortSignal },
+): Promise<string | undefined> => {
   const host = hostCliCandidates(provider).find((c) => existsSync(c));
-  if (host === undefined) return false;
-  try {
-    if (realpathSync(bin) === realpathSync(host)) return false;
-  } catch {
-    // Broken link / unresolvable host — fall through to re-link defensively.
+  if (host === undefined) return undefined;
+  const resolved =
+    opts?.demand === true
+      ? await resolveManagerCandidate(host, { signal: opts.signal })
+      : peekManagerResolution(host);
+  if (resolved === undefined || resolved.kind === "unresolved") {
+    return undefined;
   }
-  await linkIsolatedCli(provider, host);
-  return true;
+  return resolved.target ?? undefined;
 };
 
 /**
@@ -223,8 +246,19 @@ const cliVersionProbeTimeoutMs = (): number =>
 /** Per-provider last-reconcile throttle. Version spawns live in `cliVersion`. */
 const cliInstallReconcileUntil = new Map<TCliProvider, number>();
 
-/** In-flight `cliInstallState` probes — overlapping callers share one reconcile. */
+/** In-flight PASSIVE `cliInstallState` probes — overlapping passive callers
+ *  share one reconcile. Kept separate from the demand map below so a demand
+ *  caller is never starved behind (or silently downgraded to) a concurrent
+ *  passive read that would not spawn a manager subprocess. */
 const cliInstallStateInFlight = new Map<
+  TCliProvider,
+  Promise<TCliInstallState>
+>();
+
+/** In-flight DEMAND `cliInstallState` probes — overlapping demand callers
+ *  (e.g. two near-simultaneous connect attempts) share one manager-adapter
+ *  subprocess rather than each spawning their own. */
+const cliInstallStateDemandInFlight = new Map<
   TCliProvider,
   Promise<TCliInstallState>
 >();
@@ -236,27 +270,121 @@ const cliInstallStateInFlight = new Map<
 export const clearCliInstallStateCache = (): void => {
   cliInstallReconcileUntil.clear();
   cliInstallStateInFlight.clear();
+  cliInstallStateDemandInFlight.clear();
 };
 
 const parseVendorVersion = (out: string | null): string | null =>
   out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
 
+export type TCliInstallStateOpts = {
+  /**
+   * Explicit demand: this call is an actual user/system action (connect,
+   * logout, inference preparation) rather than a periodic passive status
+   * read. Only a demand call may spawn a manager adapter's subprocess
+   * (`resolveManagerCandidate`) — see `resolveHostBinary` above. A retry TTL
+   * is not demand-only behavior: a passive call NEVER spawns one, even once
+   * its reconcile window has elapsed, and reuses whatever a prior demand
+   * call cached instead.
+   */
+  readonly demand?: boolean;
+  /** Forwarded to a demand resolution's manager-adapter subprocess. Ignored
+   *  on a passive (non-demand) call, since no subprocess runs there. */
+  readonly signal?: AbortSignal;
+};
+
 const probeCliInstallState = async (
   provider: TCliProvider,
+  opts?: TCliInstallStateOpts,
 ): Promise<TCliInstallState> => {
   const now = Date.now();
   const bin = cliBin(provider);
+  const demand = opts?.demand === true;
   if (!existsSync(bin)) {
-    const host = hostCliCandidates(provider).find((c) => existsSync(c));
+    // No isolated link exists yet. A PASSIVE call here must NOT spawn a
+    // manager subprocess, even once — cold bootstrap is not exempt from the
+    // demand-only rule. `resolveHostBinary` already enforces this: for an
+    // ORDINARY (non-manager) candidate it resolves for free (no adapter
+    // recognizes it, so filesystem linking still self-heals passively, per
+    // the file header's contract); for a candidate recognized as a manager
+    // shim it fails closed on a passive call (peek-only, no cache yet) and
+    // only actually resolves when `opts.demand` is true — an explicit
+    // connect/logout/inference-prep call.
+    const host = await resolveHostBinary(provider, opts);
     if (host === undefined) {
       return { installed: false, version: null };
     }
     await linkIsolatedCli(provider, host);
+    cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
   } else {
+    // The isolated link's OWN immediate target (not the fully-resolved
+    // realpath — a resolved manager selection is a plain absolute path to a
+    // real binary, never itself a shim) may be a manager shim on the FIRST
+    // observation of a pre-existing link (no throttle entry yet — e.g. a
+    // daemon restart finding a link created by a prior process/version, or
+    // one hand-crafted before this resolution step existed). Check that
+    // unconditionally, before any TTL gating, so a link that points directly
+    // at an unresolvable shim can never be version-probed/delegated through
+    // unconfined. On a PASSIVE call this is a cache-only peek — never a
+    // subprocess; on a DEMAND call it actually resolves and populates the
+    // cache for later passive callers.
+    let immediateTarget: string | undefined;
+    try {
+      immediateTarget = readlinkSync(bin);
+    } catch {
+      immediateTarget = undefined;
+    }
+    if (immediateTarget !== undefined) {
+      const resolved = demand
+        ? await resolveManagerCandidate(immediateTarget, {
+            signal: opts?.signal,
+          })
+        : peekManagerResolution(immediateTarget);
+      if (resolved === undefined) {
+        // Recognized as a manager shim but no demand resolution has ever
+        // populated the cache for it (passive call, cold cache): fail
+        // closed rather than trust an unconfirmed shim — the cache isn't
+        // permanently unusable, an explicit demand call (connect/logout/
+        // inference prep) will resolve and populate it.
+        return { installed: false, version: null };
+      }
+      if (resolved.kind === "unresolved") {
+        // Recognized as a manager shim but it no longer resolves: fail
+        // closed rather than falling through to probe the shim unconfined.
+        cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+        return { installed: false, version: null };
+      }
+      if (
+        resolved.kind === "resolved" &&
+        resolved.target !== null &&
+        resolved.target !== immediateTarget
+      ) {
+        await linkIsolatedCli(provider, resolved.target);
+      }
+    }
+
+    // Separately, on a throttled cadence, re-derive the PREFERRED host
+    // candidate (`hostCliCandidates()` precedence) in case a higher-priority
+    // path newly exists (e.g. a vendor update relocated the binary). Best
+    // effort: if no preferred candidate is currently discoverable, the
+    // existing (already shim-checked above) link is left as-is rather than
+    // treated as absent — a transient PATH/candidate change must not evict a
+    // link that is otherwise known-good. `resolveHostBinary` itself never
+    // spawns on this cadence unless `opts.demand` is set — the TTL only
+    // throttles how often this cheap re-derive/re-stat runs, it is never
+    // itself a license to query a manager adapter.
     const until = cliInstallReconcileUntil.get(provider);
-    if (until !== undefined && until <= now) {
-      await reconcileIsolatedLink(provider, bin);
+    if (until === undefined || until <= now) {
       cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+      const host = await resolveHostBinary(provider, opts);
+      if (host !== undefined) {
+        try {
+          if (realpathSync(bin) !== realpathSync(host)) {
+            await linkIsolatedCli(provider, host);
+          }
+        } catch {
+          await linkIsolatedCli(provider, host);
+        }
+      }
     }
   }
   if (!existsSync(bin)) {
@@ -270,6 +398,7 @@ const probeCliInstallState = async (
 
   const out = await cliVersion(bin, cliEnv(provider), {
     timeoutMs: cliVersionProbeTimeoutMs(),
+    ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
   });
   const state = { installed: true, version: parseVendorVersion(out) };
   noteCliInstallProbeResult({
@@ -282,10 +411,31 @@ const probeCliInstallState = async (
 
 export const cliInstallState = async (
   provider: TCliProvider,
+  opts?: TCliInstallStateOpts,
 ): Promise<TCliInstallState> => {
+  if (opts?.demand === true) {
+    // A caller carrying its OWN AbortSignal must never join (or replace) the
+    // shared no-signal demand promise: aborting one signaled caller would
+    // otherwise abort every other caller sharing that singleflight entry,
+    // including unrelated no-signal callers. Run it as its own independent
+    // probe instead — it still shares nothing, but its cancellation is its
+    // own.
+    if (opts.signal !== undefined) {
+      return probeCliInstallState(provider, opts);
+    }
+    const existingDemand = cliInstallStateDemandInFlight.get(provider);
+    if (existingDemand !== undefined) return existingDemand;
+    const pending = probeCliInstallState(provider, opts).finally(() => {
+      if (cliInstallStateDemandInFlight.get(provider) === pending) {
+        cliInstallStateDemandInFlight.delete(provider);
+      }
+    });
+    cliInstallStateDemandInFlight.set(provider, pending);
+    return pending;
+  }
   const existing = cliInstallStateInFlight.get(provider);
   if (existing !== undefined) return existing;
-  const pending = probeCliInstallState(provider).finally(() => {
+  const pending = probeCliInstallState(provider, opts).finally(() => {
     if (cliInstallStateInFlight.get(provider) === pending) {
       cliInstallStateInFlight.delete(provider);
     }

@@ -220,6 +220,7 @@ export const makeBlockingConnect = (
               code: "spawn_denied",
               message: KEYCHAIN_NOT_READY_DETAIL,
               retryable: true,
+              reason_code: "keychain_unavailable",
             });
             releaseNoChild();
             return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
@@ -338,6 +339,7 @@ export const makeBlockingConnect = (
                 code: "spawn_denied",
                 message: KEYCHAIN_NOT_READY_DETAIL,
                 retryable: true,
+                reason_code: "keychain_unavailable",
               });
               slot?.end(flow.flowId);
               clearPendingAuth(cfg.provider, flow.flowId);
@@ -482,10 +484,18 @@ export const makeStreamConnect = (
         const ready = await cfg.beforeLogin?.();
         if (!loginReady(ready)) {
           const flow = resolveLoginFlow(cfg.provider, "browser");
-          emitLoginFailed(flow, {
-            code: "spawn_denied",
-            message: KEYCHAIN_NOT_READY_DETAIL,
-            retryable: true,
+          finalizeLoginTerminal({
+            flow,
+            event: {
+              kind: "failed",
+              code: "spawn_denied",
+              message: KEYCHAIN_NOT_READY_DETAIL,
+              retryable: true,
+              reason_code: "keychain_unavailable",
+              failedAt: "readiness",
+            },
+            provider: cfg.provider,
+            clearPending: true,
           });
           return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
         }

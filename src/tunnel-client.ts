@@ -72,7 +72,7 @@ const tunnelToPeerLive: TTunnelToPeerImpl = async (args) => {
       ? { anthropic_version: args.anthropicVersion.slice(0, 32) }
       : {}),
     ...(args.anthropicBeta != null
-      ? { anthropic_beta: args.anthropicBeta.slice(0, 256) }
+      ? { anthropic_beta: args.anthropicBeta }
       : {}),
     ...(args.userAgent != null
       ? { user_agent: args.userAgent.slice(0, 512) }

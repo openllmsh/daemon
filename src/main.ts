@@ -6,11 +6,11 @@
  * `packages/core`'s pipeline for SUBSCRIPTION hops, credentials delegated to
  * the official vendor CLIs) plus a tiny read-only `/whoami` that returns this
  * daemon's opaque `device_id` so the dashboard can tell which key's daemon is
- * on THIS host (`docs/proposals/this-machine-detection-audit.md`). CONTROL
- * (status / connect / integrations) is NOT served on localhost: the daemon
- * dials OUT to the cloud relay over a WebSocket (`control-channel.ts`) and the
- * dashboard drives it from there. Both loopback routes share one cross-origin
- * CORS/PNA grant. See `docs/proposals/daemon-relay-websocket-push.md`.
+ * on THIS host (`docs/proposals/this-machine-detection-audit.md`). Dashboard
+ * control travels through the outbound relay WebSocket (`control-channel.ts`).
+ * The CLI-only `/local/auth` and doctor routes instead require this boot's
+ * owner-only capability and reject browser Origin; they do not share the
+ * public inference/health CORS grant. See `local-auth.ts` and `local-http.ts`.
  *
  * It holds NO DEK and decrypts NO vault credential. The only secret it
  * carries is the user's `sk-llm-...` key, used to authenticate cloud
@@ -32,6 +32,7 @@
 // guards it.
 import "reflect-metadata";
 
+import { AUTH_LOCAL_PATH } from "@openllmsh/protocol";
 import { isStreamResetError } from "@openllmsh/tunnel";
 import {
   guardCrashLoop,
@@ -75,6 +76,7 @@ import {
 } from "./env";
 import { buildHealth } from "./health";
 import { handleInference } from "./listener";
+import { handleLocalAuth } from "./local-auth";
 import { logError, logInfo, safeDiagnosticMessage } from "./logger";
 import { observeLoginModelReports } from "./model-report";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
@@ -442,7 +444,7 @@ const main = async (): Promise<void> => {
             headers,
           });
         }
-        // `/whoami` — the ONLY non-`/v1` loopback route: returns this daemon's
+        // `/whoami` — the public loopback identity probe: returns this daemon's
         // opaque `device_id` so the dashboard can learn which key's daemon is on
         // THIS host (a daemon answering your own loopback IS on your machine —
         // the single authoritative locality signal, replacing the IP heuristic +
@@ -464,6 +466,7 @@ const main = async (): Promise<void> => {
         // and it carries the real sandbox posture this process applied at boot —
         // which `openllmd status` can't compute itself. Secret-free subset of
         // `computeStatus()`; see `health.ts`. Shares the loopback CORS grant.
+        if (url.pathname === AUTH_LOCAL_PATH) return handleLocalAuth(req);
         if (isDoctorLocalPath(url.pathname)) {
           return handleDoctorLocal(req);
         }
@@ -484,8 +487,8 @@ const main = async (): Promise<void> => {
           });
           return new Response(JSON.stringify(health), { status: 200, headers });
         }
-        // Everything else: control comes via the cloud relay, not a
-        // browser→loopback call.
+        // All other control remains relay-only; the capability-gated local
+        // auth/doctor routes above never authorize a browser→loopback call.
         return new Response(JSON.stringify({ error: "not found" }), {
           status: 404,
           headers: { "content-type": "application/json" },

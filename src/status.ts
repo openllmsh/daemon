@@ -64,6 +64,7 @@ import type {
   TStatusPublishTrigger,
 } from "./status-publish-coalesce";
 import { cachedUsage, peekUsage } from "./usage-cache";
+import { attachVendorCliInstall } from "./vendor-cli-install";
 import { DAEMON_VERSION } from "./version";
 
 /** True when `path` is a regular file the process can execute. */
@@ -244,6 +245,14 @@ const applyAuthLiteral = (
   slug: string,
   conn: TDaemonProviderConnection,
 ): TDaemonProviderConnection => {
+  const localPending = getPendingAuth(slug);
+  if (localPending?.localOnly === true) {
+    conn = {
+      ...conn,
+      detail: "Sign-in is running on this machine.",
+      pending_auth: pendingAuthWire(localPending),
+    };
+  }
   const last = lastKnownConnections.get(slug);
   const inFlight = providerAuthOwned(slug);
   const normalized = normalizeProviderConnection(conn);
@@ -691,7 +700,9 @@ const computeStatusFreshInner = async (
           pendingVerifiedPublish.delete(d.slug);
           const seeded = lastKnownConnections.get(d.slug);
           if (seeded?.observation === "connected") {
-            return attachUpstreamAuthCooldown(d.slug, seeded);
+            return attachVendorCliInstall(
+              attachUpstreamAuthCooldown(d.slug, seeded),
+            );
           }
         }
         const raw = await boundedDelegateStatus(
@@ -708,11 +719,17 @@ const computeStatusFreshInner = async (
               conn.detail === STATUS_CHECK_FAILED_DETAIL,
           );
         }
-        const published = attachUpstreamAuthCooldown(d.slug, conn);
+        // Installer metadata is merged AFTER auth overlays / last-known spreads
+        // so a probe timeout cannot drop this-tick `cli_install`, and last-known
+        // never has to persist process-local progress.
+        let published = attachUpstreamAuthCooldown(d.slug, conn);
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
-        if (normalizeProviderConnection(published).observation !== "connected")
-          return published;
+        if (
+          normalizeProviderConnection(published).observation !== "connected"
+        ) {
+          return attachVendorCliInstall(published);
+        }
         // PEEK only — never hit the vendor here. `computeStatus` runs on every
         // status push (hello/reconnect, the periodic observer, post-command),
         // and the vendor usage endpoint rate-limits independently of inference;
@@ -722,7 +739,8 @@ const computeStatusFreshInner = async (
         // or the providers page mounting). Here we just attach whatever that last
         // on-demand read cached. See `usage-cache.ts`.
         const usage = peekUsage(d.slug, published.account_hash);
-        return usage === null ? published : { ...published, usage };
+        if (usage !== null) published = { ...published, usage };
+        return attachVendorCliInstall(published);
       } catch (err) {
         // One provider's status read must NOT sink the whole snapshot (every
         // card would vanish + the push would fail). Surface a safe placeholder;
@@ -730,7 +748,9 @@ const computeStatusFreshInner = async (
         logWarn("status", `status() failed for ${d.slug}`, {
           err: err instanceof Error ? err.message : String(err),
         });
-        return attachUpstreamAuthCooldown(d.slug, statusFailure(d.slug));
+        return attachVendorCliInstall(
+          attachUpstreamAuthCooldown(d.slug, statusFailure(d.slug)),
+        );
       }
     }),
   );

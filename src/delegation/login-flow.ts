@@ -18,7 +18,12 @@
  * stays guarded across both methods.
  */
 
-import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
+import type {
+  TAuthLoginFailedCode,
+  TAuthLoginMode,
+  TDaemonProviderReasonCode,
+  TDoctorAuthPhase,
+} from "@openllmsh/protocol";
 import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
 import {
   admitVerifiedLogin,
@@ -28,6 +33,12 @@ import {
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { logInfo, logWarn, safeDiagnosticMessage } from "../logger";
+import type { TLoginCommandContext } from "../op-context";
+import {
+  currentLoginCommandContext,
+  currentLoginCommandCorrelation,
+  runWithLoginCommand,
+} from "../op-context";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -61,44 +72,28 @@ export type TLoginFlowCtx = {
   readonly keyId: string;
   readonly slug: string;
   readonly mode: TAuthLoginMode;
+  readonly localOnly?: boolean;
 };
 
 // ─── Per-command flow identity (threaded from control-relay) ─────────────
+// ALS lives in op-context (single ALS root). Re-export for existing callers.
 
-let commandCtx: { flowId: string; keyId: string } | null = null;
-
-/**
- * Bind the current control-command's id as `flow_id` for the duration of
- * `run()`. Background work (stream readers, `finishInBackground`) must
- * CAPTURE the resolved {@link TLoginFlowCtx} — this binding is restored
- * when `run()` returns.
- */
-export const runWithLoginCommand = async <T>(
-  ctx: { readonly flowId: string; readonly keyId: string },
-  run: () => Promise<T>,
-): Promise<T> => {
-  const prev = commandCtx;
-  commandCtx = ctx;
-  try {
-    return await run();
-  } finally {
-    commandCtx = prev;
-  }
-};
+export type { TLoginCommandContext };
+export { currentLoginCommandCorrelation, runWithLoginCommand };
 
 export const resolveLoginFlow = (
   slug: string,
   mode: TAuthLoginMode,
-): TLoginFlowCtx => ({
-  flowId: commandCtx?.flowId ?? crypto.randomUUID(),
-  keyId: commandCtx?.keyId ?? "local",
-  slug,
-  mode,
-});
-
-/** Opaque doctor correlation for logout; omit when unbound or untrusted. */
-export const currentLoginCommandCorrelation = (): string | undefined =>
-  opaqueDoctorCorrelation(commandCtx?.flowId);
+): TLoginFlowCtx => {
+  const bound = currentLoginCommandContext();
+  return {
+    flowId: bound?.flowId ?? crypto.randomUUID(),
+    keyId: bound?.keyId ?? "local",
+    ...(bound?.localOnly === true ? { localOnly: true } : {}),
+    slug,
+    mode,
+  };
+};
 
 // ─── Per-provider single-flight slot ─────────────────────────────────────
 
@@ -335,6 +330,8 @@ export const emitLoginPrompt = (
   flow: TLoginFlowCtx,
   pending: { readonly url: string; readonly code: string },
 ): void => {
+  // Local login prompts belong only to the authenticated initiating flow.
+  if (flow.localOnly === true) return;
   emitAuth({
     event: "auth.login.prompt",
     flow_id: flow.flowId,
@@ -364,6 +361,7 @@ export const publishPendingAuth = (
     code: pending.code,
     ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
     flowId: flow.flowId,
+    ...(flow.localOnly === true ? { localOnly: true } : {}),
   });
   emitLoginPrompt(flow, { url: pending.url, code: pending.code });
 };
@@ -389,6 +387,7 @@ export const emitLoginFailed = (
     readonly code: TAuthLoginFailedCode;
     readonly message: string;
     readonly retryable: boolean;
+    readonly reason_code?: TDaemonProviderReasonCode;
   },
 ): void => {
   emitAuth({
@@ -399,6 +398,9 @@ export const emitLoginFailed = (
     code: fail.code,
     message: fail.message,
     retryable: fail.retryable,
+    ...(fail.reason_code !== undefined
+      ? { reason_code: fail.reason_code }
+      : {}),
   });
 };
 
@@ -409,6 +411,12 @@ export const emitLoginFailed = (
  * `onConnected`) and decide which event to emit so stream vs device-code
  * cancel/success semantics stay distinct.
  */
+/** Local-only failing phase marker for paste/stream terminals (not on the wire). */
+export type TLoginFailedAtPhase = Extract<
+  TDoctorAuthPhase,
+  "readiness" | "prep"
+>;
+
 export type TLoginTerminalEvent =
   | { readonly kind: "succeeded" }
   | {
@@ -416,8 +424,19 @@ export type TLoginTerminalEvent =
       readonly code: TAuthLoginFailedCode;
       readonly message: string;
       readonly retryable: boolean;
+      readonly reason_code?: TDaemonProviderReasonCode;
+      /** Internal: emit one INFO phase breadcrumb before the terminal ledger. */
+      readonly failedAt?: TLoginFailedAtPhase;
     }
   | { readonly kind: "none" };
+
+const FAILED_AT_MESSAGE: Record<
+  TLoginFailedAtPhase,
+  ReturnType<typeof safeDiagnosticMessage>
+> = {
+  readiness: safeDiagnosticMessage`Native authentication readiness completed.`,
+  prep: safeDiagnosticMessage`Native authentication preparation completed.`,
+};
 
 export const finalizeLoginTerminal = (opts: {
   readonly flow: TLoginFlowCtx | null;
@@ -441,6 +460,9 @@ export const finalizeLoginTerminal = (opts: {
         code: opts.event.code,
         message: opts.event.message,
         retryable: opts.event.retryable,
+        ...(opts.event.reason_code !== undefined
+          ? { reason_code: opts.event.reason_code }
+          : {}),
       });
     }
     const correlation_id = opaqueDoctorCorrelation(opts.flow.flowId);
@@ -458,14 +480,40 @@ export const finalizeLoginTerminal = (opts: {
             : opts.event.kind === "failed"
               ? "failed"
               : undefined;
-    const ledger = projectDoctorOutcomeLedger({
-      provider: opts.provider,
-      operation_kind: "login",
-      phase: "terminal",
-      ...(outcome !== undefined ? { outcome } : {}),
-      ...(admitted ? { observation: "connected" } : {}),
-    });
+    const failureExtras =
+      opts.event.kind === "failed" && opts.event.reason_code !== undefined
+        ? {
+            reason_code: opts.event.reason_code,
+            observation: "unknown" as const,
+          }
+        : {};
     try {
+      if (opts.event.kind === "failed" && opts.event.failedAt !== undefined) {
+        const phaseLedger = projectDoctorOutcomeLedger({
+          provider: opts.provider,
+          operation_kind: "login",
+          phase: opts.event.failedAt,
+          ...(outcome !== undefined ? { outcome } : {}),
+          ...failureExtras,
+        });
+        logInfo(
+          "login-flow",
+          FAILED_AT_MESSAGE[opts.event.failedAt],
+          { phase: opts.event.failedAt },
+          {
+            ...(correlation_id !== undefined ? { correlation_id } : {}),
+            ...phaseLedger,
+          },
+        );
+      }
+      const ledger = projectDoctorOutcomeLedger({
+        provider: opts.provider,
+        operation_kind: "login",
+        phase: "terminal",
+        ...(outcome !== undefined ? { outcome } : {}),
+        ...(admitted ? { observation: "connected" } : {}),
+        ...failureExtras,
+      });
       logInfo(
         "login-flow",
         safeDiagnosticMessage`Native authentication attempt finished.`,
@@ -835,6 +883,8 @@ export const finishInBackground = async (opts: {
             code: "spawn_denied",
             message: KEYCHAIN_NOT_READY_DETAIL,
             retryable: true,
+            reason_code: "keychain_unavailable",
+            failedAt: "prep",
           }
         : sampled.state === "connected"
           ? { kind: "succeeded" }

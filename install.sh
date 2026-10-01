@@ -15,7 +15,12 @@
 #   OPENLLM_CLOUD_ORIGIN   gateway origin (env → existing ~/.openllm/.env →
 #                          default https://www.openllm.sh; a re-run keeps your origin)
 #   OPENLLM_API_KEY        pair the daemon now; otherwise pair from the dashboard
-#   OPENLLM_DAEMON_PORT    local daemon port (default 8787)
+#   OPENLLM_DAEMON_PORT    local daemon port (default 8787; if unset AND
+#                          nothing is already persisted, and 8787 is taken on
+#                          this machine, the installer walks forward to the
+#                          next free port nearby and persists that instead —
+#                          an explicit or already-persisted port is never
+#                          probed or changed)
 #   OPENLLM_DAEMON_PTY_SESSIONS  enable remote terminal sessions (1/true; default off)
 #
 # This is the ONLY shell installer for the daemon. It also background-provisions
@@ -32,7 +37,8 @@ set -euo pipefail
 OPENLLM_DIR="$HOME/.openllm"
 BIN_DIR="$OPENLLM_DIR/bin"
 ENV_FILE="${OPENLLM_DAEMON_ENV_FILE:-$OPENLLM_DIR/.env}"
-DAEMON_PORT="${OPENLLM_DAEMON_PORT:-8787}"
+# DAEMON_PORT is resolved in preflight (env → existing env-file value → default),
+# once `env_file_value`/`die` are defined — see below.
 # `install` (default) is a first-time install; `update` is a manual full-product
 # rerun (`openllm update`). Update mode converges the verified binaries + config
 # but must NOT repeat first-install side effects: no vendor-CLI provisioning, no
@@ -73,24 +79,52 @@ trim_whitespace() {
   printf '%s' "$value"
 }
 
-# Read one KEY's value from the shared env file (first match wins), trimming
-# whitespace and one layer of surrounding quotes so it matches how the CLI and
-# daemon parse the same file (packages/cli/src/env.ts). Used only to seed the
-# effective origin below; empty/absent → empty string.
-env_file_value() {
-  local wanted="$1" line key value
+# Read one KEY's LAST-occurrence value from the shared env file, mirroring
+# `parseEnvLines` (packages/daemon/src/env.ts): trim the whole line, skip
+# blank/`#` lines, split at the first `=`, trim both sides. `parseEnvLines`
+# folds lines into a `Map` via `.set(key, value)`, so a later duplicate
+# OVERWRITES an earlier one — the last matching line must win here too (the
+# bug this replaces: every reader below used to return on its first match).
+# No quote/comment stripping here — that's a per-caller decision below.
+env_file_lookup() {
+  local wanted="$1" line trimmed key value result="" found=0
   [ -f "$ENV_FILE" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ""|\#*) continue ;; esac
-    key="${line%%=*}"
+    trimmed="$(trim_whitespace "$line")"
+    case "$trimmed" in ""|\#*) continue ;; esac
+    case "$trimmed" in *=*) ;; *) continue ;; esac
+    key="$(trim_whitespace "${trimmed%%=*}")"
+    [ -n "$key" ] || continue
     [ "$key" = "$wanted" ] || continue
-    value="$(trim_whitespace "${line#*=}")"
-    value="${value#[\"\']}"
-    value="${value%[\"\']}"
-    printf '%s' "$value"
-    return 0
+    value="$(trim_whitespace "${trimmed#*=}")"
+    result="$value"
+    found=1
   done < "$ENV_FILE"
+  [ "$found" = 1 ] && printf '%s' "$result"
   return 0
+}
+
+# Read one KEY's value from the shared env file (last match wins — see
+# `env_file_lookup`), additionally stripping one layer of surrounding quotes
+# so it matches how the CLI resolves the same file (`parseEnvFile` in
+# packages/cli/src/env.ts, which underlies `cliConfig()`). Used only to seed
+# the effective origin below; empty/absent → empty string.
+env_file_value() {
+  local wanted="$1" value
+  value="$(env_file_lookup "$wanted")"
+  value="${value#[\"\']}"
+  value="${value%[\"\']}"
+  printf '%s' "$value"
+}
+
+# Read one KEY's RAW value from the shared env file (last match wins) —
+# outer-whitespace trimmed only, no quote or comment stripping — for the
+# port, whose protocol-compatible parsing (`normalize_daemon_port`) needs the
+# untouched value: whether a comment sits inside or outside the quotes
+# changes the correct strip order, so `env_file_value`'s single fixed order
+# (quotes always stripped first) cannot be reused here.
+env_file_raw_value() {
+  env_file_lookup "$1"
 }
 
 is_usable_api_key() {
@@ -131,6 +165,195 @@ ORIGIN="${OPENLLM_CLOUD_ORIGIN:-}"
 ORIGIN="${ORIGIN%/}"
 has_line_break "$ORIGIN" && die "OPENLLM_CLOUD_ORIGIN must not contain a line break"
 [ -n "$ORIGIN" ] || die "OPENLLM_CLOUD_ORIGIN must not be empty"
+# Effective port — explicit env, else the port already persisted in the shared
+# env file, else the default. Mirrors the ORIGIN precedence above. A malformed
+# selected value falls back to the default rather than partially parsing.
+#
+# `normalize_daemon_port` mirrors packages/protocol/daemon-port.ts's
+# `parseOpenllmDaemonPort` byte-for-byte: strip an inline `# comment` and one
+# layer of quotes, in the order that depends on whether the comment sits
+# INSIDE or OUTSIDE the quotes (`"59321 # local"` vs `"59321" # local` vs a
+# bare `59321 # local`), then require a plain decimal in 1-65535. No eval, no
+# sourcing, no octal interpretation (a leading-zero string like `"08787"`
+# still parses as decimal here, matching `Number.parseInt(_, 10)`), and the
+# digit-count bound below keeps `[ ... -ge ... ]` from ever seeing a string
+# long enough to trip a shell integer-overflow diagnostic.
+normalize_daemon_port() {
+  local raw="$1" trimmed value decommented stripped
+  trimmed="$(trim_whitespace "$raw")"
+  if [[ "$trimmed" =~ ^\".*\"$ || "$trimmed" =~ ^\'.*\'$ ]] && [ "${#trimmed}" -ge 2 ]; then
+    value="${trimmed:1:${#trimmed}-2}"
+    if [[ "$value" =~ ^(.*)[[:space:]]#.*$ ]]; then
+      value="$(trim_whitespace "${BASH_REMATCH[1]}")"
+    fi
+  else
+    decommented="$trimmed"
+    if [[ "$trimmed" =~ ^(.*)[[:space:]]#.*$ ]]; then
+      decommented="$(trim_whitespace "${BASH_REMATCH[1]}")"
+    fi
+    if { [[ "$decommented" =~ ^\".*\"$ || "$decommented" =~ ^\'.*\'$ ]] && [ "${#decommented}" -ge 2 ]; }; then
+      value="${decommented:1:${#decommented}-2}"
+    else
+      value="$decommented"
+    fi
+  fi
+  stripped="$(trim_whitespace "$value")"
+  case "$stripped" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#stripped}" -le 7 ] || return 1
+  { [ "$stripped" -ge 1 ] && [ "$stripped" -le 65535 ]; } || return 1
+  printf '%s' "$stripped"
+}
+
+# Default port + the bounded range the auto-increment scan below may walk
+# into (8787-8796) — only reached when no explicit/persisted port exists yet
+# (see the DAEMON_PORT resolution below); an explicit or persisted port is
+# never probed or reassigned.
+DEFAULT_DAEMON_PORT=8787
+PORT_SCAN_LIMIT=10
+
+# Is 127.0.0.1:$port free to bind? Returns 0 free, 1 occupied, 2 unverifiable
+# — a tier returns 2 (rather than falling through) the moment it gets an
+# answer it cannot confidently classify, so a shaky result never gets
+# silently reinterpreted as "free" by a later tier. No single tool is
+# guaranteed present, so this tries, in order:
+#   1. python3 — an actual bind() attempt; the only reliable tier. Its exit
+#      code is explicit: 0 free, 1 EADDRINUSE (occupied), 2 any other error
+#      (permission denied, missing socket support, …) — never guessed.
+#   2. bash's /dev/tcp, bounded by `timeout` so a filtered/backlogged port
+#      can't hang the install — skipped outright without `timeout`, since an
+#      unbounded connect is not an acceptable fallback. A connect success or
+#      a reset both mean something is already there (occupied); "Connection
+#      refused" is the ordinary free-port result. Anything else (including a
+#      build without /dev/tcp support) falls through to the next tier.
+#   3. nc -z -v with a 1s timeout, tried only if 2 gave no answer. A ZERO
+#      exit always means connected (occupied) regardless of output. A
+#      nonzero exit is free ONLY on an explicit "Connection refused" in the
+#      (C-locale, so the text is predictable) output; a reset is occupied;
+#      anything else — timeout, an invalid flag this nc build rejected, a
+#      permission failure — is unverifiable, NOT free.
+#   4. no reliable probe at all — unverifiable; the caller refuses to
+#      install rather than silently gamble.
+# Every tier is TCP-only on 127.0.0.1 (never 0.0.0.0/UDP) and closes its probe
+# socket immediately, so nothing here holds a port — a bind/start race
+# against another process remains inherent to any check-then-act port pick.
+port_is_free() {
+  local port="$1"
+
+  if has_command python3; then
+    local py_rc
+    # The heredoc runs as the tested command of this `if` so a nonzero exit
+    # (1 = EADDRINUSE, 2 = any other error) is read via `$?` in the `else`
+    # branch instead of tripping `set -e` — bash exempts the whole command a
+    # conditional tests from errexit, including everything a function it
+    # calls (here, none — it's a direct external command) runs.
+    if python3 - "$port" >/dev/null 2>&1 <<'PY'
+import errno
+import socket
+import sys
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError as e:
+    sys.exit(1 if e.errno == errno.EADDRINUSE else 2)
+else:
+    sys.exit(0)
+finally:
+    s.close()
+PY
+    then
+      py_rc=0
+    else
+      py_rc=$?
+    fi
+    case "$py_rc" in
+      0) return 0 ;;
+      1) return 1 ;;
+      *) return 2 ;;
+    esac
+  fi
+
+  if has_command timeout; then
+    local probe
+    probe="$(timeout 1 bash -c "exec 3<>'/dev/tcp/127.0.0.1/$port' && printf OK" 2>&1)" || true
+    case "$probe" in
+      OK) return 1 ;;
+      *[Rr]efused*) return 0 ;;
+      *"eset"*) return 1 ;;
+    esac
+  fi
+
+  if has_command nc; then
+    local out
+    # Same if/else exit-code capture as the python3 tier above (a bare
+    # failing assignment would otherwise trip `set -e` on the common "nc
+    # exited nonzero because the port is free" case).
+    if out="$(LC_ALL=C LANG=C nc -z -v -w 1 127.0.0.1 "$port" 2>&1)"; then
+      return 1
+    fi
+    case "$out" in
+      *"Connection refused"*) return 0 ;;
+      *"onnection reset"*|*"eset by peer"*) return 1 ;;
+    esac
+    return 2
+  fi
+
+  return 2
+}
+
+# Bounded scan for a free port starting at $1, trying at most $2 candidates
+# ($start, $start+1, … capped at 65535). Prints the first free port and
+# returns 0; returns 1 once exhausted, or 2 the moment a probe can't verify.
+find_available_port() {
+  local start="$1" limit="$2" port attempt rc
+  port="$start"
+  attempt=0
+  while [ "$attempt" -lt "$limit" ]; do
+    port_is_free "$port"
+    rc=$?
+    [ "$rc" -eq 0 ] && { printf '%s' "$port"; return 0; }
+    [ "$rc" -eq 2 ] && return 2
+    attempt=$((attempt + 1))
+    port=$((port + 1))
+    [ "$port" -le 65535 ] || break
+  done
+  return 1
+}
+
+DAEMON_PORT="${OPENLLM_DAEMON_PORT:-}"
+if [ -n "$DAEMON_PORT" ]; then
+  if NORMALIZED_PORT="$(normalize_daemon_port "$DAEMON_PORT")"; then
+    DAEMON_PORT="$NORMALIZED_PORT"
+  else
+    # Warn, but never echo the raw value: it is untrusted external input
+    # (env var content) and could carry control/escape sequences into the
+    # user's terminal.
+    echo "Warning: ignoring an invalid OPENLLM_DAEMON_PORT (must be a plain port number 1-65535); falling back" >&2
+    DAEMON_PORT=""
+  fi
+fi
+if [ -z "$DAEMON_PORT" ]; then
+  RAW_PERSISTED_PORT="$(env_file_raw_value OPENLLM_DAEMON_PORT)"
+  if [ -n "$RAW_PERSISTED_PORT" ]; then
+    NORMALIZED_PORT="$(normalize_daemon_port "$RAW_PERSISTED_PORT")" && DAEMON_PORT="$NORMALIZED_PORT"
+  fi
+fi
+# Neither an explicit nor a persisted port exists yet — a genuinely
+# first-ever choice, never a reassignment. Probe the default and, only here,
+# walk forward to the next free port in a small bounded range.
+if [ -z "$DAEMON_PORT" ]; then
+  if RESOLVED_PORT="$(find_available_port "$DEFAULT_DAEMON_PORT" "$PORT_SCAN_LIMIT")"; then
+    DAEMON_PORT="$RESOLVED_PORT"
+  else
+    SCAN_RC=$?
+    if [ "$SCAN_RC" -eq 2 ]; then
+      die "could not verify any port's availability near $DEFAULT_DAEMON_PORT (no python3, no timeout+/dev/tcp, no nc) — set OPENLLM_DAEMON_PORT to choose one explicitly"
+    fi
+    die "no free port found for the daemon in $DEFAULT_DAEMON_PORT-$((DEFAULT_DAEMON_PORT + PORT_SCAN_LIMIT - 1)) — set OPENLLM_DAEMON_PORT to choose one"
+  fi
+fi
 case "$INSTALL_MODE" in
   install|update) ;;
   *) die "OPENLLM_INSTALL_MODE must be 'install' or 'update'" ;;
@@ -288,13 +511,12 @@ fi
 # Re-read under the same exclusive `$ENV_FILE.lock` protocol as the daemon's
 # writeEnvFileVars. Never rebuild this file from a pre-download snapshot: a daemon
 # can mint a device id or update credentials while binaries are downloading.
+# Delegates to `env_file_lookup` for the same last-match-wins, trim/skip
+# semantics as `parseEnvLines` (packages/daemon/src/env.ts) — the values read
+# here (API key, device id, PTY flag) are exactly what that parser resolves
+# on the daemon's own next boot.
 read_env_value() {
-  local wanted="$1" line key
-  [ -f "$ENV_FILE" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    key="${line%%=*}"
-    [ "$key" = "$wanted" ] && { printf '%s' "${line#*=}"; return 0; }
-  done < "$ENV_FILE"
+  env_file_lookup "$1"
 }
 
 write_env_file() {
@@ -468,25 +690,588 @@ fi
 # (see cli-install.ts) — symlink self-heal is separate and needs no write grant
 # on the host CLI dirs. Fully best-effort: guarded so a slow/failed vendor
 # install never fails the daemon install, and logged to ~/.openllm/cli-install.log.
+#
+# Progress is tracked in per-provider JSON under
+# `$OPENLLM_DIR/vendor-cli-install/<slug>.json` (protocol subscription slugs).
+# Process identity / paths stay local; the daemon reader maps them to wire
+# `cli_install` without PIDs or logs. Ownership locks are SEPARATE from
+# `$ENV_FILE.lock` so installer concurrency never contends with config writes.
+vendor_cli_now_ms() {
+  # Bash 3.2 / macOS date has no %N — second resolution * 1000 is enough.
+  echo $(($(date +%s) * 1000))
+}
+
+vendor_cli_json_escape() {
+  # Values we emit are attempt ids / stages / ps lstart — keep escaping tight.
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+vendor_cli_attempt_id() {
+  # This id reaches the cloud; process identity belongs only in local fields.
+  printf 'vci-%s-%s-%s-%s-%s' "$(date +%s)" \
+    "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
+}
+
+# Remove only the attempt-scoped handshake/pid pair passed in. Never a
+# provider-wide path or glob — a completed worker must not wipe a newer attempt.
+vendor_cli_cleanup_attempt_files() {
+  local worker_pid_file="$1" handshake_file="$2"
+  rm -f "$worker_pid_file" "$handshake_file" 2>/dev/null || true
+}
+
+vendor_cli_process_start() {
+  local pid="$1"
+  # Portable PID-reuse guard (same idea as daemon child-supervisor lstart).
+  # Locale/TZ pinned: daemon processStartTime compares this from another env.
+  LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+vendor_cli_pid_live() {
+  local pid="$1" expected_start="${2:-}" live_start
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -n "$expected_start" ]; then
+    live_start="$(vendor_cli_process_start "$pid" || true)"
+    [ -n "$live_start" ] || return 1
+    [ "$live_start" = "$expected_start" ] || return 1
+  fi
+  return 0
+}
+
+vendor_cli_state_dir() {
+  printf '%s' "$OPENLLM_DIR/vendor-cli-install"
+}
+
+# Atomic JSON replace for one provider. Returns nonzero on any write failure.
+# Temp names use mktemp — NOT `$$` — because Bash 3.2 subshells share the
+# parent's `$$`, so parent/worker handoff would clobber the same tmp path.
+vendor_cli_write_state() {
+  local slug="$1" json="$2"
+  local dir tmp final saved_umask
+  dir="$(vendor_cli_state_dir)"
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  final="$dir/${slug}.json"
+  saved_umask="$(umask)"
+  umask 077
+  tmp="$(mktemp "$dir/.${slug}.json.tmp.XXXXXX")" || {
+    umask "$saved_umask"
+    return 1
+  }
+  if ! printf '%s\n' "$json" >"$tmp"; then
+    umask "$saved_umask"
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$final"; then
+    umask "$saved_umask"
+    rm -f "$tmp"
+    return 1
+  fi
+  umask "$saved_umask"
+  return 0
+}
+
+vendor_cli_read_field() {
+  # Tiny key extractor — files are ours and bounded; no jq dependency.
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
+}
+
+vendor_cli_read_num_field() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" | head -n 1
+}
+
+# True when an in-progress installer for this slug still owns a live worker.
+vendor_cli_active_worker() {
+  local slug="$1" file pid start stage
+  file="$(vendor_cli_state_dir)/${slug}.json"
+  [ -f "$file" ] || return 1
+  stage="$(vendor_cli_read_field "$file" stage || true)"
+  [ "$stage" = "installing" ] || return 1
+  pid="$(vendor_cli_read_num_field "$file" pid || true)"
+  start="$(vendor_cli_read_field "$file" process_start || true)"
+  vendor_cli_pid_live "$pid" "$start"
+}
+
+# Per-provider launch lock via mkdir (atomic). Ownership is the `owner` file
+# inside the lock dir (pid + lstart + token). Incomplete/missing owner is
+# treated as INITIALIZING for a bounded mtime grace — never immediate reclaim
+# (that stole locks during OPENLLM_TEST_VENDOR_LOCK_PAUSE). Stale reclaim takes
+# an inner `reclaim/` mkdir sublock, re-validates owner+grace, then `mv`s the
+# whole dir. release must match token.
+VENDOR_CLI_LOCK_INIT_GRACE_SEC=45
+
+vendor_cli_lock_dir() {
+  printf '%s/%s.lock.d' "$(vendor_cli_state_dir)" "$1"
+}
+
+# Capture a single portable `stat` field without mixing Darwin/Linux stdout.
+# GNU `stat -f %m` can print filesystem prose to stdout AND exit nonzero; a
+# naive `stat -f … || stat -c …` then concatenates junk + epoch in one
+# substitution. Try each form alone; accept only a pure positive integer.
+vendor_cli_stat_uint() {
+  local path="$1" darwin_fmt="$2" linux_fmt="$3" raw
+  raw="$(stat -f "$darwin_fmt" "$path" 2>/dev/null)" && {
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+      printf '%s' "$raw"
+      return 0
+    fi
+  }
+  raw="$(stat -c "$linux_fmt" "$path" 2>/dev/null)" && {
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+      printf '%s' "$raw"
+      return 0
+    fi
+  }
+  return 1
+}
+
+# Fail-closed: unavailable/invalid mtime → age 0 (still in grace; never steal).
+# (A literal mtime of 0 previously made age≈epoch and stole locks.)
+vendor_cli_path_mtime_age_sec() {
+  local path="$1" mtime now
+  mtime="$(vendor_cli_stat_uint "$path" %m %Y || true)"
+  if [ -z "$mtime" ] || ! [ "$mtime" -gt 0 ] 2>/dev/null; then
+    echo 0
+    return 0
+  fi
+  now="$(date +%s)"
+  echo $((now - mtime))
+}
+
+# Prefer immutable birth time; a parent may die before writing it. Fall back
+# to directory mtime, whose unavailable/invalid value still fails closed.
+vendor_cli_lock_init_age_sec() {
+  local lock="$1" created raw now
+  created="$lock/created"
+  if [ -f "$created" ]; then
+    raw="$(head -n 1 "$created" 2>/dev/null || true)"
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+      now="$(date +%s)"
+      echo $((now - raw))
+      return 0
+    fi
+  fi
+  vendor_cli_path_mtime_age_sec "$lock"
+}
+
+# Portable inode identity; empty on failure (caller must not reclaim).
+vendor_cli_lock_inode() {
+  local path="$1"
+  vendor_cli_stat_uint "$path" %i %i || true
+}
+
+# Drop an orphan `$lock/reclaim` left by a crashed reclaimer (mkdir succeeded,
+# then SIGKILL before mv). Only when the reclaim dir itself is aged — never
+# steal a live reclaimer's young sublock.
+vendor_cli_clear_orphan_reclaim() {
+  local lock="$1" reclaim_dir age
+  reclaim_dir="$lock/reclaim"
+  [ -d "$reclaim_dir" ] || return 0
+  age="$(vendor_cli_path_mtime_age_sec "$reclaim_dir")"
+  if [ "$age" -ge "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+    rm -rf "$reclaim_dir" 2>/dev/null || true
+  fi
+}
+
+# True when owner file has pid + token (lstart may be empty on odd hosts).
+vendor_cli_owner_complete() {
+  local file="$1" pid token
+  [ -f "$file" ] || return 1
+  pid="$(head -n 1 "$file" 2>/dev/null || true)"
+  token="$(sed -n '3p' "$file" 2>/dev/null || true)"
+  [ -n "$pid" ] && [ -n "$token" ]
+}
+
+vendor_cli_acquire_lock() {
+  local slug="$1" dir lock owner_file attempt=0
+  local owner_pid owner_start reclaim age pre_age pre_inode post_inode
+  local my_start my_token
+  dir="$(vendor_cli_state_dir)"
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  lock="$(vendor_cli_lock_dir "$slug")"
+  owner_file="$lock/owner"
+  my_start="$(vendor_cli_process_start "$$" || true)"
+  my_token="$$.${RANDOM:-0}.$(vendor_cli_now_ms)"
+  VENDOR_CLI_LOCK_TOKEN="$my_token"
+  while [ "$attempt" -lt 400 ]; do
+    if mkdir "$lock" 2>/dev/null; then
+      # Immutable birth timestamp — reclaim/child ops must not reset init age.
+      if ! printf '%s\n' "$(date +%s)" >"$lock/created"; then
+        rm -rf "$lock" 2>/dev/null || true
+        VENDOR_CLI_LOCK_TOKEN=""
+        return 1
+      fi
+      # Optional test hook: widen the window after mkdir before owner exists.
+      if [ -n "${OPENLLM_TEST_VENDOR_LOCK_PAUSE:-}" ]; then
+        sleep 0.2
+      fi
+      if ! {
+        printf '%s\n' "$$"
+        printf '%s\n' "$my_start"
+        printf '%s\n' "$my_token"
+      } >"$owner_file"; then
+        rm -rf "$lock" 2>/dev/null || true
+        VENDOR_CLI_LOCK_TOKEN=""
+        return 1
+      fi
+      # Failed owner write must not report success — re-read our token.
+      if [ "$(sed -n '3p' "$owner_file" 2>/dev/null || true)" != "$my_token" ]; then
+        rm -rf "$lock" 2>/dev/null || true
+        VENDOR_CLI_LOCK_TOKEN=""
+        return 1
+      fi
+      return 0
+    fi
+
+    # Contended. Live complete owner → give up (do not steal).
+    if vendor_cli_owner_complete "$owner_file"; then
+      owner_pid="$(head -n 1 "$owner_file" 2>/dev/null || true)"
+      owner_start="$(sed -n '2p' "$owner_file" 2>/dev/null || true)"
+      if vendor_cli_pid_live "$owner_pid" "$owner_start"; then
+        VENDOR_CLI_LOCK_TOKEN=""
+        return 1
+      fi
+    else
+      # Missing/partial owner: INITIALIZING while birth age is young.
+      age="$(vendor_cli_lock_init_age_sec "$lock")"
+      if [ "$age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+        attempt=$((attempt + 1))
+        sleep 0.05
+        continue
+      fi
+    fi
+
+    # Clear aged orphan reclaim sublock (crashed reclaimer) before retrying.
+    vendor_cli_clear_orphan_reclaim "$lock"
+
+    # Snapshot birth-age + inode BEFORE mkdir reclaim (dir mtime may refresh).
+    pre_age="$(vendor_cli_lock_init_age_sec "$lock")"
+    pre_inode="$(vendor_cli_lock_inode "$lock")"
+    if [ -z "$pre_inode" ]; then
+      attempt=$((attempt + 1))
+      sleep 0.05
+      continue
+    fi
+    if ! vendor_cli_owner_complete "$owner_file"; then
+      if [ "$pre_age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+        attempt=$((attempt + 1))
+        sleep 0.05
+        continue
+      fi
+    fi
+
+    # Inner reclaim sublock. If this lands in a replacement dir, inode check aborts.
+    if ! mkdir "$lock/reclaim" 2>/dev/null; then
+      vendor_cli_clear_orphan_reclaim "$lock"
+      attempt=$((attempt + 1))
+      sleep 0.05
+      continue
+    fi
+
+    post_inode="$(vendor_cli_lock_inode "$lock")"
+    if [ -z "$post_inode" ] || [ "$post_inode" != "$pre_inode" ]; then
+      rmdir "$lock/reclaim" 2>/dev/null || true
+      attempt=$((attempt + 1))
+      sleep 0.02
+      continue
+    fi
+
+    # Re-validate owner liveness; use PRE-reclaim birth age for incomplete grace.
+    if vendor_cli_owner_complete "$owner_file"; then
+      owner_pid="$(head -n 1 "$owner_file" 2>/dev/null || true)"
+      owner_start="$(sed -n '2p' "$owner_file" 2>/dev/null || true)"
+      if vendor_cli_pid_live "$owner_pid" "$owner_start"; then
+        rmdir "$lock/reclaim" 2>/dev/null || true
+        VENDOR_CLI_LOCK_TOKEN=""
+        return 1
+      fi
+    elif [ "$pre_age" -lt "$VENDOR_CLI_LOCK_INIT_GRACE_SEC" ]; then
+      rmdir "$lock/reclaim" 2>/dev/null || true
+      attempt=$((attempt + 1))
+      sleep 0.05
+      continue
+    fi
+
+    reclaim="${lock}.stale.$$.${RANDOM:-0}"
+    if mv "$lock" "$reclaim" 2>/dev/null; then
+      rm -rf "$reclaim" 2>/dev/null || true
+    else
+      rmdir "$lock/reclaim" 2>/dev/null || true
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.02
+  done
+  VENDOR_CLI_LOCK_TOKEN=""
+  return 1
+}
+
+vendor_cli_release_lock() {
+  local slug="$1" lock owner_file token
+  lock="$(vendor_cli_lock_dir "$slug")"
+  owner_file="$lock/owner"
+  token="${VENDOR_CLI_LOCK_TOKEN:-}"
+  VENDOR_CLI_LOCK_TOKEN=""
+  [ -n "$token" ] || return 0
+  [ -d "$lock" ] || return 0
+  # Only the acquiring token may remove the lock — never an unconditional unlink.
+  if [ "$(sed -n '3p' "$owner_file" 2>/dev/null || true)" = "$token" ]; then
+    rm -rf "$lock" 2>/dev/null || true
+  fi
+}
+
+vendor_cli_build_json() {
+  local attempt_id="$1" provider="$2" stage="$3" started="$4" updated="$5"
+  local reason="${6:-}" pid="${7:-}" process_start="${8:-}" exit_code="${9:-}"
+  local esc_attempt esc_provider esc_stage esc_reason esc_start
+  esc_attempt="$(vendor_cli_json_escape "$attempt_id")"
+  esc_provider="$(vendor_cli_json_escape "$provider")"
+  esc_stage="$(vendor_cli_json_escape "$stage")"
+  printf '{'
+  printf '"attempt_id":"%s","provider":"%s","stage":"%s","started_at_ms":%s,"updated_at_ms":%s' \
+    "$esc_attempt" "$esc_provider" "$esc_stage" "$started" "$updated"
+  if [ -n "$reason" ]; then
+    esc_reason="$(vendor_cli_json_escape "$reason")"
+    printf ',"reason":"%s"' "$esc_reason"
+  fi
+  if [ -n "$pid" ]; then
+    printf ',"pid":%s' "$pid"
+  fi
+  if [ -n "$process_start" ]; then
+    esc_start="$(vendor_cli_json_escape "$process_start")"
+    printf ',"process_start":"%s"' "$esc_start"
+  fi
+  if [ -n "$exit_code" ]; then
+    printf ',"exit_code":%s' "$exit_code"
+  fi
+  printf '}'
+}
+
+# List direct children of a pid (macOS + Linux). Bash 3.2 portable.
+vendor_cli_children() {
+  local root="$1"
+  # `ps -axo` works on Darwin; `-eo` on Linux. Prefer axo, fall back.
+  (ps -axo pid=,ppid= 2>/dev/null || ps -eo pid=,ppid= 2>/dev/null || true) \
+    | while read -r pid ppid; do
+        pid="$(printf '%s' "$pid" | tr -d '[:space:]')"
+        ppid="$(printf '%s' "$ppid" | tr -d '[:space:]')"
+        [ "$ppid" = "$root" ] && [ -n "$pid" ] && printf '%s\n' "$pid"
+      done
+}
+
+# Recursively TERM/KILL a process tree (children first, then root).
+vendor_cli_stop_tree() {
+  local root="$1" sig="${2:-TERM}" kid
+  [ -n "$root" ] || return 0
+  for kid in $(vendor_cli_children "$root"); do
+    vendor_cli_stop_tree "$kid" "$sig"
+  done
+  kill "-$sig" "$root" 2>/dev/null || true
+}
+
+vendor_cli_reap_tree() {
+  local root="$1" i
+  [ -n "$root" ] || return 0
+  vendor_cli_stop_tree "$root" TERM
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$root" 2>/dev/null || return 0
+    sleep 0.05
+  done
+  vendor_cli_stop_tree "$root" KILL
+  for i in 1 2 3 4 5; do
+    kill -0 "$root" 2>/dev/null || return 0
+    sleep 0.05
+  done
+}
+
+launch_vendor_cli_install() {
+  local name="$1" cmd="$2" slug="$3" dest="$4" url="$5" run_path="$6" curl_bin="$7"
+  local attempt_id started json worker_pid worker_start file
+  local worker_pid_file handshake_file
+
+  if ! vendor_cli_acquire_lock "$slug"; then
+    echo "  $name CLI: installer already running — skipping duplicate."
+    echo "$name CLI: duplicate launch skipped (live lock)." \
+      >>"$OPENLLM_DIR/cli-install.log" 2>/dev/null || true
+    return 0
+  fi
+
+  if vendor_cli_active_worker "$slug"; then
+    echo "  $name CLI: installer already running — skipping duplicate."
+    echo "$name CLI: duplicate launch skipped (live worker)." \
+      >>"$OPENLLM_DIR/cli-install.log" 2>/dev/null || true
+    vendor_cli_release_lock "$slug"
+    return 0
+  fi
+
+  # A previous installing record whose worker is dead: mark interrupted before
+  # starting a replacement so the UI never keeps a zombie "installing".
+  file="$(vendor_cli_state_dir)/${slug}.json"
+  if [ -f "$file" ]; then
+    local prev_stage prev_attempt prev_started
+    prev_stage="$(vendor_cli_read_field "$file" stage || true)"
+    if [ "$prev_stage" = "installing" ]; then
+      prev_attempt="$(vendor_cli_read_field "$file" attempt_id || true)"
+      prev_started="$(vendor_cli_read_num_field "$file" started_at_ms || true)"
+      if [ -n "$prev_attempt" ] && [ -n "$prev_started" ]; then
+        json="$(vendor_cli_build_json "$prev_attempt" "$slug" interrupted "$prev_started" "$(vendor_cli_now_ms)" interrupted)"
+        vendor_cli_write_state "$slug" "$json" || true
+      fi
+    fi
+  fi
+
+  attempt_id="$(vendor_cli_attempt_id)"
+  started="$(vendor_cli_now_ms)"
+  # Reserve BEFORE launch (no pid yet). A write failure must not start work.
+  json="$(vendor_cli_build_json "$attempt_id" "$slug" installing "$started" "$started")"
+  if ! vendor_cli_write_state "$slug" "$json"; then
+    echo "  $name CLI: could not track install — skipping to avoid untracked work." >&2
+    echo "$name CLI: state write failed before launch — skipped." \
+      >>"$OPENLLM_DIR/cli-install.log" 2>/dev/null || true
+    vendor_cli_release_lock "$slug"
+    return 0
+  fi
+
+  echo "  $name CLI: installing in the background…"
+  # Handshake/pid files are attempt-scoped. A completed older worker must not
+  # `rm` a newer attempt's handshake (provider-only paths caused that race).
+  worker_pid_file="$(vendor_cli_state_dir)/.${slug}.${attempt_id}.worker_pid"
+  handshake_file="$(vendor_cli_state_dir)/.${slug}.${attempt_id}.handshake"
+  vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
+  # Capture the launching shell's pid for the worker's parent-liveness guard
+  # (Bash 3.2: `$$` inside `( )&` is still this value — pass it explicitly).
+  local launcher_pid=$$
+  (
+    # Background worker: parent may exit; this job continues and owns terminal
+    # state transitions. pipefail so a nonzero curl fails the pipeline.
+    set -euo pipefail
+    my_pid=""
+    # Bounded wall deadline (~10s), not a fixed short iteration count — slow
+    # parent `ps`/JSON write under load must still complete the handshake.
+    _hs_deadline=$(($(date +%s) + 10))
+    while [ "$(date +%s)" -lt "$_hs_deadline" ]; do
+      if [ -f "$handshake_file" ] && [ -f "$worker_pid_file" ]; then
+        my_pid="$(head -n 1 "$worker_pid_file" 2>/dev/null || true)"
+        [ -n "$my_pid" ] && break
+      fi
+      # Abort early only when the launcher is gone AND handshake never arrived.
+      # If handshake already landed, a later parent exit is fine.
+      if [ -z "$my_pid" ] && ! kill -0 "$launcher_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    if [ -z "$my_pid" ]; then
+      # No handshake — parent failed or died. Do NOT run the vendor installer
+      # untracked, and do NOT invent a PPID identity.
+      echo "$name CLI: missing handshake — worker exiting without vendor start." >&2
+      exit 1
+    fi
+    my_start="$(vendor_cli_process_start "$my_pid" || true)"
+    child_pid=""
+    write_progress() {
+      local stage="$1" reason="${2:-}" exit_code="${3:-}"
+      local now payload
+      now="$(vendor_cli_now_ms)"
+      payload="$(vendor_cli_build_json "$attempt_id" "$slug" "$stage" "$started" "$now" "$reason" "$my_pid" "$my_start" "$exit_code")"
+      vendor_cli_write_state "$slug" "$payload" || true
+    }
+    on_signal() {
+      # Stop installer descendants BEFORE claiming interrupted / exiting, so a
+      # duplicate launcher cannot observe "stopped" while curl|bash still runs.
+      # Do NOT reap my_pid here — that would kill this trap before write_progress.
+      if [ -n "${child_pid:-}" ]; then
+        vendor_cli_reap_tree "$child_pid"
+      else
+        # Fallback: any children of this worker subshell (bash 3.2: use handshake pid).
+        for _kid in $(vendor_cli_children "$my_pid"); do
+          vendor_cli_reap_tree "$_kid"
+        done
+      fi
+      write_progress interrupted interrupted
+      vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
+      exit 130
+    }
+    trap on_signal HUP INT TERM
+    set +e
+    # Single waitable child wrapping the pipeline so signal cleanup has a root.
+    PATH="$run_path" bash -c '
+      set -euo pipefail
+      PATH="$1" "$2" -fsSL "$3" | PATH="$1" bash
+    ' bash "$run_path" "$curl_bin" "$url" &
+    child_pid=$!
+    wait "$child_pid"
+    rc=$?
+    set -e
+    trap - HUP INT TERM
+    if [ "$rc" -eq 0 ]; then
+      write_progress awaiting_detection
+    elif [ "$rc" -ge 128 ]; then
+      write_progress interrupted interrupted "$rc"
+    else
+      write_progress failed installer_failed "$rc"
+    fi
+    vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
+  ) >>"$OPENLLM_DIR/cli-install.log" 2>&1 &
+  worker_pid=$!
+
+  # Parent: persist pid-bearing installing JSON FIRST, then publish handshake.
+  # Never handshake before JSON — a fast worker must not finish, then get
+  # overwritten back to installing by a late parent write.
+  worker_start="$(vendor_cli_process_start "$worker_pid" || true)"
+  json="$(vendor_cli_build_json "$attempt_id" "$slug" installing "$started" "$(vendor_cli_now_ms)" "" "$worker_pid" "$worker_start")"
+  if ! vendor_cli_write_state "$slug" "$json"; then
+    echo "  $name CLI: lost track after launch — stopping untracked worker." >&2
+    vendor_cli_reap_tree "$worker_pid"
+    json="$(vendor_cli_build_json "$attempt_id" "$slug" interrupted "$started" "$(vendor_cli_now_ms)" interrupted)"
+    vendor_cli_write_state "$slug" "$json" || true
+    vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
+    vendor_cli_release_lock "$slug"
+    return 0
+  fi
+  printf '%s\n' "$worker_pid" >"$worker_pid_file" || {
+    vendor_cli_reap_tree "$worker_pid"
+    json="$(vendor_cli_build_json "$attempt_id" "$slug" interrupted "$started" "$(vendor_cli_now_ms)" interrupted)"
+    vendor_cli_write_state "$slug" "$json" || true
+    vendor_cli_release_lock "$slug"
+    return 0
+  }
+  # Handshake last — worker may proceed to curl only after this exists.
+  : >"$handshake_file" || {
+    vendor_cli_reap_tree "$worker_pid"
+    json="$(vendor_cli_build_json "$attempt_id" "$slug" interrupted "$started" "$(vendor_cli_now_ms)" interrupted)"
+    vendor_cli_write_state "$slug" "$json" || true
+    vendor_cli_cleanup_attempt_files "$worker_pid_file" "$handshake_file"
+    vendor_cli_release_lock "$slug"
+    return 0
+  }
+  vendor_cli_release_lock "$slug"
+}
+
 provision_clis() {
-  # display | command | dest launcher | official installer URL.
-  # These mirror sources of truth in TS that bash can't import: the dest
-  # launchers match the VENDOR-DEFAULT entries of `hostCliCandidates` in
-  # packages/daemon/src/cli-paths.ts (daemon-side detection additionally
-  # scans PATH generically, mirroring the `has_command` check below — the two
-  # layers agree on "installed" wherever the binary lives), and the URLs match
-  # `VENDOR_CLI_INSTALL_CMD` in lib/hooks/use-daemon.ts + `installHint` in
-  # packages/cli/src/clients/registry.ts. If a vendor path or installer URL
-  # changes, update it in all those places too.
+  # display | command | protocol slug | dest launcher | official installer URL.
+  # Dest launchers match VENDOR-DEFAULT `hostCliCandidates` in
+  # packages/daemon/src/cli-paths.ts; URLs match `VENDOR_CLI_INSTALL_CMD` in
+  # lib/hooks/use-daemon.ts + `installHint` in packages/cli/src/clients/registry.ts.
+  # Slugs are the protocol SubscriptionProviderSlug literals.
   local specs=(
-    "Claude Code|claude|$HOME/.local/bin/claude|https://claude.ai/install.sh"
-    "Codex|codex|$HOME/.local/bin/codex|https://chatgpt.com/codex/install.sh"
-    "Kimi|kimi|$HOME/.kimi-code/bin/kimi|https://code.kimi.com/kimi-code/install.sh"
-    "Grok|grok|$HOME/.grok/bin/grok|https://x.ai/cli/install.sh"
+    "Claude Code|claude|claude_code|$HOME/.local/bin/claude|https://claude.ai/install.sh"
+    "Codex|codex|chatgpt|$HOME/.local/bin/codex|https://chatgpt.com/codex/install.sh"
+    "Kimi|kimi|kimi_code|$HOME/.kimi-code/bin/kimi|https://code.kimi.com/kimi-code/install.sh"
+    "Grok|grok|grok|$HOME/.grok/bin/grok|https://x.ai/cli/install.sh"
     # ⚠️ RESEARCH-UNVERIFIED: Cursor's official installer/launcher path.
-    "Cursor Agent|cursor-agent|$HOME/.local/bin/cursor-agent|https://cursor.com/install"
+    "Cursor Agent|cursor-agent|cursor|$HOME/.local/bin/cursor-agent|https://cursor.com/install"
     # Official Muse Code installer (https://dev.meta.ai/docs/muse-code/).
-    "Muse Code|muse|$HOME/.local/bin/muse|https://dev.meta.ai/install.sh"
+    "Muse Code|muse|muse|$HOME/.local/bin/muse|https://dev.meta.ai/install.sh"
   )
   # Build a PATH that (a) puts the STANDARD system dirs FIRST — covering
   # curl/bash/tar/gzip/uname/sed/grep on macOS AND Linux (all live in
@@ -514,25 +1299,20 @@ provision_clis() {
     echo "  Vendor CLIs: curl not found — install them by hand from their official installers." >&2
     return 0
   fi
-  local spec name cmd dest url
+  local spec name cmd slug dest url
   for spec in "${specs[@]}"; do
-    IFS='|' read -r name cmd dest url <<<"$spec"
+    IFS='|' read -r name cmd slug dest url <<<"$spec"
     if has_command "$cmd" || [ -x "$dest" ]; then
       echo "  $name CLI: already installed."
       # Mirror the skip into the log too — previously only the backgrounded
       # installer output landed there, so a skipped provider left the log
-      # silent about why nothing was installed.
+      # silent about why nothing was installed. No progress record is written
+      # for an already-present binary (do not invent a finished job).
       echo "$name CLI: already installed ($(command -v "$cmd" 2>/dev/null || echo "$dest")) — skipping install." \
         >>"$OPENLLM_DIR/cli-install.log" 2>/dev/null || true
       continue
     fi
-    echo "  $name CLI: installing in the background…"
-    # Absolute curl entry + `run_path` for the piped installer and every inner
-    # tool it spawns → a detached job is immune to the outer process's PATH
-    # while the installer still writes under the real $HOME.
-    (
-      PATH="$run_path" "$curl_bin" -fsSL "$url" | PATH="$run_path" bash
-    ) >>"$OPENLLM_DIR/cli-install.log" 2>&1 &
+    launch_vendor_cli_install "$name" "$cmd" "$slug" "$dest" "$url" "$run_path" "$curl_bin" || true
   done
 }
 # `|| true` + the subshell/background jobs keep this off the `set -euo
