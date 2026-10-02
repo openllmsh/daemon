@@ -205,6 +205,89 @@ export type TSpawnClaudeCliParams = Omit<
 export type TClaudeSpawned = {
   readonly child: TSupervisedChild;
   readonly proc: ReturnType<typeof Bun.spawn>;
+  /** The child's stderr, already drained by `spawnSupervisedClaude` — callers
+   *  must NOT read `proc.stderr` themselves (a second reader would race it). */
+  readonly stderr: TStderrDrain;
+};
+
+/** Bound on the retained stderr tail. */
+export const CLAUDE_STDERR_TAIL_MAX = 8_192;
+/** After the child exits, how long the drain waits for buffered bytes / a
+ *  grandchild-held pipe to reach EOF before it cancels the reader. */
+const STDERR_EXIT_GRACE_MS = 250;
+
+/** Bounded view of a drained stderr pipe. Stderr is NOT a safe channel (the
+ *  vendor can echo caller text into it): keep a byte count and a small tail
+ *  for classification only — never log or report the raw text. */
+export type TStderrDrain = {
+  readonly bytes: () => number;
+  readonly tail: () => string;
+  /** True once the reader has stopped (EOF, exit, abort or pipe error). */
+  readonly done: boolean;
+  /** Stop reading now (idempotent). */
+  readonly stop: () => void;
+};
+
+/**
+ * Drain `stderr` continuously so an unread pipe can never back-pressure (or,
+ * unbounded-buffered, bloat) the child. Stops at EOF, shortly after the child
+ * exits (every abort path terminates the child), or on `stop()`. No listener
+ * is added to the caller's abort signal: callers pin the exact listener set
+ * on it. Never throws.
+ */
+const drainStderr = (
+  stream: unknown,
+  exited: Promise<unknown>,
+): TStderrDrain => {
+  let byteCount = 0;
+  let tail = "";
+  let stopped = false;
+  const drain: TStderrDrain = {
+    bytes: () => byteCount,
+    tail: () => tail,
+    get done() {
+      return stopped;
+    },
+    stop: () => stop(),
+  };
+  if (typeof stream !== "object" || stream === null) {
+    stopped = true;
+    return drain;
+  }
+  const reader = (stream as ReadableStream<Uint8Array>).getReader();
+  const decoder = new TextDecoder();
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  function stop(): void {
+    if (stopped) return;
+    stopped = true;
+    if (graceTimer !== undefined) clearTimeout(graceTimer);
+    void reader.cancel().catch(() => undefined);
+  }
+  void exited
+    .then(() => {
+      if (stopped) return;
+      graceTimer = setTimeout(stop, STDERR_EXIT_GRACE_MS);
+      graceTimer.unref?.();
+    })
+    .catch(() => undefined);
+  void (async (): Promise<void> => {
+    try {
+      while (!stopped) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        byteCount += value.byteLength;
+        tail += decoder.decode(value, { stream: true });
+        if (tail.length > CLAUDE_STDERR_TAIL_MAX) {
+          tail = tail.slice(-CLAUDE_STDERR_TAIL_MAX);
+        }
+      }
+    } catch {
+      // pipe closed or reader cancelled — nothing left to capture
+    } finally {
+      stop();
+    }
+  })();
+  return drain;
 };
 
 /**
@@ -279,7 +362,11 @@ const spawnSupervisedClaude = async (
     await child.terminate().catch(() => undefined);
     throw error;
   }
-  return { child, proc };
+  return {
+    child,
+    proc,
+    stderr: drainStderr(proc.stderr, proc.exited),
+  };
 };
 
 /** Stage the prompt (fresh session only), build the argv and spawn the
