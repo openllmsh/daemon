@@ -1542,10 +1542,14 @@ export const runCodexCapturedTextTurn = async (
     );
   }
 
-  const client = createIsolatedCodexAppServerClient(params.bin, {
-    ...params.env,
-    CODEX_HOME: ephemeralHome.ephemeralHome,
-  });
+  const client = createIsolatedCodexAppServerClient(
+    params.bin,
+    {
+      ...params.env,
+      CODEX_HOME: ephemeralHome.ephemeralHome,
+    },
+    { modelMetadataHome: durableCodexHome },
+  );
 
   const disposeAll = (): void => {
     try {
@@ -1581,10 +1585,13 @@ export const runCodexCapturedTextTurn = async (
   try {
     phase = "initialize";
     await client.ensureStarted();
-    const startParams = codexBaseStartParams(
-      params.providerModelId,
-      params.systemText,
-      params.serviceTier,
+    const startParams = await client.prepareThreadParams(
+      codexBaseStartParams(
+        params.providerModelId,
+        params.systemText,
+        params.serviceTier,
+        params.modelContextWindow,
+      ),
     );
     // Capture path always starts a FRESH isolated thread — do not resume the
     // shared warm map's thread ids (history injection unproven).

@@ -475,10 +475,14 @@ export const runCodexCapturedToolTurn = async (
     };
   }
 
-  const client = createIsolatedCodexAppServerClient(params.bin, {
-    ...params.env,
-    CODEX_HOME: ephemeralHome.ephemeralHome,
-  });
+  const client = createIsolatedCodexAppServerClient(
+    params.bin,
+    {
+      ...params.env,
+      CODEX_HOME: ephemeralHome.ephemeralHome,
+    },
+    { modelMetadataHome: durableCodexHome },
+  );
 
   const disposeAll = (): void => {
     if (threadId !== null) {
@@ -528,11 +532,14 @@ export const runCodexCapturedToolTurn = async (
     await client.ensureStarted();
     const started = (await client.request(
       "thread/start",
-      codexToolStartParams(
-        params.providerModelId,
-        params.systemText,
-        dynamicTools,
-        params.serviceTier,
+      await client.prepareThreadParams(
+        codexToolStartParams(
+          params.providerModelId,
+          params.systemText,
+          dynamicTools,
+          params.serviceTier,
+          params.modelContextWindow,
+        ),
       ),
     )) as { thread?: { id?: string } };
     if (typeof started.thread?.id !== "string") {

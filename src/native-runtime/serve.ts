@@ -34,7 +34,7 @@ import {
   deliverJsonResponse,
   isClientHangUp,
 } from "../client-encode";
-import { planSigningKey } from "../config";
+import { lookupCatalogEntry, planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
 import type { TExecutionIdentity } from "../execution-identity";
@@ -552,6 +552,18 @@ const hasAnthropicNativeServerTool = (params: TNativeServeParams): boolean =>
   params.surface === "messages" &&
   declaresAnthropicServerSearchTool(params.rawBody);
 
+/**
+ * Bootstrap-projected effective input budget for this hop. Older daemons
+ * that only read `input_token_limit` still get the pin; native Codex applies
+ * the same number via `thread/start.config.model_context_window`.
+ */
+const catalogModelContextWindow = (
+  provider: string,
+  providerModelId: string,
+): number | null =>
+  lookupCatalogEntry(`${provider}/${providerModelId}`)?.input_token_limit ??
+  null;
+
 export const tryServeNativeRuntime = async (
   params: TNativeServeParams,
   overrides?: TNativeServeOverrides,
@@ -822,6 +834,10 @@ export const tryServeNativeRuntime = async (
             resumeThreadId: builderResumeId,
             reasoningEffort: params.canonical.reasoning_effort ?? null,
             serviceTier: params.canonical.service_tier,
+            modelContextWindow: catalogModelContextWindow(
+              params.provider,
+              params.providerModelId,
+            ),
             signal: params.signal,
             bridgeCapture: captureActive,
           });
@@ -1123,6 +1139,10 @@ const serveCapturedToolTurn = async (
         historyTurns: decomposed.historyTurns,
         reasoningEffort: params.canonical.reasoning_effort ?? null,
         serviceTier: params.canonical.service_tier,
+        modelContextWindow: catalogModelContextWindow(
+          params.provider,
+          params.providerModelId,
+        ),
         signal: params.signal,
         ...(captureTool?.codexFetchImpl !== undefined
           ? { fetchImpl: captureTool.codexFetchImpl }

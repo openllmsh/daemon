@@ -16,6 +16,7 @@ import { TOOL_SESSION_HEADER } from "@openllmsh/protocol";
 import { responseToChunkStream } from "@openllmsh/wire/lib/streaming/response-stream";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { deliverJsonResponse, sseResponseForClient } from "../client-encode";
+import { lookupCatalogEntry } from "../config";
 import type { TToolContinuationIdentity } from "./claude-tool-continuation";
 import type { TClientTool, TIteratorFactory } from "./claude-tool-session";
 import {
@@ -194,6 +195,9 @@ export const tryServeNativeToolTurn = async (
             systemText: systemTextOf(params.canonical),
             reasoningEffort: params.canonical.reasoning_effort ?? null,
             serviceTier: params.canonical.service_tier,
+            modelContextWindow:
+              lookupCatalogEntry(`${params.provider}/${params.providerModelId}`)
+                ?.input_token_limit ?? null,
             userText: seedFromHistory(params.canonical),
           });
 

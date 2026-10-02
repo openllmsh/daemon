@@ -33,8 +33,10 @@ import { codexServiceTier } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
+import { daemonTempDir } from "../sandbox/working-set";
 import { DAEMON_VERSION } from "../version";
 import type { TClientTool } from "./claude-tool-session";
+import { CodexModelContextCatalog } from "./codex-model-context";
 import {
   CODEX_HOSTED_WEB_SEARCH_CONFIG,
   suppressHostedSearchClientTool,
@@ -121,6 +123,8 @@ export type TCodexAppServerClientOptions = {
    * builders must be isolated from the shared app-server.
    */
   readonly isolated?: boolean;
+  /** Capture children read native model metadata from the durable home. */
+  readonly modelMetadataHome?: string;
 };
 
 class CodexAppServerClient {
@@ -147,6 +151,9 @@ class CodexAppServerClient {
    */
   private exited: Promise<number> | null = null;
   private readonly spawnArgvExtra: readonly string[];
+  private readonly modelMetadataHome: string | undefined;
+  private modelContextCatalog: CodexModelContextCatalog | null = null;
+  private readonly threadContextKeys = new Map<string, string>();
   /** True when created via {@link createIsolatedCodexAppServerClient}. */
   readonly isolated: boolean;
 
@@ -157,6 +164,7 @@ class CodexAppServerClient {
   ) {
     this.spawnArgvExtra = options.spawnArgvExtra ?? [];
     this.isolated = options.isolated === true;
+    this.modelMetadataHome = options.modelMetadataHome ?? env.CODEX_HOME;
   }
 
   /** Spawn + handshake exactly once per child; respawn after an exit. */
@@ -212,10 +220,81 @@ class CodexAppServerClient {
    */
   async disposeAndWaitForExit(): Promise<void> {
     const exited = this.exited;
+    const catalog = this.modelContextCatalog;
     this.dispose();
     if (exited !== null) {
       await exited;
+      await catalog?.cleanup();
     }
+  }
+
+  /** Config overrides alone cannot replace ModelInfo's 95% reserve/max clamp. */
+  async prepareThreadParams(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const config = params.config as Record<string, unknown> | undefined;
+    const window = config?.model_context_window;
+    if (typeof window !== "number" || typeof params.model !== "string")
+      return params;
+    const catalog = this.modelContextCatalog;
+    if (catalog === null)
+      throw new Error("codex app-server is not initialized");
+    let path: string;
+    try {
+      path = await catalog.pathFor(params.model, window);
+    } catch {
+      // Demand-driven refresh only: this method runs while opening an inference
+      // thread. Never start login/auth work or replace the vendor cache ourselves.
+      await this.request("model/list", { limit: 1 });
+      path = await catalog.pathFor(params.model, window);
+    }
+    return { ...params, config: { ...config, model_catalog_json: path } };
+  }
+
+  /** A loaded resume ignores config. Fork history when its input budget changes. */
+  async openThread(
+    params: Record<string, unknown>,
+    resumeThreadId: string | null,
+  ): Promise<string> {
+    const prepared = await this.prepareThreadParams(params);
+    const config = prepared.config as Record<string, unknown> | undefined;
+    const contextKey = JSON.stringify([
+      config?.model_context_window ?? null,
+      config?.model_catalog_json ?? null,
+    ]);
+    const previous =
+      resumeThreadId !== null
+        ? this.threadContextKeys.get(resumeThreadId)
+        : undefined;
+    const changed = previous !== undefined && previous !== contextKey;
+    if (changed && resumeThreadId !== null && this.sinks.has(resumeThreadId)) {
+      throw new Error(
+        "cannot change context budget during an active Codex turn",
+      );
+    }
+    const opened = (await (resumeThreadId === null
+      ? this.request("thread/start", prepared)
+      : changed
+        ? this.request("thread/fork", { threadId: resumeThreadId, ...prepared })
+        : this.request("thread/resume", {
+            threadId: resumeThreadId,
+            ...prepared,
+          }).catch(() => this.request("thread/start", prepared)))) as {
+      thread?: { id?: string };
+    };
+    const threadId = opened.thread?.id;
+    if (typeof threadId !== "string")
+      throw new Error("thread/start returned no thread id");
+    this.threadContextKeys.set(threadId, contextKey);
+    if (changed && resumeThreadId !== null) {
+      this.threadContextKeys.delete(resumeThreadId);
+      // Stop receiving old-thread events; do not archive/delete its persisted
+      // history or terminate a shared child serving unrelated conversations.
+      await this.request("thread/unsubscribe", {
+        threadId: resumeThreadId,
+      }).catch(() => {});
+    }
+    return threadId;
   }
 
   private async start(): Promise<void> {
@@ -230,6 +309,12 @@ class CodexAppServerClient {
       },
     );
     this.proc = proc;
+    const contextCatalog = new CodexModelContextCatalog(
+      this.modelMetadataHome,
+      daemonTempDir(),
+      this.env.CODEX_HOME,
+    );
+    this.modelContextCatalog = contextCatalog;
     // Reset for THIS spawn — a respawn (shared warm client only) must not
     // let a stale `disposeAndWaitForExit()` caller from the PREVIOUS child
     // keep awaiting an already-settled promise for a process that's gone.
@@ -249,6 +334,7 @@ class CodexAppServerClient {
       () => {
         if (this.proc === proc) this.proc = null;
         this.teardown("codex app-server exited");
+        void contextCatalog.cleanup().catch(() => {});
       },
       () => {
         if (this.proc === proc) this.proc = null;
@@ -285,6 +371,7 @@ class CodexAppServerClient {
     }
     for (const [, sink] of this.sinks) sink.onCompleted("failed", reason);
     this.sinks.clear();
+    this.threadContextKeys.clear();
     this.stdin = null;
     this.initialized = null; // next request respawns (shared warm client only)
   }
@@ -628,6 +715,13 @@ export type TCodexNativeParams = {
   /** Canonical `reasoning_effort`, forwarded when the runtime supports it. */
   readonly reasoningEffort: string | null;
   readonly serviceTier?: unknown;
+  /**
+   * Effective gateway input budget for this hop (user pin → report →
+   * authored). Applied as `thread/start|resume.config.model_context_window`
+   * (Codex v0.144.1 Config / ModelsManager override) — not an inference-wire
+   * field. Omitted when unknown so Codex keeps its catalog/built-in window.
+   */
+  readonly modelContextWindow?: number | null;
   readonly signal: AbortSignal;
   /** Override the pre-commit deadline (default 60s). Tests use a small value to
    *  exercise the timeout→interrupt path without a real 60s wait. */
@@ -663,10 +757,36 @@ export const effortOf = (raw: string | null): string | null => {
  * provider-owned on Codex native hops (always-on), and Codex resolves the
  * requested `live` mode against its own permission profile.
  */
+/**
+ * Merge hosted-search defaults with an optional per-thread context override.
+ * Keys are snake_case ConfigToml / ModelsManager fields (see
+ * `ref/codex-rust-v0.144.1` `Config.model_context_window`).
+ */
+export const codexThreadConfig = (
+  modelContextWindow?: number | null,
+): Record<string, unknown> => {
+  if (
+    modelContextWindow === undefined ||
+    modelContextWindow === null ||
+    !Number.isInteger(modelContextWindow) ||
+    modelContextWindow <= 0
+  ) {
+    return { ...CODEX_HOSTED_WEB_SEARCH_CONFIG };
+  }
+  // Match Codex's default auto-compact floor (90% of the resolved window).
+  const autoCompact = Math.floor((modelContextWindow * 9) / 10);
+  return {
+    ...CODEX_HOSTED_WEB_SEARCH_CONFIG,
+    model_context_window: modelContextWindow,
+    model_auto_compact_token_limit: autoCompact,
+  };
+};
+
 export const codexBaseStartParams = (
   providerModelId: string,
   systemText: string | null,
   serviceTier?: unknown,
+  modelContextWindow?: number | null,
 ): Record<string, unknown> => ({
   model: providerModelId,
   ...(serviceTier !== undefined
@@ -675,7 +795,7 @@ export const codexBaseStartParams = (
   approvalPolicy: "never",
   sandbox: "read-only",
   personality: "none",
-  config: CODEX_HOSTED_WEB_SEARCH_CONFIG,
+  config: codexThreadConfig(modelContextWindow),
   ...(systemText !== null ? { developerInstructions: systemText } : {}),
 });
 
@@ -721,8 +841,14 @@ export const codexToolStartParams = (
   systemText: string | null,
   dynamicTools: ReadonlyArray<TCodexDynamicToolSpec>,
   serviceTier?: unknown,
+  modelContextWindow?: number | null,
 ): Record<string, unknown> => ({
-  ...codexBaseStartParams(providerModelId, systemText, serviceTier),
+  ...codexBaseStartParams(
+    providerModelId,
+    systemText,
+    serviceTier,
+    modelContextWindow,
+  ),
   features: { code_mode: false, code_mode_only: false },
   experimentalRawEvents: true,
   dynamicTools,
@@ -775,21 +901,9 @@ export const runCodexNative = async (
       params.providerModelId,
       params.systemText,
       params.serviceTier,
+      params.modelContextWindow,
     );
-    const opened = (await (params.resumeThreadId !== null
-      ? client
-          .request("thread/resume", {
-            threadId: params.resumeThreadId,
-            ...startParams,
-          })
-          .catch(() => client.request("thread/start", startParams))
-      : client.request("thread/start", startParams))) as {
-      thread?: { id?: string };
-    };
-    if (typeof opened.thread?.id !== "string") {
-      return { kind: "declined", reason: "thread/start returned no thread id" };
-    }
-    threadId = opened.thread.id;
+    threadId = await client.openThread(startParams, params.resumeThreadId);
   } catch (error) {
     return {
       kind: "declined",
