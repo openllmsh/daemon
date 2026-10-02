@@ -17,7 +17,7 @@ import {
 import { join } from "node:path";
 import type { TSupervisedChild } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
-import { spawnCwd } from "../delegation/util";
+import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -27,6 +27,11 @@ import { daemonTempDir } from "../sandbox/working-set";
  *  the dir is touched. */
 const SYSTEM_PROMPT_FILE_PREFIX = "system-prompt-";
 const SYSTEM_PROMPT_FILE_SUFFIX = ".md";
+/** The facade's MCP config carries a live bearer token + the caller's tool
+ *  schemas, so it is staged exactly like the prompt (0600, daemon-private
+ *  dir, swept on the same stale bound) and never rides argv. */
+const MCP_CONFIG_FILE_PREFIX = "mcp-config-";
+const MCP_CONFIG_FILE_SUFFIX = ".json";
 
 /** A staged file older than this can only be residue of a DEAD daemon: a
  *  live run removes its file when the child exits, and the staging-to-parse
@@ -38,7 +43,7 @@ const STALE_SYSTEM_PROMPT_AGE_MS = 60_000;
  *  deletes a live in-flight prompt. */
 const liveSystemPromptFiles = new Set<string>();
 
-/** Delete staged prompt files left on disk by a daemon that died mid-turn
+/** Delete staged prompt / MCP-config files left on disk by a daemon that died mid-turn
  *  (SIGKILL, crash, power loss — the exited-path cleanup never ran).
  *  Bounded: one readdir of the daemon-private temp dir plus an lstat per
  *  matching name — no recursion, no link follows. Ownership-safe: only our
@@ -55,12 +60,12 @@ export const sweepStaleSystemPromptFiles = (): void => {
   }
   const staleBefore = Date.now() - STALE_SYSTEM_PROMPT_AGE_MS;
   for (const name of names) {
-    if (
-      !name.startsWith(SYSTEM_PROMPT_FILE_PREFIX) ||
-      !name.endsWith(SYSTEM_PROMPT_FILE_SUFFIX)
-    ) {
-      continue;
-    }
+    const ours =
+      (name.startsWith(SYSTEM_PROMPT_FILE_PREFIX) &&
+        name.endsWith(SYSTEM_PROMPT_FILE_SUFFIX)) ||
+      (name.startsWith(MCP_CONFIG_FILE_PREFIX) &&
+        name.endsWith(MCP_CONFIG_FILE_SUFFIX));
+    if (!ours) continue;
     const path = join(dir, name);
     if (liveSystemPromptFiles.has(path)) continue;
     try {
@@ -73,27 +78,23 @@ export const sweepStaleSystemPromptFiles = (): void => {
   }
 };
 
-export type TStagedSystemPrompt = {
+export type TStagedFile = {
   readonly path: string;
   /** Idempotent, best-effort removal — 0600 inside a daemon-private 0700 dir
    *  leaks nothing if it fails; the stale sweep collects a missed file. */
   readonly remove: () => void;
 };
+export type TStagedSystemPrompt = TStagedFile;
 
-/**
- * SP-6: the caller's system prompt must NEVER ride argv — `--system-prompt
- * <text>` exposes it to any local user via `ps`/`/proc/<pid>/cmdline`. Stage
- * it in a 0600 file inside the daemon-private 0700 temp dir (which the
- * confined child CAN read — `daemonTempDir` is in the sandbox working set) and
- * pass `--system-prompt-file` instead. Throws on a staging failure AFTER
- * removing any partially-written file, so repeated failures never accumulate
- * prompt copies.
- */
-export const stageSystemPromptFile = (text: string): TStagedSystemPrompt => {
-  const path = join(
-    daemonTempDir(),
-    `${SYSTEM_PROMPT_FILE_PREFIX}${randomUUID()}${SYSTEM_PROMPT_FILE_SUFFIX}`,
-  );
+/** Write `text` to a fresh 0600 file in the daemon-private temp dir. Throws
+ *  on a staging failure AFTER removing any partially-written file, so
+ *  repeated failures never accumulate copies. */
+const stageDaemonTempFile = (
+  prefix: string,
+  suffix: string,
+  text: string,
+): TStagedFile => {
+  const path = join(daemonTempDir(), `${prefix}${randomUUID()}${suffix}`);
   let removed = false;
   const remove = (): void => {
     if (removed) return;
@@ -102,7 +103,7 @@ export const stageSystemPromptFile = (text: string): TStagedSystemPrompt => {
     try {
       rmSync(path, { force: true });
     } catch {
-      // best-effort — see TStagedSystemPrompt.remove
+      // best-effort — see TStagedFile.remove
     }
   };
   try {
@@ -116,22 +117,48 @@ export const stageSystemPromptFile = (text: string): TStagedSystemPrompt => {
   return { path, remove };
 };
 
+/**
+ * SP-6: the caller's system prompt must NEVER ride argv — `--system-prompt
+ * <text>` exposes it to any local user via `ps`/`/proc/<pid>/cmdline`. Stage
+ * it in a 0600 file inside the daemon-private 0700 temp dir (which the
+ * confined child CAN read — `daemonTempDir` is in the sandbox working set) and
+ * pass `--system-prompt-file` instead.
+ */
+export const stageSystemPromptFile = (text: string): TStagedSystemPrompt =>
+  stageDaemonTempFile(
+    SYSTEM_PROMPT_FILE_PREFIX,
+    SYSTEM_PROMPT_FILE_SUFFIX,
+    text,
+  );
+
+/** The MCP config (bearer token + tool schemas) staged like the prompt;
+ *  passed as `--mcp-config <path>`, never as JSON on argv. */
+export const stageMcpConfigFile = (text: string): TStagedFile =>
+  stageDaemonTempFile(MCP_CONFIG_FILE_PREFIX, MCP_CONFIG_FILE_SUFFIX, text);
+
+/** The isolated credential store was not verified ready, so no `claude`
+ *  child was launched. Callers surface it as a decline. */
+export class ClaudeKeychainNotReadyError extends Error {
+  constructor(detail: string) {
+    super(`isolated credential store not ready (${detail})`);
+    this.name = "ClaudeKeychainNotReadyError";
+  }
+}
+
 export type TClaudeCliArgvParams = {
   readonly bin: string;
   readonly providerModelId: string;
-  /** Applied ONLY on a fresh session (a resumed session already carries it). */
-  readonly systemText: string | null;
   /** Resume this session id (feed only the delta turn), or null → fresh session. */
   readonly resumeSessionId: string | null;
-  /** SP-6: path of the staged system-prompt file. The spawn owners pass ONLY
-   *  this (never `systemText`), so the prompt text never reaches argv. */
+  /** SP-6: path of the staged system-prompt file (fresh session only). The
+   *  prompt text never reaches argv — the builder has no raw-text path. */
   readonly systemPromptFile?: string;
 };
 
 /** The one `claude -p …` argv both callers build. See `claude-native.ts`'s
  *  file doc for per-flag rationale (no `--bare`, `--max-turns 1`, …).
- *  `systemText` is retained for the pure builder contract ONLY: every spawn
- *  path stages the prompt and passes `systemPromptFile` instead. */
+ *  There is deliberately no raw system-text input: the prompt is always
+ *  staged and passed as `systemPromptFile` (SP-6 / SEC-02). */
 export const buildClaudeCliArgv = (params: TClaudeCliArgvParams): string[] => [
   params.bin,
   "-p",
@@ -155,12 +182,17 @@ export const buildClaudeCliArgv = (params: TClaudeCliArgvParams): string[] => [
     ? ["--resume", params.resumeSessionId]
     : params.systemPromptFile !== undefined
       ? ["--system-prompt-file", params.systemPromptFile]
-      : params.systemText !== null
-        ? ["--system-prompt", params.systemText]
-        : []),
+      : []),
 ];
 
-export type TSpawnClaudeCliParams = TClaudeCliArgvParams & {
+export type TSpawnClaudeCliParams = Omit<
+  TClaudeCliArgvParams,
+  "systemPromptFile"
+> & {
+  /** Fresh-session system text; staged to a 0600 file, never put on argv. */
+  readonly systemText: string | null;
+  /** Aborts the keychain readiness probe that gates the launch. */
+  readonly signal?: AbortSignal;
   /** Fed over stdin: the delta turn on resume, or the seed prompt fresh. */
   readonly userText: string;
   /** Final env to spawn with — already cleaned (and, for capture, loopback-
@@ -186,7 +218,7 @@ export type TClaudeSpawned = {
  *   TERM→KILLs the WHOLE tree.
  * - The keychain probe is `unwrapKeychainSpawn` (macOS runs unconfined: securityd
  *   denies a Seatbelt-confined caller; confined on Linux).
- * - The prompt file is removed when the child exits, or at once if no child
+ * - Staged files (prompt, MCP config) are removed when the child exits, or at once if no child
  *   ever ran (spawn or sandbox-setup failure); the original error is rethrown
  *   (callers rethrow `SandboxLaunchError` so setup rejection stays terminal).
  */
@@ -194,8 +226,29 @@ const spawnSupervisedClaude = async (
   argv: string[],
   stdin: "pipe" | Uint8Array,
   finalEnv: Record<string, string>,
-  stagedPrompt: TStagedSystemPrompt | null,
+  staged: ReadonlyArray<TStagedFile>,
+  signal: AbortSignal | undefined,
 ): Promise<TClaudeSpawned> => {
+  const removeStaged = (): void => {
+    for (const file of staged) file.remove();
+  };
+  // Gate EVERY shared Claude spawn on the isolated keychain being VERIFIED
+  // ready (`unwrapKeychainSpawn` below only exempts the confinement; it
+  // neither checks readiness nor validates FSS-11 permissions). A no-op off
+  // macOS / under the daemon's own home.
+  let store: Awaited<ReturnType<typeof ensureVendorKeychainReady>>;
+  try {
+    store = await ensureVendorKeychainReady(finalEnv, signal);
+  } catch (error) {
+    removeStaged();
+    throw error;
+  }
+  if (store.kind !== "present") {
+    removeStaged();
+    throw new ClaudeKeychainNotReadyError(
+      store.kind === "indeterminate" ? store.cause : store.kind,
+    );
+  }
   let child: TSupervisedChild;
   try {
     child = withSandboxSpawn(
@@ -212,19 +265,17 @@ const spawnSupervisedClaude = async (
       { probe: unwrapKeychainSpawn("claude_code") },
     );
   } catch (error) {
-    stagedPrompt?.remove();
+    removeStaged();
     throw error;
   }
   const proc = child.subprocess;
   // The prompt file is needed only while the child parses it at startup; tie
   // removal to exit so every terminal path cleans it up exactly once.
-  if (stagedPrompt !== null) {
-    void proc.exited.then(stagedPrompt.remove).catch(() => undefined);
-  }
+  void proc.exited.then(removeStaged).catch(() => undefined);
   try {
     await child.sandbox?.ready;
   } catch (error) {
-    stagedPrompt?.remove();
+    removeStaged();
     await child.terminate().catch(() => undefined);
     throw error;
   }
@@ -245,7 +296,6 @@ export const spawnClaudeCli = async (
   const argv = buildClaudeCliArgv({
     bin: params.bin,
     providerModelId: params.providerModelId,
-    systemText: null,
     resumeSessionId: params.resumeSessionId,
     ...(staged !== null ? { systemPromptFile: staged.path } : {}),
   });
@@ -253,7 +303,8 @@ export const spawnClaudeCli = async (
     argv,
     new TextEncoder().encode(params.userText),
     params.finalEnv,
-    staged,
+    staged !== null ? [staged] : [],
+    params.signal,
   );
 };
 
@@ -274,16 +325,17 @@ export type TClaudeFacadeMcpServerRef = {
 export type TClaudeFacadeCliArgvParams = {
   readonly bin: string;
   readonly providerModelId: string;
-  /** Full system text for this turn — the facade replays whole history every
-   *  turn (no vendor session to carry it), so this is never conditional on
-   *  resume like {@link TClaudeCliArgvParams.systemText}. */
-  readonly systemText: string | null;
-  readonly mcpServer: TClaudeFacadeMcpServerRef | null;
-  /** SP-6: staged system-prompt file; spawn passes ONLY this, never `systemText`. */
+  /** SP-6: staged system-prompt file (the facade replays whole history every
+   *  turn, so it is never conditional on resume). */
   readonly systemPromptFile?: string;
+  /** Staged 0600 MCP config file (bearer token + tool schemas) → `--mcp-config
+   *  <path>`. Never JSON on argv. */
+  readonly mcpConfigFile?: string;
 };
 
-const facadeMcpConfigJson = (server: TClaudeFacadeMcpServerRef): string =>
+export const facadeMcpConfigJson = (
+  server: TClaudeFacadeMcpServerRef,
+): string =>
   JSON.stringify({
     mcpServers: {
       openllm: {
@@ -338,15 +390,21 @@ export const buildClaudeFacadeArgv = (
   params.providerModelId,
   ...(params.systemPromptFile !== undefined
     ? ["--system-prompt-file", params.systemPromptFile]
-    : params.systemText !== null
-      ? ["--system-prompt", params.systemText]
-      : []),
-  ...(params.mcpServer !== null
-    ? ["--mcp-config", facadeMcpConfigJson(params.mcpServer)]
+    : []),
+  ...(params.mcpConfigFile !== undefined
+    ? ["--mcp-config", params.mcpConfigFile]
     : []),
 ];
 
-export type TSpawnClaudeFacadeCliParams = TClaudeFacadeCliArgvParams & {
+export type TSpawnClaudeFacadeCliParams = Omit<
+  TClaudeFacadeCliArgvParams,
+  "systemPromptFile" | "mcpConfigFile"
+> & {
+  /** Full system text for this turn; staged to a 0600 file, never on argv. */
+  readonly systemText: string | null;
+  readonly mcpServer: TClaudeFacadeMcpServerRef | null;
+  /** Aborts the keychain readiness probe that gates the launch. */
+  readonly signal?: AbortSignal;
   /** Final env — already cleaned (and, for `sdk-facade-capture`, loopback-
    *  decorated) by the caller, exactly like {@link TSpawnClaudeCliParams}. */
   readonly finalEnv: Record<string, string>;
@@ -363,16 +421,35 @@ export const spawnClaudeFacadeCli = async (
   params: TSpawnClaudeFacadeCliParams,
 ): Promise<TClaudeSpawned> => {
   sweepStaleSystemPromptFiles();
-  const staged =
+  const stagedFiles: TStagedFile[] = [];
+  try {
+    if (params.systemText !== null) {
+      stagedFiles.push(stageSystemPromptFile(params.systemText));
+    }
+    if (params.mcpServer !== null) {
+      stagedFiles.push(
+        stageMcpConfigFile(facadeMcpConfigJson(params.mcpServer)),
+      );
+    }
+  } catch (error) {
+    for (const file of stagedFiles) file.remove();
+    throw error;
+  }
+  const [promptFile, mcpFile] =
     params.systemText !== null
-      ? stageSystemPromptFile(params.systemText)
-      : null;
+      ? [stagedFiles[0], stagedFiles[1]]
+      : [undefined, stagedFiles[0]];
   const argv = buildClaudeFacadeArgv({
     bin: params.bin,
     providerModelId: params.providerModelId,
-    systemText: null,
-    mcpServer: params.mcpServer,
-    ...(staged !== null ? { systemPromptFile: staged.path } : {}),
+    ...(promptFile !== undefined ? { systemPromptFile: promptFile.path } : {}),
+    ...(mcpFile !== undefined ? { mcpConfigFile: mcpFile.path } : {}),
   });
-  return spawnSupervisedClaude(argv, "pipe", params.finalEnv, staged);
+  return spawnSupervisedClaude(
+    argv,
+    "pipe",
+    params.finalEnv,
+    stagedFiles,
+    params.signal,
+  );
 };

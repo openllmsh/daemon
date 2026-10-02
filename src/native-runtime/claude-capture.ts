@@ -673,6 +673,7 @@ export const runClaudeTextCapture = async (
       resumeSessionId: params.resumeSessionId,
       userText: params.userText,
       finalEnv: spawnEnv,
+      signal: params.signal,
     });
   } catch (error) {
     loopback.stop();
@@ -879,6 +880,9 @@ export const runClaudeTextCapture = async (
         }
         controller.enqueue(value);
       } catch (err) {
+        // A post-commit read rejection must not leave the builder child (and
+        // its staged prompt file) alive until it exits on its own.
+        kill();
         cleanupLifetime();
         controller.error(err);
       }

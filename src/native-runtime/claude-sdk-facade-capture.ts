@@ -152,6 +152,7 @@ const runClaudeSdkFacadeCaptureCore = async (
       systemText: plan.systemText,
       mcpServer,
       finalEnv: spawnEnv,
+      signal: params.signal,
     });
   } catch (error) {
     stopMcpServer?.();

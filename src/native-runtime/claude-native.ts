@@ -250,7 +250,6 @@ export const runClaudeNative = async (
     providerModelId: params.providerModelId,
     // Never the text — see SP-6 above. Resume feeds ONLY the delta turn into
     // the persisted session (which already holds history + system prompt).
-    systemText: null,
     resumeSessionId: params.resumeSessionId,
     ...(systemPromptFile !== undefined ? { systemPromptFile } : {}),
   });

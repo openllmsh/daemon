@@ -827,6 +827,7 @@ const runClaudeSdkFacadeCore = async (
       systemText: plan.systemText,
       mcpServer,
       finalEnv: cleanNativeSpawnEnv(params.env),
+      signal: params.signal,
     });
   } catch (error) {
     stopMcpServer?.();
