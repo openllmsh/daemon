@@ -40,6 +40,7 @@ export const createDeadlineBudget = (
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   const abortFromDeadline = (): void => {
+    parent?.removeEventListener("abort", abortFromDeadline);
     if (timer !== null) {
       clearTimeout(timer);
       timer = null;
@@ -55,7 +56,8 @@ export const createDeadlineBudget = (
 
   if (parent !== undefined) {
     if (parent.aborted) abortFromDeadline();
-    else parent.addEventListener("abort", abortFromDeadline, { once: true });
+    else if (!ac.signal.aborted)
+      parent.addEventListener("abort", abortFromDeadline, { once: true });
   }
 
   const budget: TDeadlineBudget = {

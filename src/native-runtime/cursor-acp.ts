@@ -60,6 +60,31 @@ import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import type { TLinuxLaunchHandle } from "../sandbox/linux-adapter";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
+import { declinedForNonOkCapturedResponse } from "./claude-capture";
+import type {
+  TCursorCaptureBridge,
+  TCursorTransactionSender,
+} from "./cursor-capture";
+import {
+  CursorCaptureDecodeError,
+  chunksStreamFromCursorConnectResponseBody,
+  defaultCursorCaptureSender,
+  forwardCursorKvControlThroughBuilder,
+  forwardCursorMcpStateExecThroughBuilder,
+  forwardCursorRequestContextThroughBuilder,
+  isCursorHttp2Envelope,
+  openCursorCaptureBridge,
+  openCursorCapturedHttp2Session,
+  runCursorCapturedTransaction,
+  settleCursorCaptureViaAcpCancel,
+} from "./cursor-capture";
+import {
+  cursorExecServerFailure,
+  decodeAgentServerMessage,
+  encodeConnectEnvelope,
+  resolveConnectEnvelopePayload,
+  takeConnectEnvelopesStrict,
+} from "./cursor-capture-decode";
 import type { TCursorNativeImageAsset } from "./cursor-image-assets";
 import {
   cleanupCursorImageProjectDir,
@@ -82,8 +107,53 @@ import {
 } from "./cursor-model-observation";
 import type { TCursorImage, TCursorTool } from "./cursor-request";
 import { acpPromptBlocks, extractJsonObject } from "./cursor-request";
+import type { TCaptureDestinationPolicy } from "./request-capture";
 import type { TNativeRunResult } from "./types";
-import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+import {
+  captureOwnershipFromSession,
+  cleanNativeSpawnEnv,
+  PRE_COMMIT_TIMEOUT_MS,
+} from "./types";
+
+export type {
+  TCursorCaptureBridge,
+  TCursorCaptureChildEnv,
+} from "./cursor-capture";
+export {
+  buildCursorCaptureChildEnv,
+  CURSOR_AGENT_DEFAULT_ORIGIN,
+  CURSOR_AGENT_STATIC_ORIGINS,
+  CURSOR_DYNAMIC_AGENT_HOST_RE,
+  classifyCursorOutboundRequest,
+  cursorCaptureDestinationPolicy,
+  defaultCursorCaptureSender,
+  isCursorAgentServiceInferencePath,
+  isCursorBridgeRequestCaptureEnabled,
+  isCursorHttp2Envelope,
+  isCursorOwnedHostname,
+  isOfficialCursorAgentCaptureUrl,
+  materializeCursorCapturePreload,
+  openCursorCaptureBridge,
+  runCursorCapturedTransaction,
+  sendCursorCapturedEnvelope,
+  sendCursorCapturedHttp2,
+  settleCursorCaptureViaAcpCancel,
+} from "./cursor-capture";
+
+/**
+ * Merge a capture bridge's child env into an AcpClient spawn env.
+ * No-op when bridge is null — today's path unchanged.
+ */
+export const applyCursorCaptureBridgeEnv = (
+  env: Record<string, string>,
+  bridge: TCursorCaptureBridge | null,
+): Record<string, string> => {
+  if (bridge === null) return env;
+  return {
+    ...env,
+    ...bridge.childEnv,
+  };
+};
 
 /** Handshake RPC budget (initialize / authenticate / session/new). */
 const RPC_TIMEOUT_MS = 30_000;
@@ -734,6 +804,18 @@ export type TCursorNativeParams = {
   readonly turnTimeoutMs?: number;
   /** Test override for handshake RPC timeout. */
   readonly rpcTimeoutMs?: number;
+  /**
+   * Optional request-capture bridge (default off / omit). When set, the child
+   * spawn receives the preload + IPC env. Omitting this preserves today's ACP
+   * path exactly.
+   */
+  readonly captureBridge?: TCursorCaptureBridge | null;
+  /**
+   * When true with `captureBridge`, serve owns waitForTransaction / dispatch /
+   * settle / dispose. ACP only injects the preload env and must NOT cancel the
+   * builder before companions are collected or dispose the bridge.
+   */
+  readonly serveOwnedCapture?: boolean;
 };
 
 /**
@@ -836,12 +918,15 @@ export const runCursorNative = async (
   // it before initialization (a tools/call can only arrive after session/new,
   // which needs `client` — but declaring it first makes that ordering explicit
   // rather than relying on it).
+  const captureBridge = params.captureBridge ?? null;
+  const spawnEnv = applyCursorCaptureBridgeEnv(params.env, captureBridge);
+
   let client: AcpClient;
   try {
     mark("spawn_started_ms");
     client = new AcpClient(
       params.bin,
-      params.env,
+      spawnEnv,
       (method, p) => {
         if (method !== "session/update" || ended) return;
         const notif = p as
@@ -857,6 +942,57 @@ export const runCursorNative = async (
     );
   } catch (error) {
     return setupDecline(error, params.signal);
+  }
+
+  // Capture bridge: serve-owned mode only injects preload env — serve runs
+  // waitForTransaction → dispatch → settle after the final BidiAppend is
+  // buffered so the ACP builder is not cancelled mid-construction. Legacy
+  // auto mode (tests without serve) still waits then settles/cancels locally.
+  // Never feed the true model stream back into the vendor child.
+  const serveOwnedCapture = params.serveOwnedCapture === true;
+  let pendingCaptureCancel: {
+    readonly method: string;
+    readonly externalUrl: string;
+  } | null = null;
+  const runCaptureAcpCancel = (args: {
+    readonly method: string;
+    readonly externalUrl: string;
+  }): void => {
+    settleCursorCaptureViaAcpCancel({
+      settlement: {
+        kind: "suppressed",
+        reason: `captured ${args.method} ${args.externalUrl}`,
+      },
+      cancelSession: () => {
+        if (sessionId !== null) client.cancelAndDispose(sessionId);
+      },
+    });
+  };
+  if (captureBridge !== null && !serveOwnedCapture) {
+    void captureBridge
+      .waitForTransaction()
+      .then((tx) => {
+        mark("capture_offered_ms");
+        captureBridge.settleChild({
+          kind: "suppressed",
+          reason:
+            "original AgentService + BidiAppend sends suppressed; daemon owns the transaction",
+        });
+        if (sessionId !== null) {
+          runCaptureAcpCancel({
+            method: tx.primary.method,
+            externalUrl: tx.primary.externalUrl,
+          });
+        } else {
+          pendingCaptureCancel = {
+            method: tx.primary.method,
+            externalUrl: tx.primary.externalUrl,
+          };
+        }
+      })
+      .catch(() => {
+        // Timeout / cancel / dispose — cleanup path owns the rest.
+      });
   }
 
   const report = (
@@ -884,6 +1020,11 @@ export const runCursorNative = async (
     if (cancel && sessionId !== null) client.cancelAndDispose(sessionId);
     else client.dispose();
     stopMcp();
+    // Serve-owned capture disposes the bridge after the daemon response stream
+    // completes — ACP must not tear it down while companions may still arrive.
+    if (captureBridge !== null && !serveOwnedCapture) {
+      void captureBridge.dispose();
+    }
   };
   const abort = (): void => {
     failStream(new DOMException("client aborted", "AbortError"));
@@ -970,6 +1111,11 @@ export const runCursorNative = async (
   }
   sessionId = sid;
   mark("session_ready_ms");
+  if (pendingCaptureCancel !== null) {
+    const pending = pendingCaptureCancel;
+    pendingCaptureCancel = null;
+    runCaptureAcpCancel(pending);
+  }
   if (observationTicket !== null) {
     observeCursorNativeModelsFromSession({
       ticket: observationTicket,
@@ -1121,6 +1267,1315 @@ export const runCursorNative = async (
   });
   // Cold sessions in v1 — never record a resumable id (see module header).
   return { kind: "committed", chunks, sessionId: () => null };
+};
+
+export type TCursorNativeCaptureParams = {
+  readonly bin: string;
+  readonly env: Record<string, string>;
+  readonly providerModelId: string;
+  readonly systemText: string | null;
+  readonly userText: string;
+  readonly images?: ReadonlyArray<TCursorImage>;
+  readonly tools?: ReadonlyArray<TCursorTool>;
+  readonly jsonInstructionText?: string | null;
+  readonly signal: AbortSignal;
+  readonly precommitMs?: number;
+  readonly idleMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly rpcTimeoutMs?: number;
+  /**
+   * Production omits → {@link defaultCursorCaptureSender} (HTTP/2 via
+   * `node:http2`, HTTP/1 via fetch). Injected senders are tests only.
+   */
+  readonly sender?: TCursorTransactionSender;
+  /**
+   * Hermetic tests may inject a fake ACP runner that still goes through the
+   * capture preload / Connect offer path. Production omits → {@link runCursorNative}.
+   */
+  readonly runAcp?: (params: TCursorNativeParams) => Promise<TNativeRunResult>;
+  /**
+   * CodeRabbit round 2: production must NEVER default to loopback-allowed
+   * capture destinations. Omitted here → {@link openCursorCaptureBridge}'s
+   * own STRICT default (official Cursor hosts only). Hermetic local tests
+   * that dispatch against a `127.0.0.1` fake upstream pass
+   * `cursorCaptureDestinationPolicy({ allowLoopback: true })` explicitly —
+   * this is a test-only override, never a production relaxation.
+   */
+  readonly destinationPolicy?: TCaptureDestinationPolicy;
+};
+
+/**
+ * Official Cursor bridge-capture runner: spawn the vendor ACP builder with the
+ * capture preload, collect the opaque RunSSE + BidiAppend transaction (builder
+ * not cancelled until companions are buffered), dispatch each exact RPC once,
+ * stream Connect→chunks to the CALLER, then settle/cancel the builder locally.
+ * Never feeds the true model stream back into ACP.
+ */
+const CURSOR_CAPTURE_ERROR_OPTIONS = {
+  provider: "cursor",
+  providerFormat: "openai",
+} as const;
+
+export const runCursorNativeCapture = async (
+  params: TCursorNativeCaptureParams,
+): Promise<TNativeRunResult> => {
+  if (!existsSync(params.bin)) {
+    return { kind: "declined", reason: "cursor-agent CLI not installed" };
+  }
+  if (params.signal.aborted) {
+    return { kind: "declined", reason: "client aborted" };
+  }
+
+  const bridge = await openCursorCaptureBridge({
+    signal: params.signal,
+    captureTimeoutMs: params.precommitMs ?? 60_000,
+    destinationPolicy: params.destinationPolicy,
+  });
+  const builderAbort = new AbortController();
+  const builderSignal = AbortSignal.any([params.signal, builderAbort.signal]);
+  const runAcp = params.runAcp ?? runCursorNative;
+  // Always decorate env here so injected hermetic `runAcp` implementations
+  // still receive the preload + IPC socket (they may not call
+  // applyCursorCaptureBridgeEnv themselves).
+  const captureEnv = applyCursorCaptureBridgeEnv(params.env, bridge);
+  const acpPromise = runAcp({
+    bin: params.bin,
+    env: captureEnv,
+    providerModelId: params.providerModelId,
+    systemText: params.systemText,
+    userText: params.userText,
+    images: params.images,
+    tools: params.tools,
+    jsonInstructionText: params.jsonInstructionText,
+    signal: builderSignal,
+    precommitMs: params.precommitMs,
+    idleMs: params.idleMs,
+    turnTimeoutMs: params.turnTimeoutMs,
+    rpcTimeoutMs: params.rpcTimeoutMs,
+    captureBridge: bridge,
+    serveOwnedCapture: true,
+  });
+  void acpPromise.catch(() => {});
+
+  let dispatchStarted = false;
+  try {
+    // CodeRabbit round 3: `runAcp` can decline FAST (auth failure, missing
+    // CLI, immediate vendor exit) — e.g. `{ kind: "declined", cooldownReason:
+    // "auth" }` resolved well before any transaction is ever captured. The
+    // previous code discarded that entirely (`void acpPromise.catch(() =>
+    // {})` only guards against an unhandled REJECTION) and unconditionally
+    // waited out the full `waitForTransaction` timeout, then declined with a
+    // generic "no output" reason — losing the real cooldown attribution and
+    // stalling for up to 30s on a process that had already exited. Race the
+    // two: an early ACP decline/rejection wins immediately and its
+    // cooldownReason/message is preserved; the normal happy path (a
+    // transaction arrives first) is unaffected.
+    // A single, shared transaction-wait promise — reused below if the ACP
+    // side settles first with something other than an early decline, so we
+    // never issue a second/duplicate `waitForTransaction` call.
+    const transactionPromise = bridge.waitForTransaction({
+      quietMs: 75,
+      maxWaitMs: Math.min(params.precommitMs ?? 60_000, 30_000),
+    });
+    const raced = await Promise.race([
+      transactionPromise.then((tx) => ({ kind: "transaction" as const, tx })),
+      acpPromise.then(
+        (result) =>
+          result.kind === "declined"
+            ? ({ kind: "acp_declined" as const, result } as const)
+            : ({ kind: "acp_settled_other" as const } as const),
+        (err: unknown) => ({ kind: "acp_error" as const, err }) as const,
+      ),
+    ]);
+    if (raced.kind === "acp_declined") {
+      // No dispatch was ever attempted — nothing touched upstream. Save
+      // ownership BEFORE disposing (dispose tears down the session this
+      // reads from), then release the bridge's socket/temp-file resources
+      // and signal the builder abort — every other return path here does
+      // both; this early-decline race must too, not just skip cleanup
+      // because nothing was ever dispatched.
+      const ownership = captureOwnershipFromSession(bridge.session);
+      builderAbort.abort();
+      try {
+        await bridge.dispose();
+      } catch {
+        // ignore — best-effort cleanup
+      }
+      return {
+        ...raced.result,
+        captureOwnership: ownership,
+      };
+    }
+    if (raced.kind === "acp_error") {
+      const ownership = captureOwnershipFromSession(bridge.session);
+      builderAbort.abort();
+      try {
+        await bridge.dispose();
+      } catch {
+        // ignore — best-effort cleanup
+      }
+      return {
+        kind: "declined",
+        reason:
+          raced.err instanceof Error ? raced.err.message : String(raced.err),
+        captureOwnership: ownership,
+      };
+    }
+    // `acp_settled_other` (acpPromise resolved "committed" — unexpected in
+    // bridge-capture mode, since the builder's own send is meant to be
+    // captured rather than streamed through ACP directly) falls through to
+    // await the SAME `transactionPromise` already in flight — no behavior
+    // change from before this fix for that edge case, and no duplicate
+    // `waitForTransaction` call.
+    const tx =
+      raced.kind === "transaction" ? raced.tx : await transactionPromise;
+
+    const captureId = bridge.lastCaptureId();
+
+    let ownershipAtAccept: ReturnType<typeof captureOwnershipFromSession>;
+
+    if (isCursorHttp2Envelope(tx.primary) && params.sender === undefined) {
+      // Production H2 path: keep builder alive for allowlisted request_context.
+      if (captureId === null) {
+        throw new Error("missing primary capture id for duplex bridge");
+      }
+      // Only from here on has a real dispatch actually begun — a missing
+      // capture id above is a pure local validation failure with zero
+      // upstream contact, so `dispatchStarted` must stay false for it
+      // (CodeRabbit round 3: it was previously set unconditionally right
+      // after `waitForTransaction`, before this id check, which would
+      // mislabel that validation failure as "uncertain" capture ownership).
+      dispatchStarted = true;
+      // Rebind as a non-null local — the async generator below closes over
+      // this across an `await`, and TS does not retain the `!== null`
+      // narrowing of the outer `const` through that closure boundary.
+      const nonNullCaptureId: string = captureId;
+      bridge.session.markDispatchStarted();
+      // Open the REAL upstream H2 session BEFORE settling the child as
+      // duplex_bridge, so the negotiated `connect-content-encoding` (if any)
+      // is known and can be mirrored onto the synthetic response headers the
+      // builder's own Connect client sees. Settling first (as before) meant
+      // the builder's client learned no encoding, so a later COMPRESSED
+      // injected frame had no algorithm to decode with — a silent hang, not
+      // an error (retest #26 root cause).
+      const http2 = await openCursorCapturedHttp2Session(
+        tx.primary,
+        params.signal,
+      );
+      bridge.session.markUpstreamAccepted();
+      ownershipAtAccept = captureOwnershipFromSession(bridge.session);
+      if (!http2.response.ok) {
+        try {
+          return await declinedForNonOkCapturedResponse(
+            http2.response,
+            params.signal,
+            CURSOR_CAPTURE_ERROR_OPTIONS,
+          );
+        } finally {
+          http2.close();
+          builderAbort.abort();
+          await bridge.dispose();
+        }
+      }
+      if (http2.response.body === null) {
+        http2.close();
+        builderAbort.abort();
+        await bridge.dispose();
+        return {
+          kind: "declined",
+          reason: "cursor capture upstream returned an empty body",
+          captureOwnership: ownershipAtAccept,
+        };
+      }
+      const connectContentEncoding = http2.response.headers.get(
+        "connect-content-encoding",
+      );
+      bridge.settleChild({
+        kind: "duplex_bridge",
+        reason:
+          "HTTP/2 capture open for allowlisted request_context duplex; daemon owns inference",
+        connectContentEncoding,
+      });
+      // Peel leading Connect envelopes; bridge request_context_args, then
+      // decode remaining envelopes INCREMENTALLY (never buffer-then-decode —
+      // that made the ONLY way to finish the turn "wait for the H2 socket to
+      // close", and this long-lived native stream does not close on its own
+      // after model output ends). The Connect `endStream` envelope (spec:
+      // "the final Enveloped-Message... must appear last") is the ONE
+      // genuine native completion marker; plain reader EOF without ever
+      // seeing it — whether from a real close or from OUR OWN
+      // `reader.cancel()` on caller abort resolving a pending read with
+      // `{done:true}` — must never be treated as success. That exact
+      // cancel()-masks-as-clean-EOF race produced retest #30's fabricated
+      // `finish_reason:"stop"`/0-token completion at the caller's abort
+      // deadline: the check for `params.signal.aborted` ran only BEFORE each
+      // `reader.read()` call, never immediately after one resolved, so an
+      // abort that fired while blocked inside `read()` was indistinguishable
+      // from a real clean close.
+      const reader = http2.response.body.getReader();
+      let pending = new Uint8Array(0);
+      let contextBridged = false;
+      // Verified generic-exec-loop behavior: `stream_close` is written
+      // unconditionally after EVERY exec result — not just request_context
+      // — so a queued one can reference ANY earlier completed control
+      // exchange (request_context OR mcp_state_exec, including a prior one
+      // in a batch of several). Tracks EVERY completed exchange's numeric
+      // id (never just the most recent — a single "latest wins" scalar
+      // would incorrectly reject a still-valid stream_close for an OLDER
+      // completed exchange once a newer one has also completed) for exact
+      // correlation; never used to relax/guess an unknown id. Fed into both
+      // KV and mcp_state_exec forward calls.
+      const completedControlExecNumericIds = new Set<number>();
+      let sawModelOutput = false;
+      // Metadata-only diagnostics (never payload/args/content) so a stuck
+      // phase is identifiable from the decline reason alone.
+      let phase:
+        | "awaiting_first_frame"
+        | "context_handshake"
+        | "post_context_wait"
+        | "model_stream"
+        | "done" = "awaiting_first_frame";
+      let framesSeen = 0;
+      let execFramesSeen = 0;
+      let modelFramesSeen = 0;
+      let endStreamFramesSeen = 0;
+      // Per-kind counters for frames that carry no model output — added so a
+      // frame-count mismatch (e.g. live retest #32's 36 total frames vs the
+      // 9 accounted for by exec/model/endStream) can be attributed to a
+      // specific decoded kind without another live capture. Metadata-only:
+      // counts and bounded reason/tag strings, never prompts/args/payload.
+      let heartbeatFramesSeen = 0;
+      let ignoredFramesSeen = 0;
+      let requiresDuplexFramesSeen = 0;
+      let nativeToolFramesSeen = 0;
+      // KV control (AgentServerMessage.kv_server_message, field 4) counts —
+      // metadata only, never the blob id/data bytes.
+      let kvGetFramesSeen = 0;
+      let kvSetFramesSeen = 0;
+      // `exec_server_message.mcp_state_exec_args` (field 36) relay count —
+      // metadata only, never server names/tool schemas/instructions.
+      let mcpStateExecFramesSeen = 0;
+      // Bounded, deduplicated inventory of `ignored`-kind reasons (each
+      // already carries only bounded field-tag metadata — see
+      // `describeProtoFieldTags` — never payload/value).
+      const MAX_TRACKED_IGNORED_REASONS = 8;
+      const ignoredReasonsSeen: string[] = [];
+      // `InteractionUpdate.turn_ended` (field 14) is the real native
+      // turn-completion marker the official client relies on — it is
+      // authoritative independent of the Connect transport `endStream`
+      // envelope. Once observed, a subsequent transport close/reset is
+      // benign (mirrors the official client's own "Ignoring transport close
+      // after terminal agent stream" behavior) rather than a failure.
+      let turnEndedSeen = false;
+      const diagSnapshot = (): string =>
+        `phase=${phase} frames=${framesSeen} exec=${execFramesSeen} model=${modelFramesSeen} endStream=${endStreamFramesSeen} heartbeat=${heartbeatFramesSeen} ignored=${ignoredFramesSeen} requiresDuplex=${requiresDuplexFramesSeen} nativeTool=${nativeToolFramesSeen} kvGet=${kvGetFramesSeen} kvSet=${kvSetFramesSeen} mcpStateExec=${mcpStateExecFramesSeen} turnEnded=${turnEndedSeen} contextBridged=${contextBridged} ignoredReasons=[${ignoredReasonsSeen.join(";")}]`;
+      const onAbortDuringPeel = (): void => {
+        try {
+          reader.cancel().catch(() => undefined);
+        } catch {
+          // ignore
+        }
+      };
+      params.signal.addEventListener("abort", onAbortDuringPeel, {
+        once: true,
+      });
+
+      const createdAt = Math.floor(Date.now() / 1000);
+      const chunkId = `cursor-capture-${createdAt}`;
+      let toolIndex = 0;
+      const toolIndexByCallId = new Map<string, number>();
+      const ensureToolIndex = (callId: string): number => {
+        const existing = toolIndexByCallId.get(callId);
+        if (existing !== undefined) return existing;
+        const next = toolIndex;
+        toolIndexByCallId.set(callId, next);
+        toolIndex += 1;
+        return next;
+      };
+      // Only tool NAMES the caller itself registered for this turn may ever
+      // be handed off as a successful `exec_server_message.mcp_args` — an
+      // unregistered name still fails closed via `cursorExecServerFailure`,
+      // never a generic/blanket approval.
+      const registeredToolNames = new Set(
+        (params.tools ?? []).map((tool) => tool.name),
+      );
+      // `InteractionUpdate.partial_tool_call` / `tool_call_started` can
+      // stream a call's arguments incrementally as raw, possibly-INCOMPLETE
+      // JSON fragments (fine on its own — the caller reconstructs by
+      // concatenation). But the SAME call id can also later receive an
+      // AUTHORITATIVE, complete `exec_server_message.mcp_args` map (live
+      // retest #37's shape). The two must never both reach the caller:
+      // streaming the partial fragments AND THEN the full map would either
+      // corrupt the concatenated JSON, or — the sharper bug — silently
+      // WITHHOLDING the full map (as an earlier fix here mistakenly did)
+      // would leave the caller with only a truncated partial fragment
+      // treated as a successful, complete tool call.
+      //
+      // Fix: buffer partial argument text per call id here WITHOUT ever
+      // yielding it to the caller. Only once (a) an authoritative
+      // `mcp_args` arrives for that id, emit ONE complete tool_calls delta
+      // with the real decoded arguments — the buffered partial is simply
+      // discarded, since the authoritative source is strictly better; or
+      // (b) the turn ends with no authoritative `mcp_args` ever arriving
+      // for a buffered call, flush its buffered text once as a best-effort
+      // delta (preserves the ordinary MCP-tool-only flow, which has no
+      // second exchange at all).
+      // Bound both the number of distinct buffered calls and the total
+      // buffered text — a hostile/corrupt stream that keeps sending partial
+      // fragments with no authoritative resolution and no terminal must not
+      // be able to grow this buffer without limit.
+      const MAX_PENDING_MCP_TOOL_CALLS = 32;
+      const MAX_PENDING_MCP_ARGS_BYTES = 64 * 1024;
+      let pendingMcpArgsBytes = 0;
+      const pendingMcpToolCalls = new Map<
+        string,
+        {
+          readonly name: string;
+          readonly index: number;
+          argsText: string;
+          /**
+           * True once this call's `argsText` is already a COMPLETE,
+           * schema-confirmed map (from a `mcp_tool_started` that carried a
+           * full args map — see `decodeCursorMcpArgs`/`parseMcpArgs`).
+           * Once true, further `mcp_tool_partial` fragments for the SAME
+           * call id must never be concatenated onto it — that would corrupt
+           * otherwise-valid JSON into garbage (round 9 review). Normal
+           * fragment-only accumulation (seeded empty, appended by partials)
+           * is unaffected — this flag stays false for that case throughout.
+           */
+          complete: boolean;
+        }
+      >();
+      const bufferMcpToolCallUpdate = (
+        callId: string,
+        name: string,
+        argsTextDelta: string,
+        isCompleteSeed: boolean,
+      ): void => {
+        const existing = pendingMcpToolCalls.get(callId);
+        if (
+          existing === undefined &&
+          pendingMcpToolCalls.size >= MAX_PENDING_MCP_TOOL_CALLS
+        ) {
+          throw new CursorCaptureDecodeError(
+            "invalid_protobuf",
+            `pending MCP tool call count exceeds ${MAX_PENDING_MCP_TOOL_CALLS}`,
+          );
+        }
+        if (existing?.complete === true) {
+          // Already a complete, authoritative-shaped map — silently ignore
+          // any further fragment; never append onto it.
+          return;
+        }
+        pendingMcpArgsBytes += argsTextDelta.length;
+        if (pendingMcpArgsBytes > MAX_PENDING_MCP_ARGS_BYTES) {
+          throw new CursorCaptureDecodeError(
+            "invalid_protobuf",
+            `pending MCP tool call argument bytes exceed ${MAX_PENDING_MCP_ARGS_BYTES}`,
+          );
+        }
+        if (existing !== undefined) {
+          existing.argsText = isCompleteSeed
+            ? argsTextDelta
+            : existing.argsText + argsTextDelta;
+          existing.complete = isCompleteSeed;
+          return;
+        }
+        pendingMcpToolCalls.set(callId, {
+          name,
+          index: ensureToolIndex(callId),
+          argsText: argsTextDelta,
+          complete: isCompleteSeed,
+        });
+      };
+      /**
+       * Flush every still-pending (never authoritatively resolved) MCP tool
+       * call — called ONLY at a genuine turn terminal, never mid-turn. Live
+       * retest #38 review: this previously yielded each pending entry's raw
+       * `name`/`argsText` completely unvalidated — an unregistered name, or
+       * argument text that never finished as a complete JSON object (e.g. a
+       * lone `{"token":` fragment when no authoritative `mcp_args` ever
+       * arrived before the terminal), could reach the caller as an
+       * apparently-successful tool call. Fix: validate EVERY pending entry
+       * — registered name AND parses as one complete JSON value — BEFORE
+       * yielding ANY of them. A single invalid entry fails the whole flush
+       * closed (never a partial success, never a fabricated `"{}"`
+       * stand-in); only once every pending entry is verified valid does any
+       * of them get yielded, and each yields its own real, already-complete
+       * buffered JSON text unchanged.
+       */
+      function* flushPendingMcpToolCalls(): Generator<TChatCompletionChunk> {
+        if (pendingMcpToolCalls.size === 0) return;
+        const verified: Array<{
+          readonly callId: string;
+          readonly name: string;
+          readonly index: number;
+          readonly argsText: string;
+        }> = [];
+        for (const [callId, pending] of pendingMcpToolCalls) {
+          if (!registeredToolNames.has(pending.name)) {
+            throw new CursorCaptureDecodeError(
+              "unsupported_native_tool_intent",
+              `pending MCP tool call ${callId} name is not in the caller's registered tools`,
+            );
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(pending.argsText);
+          } catch {
+            throw new CursorCaptureDecodeError(
+              "invalid_protobuf",
+              `pending MCP tool call ${callId} arguments never completed as valid JSON`,
+            );
+          }
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            Array.isArray(parsed)
+          ) {
+            throw new CursorCaptureDecodeError(
+              "invalid_protobuf",
+              `pending MCP tool call ${callId} arguments did not decode to a JSON object`,
+            );
+          }
+          verified.push({
+            callId,
+            name: pending.name,
+            index: pending.index,
+            argsText: pending.argsText,
+          });
+        }
+        // Stable index order — explicit, not relied on implicitly from Map
+        // insertion order.
+        verified.sort((a, b) => a.index - b.index);
+        for (const entry of verified) {
+          yield {
+            ...baseChunk(),
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: entry.index,
+                      id: entry.callId,
+                      type: "function",
+                      function: {
+                        name: entry.name,
+                        arguments: entry.argsText,
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          };
+        }
+        pendingMcpToolCalls.clear();
+        pendingMcpArgsBytes = 0;
+      }
+      const baseChunk = (): Pick<
+        TChatCompletionChunk,
+        "id" | "object" | "created" | "model"
+      > => ({
+        id: chunkId,
+        object: "chat.completion.chunk",
+        created: createdAt,
+        model: params.providerModelId,
+      });
+
+      // Async generator: yields ONE canonical chunk at a time as real
+      // Connect envelopes decode, stopping ONLY on a genuine `endStream`
+      // marker (throwing on abort / protocol error / missing terminal — NEVER
+      // synthesizing a finish chunk from a plain closed/cancelled reader).
+      // Tear the builder down ONLY on a genuine terminal signal (turn_ended /
+      // endStream) — never on the first model token, which would close the
+      // duplex inject path before a later real KV control round-trip (or
+      // interaction_query) could ever use it.
+      const teardownBuilderOnTerminal = (): void => {
+        bridge.closeDuplexInject(nonNullCaptureId);
+        settleCursorCaptureViaAcpCancel({
+          settlement: {
+            kind: "suppressed",
+            reason: "cursor capture reached a genuine native terminal",
+          },
+          cancelSession: () => {
+            builderAbort.abort();
+          },
+        });
+      };
+      async function* stepChunks(): AsyncGenerator<TChatCompletionChunk> {
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (params.signal.aborted) {
+              throw new DOMException(
+                `client aborted (${diagSnapshot()})`,
+                "AbortError",
+              );
+            }
+            if (done) {
+              if (turnEndedSeen) {
+                // A real native turn_ended marker already arrived; the
+                // transport closing afterward (no Connect endStream) is
+                // benign, not a failure — matches the official client.
+                phase = "done";
+                teardownBuilderOnTerminal();
+                // Genuine turn terminal reached with no authoritative
+                // `mcp_args` ever arriving for some buffered call(s) — flush
+                // their buffered text once, as a whole, rather than
+                // silently dropping them.
+                yield* flushPendingMcpToolCalls();
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason:
+                        toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+                    },
+                  ],
+                };
+                return;
+              }
+              throw new Error(
+                `cursor capture upstream closed without a terminal Connect end-stream marker or turn_ended (${diagSnapshot()})`,
+              );
+            }
+            const next = new Uint8Array(pending.byteLength + value.byteLength);
+            next.set(pending, 0);
+            next.set(value, pending.byteLength);
+            // Strict: `pending` accumulates across repeated live reads, so an
+            // oversized declared length must fail the instant its 5-byte
+            // header is visible — never be tolerated as "incomplete" while
+            // this buffer keeps growing (CodeRabbit round 2).
+            const taken = takeConnectEnvelopesStrict(next);
+            pending = new Uint8Array(taken.rest);
+            for (const env of taken.envelopes) {
+              framesSeen += 1;
+              if (env.endStream) {
+                endStreamFramesSeen += 1;
+                const trailerPayload = resolveConnectEnvelopePayload(
+                  env,
+                  connectContentEncoding,
+                );
+                const raw = new TextDecoder().decode(trailerPayload);
+                if (raw.length > 0 && raw !== "{}") {
+                  let parsed: unknown;
+                  try {
+                    parsed = JSON.parse(raw);
+                  } catch {
+                    throw new CursorCaptureDecodeError(
+                      "connect_end_stream_error",
+                      `invalid Connect end-stream JSON (${diagSnapshot()})`,
+                    );
+                  }
+                  if (
+                    typeof parsed === "object" &&
+                    parsed !== null &&
+                    "error" in parsed &&
+                    (parsed as { error?: unknown }).error != null
+                  ) {
+                    const errVal = (parsed as { error: unknown }).error;
+                    const msg =
+                      typeof errVal === "object" &&
+                      errVal !== null &&
+                      typeof (errVal as { message?: unknown }).message ===
+                        "string"
+                        ? (errVal as { message: string }).message
+                        : JSON.stringify(errVal);
+                    throw new CursorCaptureDecodeError(
+                      "connect_end_stream_error",
+                      msg,
+                    );
+                  }
+                }
+                // Genuine native completion marker — finish now. Do not wait
+                // for the socket to close; per Connect spec this is always
+                // the last message on the stream.
+                phase = "done";
+                teardownBuilderOnTerminal();
+                if (sawModelOutput) {
+                  yield* flushPendingMcpToolCalls();
+                  yield {
+                    ...baseChunk(),
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason:
+                          toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+                      },
+                    ],
+                  };
+                }
+                return;
+              }
+              // Inspect a decompressed COPY only; never mutate `env.payload`.
+              const inspectPayload = resolveConnectEnvelopePayload(
+                env,
+                connectContentEncoding,
+              );
+              const decoded = decodeAgentServerMessage(inspectPayload);
+              if (
+                decoded.kind === "exec_server" &&
+                decoded.subtype === "request_context_args"
+              ) {
+                execFramesSeen += 1;
+                phase = "context_handshake";
+                if (contextBridged) {
+                  throw new CursorCaptureDecodeError(
+                    "requires_duplex_bridge",
+                    `unexpected second request_context_args (${diagSnapshot()})`,
+                    {
+                      execSubtype: decoded.subtype,
+                      execClass: decoded.classification,
+                    },
+                  );
+                }
+                // Forward the EXACT original envelope (preserve compression
+                // flag + bytes) into the builder — never a re-encoded/
+                // rewritten copy of the control frame.
+                const contextForward =
+                  await forwardCursorRequestContextThroughBuilder({
+                    captureBridge: bridge,
+                    captureId: nonNullCaptureId,
+                    http2,
+                    serverExecEnvelope: encodeConnectEnvelope(
+                      env.payload,
+                      env.flags,
+                    ),
+                    connectContentEncoding,
+                    signal: params.signal,
+                    // Empty at call time today (request_context is the
+                    // first control exchange processed per capture); kept
+                    // symmetric with the KV and mcp_state_exec call sites.
+                    knownControlExecNumericIds: completedControlExecNumericIds,
+                  });
+                if (contextForward.contextExecNumericId !== null) {
+                  completedControlExecNumericIds.add(
+                    contextForward.contextExecNumericId,
+                  );
+                }
+                contextBridged = true;
+                phase = "post_context_wait";
+                continue;
+              }
+              if (
+                decoded.kind === "exec_server" &&
+                decoded.subtype === "mcp_state_exec_args"
+              ) {
+                // Real benchmark evidence: `mcp_state_exec_args` (field 36,
+                // verified native schema `McpStateExecArgs { server_identifiers
+                // repeated string, kick_only bool }` → `McpStateExecResult
+                // { success | error | rejected }`) was previously rejected
+                // outright via the generic protocol_control failure. It is a
+                // genuine list/kick MCP-servers control query — never a tool
+                // call, never model output — so it is relayed exactly like
+                // request_context/KV: inject the EXACT original bytes into
+                // the still-live builder, wait for its own authoritative
+                // reply, forward those exact bytes upstream. Never decode or
+                // report server names/tool schemas/instructions anywhere
+                // (opaque relay only), never fabricate a state reply, and —
+                // unlike request_context — legitimately repeatable within one
+                // turn (e.g. a batch of server queries), so no "already
+                // bridged" guard here.
+                execFramesSeen += 1;
+                mcpStateExecFramesSeen += 1;
+                const stateForward =
+                  await forwardCursorMcpStateExecThroughBuilder({
+                    captureBridge: bridge,
+                    captureId: nonNullCaptureId,
+                    http2,
+                    serverExecEnvelope: encodeConnectEnvelope(
+                      env.payload,
+                      env.flags,
+                    ),
+                    connectContentEncoding,
+                    signal: params.signal,
+                    knownControlExecNumericIds: completedControlExecNumericIds,
+                  });
+                if (stateForward.completedExecNumericId !== null) {
+                  completedControlExecNumericIds.add(
+                    stateForward.completedExecNumericId,
+                  );
+                }
+                continue;
+              }
+              if (decoded.kind === "turn_ended") {
+                // The real native turn-completion marker
+                // (`InteractionUpdate.turn_ended`, field 14) — authoritative
+                // independent of Connect transport `endStream`. Finish now;
+                // do not keep waiting on the socket (the official client
+                // itself stops here and treats any later transport
+                // close/error as benign).
+                turnEndedSeen = true;
+                phase = "done";
+                teardownBuilderOnTerminal();
+                yield* flushPendingMcpToolCalls();
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason:
+                        toolIndexByCallId.size > 0 ? "tool_calls" : "stop",
+                    },
+                  ],
+                  ...(decoded.inputTokens !== null ||
+                  decoded.outputTokens !== null
+                    ? {
+                        usage: {
+                          prompt_tokens: decoded.inputTokens ?? 0,
+                          completion_tokens: decoded.outputTokens ?? 0,
+                          total_tokens:
+                            (decoded.inputTokens ?? 0) +
+                            (decoded.outputTokens ?? 0),
+                        },
+                      }
+                    : {}),
+                };
+                return;
+              }
+              if (decoded.kind === "exec_server") {
+                execFramesSeen += 1;
+                if (
+                  decoded.classification === "caller_mcp_tool" &&
+                  decoded.mcp !== null &&
+                  registeredToolNames.has(decoded.mcp.name)
+                ) {
+                  // Verified native schema: `exec_server_message.mcp_args`
+                  // handing a tool call to the CALLER is a real, complete
+                  // exchange — not an error condition. Emit the tool_calls
+                  // delta (with the fully decoded, real arguments — never
+                  // fabricated), then a genuine successful `tool_calls`
+                  // terminal, and gracefully tear the builder down. Never
+                  // forward mcp_args into the builder, never execute the
+                  // tool natively — execution is entirely the caller's own
+                  // responsibility once it receives this response. Only a
+                  // NAME the caller itself registered for this turn may take
+                  // this path; anything else still falls through to the
+                  // fail-closed `cursorExecServerFailure` below.
+                  const intent = decoded.mcp;
+                  const callId = intent.callId || `exec-${decoded.id ?? 0}`;
+                  // Independent-review fix: this branch used to emit ONLY
+                  // this one call id then return immediately — silently
+                  // dropping any OTHER tool call already declared in
+                  // parallel via `mcp_tool_partial`/`mcp_tool_started`
+                  // (buffered in `pendingMcpToolCalls`) that hadn't yet
+                  // received its own authoritative exchange. A turn ending
+                  // in `finish_reason: "tool_calls"` implies ALL of this
+                  // turn's tool calls are included — reporting only a
+                  // subset is a silent-loss bug, not a valid partial
+                  // success.
+                  //
+                  // Fix: this authoritative map always overrides this call
+                  // id's own buffered entry (never the reverse), then EVERY
+                  // still-pending call — this one included — is validated
+                  // and emitted together via the same all-or-nothing
+                  // `flushPendingMcpToolCalls` path used at the natural
+                  // turn terminal: every entry must be a registered name
+                  // with complete, valid JSON before ANY of them is
+                  // yielded; one incomplete/unregistered OTHER call fails
+                  // the whole turn closed rather than reporting a partial
+                  // batch success.
+                  if (
+                    !pendingMcpToolCalls.has(callId) &&
+                    pendingMcpToolCalls.size >= MAX_PENDING_MCP_TOOL_CALLS
+                  ) {
+                    throw new CursorCaptureDecodeError(
+                      "invalid_protobuf",
+                      `pending MCP tool call count exceeds ${MAX_PENDING_MCP_TOOL_CALLS}`,
+                    );
+                  }
+                  pendingMcpToolCalls.set(callId, {
+                    name: intent.name,
+                    index: ensureToolIndex(callId),
+                    argsText: intent.argumentsText,
+                    complete: true,
+                  });
+                  phase = "done";
+                  teardownBuilderOnTerminal();
+                  yield* flushPendingMcpToolCalls();
+                  yield {
+                    ...baseChunk(),
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason: "tool_calls",
+                      },
+                    ],
+                  };
+                  return;
+                }
+                throw cursorExecServerFailure({
+                  id: decoded.id,
+                  execId: decoded.execId,
+                  subtype: decoded.subtype,
+                  classification: decoded.classification,
+                  mcp: decoded.mcp,
+                });
+              }
+              if (decoded.kind === "kv_server") {
+                // Independent-reviewer-verified: `AgentServerMessage.kv_server_message`
+                // (field 4) is a real human/tool/service-facing native
+                // protocol, not inert bookkeeping — a genuine
+                // ControlledKvManager get/set round-trip against the live
+                // builder's own blobStore. Keep the builder alive across
+                // this (never torn down on first model token) and relay ONLY
+                // the exact known get/set envelope unchanged; the real reply
+                // bytes come back from the builder untouched — the daemon
+                // never fabricates a cache miss/write ack, never reads the
+                // blob id/data, and never invents/changes the captured model
+                // request. `tracing`/`unknown` KV subtypes are not relayed —
+                // they fail closed the same as any other unsupported case.
+                if (decoded.subtype === "get_blob") {
+                  kvGetFramesSeen += 1;
+                } else if (decoded.subtype === "set_blob") {
+                  kvSetFramesSeen += 1;
+                }
+                await forwardCursorKvControlThroughBuilder({
+                  captureBridge: bridge,
+                  captureId: nonNullCaptureId,
+                  http2,
+                  serverKvEnvelope: encodeConnectEnvelope(
+                    env.payload,
+                    env.flags,
+                  ),
+                  connectContentEncoding,
+                  signal: params.signal,
+                  knownControlExecNumericIds: completedControlExecNumericIds,
+                });
+                continue;
+              }
+              if (decoded.kind === "requires_duplex") {
+                // Independent-review fix: the H2 duplex path previously had
+                // no branch for this case (unlike the HTTP1 decode paths),
+                // so an `AgentServerMessage.interaction_query` (field 7) or
+                // `exec_server_control_message` (field 5) was silently
+                // dropped by falling through the if-chain, leaving the loop
+                // to just `read()` again forever — a real message the daemon
+                // has no safe response for, hanging until the caller's
+                // abort deadline. Fail closed immediately instead, with
+                // bounded messageCase/subtype/tag metadata only (never
+                // payload) so the exact unhandled case is diagnosable.
+                requiresDuplexFramesSeen += 1;
+                throw new CursorCaptureDecodeError(
+                  "requires_duplex_bridge",
+                  `AgentServerMessage.${decoded.messageCase} requires client duplex follow-up; no-execution bridge not active (${decoded.tags}; ${diagSnapshot()})`,
+                  {
+                    execSubtype: decoded.execSubtype,
+                    execClass: decoded.execClass,
+                  },
+                );
+              }
+              if (decoded.kind === "text_delta" && decoded.text.length > 0) {
+                sawModelOutput = true;
+                modelFramesSeen += 1;
+                phase = "model_stream";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: decoded.text },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+              } else if (
+                decoded.kind === "thinking_delta" &&
+                decoded.text.length > 0
+              ) {
+                sawModelOutput = true;
+                modelFramesSeen += 1;
+                phase = "model_stream";
+                yield {
+                  ...baseChunk(),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { reasoning_content: decoded.text },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+              } else if (
+                decoded.kind === "mcp_tool_partial" ||
+                decoded.kind === "mcp_tool_started"
+              ) {
+                sawModelOutput = true;
+                modelFramesSeen += 1;
+                phase = "model_stream";
+                const intent = decoded.intent;
+                // Round 9 review: `mcp_tool_started` can ALREADY carry a
+                // COMPLETE args map (verified schema — see
+                // `parseMcpArgs`/`decodeCursorMcpArgs`), not just an empty
+                // placeholder. Seed the buffer with that complete map
+                // directly (never discard it as `""`) and mark it complete
+                // so a later `mcp_tool_partial` fragment for the SAME call
+                // id is never concatenated onto it — that would corrupt
+                // otherwise-valid JSON. A `started` with NO complete args
+                // (the ordinary case) still seeds an empty, non-complete
+                // buffer, preserving normal fragment-only accumulation.
+                const isCompleteSeed =
+                  decoded.kind === "mcp_tool_started" &&
+                  intent.argumentsText.length > 0;
+                const argsDelta =
+                  decoded.kind === "mcp_tool_partial"
+                    ? decoded.argsTextDelta
+                    : intent.argumentsText;
+                // Buffer WITHOUT emitting — never yield a partial/possibly
+                // truncated argument fragment to the caller. See
+                // `pendingMcpToolCalls` above: an authoritative
+                // `exec_server_message.mcp_args` (if one arrives for this
+                // call id) replaces this buffered text entirely; otherwise
+                // it is flushed once, as a whole, at the genuine turn
+                // terminal.
+                bufferMcpToolCallUpdate(
+                  intent.callId,
+                  intent.name,
+                  argsDelta,
+                  isCompleteSeed,
+                );
+              } else if (decoded.kind === "heartbeat") {
+                heartbeatFramesSeen += 1;
+              } else if (decoded.kind === "native_tool") {
+                // Metadata-only count — never relabels/forwards the native
+                // tool intent; production still fails closed elsewhere if
+                // the caller ever needs to act on it.
+                nativeToolFramesSeen += 1;
+              } else if (decoded.kind === "ignored") {
+                ignoredFramesSeen += 1;
+                if (
+                  ignoredReasonsSeen.length < MAX_TRACKED_IGNORED_REASONS &&
+                  !ignoredReasonsSeen.includes(decoded.reason)
+                ) {
+                  ignoredReasonsSeen.push(decoded.reason);
+                }
+              }
+              // Independent-reviewer-verified fix: the builder used to be
+              // cancelled here — as soon as the FIRST model token arrived —
+              // which closed the duplex inject path before a later, real KV
+              // control round-trip (or interaction_query) could ever use it,
+              // producing exactly retest #32/#33's silent gap (frames
+              // counted but never answered). The builder now stays alive
+              // until a genuine terminal signal: `turn_ended` / Connect
+              // `endStream` (below), a thrown error, or the caller
+              // cancelling — never on first model output. Model output/tool
+              // calls are still never written back into the builder; only
+              // known control replies (request_context_result, KV get/set
+              // results) are ever forwarded to it.
+            }
+          }
+        } finally {
+          params.signal.removeEventListener("abort", onAbortDuringPeel);
+        }
+      }
+
+      const iterator = stepChunks();
+      const precommitMs = params.precommitMs ?? PRE_COMMIT_TIMEOUT_MS;
+      let precommitTimer: ReturnType<typeof setTimeout> | undefined;
+      const first = await Promise.race([
+        iterator.next().then(
+          (r) =>
+            r.done
+              ? ({ kind: "exit" } as const)
+              : ({ kind: "meaningful", chunk: r.value } as const),
+          (err: unknown) => ({ kind: "error", err }) as const,
+        ),
+        new Promise<{ kind: "timeout" }>((resolve) => {
+          precommitTimer = setTimeout(
+            () => resolve({ kind: "timeout" }),
+            precommitMs,
+          );
+        }),
+      ]);
+      clearTimeout(precommitTimer);
+
+      if (first.kind !== "meaningful") {
+        // Round 9 review: on a precommit TIMEOUT specifically, `stepChunks()`
+        // is quite possibly still blocked inside `await reader.read()` on
+        // the real H2 socket — that pending read is WHY nothing arrived
+        // before the deadline. `iterator.return()` only takes effect the
+        // NEXT time the generator actually resumes, which never happens
+        // until that pending read itself settles — so the previous
+        // `await iterator.return(undefined)` here could hang FOREVER
+        // waiting on a read that will never resolve on its own. Fix: close
+        // the real H2 session and cancel the reader FIRST — this is what
+        // actually unblocks the pending read — then request iterator
+        // cleanup fire-and-forget (never awaited; a caught rejection is
+        // fine, an unbounded hang here is not). Bridge/builder cleanup and
+        // ownership reporting are unchanged.
+        http2.close();
+        try {
+          void reader.cancel().catch(() => undefined);
+        } catch {
+          // ignore — reader may already be released/cancelled
+        }
+        void iterator.return(undefined).catch(() => undefined);
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore
+        }
+        bridge.closeDuplexInject(captureId);
+        builderAbort.abort();
+        await bridge.dispose();
+        if (first.kind === "timeout") {
+          return {
+            kind: "declined",
+            reason: `cursor capture produced no output before the pre-commit deadline (${diagSnapshot()})`,
+            captureOwnership: ownershipAtAccept,
+          };
+        }
+        if (first.kind === "exit") {
+          return {
+            kind: "declined",
+            reason: contextBridged
+              ? "cursor capture completed request_context but produced no model output"
+              : "cursor capture produced no output",
+            captureOwnership: ownershipAtAccept,
+          };
+        }
+        // first.kind === "error"
+        const err = first.err;
+        const isAbort =
+          params.signal.aborted ||
+          (err instanceof Error && err.name === "AbortError");
+        return {
+          kind: "declined",
+          reason: err instanceof Error ? err.message : String(err),
+          captureOwnership: isAbort
+            ? ownershipAtAccept === "none"
+              ? "accepted"
+              : ownershipAtAccept
+            : ownershipAtAccept,
+        };
+      }
+
+      const firstChunk = first.chunk;
+      const out = new ReadableStream<TChatCompletionChunk>({
+        start(controller) {
+          controller.enqueue(firstChunk);
+        },
+        async pull(controller) {
+          let step: IteratorResult<TChatCompletionChunk>;
+          try {
+            step = await iterator.next();
+          } catch (err) {
+            controller.error(
+              err instanceof Error ? err : new Error(String(err)),
+            );
+            try {
+              reader.releaseLock();
+            } catch {
+              // ignore
+            }
+            http2.close();
+            builderAbort.abort();
+            void bridge.dispose();
+            return;
+          }
+          if (step.done) {
+            controller.close();
+            try {
+              reader.releaseLock();
+            } catch {
+              // ignore
+            }
+            http2.close();
+            // CodeRabbit round 2: every OTHER terminal path here (iterator
+            // error, stream cancel) aborts the builder; this natural-close
+            // path did not. In the common case `teardownBuilderOnTerminal()`
+            // already aborted it synchronously inside the generator before
+            // yielding the final chunk, so this is idempotent — but it is
+            // the defensive backstop if a future terminal branch inside
+            // `stepChunks()` ever returns without going through that
+            // teardown, so the builder process can never be left running.
+            builderAbort.abort();
+            void bridge.dispose();
+            return;
+          }
+          controller.enqueue(step.value);
+        },
+        cancel() {
+          void iterator.return(undefined).catch(() => undefined);
+          try {
+            reader.releaseLock();
+          } catch {
+            // ignore
+          }
+          http2.close();
+          builderAbort.abort();
+          void bridge.dispose();
+        },
+      });
+      return {
+        kind: "committed",
+        chunks: out,
+        sessionId: () => null,
+      };
+    }
+
+    // HTTP/1 (and injected sender) path — existing single-shot dispatch.
+    // `dispatchStarted` is set immediately before the actual dispatch call —
+    // never earlier — for the same reason as the H2 branch above: anything
+    // that could still throw before this point (id/shape validation) is a
+    // pure local failure with zero upstream contact and must report
+    // ownership "none", not "uncertain".
+    dispatchStarted = true;
+    const sender = params.sender ?? defaultCursorCaptureSender;
+    const dispatched = await runCursorCapturedTransaction({
+      session: bridge.session,
+      transaction: tx,
+      sender,
+      signal: params.signal,
+    });
+    bridge.settleChild({
+      kind: "suppressed",
+      reason:
+        "original AgentService + BidiAppend sends suppressed; daemon owns the transaction",
+    });
+    settleCursorCaptureViaAcpCancel({
+      settlement: {
+        kind: "suppressed",
+        reason: `captured ${tx.primary.method} ${tx.primary.externalUrl}`,
+      },
+      cancelSession: () => {
+        builderAbort.abort();
+      },
+    });
+
+    if (!dispatched.response.ok) {
+      try {
+        return await declinedForNonOkCapturedResponse(
+          dispatched.response,
+          params.signal,
+          CURSOR_CAPTURE_ERROR_OPTIONS,
+        );
+      } finally {
+        await bridge.dispose();
+      }
+    }
+    if (dispatched.response.body === null) {
+      const ownership = captureOwnershipFromSession(bridge.session);
+      await bridge.dispose();
+      return {
+        kind: "declined",
+        reason: "cursor capture upstream returned an empty body",
+        captureOwnership: ownership,
+      };
+    }
+
+    ownershipAtAccept = captureOwnershipFromSession(bridge.session);
+    const decodeStream = chunksStreamFromCursorConnectResponseBody(
+      dispatched.response.body,
+      { providerModelId: params.providerModelId, signal: params.signal },
+    );
+    const reader = decodeStream.getReader();
+    let first: TChatCompletionChunk | null = null;
+    try {
+      const { value, done } = await reader.read();
+      if (!done && value !== undefined) first = value;
+    } catch (err) {
+      builderAbort.abort();
+      await bridge.dispose();
+      if (
+        err instanceof CursorCaptureDecodeError &&
+        (err.code === "requires_duplex_bridge" ||
+          err.code === "requires_request_context_duplex" ||
+          err.code === "unsupported_native_tool_intent" ||
+          err.code === "unsupported_native_exec" ||
+          err.code === "caller_mcp_tool_cancel")
+      ) {
+        return {
+          kind: "declined",
+          reason: err.message,
+          // Upstream already accepted — never fall through to another provider.
+          captureOwnership:
+            ownershipAtAccept === "none" ? "accepted" : ownershipAtAccept,
+        };
+      }
+      return {
+        kind: "declined",
+        reason: err instanceof Error ? err.message : String(err),
+        captureOwnership: ownershipAtAccept,
+      };
+    }
+    if (first === null) {
+      builderAbort.abort();
+      await bridge.dispose();
+      return {
+        kind: "declined",
+        reason: "cursor capture produced no output",
+        captureOwnership: ownershipAtAccept,
+      };
+    }
+
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      builderAbort.abort();
+      void bridge.dispose();
+    };
+
+    const out = new ReadableStream<TChatCompletionChunk>({
+      start(controller) {
+        controller.enqueue(first);
+      },
+      async pull(controller) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) {
+            controller.close();
+            release();
+            return;
+          }
+          controller.enqueue(value);
+        } catch (err) {
+          release();
+          controller.error(err instanceof Error ? err : new Error(String(err)));
+        }
+      },
+      cancel() {
+        void reader.cancel();
+        release();
+      },
+    });
+
+    return {
+      kind: "committed",
+      chunks: out,
+      sessionId: () => null,
+    };
+  } catch (err) {
+    builderAbort.abort();
+    const ownership = captureOwnershipFromSession(bridge.session);
+    try {
+      await bridge.dispose();
+    } catch {
+      // ignore
+    }
+    void acpPromise;
+    if (dispatchStarted && ownership === "none") {
+      return {
+        kind: "declined",
+        reason: err instanceof Error ? err.message : String(err),
+        captureOwnership: "uncertain",
+      };
+    }
+    return {
+      kind: "declined",
+      reason: err instanceof Error ? err.message : String(err),
+      captureOwnership: ownership === "none" ? undefined : ownership,
+    };
+  }
 };
 
 /**

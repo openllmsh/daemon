@@ -78,9 +78,9 @@ import type {
   TMuseSessionUsage,
 } from "./muse-events";
 import { createMuseTurnState } from "./muse-events";
-import type { TMuseMcpServer } from "./muse-mcp-server";
-import { startMuseMcpServer } from "./muse-mcp-server";
-import type { TMuseOverlay } from "./muse-overlay";
+import type { TMuseMcpServer, TMuseToolNameMap } from "./muse-mcp-server";
+import { buildMuseToolNameMap, startMuseMcpServer } from "./muse-mcp-server";
+import type { TMuseOverlay, TMuseWebSearchMode } from "./muse-overlay";
 import { createMuseExecutionOverlay } from "./muse-overlay";
 import type { TMuseCallerTool, TMuseInputPart } from "./muse-request";
 import type { TMuseApprovalRequest } from "./muse-web-search";
@@ -659,8 +659,25 @@ const wrapOfficialHost = async (
           : {}),
         approvalMode: start.approvalMode,
       });
+      // Per-session mutable approval delegate. The real MSP SDK exposes
+      // exactly ONE `onApproval` registration slot per session (a second
+      // `session.onApproval(...)` call replaces, not adds, the callback —
+      // see `MuseClient`/`session` from `@muse-code/sdk`), so we install our
+      // OWN single real callback here, once, for the lifetime of the
+      // session, and have it always invoke whichever handler is currently
+      // assigned to `approvalHandler`. `TMuseSession.onApproval(handler)`
+      // (below) then just reassigns `approvalHandler` — it does NOT attempt
+      // a second real SDK registration, so callers (e.g. `runMuseNative`)
+      // can safely upgrade the policy after `startSession` resolves without
+      // silently landing on a no-op and without ever having two live SDK
+      // callbacks racing each other.
+      let approvalHandler: (
+        request: TMuseApprovalRequest,
+      ) =>
+        | Promise<{ readonly choiceId: string }>
+        | { readonly choiceId: string } = decideNativeApproval;
       session.onApproval((request) =>
-        decideNativeApproval(mapApprovalRequest(request)),
+        approvalHandler(mapApprovalRequest(request)),
       );
       return {
         sessionId: session.sessionId,
@@ -734,8 +751,14 @@ const wrapOfficialHost = async (
             },
           };
         },
-        onApproval: () => {
-          // Official path is wired at startSession; extra handlers are ignored.
+        onApproval: (handler) => {
+          // Reassigns the per-session delegate the ONE real SDK callback
+          // (registered once, above, at `startSession` time) invokes —
+          // never a second real `session.onApproval` registration. Replaces
+          // whatever handler is currently active (including the
+          // `decideNativeApproval` default), so exactly one handler is ever
+          // live for this session at a time.
+          approvalHandler = handler;
         },
       };
     },
@@ -758,6 +781,15 @@ export type TMuseNativeParams = {
   readonly rpcTimeoutMs?: number;
   readonly hostFactory?: TMuseHostFactory;
   readonly cwd?: string;
+  /**
+   * Optional Meta endpoint redirect written into the per-turn overlay as
+   * nested `settings.endpoint_transport`. Used by bridge-capture — never by
+   * the default MSP bridge path.
+   */
+  readonly endpointTransport?: {
+    readonly base_url: string;
+    readonly auth: "bearer";
+  };
 };
 
 const setupDecline = (
@@ -1261,6 +1293,311 @@ export const listMuseModelsDemand = async (
   }
 };
 /**
+ * Lifecycle hooks a caller (bridge or capture) may attach to
+ * {@link openMuseTurnSession}. All optional; a hook that is omitted is simply
+ * never invoked. `onToolCall` args mirror the MCP server's own callback
+ * signature — the caller decides what a tool call means for its turn.
+ */
+export type TMuseTurnSessionHooks = {
+  readonly onToolCall?: (name: string, args: Record<string, unknown>) => void;
+  readonly onStderr?: (chunk: string) => void;
+  /** Fires immediately before the SDK host factory is invoked (setup done). */
+  readonly onBeforeHostOpen?: () => void;
+  /** Fires once the host handshake has settled. */
+  readonly onHostReady?: () => void;
+  /** Fires once `session/start` has settled. */
+  readonly onSessionReady?: () => void;
+};
+
+export type TOpenMuseTurnSessionOptions = {
+  readonly bin: string;
+  readonly env: Record<string, string>;
+  readonly providerModelId: string;
+  readonly providerId?: string;
+  /** Caller function tools exposed via the per-request loopback MCP server. */
+  readonly tools?: ReadonlyArray<TMuseCallerTool>;
+  readonly signal: AbortSignal;
+  readonly rpcTimeoutMs?: number;
+  readonly hostFactory?: TMuseHostFactory;
+  readonly cwd?: string;
+  /** `mkdtemp` prefix — distinguishes bridge (`muse-turn-`) from capture (`muse-capture-`) turn roots. */
+  readonly dirPrefix: string;
+  /**
+   * Bridge-capture-only Meta endpoint redirect. Never set by the default
+   * (non-capture) bridge path — see `createMuseExecutionOverlay`.
+   */
+  readonly endpointTransport?: {
+    readonly base_url: string;
+    readonly auth: "bearer";
+  };
+  /** Bridge-capture-only server-executed search folding. Never set by the default bridge path. */
+  readonly webSearchMode?: TMuseWebSearchMode;
+  /**
+   * Extra env merged in AFTER the overlay env (e.g. capture's private
+   * proxy-hop guard). Receives the per-turn MCP server URL, or `null` when no
+   * caller tools were registered for this turn.
+   */
+  readonly extraEnv?: (mcpServerUrl: string | null) => Record<string, string>;
+  /**
+   * Post-composition env guard (e.g. capture's Keychain-safety assertion).
+   * Throwing here fails setup exactly like any other setup step, via the
+   * same partial-cleanup path.
+   */
+  readonly assertEnv?: (env: NodeJS.ProcessEnv) => void;
+  readonly hooks?: TMuseTurnSessionHooks;
+};
+
+export type TMuseTurnSessionResult = {
+  readonly dirs: TMuseTurnDirs;
+  readonly host: TMuseHost;
+  readonly session: TMuseSession;
+  /** `null` when the turn registered no caller tools. */
+  readonly mcp: TMuseMcpServer | null;
+  readonly callerToolNameMap: TMuseToolNameMap;
+  /**
+   * Idempotent, deterministic-order teardown: `host.close` → `mcp.stop` →
+   * `overlay.cleanup` → `rm(turnRoot)`. Every step is independently
+   * null-guarded and swallows its own error, so an earlier failure never
+   * blocks a later step. Safe to call more than once (a no-op after the
+   * first call) and safe to call after a partial setup failure — this is the
+   * SAME function `openMuseTurnSession` calls internally when a later setup
+   * step throws.
+   */
+  cleanup(): Promise<void>;
+};
+
+/**
+ * Provider-owned session/lifecycle opener shared by the default (non-capture)
+ * bridge (`runMuseNative`) and bridge-capture (`runMuseNativeCapture`):
+ * allocate the turn's temp dirs, optionally start the per-turn caller-tool MCP
+ * server, build the isolated execution overlay, compose the spawn env, open
+ * the SDK host under a deadline, and start the session with exact ids.
+ *
+ * Deliberately narrow and provider-owned, not a generic native-runtime
+ * framework: callers still own everything AFTER a session exists — sending
+ * the turn, model+policy confirmation, approval policy, item/delta pumping,
+ * and turn cancellation/settlement all differ between the bridge and capture
+ * transports and stay in their own files.
+ *
+ * On any setup failure (dir alloc, MCP start, overlay build, env assertion,
+ * host spawn/handshake, or `session/start`), whatever was already allocated
+ * is torn down via {@link TMuseTurnSessionResult.cleanup} — in the same
+ * deterministic order a normal caller-driven close uses — before the error is
+ * rethrown. Callers therefore never need to hand-manage host/mcp/overlay/dir
+ * cleanup for a setup failure; they only still own cancelling their own
+ * in-flight turn once one exists.
+ */
+/**
+ * Race `work` against a deadline AND the given abort signal. Unlike
+ * {@link withTimeout}, an outer abort rejects immediately — it does not wait
+ * out `work` on its own, since a pending RPC (e.g. `session/start`) may never
+ * settle by itself once its connection is torn down from under it. `work` is
+ * always observed (a `.catch` is attached up front) so an abandoned
+ * rejection can never surface as an unhandled rejection once this race has
+ * already settled via timeout or abort.
+ */
+const withAbortableSetupTimeout = async <T>(
+  work: Promise<T>,
+  ms: number,
+  label: string,
+  signal: AbortSignal,
+): Promise<T> => {
+  void work.catch(() => {});
+  if (signal.aborted) {
+    throw new Error(`${label} aborted`);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+        onAbort = () => reject(new Error(`${label} aborted`));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+  }
+};
+
+export const openMuseTurnSession = async (
+  options: TOpenMuseTurnSessionOptions,
+): Promise<TMuseTurnSessionResult> => {
+  const rpcTimeoutMs = options.rpcTimeoutMs ?? MUSE_RPC_TIMEOUT_MS;
+  const hostFactory = options.hostFactory ?? defaultMuseHostFactory;
+
+  let turnRoot: string | undefined;
+  let mcp: TMuseMcpServer | null = null;
+  let overlay: TMuseOverlay | null = null;
+  let host: TMuseHost | null = null;
+
+  // A CHAIN, not a cached single promise: every call to `cleanup()` appends
+  // a fresh drain pass that re-reads whatever is CURRENTLY assigned to
+  // host/mcp/overlay/turnRoot at the time it actually runs, serialized after
+  // any prior pass. This is what makes cleanup both idempotent (each pass
+  // finds already-nulled fields and is a no-op) AND correct under a "late
+  // completion race" — a resource that finishes allocating (overlay build,
+  // host open) strictly AFTER an earlier cleanup() call already returned is
+  // still picked up by the NEXT drain pass, rather than being silently
+  // stranded because cleanup had already been "used up" once.
+  let cleanupChain: Promise<void> = Promise.resolve();
+  const cleanup = (): Promise<void> => {
+    cleanupChain = cleanupChain.then(async () => {
+      if (host !== null) {
+        const closing = host;
+        host = null;
+        await closing.close().catch(() => {});
+      }
+      if (mcp !== null) {
+        const stopping = mcp;
+        mcp = null;
+        try {
+          stopping.stop();
+        } catch {
+          // already stopped
+        }
+      }
+      if (overlay !== null) {
+        const disposing = overlay;
+        overlay = null;
+        await disposing.cleanup().catch(() => {});
+      }
+      if (turnRoot !== undefined) {
+        const root = turnRoot;
+        turnRoot = undefined;
+        await rm(root, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+    return cleanupChain;
+  };
+
+  // Abort during setup must close/dispose promptly — it must not wait out a
+  // pending RPC (e.g. session/start) on its own, and it must not leave any
+  // resource allocated AFTER the abort fired undisposed. This listener fires
+  // `cleanup()` immediately on abort regardless of which await is currently
+  // in flight; the explicit `if (options.signal.aborted)` checks below (one
+  // after every resource-acquiring await) additionally stop the setup from
+  // doing any FURTHER work once aborted, and each schedules one more drain
+  // pass so a resource that finished allocating in the same tick this check
+  // runs is still caught.
+  const onAbort = (): void => {
+    void cleanup();
+  };
+  options.signal.addEventListener("abort", onAbort, { once: true });
+
+  const abortedError = (): Error => new Error("muse turn session aborted");
+
+  try {
+    if (options.signal.aborted) throw abortedError();
+    // Caller resolves its own cwd fallback (the bridge and capture paths
+    // disagree: the bridge falls back through `spawnCwd(env)` before
+    // `tmpdir()`, capture goes straight to `tmpdir()`) — this helper only
+    // ever allocates under whatever `options.cwd` it is handed.
+    const dirs = await allocateMuseTurnDirs(
+      options.cwd ?? tmpdir(),
+      options.dirPrefix,
+    );
+    turnRoot = dirs.turnRoot;
+    if (options.signal.aborted) {
+      await cleanup();
+      throw abortedError();
+    }
+
+    const callerToolNameMap = buildMuseToolNameMap(options.tools ?? []);
+    if ((options.tools?.length ?? 0) > 0) {
+      mcp = startMuseMcpServer({
+        tools: options.tools ?? [],
+        onToolCall: (name, args) => options.hooks?.onToolCall?.(name, args),
+      });
+    }
+    if (options.signal.aborted) {
+      await cleanup();
+      throw abortedError();
+    }
+
+    overlay = await createMuseExecutionOverlay({
+      baseEnv: options.env,
+      mcp,
+      modelId: options.providerModelId,
+      ...(options.providerId !== undefined
+        ? { providerId: options.providerId }
+        : {}),
+      ...(options.endpointTransport !== undefined
+        ? { endpointTransport: options.endpointTransport }
+        : {}),
+      ...(options.webSearchMode !== undefined
+        ? { webSearchMode: options.webSearchMode }
+        : {}),
+      parentDir: dirs.runtimeParent,
+    });
+    if (options.signal.aborted) {
+      await cleanup();
+      throw abortedError();
+    }
+
+    const env: NodeJS.ProcessEnv = {
+      ...cleanMuseSpawnEnv(options.env),
+      ...overlay.env,
+      ...(options.extraEnv?.(mcp?.url ?? null) ?? {}),
+    };
+    options.assertEnv?.(env);
+
+    const spawn = wrapMuseServeSpawn(options.bin);
+    options.hooks?.onBeforeHostOpen?.();
+    // `openMuseHostWithTimeout` is already abort-aware: it aborts the spawn
+    // signal and closes any host that resolves late once abandoned — no
+    // separate late-completion handling needed here for the host itself.
+    host = await openMuseHostWithTimeout(
+      (signal) =>
+        hostFactory({
+          command: spawn.command,
+          args: spawn.args,
+          cwd: dirs.workspaceRoot,
+          env,
+          signal,
+          ...(options.hooks?.onStderr !== undefined
+            ? { onStderr: options.hooks.onStderr }
+            : {}),
+        }),
+      rpcTimeoutMs,
+      "muse SDK spawn",
+      options.signal,
+    );
+    options.hooks?.onHostReady?.();
+    if (options.signal.aborted) {
+      await cleanup();
+      throw abortedError();
+    }
+
+    const session = await withAbortableSetupTimeout(
+      host.startSession({
+        sessionId: Bun.randomUUIDv7(),
+        workspaceRoot: dirs.workspaceRoot,
+        modelId: options.providerModelId,
+        ...(options.providerId !== undefined
+          ? { providerId: options.providerId }
+          : {}),
+        approvalMode: MUSE_APPROVAL_MODE,
+      }),
+      rpcTimeoutMs,
+      "muse session/start",
+      options.signal,
+    );
+    options.hooks?.onSessionReady?.();
+
+    options.signal.removeEventListener("abort", onAbort);
+    return { dirs, host, session, mcp, callerToolNameMap, cleanup };
+  } catch (error) {
+    options.signal.removeEventListener("abort", onAbort);
+    await cleanup();
+    throw error;
+  }
+};
+
+/**
  * Run one cold Muse turn through the official SDK surface. Commit-on-first
  * output; every pre-commit failure declines. The child / host is closed on
  * completion, abort, setup-RPC timeout, and pre-commit silence. After the
@@ -1287,16 +1624,11 @@ export const runMuseNative = async (
   // Entry clock after invalid-request declines — setup includes turn-root
   // prep, MCP, and overlay before the SDK host factory.
   const phaseMarks = createMusePhaseMarks();
-  const spawn = wrapMuseServeSpawn(params.bin);
-  // Split layout: workspaceRoot (session cwd) NEVER contains the auth
-  // overlay HOME. Known-safe workspace reads therefore cannot reach the
-  // auth symlink by a workspace-relative path. Absolute-path reads of HOME
-  // remain a residual host-policy risk (see file header).
-  // Always unique under params.cwd / tmp — avoids parallel cwd collisions.
-  // Allocated inside the setup try so mkdtemp/mkdir failures decline (and
-  // allocateMuseTurnDirs removes any partial turn root) instead of throwing.
-  let turnRoot: string | undefined;
-  const hostFactory = params.hostFactory ?? defaultMuseHostFactory;
+  // Split layout (enforced by `openMuseTurnSession`): workspaceRoot (session
+  // cwd) NEVER contains the auth overlay HOME. Known-safe workspace reads
+  // therefore cannot reach the auth symlink by a workspace-relative path.
+  // Absolute-path reads of HOME remain a residual host-policy risk (see file
+  // header).
   const rpcTimeoutMs = params.rpcTimeoutMs ?? MUSE_RPC_TIMEOUT_MS;
   const observationGeneration = museNativeModelGeneration();
   const turn = createMuseTurnState({
@@ -1331,16 +1663,9 @@ export const runMuseNative = async (
     push({ error });
   };
 
-  let host: TMuseHost | null = null;
   let session: TMuseSession | null = null;
   let activeTurn: TMuseTurn | null = null;
-  let mcp: TMuseMcpServer | null = null;
-  let overlay: TMuseOverlay | null = null;
-
-  const stopMcp = (): void => {
-    mcp?.stop();
-    mcp = null;
-  };
+  let sessionHandle: TMuseTurnSessionResult | null = null;
 
   const cleanup = async (): Promise<void> => {
     params.signal.removeEventListener("abort", abort);
@@ -1348,19 +1673,10 @@ export const runMuseNative = async (
       await activeTurn.cancel().catch(() => {});
       activeTurn = null;
     }
-    if (host !== null) {
-      await host.close().catch(() => {});
-      host = null;
-    }
-    stopMcp();
-    if (overlay !== null) {
-      await overlay.cleanup().catch(() => {});
-      overlay = null;
-    }
-    if (turnRoot !== undefined) {
-      const root = turnRoot;
-      turnRoot = undefined;
-      await rm(root, { recursive: true, force: true }).catch(() => {});
+    if (sessionHandle !== null) {
+      const closing = sessionHandle;
+      sessionHandle = null;
+      await closing.cleanup();
     }
   };
 
@@ -1379,15 +1695,32 @@ export const runMuseNative = async (
   params.signal.addEventListener("abort", abort, { once: true });
 
   try {
-    const dirs = await allocateMuseTurnDirs(
-      params.cwd ?? (spawnCwd(params.env) || tmpdir()),
-      "muse-turn-",
-    );
-    turnRoot = dirs.turnRoot;
-    const { workspaceRoot, runtimeParent } = dirs;
-    if ((params.tools?.length ?? 0) > 0) {
-      mcp = startMuseMcpServer({
-        tools: params.tools ?? [],
+    // OUR OWN registered caller/MCP tools, in BOTH the bare form and Meta's
+    // observed MCP wire form (`mcp__openllm_muse_client_tools.<leaf>`) —
+    // built by the SAME shared helper the return-side tool-name mapping
+    // already uses, over the SAME `params.tools` this turn registers, so
+    // approval matching verifies against our OWN server's real prefix
+    // rather than guessing or accepting an arbitrary name. Approving only
+    // lets the turn proceed to OUR loopback MCP server (which immediately
+    // ends the turn via `onToolCall` below), never native execution. See
+    // `decideMuseNativeApproval`/`isRegisteredCallerToolApproval` in
+    // `muse-web-search.ts`.
+    sessionHandle = await openMuseTurnSession({
+      bin: params.bin,
+      env: params.env,
+      providerModelId: params.providerModelId,
+      ...(params.providerId !== undefined
+        ? { providerId: params.providerId }
+        : {}),
+      tools: params.tools ?? [],
+      signal: params.signal,
+      rpcTimeoutMs,
+      ...(params.hostFactory !== undefined
+        ? { hostFactory: params.hostFactory }
+        : {}),
+      cwd: params.cwd ?? (spawnCwd(params.env) || tmpdir()),
+      dirPrefix: "muse-turn-",
+      hooks: {
         onToolCall: (name, args) => {
           if (ended) return;
           // Capture vendor usage around cancellation when the fold already
@@ -1398,63 +1731,43 @@ export const runMuseNative = async (
           noteFirstOutputSuccess();
           void activeTurn?.cancel().catch(() => {});
         },
-      });
-    }
-    overlay = await createMuseExecutionOverlay({
-      baseEnv: params.env,
-      mcp,
-      modelId: params.providerModelId,
-      ...(params.providerId !== undefined
-        ? { providerId: params.providerId }
-        : {}),
-      parentDir: runtimeParent,
+        onStderr: (chunk) => {
+          const trimmed = chunk.trim();
+          if (trimmed.length === 0) return;
+          const classified = classifyMuseStderr(trimmed);
+          logWarn("native-runtime", safeDiagnosticMessage`muse-sdk stderr`, {
+            code: classified.code,
+            bytes: classified.bytes,
+          });
+        },
+        // Spawn/init clock starts immediately before the host factory — MCP
+        // and overlay prep belong to setup_ms, not spawn_init_ms.
+        onBeforeHostOpen: () => {
+          phaseMarks.spawnStartedAt = musePhaseNow();
+        },
+        onHostReady: () => {
+          phaseMarks.hostReadyAt = musePhaseNow();
+        },
+        onSessionReady: () => {
+          phaseMarks.sessionReadyAt = musePhaseNow();
+        },
+      },
     });
-    // cleanMuseSpawnEnv strips ambient XDG_*; re-apply the isolated overlay.
-    const env: NodeJS.ProcessEnv = {
-      ...cleanMuseSpawnEnv(params.env),
-      ...overlay.env,
-    };
-    // Spawn/init clock starts immediately before the host factory — MCP and
-    // overlay prep belong to setup_ms, not spawn_init_ms.
-    phaseMarks.spawnStartedAt = musePhaseNow();
-    host = await openMuseHostWithTimeout(
-      (signal) =>
-        hostFactory({
-          command: spawn.command,
-          args: spawn.args,
-          cwd: workspaceRoot,
-          env,
-          signal,
-          onStderr: (chunk) => {
-            const trimmed = chunk.trim();
-            if (trimmed.length === 0) return;
-            const classified = classifyMuseStderr(trimmed);
-            logWarn("native-runtime", safeDiagnosticMessage`muse-sdk stderr`, {
-              code: classified.code,
-              bytes: classified.bytes,
-            });
-          },
-        }),
-      rpcTimeoutMs,
-      "muse SDK spawn",
-      params.signal,
+    session = sessionHandle.session;
+    const callerToolNameMap = sessionHandle.callerToolNameMap;
+    // Upgrades the session's per-session approval delegate (installed once,
+    // for real, inside `wrapOfficialHost.startSession`) from the default
+    // `decideNativeApproval` (web_search only) to the caller-tool-aware
+    // policy for THIS turn's registered tools. This reassigns the delegate
+    // the ONE real SDK callback invokes — it is not a second live SDK
+    // registration, so this take effect immediately and exclusively; only
+    // THIS caller (the non-capture bridge path, the one that actually
+    // reaches MSP's local approval prompt for a caller-tool call; capture
+    // mode never does, since it decodes the model's raw wire response
+    // itself) approves our own registered caller/MCP tools.
+    session.onApproval((request) =>
+      decideMuseNativeApproval(request, callerToolNameMap),
     );
-    phaseMarks.hostReadyAt = musePhaseNow();
-    session = await withTimeout(
-      host.startSession({
-        sessionId: Bun.randomUUIDv7(),
-        workspaceRoot,
-        modelId: params.providerModelId,
-        ...(params.providerId !== undefined
-          ? { providerId: params.providerId }
-          : {}),
-        approvalMode: MUSE_APPROVAL_MODE,
-      }),
-      rpcTimeoutMs,
-      "muse session/start",
-    );
-    phaseMarks.sessionReadyAt = musePhaseNow();
-    session.onApproval(decideNativeApproval);
     await withTimeout(
       confirmExactModelAndPolicy(
         session,

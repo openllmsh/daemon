@@ -15,6 +15,11 @@
  * carries exactly those messages plus its own new user turn — matches and
  * resumes the same session.
  *
+ * Known limitation (pre-existing, separate from bridge-capture): independent
+ * conversations that share an identical consumed prefix can overwrite each
+ * other's vendor-session mapping under the same next key. Capture does not
+ * rely on warm resume to fix that — see `captureAwareTextBuilderPlan`.
+ *
  * If nothing matches (first turn, or the client edited/compacted history) the
  * caller starts a FRESH session; for a first turn that's clean, and for an
  * unmatched mid-conversation join the caller seeds the fresh session with the
@@ -23,7 +28,9 @@
  * State lives in the daemon (the resume files / threads are daemon-local
  * disk/process state; the cloud can't hold them). In-memory with LRU + TTL;
  * a per-key lock serialises concurrent advances of the same conversation
- * (vendor resume files don't tolerate concurrent writers).
+ * (vendor resume files don't tolerate concurrent writers). Tool-continuation
+ * capability maps stay separate — never reuse this store for held-tool
+ * identity binding.
  */
 
 import { createHash } from "node:crypto";
@@ -117,6 +124,59 @@ export const renderSeed = (
     .map((t) => `${t.role === "user" ? "User" : "Assistant"}: ${t.text}`)
     .join("\n\n");
   return `Continue this conversation. Prior transcript:\n\n${transcript}\n\nUser: ${deltaText}`;
+};
+
+/**
+ * Builder feed for one native TEXT turn (no tool/reasoning artifacts).
+ *
+ * When bridge request capture is active the vendor builder never observes the
+ * true assistant/tool response (local settlement only). Warm `--resume` /
+ * `thread/resume` would therefore reconstruct wrong history. Until warm
+ * history injection is proven, capture turns always start cold and seed prior
+ * turns via {@link renderSeed}, and the session map must not publish a resume
+ * handle.
+ *
+ * Tool-bearing / reasoning history MUST NOT go through this helper — use
+ * `captureAwareHistoryBuilderPlan` in `request-capture-history.ts`, which
+ * refuses lossy silent success when IDs/roles/reasoning would be dropped.
+ */
+export type TCaptureAwareTextBuilderPlan = {
+  readonly builderResumeId: string | null;
+  readonly userText: string;
+  readonly systemText: string | null;
+  /** False under capture — commit the lease with a null session id. */
+  readonly publishResumeSession: boolean;
+};
+
+export const captureAwareTextBuilderPlan = (args: {
+  readonly captureActive: boolean;
+  readonly resumeId: string | null;
+  readonly hasPrior: boolean;
+  readonly deltaText: string;
+  readonly systemText: string | null;
+  readonly turns: ReadonlyArray<TNativeTurn>;
+}): TCaptureAwareTextBuilderPlan => {
+  if (args.captureActive) {
+    return {
+      builderResumeId: null,
+      userText: args.hasPrior
+        ? renderSeed(args.turns, args.deltaText)
+        : args.deltaText,
+      systemText: args.systemText,
+      publishResumeSession: false,
+    };
+  }
+  return {
+    builderResumeId: args.resumeId,
+    userText:
+      args.resumeId !== null
+        ? args.deltaText
+        : args.hasPrior
+          ? renderSeed(args.turns, args.deltaText)
+          : args.deltaText,
+    systemText: args.resumeId !== null ? null : args.systemText,
+    publishResumeSession: true,
+  };
 };
 
 type TEntry = { sessionId: string; lastUsed: number };

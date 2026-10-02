@@ -447,23 +447,232 @@ delegate. The native bridges:
   Usage maps from `thread/tokenUsage/updated` (`total`; cached input stays a
   SUBSET of `tokens_in`).
 
-**Multi-turn via session resume (`session-store.ts`).** OpenLLM is a
-STATELESS gateway (the client resends the full history every request); the
-native runtimes are STATEFUL agents that only accept the NEW turn. The
-session store bridges them the way T3 does: it correlates a conversation to
-a provider session and feeds only the delta. Correlation is content-derived
-(the gateway carries no session id) — the conversation is keyed by a hash of
-its "consumed prefix" (system + turns up to and including the last assistant
-turn); the DELTA (the new user turn after it) is fed to the resumed session
+**Multi-turn via session resume (`session-store.ts`).**
+OpenLLM is a STATELESS gateway (the client resends the full history every
+request); the native runtimes are STATEFUL agents that only accept the NEW
+turn. The session store bridges them: it correlates a conversation to a
+provider session by a content-derived prefix hash (`deriveConversation`) and
+feeds only the delta. The DELTA is fed to the resumed session
 (`claude -p --resume <session_id>` / `thread/resume` + `turn/start`). After
-the runtime answers, the store re-keys the session under `hash(prefix +
-delta + response)` so the NEXT request — which carries exactly those messages
-plus its own new user turn — matches and resumes. First turn / unmatched
-history (daemon restart, client compaction) starts fresh; an unmatched
-mid-conversation join renders the transcript as a lossy seed. State is
-daemon-resident (the resume files/threads are daemon-local); in-memory LRU +
-TTL, per-conversation lock. Verified live: a follow-up recalled a codeword
-set in turn 1 while only the new question was fed.
+the runtime answers, the store re-keys under
+`nextPrefixHash(... assistant)`. State is daemon-resident (in-memory LRU +
+TTL, per-key lock). Known limitation: independent identical-prefix
+conversations can overwrite each other's vendor-session mapping — see
+`docs/plan/bridge-request-capture/session-continuity.md` (deferred; not a
+capture blocker).
+
+**Bridge/capture ownership rule.** Capture is a transport wrapper over each
+provider's bridge, not a parallel bridge implementation. CLI arguments, SDK
+query configuration, RPC request shapes, authentication/spawn configuration,
+and common session-resource setup/cleanup must each have one provider-owned
+implementation used by both modes. Capture supplies interception, destination
+relocation, direct dispatch and response/control handling. Necessary differences
+(such as isolated versus shared clients, inert versus paused caller-tool handlers,
+and Muse's native hosted-search mode) are explicit policy inputs at the shared
+boundary, not copied orchestration. Tests must exercise both consumers of that
+boundary so a future bridge change carries through to capture automatically.
+
+The shared owners live alongside each provider, not in a cross-provider framework:
+- Claude: `claude-spawn.ts` owns CLI arguments and spawning;
+  `claude-tool-sdk-options.ts` owns common SDK query/MCP configuration. Held
+  caller-tool callbacks and inert capture callbacks remain explicit policies.
+- Codex: `codex-app-server.ts` owns dynamic-tool mapping and thread/turn request
+  builders. Shared bridge clients and isolated capture clients use those same
+  builders; capture still owns its private `CODEX_HOME` and exit-before-cleanup.
+- Cursor: `runCursorNativeCapture` wraps `runCursorNative` itself. Both modes
+  receive the same normalized serve inputs; capture adds only transport controls.
+- Muse: `openMuseTurnSession` in `muse-runtime.ts` owns turn directories, MCP,
+  overlay configuration, host/session creation and partial-failure cleanup for
+  both modes. Native approval/turn processing and direct captured-response
+  processing remain separate. Capture selects native hosted search through the
+  shared overlay, without substituting a caller tool or rewriting vendor bytes.
+
+**Bridge request capture (`bridge-capture` sub-method).** Cloud
+`ACTIVE_SUB_METHOD` may select `bridge-capture` (global or
+`provider:bridge-capture`). Serve activates only **ready** paths declared in
+the capability table — Claude/Codex/Muse/Cursor text + first-turn tools + a
+tool-result follow-up have each now passed real authenticated live smoke (see
+`docs/plan/bridge-request-capture/live-validation.md` for the current measured
+status, validation results, review status, and remaining coverage limits;
+selection does not certify every scenario). Muse capture uses overlay `settings.endpoint_transport` +
+Responses decode; history under Muse capture is cold text via `museRequestOf`
+(not MSP role inject). Cursor multi-turn history is likewise the existing
+cold-text rendered transcript (`cursor-request.ts`) — not native structured
+continuation — over the HTTP/2 Connect path; Cursor's HTTP/1 duplex/BidiAppend
+path has not been live-checked, and a native tool-call execution failure fails
+closed rather than retrying or relabeling. A scratch localhost probe used
+during the Cursor investigation applied a prohibited TLS bypass and relied
+only on local server logs; its "zero egress" claim is retracted and none of
+the live results above depend on it — do not read Cursor's Connect-path
+results as native compressed-envelope proof beyond what was captured through
+the production path. See `sub-method.ts`,
+`bridge-request-capture-readiness.ts`, and `docs/plan/bridge-request-capture/`.
+
+**Execution defaults (`execution-registry.ts` / `sub-method.ts`).**
+The registry's `defaultSelection` explicitly owns the default, including capture;
+`variants` and legacy `methods` are capability lists, not array-index priority.
+`resolveHopExecution` resolves the outer transport and the concrete native
+selection together, after applying caller policy and provider overrides.
+
+| Provider | Default | Caller-policy fallback |
+| --- | --- | --- |
+| `claude_code` | `handrolled` for eligible first-party callers | `sdk-facade-capture` for other callers |
+| `chatgpt` | `handrolled` | — |
+| `cursor` | `acp` | — |
+| `muse` | `msp-capture` | — |
+| `kimi_code`, `grok` | `handrolled` | — |
+
+An unset preference uses these defaults. Global `ACTIVE_SUB_METHOD=handrolled`
+uses handrolled only where supported/permitted; otherwise it uses the provider's
+own default. A provider override in either vocabulary beats the global preference;
+caller policy beats both. Explicit legacy `bridge`/`bridge-capture` selectors keep
+their historical dispatch, and explicit concrete vendor selections remain exact.
+The registry's `legacyBridgeVariant` freezes old-daemon projection independently
+of the current default. See [configuration examples](../../docs/proposals/active-sub-method.md)
+and the exploratory [benchmark](../../routing-variants-bench.md). Handrolled-first
+is a policy choice, not a claim that it won the Codex benchmark. Defaults require
+an updated daemon binary; older binaries retain their shipped defaults.
+
+**Named execution variants (`execution-registry.ts` / `execution-identity.ts`).**
+An admin may configure an EXPLICIT provider-unprefixed integration id
+through the SAME `ACTIVE_SUB_METHOD` env (`stream-json`/`app-server`/`acp`/
+`msp`/`sdk-facade`, each with an optional `-capture` suffix — `agent-sdk` is
+still reserved but unregistered). The cloud decodes both grammars from one env
+string (`packages/api/lib/sub-method.ts`) and ships the explicit selection as
+versioned bootstrap fields (`execution_selection`/`execution_selections`) only
+to a daemon that negotiated `EXECUTION_SELECTION2_CAP`. `walker.ts` samples it
+once per request (same per-provider-override-then-global precedence as the
+legacy fields) and hands it to `native-runtime/serve.ts`, which resolves it
+through `execution-registry.ts`'s `PROVIDER_EXECUTION_REGISTRY` +
+`resolveExecutionSelection` for all four native-runtime providers (Claude
+direct `stream-json`, Codex `app-server`, Cursor `acp`, Muse `msp`) before
+either the tool or text dispatch branch. With no preference, the walker supplies
+the provider's concrete default; explicit legacy selectors instead retain the
+`shouldActivateBridgeRequestCapture` dispatch. A concrete selection either
+dispatches through the SAME base integration (its `capture` flag replaces the
+legacy heuristic, still gated by the same dynamic capture-readiness table) or
+refuses pre-dispatch with a typed reason — never a silent fallback to another
+variant/provider. The one request-shape gate this baseline defines: explicit
+Claude `stream-json`(`-capture`) refuses a caller-tool-bearing turn rather
+than silently invoking the held Agent SDK (`agent-sdk`) behind the
+`stream-json` label — legacy `bridge`/`bridge-capture` is unaffected and keeps
+its existing text→CLI / tools→SDK split. `execution-identity.ts` partitions
+native session/continuation state by `(provider, variant, capture)` so an
+explicit selection and a legacy dispatch for the same provider (or a sibling
+Claude variant — `sdk-facade` alongside `stream-json`) can never collide. See
+`docs/plan/bridge-variants-and-capture-adapters/09-implementation-plan.md`.
+
+**Claude `sdk-facade`/`sdk-facade-capture` (`claude-sdk-facade.ts` /
+`claude-sdk-facade-capture.ts` /`claude-facade-mcp-server.ts`, phase 6,
+`docs/plan/bridge-variants-and-capture-adapters/12-hermes-adoption-plan.md`
+H1-H4).** Reachable through an explicit `sdk-facade`/`sdk-facade-capture`
+selection or Claude's non-first-party default (`sdk-facade-capture`). It is an
+independently-selectable Claude integration; explicit `stream-json` and legacy
+Agent SDK dispatch remain available. Unlike `stream-json` (single buffered
+stdin write, `--resume`-based session persistence) or `agent-sdk` (a held
+`query()`), `sdk-facade` drives `claude -p --input-format stream-json
+--output-format stream-json` with the ENTIRE canonical history replayed as
+framed input lines every turn — `--no-session-persistence`, no vendor session
+at all. The `shouldQuery: false` acknowledgment contract is ROLE-SPECIFIC,
+matching the reference implementation this facade is adapted from exactly
+(`tmp/hermes-claude-sdk-reference/directsdk.py:581-595`): only a non-final
+`type:"user"` frame carries `shouldQuery: false` and must receive a zero-turn
+`result` acknowledgment before the next frame is sent; a `type:"assistant"`
+historical frame is always written unconditionally and is never acknowledged
+(Hermes-inspired structured full-history replay); the final frame (always
+`type:"user"`) is the turn's one real model call. This makes the variant
+STATELESS at the daemon level — no session-store
+lease, no new conversation identifier (00-requirements.md req. 5) — the
+client's own message history already correlates the turn, exactly like an
+ordinary completion call. History → frames reuses the SAME exact decomposition
+every other Claude tool path already uses
+(`request-capture-history.ts#historyTurnsFromCanonicalMessages` +
+`claude-tool-capture.ts#anthropicMessagesFromHistoryTurns`/
+`buildClaudeToolNameMap`) rather than a parallel planner, and caller tools are
+declared (schema only, never executed) via a dedicated loopback MCP server
+(`claude-facade-mcp-server.ts`) — `--max-turns 1` means the model's `tool_use`
+ends the turn before the CLI would ever invoke it. `sdk-facade-capture`
+attaches interception BEFORE spawning the SAME base runtime and reuses the
+existing Claude capture loopback/session/commit machinery
+(`claude-capture.ts#startClaudeCaptureLoopback`/`commitFromChunkStream`/
+`declinedForNonOkCapturedResponse`, `request-capture.ts`) rather than a
+duplicated relay — replay itself makes no network request, so only the final
+frame's one real `/v1/messages` POST is ever intercepted. Hermetic protocol
+fixture: `tests/transport/native-runtime-fixtures/fake-claude-facade.ts`
+(`tests/transport/claude-sdk-facade{,-capture}.test.ts`). REAL-CLI construction
+proof (H1, opt-in `RUN_DAEMON_LIVE=1`, no login —
+`tests/transport/claude-sdk-facade-real-cli-construction.e2e.test.ts`)
+confirms the role-specific contract above against the real installed CLI: a
+`type:"user"` `shouldQuery:false` replay frame IS acknowledged with a
+zero-turn `result`; a `type:"assistant"` frame written WITHOUT `shouldQuery`
+is never acknowledged and never waited on. Proven end to end through the
+ACTUAL production functions, never a hand-rolled spawn: `runClaudeSdkFacade
+Capture` reaches exactly one real `/v1/messages` POST for a single-turn
+request, for a genuinely multi-turn request (system + user + assistant +
+user, each turn a unique sentinel) — with the captured body's `messages`
+array structurally verified as the ORDERED `[user, assistant, user]` triple,
+each turn's sentinel in the right slot and no other turn's bled in — and for
+a tool_use/tool_result continuation, with the captured `tool_use` block
+carrying the CLI's `mcp__openllm__`-prefixed wire name, original call id and
+parsed input, and the `tool_result` block carrying the original id and
+content. `runClaudeSdkFacade` — the NORMAL, non-capture path — separately
+replays the same multi-turn history against a real local fake SSE upstream
+and produces a COMMITTED run with matching output and confirmed history
+delivery. **An earlier stage of this facade mis-adapted the reference
+protocol** (assigning `shouldQuery: false` to every non-final frame BY
+INDEX, including assistant frames, rather than by role) and, on finding the
+real CLI never acks an assistant-typed frame, concluded multi-turn history
+was unsupported by the vendor CLI and added a pre-spawn refusal for it. That
+refusal has been REMOVED: with the corrected, role-specific construction, an
+assistant frame is never assigned the flag that would make the replay loop
+wait for a nonexistent acknowledgment, so there is no hang to guard against
+and no unsupported shape to refuse. All of the above is CONSTRUCTION/SHAPE
+proof against a local mock upstream — never proof under genuine
+authenticated inference, a different CLI version, or real network
+conditions. Subsequent live-authenticated text, caller-tool, tool-result and
+three-turn measurements are recorded in [routing-variants-bench.md](../../routing-variants-bench.md),
+run `1790691747528`; those measurements, not the isolated construction proof,
+inform the new provider default.
+Capture turns force cold construction + full-history seed
+(`captureAwareTextBuilderPlan` / `historyTurnsFromCanonicalMessages` +
+`captureAwareHistoryBuilderPlan`) and never publish a warm resume handle.
+Under capture, tool turns route through `serveCapturedToolTurn`
+(`runClaudeToolCapture` / `runCodexCapturedToolTurn`) — never the ordinary
+held SDK / app-server execution path. Claude multi-turn tool continuation is
+**live-proven** via `sdk_session_resume`: the daemon writes an owned synthetic
+session JSONL under the isolated `CLAUDE_CONFIG_DIR` (assistant `tool_use` +
+caller `tool_result`) and resumes it through the Agent SDK — a direct
+`AsyncIterable<SDKUserMessage>` with a forged assistant-role message is
+rejected by the real CLI, so this on-disk resume is the only proven path, and
+reasoning/thinking-block history remains explicitly refused rather than
+invented. Codex multi-turn tool continuation is also **live-proven** via
+`thread/inject_items` (real builder/auth/sender; the validation run set an
+explicit `codexStructuredInjectProven` override, which is now the production
+default following that proof). Neither Claude's nor Codex's continuation
+carries a warm-session or cache-ID stability claim, and no number in the live
+report is a statistical or speedup claim — every measurement is a single
+observation. Accepted/uncertain capture ownership terminates the entire walk
+(no second send).
+
+**Execution-selection diagnostics and phase timing (plan phase 8,
+09-implementation-plan.md §8.3).** Every concrete selection (configured or default)
+`native-runtime/serve.ts`'s `resolveExplicitDispatch` resolves — for all four
+migrated providers, one shared call site — logs a `debug`-level "execution
+selection resolved" line with the requested token
+(`formatActiveExecutionToken`) alongside the effective outcome: `accepted`
+with its resolved variant/capture, or `refused` with a typed refusal kind
+(`unsupported_execution_variant`/`unsupported_execution_shape`/
+`capture_not_supported`/`capture_not_ready`/`handrolled_unreachable`). The
+explicit legacy-selector hop has no concrete selection and retains its own
+diagnostics; concrete provider defaults use the same resolution diagnostics. Metadata-only: provider/variant/
+capture/outcome tags, never the request body, prompt, or credentials. Claude
+`sdk-facade`/`sdk-facade-capture` additionally share ONE phase-timing emitter
+(`claude-sdk-facade.ts#logSdkFacadePhaseTiming`, called by both the native
+runner and `claude-sdk-facade-capture.ts` rather than a second
+implementation) that logs elapsed milliseconds and the run's closed
+`committed`/`declined` outcome — the same numbers-plus-outcome convention
+`muse-runtime.ts`'s existing phase timings already use, common to both base
+and capture mode so neither variant's timing signal drifts from the other's.
 
 **Claude tool-passthrough (`claude-tool-session.ts` + `claude-tool-serve.ts`).**
 A tool-bearing `claude_code` request (client function tools present) is served

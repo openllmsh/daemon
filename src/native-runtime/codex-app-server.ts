@@ -35,7 +35,11 @@ import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import { DAEMON_VERSION } from "../version";
-import { CODEX_HOSTED_WEB_SEARCH_CONFIG } from "./codex-web-search";
+import type { TClientTool } from "./claude-tool-session";
+import {
+  CODEX_HOSTED_WEB_SEARCH_CONFIG,
+  suppressHostedSearchClientTool,
+} from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
@@ -100,6 +104,39 @@ type TThreadSink = {
    *  `item.type: "webSearch"`) — the provider ran it; we only report it so
    *  client wires can re-encode the lifecycle (Claude Code counts these). */
   onWebSearch?: (call: TServerSearchCall) => void;
+  /**
+   * Non-terminal stream/retry error (`error` notification with
+   * `willRetry: true`). `openai/codex` (`rust-v0.156.0`
+   * `app-server/.../bespoke_event_handling.rs`) emits these for
+   * `EventMsg::StreamError` ("Reconnecting... N/M") WITHOUT ending the turn;
+   * only `willRetry: false` / `turn/completed` are terminals. Optional — sinks
+   * that only care about terminals can omit this.
+   */
+  onRetryError?: (
+    message: string,
+    info: {
+      readonly willRetry: true;
+      readonly codexErrorInfo: unknown;
+      readonly additionalDetails: string | null;
+    },
+  ) => void;
+};
+
+export type TCodexAppServerClientOptions = {
+  /**
+   * Extra argv inserted after `app-server` (e.g. `-c chatgpt_base_url=…`).
+   * Used by the bridge-request-capture path; the shared warm client passes none.
+   * Daemon-authored flags ONLY — never caller text (SP-6: no system prompt /
+   * user text in argv); production capture uses the ephemeral CODEX_HOME
+   * config.toml instead.
+   */
+  readonly spawnArgvExtra?: readonly string[];
+  /**
+   * When true, this client is NOT registered in the process-wide warm map and
+   * callers are expected to {@link CodexAppServerClient.dispose} it. Capture
+   * builders must be isolated from the shared app-server.
+   */
+  readonly isolated?: boolean;
 };
 
 class CodexAppServerClient {
@@ -117,11 +154,29 @@ class CodexAppServerClient {
    *  failed-init detach). The next start() waits for it first so the stale
    *  stdout pump has finished draining before a successor is born. */
   private supersededRelease: Promise<TReapOutcome> | null = null;
+  /**
+   * The CURRENT/most-recent child, retained here (not read off `this.child`)
+   * so it survives a `dispose()` call — `dispose()`/teardown null
+   * `this.child` immediately, but this field is only reassigned by
+   * {@link start} on the NEXT spawn. This is what makes
+   * {@link disposeAndWaitForExit} idempotent: a synchronous `dispose()`
+   * followed by `disposeAndWaitForExit()`, or two concurrent
+   * `disposeAndWaitForExit()` calls, all await the SAME supervised child's
+   * (memoized) `terminate()`, so none can resolve early.
+   */
+  private lastChild: TSupervisedChild | null = null;
+  private readonly spawnArgvExtra: readonly string[];
+  /** True when created via {@link createIsolatedCodexAppServerClient}. */
+  readonly isolated: boolean;
 
   constructor(
     private readonly bin: string,
     private readonly env: Record<string, string>,
-  ) {}
+    options: TCodexAppServerClientOptions = {},
+  ) {
+    this.spawnArgvExtra = options.spawnArgvExtra ?? [];
+    this.isolated = options.isolated === true;
+  }
 
   /** Spawn + handshake exactly once per child; respawn after an exit. */
   ensureStarted(): Promise<void> {
@@ -136,6 +191,61 @@ class CodexAppServerClient {
       if (this.initialized === started) this.initialized = null;
     });
     return started;
+  }
+
+  /**
+   * Kill the child and reject in-flight RPCs. Required for isolated capture
+   * builders; safe but unusual for the shared warm client. Signals the kill
+   * of the process group via the supervisor's TERM→KILL ladder and returns
+   * immediately — it does NOT wait for the process to actually exit (that's
+   * {@link disposeAndWaitForExit}). Unchanged: kept exactly as the shared
+   * warm client's fire-and-forget teardown always worked.
+   */
+  dispose(): void {
+    const child = this.child;
+    this.teardown("codex app-server disposed");
+    void child?.terminate().catch((): TReapOutcome => "reap_unconfirmed");
+  }
+
+  /**
+   * Same signal + teardown as {@link dispose} (calls it verbatim, so the
+   * shared warm client's immediate/fire-and-forget behavior is untouched),
+   * but resolves only once the child has ACTUALLY exited — awaits the
+   * supervised child's `terminate()` rather than returning as soon as the
+   * kill signal is sent. `kill()` only requests termination; the process
+   * can still be running — and, in the capture path, still holding/reading
+   * its ephemeral `CODEX_HOME` — for a window after `dispose()` returns.
+   * Callers that must delete that directory (isolated capture builders)
+   * need this, not `dispose()`, to avoid deleting out from under a
+   * still-live child.
+   *
+   * IDEMPOTENT and safe to call concurrently or after a prior synchronous
+   * `dispose()`: reads {@link lastChild} BEFORE calling `dispose()`, so
+   * every caller — however many, in whatever order relative to a plain
+   * `dispose()` — awaits the SAME child, and `terminate()` is memoized per
+   * child so none can resolve early.
+   *
+   * A `reap_unconfirmed` outcome is NOT treated as a confirmed exit — it
+   * rejects (the caller could otherwise delete a directory a still-running
+   * child is using). The rejection propagates; callers that chain cleanup
+   * after this MUST NOT run that cleanup from a `.catch()` on this call.
+   */
+  async disposeAndWaitForExit(): Promise<void> {
+    const child = this.lastChild;
+    this.dispose();
+    if (child === null) return;
+    const outcome = await child.terminate();
+    if (outcome === "reap_unconfirmed") {
+      throw new Error("codex app-server process group reap unconfirmed");
+    }
+  }
+
+  /** Settles once the most recent child's process tree is confirmed gone
+   *  (the supervisor's `whenReleased`), however long that takes. */
+  whenReleased(): Promise<void> {
+    return (
+      this.lastChild?.whenReleased.then(() => undefined) ?? Promise.resolve()
+    );
   }
 
   private async start(): Promise<void> {
@@ -162,8 +272,9 @@ class CodexAppServerClient {
         if (waitTimer !== undefined) clearTimeout(waitTimer);
       }
     }
+    const argv = [this.bin, "app-server", ...this.spawnArgvExtra];
     const child = withSandboxSpawn(
-      [this.bin, "app-server"],
+      argv,
       (wrapped) =>
         superviseSpawn(wrapped, {
           kind: "native-runtime",
@@ -176,8 +287,16 @@ class CodexAppServerClient {
       undefined,
     );
     this.child = child;
+    // Reset for THIS spawn — a respawn (shared warm client only) must not
+    // let a stale `disposeAndWaitForExit()` caller from the PREVIOUS child
+    // keep awaiting a reap for a process that's gone.
+    this.lastChild = child;
     const proc = child.subprocess;
     await child.sandbox?.ready;
+    // Disposed while the sandbox handshake was pending: never drive the
+    // protocol on a child the caller already tore down.
+    if (this.child !== child)
+      throw new Error("codex app-server disposed during startup");
     this.stdin = proc.stdin as unknown as {
       write: (s: string) => void;
       flush?: () => void;
@@ -193,10 +312,14 @@ class CodexAppServerClient {
     );
     // Only the CURRENT child's exit may tear the client down — a stale
     // child's late `exited` (e.g. after an init-failure kill) must not wipe
-    // a successor's state.
-    void proc.exited.then(() => {
-      if (this.child === child) this.teardown("codex app-server exited");
-    });
+    // a successor's state. Settle whichever way `exited` settles.
+    const onExit = (reason: string) => (): void => {
+      if (this.child === child) this.teardown(reason);
+    };
+    void proc.exited.then(
+      onExit("codex app-server exited"),
+      onExit("codex app-server exited (unexpectedly)"),
+    );
     try {
       await this.request("initialize", {
         clientInfo: {
@@ -247,7 +370,7 @@ class CodexAppServerClient {
     this.stdin = null;
     this.child = null;
     if (superseded !== null) this.supersededRelease = superseded.whenReleased;
-    this.initialized = null; // next request respawns
+    this.initialized = null; // next request respawns (shared warm client only)
   }
 
   private send(message: Record<string, unknown>): void {
@@ -422,7 +545,12 @@ class CodexAppServerClient {
             readonly status?: string;
             readonly error?: { readonly message?: string } | null;
           };
-          readonly error?: { readonly message?: string };
+          readonly error?: {
+            readonly message?: string;
+            readonly codexErrorInfo?: unknown;
+            readonly additionalDetails?: string | null;
+          };
+          readonly willRetry?: boolean;
         }
       | undefined;
     const threadId = params?.threadId;
@@ -494,9 +622,26 @@ class CodexAppServerClient {
           params?.turn?.error?.message ?? null,
         );
         return;
-      case "error":
-        sink.onCompleted("failed", params?.error?.message ?? "codex error");
+      case "error": {
+        // Preserve retry-vs-terminal. StreamError → ErrorNotification with
+        // willRetry:true ("Reconnecting... N/M") is NOT a turn terminal
+        // (bespoke_event_handling.rs EventMsg::StreamError). Treating it as
+        // onCompleted("failed") races capture and swallows the real cause.
+        const message = params?.error?.message ?? "codex error";
+        if (params?.willRetry === true) {
+          sink.onRetryError?.(message, {
+            willRetry: true,
+            codexErrorInfo: params.error?.codexErrorInfo ?? null,
+            additionalDetails:
+              typeof params.error?.additionalDetails === "string"
+                ? params.error.additionalDetails
+                : null,
+          });
+          return;
+        }
+        sink.onCompleted("failed", message);
         return;
+      }
       default:
         return;
     }
@@ -519,6 +664,50 @@ export const clientFor = (
   clients.set(bin, created);
   return created;
 };
+
+/**
+ * Dispose the shared warm client for `bin` IF ONE EXISTS — never creates one.
+ * GET-ONLY by design: `clientFor` would spawn a fresh child on a miss, which
+ * is exactly wrong for a cleanup call (nothing to clean up must mean nothing
+ * happens, never "make one so we can kill it"). Deletes the captured
+ * instance from the shared map BEFORE disposing it, so a concurrent
+ * `clientFor(bin, env)` racing this call cannot receive (and then have
+ * unexpectedly killed out from under it) the exact instance being torn
+ * down — it will see the map miss and create its own fresh replacement
+ * instead. Awaits the real child exit via
+ * {@link CodexAppServerClient.disposeAndWaitForExit} (kill() alone only
+ * requests termination); resolves `false` when no shared client for `bin`
+ * was registered (nothing to dispose), `true` once the child has actually
+ * exited.
+ *
+ * Intended for a standalone short-lived caller process (e.g. a benchmark
+ * harness) that itself invoked `tryServeNativeRuntime` for a chatgpt
+ * "bridge" (non-capture) hop and thereby caused this module to create the
+ * shared client — never for use inside the daemon's own long-lived runtime,
+ * which must keep serving warm requests across calls.
+ */
+export const disposeSharedCodexAppServerClientAndWaitForExit = async (
+  bin: string,
+): Promise<boolean> => {
+  const existing = clients.get(bin);
+  if (existing === undefined) return false;
+  clients.delete(bin);
+  await existing.disposeAndWaitForExit();
+  return true;
+};
+
+/**
+ * Fresh app-server child that is NOT shared with {@link clientFor}. Capture
+ * builders must use this so `turn/interrupt` cannot disturb unrelated warm
+ * threads, and so `-c chatgpt_base_url` / `-c openai_base_url` redirects apply
+ * only to the experimental child.
+ */
+export const createIsolatedCodexAppServerClient = (
+  bin: string,
+  env: Record<string, string>,
+  options: Omit<TCodexAppServerClientOptions, "isolated"> = {},
+): CodexAppServerClient =>
+  new CodexAppServerClient(bin, env, { ...options, isolated: true });
 
 export type TCodexNativeParams = {
   /** Absolute path to the isolated codex binary (`cliBin("chatgpt")`). */
@@ -545,6 +734,11 @@ export type TCodexNativeParams = {
    *  {@link POST_COMMIT_IDLE_TIMEOUT_MS}). Tests use a small value to exercise
    *  the mid-turn stall → `turn/interrupt` path without a real wait. */
   readonly postCommitIdleMs?: number;
+  /**
+   * When true (serve selected sub-method `bridge-capture` + readiness), run the
+   * isolated capture text path instead of the warm shared app-server bridge.
+   */
+  readonly bridgeCapture?: boolean;
 };
 
 /** Canonical `reasoning_effort` → app-server effort (same narrowing as the
@@ -583,11 +777,82 @@ export const codexBaseStartParams = (
   ...(systemText !== null ? { developerInstructions: systemText } : {}),
 });
 
+/** One dynamic (client function) tool as the app-server's `thread/start.dynamicTools`
+ *  entry shape (`inputSchema` is raw JSON — the client's JSON-Schema passes through). */
+export type TCodexDynamicToolSpec = {
+  readonly type: "function";
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Record<string, unknown>;
+};
+
+/**
+ * Map caller function tools → app-server `dynamicTools`, after dropping the
+ * hosted-search collision (Codex owns `web_search` on native hops — see
+ * `codex-web-search.ts`). Identical mapping was previously duplicated between
+ * the bridge tool path (`codex-tool-session.ts`) and the bridge-capture tool
+ * path (`codex-capture-tools.ts`); both now call this one definition.
+ */
+export const codexDynamicToolsFrom = (
+  tools: ReadonlyArray<TClientTool>,
+): ReadonlyArray<TCodexDynamicToolSpec> =>
+  suppressHostedSearchClientTool(tools).map((t) => ({
+    type: "function" as const,
+    name: t.name,
+    description: t.description ?? t.name,
+    inputSchema: t.parameters ?? { type: "object", properties: {} },
+  }));
+
+/**
+ * The `thread/start` fields shared by BOTH codex tool bridges — the bridge
+ * tool path (`codex-tool-session.ts`) and the bridge-capture tool path
+ * (`codex-capture-tools.ts`) — layered on top of {@link codexBaseStartParams}.
+ * Routes dynamic-tool calls to US via `item/tool/call` instead of the
+ * `codex-code-mode-host` sidecar (which the isolated install doesn't ship).
+ * Verified live 2026-07-14: with code-mode ON the call never reaches the
+ * client (once misread as "0.144.0 doesn't emit item/tool/call"); with it
+ * OFF the call fires and the turn completes. `experimentalRawEvents` matches
+ * openclaw's `thread/start`.
+ */
+export const codexToolStartParams = (
+  providerModelId: string,
+  systemText: string | null,
+  dynamicTools: ReadonlyArray<TCodexDynamicToolSpec>,
+): Record<string, unknown> => ({
+  ...codexBaseStartParams(providerModelId, systemText),
+  features: { code_mode: false, code_mode_only: false },
+  experimentalRawEvents: true,
+  dynamicTools,
+});
+
+/**
+ * The `turn/start` input shared by EVERY codex call site — bridge text
+ * (`runCodexNative`), bridge tool (`codex-tool-session.ts`), bridge-capture
+ * text (`codex-capture.ts`), and bridge-capture tool (`codex-capture-tools.ts`):
+ * one text element (no `text_elements` payload of our own) plus the optional
+ * canonical `effort`.
+ */
+export const codexTurnStartParams = (
+  threadId: string,
+  text: string,
+  effort: string | null,
+): Record<string, unknown> => ({
+  threadId,
+  input: [{ type: "text", text, text_elements: [] }],
+  ...(effort !== null ? { effort } : {}),
+});
+
 export const runCodexNative = async (
   params: TCodexNativeParams,
 ): Promise<TNativeRunResult> => {
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "codex CLI not installed" };
+  }
+  // bridge-capture sub-method (W4). Dynamic import keeps the warm path free of
+  // a hard cycle with `codex-capture.ts`.
+  if (params.bridgeCapture === true) {
+    const { runCodexCapturedTextTurn } = await import("./codex-capture");
+    return await runCodexCapturedTextTurn(params);
   }
   const client = clientFor(params.bin, params.env);
   let threadId: string;
@@ -709,11 +974,10 @@ export const runCodexNative = async (
 
   const effort = effortOf(params.reasoningEffort);
   try {
-    const turn = (await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: params.userText, text_elements: [] }],
-      ...(effort !== null ? { effort } : {}),
-    })) as { turn?: { id?: string } };
+    const turn = (await client.request(
+      "turn/start",
+      codexTurnStartParams(threadId, params.userText, effort),
+    )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {
     client.removeSink(threadId);

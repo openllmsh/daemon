@@ -184,6 +184,8 @@ import {
 } from "./client-encode";
 import { recordRequest } from "./cloud-client";
 import {
+  activeExecutionSelection,
+  activeExecutionSelectionOverrides,
   activeSubMethod,
   activeSubMethodOverrides,
   contextOverflowStrategy as bootstrapContextOverflowStrategy,
@@ -208,6 +210,7 @@ import {
 } from "./hop-cooldown";
 import { logWarn, safeDiagnosticMessage } from "./logger";
 import { maybeReportModels } from "./model-report";
+import type { TNativeServeOutcome } from "./native-runtime/serve";
 import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
@@ -216,7 +219,12 @@ import type { TNativeTokens } from "./native-runtime/types";
 import { tokensFromResponse, ZERO_TOKENS } from "./native-runtime/types";
 import { clearPlanCache } from "./plan-cache";
 import { isSandboxRejectionResponse } from "./sandbox/exec";
-import { isClaudeCodeOriginator, localMethodsForHop } from "./sub-method";
+import {
+  isClaudeCodeOriginator,
+  localMethodsForHop,
+  methodsIncludeNativeBridge,
+  resolveHopExecution,
+} from "./sub-method";
 import { tunnelToPeer } from "./tunnel-client";
 import { fetchWithBoundedRedirects } from "./upstream-redirect";
 import {
@@ -227,6 +235,23 @@ import {
 
 /** Test seam: how many immediate status pushes auth-cooldown marks requested. */
 let authCooldownStatusPushesForTests = 0;
+
+type TTryServeNativeRuntime = typeof tryServeNativeRuntime;
+let tryServeNativeRuntimeOverride: TTryServeNativeRuntime | null = null;
+
+/** Install (or clear with `null`) a test-only native serve implementation. */
+export const setTryServeNativeRuntimeForTest = (
+  impl: TTryServeNativeRuntime | null,
+): void => {
+  tryServeNativeRuntimeOverride = impl;
+};
+
+const serveNativeRuntime = (
+  ...args: Parameters<TTryServeNativeRuntime>
+): Promise<TNativeServeOutcome> =>
+  tryServeNativeRuntimeOverride !== null
+    ? tryServeNativeRuntimeOverride(...args)
+    : tryServeNativeRuntime(...args);
 
 export const noteWalkerStreamTerminal = (opts: {
   readonly aborted: boolean;
@@ -1415,7 +1440,26 @@ export const formatHopFailuresHeader = (
     })
     .join(";");
 
-const serveSubscription = async (
+/** The handrolled transport's upstream wire for `provider`, or `undefined`
+ *  when the provider has no manual (handrolled) transport at all (cursor,
+ *  muse). A read-only lookup over the same `UPSTREAM_WIRE` table
+ *  `serveSubscriptionHop` uses — never a second, duplicated map — so a
+ *  benchmark or diagnostic caller can determine handrolled-eligibility
+ *  without re-deriving the provider→wire mapping. */
+export const upstreamWireFor = (provider: string): TUpstreamWire | undefined =>
+  UPSTREAM_WIRE[provider];
+
+/**
+ * The walker's manual (handrolled) upstream-HTTP transport for one
+ * subscription hop — exported ONLY as a benchmark/diagnostic seam (see
+ * `scripts/bridge-capture-benchmark/`). Production call sites remain
+ * `serveSubscriptionHop`'s own internal calls above; this export changes no
+ * behavior, it just lets an external, read-only caller reuse the exact same
+ * `acquireUpstream` → `buildUpstreamRequest` → streaming/cleanup pipeline
+ * production handrolled dispatch already runs, rather than reimplementing
+ * headers/credential-acquisition/body-adaptation in a parallel script.
+ */
+export const serveSubscription = async (
   hop: THop,
   wire: TUpstreamWire,
   args: TWalkArgs,
@@ -2645,12 +2689,19 @@ const walkPlan = async (
   // overrides — sampled ONCE per request from the cached bootstrap
   // snapshot so it can never switch mid-hop (a bootstrap refresh landing
   // mid-walk applies to the NEXT request). Resolved per hop against the
-  // provider's declared methods in `localMethodsForHop` (capability table +
-  // preference + ToS: CC originator → handrolled-only; non-CC claude_code →
-  // bridge-only; cursor → bridge-only).
+  // provider's declared defaults in `resolveHopExecution` (both vocabularies +
+  // caller policy: first-party Claude → handrolled-only; other Claude callers
+  // and Cursor/Muse → vendor runtime only).
   const requestedSubMethod = activeSubMethod();
   const subMethodOverrides = activeSubMethodOverrides();
   const claudeCodeOriginator = isClaudeCodeOriginator(args.req.headers);
+  // The same env's NEW-vocabulary projection (populated only when this
+  // daemon negotiated `EXECUTION_SELECTION2_CAP` — see `cloud-client.ts`),
+  // sampled together so it can never switch mid-hop either. Missing preferences
+  // resolve to registry defaults; explicit legacy selectors keep their old
+  // request-shape-dependent dispatch.
+  const requestedExecutionSelection = activeExecutionSelection();
+  const executionSelectionOverrides = activeExecutionSelectionOverrides();
 
   let lastError: string | null = null;
   let firstTerminalResponse: Response | null = null;
@@ -2892,14 +2943,17 @@ const walkPlan = async (
       return HOP_CONTINUE;
     }
 
-    // Ordered local transports for THIS hop — capability table + preference
-    // + ToS policy (non-CC claude_code → bridge only; cursor → bridge only;
-    // handrolled preference → handrolled only). No per-slug branches here.
-    const methods = localMethodsForHop(
-      hop.provider,
-      subMethodOverrides[hop.provider] ?? requestedSubMethod,
-      { isClaudeCode: claudeCodeOriginator },
-    );
+    // Resolve the outer transport and concrete variant together: a global
+    // handrolled preference must not leak into a bridge-only provider's native
+    // dispatch after its outer selector has fallen back to the provider default.
+    const { methods, executionSelection } = resolveHopExecution({
+      provider: hop.provider,
+      legacyPreference: requestedSubMethod,
+      legacyOverrides: subMethodOverrides,
+      executionPreference: requestedExecutionSelection,
+      executionOverrides: executionSelectionOverrides,
+      originator: { isClaudeCode: claudeCodeOriginator },
+    });
     const wire = UPSTREAM_WIRE[hop.provider];
     const hasHandrolledFallback =
       methods.includes("handrolled") && wire !== undefined;
@@ -2907,11 +2961,15 @@ const walkPlan = async (
     let nativeCooldownReason: TCooldownReason | undefined;
     let handrolledRetry: THopRetry | null = null;
 
-    if (methods.includes("bridge") && isNativeRuntimeProvider(hop.provider)) {
+    if (
+      methodsIncludeNativeBridge(methods) &&
+      isNativeRuntimeProvider(hop.provider)
+    ) {
       // Official vendor runtime (Claude stream-json / Codex app-server /
-      // cursor ACP). Pre-commit declines fall through to handrolled when
-      // `methods` still allows it; otherwise fleet (below).
-      const native = await tryServeNativeRuntime({
+      // cursor ACP). `bridge-capture` is the same entry with capture forced
+      // for ready providers (Claude/Codex text). Pre-commit declines fall
+      // through to handrolled when `methods` still allows it; otherwise fleet.
+      const native = await serveNativeRuntime({
         provider: hop.provider,
         providerModelId: hop.providerModelId,
         surface: args.surface,
@@ -2924,6 +2982,8 @@ const walkPlan = async (
         // fallback. Until a durable owner registry exists, validation below gives
         // a precise wrong-owner/epoch decline rather than a misleading map miss.
         continuationToken: args.req.headers.get(TOOL_SESSION_HEADER),
+        bridgeCapture: methods.includes("bridge-capture"),
+        executionSelection,
         stripSubagentIsolation: hop.stripSubagentIsolation,
         signal: args.req.signal,
         record: (tokens, status) =>
@@ -3023,6 +3083,28 @@ const walkPlan = async (
       }
       nativeDecline = `native hop ${hop.modelId} declined: ${native.declined}`;
       nativeCooldownReason = native.cooldownReason;
+      // Capture already owned (or may have owned) the upstream send — never
+      // handroll, fleet, or advance to another provider for the same turn.
+      const captureOwnership = native.captureOwnership;
+      if (captureOwnership === "accepted" || captureOwnership === "uncertain") {
+        if (args.req.signal.aborted) {
+          return {
+            response: errorJson(499, "client aborted request"),
+            servedLocally: true,
+          };
+        }
+        addHopFailure(hop, nativeDecline, undefined, nativeCooldownReason);
+        lastError = nativeDecline;
+        return {
+          response: errorJson(
+            502,
+            captureOwnership === "uncertain"
+              ? `${nativeDecline} (capture send may have reached upstream; not retried)`
+              : nativeDecline,
+          ),
+          servedLocally: true,
+        };
+      }
       if (hasHandrolledFallback) {
         nativeDecline += " — served by the manual transport";
       }

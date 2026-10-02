@@ -24,17 +24,14 @@
 
 import { randomUUID } from "node:crypto";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import {
-  createSdkMcpServer,
-  query,
-  tool,
-} from "@anthropic-ai/claude-agent-sdk";
+import { query, tool } from "@anthropic-ai/claude-agent-sdk";
 import type {
   TChatCompletionResponse,
   TServerSearchCall,
 } from "@openllmsh/protocol";
 import { z } from "zod";
-import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
+import { ensureVendorKeychainReady } from "../delegation/util";
+import { CLAUDE_TOOL_PASSTHROUGH_SCOPE } from "../execution-identity";
 import type {
   TToolContinuationIdentity,
   TValidatedToolContinuation,
@@ -44,6 +41,10 @@ import {
   validateToolContinuation,
 } from "./claude-tool-continuation";
 import type { TSdkUserContent } from "./claude-tool-media";
+import {
+  buildClaudeToolSdkOptionsBase,
+  claudeToolResumeAndSystemPromptOptions,
+} from "./claude-tool-sdk-options";
 import type { TNativeTokens } from "./types";
 import { cleanNativeSpawnEnv, normalizeNativeTerminalResult } from "./types";
 
@@ -51,12 +52,25 @@ import { cleanNativeSpawnEnv, normalizeNativeTerminalResult } from "./types";
 const HELD_TTL_MS = 10 * 60 * 1000;
 /** How long to wait for the model's first output / next pause. */
 const DRIVE_TIMEOUT_MS = 120_000;
+/** Mutable so `setDriveTimeoutMsForTest` can shrink it for deterministic,
+ *  bounded coverage of the deadline race in `drive()` — production never
+ *  calls the setter, so this is always {@link DRIVE_TIMEOUT_MS}. */
+let driveTimeoutMs = DRIVE_TIMEOUT_MS;
+/** Test-only timeout override for deterministic drive()-deadline coverage
+ *  (mirrors `setMuxAckTimeoutForTest` in `mux-host.ts`). Pass `null` to
+ *  restore the production value. */
+export const setDriveTimeoutMsForTest = (timeoutMs: number | null): void => {
+  driveTimeoutMs = timeoutMs ?? DRIVE_TIMEOUT_MS;
+};
 /** After the FIRST tool handler fires, how long to keep collecting the rest of
  *  a parallel tool_use burst before returning. Parallel handlers fire within
  *  milliseconds; this only bounds a pathological unpaired block so it can't
  *  wait out the whole drive deadline. */
 const FIRE_SETTLE_MS = 2_000;
-const MCP_PREFIX = "mcp__openllm__";
+/** MCP server name prefix the Agent SDK applies to in-process tools. */
+export const CLAUDE_MCP_TOOL_PREFIX = "mcp__openllm__";
+/** @deprecated Prefer {@link CLAUDE_MCP_TOOL_PREFIX}. */
+const MCP_PREFIX = CLAUDE_MCP_TOOL_PREFIX;
 const DEFAULT_CONTINUATION_IDENTITY: TToolContinuationIdentity = {
   subject: "local",
   ownerDaemonKey: "local",
@@ -64,7 +78,10 @@ const DEFAULT_CONTINUATION_IDENTITY: TToolContinuationIdentity = {
   secret: randomUUID(),
 };
 
-const sanitize = (name: string): string => name.replace(/[^a-zA-Z0-9_-]/g, "_");
+/** Sanitize a caller tool name for MCP registration (Agent SDK constraint). */
+export const sanitizeClaudeMcpToolName = (name: string): string =>
+  name.replace(/[^a-zA-Z0-9_-]/g, "_");
+const sanitize = sanitizeClaudeMcpToolName;
 const nowMs = (): number => Date.now();
 
 /** SDK assistant-message usage (Anthropic `BetaUsage`) → the daemon token row,
@@ -203,7 +220,25 @@ export type TToolTurnResult =
       readonly usage?: TNativeTokens;
       readonly serverSearchCalls?: ReadonlyArray<TServerSearchCall>;
     }
-  | { readonly kind: "declined"; readonly reason: string };
+  | {
+      readonly kind: "declined";
+      readonly reason: string;
+      /**
+       * Mirrors `TNativeRunResult`'s capture-ownership field (same name, same
+       * walker check — `walker.ts` reads `native.captureOwnership` on ANY
+       * declined native outcome, not only capture ones) so an indeterminate
+       * `streamInput` failure is protected the identical way a capture upstream
+       * send is: `"uncertain"` when a send to the live SDK Query may have
+       * partially gone out (its `streamInput` call threw) — the walker must
+       * treat the hop as terminal (502) rather than retrying via handrolled or
+       * fleet transport, which would resend this turn (tool result + context)
+       * a second time over a different transport. Closing an already-started
+       * held query on a missing capability is also terminal (`"accepted"`),
+       * because closeHeld resolves its pending handlers. `"none"` (or omitted)
+       * is reserved for declines before taking ownership of a live query.
+       */
+      readonly captureOwnership?: "none" | "accepted" | "uncertain";
+    };
 
 /** Shared channel between the paused tool handlers and the driver: fired
  *  handler resolvers, plus a one-shot wake for the driver. Exported so tests
@@ -216,8 +251,29 @@ export type TChannel = {
 
 type TStep = { done?: boolean; value?: unknown };
 
+/** An `AsyncIterator<unknown>` carrying a duck-typed `streamInput` — attached
+ *  by the real SDK Query path ({@link buildIterator}) unconditionally, so a
+ *  held session missing it is a genuine failure, not a supported variant to
+ *  gracefully degrade from (see {@link continueToolTurn}'s fail-closed
+ *  handling). Typed as optional only because `AsyncIterator<unknown>`
+ *  (the `TIteratorFactory` contract) can't statically guarantee it — every
+ *  test fake must attach a real one. */
+type TClaudeToolIterator = AsyncIterator<unknown> & {
+  streamInput?: (text: string) => Promise<void>;
+  /** Tears down the never-completing queue backing `streamInput` (see
+   *  {@link makeUserMessageQueue}); called from {@link closeHeld}. */
+  closeStreamInput?: (reason: unknown) => void;
+};
+
 type THeld = {
   readonly it: AsyncIterator<unknown>;
+  /** See {@link TClaudeToolIterator} — reaches the same object as `it`.
+   *  `undefined` here is a construction defect, not a supported fallback
+   *  path; {@link continueToolTurn} fails closed rather than folding
+   *  context into a tool's own output when this is missing. */
+  readonly streamInput?: (text: string) => Promise<void>;
+  /** See {@link TClaudeToolIterator.closeStreamInput}. */
+  readonly closeStreamInput?: (reason: unknown) => void;
   readonly chan: TChannel;
   /** client tool-call id → the paused handler's resolver. */
   readonly pending: Map<string, (result: string) => void>;
@@ -261,7 +317,9 @@ const sameContinuationScope = (
 ): boolean =>
   left.subject === right.subject &&
   left.ownerDaemonKey === right.ownerDaemonKey &&
-  left.ownerDaemonEpoch === right.ownerDaemonEpoch;
+  left.ownerDaemonEpoch === right.ownerDaemonEpoch &&
+  (left.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE) ===
+    (right.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE);
 
 const fingerprintOf = (
   continuationIdentity: TToolContinuationIdentity,
@@ -274,6 +332,8 @@ const fingerprintOf = (
       subject: continuationIdentity.subject,
       ownerDaemonKey: continuationIdentity.ownerDaemonKey,
       ownerDaemonEpoch: continuationIdentity.ownerDaemonEpoch,
+      executionScope:
+        continuationIdentity.executionScope ?? CLAUDE_TOOL_PASSTHROUGH_SCOPE,
     },
     tokenId: validatedToken.tokenId,
     results: toolResults
@@ -281,6 +341,14 @@ const fingerprintOf = (
       .sort((a, b) => a.id.localeCompare(b.id)),
     injectedContext,
   });
+
+/** Stamp `captureOwnership: "accepted"` onto an unmarked `declined` result —
+ *  used once a send is definitely committed, so a later failure never reads
+ *  as safe to retry. Never downgrades an existing marker. */
+const markAcceptedIfDeclined = (result: TToolTurnResult): TToolTurnResult =>
+  result.kind === "declined" && result.captureOwnership === undefined
+    ? { ...result, captureOwnership: "accepted" }
+    : result;
 
 const replayedResultOf = (result: TToolTurnResult): TToolTurnResult => {
   if (result.kind === "declined") return result;
@@ -352,6 +420,10 @@ const closeHeld = (h: THeld): void => {
   // rejection once we stop draining the iterator.
   h.nextP?.catch(() => undefined);
   h.nextP = null;
+  // Release the persistent streamInput queue (see `makeUserMessageQueue`) —
+  // it deliberately never completes on its own, so it must be torn down
+  // explicitly or it leaks a dangling `wake` promise past session close.
+  h.closeStreamInput?.(new Error("held tool session closed"));
   void h.it.return?.(undefined).catch(() => undefined);
   dropIndex(h);
 };
@@ -408,6 +480,120 @@ export const sdkPromptOf = (
   };
 };
 
+/** One pending user-role message awaiting delivery confirmation. */
+type TQueuedUserMessage = {
+  readonly text: string;
+  readonly resolve: () => void;
+  readonly reject: (err: unknown) => void;
+};
+
+type TSdkUserMessage = {
+  readonly type: "user";
+  readonly message: { readonly role: "user"; readonly content: string };
+  readonly parent_tool_use_id: null;
+};
+
+/**
+ * A queue-backed `AsyncIterable<SDKUserMessage>` feeding the real SDK's
+ * `Query.streamInput`, plus the `push`/`close` handles the daemon drives it
+ * with.
+ *
+ * Invariant: the generator backing this iterable must NEVER return on its
+ * own. The installed `@anthropic-ai/claude-agent-sdk`'s `Query.streamInput`
+ * calls `transport.endInput()` — irreversibly closing the CLI subprocess's
+ * stdin — the instant its input iterable completes normally, and that same
+ * transport carries every later write back to the CLI (including the
+ * tool_result that unblocks a paused model). A one-shot generator per
+ * `injectedContext` delivery (the prior implementation) closed stdin on the
+ * FIRST delivery, silently breaking every write after it. One persistent,
+ * never-completing generator per held session keeps stdin open for the
+ * session's life. Full source-level diagnosis + a real-CLI construction
+ * proof: `tmp/bridge-capture-benchmark/streaminput-stall-diagnosis.md`.
+ *
+ * `push` resolves once the SDK asks for the NEXT item (proof the previous
+ * item's write did not throw); a write failure closes the queue so every
+ * pending/future `push` fails fast instead of hanging.
+ */
+const makeUserMessageQueue = (): {
+  readonly iterable: AsyncIterable<TSdkUserMessage>;
+  readonly push: (text: string) => Promise<void>;
+  readonly close: (reason: unknown) => void;
+} => {
+  const queue: TQueuedUserMessage[] = [];
+  let lastYielded: TQueuedUserMessage | null = null;
+  let wake: (() => void) | null = null;
+  let closed = false;
+  let closeReason: unknown = new Error(
+    "held session's user-message queue was closed",
+  );
+
+  const confirmLastYielded = (): void => {
+    const item = lastYielded;
+    lastYielded = null;
+    item?.resolve();
+  };
+  const failAll = (reason: unknown): void => {
+    const pending = lastYielded;
+    lastYielded = null;
+    pending?.reject(reason);
+    for (const item of queue.splice(0)) item.reject(reason);
+  };
+
+  const iterable: AsyncIterable<TSdkUserMessage> = {
+    [Symbol.asyncIterator](): AsyncIterator<TSdkUserMessage> {
+      return {
+        async next(): Promise<IteratorResult<TSdkUserMessage>> {
+          // Being asked for the NEXT value proves the SDK's own await on the
+          // previous item's transport.write() settled without throwing.
+          confirmLastYielded();
+          for (;;) {
+            const item = queue.shift();
+            if (item !== undefined) {
+              lastYielded = item;
+              return {
+                done: false,
+                value: {
+                  type: "user",
+                  message: { role: "user", content: item.text },
+                  parent_tool_use_id: null,
+                },
+              };
+            }
+            if (closed) return { done: true, value: undefined };
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        },
+      };
+    },
+  };
+
+  return {
+    iterable,
+    push: (text: string): Promise<void> =>
+      new Promise<void>((resolve, reject) => {
+        if (closed) {
+          reject(closeReason);
+          return;
+        }
+        queue.push({ text, resolve, reject });
+        const w = wake;
+        wake = null;
+        w?.();
+      }),
+    close: (reason: unknown): void => {
+      if (closed) return;
+      closed = true;
+      closeReason = reason;
+      failAll(reason);
+      const w = wake;
+      wake = null;
+      w?.();
+    },
+  };
+};
+
 const buildIterator = (
   params: TStartToolTurnParams,
   chan: TChannel,
@@ -442,36 +628,34 @@ const buildIterator = (
   const q = query({
     prompt: sdkPromptOf(params),
     options: {
-      model: params.providerModelId,
-      pathToClaudeCodeExecutable: params.bin,
-      env: cleanNativeSpawnEnv(params.env),
-      cwd: spawnCwd(params.env),
-      settingSources: [],
-      // Strip ALL built-in tools (Bash/Read/Write/Edit/…): a completion
-      // passthrough must NEVER execute a tool on the user's machine — the
-      // CLIENT runs its own tools. Only the client's function tools (the MCP
-      // server below) reach the model. Mirrors `claude-native.ts`'s
-      // `--tools ""`, which the plain-text path relies on for the same reason.
-      tools: [],
-      mcpServers: {
-        openllm: createSdkMcpServer({
-          name: "openllm",
-          version: "1.0.0",
-          tools: sdkTools,
-        }),
-      },
-      // Grant ONLY the registered client tools; deny anything else (built-ins
-      // are already gone via `tools: []` — this is the defense-in-depth guard).
+      ...buildClaudeToolSdkOptionsBase({
+        bin: params.bin,
+        env: cleanNativeSpawnEnv(params.env),
+        providerModelId: params.providerModelId,
+        tools: sdkTools,
+      }),
+      // Passthrough contract: tool_use PAUSES for the client's own execution
+      // (unlike capture's deny-all, which never reaches a real handler).
       canUseTool: buildPermit(allowed) as never,
-      ...(params.systemText !== null
-        ? { systemPrompt: params.systemText }
-        : {}),
-      ...(params.resumeSessionId !== null
-        ? { resume: params.resumeSessionId }
-        : {}),
+      ...claudeToolResumeAndSystemPromptOptions({
+        systemText: params.systemText,
+        resumeSessionId: params.resumeSessionId,
+      }),
     } as never,
   });
-  return (q as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+  const it = (q as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+  // Duck-typed: deliver client context as a genuine `user`-role message
+  // (never folded into a tool's resolved output) via ONE persistent queue
+  // (`makeUserMessageQueue` — see its doc for the invariant this preserves).
+  // `push` is exposed as `streamInput`; a write failure poisons the queue so
+  // every later push also fails fast, matching `continueToolTurn`'s
+  // fail-closed handling.
+  const userMessages = makeUserMessageQueue();
+  const streamInputDone = q.streamInput(userMessages.iterable);
+  streamInputDone.catch((err: unknown) => userMessages.close(err));
+  (it as TClaudeToolIterator).streamInput = userMessages.push;
+  (it as TClaudeToolIterator).closeStreamInput = userMessages.close;
+  return it;
 };
 
 export type TStartToolTurnParams = {
@@ -525,6 +709,8 @@ export const startToolTurn = async (
   }
   const h: THeld = {
     it,
+    streamInput: (it as TClaudeToolIterator).streamInput,
+    closeStreamInput: (it as TClaudeToolIterator).closeStreamInput,
     chan,
     pending: new Map(),
     nextP: null,
@@ -539,9 +725,17 @@ export const startToolTurn = async (
 /** Continue a HELD turn: resolve the paused handlers with the client's tool
  *  results, then drive to the next tool call or final text. `injectedContext`
  *  is conversation context the client added alongside the results (e.g.
- *  loaded Skill instructions) — a paused `query()` offers no way to add a
- *  fresh user/system message, so it rides the LAST handler's tool output
- *  instead of being dropped. */
+ *  loaded Skill instructions, or the client's own next question) — delivered
+ *  to the model as a genuine `role: "user"` message via the held session's
+ *  `streamInput`, BEFORE any pending tool handler is resolved. It must never
+ *  ride a tool handler's own resolved output: the model can tell the
+ *  difference and will (correctly) report an instruction folded into a
+ *  tool_result as untrusted/injected content rather than a real user turn.
+ *  If `streamInput` is unavailable or its call fails, this fails closed — the
+ *  held session is torn down and the continuation declines with
+ *  `captureOwnership: "uncertain"` on a failed (possibly partial) send, so
+ *  the caller (claude-tool-serve.ts → serve.ts → walker.ts) treats the hop
+ *  as terminal instead of retrying it over a different transport. */
 export const continueToolTurn = async (
   toolResults: ReadonlyArray<{ readonly id: string; readonly content: string }>,
   injectedContext: string | null = null,
@@ -639,21 +833,69 @@ export const continueToolTurn = async (
   }
   refreshHeld(h);
   const outcome = (async (): Promise<TToolTurnResult> => {
-    for (const [index, r] of matched.entries()) {
+    // Deliver client-added context as a genuine `role: "user"` message via
+    // streamInput, BEFORE resolving any paused handler — it must never be
+    // folded into a tool's own resolved output (the model can tell, and
+    // reports it as untrusted injected content rather than a real turn).
+    // `streamInput` is always attached in production (buildIterator); a
+    // missing/throwing one fails closed: the held session is closed and the
+    // continuation declines. `captureOwnership` below is what stops the
+    // walker from retrying this same turn over a different transport.
+    if (injectedContext !== null) {
+      if (h.streamInput === undefined) {
+        // Closing an already-started query resolves its pending handlers.
+        // Even without a context send, it must not become a retryable decline
+        // that lets the walker start this turn again through another transport.
+        closeHeld(h);
+        return {
+          kind: "declined",
+          reason:
+            "tool-session continuation cannot deliver client context: held session has no streamInput capability",
+          captureOwnership: "accepted",
+        };
+      }
+      let inputTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          h.streamInput(injectedContext),
+          new Promise<never>((_, reject) => {
+            inputTimer = setTimeout(
+              () => reject(new Error("client context delivery timed out")),
+              driveTimeoutMs,
+            );
+          }),
+        ]);
+      } catch (err) {
+        // May have partially sent — "uncertain" stops the walker from
+        // retrying this hop over a different transport.
+        closeHeld(h);
+        return {
+          kind: "declined",
+          reason: `tool-session continuation failed to deliver client context: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          captureOwnership: "uncertain",
+        };
+      } finally {
+        clearTimeout(inputTimer);
+      }
+    }
+    for (const r of matched) {
       const resolve = h.pending.get(r.id);
       if (resolve === undefined) continue;
       h.pending.delete(r.id);
       held.delete(r.id);
       consumedToolIds.set(r.id, continuationExpiryOf(h));
-      const last = index === matched.length - 1;
-      resolve(
-        last && injectedContext !== null
-          ? `${r.content}\n\n${injectedContext}`
-          : r.content,
-      );
+      resolve(r.content);
     }
-    refreshHeld(h);
-    const result = immutableResultOf(await withSessionLock(h, () => drive(h)));
+    // From here the tool result(s) are DEFINITELY handed to the live query
+    // (an in-process resolve — cannot partially fail), so any decline
+    // `drive()` returns from now on (including its own deadline timeout)
+    // must not read as safe-to-retry — stamp `captureOwnership: "accepted"`
+    // unless drive() already set something more specific.
+    const result = immutableResultOf(
+      markAcceptedIfDeclined(await withSessionLock(h, () => drive(h))),
+    );
     if (fingerprint !== null) {
       completedContinuations.set(fingerprint, {
         expiresAt: continuationExpiryOf(h),
@@ -680,10 +922,11 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
   let text = "";
   let toolUse: Array<{ id: string; name: string; input: unknown }> = [];
   let usage: TNativeTokens | undefined;
-  const deadline = nowMs() + DRIVE_TIMEOUT_MS;
+  const deadline = nowMs() + driveTimeoutMs;
 
   for (;;) {
-    if (nowMs() > deadline) {
+    const remaining = deadline - nowMs();
+    if (remaining <= 0) {
       closeHeld(h);
       return { kind: "declined", reason: "tool turn drive timed out" };
     }
@@ -694,15 +937,36 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     // after a resume isn't lost to an abandoned promise; otherwise fetch one.
     const nextP = h.nextP ?? h.it.next().then((r) => r as TStep);
     h.nextP = null;
-    let step: TStep | "fired";
+    // Race against the REMAINING drive deadline too, not just re-checked
+    // between completed iterations: without this, a `next()` that never
+    // settles (e.g. the underlying child process hangs before producing its
+    // first message) blocks this `await` forever — `nowMs() > deadline`
+    // above is never reached again once we're stuck inside this race.
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let step: TStep | "fired" | "drive-timeout";
     try {
-      step = await Promise.race([nextP, firePromise]);
+      step = await Promise.race([
+        nextP,
+        firePromise,
+        new Promise<"drive-timeout">((resolve) => {
+          deadlineTimer = setTimeout(() => resolve("drive-timeout"), remaining);
+        }),
+      ]);
     } catch (error) {
+      clearTimeout(deadlineTimer);
       closeHeld(h);
       return {
         kind: "declined",
         reason: error instanceof Error ? error.message : String(error),
       };
+    }
+    clearTimeout(deadlineTimer);
+    if (step === "drive-timeout") {
+      // Nothing usable remains once we've given up on the session. The race
+      // above still observes nextP's eventual rejection, even after timeout
+      // wins; dropping our local reference does not remove that handler.
+      closeHeld(h);
+      return { kind: "declined", reason: "tool turn drive timed out" };
     }
 
     // A handler paused → the model called tool(s). Parallel tool_use emits N
@@ -934,4 +1198,16 @@ export const heldToolSessionCount = (): number => {
   const seen = new Set<THeld>();
   for (const [, h] of held) seen.add(h);
   return seen.size;
+};
+
+/** Test-only teardown: force-close every currently held session (its live
+ *  iterator + spawned subprocess, if any, and its streamInput queue) so a
+ *  test that fails or times out before reaching a terminal drive() outcome
+ *  doesn't leak a real spawned CLI process past the test. Mirrors
+ *  `resetSessionsForTest` (session-core.ts) / `setMuxAckTimeoutForTest`
+ *  (mux-host.ts)'s `*ForTest` convention. */
+export const closeAllHeldToolSessionsForTest = (): void => {
+  const seen = new Set<THeld>();
+  for (const [, h] of held) seen.add(h);
+  for (const h of seen) closeHeld(h);
 };

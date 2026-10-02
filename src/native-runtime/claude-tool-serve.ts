@@ -34,7 +34,17 @@ import {
 import type { TNativeTokens } from "./types";
 import { ZERO_TOKENS } from "./types";
 
-export type TToolServeOutcome = Response | { readonly declined: string };
+export type TToolServeOutcome =
+  | Response
+  | {
+      readonly declined: string;
+      /** Same field/semantics as `TNativeRunResult`'s capture-ownership —
+       *  `walker.ts` reads it off ANY declined native outcome. `"uncertain"`
+       *  (e.g. a held Claude session's streamInput call may have partially
+       *  sent before failing) or `"accepted"` must stop the walker from
+       *  retrying this hop via handrolled/fleet transport. */
+      readonly captureOwnership?: "accepted" | "uncertain";
+    };
 
 const withContinuationHeader = (
   response: Response,
@@ -70,7 +80,8 @@ const plainText = (
     .join("");
 };
 
-const clientToolsOf = (
+/** Map OpenAI-shaped client tools onto the native tool-session / capture shape. */
+export const clientToolsOf = (
   canonical: TChatCompletionRequest,
 ): ReadonlyArray<TClientTool> =>
   (canonical.tools ?? []).map((t) => ({
@@ -272,7 +283,18 @@ export const tryServeNativeToolTurn = async (
           });
 
   if (result.kind === "declined") {
-    return { declined: result.reason };
+    // Only the Claude path's TToolTurnResult carries `captureOwnership`
+    // (Codex's own declined shape doesn't); read it narrowly so an
+    // indeterminate streamInput failure still reaches serve.ts → walker.ts,
+    // which refuses handrolled/fleet fallback on "uncertain"/"accepted".
+    const captureOwnership =
+      "captureOwnership" in result ? result.captureOwnership : undefined;
+    return {
+      declined: result.reason,
+      ...(captureOwnership !== undefined && captureOwnership !== "none"
+        ? { captureOwnership }
+        : {}),
+    };
   }
 
   // Record THIS fresh turn's token row. The Claude SDK path surfaces per-turn

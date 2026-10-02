@@ -32,16 +32,7 @@ import { superviseSpawn } from "../child-supervisor";
  * output → the bridge DECLINES and the manual transport serves the hop.
  */
 
-import { randomUUID } from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  lstatSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import type { TChatCompletionChunk, TUsage } from "@openllmsh/protocol";
 import { AnthropicStreamEvent } from "@openllmsh/protocol";
 import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
@@ -55,7 +46,13 @@ import { ensureVendorKeychainReady, spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import { daemonTempDir } from "../sandbox/working-set";
+import { runClaudeTextCapture } from "./claude-capture";
+import {
+  buildClaudeCliArgv,
+  stageSystemPromptFile,
+  sweepStaleSystemPromptFiles,
+} from "./claude-spawn";
+import type { TCapturedDispatchSender } from "./request-capture";
 import type { TNativeRunResult } from "./types";
 import {
   cleanNativeSpawnEnv,
@@ -159,63 +156,28 @@ export type TClaudeNativeParams = {
    *  {@link POST_COMMIT_IDLE_TIMEOUT_MS}). Tests use a small value to exercise
    *  the mid-stream stall path without a real wait. */
   readonly postCommitIdleMs?: number;
+  /**
+   * Optional request-capture decoration (W2 text path). When set (serve passes
+   * this for selected sub-method `bridge-capture` on ready providers) the CLI
+   * builds the Messages envelope against a private loopback; the daemon
+   * dispatches that envelope once and decodes the true response. Tool-bearing
+   * capture is owned by `serve.ts` → `runClaudeToolCapture` (not this runner).
+   *
+   * Hermetic tests MUST inject `sender` (mock upstream). A production enable
+   * without `sender` uses `fetch` against the captured external URL.
+   */
+  readonly requestCapture?: {
+    readonly sender?: TCapturedDispatchSender;
+    readonly allowLoopbackDestinations?: boolean;
+    readonly captureTimeoutMs?: number;
+    readonly maxBodyBytes?: number;
+  };
 };
 
 /** Once the stream has committed, a silent runtime must not pin the request
  *  forever — a chunk drought past this bound terminates the child and ends
  *  the stream (post-commit, so it cannot re-route). */
 export const POST_COMMIT_IDLE_TIMEOUT_MS = 60_000;
-
-/** Staged system-prompt files ride this exact name shape inside the
- *  daemon-private temp dir. The sweep below matches on it — nothing else in
- *  the dir is touched. */
-const SYSTEM_PROMPT_FILE_PREFIX = "system-prompt-";
-const SYSTEM_PROMPT_FILE_SUFFIX = ".md";
-
-/** A staged file older than this can only be residue of a DEAD daemon: a
- *  live run removes its file when the child exits, and the staging-to-parse
- *  window is seconds. The bound also keeps the sweep from racing a
- *  co-started daemon still inside its own spawn window. */
-const STALE_SYSTEM_PROMPT_AGE_MS = 60_000;
-
-/** Files this process staged and has not removed yet. The sweep never
- *  deletes a live in-flight prompt. */
-const liveSystemPromptFiles = new Set<string>();
-
-/** Delete staged prompt files left on disk by a daemon that died mid-turn
- *  (SIGKILL, crash, power loss — the exited-path cleanup never ran).
- *  Bounded: one readdir of the daemon-private temp dir plus an lstat per
- *  matching name — no recursion, no link follows. Ownership-safe: only our
- *  own prefix/suffix shape, only regular files, only entries older than the
- *  stale bound and not live in this process. Best-effort: a failure leaves
- *  the residue for the next call's sweep and never blocks the run. */
-const sweepStaleSystemPromptFiles = (): void => {
-  const dir = daemonTempDir();
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return;
-  }
-  const staleBefore = Date.now() - STALE_SYSTEM_PROMPT_AGE_MS;
-  for (const name of names) {
-    if (
-      !name.startsWith(SYSTEM_PROMPT_FILE_PREFIX) ||
-      !name.endsWith(SYSTEM_PROMPT_FILE_SUFFIX)
-    ) {
-      continue;
-    }
-    const path = join(dir, name);
-    if (liveSystemPromptFiles.has(path)) continue;
-    try {
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.mtimeMs >= staleBefore) continue;
-      rmSync(path, { force: true });
-    } catch {
-      // best-effort — residue stays for the next sweep
-    }
-  }
-};
 
 /** One NDJSON line of `claude -p --output-format stream-json` output. */
 type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
@@ -227,6 +189,12 @@ type TClaudeStreamLine = Readonly<Record<string, unknown>> & {
   readonly session_id?: unknown;
 };
 
+const defaultCaptureSender: TCapturedDispatchSender = async (
+  request,
+  _envelope,
+  signal,
+): Promise<Response> => fetch(request, { signal });
+
 export const runClaudeNative = async (
   params: TClaudeNativeParams,
 ): Promise<TNativeRunResult> => {
@@ -237,6 +205,19 @@ export const runClaudeNative = async (
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "claude CLI not installed" };
   }
+
+  if (params.requestCapture !== undefined) {
+    const { run } = await runClaudeTextCapture({
+      ...params,
+      captureSender: params.requestCapture?.sender ?? defaultCaptureSender,
+      allowLoopbackDestinations:
+        params.requestCapture?.allowLoopbackDestinations,
+      captureTimeoutMs: params.requestCapture?.captureTimeoutMs,
+      maxBodyBytes: params.requestCapture?.maxBodyBytes,
+    });
+    return run;
+  }
+
   // NB: the bridge deliberately does NOT unlock or re-partition the isolated
   // keychain. `claude` reads its OWN keychain item (resolved from the isolated
   // HOME), and the daemon's status watcher already keeps that keychain
@@ -245,80 +226,34 @@ export const runClaudeNative = async (
   // `cleanNativeSpawnEnv` drops `ANTHROPIC_*`/`CLAUDE_CODE_*` auth vars that
   // would otherwise override the subscription credential.
   //
-  // SP-6: the caller's system prompt must NEVER ride argv — `--system-prompt
-  // <text>` exposes it to any local user via `ps`/`/proc/<pid>/cmdline`.
-  // Stage it in a 0600 file inside the daemon-private 0700 temp dir (which
-  // the confined child CAN read — daemonTempDir is in the sandbox working
-  // set) and pass `--system-prompt-file` instead. The file is removed once
-  // the child exits (every terminal path below removes it earlier if no
-  // child ever ran).
-  let systemPromptFile: string | null = null;
-  const removeSystemPromptFile = (): void => {
-    if (systemPromptFile === null) return;
-    const path = systemPromptFile;
-    systemPromptFile = null;
-    liveSystemPromptFiles.delete(path);
-    try {
-      rmSync(path, { force: true });
-    } catch {
-      // best-effort — 0600 inside a daemon-private 0700 dir leaks nothing;
-      // the stale sweep collects a missed file.
-    }
-  };
-  let promptArgv: string[];
+  // SP-6: the caller's system prompt must NEVER ride argv — it is staged in a
+  // 0600 file inside the daemon-private 0700 temp dir (`stageSystemPromptFile`)
+  // and passed with `--system-prompt-file`. The file is removed once the child
+  // exits (every terminal path below removes it earlier if no child ever ran).
+  let removeSystemPromptFile = (): void => undefined;
+  let systemPromptFile: string | undefined;
   try {
-    if (params.resumeSessionId !== null) {
-      promptArgv = ["--resume", params.resumeSessionId];
-    } else if (params.systemText !== null) {
-      systemPromptFile = join(
-        daemonTempDir(),
-        `${SYSTEM_PROMPT_FILE_PREFIX}${randomUUID()}${SYSTEM_PROMPT_FILE_SUFFIX}`,
-      );
-      writeFileSync(systemPromptFile, params.systemText, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      chmodSync(systemPromptFile, 0o600);
-      liveSystemPromptFiles.add(systemPromptFile);
-      promptArgv = ["--system-prompt-file", systemPromptFile];
-    } else {
-      promptArgv = [];
+    if (params.resumeSessionId === null && params.systemText !== null) {
+      const staged = stageSystemPromptFile(params.systemText);
+      systemPromptFile = staged.path;
+      removeSystemPromptFile = staged.remove;
     }
   } catch (error) {
-    // A failure AFTER the write lands (chmod, or any later staging step)
-    // leaves the 0600 prompt file on disk — remove it, never just drop the
-    // path, or repeated failures accumulate prompt copies in the temp dir.
-    removeSystemPromptFile();
+    // `stageSystemPromptFile` already removed any partially-written file.
     return {
       kind: "declined",
       reason: `could not stage the system prompt: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  const argv = [
-    params.bin,
-    "-p",
-    "--output-format",
-    "stream-json",
-    "--include-partial-messages",
-    "--verbose",
-    "--setting-sources",
-    "",
-    // Belt-and-suspenders with `--setting-sources ""`: never load an MCP
-    // server (e.g. the user's global openllm MCP) — a loaded openllm MCP would
-    // run `openllm` under the isolated HOME and recursively create
-    // `<iso home>/.openllm/...`.
-    "--strict-mcp-config",
-    "--tools",
-    "",
-    "--max-turns",
-    "1",
-    "--model",
-    params.providerModelId,
-    // Resume feeds ONLY the delta turn into the persisted session (which
-    // already holds prior history + the system prompt). A fresh start applies
-    // the system prompt and seeds with `userText`.
-    ...promptArgv,
-  ];
+  const argv = buildClaudeCliArgv({
+    bin: params.bin,
+    providerModelId: params.providerModelId,
+    // Never the text — see SP-6 above. Resume feeds ONLY the delta turn into
+    // the persisted session (which already holds history + system prompt).
+    systemText: null,
+    resumeSessionId: params.resumeSessionId,
+    ...(systemPromptFile !== undefined ? { systemPromptFile } : {}),
+  });
   // Gate the vendor spawn on the isolated keychain being VERIFIED ready —
   // `claude` resolves its credential through the isolated HOME's search
   // list, and an unverified store is exactly the "A keychain cannot be
@@ -669,8 +604,11 @@ export const runClaudeNative = async (
   return { kind: "committed", chunks, sessionId: () => capturedSessionId };
 };
 
-/** Split a byte stream into NDJSON lines (no trailing-newline loss). */
-const ndjsonLines = (
+/** Split a byte stream into NDJSON lines (no trailing-newline loss). Exported
+ *  for `claude-sdk-facade.ts` — the ONE NDJSON line-splitter both Claude
+ *  stdout decoders use; the facade's own decode loop differs (framed replay,
+ *  tool_use handling) but must not re-implement this framing primitive. */
+export const ndjsonLines = (
   raw: ReadableStream<Uint8Array>,
 ): ReadableStream<string> => {
   const decoder = new TextDecoder();
