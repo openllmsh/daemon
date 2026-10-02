@@ -720,6 +720,12 @@ export const tryServeNativeRuntime = async (
       record: params.record,
       continuationToken: params.continuationToken ?? null,
       continuationIdentity: toolContinuationIdentity(),
+    }).catch((error: unknown): Response | { readonly declined: string } => {
+      // The SDK-spawned Claude child is sandbox-wrapped; a refusal must reach
+      // the caller as the terminal sandbox-unavailable response.
+      if (error instanceof SandboxLaunchError)
+        return sandboxUnavailableResponse(error.code);
+      throw error;
     });
   }
   const req = nativeRequestOf(params.canonical);
@@ -981,6 +987,10 @@ const serveClaudeSdkFacadeHop = async (
           signal: params.signal,
         });
   } catch (error) {
+    // A sandbox refusal is terminal: surface the sandbox-unavailable response
+    // instead of a decline the walker could route around (default Claude route).
+    if (error instanceof SandboxLaunchError)
+      return sandboxUnavailableResponse(error.code);
     return {
       declined: error instanceof Error ? error.message : String(error),
     };
