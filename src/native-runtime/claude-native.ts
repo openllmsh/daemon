@@ -174,6 +174,33 @@ export type TClaudeNativeParams = {
   };
 };
 
+/** Closed set of classified stderr codes — the ONLY stderr-derived text that
+ *  may reach a decline reason or a log line. */
+type TVendorStderrCode =
+  | "auth"
+  | "rate_limit"
+  | "keychain"
+  | "sandbox"
+  | "other"
+  | "none";
+
+const VENDOR_STDERR_CLASSES: ReadonlyArray<
+  readonly [TVendorStderrCode, RegExp]
+> = [
+  ["keychain", /keychain/i],
+  ["auth", /\b(401|403|unauthori[sz]ed|forbidden|login|credential|token)\b/i],
+  ["rate_limit", /\b(429|rate.?limit|overloaded|quota)\b/i],
+  ["sandbox", /\b(sandbox|seatbelt|landlock|operation not permitted)\b/i],
+];
+
+const classifyVendorStderr = (tail: string): TVendorStderrCode => {
+  if (tail.length === 0) return "none";
+  for (const [code, pattern] of VENDOR_STDERR_CLASSES) {
+    if (pattern.test(tail)) return code;
+  }
+  return "other";
+};
+
 /** Once the stream has committed, a silent runtime must not pin the request
  *  forever — a chunk drought past this bound terminates the child and ends
  *  the stream (post-commit, so it cannot re-route). */
@@ -325,9 +352,12 @@ export const runClaudeNative = async (
   // stderr must be DRAINED for the child's whole life: an unread pipe fills
   // at ~64KiB and stalls the runtime mid-turn — the previous code only read
   // it after a pre-commit failure, as an UNBOUNDED `.text()` that could wait
-  // forever on a wedged child. Keep a small TAIL for decline diagnostics.
-  const STDERR_CAPTURE_MAX = 4_096;
-  let stderrBuf = "";
+  // forever on a wedged child. Stderr is NOT a safe channel (the vendor can
+  // echo caller text into it): keep only a byte count and a small tail used
+  // solely to pick a classified code. The tail is never reported or logged.
+  const STDERR_CLASSIFY_TAIL_MAX = 4_096;
+  let stderrBytes = 0;
+  let stderrTail = "";
   {
     const stderrStream = proc.stderr;
     if (typeof stderrStream === "object" && stderrStream !== null) {
@@ -338,9 +368,10 @@ export const runClaudeNative = async (
           for (;;) {
             const { value, done } = await reader.read();
             if (done) return;
-            stderrBuf += dec.decode(value, { stream: true });
-            if (stderrBuf.length > STDERR_CAPTURE_MAX) {
-              stderrBuf = stderrBuf.slice(-STDERR_CAPTURE_MAX);
+            stderrBytes += value.byteLength;
+            stderrTail += dec.decode(value, { stream: true });
+            if (stderrTail.length > STDERR_CLASSIFY_TAIL_MAX) {
+              stderrTail = stderrTail.slice(-STDERR_CLASSIFY_TAIL_MAX);
             }
           }
         } catch {
@@ -518,15 +549,15 @@ export const runClaudeNative = async (
     // Bounded: TERM the group → grace → KILL → final reap. stderr was drained
     // continuously above, so this await can never block on a full pipe.
     await requestTerminate();
-    const stderr = stderrBuf;
+    const stderrCode = classifyVendorStderr(stderrTail);
     const reason =
       first === "timeout"
         ? "claude runtime produced no output before the pre-commit deadline"
-        : `claude runtime exited before producing output${stderr.length > 0 ? `: ${stderr.slice(0, 300)}` : ""}`;
+        : `claude runtime exited before producing output${stderrBytes > 0 ? ` (stderr=${stderrCode} stderr_bytes=${stderrBytes})` : ""}`;
     logError(
       "native-runtime",
       safeDiagnosticMessage`claude hop declined pre-commit`,
-      { reason },
+      { reason, stderrCode, stderrBytes },
     );
     return { kind: "declined", reason };
   }

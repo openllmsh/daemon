@@ -35,13 +35,36 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { TSupervisedChild } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
+import { ensureVendorKeychainReady } from "../delegation/util";
 import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
 import type { TStagedSystemPrompt } from "./claude-spawn";
 import {
+  ClaudeKeychainNotReadyError,
   stageSystemPromptFile,
   sweepStaleSystemPromptFiles,
 } from "./claude-spawn";
+
+/**
+ * The readiness gate every SDK `query()` must pass BEFORE it is built — the
+ * same gate and refusal shape as `claude-spawn.ts`'s `spawnSupervisedClaude`.
+ * `unwrapKeychainSpawn` in the spawn hook below only exempts the confinement;
+ * it neither checks readiness nor validates FSS-11 permissions. The hook is
+ * synchronous and cannot await, so the gate runs here, ahead of `query()`:
+ * a refusal means no child, no staged system-prompt file. Abort-aware via
+ * `signal`. A no-op off macOS / under the daemon's own home.
+ */
+export const assertClaudeSdkSpawnReady = async (
+  env: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<void> => {
+  const store = await ensureVendorKeychainReady(env, signal);
+  if (store.kind !== "present") {
+    throw new ClaudeKeychainNotReadyError(
+      store.kind === "indeterminate" ? store.cause : store.kind,
+    );
+  }
+};
 
 /** Per-`query()` record of a sandbox refusal the SDK cannot carry. */
 export type TClaudeSdkSpawnGuard = {

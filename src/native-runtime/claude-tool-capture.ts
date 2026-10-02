@@ -23,7 +23,13 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { query, tool } from "@anthropic-ai/claude-agent-sdk";
 import type {
@@ -57,7 +63,10 @@ export {
   CLAUDE_TOOL_CAPTURE_STATUS,
 } from "./claude-tool-capture-status";
 
-import { createClaudeSdkSpawnGuard } from "./claude-sdk-spawn";
+import {
+  assertClaudeSdkSpawnReady,
+  createClaudeSdkSpawnGuard,
+} from "./claude-sdk-spawn";
 import {
   buildClaudeToolSdkOptionsBase,
   claudeToolResumeAndSystemPromptOptions,
@@ -441,7 +450,15 @@ export const writeClaudeToolCaptureSessionTranscript = (args: {
   const sessionId = args.sessionId ?? randomUUID();
   const projectKey = claudeCaptureProjectsKeyFromCwd(args.cwd);
   const projectsDir = join(args.configDir, "projects", projectKey);
-  mkdirSync(projectsDir, { recursive: true });
+  // The transcript carries the full caller history + tool results: every
+  // directory THIS call creates is owner-only (an existing config root is the
+  // vendor's own and is left untouched).
+  const projectsRoot = join(args.configDir, "projects");
+  const createdRoot = !existsSync(projectsRoot);
+  const createdProject = !existsSync(projectsDir);
+  mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+  if (createdRoot) chmodSync(projectsRoot, 0o700);
+  if (createdProject) chmodSync(projectsDir, 0o700);
   const sessionPath = join(projectsDir, `${sessionId}.jsonl`);
   if (existsSync(sessionPath)) {
     throw new Error(
@@ -547,11 +564,16 @@ export const writeClaudeToolCaptureSessionTranscript = (args: {
     }
   }
 
-  writeFileSync(
-    sessionPath,
-    `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
-    { mode: 0o600 },
-  );
+  try {
+    writeFileSync(
+      sessionPath,
+      `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+      { mode: 0o600 },
+    );
+  } catch (error) {
+    cleanup(); // a partial write must not leave history on disk
+    throw error;
+  }
   return { sessionId, sessionPath, projectKey, cleanup };
 };
 
@@ -670,6 +692,9 @@ export const claudeToolCaptureSdkBuilder: TClaudeToolCaptureBuilder = async (
     },
   });
   const spawnEnv = withClaudeCaptureBaseUrl(args.cleanedEnv, args.loopbackBase);
+  // The SDK child must not start against an unverified isolated credential
+  // store (the spawn hook's keychain probe is only a confinement exemption).
+  await assertClaudeSdkSpawnReady(spawnEnv, args.signal);
 
   // Prompt must stay user-role text. Multi-turn tool history is NOT flattened
   // into the prompt — it is resumed from a synthetic on-disk session when
@@ -1072,284 +1097,306 @@ export const runClaudeToolCapture = async (
   let textSettlement: TClaudeToolCaptureDiagnostics["textSettlement"] = null;
   let auxiliaryMessagesSettled = 0;
   const expectedMcpToolNames = new Set(nameMap.mcpToCaller.keys());
-  const loopback = startClaudeCaptureLoopback({
-    session,
-    inferenceGate: claudeToolCaptureInferenceGate({
-      providerModelId: params.providerModelId,
-      expectedMcpToolNames,
-    }),
-    onSettlement: (kind) => {
-      textSettlement =
-        kind === "unproven_text_settlement" ? "interrupted" : kind;
-    },
-    onAuxiliarySettled: () => {
-      auxiliaryMessagesSettled += 1;
-    },
-  });
-
   const releaseOwnedSession = (): void => {
     const fn = ownedSessionCleanup;
     ownedSessionCleanup = null;
     fn?.();
   };
+  let loopback: ReturnType<typeof startClaudeCaptureLoopback>;
+  try {
+    loopback = startClaudeCaptureLoopback({
+      session,
+      inferenceGate: claudeToolCaptureInferenceGate({
+        providerModelId: params.providerModelId,
+        expectedMcpToolNames,
+      }),
+      onSettlement: (kind) => {
+        textSettlement =
+          kind === "unproven_text_settlement" ? "interrupted" : kind;
+      },
+      onAuxiliarySettled: () => {
+        auxiliaryMessagesSettled += 1;
+      },
+    });
+  } catch (error) {
+    // The synthetic session transcript is already on disk.
+    session.dispose();
+    releaseOwnedSession();
+    throw error;
+  }
   const builder = params.builder ?? claudeToolCaptureSdkBuilder;
 
-  let builderHandle: TClaudeToolCaptureBuilderResult;
+  let startedBuilder: TClaudeToolCaptureBuilderResult | null = null;
+  // Any unexpected throw after the transcript was written must still remove
+  // it (and stop the loopback / session); the explicit paths below already do.
   try {
-    builderHandle = await builder({
-      bin: params.bin,
-      cleanedEnv: cleaned,
-      loopbackBase: loopback.baseUrl,
-      providerModelId: params.providerModelId,
-      systemText,
-      tools: params.tools,
-      messages,
-      ...(resumeSessionId !== null ? { resumeSessionId } : {}),
-      signal: params.signal,
-    });
-  } catch (err) {
-    loopback.stop();
-    session.dispose();
-    releaseOwnedSession();
-    // A sandbox refusal is terminal (sandbox-unavailable response), never a
-    // decline that lets the request fall back to another transport.
-    if (err instanceof SandboxLaunchError) throw err;
-    const reason = err instanceof Error ? err.message : String(err);
-    return {
-      run: {
-        kind: "declined",
-        reason: `claude tool capture builder failed: ${reason}`,
-      },
-      diagnostics,
-      directOutput: null,
-    };
-  }
-
-  if (params.signal.aborted) {
-    builderHandle.abort();
-    await builderHandle
-      .settle({ kind: "cancelled", reason: "client aborted" })
-      .catch(() => undefined);
-    loopback.stop();
-    session.dispose();
-    releaseOwnedSession();
-    return {
-      run: { kind: "declined", reason: "client aborted" },
-      diagnostics: {
-        ...diagnostics,
-        textSettlement: "cancelled",
-        auxiliaryMessagesSettled,
-      },
-      directOutput: null,
-    };
-  }
-
-  let daemonDispatchCount = 0;
-  let dispatchResult: TRunCapturedDispatchResult;
-  try {
-    dispatchResult = await runCapturedDispatch({
-      session,
-      sender: async (request, envelope, signal) => {
-        daemonDispatchCount += 1;
-        return params.captureSender(request, envelope, signal);
-      },
-      signal: params.signal,
-      suppressReason:
-        "claude tool capture: original external send suppressed; builder settled locally (interrupt) — not warm-reuse proof",
-    });
-  } catch (err) {
-    const ownership: TCaptureOwnership =
-      daemonDispatchCount > 0
-        ? session.upstreamAccepted()
-          ? "accepted"
-          : "uncertain"
-        : "none";
-    const failure = captureDirectOutputFailure({
-      session,
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    await builderHandle
-      .settle(
-        failure.builderSettlement ?? {
-          kind: "failed",
-          reason: failure.reason,
+    let builderHandle: TClaudeToolCaptureBuilderResult;
+    try {
+      builderHandle = await builder({
+        bin: params.bin,
+        cleanedEnv: cleaned,
+        loopbackBase: loopback.baseUrl,
+        providerModelId: params.providerModelId,
+        systemText,
+        tools: params.tools,
+        messages,
+        ...(resumeSessionId !== null ? { resumeSessionId } : {}),
+        signal: params.signal,
+      });
+    } catch (err) {
+      loopback.stop();
+      session.dispose();
+      releaseOwnedSession();
+      // A sandbox refusal is terminal (sandbox-unavailable response), never a
+      // decline that lets the request fall back to another transport.
+      if (err instanceof SandboxLaunchError) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      return {
+        run: {
+          kind: "declined",
+          reason: `claude tool capture builder failed: ${reason}`,
         },
-      )
-      .catch(() => undefined);
-    builderHandle.abort();
-    loopback.stop();
-    session.dispose();
-    releaseOwnedSession();
-    return {
-      run: {
-        kind: "declined",
-        reason: `claude tool capture dispatch failed: ${failure.reason}`,
-        ...(ownership !== "none" ? { captureOwnership: ownership } : {}),
-      },
-      diagnostics: {
-        ...diagnostics,
-        textSettlement: textSettlement ?? "failed",
-        daemonDispatchCount,
-        auxiliaryMessagesSettled,
-        capturedEnvelope: failure.envelope,
-      },
-      directOutput: null,
-    };
-  }
+        diagnostics,
+        directOutput: null,
+      };
+    }
 
-  // CAPTURE_INTERRUPT_ORDER: settle builder → terminal → publish.
-  // `runCapturedDispatch` already called session.settleBuilder(suppressed)
-  // before the daemon send; re-read that settlement for the SDK interrupt.
-  const builderSettlement: TBuilderSettlement = session.builderSettlement() ?? {
-    kind: "suppressed",
-    reason:
-      "original external send suppressed; daemon owns the exchange (tool capture)",
-  };
-  await builderHandle.settle(builderSettlement).catch(() => undefined);
-  textSettlement = settlementKindOf(builderSettlement);
-  const terminal: TCaptureTerminalOutcome = dispatchResult.outcome;
+    startedBuilder = builderHandle;
+    if (params.signal.aborted) {
+      builderHandle.abort();
+      await builderHandle
+        .settle({ kind: "cancelled", reason: "client aborted" })
+        .catch(() => undefined);
+      loopback.stop();
+      session.dispose();
+      releaseOwnedSession();
+      return {
+        run: { kind: "declined", reason: "client aborted" },
+        diagnostics: {
+          ...diagnostics,
+          textSettlement: "cancelled",
+          auxiliaryMessagesSettled,
+        },
+        directOutput: null,
+      };
+    }
 
-  const rawChunks = chunksFromCapturedAnthropicResponse(
-    dispatchResult.response,
-    params.providerModelId,
-  );
-  const mappedChunks = mapClaudeCaptureChunkToolNames(rawChunks, nameMap);
-  // Capture-only guard: a clean upstream EOF with no observed terminal
-  // finish_reason (dropped connection, truncated body after 200) must not
-  // silently become a synthesized "stop" — see request-capture-output.ts.
-  const guardedChunks = requireCaptureTerminalFinishReason(mappedChunks);
-
-  // Pre-commit: require first meaningful byte (text or tool_call) within
-  // budget. Called ONLY after dispatch already succeeded, so a rejected
-  // `reader.read()` (including the terminal-finish-reason guard above) is
-  // folded into the same "exit" decline below — which already carries
-  // `captureOwnership: "accepted"` — never left to propagate uncaught (this
-  // function's callers do not wrap it in try/catch and would otherwise lose
-  // that ownership signal).
-  const reader = guardedChunks.getReader();
-  const buffered: TChatCompletionChunk[] = [];
-  let firstMeaningful: TChatCompletionChunk | null = null;
-  let precommitTimer: ReturnType<typeof setTimeout> | undefined;
-  const first = await Promise.race([
-    (async (): Promise<"ok" | "exit"> => {
-      for (;;) {
-        let read: { value: TChatCompletionChunk; done: false } | { done: true };
-        try {
-          read = await reader.read();
-        } catch {
-          return "exit";
-        }
-        if (read.done) return "exit";
-        const { value } = read;
-        const inv = inventoryToolCallsFromChunks([value]);
-        const hasTool = inv.toolCalls.length > 0;
-        const hasText = value.choices.some(
-          (c) =>
-            typeof c.delta.content === "string" && c.delta.content.length > 0,
-        );
-        const hasReasoning =
-          typeof value.choices[0]?.delta.reasoning_content === "string" &&
-          (value.choices[0]?.delta.reasoning_content.length ?? 0) > 0;
-        if (hasTool || hasText || hasReasoning) {
-          firstMeaningful = value;
-          return "ok";
-        }
-        buffered.push(value);
-      }
-    })(),
-    new Promise<"timeout">((resolve) => {
-      precommitTimer = setTimeout(
-        () => resolve("timeout"),
-        PRE_COMMIT_TIMEOUT_MS,
-      );
-    }),
-  ]);
-  clearTimeout(precommitTimer);
-
-  if (first !== "ok" || firstMeaningful === null) {
-    builderHandle.abort();
-    loopback.stop();
-    session.dispose();
-    releaseOwnedSession();
-    void reader.cancel().catch(() => undefined);
-    return {
-      run: {
-        kind: "declined",
-        reason:
-          first === "timeout"
-            ? "claude tool capture produced no output before the pre-commit deadline"
-            : "claude tool capture upstream ended before producing output",
-        captureOwnership: "accepted",
-      },
-      diagnostics: {
-        ...diagnostics,
-        textSettlement: textSettlement ?? "failed",
-        daemonDispatchCount,
-        auxiliaryMessagesSettled,
-        capturedEnvelope: dispatchResult.envelope,
-      },
-      directOutput: null,
-    };
-  }
-
-  const committedSeed = firstMeaningful;
-  const restStream = new ReadableStream<TChatCompletionChunk>({
-    start(controller) {
-      for (const c of buffered) controller.enqueue(c);
-      controller.enqueue(committedSeed);
-    },
-    async pull(controller) {
-      const { value, done } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      controller.enqueue(value);
-    },
-    cancel(reason) {
-      void reader.cancel(reason).catch(() => undefined);
-    },
-  });
-
-  const directOutput = publishCapturedDirectOutput({
-    session,
-    envelope: dispatchResult.envelope,
-    terminal,
-    chunks: restStream,
-    builderSettlement,
-    onRelease: () => {
+    let daemonDispatchCount = 0;
+    let dispatchResult: TRunCapturedDispatchResult;
+    try {
+      dispatchResult = await runCapturedDispatch({
+        session,
+        sender: async (request, envelope, signal) => {
+          daemonDispatchCount += 1;
+          return params.captureSender(request, envelope, signal);
+        },
+        signal: params.signal,
+        suppressReason:
+          "claude tool capture: original external send suppressed; builder settled locally (interrupt) — not warm-reuse proof",
+      });
+    } catch (err) {
+      const ownership: TCaptureOwnership =
+        daemonDispatchCount > 0
+          ? session.upstreamAccepted()
+            ? "accepted"
+            : "uncertain"
+          : "none";
+      const failure = captureDirectOutputFailure({
+        session,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      await builderHandle
+        .settle(
+          failure.builderSettlement ?? {
+            kind: "failed",
+            reason: failure.reason,
+          },
+        )
+        .catch(() => undefined);
       builderHandle.abort();
       loopback.stop();
       session.dispose();
       releaseOwnedSession();
-    },
-  });
+      return {
+        run: {
+          kind: "declined",
+          reason: `claude tool capture dispatch failed: ${failure.reason}`,
+          ...(ownership !== "none" ? { captureOwnership: ownership } : {}),
+        },
+        diagnostics: {
+          ...diagnostics,
+          textSettlement: textSettlement ?? "failed",
+          daemonDispatchCount,
+          auxiliaryMessagesSettled,
+          capturedEnvelope: failure.envelope,
+        },
+        directOutput: null,
+      };
+    }
 
-  // Inventory from the seed chunk (full parallel set may arrive later in stream;
-  // tests also drain + re-inventory).
-  const seedInventory = inventoryToolCallsFromChunks([committedSeed]);
+    // CAPTURE_INTERRUPT_ORDER: settle builder → terminal → publish.
+    // `runCapturedDispatch` already called session.settleBuilder(suppressed)
+    // before the daemon send; re-read that settlement for the SDK interrupt.
+    const builderSettlement: TBuilderSettlement =
+      session.builderSettlement() ?? {
+        kind: "suppressed",
+        reason:
+          "original external send suppressed; daemon owns the exchange (tool capture)",
+      };
+    await builderHandle.settle(builderSettlement).catch(() => undefined);
+    textSettlement = settlementKindOf(builderSettlement);
+    const terminal: TCaptureTerminalOutcome = dispatchResult.outcome;
 
-  return {
-    run: {
-      kind: "committed",
-      chunks: directOutput.chunks,
-      sessionId: () => null,
-    },
-    diagnostics: {
-      textSettlement: textSettlement ?? "interrupted",
-      toolCapture: CLAUDE_TOOL_CAPTURE_STATUS,
-      sdkStructuredHistory: CLAUDE_SDK_STRUCTURED_HISTORY_STATUS,
-      fixtureStructuredHistory: CLAUDE_FIXTURE_STRUCTURED_HISTORY_STATUS,
-      daemonDispatchCount,
-      preambleExternalForwards: 0,
-      auxiliaryMessagesSettled,
-      capturedEnvelope: dispatchResult.envelope,
-      inertHandlerInvocations: 0,
-      interruptOrder: CAPTURE_INTERRUPT_ORDER,
-      toolInventory: seedInventory,
-    },
-    directOutput,
-  };
+    const rawChunks = chunksFromCapturedAnthropicResponse(
+      dispatchResult.response,
+      params.providerModelId,
+    );
+    const mappedChunks = mapClaudeCaptureChunkToolNames(rawChunks, nameMap);
+    // Capture-only guard: a clean upstream EOF with no observed terminal
+    // finish_reason (dropped connection, truncated body after 200) must not
+    // silently become a synthesized "stop" — see request-capture-output.ts.
+    const guardedChunks = requireCaptureTerminalFinishReason(mappedChunks);
+
+    // Pre-commit: require first meaningful byte (text or tool_call) within
+    // budget. Called ONLY after dispatch already succeeded, so a rejected
+    // `reader.read()` (including the terminal-finish-reason guard above) is
+    // folded into the same "exit" decline below — which already carries
+    // `captureOwnership: "accepted"` — never left to propagate uncaught (this
+    // function's callers do not wrap it in try/catch and would otherwise lose
+    // that ownership signal).
+    const reader = guardedChunks.getReader();
+    const buffered: TChatCompletionChunk[] = [];
+    let firstMeaningful: TChatCompletionChunk | null = null;
+    let precommitTimer: ReturnType<typeof setTimeout> | undefined;
+    const first = await Promise.race([
+      (async (): Promise<"ok" | "exit"> => {
+        for (;;) {
+          let read:
+            | { value: TChatCompletionChunk; done: false }
+            | { done: true };
+          try {
+            read = await reader.read();
+          } catch {
+            return "exit";
+          }
+          if (read.done) return "exit";
+          const { value } = read;
+          const inv = inventoryToolCallsFromChunks([value]);
+          const hasTool = inv.toolCalls.length > 0;
+          const hasText = value.choices.some(
+            (c) =>
+              typeof c.delta.content === "string" && c.delta.content.length > 0,
+          );
+          const hasReasoning =
+            typeof value.choices[0]?.delta.reasoning_content === "string" &&
+            (value.choices[0]?.delta.reasoning_content.length ?? 0) > 0;
+          if (hasTool || hasText || hasReasoning) {
+            firstMeaningful = value;
+            return "ok";
+          }
+          buffered.push(value);
+        }
+      })(),
+      new Promise<"timeout">((resolve) => {
+        precommitTimer = setTimeout(
+          () => resolve("timeout"),
+          PRE_COMMIT_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    clearTimeout(precommitTimer);
+
+    if (first !== "ok" || firstMeaningful === null) {
+      builderHandle.abort();
+      loopback.stop();
+      session.dispose();
+      releaseOwnedSession();
+      void reader.cancel().catch(() => undefined);
+      return {
+        run: {
+          kind: "declined",
+          reason:
+            first === "timeout"
+              ? "claude tool capture produced no output before the pre-commit deadline"
+              : "claude tool capture upstream ended before producing output",
+          captureOwnership: "accepted",
+        },
+        diagnostics: {
+          ...diagnostics,
+          textSettlement: textSettlement ?? "failed",
+          daemonDispatchCount,
+          auxiliaryMessagesSettled,
+          capturedEnvelope: dispatchResult.envelope,
+        },
+        directOutput: null,
+      };
+    }
+
+    const committedSeed = firstMeaningful;
+    const restStream = new ReadableStream<TChatCompletionChunk>({
+      start(controller) {
+        for (const c of buffered) controller.enqueue(c);
+        controller.enqueue(committedSeed);
+      },
+      async pull(controller) {
+        const { value, done } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      },
+      cancel(reason) {
+        void reader.cancel(reason).catch(() => undefined);
+      },
+    });
+
+    const directOutput = publishCapturedDirectOutput({
+      session,
+      envelope: dispatchResult.envelope,
+      terminal,
+      chunks: restStream,
+      builderSettlement,
+      onRelease: () => {
+        builderHandle.abort();
+        loopback.stop();
+        session.dispose();
+        releaseOwnedSession();
+      },
+    });
+
+    // Inventory from the seed chunk (full parallel set may arrive later in stream;
+    // tests also drain + re-inventory).
+    const seedInventory = inventoryToolCallsFromChunks([committedSeed]);
+
+    return {
+      run: {
+        kind: "committed",
+        chunks: directOutput.chunks,
+        sessionId: () => null,
+      },
+      diagnostics: {
+        textSettlement: textSettlement ?? "interrupted",
+        toolCapture: CLAUDE_TOOL_CAPTURE_STATUS,
+        sdkStructuredHistory: CLAUDE_SDK_STRUCTURED_HISTORY_STATUS,
+        fixtureStructuredHistory: CLAUDE_FIXTURE_STRUCTURED_HISTORY_STATUS,
+        daemonDispatchCount,
+        preambleExternalForwards: 0,
+        auxiliaryMessagesSettled,
+        capturedEnvelope: dispatchResult.envelope,
+        inertHandlerInvocations: 0,
+        interruptOrder: CAPTURE_INTERRUPT_ORDER,
+        toolInventory: seedInventory,
+      },
+      directOutput,
+    };
+  } catch (error) {
+    startedBuilder?.abort();
+    loopback.stop();
+    session.dispose();
+    releaseOwnedSession();
+    throw error;
+  }
 };
 
 /**
