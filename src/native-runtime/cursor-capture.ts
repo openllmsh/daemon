@@ -55,12 +55,12 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as http2 from "node:http2";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
+import { daemonTempDir } from "../sandbox/working-set";
 import { providerDeclaresBridgeCapture } from "../sub-method";
 import type {
   TCursorAgentServiceMethod,
@@ -368,7 +368,7 @@ export const cursorCaptureDestinationPolicy = (args?: {
 export const materializeCursorCapturePreload = async (
   targetDir: string,
 ): Promise<string> => {
-  await mkdir(targetDir, { recursive: true });
+  await mkdir(targetDir, { recursive: true, mode: 0o700 });
   const path = join(targetDir, "cursor-capture-preload.cjs");
   await writeFile(path, preloadSource, { mode: 0o600 });
   return path;
@@ -460,9 +460,30 @@ export const openCursorCaptureBridge = async (args: {
     captureTimeoutMs: args.captureTimeoutMs,
   });
 
-  const root =
-    args.tempRoot ?? (await mkdtemp(join(tmpdir(), "openllm-cursor-capture-")));
-  const preloadPath = await materializeCursorCapturePreload(root);
+  // The bridge root lives under `daemonTempDir()` (`<stateDir>/tmp`, mode
+  // 0o700) — the one temp location the sandboxed child can see; OS /tmp is
+  // unreachable on Linux. Shorter prefix than the old tmpdir() layout on
+  // purpose: `<root>/ipc.sock` must stay under the ~104-byte unix socket
+  // path limit on macOS.
+  const ownsRoot = args.tempRoot === undefined;
+  let root = "";
+  let preloadPath = "";
+  try {
+    root =
+      args.tempRoot ??
+      (await mkdtemp(join(daemonTempDir(), "cursor-capture-")));
+    preloadPath = await materializeCursorCapturePreload(root);
+  } catch (err) {
+    session.dispose();
+    if (ownsRoot && root.length > 0) {
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    throw err;
+  }
   const socketPath = join(root, "ipc.sock");
   const token = randomBytes(32).toString("hex");
 
@@ -697,13 +718,31 @@ export const openCursorCaptureBridge = async (args: {
     }
   };
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+    await chmod(socketPath, 0o600);
+  } catch (err) {
+    session.dispose();
+    if (server.listening) {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+    if (ownsRoot) {
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    throw err;
+  }
 
   const childEnv = buildCursorCaptureChildEnv({
     preloadPath,

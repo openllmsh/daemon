@@ -46,7 +46,6 @@
 
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TurnOutcome as TOfficialMuseTurnOutcome } from "@muse-code/sdk";
 import {
@@ -71,6 +70,7 @@ import {
 import { spawnCwd } from "../delegation/util";
 import { logError, logInfo, logWarn, safeDiagnosticMessage } from "../logger";
 import { SandboxLaunchError, withSandboxSpawn } from "../sandbox/exec";
+import { daemonTempDir } from "../sandbox/working-set";
 import { DAEMON_VERSION } from "../version";
 import type {
   TMuseFoldedItem,
@@ -1232,7 +1232,7 @@ export const listMuseModelsDemand = async (
   let host: TMuseHost | null = null;
   try {
     const dirs = await allocateMuseTurnDirs(
-      params.cwd ?? (spawnCwd(baseEnv) || tmpdir()),
+      params.cwd ?? (spawnCwd(baseEnv) || daemonTempDir()),
       "muse-models-",
     );
     turnRoot = dirs.turnRoot;
@@ -1494,10 +1494,11 @@ export const openMuseTurnSession = async (
     if (options.signal.aborted) throw abortedError();
     // Caller resolves its own cwd fallback (the bridge and capture paths
     // disagree: the bridge falls back through `spawnCwd(env)` before
-    // `tmpdir()`, capture goes straight to `tmpdir()`) — this helper only
-    // ever allocates under whatever `options.cwd` it is handed.
+    // `daemonTempDir()`, capture goes straight to `daemonTempDir()`) — this
+    // helper's own default is `daemonTempDir()` too, the one temp location
+    // the sandboxed child can see.
     const dirs = await allocateMuseTurnDirs(
-      options.cwd ?? tmpdir(),
+      options.cwd ?? daemonTempDir(),
       options.dirPrefix,
     );
     turnRoot = dirs.turnRoot;
@@ -1718,7 +1719,7 @@ export const runMuseNative = async (
       ...(params.hostFactory !== undefined
         ? { hostFactory: params.hostFactory }
         : {}),
-      cwd: params.cwd ?? (spawnCwd(params.env) || tmpdir()),
+      cwd: params.cwd ?? (spawnCwd(params.env) || daemonTempDir()),
       dirPrefix: "muse-turn-",
       hooks: {
         onToolCall: (name, args) => {

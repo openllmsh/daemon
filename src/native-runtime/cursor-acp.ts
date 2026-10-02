@@ -1338,27 +1338,31 @@ export const runCursorNativeCapture = async (
   // still receive the preload + IPC socket (they may not call
   // applyCursorCaptureBridgeEnv themselves).
   const captureEnv = applyCursorCaptureBridgeEnv(params.env, bridge);
-  const acpPromise = runAcp({
-    bin: params.bin,
-    env: captureEnv,
-    providerModelId: params.providerModelId,
-    systemText: params.systemText,
-    userText: params.userText,
-    images: params.images,
-    tools: params.tools,
-    jsonInstructionText: params.jsonInstructionText,
-    signal: builderSignal,
-    precommitMs: params.precommitMs,
-    idleMs: params.idleMs,
-    turnTimeoutMs: params.turnTimeoutMs,
-    rpcTimeoutMs: params.rpcTimeoutMs,
-    captureBridge: bridge,
-    serveOwnedCapture: true,
-  });
-  void acpPromise.catch(() => {});
-
+  // `runAcp` is invoked INSIDE the try: a synchronous throw (e.g. a sandbox
+  // launch refusal raised before the first await) must still run the shared
+  // abort + bridge-dispose cleanup in the catch below instead of escaping
+  // with the socket dir leaked.
+  let acpPromise: Promise<TNativeRunResult> | null = null;
   let dispatchStarted = false;
   try {
+    acpPromise = runAcp({
+      bin: params.bin,
+      env: captureEnv,
+      providerModelId: params.providerModelId,
+      systemText: params.systemText,
+      userText: params.userText,
+      images: params.images,
+      tools: params.tools,
+      jsonInstructionText: params.jsonInstructionText,
+      signal: builderSignal,
+      precommitMs: params.precommitMs,
+      idleMs: params.idleMs,
+      turnTimeoutMs: params.turnTimeoutMs,
+      rpcTimeoutMs: params.rpcTimeoutMs,
+      captureBridge: bridge,
+      serveOwnedCapture: true,
+    });
+    void acpPromise.catch(() => {});
     // CodeRabbit round 3: `runAcp` can decline FAST (auth failure, missing
     // CLI, immediate vendor exit) — e.g. `{ kind: "declined", cooldownReason:
     // "auth" }` resolved well before any transaction is ever captured. The
@@ -1414,6 +1418,10 @@ export const runCursorNativeCapture = async (
       } catch {
         // ignore — best-effort cleanup
       }
+      // A sandbox launch refusal is terminal — serve.ts maps it to
+      // `sandboxUnavailableResponse`; it must never degrade into a decline
+      // that lets the walker fall back to another route.
+      if (raced.err instanceof SandboxLaunchError) throw raced.err;
       return {
         kind: "declined",
         reason:
@@ -2562,7 +2570,8 @@ export const runCursorNativeCapture = async (
     } catch {
       // ignore
     }
-    void acpPromise;
+    void acpPromise?.catch(() => {});
+    if (err instanceof SandboxLaunchError) throw err;
     if (dispatchStarted && ownership === "none") {
       return {
         kind: "declined",
