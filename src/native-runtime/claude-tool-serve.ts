@@ -193,6 +193,7 @@ export const tryServeNativeToolTurn = async (
             tools: clientToolsOf(params.canonical),
             systemText: systemTextOf(params.canonical),
             reasoningEffort: params.canonical.reasoning_effort ?? null,
+            serviceTier: params.canonical.service_tier,
             userText: seedFromHistory(params.canonical),
           });
 

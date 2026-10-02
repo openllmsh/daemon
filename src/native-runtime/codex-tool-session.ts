@@ -157,6 +157,7 @@ export type TStartCodexToolTurnParams = {
   readonly tools: ReadonlyArray<TClientTool>;
   readonly systemText: string | null;
   readonly reasoningEffort: string | null;
+  readonly serviceTier?: unknown;
   readonly userText: string;
   /**
    * When true (serve selected `bridge-capture`), use the isolated capture
@@ -200,6 +201,7 @@ export const startCodexToolTurn = async (
         params.providerModelId,
         params.systemText,
         codexDynamicToolsFrom(params.tools),
+        params.serviceTier,
       ),
     )) as { thread?: { id?: string } };
     if (typeof started.thread?.id !== "string") {
@@ -230,7 +232,12 @@ export const startCodexToolTurn = async (
   try {
     const turn = (await client.request(
       "turn/start",
-      codexTurnStartParams(threadId, params.userText, effort),
+      codexTurnStartParams(
+        threadId,
+        params.userText,
+        effort,
+        params.serviceTier,
+      ),
     )) as { turn?: { id?: string } };
     h.turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {

@@ -29,6 +29,7 @@ import type {
   TServerSearchCall,
   TUsage,
 } from "@openllmsh/protocol";
+import { codexServiceTier } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
@@ -626,6 +627,7 @@ export type TCodexNativeParams = {
   readonly resumeThreadId: string | null;
   /** Canonical `reasoning_effort`, forwarded when the runtime supports it. */
   readonly reasoningEffort: string | null;
+  readonly serviceTier?: unknown;
   readonly signal: AbortSignal;
   /** Override the pre-commit deadline (default 60s). Tests use a small value to
    *  exercise the timeout→interrupt path without a real 60s wait. */
@@ -664,8 +666,12 @@ export const effortOf = (raw: string | null): string | null => {
 export const codexBaseStartParams = (
   providerModelId: string,
   systemText: string | null,
+  serviceTier?: unknown,
 ): Record<string, unknown> => ({
   model: providerModelId,
+  ...(serviceTier !== undefined
+    ? { serviceTier: codexServiceTier(serviceTier) }
+    : {}),
   approvalPolicy: "never",
   sandbox: "read-only",
   personality: "none",
@@ -714,8 +720,9 @@ export const codexToolStartParams = (
   providerModelId: string,
   systemText: string | null,
   dynamicTools: ReadonlyArray<TCodexDynamicToolSpec>,
+  serviceTier?: unknown,
 ): Record<string, unknown> => ({
-  ...codexBaseStartParams(providerModelId, systemText),
+  ...codexBaseStartParams(providerModelId, systemText, serviceTier),
   features: { code_mode: false, code_mode_only: false },
   experimentalRawEvents: true,
   dynamicTools,
@@ -732,8 +739,13 @@ export const codexTurnStartParams = (
   threadId: string,
   text: string,
   effort: string | null,
+  serviceTier?: unknown,
 ): Record<string, unknown> => ({
   threadId,
+  // Standard/null clears a previous tier; absence leaves native config alone.
+  ...(serviceTier !== undefined
+    ? { serviceTier: codexServiceTier(serviceTier) }
+    : {}),
   input: [{ type: "text", text, text_elements: [] }],
   ...(effort !== null ? { effort } : {}),
 });
@@ -762,6 +774,7 @@ export const runCodexNative = async (
     const startParams = codexBaseStartParams(
       params.providerModelId,
       params.systemText,
+      params.serviceTier,
     );
     const opened = (await (params.resumeThreadId !== null
       ? client
@@ -863,7 +876,12 @@ export const runCodexNative = async (
   try {
     const turn = (await client.request(
       "turn/start",
-      codexTurnStartParams(threadId, params.userText, effort),
+      codexTurnStartParams(
+        threadId,
+        params.userText,
+        effort,
+        params.serviceTier,
+      ),
     )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
   } catch (error) {

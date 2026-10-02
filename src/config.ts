@@ -22,6 +22,7 @@ import type {
   TDaemonReportingPolicy,
   TExecutionSelection,
   TModelCapsDefaultRule,
+  TModelSettingsOverrides,
   TSubMethod,
 } from "@openllmsh/protocol";
 import { resolveContextOverflowStrategy } from "@openllmsh/wire";
@@ -151,6 +152,10 @@ export const refreshBootstrap = (): Promise<boolean> =>
 export const planSigningKey = (): string | null =>
   snapshot.plan_signing_key ?? null;
 
+/** Sparse per-model user overrides from the authenticated bootstrap snapshot. */
+export const modelSettingsOverrides = (): TModelSettingsOverrides =>
+  snapshot.model_settings ?? {};
+
 /** Per-user context-overflow policy from bootstrap; absence preserves hopping. */
 export const contextOverflowStrategy = (): TContextOverflowStrategy =>
   resolveContextOverflowStrategy(snapshot.context_overflow_strategy);
@@ -272,11 +277,13 @@ export const catalogCapsDefaults = (): ReadonlyArray<TModelCapsDefaultRule> =>
 export const setCatalogForTest = (
   catalog: ReadonlyArray<TDaemonCatalogEntry>,
   capsDefaults: ReadonlyArray<TModelCapsDefaultRule> = [],
+  modelSettings: TModelSettingsOverrides = {},
 ): void => {
   snapshot = {
     ...EMPTY,
     catalog: [...catalog],
     caps_defaults: [...capsDefaults],
+    model_settings: modelSettings,
   };
   byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
 };

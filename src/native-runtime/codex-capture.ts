@@ -1584,6 +1584,7 @@ export const runCodexCapturedTextTurn = async (
     const startParams = codexBaseStartParams(
       params.providerModelId,
       params.systemText,
+      params.serviceTier,
     );
     // Capture path always starts a FRESH isolated thread — do not resume the
     // shared warm map's thread ids (history injection unproven).
@@ -1647,7 +1648,12 @@ export const runCodexCapturedTextTurn = async (
     const effort = effortOf(params.reasoningEffort);
     const turn = (await client.request(
       "turn/start",
-      codexTurnStartParams(threadId, params.userText, effort),
+      codexTurnStartParams(
+        threadId,
+        params.userText,
+        effort,
+        params.serviceTier,
+      ),
     )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
 

@@ -532,6 +532,7 @@ export const runCodexCapturedToolTurn = async (
         params.providerModelId,
         params.systemText,
         dynamicTools,
+        params.serviceTier,
       ),
     )) as { thread?: { id?: string } };
     if (typeof started.thread?.id !== "string") {
@@ -583,7 +584,7 @@ export const runCodexCapturedToolTurn = async (
     const effort = effortOf(params.reasoningEffort);
     const turn = (await client.request(
       "turn/start",
-      codexTurnStartParams(threadId, turnUserText, effort),
+      codexTurnStartParams(threadId, turnUserText, effort, params.serviceTier),
     )) as { turn?: { id?: string } };
     turnId = typeof turn.turn?.id === "string" ? turn.turn.id : null;
 

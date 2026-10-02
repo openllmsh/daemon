@@ -821,6 +821,7 @@ export const tryServeNativeRuntime = async (
             userText,
             resumeThreadId: builderResumeId,
             reasoningEffort: params.canonical.reasoning_effort ?? null,
+            serviceTier: params.canonical.service_tier,
             signal: params.signal,
             bridgeCapture: captureActive,
           });
@@ -1121,6 +1122,7 @@ const serveCapturedToolTurn = async (
         tools,
         historyTurns: decomposed.historyTurns,
         reasoningEffort: params.canonical.reasoning_effort ?? null,
+        serviceTier: params.canonical.service_tier,
         signal: params.signal,
         ...(captureTool?.codexFetchImpl !== undefined
           ? { fetchImpl: captureTool.codexFetchImpl }

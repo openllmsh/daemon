@@ -47,6 +47,7 @@ import type {
   TDaemonRecordRequest,
   TErrorEnvelope,
   TModelCaps,
+  TModelSettings,
   TProviderUsageSnapshot,
   TRequestStatus,
   TServerSearchCall,
@@ -57,6 +58,7 @@ import {
   cooldownPolicyFor,
   daemonPlanSigningPayload,
   resolveDefaultModelCaps,
+  resolveModelSettings,
   TOOL_SESSION_HEADER,
   TUNNELED_REQUEST_HEADER,
   TUNNELED_REQUEST_VALUE,
@@ -81,6 +83,7 @@ import {
   shouldSkipHopForContext,
 } from "@openllmsh/wire/features/context-skip";
 import { applyOutputTokenBackfill } from "@openllmsh/wire/features/max-tokens-backfill";
+import { applyModelSettings } from "@openllmsh/wire/features/model-settings";
 import {
   GATE_STALE_CAP_MS,
   quotaGateDecision,
@@ -192,6 +195,7 @@ import {
   catalogCapsDefaults,
   fleetSubscriptionServerFor,
   lookupCatalogEntry,
+  modelSettingsOverrides,
   planSigningKey,
 } from "./config";
 import { errorJson } from "./cors";
@@ -355,6 +359,7 @@ type THop = {
   readonly capabilities: ReadonlyArray<string>;
   /** Catalog-declared final outbound-body constraints, resolved locally. */
   readonly caps?: TModelCaps;
+  readonly modelSettings?: TModelSettings;
   /** Catalog-gated client-output repair, resolved locally from bootstrap. */
   readonly stripSubagentIsolation: boolean;
 };
@@ -381,6 +386,10 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
   const provider = slash > 0 ? modelId.slice(0, slash) : modelId;
   const entry = lookupCatalogEntry(modelId);
   const capabilities = entry?.capabilities ?? [];
+  const modelSettings = resolveModelSettings(
+    entry?.settings,
+    modelSettingsOverrides()[modelId],
+  );
   // A card always wins. With no row, fall back to the catalog-owned
   // family defaults using the SAME shared matcher the cloud runs, so an
   // un-catalogued id resolves identically on both paths.
@@ -398,7 +407,8 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
       provider,
       providerModelId,
       capabilities,
-      caps,
+      ...(caps !== undefined ? { caps } : {}),
+      ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}),
       stripSubagentIsolation,
     };
   }
@@ -408,7 +418,8 @@ export const resolveHop = (modelId: string, providerModelId?: string): THop => {
       provider: entry.provider,
       providerModelId: entry.provider_model_id,
       capabilities,
-      caps,
+      ...(caps !== undefined ? { caps } : {}),
+      ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}),
       stripSubagentIsolation,
     };
   }
@@ -1349,6 +1360,7 @@ export const serveSubscription = async (
       isOAuth: wire === "anthropic",
       codexInstructions: wantsCodexPreamble(hop.provider),
       caps: hop.caps,
+      modelSettings: hop.modelSettings,
       capabilities: hop.capabilities,
     });
   } catch (err) {
@@ -2828,7 +2840,7 @@ const walkPlan = async (
         providerModelId: hop.providerModelId,
         surface: args.surface,
         rawBody: args.rawBody,
-        canonical,
+        canonical: applyModelSettings(canonical, hop.modelSettings),
         wantsStream:
           (args.rawBody as { stream?: unknown } | null)?.stream === true,
         // TODO(docs/audit/2026-08-30-claude-code-bridge-failures.md §4 B1):
@@ -3620,6 +3632,7 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
       inboundBeta: inboundBetaOf(args),
       isOAuth: true,
       caps: hop.caps,
+      modelSettings: hop.modelSettings,
       capabilities: hop.capabilities,
     });
   } catch (err) {
