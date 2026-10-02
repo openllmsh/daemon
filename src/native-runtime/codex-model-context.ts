@@ -84,20 +84,23 @@ export class CodexModelContextCatalog {
     providerModelId: string,
     inputTokenLimit: number,
   ): Promise<ReturnType<typeof codexContextModelCatalog>> {
-    let cache: unknown;
     for (const home of new Set([this.codexHome, this.fallbackCodexHome])) {
       if (home === undefined) continue;
       try {
-        cache = JSON.parse(
+        const cache: unknown = JSON.parse(
           await readFile(join(home, "models_cache.json"), "utf8"),
-        ) as unknown;
-        break;
+        );
+        return codexContextModelCatalog(
+          cache,
+          providerModelId,
+          inputTokenLimit,
+        );
       } catch {
-        // An isolated capture may have just refreshed its own cache while the
-        // durable home has none. Both are vendor-written metadata sources.
+        // A readable durable cache may be stale or incomplete while an isolated
+        // capture has refreshed its own matching metadata. Try both sources.
       }
     }
-    return codexContextModelCatalog(cache, providerModelId, inputTokenLimit);
+    throw new Error("Codex native model metadata is unavailable");
   }
 
   private async writeCatalog(contents: string): Promise<string> {

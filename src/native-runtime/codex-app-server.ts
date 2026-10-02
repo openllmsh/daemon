@@ -236,27 +236,21 @@ class CodexAppServerClient {
     const window = config?.model_context_window;
     if (typeof window !== "number" || typeof params.model !== "string")
       return params;
-    const catalog = this.modelContextCatalog;
-    if (catalog === null)
-      throw new Error("codex app-server is not initialized");
-    let path: string;
     try {
-      path = await catalog.pathFor(params.model, window);
+      const catalog = this.modelContextCatalog;
+      if (catalog === null)
+        throw new Error("codex app-server is not initialized");
+      let path: string;
+      try {
+        path = await catalog.pathFor(params.model, window);
+      } catch {
+        // Demand-driven refresh only: this method runs while opening an inference
+        // thread. Never start login/auth work or replace the vendor cache ourselves.
+        await this.request("model/list", { limit: 1 });
+        path = await catalog.pathFor(params.model, window);
+      }
+      return { ...params, config: { ...config, model_catalog_json: path } };
     } catch {
-      // Demand-driven refresh only: this method runs while opening an inference
-      // thread. Never start login/auth work or replace the vendor cache ourselves.
-      await this.request("model/list", { limit: 1 });
-      path = await catalog.pathFor(params.model, window);
-    }
-    return { ...params, config: { ...config, model_catalog_json: path } };
-  }
-
-  /** A loaded resume ignores config. Fork history when its input budget changes. */
-  async openThread(
-    params: Record<string, unknown>,
-    resumeThreadId: string | null,
-  ): Promise<string> {
-    const prepared = await this.prepareThreadParams(params).catch(() => {
       logWarn(
         "native-runtime",
         safeDiagnosticMessage`codex context catalog unavailable; using native context defaults`,
@@ -265,10 +259,18 @@ class CodexAppServerClient {
         model_context_window: _window,
         model_auto_compact_token_limit: _compactLimit,
         model_catalog_json: _catalog,
-        ...config
-      } = (params.config as Record<string, unknown> | undefined) ?? {};
-      return { ...params, config };
-    });
+        ...nativeConfig
+      } = config ?? {};
+      return { ...params, config: nativeConfig };
+    }
+  }
+
+  /** A loaded resume ignores config. Fork history when its input budget changes. */
+  async openThread(
+    params: Record<string, unknown>,
+    resumeThreadId: string | null,
+  ): Promise<string> {
+    const prepared = await this.prepareThreadParams(params);
     const config = prepared.config as Record<string, unknown> | undefined;
     const contextKey = JSON.stringify([
       config?.model_context_window ?? null,
@@ -284,6 +286,8 @@ class CodexAppServerClient {
         "cannot change context budget during an active Codex turn",
       );
     }
+    // A resume/fork failure must decline to the full-request transport. A
+    // fresh thread would receive only the delta turn and silently lose history.
     const opened = (await (resumeThreadId === null
       ? this.request("thread/start", prepared)
       : changed
@@ -291,7 +295,7 @@ class CodexAppServerClient {
         : this.request("thread/resume", {
             threadId: resumeThreadId,
             ...prepared,
-          }).catch(() => this.request("thread/start", prepared)))) as {
+          }))) as {
       thread?: { id?: string };
     };
     const threadId = opened.thread?.id;
@@ -907,8 +911,8 @@ export const runCodexNative = async (
     await client.ensureStarted();
     // Resume the persisted thread when we have its id (it already holds prior
     // turns + instructions); otherwise start a fresh NON-ephemeral thread so
-    // it survives on disk to be resumed next turn. `thread/resume` falls back
-    // to `thread/start` when the id is unknown (daemon restart evicted it).
+    // it survives on disk to be resumed next turn. A failed resume/fork declines
+    // before output so the walker can replay the full canonical request safely.
     const startParams = codexBaseStartParams(
       params.providerModelId,
       params.systemText,
