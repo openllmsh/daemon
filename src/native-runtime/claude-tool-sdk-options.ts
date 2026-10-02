@@ -9,6 +9,8 @@
 
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { spawnCwd } from "../delegation/util";
+import type { TClaudeSdkSpawnGuard } from "./claude-sdk-spawn";
+import { createClaudeSdkSpawn } from "./claude-sdk-spawn";
 
 /** The `tool()`-built entries `createSdkMcpServer` accepts. */
 type TSdkMcpTools = Parameters<typeof createSdkMcpServer>[0]["tools"];
@@ -28,6 +30,9 @@ export type TClaudeToolSdkOptionsBaseParams = {
   /** In-process MCP tool definitions built by each caller's own `tool()`
    *  registration (the passthrough tools vs the inert capture tools). */
   readonly tools: TSdkMcpTools;
+  /** Records a sandbox refusal the SDK cannot carry — the caller keeps it to
+   *  rethrow `SandboxLaunchError` (see `claude-sdk-spawn.ts`). */
+  readonly spawnGuard: TClaudeSdkSpawnGuard;
 };
 
 export type TClaudeToolSdkOptionsBase = {
@@ -35,6 +40,8 @@ export type TClaudeToolSdkOptionsBase = {
   readonly pathToClaudeCodeExecutable: string;
   readonly env: Record<string, string>;
   readonly cwd: string;
+  /** The SDK child starts through the sandbox + supervisor, never a bare spawn. */
+  readonly spawnClaudeCodeProcess: ReturnType<typeof createClaudeSdkSpawn>;
   readonly settingSources: []; // `Options.settingSources` is `SettingSource[]`
   readonly tools: string[]; // built-ins stripped; `Options.tools` is `string[]`
   readonly mcpServers: {
@@ -56,6 +63,7 @@ export const buildClaudeToolSdkOptionsBase = (
   pathToClaudeCodeExecutable: params.bin,
   env: params.env,
   cwd: spawnCwd(params.env),
+  spawnClaudeCodeProcess: createClaudeSdkSpawn(params.spawnGuard),
   settingSources: [],
   tools: [],
   mcpServers: {

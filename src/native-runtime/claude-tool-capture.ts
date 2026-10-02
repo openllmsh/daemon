@@ -34,6 +34,7 @@ import type {
 import { z } from "zod";
 import { spawnCwd } from "../delegation/util";
 import { logError, safeDiagnosticMessage } from "../logger";
+import { SandboxLaunchError } from "../sandbox/exec";
 import type { TClaudeCaptureInferenceGate } from "./claude-capture";
 import {
   chunksFromCapturedAnthropicResponse,
@@ -56,6 +57,7 @@ export {
   CLAUDE_TOOL_CAPTURE_STATUS,
 } from "./claude-tool-capture-status";
 
+import { createClaudeSdkSpawnGuard } from "./claude-sdk-spawn";
 import {
   buildClaudeToolSdkOptionsBase,
   claudeToolResumeAndSystemPromptOptions,
@@ -700,34 +702,58 @@ export const claudeToolCaptureSdkBuilder: TClaudeToolCaptureBuilder = async (
   if (args.signal.aborted) abortController.abort();
   else args.signal.addEventListener("abort", onOuterAbort, { once: true });
 
-  const q = query({
-    prompt: promptText,
-    options: {
-      ...buildClaudeToolSdkOptionsBase({
-        bin: args.bin,
-        env: spawnEnv,
-        providerModelId: args.providerModelId,
-        tools: sdkTools,
-      }),
-      // Hard deny — capture has no legitimate execution path at all (unlike
-      // passthrough's pause-for-client-result).
-      canUseTool: async () => ({
-        behavior: "deny" as const,
-        message: "claude tool capture: tool execution denied (inert capture)",
-      }),
-      // Capture's own AbortController — independent interrupt/close, unlike
-      // the passthrough session which stays held open across requests.
-      abortController,
-      // Skip SDK auto title-generation (live capture otherwise ate the title
-      // JSON as the daemon answer); the loopback gate is the hard backstop.
-      title: CLAUDE_TOOL_CAPTURE_SESSION_TITLE,
-      ...claudeToolResumeAndSystemPromptOptions({
-        systemText: args.systemText,
-        resumeSessionId: resumeId,
-        suppressSystemPromptWhenResuming: true,
-      }),
-    },
-  });
+  const spawnGuard = createClaudeSdkSpawnGuard();
+  let q: ReturnType<typeof query>;
+  try {
+    q = query({
+      prompt: promptText,
+      options: {
+        ...buildClaudeToolSdkOptionsBase({
+          bin: args.bin,
+          env: spawnEnv,
+          providerModelId: args.providerModelId,
+          tools: sdkTools,
+          spawnGuard,
+        }),
+        // Hard deny — capture has no legitimate execution path at all (unlike
+        // passthrough's pause-for-client-result).
+        canUseTool: async () => ({
+          behavior: "deny" as const,
+          message: "claude tool capture: tool execution denied (inert capture)",
+        }),
+        // Capture's own AbortController — independent interrupt/close, unlike
+        // the passthrough session which stays held open across requests.
+        abortController,
+        // Skip SDK auto title-generation (live capture otherwise ate the title
+        // JSON as the daemon answer); the loopback gate is the hard backstop.
+        title: CLAUDE_TOOL_CAPTURE_SESSION_TITLE,
+        ...claudeToolResumeAndSystemPromptOptions({
+          systemText: args.systemText,
+          resumeSessionId: resumeId,
+          suppressSystemPromptWhenResuming: true,
+        }),
+      },
+    });
+  } catch (error) {
+    args.signal.removeEventListener("abort", onOuterAbort);
+    throw spawnGuard.launchFailure ?? error;
+  }
+
+  // The SDK's spawn hook is synchronous, so a sandbox setup rejection is only
+  // known here. Tear the query down and rethrow the `SandboxLaunchError` (the
+  // SDK would report a generic spawn failure) so it is never a plain decline.
+  try {
+    await spawnGuard.setup;
+  } catch (error) {
+    args.signal.removeEventListener("abort", onOuterAbort);
+    abortController.abort();
+    try {
+      (q as { close?: () => void }).close?.();
+    } catch {
+      // already closed
+    }
+    throw spawnGuard.launchFailure ?? error;
+  }
 
   // Drain iterator in the background so the CLI actually builds + sends the
   // Messages request; never treat yielded content as the daemon response.
@@ -1085,6 +1111,9 @@ export const runClaudeToolCapture = async (
     loopback.stop();
     session.dispose();
     releaseOwnedSession();
+    // A sandbox refusal is terminal (sandbox-unavailable response), never a
+    // decline that lets the request fall back to another transport.
+    if (err instanceof SandboxLaunchError) throw err;
     const reason = err instanceof Error ? err.message : String(err);
     return {
       run: {

@@ -32,6 +32,8 @@ import type {
 import { z } from "zod";
 import { ensureVendorKeychainReady } from "../delegation/util";
 import { CLAUDE_TOOL_PASSTHROUGH_SCOPE } from "../execution-identity";
+import type { TClaudeSdkSpawnGuard } from "./claude-sdk-spawn";
+import { createClaudeSdkSpawnGuard } from "./claude-sdk-spawn";
 import type {
   TToolContinuationIdentity,
   TValidatedToolContinuation,
@@ -247,6 +249,16 @@ export type TToolTurnResult =
 export type TChannel = {
   readonly fired: Array<(result: string) => void>;
   wake: (() => void) | null;
+};
+
+/** Spawn guards of the real SDK iterators, by channel. A sandbox refusal comes
+ *  back from the SDK as a generic error; `rethrowSandboxRefusal` restores it so
+ *  serve.ts answers sandbox-unavailable instead of an ordinary decline. */
+const launchGuards = new WeakMap<TChannel, TClaudeSdkSpawnGuard>();
+
+const rethrowSandboxRefusal = (chan: TChannel): void => {
+  const failure = launchGuards.get(chan)?.launchFailure ?? null;
+  if (failure !== null) throw failure;
 };
 
 type TStep = { done?: boolean; value?: unknown };
@@ -625,6 +637,8 @@ const buildIterator = (
   const allowed = new Set(
     params.tools.map((t) => `${MCP_PREFIX}${sanitize(t.name)}`),
   );
+  const spawnGuard = createClaudeSdkSpawnGuard();
+  launchGuards.set(chan, spawnGuard);
   const q = query({
     prompt: sdkPromptOf(params),
     options: {
@@ -633,6 +647,7 @@ const buildIterator = (
         env: cleanNativeSpawnEnv(params.env),
         providerModelId: params.providerModelId,
         tools: sdkTools,
+        spawnGuard,
       }),
       // Passthrough contract: tool_use PAUSES for the client's own execution
       // (unlike capture's deny-all, which never reaches a real handler).
@@ -702,6 +717,7 @@ export const startToolTurn = async (
   try {
     it = makeIterator(params, chan);
   } catch (error) {
+    rethrowSandboxRefusal(chan);
     return {
       kind: "declined",
       reason: error instanceof Error ? error.message : String(error),
@@ -955,6 +971,7 @@ const drive = async (h: THeld): Promise<TToolTurnResult> => {
     } catch (error) {
       clearTimeout(deadlineTimer);
       closeHeld(h);
+      rethrowSandboxRefusal(h.chan);
       return {
         kind: "declined",
         reason: error instanceof Error ? error.message : String(error),
