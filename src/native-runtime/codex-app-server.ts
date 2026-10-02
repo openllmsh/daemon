@@ -31,7 +31,7 @@ import type {
 } from "@openllmsh/protocol";
 import { codexServiceTier } from "@openllmsh/protocol";
 import { spawnCwd } from "../delegation/util";
-import { logError, safeDiagnosticMessage } from "../logger";
+import { logError, logWarn, safeDiagnosticMessage } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
 import { DAEMON_VERSION } from "../version";
@@ -256,7 +256,19 @@ class CodexAppServerClient {
     params: Record<string, unknown>,
     resumeThreadId: string | null,
   ): Promise<string> {
-    const prepared = await this.prepareThreadParams(params);
+    const prepared = await this.prepareThreadParams(params).catch(() => {
+      logWarn(
+        "native-runtime",
+        safeDiagnosticMessage`codex context catalog unavailable; using native context defaults`,
+      );
+      const {
+        model_context_window: _window,
+        model_auto_compact_token_limit: _compactLimit,
+        model_catalog_json: _catalog,
+        ...config
+      } = (params.config as Record<string, unknown> | undefined) ?? {};
+      return { ...params, config };
+    });
     const config = prepared.config as Record<string, unknown> | undefined;
     const contextKey = JSON.stringify([
       config?.model_context_window ?? null,
