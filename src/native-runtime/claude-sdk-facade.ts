@@ -146,6 +146,10 @@ import type { TClientTool } from "./claude-tool-session";
 import { historyTurnsFromCanonicalMessages } from "./request-capture-history";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+import {
+  vendorErrorLogFields,
+  vendorErrorLogFieldsOf,
+} from "./vendor-error-log";
 
 const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
 
@@ -702,7 +706,7 @@ const runFacadeDecode = (args: {
       logError(
         "native-runtime",
         safeDiagnosticMessage`sdk-facade hop declined pre-commit`,
-        { reason },
+        vendorErrorLogFields(reason),
       );
       return { kind: "declined", reason };
     }
@@ -711,7 +715,7 @@ const runFacadeDecode = (args: {
       logError(
         "native-runtime",
         safeDiagnosticMessage`sdk-facade hop declined pre-commit`,
-        { reason: first.reason },
+        vendorErrorLogFields(first.reason),
       );
       return { kind: "declined", reason: first.reason };
     }
@@ -735,7 +739,7 @@ const runFacadeDecode = (args: {
           logError(
             "native-runtime",
             safeDiagnosticMessage`sdk-facade stream failed post-commit`,
-            { reason: error instanceof Error ? error.message : String(error) },
+            vendorErrorLogFieldsOf(error),
           );
           args.kill();
           controller.error(error);
@@ -870,7 +874,7 @@ const runClaudeSdkFacadeCore = async (
     logError(
       "native-runtime",
       safeDiagnosticMessage`sdk-facade hop declined during history replay`,
-      { reason: replay.reason },
+      vendorErrorLogFields(replay.reason),
     );
     return { kind: "declined", reason: replay.reason };
   }

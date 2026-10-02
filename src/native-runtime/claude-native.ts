@@ -59,6 +59,7 @@ import {
   normalizeNativeTerminalResult,
   PRE_COMMIT_TIMEOUT_MS,
 } from "./types";
+import { classifyVendorError, vendorErrorLogFields } from "./vendor-error-log";
 
 const decodeStreamEvent = Schema.decodeUnknownOption(AnthropicStreamEvent);
 
@@ -172,33 +173,6 @@ export type TClaudeNativeParams = {
     readonly captureTimeoutMs?: number;
     readonly maxBodyBytes?: number;
   };
-};
-
-/** Closed set of classified stderr codes — the ONLY stderr-derived text that
- *  may reach a decline reason or a log line. */
-type TVendorStderrCode =
-  | "auth"
-  | "rate_limit"
-  | "keychain"
-  | "sandbox"
-  | "other"
-  | "none";
-
-const VENDOR_STDERR_CLASSES: ReadonlyArray<
-  readonly [TVendorStderrCode, RegExp]
-> = [
-  ["keychain", /keychain/i],
-  ["auth", /\b(401|403|unauthori[sz]ed|forbidden|login|credential|token)\b/i],
-  ["rate_limit", /\b(429|rate.?limit|overloaded|quota)\b/i],
-  ["sandbox", /\b(sandbox|seatbelt|landlock|operation not permitted)\b/i],
-];
-
-const classifyVendorStderr = (tail: string): TVendorStderrCode => {
-  if (tail.length === 0) return "none";
-  for (const [code, pattern] of VENDOR_STDERR_CLASSES) {
-    if (pattern.test(tail)) return code;
-  }
-  return "other";
 };
 
 /** Once the stream has committed, a silent runtime must not pin the request
@@ -549,7 +523,7 @@ export const runClaudeNative = async (
     // Bounded: TERM the group → grace → KILL → final reap. stderr was drained
     // continuously above, so this await can never block on a full pipe.
     await requestTerminate();
-    const stderrCode = classifyVendorStderr(stderrTail);
+    const stderrCode = classifyVendorError(stderrTail).code;
     const reason =
       first === "timeout"
         ? "claude runtime produced no output before the pre-commit deadline"
@@ -567,9 +541,7 @@ export const runClaudeNative = async (
     logError(
       "native-runtime",
       safeDiagnosticMessage`claude hop declined pre-commit`,
-      {
-        reason: first.reason,
-      },
+      vendorErrorLogFields(first.reason),
     );
     return { kind: "declined", reason: first.reason };
   }
@@ -616,9 +588,7 @@ export const runClaudeNative = async (
           logError(
             "native-runtime",
             safeDiagnosticMessage`claude stream failed post-commit`,
-            {
-              reason: next.error,
-            },
+            vendorErrorLogFields(next.error),
           );
         }
         controller.close();

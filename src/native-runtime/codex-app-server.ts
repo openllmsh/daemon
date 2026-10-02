@@ -42,6 +42,7 @@ import {
 } from "./codex-web-search";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+import { vendorErrorLogFields } from "./vendor-error-log";
 
 /** Handshake / thread-start RPC budget. */
 const RPC_TIMEOUT_MS = 30_000;
@@ -360,7 +361,7 @@ class CodexAppServerClient {
         "native-runtime",
         safeDiagnosticMessage`codex app-server teardown failed live turns`,
         {
-          reason,
+          ...vendorErrorLogFields(reason),
           turns: this.sinks.size,
         },
       );
@@ -1050,7 +1051,7 @@ export const runCodexNative = async (
     logError(
       "native-runtime",
       safeDiagnosticMessage`codex hop declined pre-commit`,
-      { reason },
+      vendorErrorLogFields(reason),
     );
     return { kind: "declined", reason };
   }

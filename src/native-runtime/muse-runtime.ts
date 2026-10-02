@@ -87,6 +87,10 @@ import type { TMuseApprovalRequest } from "./muse-web-search";
 import { decideMuseNativeApproval } from "./muse-web-search";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
+import {
+  vendorErrorLogFields,
+  vendorErrorLogFieldsOf,
+} from "./vendor-error-log";
 
 /** Official `muse serve` flags verified in the pinned reference
  *  (`safety-settings.ts` `safetyArgs`). There is no verified disable-all
@@ -1151,9 +1155,7 @@ export const rememberMuseModelsFromSession = async (
     logWarn(
       "native-runtime",
       safeDiagnosticMessage`muse model/list failed; skipping observation`,
-      {
-        error: error instanceof Error ? error.message : String(error),
-      },
+      vendorErrorLogFieldsOf(error),
     );
     return [];
   }
@@ -1279,9 +1281,7 @@ export const listMuseModelsDemand = async (
     logWarn(
       "native-runtime",
       safeDiagnosticMessage`muse demand model/list failed`,
-      {
-        error: error instanceof Error ? error.message : String(error),
-      },
+      vendorErrorLogFieldsOf(error),
     );
     return null;
   } finally {
@@ -1836,14 +1836,18 @@ export const runMuseNative = async (
     }
   })();
   void pumpItems.catch((error: unknown) => {
-    logError("native-runtime", safeDiagnosticMessage`muse item pump failed`, {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`muse item pump failed`,
+      vendorErrorLogFieldsOf(error),
+    );
   });
   void pumpDeltas.catch((error: unknown) => {
-    logError("native-runtime", safeDiagnosticMessage`muse delta pump failed`, {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    logError(
+      "native-runtime",
+      safeDiagnosticMessage`muse delta pump failed`,
+      vendorErrorLogFieldsOf(error),
+    );
   });
 
   // Official SDK adapters wait for item/delta pumps AFTER turn.completed
@@ -1940,7 +1944,7 @@ export const runMuseNative = async (
         safeDiagnosticMessage`muse turn failed after start`,
         {
           code: "muse_turn_failed_after_start",
-          error: err.message.slice(0, MUSE_TURN_ERROR_MESSAGE_MAX),
+          ...vendorErrorLogFields(err.message),
         },
       );
       if (turn.sawOutput()) {
