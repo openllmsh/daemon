@@ -119,15 +119,20 @@ import type {
   TChatCompletionRequest,
 } from "@openllmsh/protocol";
 import { AnthropicStreamEvent } from "@openllmsh/protocol";
+import { CLAUDE_NATIVE_ASSISTANT_PENDING } from "@openllmsh/wire/adapters/messages/reasoning-signature";
 import { isRefusalChunk } from "@openllmsh/wire/lib/refusal";
 import { isMeaningfulChunk } from "@openllmsh/wire/lib/streaming/peek";
+import type { TAnthropicStreamState } from "@openllmsh/wire/providers/anthropic/streaming";
 import {
   fromAnthropicStreamEvent,
   newAnthropicStreamState,
-  type TAnthropicStreamState,
 } from "@openllmsh/wire/providers/anthropic/streaming";
 import { Schema } from "effect";
 import { logDebug, logError, safeDiagnosticMessage } from "../logger";
+import {
+  claudeFacadeHistory,
+  claudeNativeAssistantCarrier,
+} from "./claude-facade-history";
 import { startClaudeFacadeMcpServer } from "./claude-facade-mcp-server";
 import { ndjsonLines } from "./claude-native";
 import type { TClaudeFacadeMcpServerRef } from "./claude-spawn";
@@ -136,13 +141,9 @@ import type {
   TClaudeAnthropicMessage,
   TClaudeToolNameMap,
 } from "./claude-tool-capture";
-import {
-  anthropicMessagesFromHistoryTurns,
-  buildClaudeToolNameMap,
-} from "./claude-tool-capture";
+import { buildClaudeToolNameMap } from "./claude-tool-capture";
 import { clientToolsOf } from "./claude-tool-serve";
 import type { TClientTool } from "./claude-tool-session";
-import { historyTurnsFromCanonicalMessages } from "./request-capture-history";
 import type { TNativeRunResult } from "./types";
 import { cleanNativeSpawnEnv, PRE_COMMIT_TIMEOUT_MS } from "./types";
 
@@ -167,40 +168,28 @@ export type TClaudeSdkFacadeTurnPlan =
   | { readonly ok: false; readonly reason: string };
 
 /**
- * Decompose a canonical request into the facade's framed history. Refuses
- * (never lossy-seeds) exactly when the shared history planner or
- * {@link anthropicMessagesFromHistoryTurns} refuses — non-text content,
- * missing trailing user/tool-result turn, or (today) reasoning artifacts in
- * history, which Claude Messages encoding cannot carry without a proven
- * thinking-block mapping (same restriction `claude-tool-capture.ts` already
- * documents).
+ * Decompose a canonical request into Hermes-style framed history. User
+ * multimodal blocks and grouped tool results use the shared Anthropic wire
+ * converter. Unsigned reasoning is visible context; native signed blocks use
+ * a versioned, projection-checked carrier. Opaque foreign state, edited native
+ * projections, unsupported content, and assistant prefills fail before spawn.
  */
 export const planClaudeSdkFacadeTurn = (
   canonical: TChatCompletionRequest,
+  providerModelId: string = canonical.model,
 ): TClaudeSdkFacadeTurnPlan => {
-  const decomposed = historyTurnsFromCanonicalMessages(canonical.messages);
-  if (decomposed === null) {
-    return {
-      ok: false,
-      reason:
-        "sdk-facade: conversation shape unsupported (non-text parts, or no trailing user/tool-result turn)",
-    };
-  }
-  if (
-    decomposed.deltaText.length === 0 &&
-    decomposed.deltaKind !== "tool_results"
-  ) {
-    return { ok: false, reason: "no user turn to answer" };
-  }
   const tools = clientToolsOf(canonical);
   const toolNameMap = buildClaudeToolNameMap(tools);
   let messages: ReadonlyArray<TClaudeAnthropicMessage>;
+  let systemText: string | null;
   try {
-    messages = anthropicMessagesFromHistoryTurns(
-      decomposed.historyTurns,
-      decomposed.deltaText,
+    const history = claudeFacadeHistory(
+      canonical,
       toolNameMap,
+      providerModelId,
     );
+    messages = history.messages;
+    systemText = history.systemText;
   } catch (error) {
     return {
       ok: false,
@@ -229,7 +218,7 @@ export const planClaudeSdkFacadeTurn = (
   }));
   return {
     ok: true,
-    systemText: decomposed.systemText,
+    systemText,
     frames,
     tools,
     toolNameMap,
@@ -563,6 +552,15 @@ const runFacadeDecode = (args: {
   let emittedContent = false;
   let terminalSucceeded = false;
   const toolTracker = new TFacadeToolCallTracker(args.toolNameMap);
+  const nativeMessages: unknown[] = [];
+  let pendingTerminal: TChatCompletionChunk | null = null;
+
+  const successfulTerminal = (): TChatCompletionChunk | "end" => {
+    terminalSucceeded = true;
+    const terminal = pendingTerminal;
+    pendingTerminal = null;
+    return terminal ?? "end";
+  };
 
   const boundedExitCode = async (): Promise<number | "timeout"> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -581,6 +579,7 @@ const runFacadeDecode = (args: {
   const nextChunk = async (): Promise<
     TChatCompletionChunk | "end" | { error: string }
   > => {
+    if (terminalSucceeded) return "end";
     for (;;) {
       const { value, done } = await args.reader.read();
       if (done) {
@@ -601,20 +600,74 @@ const runFacadeDecode = (args: {
           providerModelId: args.providerModelId,
         });
         if (chunk === null) continue;
+        // A native message's finish is not the CLI's terminal outcome. Hold it
+        // until the result line validates success, and emit the lossless carrier
+        // first so a client stopping at finish_reason has already received it.
+        if (chunk.choices.some((choice) => choice.finish_reason != null)) {
+          pendingTerminal = chunk;
+          continue;
+        }
         if (isMeaningfulChunk(chunk)) emittedContent = true;
-        return chunk;
+        // Tell the Messages encoder to hold thinking for its replay carrier,
+        // instead of dumping it into visible text before the signed snapshot.
+        return event.value.type === "message_start"
+          ? {
+              ...chunk,
+              choices: chunk.choices.map((choice) => ({
+                ...choice,
+                delta: {
+                  ...choice.delta,
+                  reasoning_items: [{ type: CLAUDE_NATIVE_ASSISTANT_PENDING }],
+                },
+              })),
+            }
+          : chunk;
       }
-      if (line.type === "assistant" && !emittedContent) {
-        const chunk = assistantMessageChunk(
-          line.message,
+      if (line.type === "assistant") {
+        nativeMessages.push(line.message);
+        const carrier = claudeNativeAssistantCarrier(
+          nativeMessages,
           args.providerModelId,
-          args.toolNameMap,
+          {
+            mcpToCaller: args.toolNameMap,
+            leafToCaller: new Map(),
+          },
         );
+        const chunk = !emittedContent
+          ? assistantMessageChunk(
+              line.message,
+              args.providerModelId,
+              args.toolNameMap,
+            )
+          : null;
         if (chunk !== null) {
           emittedContent = true;
-          return chunk;
+          pendingTerminal ??= {
+            ...chunk,
+            choices: chunk.choices.map((choice) => ({ ...choice, delta: {} })),
+          };
+          return {
+            ...chunk,
+            choices: chunk.choices.map((choice) => ({
+              ...choice,
+              finish_reason: null,
+              delta: { ...choice.delta, reasoning_items: [carrier] },
+            })),
+          };
         }
-        continue;
+        return {
+          id: args.state.id ?? "msg_sdk_facade",
+          object: "chat.completion.chunk",
+          created: args.state.created,
+          model: args.providerModelId,
+          choices: [
+            {
+              index: 0,
+              delta: { reasoning_items: [carrier] },
+              finish_reason: null,
+            },
+          ],
+        };
       }
       if (line.type === "result") {
         const isError = line.is_error === true;
@@ -636,8 +689,7 @@ const runFacadeDecode = (args: {
         ) {
           const exitCode = await boundedExitCode();
           if (exitCode === 1) {
-            terminalSucceeded = true;
-            return "end";
+            return successfulTerminal();
           }
         }
         if (isError) {
@@ -647,8 +699,7 @@ const runFacadeDecode = (args: {
               : "sdk-facade: native runtime reported an unsuccessful terminal result";
           return { error: reason };
         }
-        terminalSucceeded = true;
-        return "end";
+        return successfulTerminal();
       }
     }
   };
@@ -683,7 +734,10 @@ const runFacadeDecode = (args: {
   return (async (): Promise<TNativeRunResult> => {
     let precommitTimer: ReturnType<typeof setTimeout> | undefined;
     const first = await Promise.race([
-      pump(),
+      pump().catch(() => ({
+        kind: "error" as const,
+        reason: "sdk-facade: invalid native response before commitment",
+      })),
       new Promise<"timeout">((resolve) => {
         precommitTimer = setTimeout(
           () => resolve("timeout"),
@@ -796,7 +850,10 @@ const runClaudeSdkFacadeCore = async (
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "claude CLI not installed" };
   }
-  const plan = planClaudeSdkFacadeTurn(params.canonical);
+  const plan = planClaudeSdkFacadeTurn(
+    params.canonical,
+    params.providerModelId,
+  );
   if (!plan.ok) {
     return { kind: "declined", reason: plan.reason };
   }

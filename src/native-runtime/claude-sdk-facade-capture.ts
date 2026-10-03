@@ -41,7 +41,6 @@ import { existsSync } from "node:fs";
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { logError, safeDiagnosticMessage } from "../logger";
 import {
-  chunksFromCapturedAnthropicResponse,
   claudeCaptureDestinationPolicy,
   commitFromChunkStream,
   declinedForNonOkCapturedResponse,
@@ -49,13 +48,16 @@ import {
   withClaudeCaptureBaseUrl,
 } from "./claude-capture";
 import { startClaudeFacadeMcpServer } from "./claude-facade-mcp-server";
+import { chunksFromFacadeCapturedResponse } from "./claude-facade-stream";
 import { ndjsonLines } from "./claude-native";
+import type {
+  TClaudeFacadeStdinWriter,
+  TClaudeSdkFacadeParams,
+} from "./claude-sdk-facade";
 import {
   logSdkFacadePhaseTiming,
   planClaudeSdkFacadeTurn,
   replayClaudeSdkFacadeHistory,
-  type TClaudeFacadeStdinWriter,
-  type TClaudeSdkFacadeParams,
 } from "./claude-sdk-facade";
 import type { TClaudeFacadeMcpServerRef } from "./claude-spawn";
 import { spawnClaudeFacadeCli } from "./claude-spawn";
@@ -109,7 +111,10 @@ const runClaudeSdkFacadeCaptureCore = async (
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "claude CLI not installed" };
   }
-  const plan = planClaudeSdkFacadeTurn(params.canonical);
+  const plan = planClaudeSdkFacadeTurn(
+    params.canonical,
+    params.providerModelId,
+  );
   if (!plan.ok) {
     return { kind: "declined", reason: plan.reason };
   }
@@ -305,10 +310,10 @@ const runClaudeSdkFacadeCaptureCore = async (
     return declined;
   }
 
-  const rawChunks = chunksFromCapturedAnthropicResponse(
+  const rawChunks = chunksFromFacadeCapturedResponse(
     dispatchResult.response,
     params.providerModelId,
-    plan.toolNameMap.mcpToCaller,
+    plan.toolNameMap,
   );
   // Same EOF-without-terminal-finish-reason guard `stream-json-capture` uses
   // — a clean upstream close with no observed finish reason must not

@@ -571,12 +571,21 @@ historical frame is always written unconditionally and is never acknowledged
 STATELESS at the daemon level — no session-store
 lease, no new conversation identifier (00-requirements.md req. 5) — the
 client's own message history already correlates the turn, exactly like an
-ordinary completion call. History → frames reuses the SAME exact decomposition
-every other Claude tool path already uses
-(`request-capture-history.ts#historyTurnsFromCanonicalMessages` +
-`claude-tool-capture.ts#anthropicMessagesFromHistoryTurns`/
-`buildClaudeToolNameMap`) rather than a parallel planner, and caller tools are
-declared (schema only, never executed) via a dedicated loopback MCP server
+ordinary completion call. `claude-facade-history.ts` follows Hermes's structured
+history rules, reusing the shared Anthropic content converter and Claude tool
+name/history helpers rather than the older text-only capture decomposition.
+Adjacent user/tool-result blocks are grouped into one user frame; images and
+supported documents retain their native block shapes. Unsigned reasoning and
+portable foreign summaries remain visible context, never fabricated thinking
+signatures. Native assistant blocks (including signed/redacted thinking) use a
+versioned `reasoning_items` carrier whose model and visible text/tool projection
+must match before replay; edited projections and encrypted-only foreign state
+fail closed. Messages JSON/SSE transports preserve that carrier in a separate
+`openllm-cn1:` envelope, and cumulative snapshots supersede earlier ones.
+Native projection text is not padded or deduplicated by compaction helpers.
+Terminal finish chunks wait for the CLI's validated result, after the carrier
+has been emitted. Caller tools are declared (schema only, never executed) via a
+dedicated loopback MCP server
 (`claude-facade-mcp-server.ts`) — `--max-turns 1` means the model's `tool_use`
 ends the turn before the CLI would ever invoke it. `sdk-facade-capture`
 attaches interception BEFORE spawning the SAME base runtime and reuses the
