@@ -24,6 +24,7 @@ import {
 } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
 import type { TCliProvider } from "./cli-paths";
 import {
   cliBin,
@@ -67,7 +68,10 @@ export const noteCliInstallProbeResult = (opts: {
     "cli-install",
     safeDiagnosticMessage`The installed client version could not be read repeatedly.`,
     undefined,
-    { timings: { repeat_count: n } },
+    {
+      timings: { repeat_count: n },
+      ...projectDoctorOutcomeLedger({ provider: opts.provider }),
+    },
   );
 };
 

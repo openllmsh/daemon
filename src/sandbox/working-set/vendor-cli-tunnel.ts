@@ -20,16 +20,20 @@
  */
 
 import type { TWorkingSet } from "./base";
-import { vendorExecDirs } from "./base";
+import { miseDirs, vendorExecDirs } from "./base";
 
 /**
  * The `vendor-cli-tunnel` layer's unique working set (pre-normalization —
  * `index.ts` runs `existing()`).
  */
-export const vendorCliTunnelLayer = (home: string): TWorkingSet => ({
-  readWrite: [],
-  // The vendor-CLI binary dirs — READ+EXEC only. A device PTY session execs the
-  // real vendor binary; the daemon never writes it (installs are user-run +
-  // unsandboxed). Shared with `auth-state` via the base helper.
-  readOnly: vendorExecDirs(home),
-});
+export const vendorCliTunnelLayer = (home: string): TWorkingSet => {
+  // A mise-managed vendor CLI runs through mise's roots (see `miseDirs`).
+  const mise = miseDirs(home);
+  return {
+    readWrite: mise.readWrite,
+    // The vendor-CLI binary dirs — READ+EXEC only. A device PTY session execs
+    // the real vendor binary; the daemon never writes it (installs are
+    // user-run + unsandboxed). Shared with `auth-state` via the base helper.
+    readOnly: [...vendorExecDirs(home), ...mise.readOnly],
+  };
+};

@@ -70,6 +70,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CLI_PROVIDERS, cliBin, hostCliCandidates } from "../../cli-paths";
 import { stateDir } from "../../env";
+import { misePaths } from "../../mise-paths";
 import { DAEMON_VERSION } from "../../version";
 
 export type TWorkingSet = {
@@ -258,6 +259,42 @@ export const resolveCliExecDirs = (seed: string, home: string): string[] => {
   }
 
   return [...out];
+};
+
+/**
+ * The user's `mise` GLOBAL roots, for hosts whose vendor CLIs are mise-managed.
+ * Without these, `mise which <cli>` (manager resolution) and any mise shim the
+ * daemon execs abort under confinement with `failed read_to_string
+ * ~/.config/mise/config.toml: Permission denied (os error 13)` — so the CLI is
+ * never resolved and native login exits before it starts (the 2026-10-04
+ * Linux/Landlock report).
+ *
+ *   read+exec  — the config dir (global `config.toml`; `~/.config` stays
+ *                ungranted, only its `mise` leaf), the data dir (mise's own
+ *                launcher, `installs/`, `shims/`) and the state dir (tracked
+ *                configs + trust records — read only, so a compromised daemon
+ *                cannot mark a project config trusted);
+ *   read-write — the cache dir only (holds no secrets or executables).
+ *
+ * Only EXISTING dirs are emitted (a mise-less host contributes nothing, and a
+ * missing leaf must never climb onto `~/.local/share` or `$HOME`), and a
+ * relocated root that is `/`, `$HOME`, an ancestor of `$HOME`, or a bare
+ * `SENSITIVE_ROOTS` entry is dropped.
+ */
+export const miseDirs = (
+  home: string,
+): { readonly readOnly: string[]; readonly readWrite: string[] } => {
+  const p = misePaths(home);
+  const forbidden = new Set<string>(["/", home, ...SENSITIVE_ROOTS(home)]);
+  for (let a = dirname(home); a !== dirname(a); a = dirname(a)) {
+    forbidden.add(a);
+  }
+  const keep = (dirs: readonly string[]): string[] =>
+    dirs.filter((d) => isAbsolute(d) && !forbidden.has(d) && existsSync(d));
+  return {
+    readOnly: keep([p.configDir, p.dataDir, p.stateDir]),
+    readWrite: keep([p.cacheDir]),
+  };
 };
 
 /**

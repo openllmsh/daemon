@@ -24,7 +24,10 @@ import type {
   TDaemonProviderReasonCode,
   TDoctorAuthPhase,
 } from "@openllmsh/protocol";
-import { projectDoctorOutcomeLedger } from "@openllmsh/protocol";
+import {
+  classifyFailureOutput,
+  projectDoctorOutcomeLedger,
+} from "@openllmsh/protocol";
 import {
   admitVerifiedLogin,
   emitAuth,
@@ -381,6 +384,13 @@ export const emitLoginSucceeded = (flow: TLoginFlowCtx): boolean => {
   return true;
 };
 
+const loginFailureMessage = (
+  code: TAuthLoginFailedCode,
+): ReturnType<typeof safeDiagnosticMessage> =>
+  code === "poll_expired" || code === "prompt_timeout"
+    ? safeDiagnosticMessage`The login time budget expired.`
+    : safeDiagnosticMessage`Login ended in an unexpected failure.`;
+
 export const emitLoginFailed = (
   flow: TLoginFlowCtx,
   fail: {
@@ -390,6 +400,30 @@ export const emitLoginFailed = (
     readonly reason_code?: TDaemonProviderReasonCode;
   },
 ): void => {
+  // Remote-diagnosable failure record: the closed failure code + a LOCAL
+  // classification of the message (which carries the redacted CLI output),
+  // never the message itself. Every login failure funnels through here, so
+  // this covers the stream, device-code, paste and background paths alike.
+  if (fail.code !== "user_cancelled") {
+    try {
+      const correlation_id = opaqueDoctorCorrelation(flow.flowId);
+      logWarn("login-flow", loginFailureMessage(fail.code), undefined, {
+        ...(correlation_id !== undefined ? { correlation_id } : {}),
+        ...projectDoctorOutcomeLedger({
+          provider: flow.slug,
+          operation_kind: "login",
+          outcome: "failed",
+          login_failure_code: fail.code,
+          failure_signature: classifyFailureOutput(fail.message),
+          ...(fail.reason_code !== undefined
+            ? { reason_code: fail.reason_code }
+            : {}),
+        }),
+      });
+    } catch {
+      // Reporting must never change login outcome.
+    }
+  }
   emitAuth({
     event: "auth.login.failed",
     flow_id: flow.flowId,
@@ -444,12 +478,24 @@ export const finalizeLoginTerminal = (opts: {
   readonly provider: string;
   readonly clearPending: boolean;
 }): void => {
-  if (opts.event.kind === "failed" && opts.event.code !== "user_cancelled") {
+  if (
+    opts.flow === null &&
+    opts.event.kind === "failed" &&
+    opts.event.code !== "user_cancelled"
+  ) {
+    // Flow-less terminal: `emitLoginFailed` (which records the classified
+    // failure) never runs, so record it here.
     logWarn(
       "login-flow",
-      opts.event.code === "poll_expired" || opts.event.code === "prompt_timeout"
-        ? safeDiagnosticMessage`The login time budget expired.`
-        : safeDiagnosticMessage`Login ended in an unexpected failure.`,
+      loginFailureMessage(opts.event.code),
+      undefined,
+      projectDoctorOutcomeLedger({
+        provider: opts.provider,
+        operation_kind: "login",
+        outcome: "failed",
+        login_failure_code: opts.event.code,
+        failure_signature: classifyFailureOutput(opts.event.message),
+      }),
     );
   }
   if (opts.flow !== null) {
@@ -481,10 +527,16 @@ export const finalizeLoginTerminal = (opts: {
               ? "failed"
               : undefined;
     const failureExtras =
-      opts.event.kind === "failed" && opts.event.reason_code !== undefined
+      opts.event.kind === "failed"
         ? {
-            reason_code: opts.event.reason_code,
-            observation: "unknown" as const,
+            login_failure_code: opts.event.code,
+            failure_signature: classifyFailureOutput(opts.event.message),
+            ...(opts.event.reason_code !== undefined
+              ? {
+                  reason_code: opts.event.reason_code,
+                  observation: "unknown" as const,
+                }
+              : {}),
           }
         : {};
     try {

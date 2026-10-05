@@ -23,7 +23,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, sep } from "node:path";
-import { runCapture, spawnCwd } from "./delegation/spawn";
+import type { TDoctorFailureSignature } from "@openllmsh/protocol";
+import { classifyFailureOutput } from "@openllmsh/protocol";
+import { runCaptureResult, spawnCwd } from "./delegation/spawn";
+import { logWarn, safeDiagnosticMessage } from "./logger";
+import { misePaths } from "./mise-paths";
 import { resolveOnPath } from "./path-utils";
 
 export type TManagerResolutionKind =
@@ -412,14 +416,8 @@ const trustedGlobalMiseEnvOverrides = (): Record<
  * writes it — it exists purely so the coordinator's cache can tell a real
  * `mise use -g …` selection change from an untouched shim file.
  */
-const miseGlobalConfigPath = (): string => {
-  const explicit = process.env.MISE_GLOBAL_CONFIG_FILE;
-  if (explicit !== undefined) return explicit;
-  const configDir =
-    process.env.MISE_CONFIG_DIR ??
-    join(process.env.XDG_CONFIG_HOME ?? join(miseHomeDir(), ".config"), "mise");
-  return join(configDir, "config.toml");
-};
+const miseGlobalConfigPath = (): string =>
+  misePaths(miseHomeDir()).globalConfigFile;
 
 /** {@link TManagerAdapter.fingerprint} for mise: the global config file's
  *  mtime+size (or its documented absence) — a selection SWITCH rewrites this
@@ -432,6 +430,29 @@ const miseSelectionFingerprint = (): string => {
   } catch {
     return `cfg-absent:${path}`;
   }
+};
+
+/**
+ * Record WHY `mise which` failed — a closed signature of its stderr (e.g.
+ * `mise_permission_denied` when confinement blocks mise's own config), never
+ * the text. Without this a sandbox-blocked mise was indistinguishable from an
+ * uninstalled CLI in remote diagnostics (2026-10-04 Linux report).
+ */
+const noteMiseResolveFailure = (
+  kind: "failed" | "timeout",
+  signature: TDoctorFailureSignature | null,
+): void => {
+  logWarn(
+    "manager-resolution",
+    kind === "timeout"
+      ? safeDiagnosticMessage`Version-manager resolution timed out.`
+      : safeDiagnosticMessage`Version-manager resolution failed.`,
+    undefined,
+    {
+      failure_signature:
+        kind === "timeout" ? "unclassified" : (signature ?? "no_output"),
+    },
+  );
 };
 
 const resolveMiseShim = async (
@@ -453,14 +474,22 @@ const resolveMiseShim = async (
   // never starts in one.
   const env = trustedGlobalMiseEnvOverrides();
   if (env === null) return null;
-  const result = await runCapture([mise, "which", cmd], env, {
+  let signature: TDoctorFailureSignature | null = null;
+  const result = await runCaptureResult([mise, "which", cmd], env, {
     probe: true,
     timeoutMs: miseResolveTimeoutMs(),
     maxBytes: 4_096,
     ...(signal !== undefined ? { signal } : {}),
+    onFailureStderr: (stderr) => {
+      signature = classifyFailureOutput(stderr);
+    },
   });
-  if (result === null) return null;
-  const answer = result.trim();
+  if (result.kind !== "ok") {
+    if (result.kind !== "aborted")
+      noteMiseResolveFailure(result.kind, signature);
+    return null;
+  }
+  const answer = result.text.trim();
   if (answer.length === 0 || /[\r\n\0]/.test(answer)) return null;
   if (!isAbsolute(answer)) return null;
   if (answer === candidate) return null; // self-reference

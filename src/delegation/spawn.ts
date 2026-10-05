@@ -196,6 +196,49 @@ export type TRunCaptureOpts = {
   readonly maxBytes?: number;
   readonly producer?: TNativeAuthProducer;
   readonly operationId?: string;
+  /**
+   * Opt-in: pipe stderr (capped at {@link FAILURE_STDERR_MAX_BYTES}) and hand
+   * it to this callback when the child exits NON-ZERO. For LOCAL failure
+   * classification only — callers must never log or upload the text itself.
+   * Unset keeps stderr ignored (the default for every existing caller).
+   */
+  readonly onFailureStderr?: (stderr: string) => void;
+};
+
+const FAILURE_STDERR_MAX_BYTES = 2_048;
+
+const readCappedText = async (
+  stream: ReadableStream<Uint8Array>,
+  cap: number,
+): Promise<string> => {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined || n >= cap) continue; // keep draining
+      const take = value.subarray(0, cap - n);
+      chunks.push(take);
+      n += take.byteLength;
+    }
+  } catch {
+    // stream torn down — return what was read
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // already released
+    }
+  }
+  const merged = new Uint8Array(n);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder().decode(merged);
 };
 
 /** Subscribe to `signal` abort; invoke `onAbort` immediately if already aborted. */
@@ -335,7 +378,7 @@ export const runCaptureResult = async (
       kind: opts?.kind ?? (opts?.probe === true ? "probe" : "vendor-capture"),
       stdin: "ignore",
       stdout: "pipe",
-      stderr: "ignore",
+      stderr: opts?.onFailureStderr !== undefined ? "pipe" : "ignore",
       cwd: spawnCwd(env),
       ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
     };
@@ -358,6 +401,13 @@ export const runCaptureResult = async (
         clock: "performance.now",
       });
     }
+    const stderrStream = proc.stderr;
+    const stderrText =
+      opts?.onFailureStderr !== undefined &&
+      stderrStream !== undefined &&
+      typeof stderrStream !== "number"
+        ? readCappedText(stderrStream, FAILURE_STDERR_MAX_BYTES)
+        : null;
     const stdout = proc.stdout;
     if (stdout === undefined || typeof stdout === "number") {
       await child.terminate();
@@ -580,7 +630,16 @@ export const runCaptureResult = async (
       logIfKilled(redactSensitiveArgv(argv), proc, {
         confined: opts?.probe !== true,
       });
-      if (outcome.code !== 0) return { kind: "failed" };
+      if (outcome.code !== 0) {
+        if (stderrText !== null && opts?.onFailureStderr !== undefined) {
+          try {
+            opts.onFailureStderr(await stderrText);
+          } catch {
+            // classification must never change the capture outcome
+          }
+        }
+        return { kind: "failed" };
+      }
       const trimmed = outcome.out.trim();
       if (trimmed.length > 0) return { kind: "ok", text: trimmed };
       return opts?.allowEmpty === true

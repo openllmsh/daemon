@@ -17,7 +17,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { cliConfigDir } from "../../cli-paths";
 import type { TWorkingSet } from "./base";
-import { vendorExecDirs } from "./base";
+import { miseDirs, vendorExecDirs } from "./base";
 
 /**
  * The `auth-state` layer's unique working set (pre-normalization — `index.ts`
@@ -55,7 +55,11 @@ export const authStateLayer = (home: string): TWorkingSet => {
       // best-effort — see the claude-dir loop above.
     }
   }
+  // mise's global roots: login/usage delegation resolves and execs
+  // mise-managed vendor CLIs (see `miseDirs`).
+  const mise = miseDirs(home);
   const readWrite = new Set<string>([
+    ...mise.readWrite,
     //   claude's XDG STATE + CACHE dirs — the isolated claude WRITES these at
     //   RUN time (logs/state + cache) on Linux; absent on macOS. Scoped to the
     //   claude subdirs (not the whole `~/.local/state` / `~/.cache`) — no
@@ -77,6 +81,7 @@ export const authStateLayer = (home: string): TWorkingSet => {
     // symlink-chain resolution). The daemon RUNS the vendor CLIs (login/usage
     // delegation) but never WRITES them: installs are user-run + unsandboxed.
     ...vendorExecDirs(home),
+    ...mise.readOnly,
     // bun's BINARY dir — read+exec only (the split ~/.bun grant, audit §5-B):
     // the plugin install must EXEC `bun`, but a write grant here would let a
     // compromised daemon replace the user's `bun` launcher. The cache half
