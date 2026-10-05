@@ -288,14 +288,25 @@ export const claudeFacadeHistory = (
   };
   for (const message of canonical.messages) {
     if (message.role === "system") {
-      if (messages.length > 0)
-        throw new Error("system history must precede conversation turns");
       const blocks = contentBlocks(message.content);
       if (blocks.some((b) => b.type !== "text"))
         throw new Error("system history must be text");
-      system.push(
-        blocks.map((b) => (b.type === "text" ? b.text : "")).join(""),
-      );
+      const text = blocks
+        .map((b) => (b.type === "text" ? b.text : ""))
+        .join("");
+      // Only the leading run is the CLI's system prompt. A later one (Codex
+      // `developer` instructions between turns) keeps its position as a
+      // reminder in the user frame, the way Claude Code itself injects
+      // mid-conversation instructions; hoisting it would reorder it and
+      // rewrite the cached system prefix.
+      if (messages.length === 0) system.push(text);
+      else if (text.length > 0)
+        appendUser([
+          {
+            type: "text",
+            text: `<system-reminder>\n${text}\n</system-reminder>`,
+          },
+        ]);
     } else if (message.role === "assistant") {
       messages.push(...assistantMessages(message, model, nameMap));
     } else if (message.role === "tool") {
