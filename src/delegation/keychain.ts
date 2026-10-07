@@ -32,7 +32,16 @@
  */
 import { randomBytes } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { link, mkdir, readdir, rename, rm } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  readdir,
+  readlink,
+  rename,
+  rm,
+  symlink,
+} from "node:fs/promises";
 import { platform } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type {
@@ -86,8 +95,77 @@ const canonicalizeHome = (home: string): string => {
   }
 };
 
+const keychainsDir = (home: string): string =>
+  join(canonicalizeHome(home), "Library", "Keychains");
+
+/** Name the vendor CLIs resolve from HOME. macOS 27 `securityd` refuses to
+ *  UNLOCK any keychain with this basename other than the account's own
+ *  (exit 51, "passphrase … not correct" — password-independent), so it is only
+ *  ever a SYMLINK to {@link ISOLATED_KEYCHAIN_NAME}. */
+const VENDOR_KEYCHAIN_NAME = "login.keychain-db";
+/** The real isolated store. Every `security` operation targets this file. */
+const ISOLATED_KEYCHAIN_NAME = "openllm.keychain-db";
+
+/** The REAL isolated store (create / unlock / grant / read / identity). */
 const loginKeychainPath = (home: string): string =>
-  join(canonicalizeHome(home), "Library", "Keychains", "login.keychain-db");
+  join(keychainsDir(home), ISOLATED_KEYCHAIN_NAME);
+
+/** The HOME-derived path the vendor CLIs open; a relative symlink. */
+const vendorKeychainPath = (home: string): string =>
+  join(keychainsDir(home), VENDOR_KEYCHAIN_NAME);
+
+type TKeychainLayout = "ready" | "absent" | "conflict";
+
+/**
+ * Reconcile the two-name layout. Lossless and create-only:
+ * - legacy regular file at the vendor name, no real store → atomic same-dir
+ *   rename to the real name (keeps every credential; it just becomes
+ *   unlockable on macOS 27), then link the vendor name back;
+ * - real store present, vendor name missing → create the symlink;
+ * - both REGULAR files, or a foreign symlink → `conflict`: touch nothing.
+ * Never deletes or recreates a store. Racing peers converge via EEXIST.
+ */
+const reconcileKeychainLayout = async (
+  home: string,
+): Promise<TKeychainLayout> => {
+  const real = loginKeychainPath(home);
+  const vendor = vendorKeychainPath(home);
+  const vendorKind = await lstat(vendor).then(
+    (st) => (st.isSymbolicLink() ? "link" : "file"),
+    () => "missing" as const,
+  );
+  if (vendorKind === "link") {
+    const target = await readlink(vendor).catch(() => null);
+    if (target !== ISOLATED_KEYCHAIN_NAME && target !== real) {
+      return "conflict";
+    }
+    return existsSync(real) ? "ready" : "absent";
+  }
+  if (vendorKind === "file") {
+    if (existsSync(real)) return "conflict";
+    try {
+      await rename(vendor, real);
+    } catch {
+      return existsSync(real) ? "conflict" : "absent";
+    }
+    logInfo(
+      "keychain",
+      safeDiagnosticMessage`keychain store migrated off the reserved name`,
+    );
+  }
+  if (!existsSync(real)) return "absent";
+  try {
+    await symlink(ISOLATED_KEYCHAIN_NAME, vendor);
+  } catch (err) {
+    if (!isExistError(err)) return "conflict";
+    // A peer linked first; re-check it points at us.
+    const target = await readlink(vendor).catch(() => null);
+    if (target !== ISOLATED_KEYCHAIN_NAME && target !== real) {
+      return "conflict";
+    }
+  }
+  return "ready";
+};
 
 type TSpawnMode = "ignore" | "pipe";
 
@@ -1304,22 +1382,32 @@ const createIsolatedKeychain = async (
       }),
     );
   }
-  const unlock = await spawnSecurityQuiet(
-    ["unlock-keychain", "-p", "", kc],
-    home,
-    signal,
-  );
+  // stderr captured only to classify; never logged or uploaded.
+  const unlock = await spawnSecurity(["unlock-keychain", "-p", "", kc], home, {
+    stdout: "ignore",
+    stderr: "pipe",
+    ...(signal !== undefined ? { signal } : {}),
+  });
   if (unlock.code !== 0 || unlock.timedOut || unlock.aborted) {
+    const classifier = storeClassifierOf(
+      matchUnlockFailureToken(unlock.stderr),
+    );
+    const observation = toStoreObservation({
+      operation: "unlock",
+      stage: "final",
+      result: storeResultOf(unlock),
+      exitCode: unlock.code,
+      ...(classifier !== undefined ? { classifier } : {}),
+    });
     logWarn(
       "keychain",
       safeDiagnosticMessage`keychain final unlock failed`,
       undefined,
-      toStoreObservation({
-        operation: "unlock",
-        stage: "final",
-        result: storeResultOf(unlock),
-        exitCode: unlock.code,
-      }),
+      // Staging unlocked this same store moments ago: a refusal now points at
+      // the store's name/location, not its password.
+      installed === "installed"
+        ? { ...observation, store_staging_unlocked: true }
+        : observation,
     );
     return false;
   }
@@ -1647,12 +1735,25 @@ const ensureKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // Migrates a legacy reserved-name store before anything opens it.
+  const layout = await reconcileKeychainLayout(home);
+  if (layout === "conflict") {
+    logWarn(
+      "keychain",
+      safeDiagnosticMessage`keychain layout conflict; leaving both stores untouched`,
+    );
+    return { kind: "indeterminate", cause: "keychain_create_failed" };
+  }
   const existedAtStart = existsSync(kc);
   const isInitialExistingUnlock =
     existedAtStart && !initialExistingKeychainUnlocks.has(kc);
   if (isInitialExistingUnlock) initialExistingKeychainUnlocks.add(kc);
   if (!existedAtStart) {
     if (!(await createIsolatedKeychain(home, kc, signal))) {
+      logKeychainFailure(kc);
+      return noteTransientFailure(kc, "keychain_create_failed");
+    }
+    if ((await reconcileKeychainLayout(home)) !== "ready") {
       logKeychainFailure(kc);
       return noteTransientFailure(kc, "keychain_create_failed");
     }
@@ -1850,6 +1951,8 @@ const observeKeychainNow = async (
   kc: string,
   signal?: AbortSignal,
 ): Promise<TStoreRead<void>> => {
+  // Rename-only migration is lossless, so it is safe even on the passive path.
+  await reconcileKeychainLayout(home);
   if (!existsSync(kc)) {
     return { kind: "indeterminate", cause: "keychain_absent" };
   }

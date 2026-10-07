@@ -217,7 +217,7 @@ export const makeBlockingConnect = (
               reason_code: "keychain_unavailable",
             };
             emitLoginFailed(flow, {
-              code: "spawn_denied",
+              code: "store_unavailable",
               message: KEYCHAIN_NOT_READY_DETAIL,
               retryable: true,
               reason_code: "keychain_unavailable",
@@ -336,7 +336,7 @@ export const makeBlockingConnect = (
                 reason_code: "keychain_unavailable",
               };
               emitLoginFailed(flow, {
-                code: "spawn_denied",
+                code: "store_unavailable",
                 message: KEYCHAIN_NOT_READY_DETAIL,
                 retryable: true,
                 reason_code: "keychain_unavailable",
@@ -488,7 +488,7 @@ export const makeStreamConnect = (
             flow,
             event: {
               kind: "failed",
-              code: "spawn_denied",
+              code: "store_unavailable",
               message: KEYCHAIN_NOT_READY_DETAIL,
               retryable: true,
               reason_code: "keychain_unavailable",

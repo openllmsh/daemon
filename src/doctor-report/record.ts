@@ -21,7 +21,7 @@ import { DAEMON_VERSION } from "../version";
 import { opaqueDoctorCorrelation } from "./correlation";
 import { doctorStateDir, doctorStatePath } from "./files";
 import { diagnosticMessageText } from "./message";
-import { doctorArchitecture, doctorPlatform } from "./platform";
+import { doctorArchitecture, doctorOsStamp, doctorPlatform } from "./platform";
 
 export { opaqueDoctorCorrelation } from "./correlation";
 
@@ -100,7 +100,7 @@ export const recordDoctorObservation = (
     ...(input.timings !== undefined
       ? { timings: projectDoctorTimings(input.timings) }
       : {}),
-    ...projectDoctorOutcomeLedger(input),
+    ...projectDoctorOutcomeLedger({ ...input, ...doctorOsStamp() }),
   };
   let parsed: TDoctorReportEvent;
   try {

@@ -131,7 +131,7 @@ export const makePasteBackDevice = (
             flow,
             event: {
               kind: "failed",
-              code: "spawn_denied",
+              code: "store_unavailable",
               message: KEYCHAIN_NOT_READY_DETAIL,
               retryable: true,
               reason_code: "keychain_unavailable",
@@ -372,7 +372,7 @@ export const makePasteBackDevice = (
           flow: submittingFlow,
           event: {
             kind: "failed",
-            code: "spawn_denied",
+            code: "store_unavailable",
             message: KEYCHAIN_NOT_READY_DETAIL,
             retryable: true,
             reason_code: "keychain_unavailable",
