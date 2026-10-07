@@ -713,10 +713,15 @@ const computeStatusFreshInner = async (
         const conn = applyAuthLiteral(d.slug, raw);
         rememberConnection(d.slug, raw, conn);
         if (!providerAuthOwned(d.slug) && !probeBackoffBlocks(d.slug, force)) {
+          // An absent CLI is a definite (cheap stat) answer, not a flaky
+          // probe: backing it off would delay detecting a finished vendor
+          // install by up to the backoff ceiling and publish a placeholder
+          // that drops `cli_installed` in the meantime.
           noteProbeIndeterminate(
             d.slug,
-            conn.observation === "unknown" ||
-              conn.detail === STATUS_CHECK_FAILED_DETAIL,
+            conn.reason_code !== "cli_unavailable" &&
+              (conn.observation === "unknown" ||
+                conn.detail === STATUS_CHECK_FAILED_DETAIL),
           );
         }
         // Installer metadata is merged AFTER auth overlays / last-known spreads
