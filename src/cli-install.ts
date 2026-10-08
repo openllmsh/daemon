@@ -35,11 +35,13 @@ import {
   hostCliCandidates,
 } from "./cli-paths";
 import { cliVersion } from "./delegation/util";
+import type { TSafeDiagnosticMessage } from "./doctor-report/message";
 import { logWarn, safeDiagnosticMessage } from "./logger";
 import {
   peekManagerResolution,
   resolveManagerCandidate,
 } from "./manager-resolution";
+import { isHostCliRunnable } from "./path-utils";
 
 export type TCliInstallState = {
   readonly installed: boolean;
@@ -50,6 +52,30 @@ const cliFailStreak = new Map<string, number>();
 
 export const resetCliInstallDoctorStreakForTests = (): void => {
   cliFailStreak.clear();
+};
+
+/**
+ * Per-provider doctor copy — `safeDiagnosticMessage` forbids interpolation, and
+ * underscores (as in `claude_code`) fail message sanitization, so the shell
+ * command name (`claude`, `codex`, …) is baked into each literal. The closed
+ * `provider` ledger field carries the slug.
+ */
+const VERSION_UNREADABLE_MESSAGES: Readonly<
+  Record<TCliProvider, TSafeDiagnosticMessage>
+> = {
+  claude_code: safeDiagnosticMessage`The installed claude client version could not be read repeatedly.`,
+  chatgpt: safeDiagnosticMessage`The installed codex client version could not be read repeatedly.`,
+  kimi_code: safeDiagnosticMessage`The installed kimi client version could not be read repeatedly.`,
+  grok: safeDiagnosticMessage`The installed grok client version could not be read repeatedly.`,
+  cursor: safeDiagnosticMessage`The installed cursor-agent client version could not be read repeatedly.`,
+  muse: safeDiagnosticMessage`The installed muse client version could not be read repeatedly.`,
+};
+
+const versionUnreadableMessage = (provider: string): TSafeDiagnosticMessage => {
+  if (Object.hasOwn(VERSION_UNREADABLE_MESSAGES, provider)) {
+    return VERSION_UNREADABLE_MESSAGES[provider as TCliProvider];
+  }
+  return safeDiagnosticMessage`The installed client version could not be read repeatedly.`;
 };
 
 export const noteCliInstallProbeResult = (opts: {
@@ -64,15 +90,10 @@ export const noteCliInstallProbeResult = (opts: {
   const n = (cliFailStreak.get(opts.provider) ?? 0) + 1;
   cliFailStreak.set(opts.provider, n);
   if (n !== 3) return;
-  logWarn(
-    "cli-install",
-    safeDiagnosticMessage`The installed client version could not be read repeatedly.`,
-    undefined,
-    {
-      timings: { repeat_count: n },
-      ...projectDoctorOutcomeLedger({ provider: opts.provider }),
-    },
-  );
+  logWarn("cli-install", versionUnreadableMessage(opts.provider), undefined, {
+    timings: { repeat_count: n },
+    ...projectDoctorOutcomeLedger({ provider: opts.provider }),
+  });
 };
 
 /** Create the isolated provider dirs (root + home + config) before a write. */
@@ -192,16 +213,27 @@ const resolveHostBinary = async (
   provider: TCliProvider,
   opts?: { readonly demand?: boolean; readonly signal?: AbortSignal },
 ): Promise<string | undefined> => {
-  const host = hostCliCandidates(provider).find((c) => existsSync(c));
-  if (host === undefined) return undefined;
-  const resolved =
-    opts?.demand === true
-      ? await resolveManagerCandidate(host, { signal: opts.signal })
-      : peekManagerResolution(host);
-  if (resolved === undefined || resolved.kind === "unresolved") {
-    return undefined;
+  // Walk every candidate: a PATH-hit shebang whose interpreter is missing
+  // (npm `@openai/codex` → `#!/usr/bin/env node` under nvm) must not win over
+  // a later native install, and must not count as "installed" when it is the
+  // only hit — that falls through to the isolated vendor-install flow.
+  for (const candidate of hostCliCandidates(provider)) {
+    if (!existsSync(candidate)) continue;
+    if (!isHostCliRunnable(candidate)) continue;
+    const resolved =
+      opts?.demand === true
+        ? await resolveManagerCandidate(candidate, { signal: opts.signal })
+        : peekManagerResolution(candidate);
+    if (resolved === undefined || resolved.kind === "unresolved") {
+      continue;
+    }
+    const target = resolved.target ?? undefined;
+    if (target === undefined) continue;
+    // Manager resolution can point at another script; re-check the final target.
+    if (!isHostCliRunnable(target)) continue;
+    return target;
   }
-  return resolved.target ?? undefined;
+  return undefined;
 };
 
 /**
@@ -392,6 +424,24 @@ const probeCliInstallState = async (
     }
   }
   if (!existsSync(bin)) {
+    return { installed: false, version: null };
+  }
+
+  // A leftover isolated link at an unrunnable shebang (npm shim without node
+  // on the daemon PATH) must not keep reporting installed / burn version
+  // probes — drop it so the next demand can take the vendor-install path.
+  let linkedTarget = bin;
+  try {
+    linkedTarget = realpathSync(bin);
+  } catch {
+    linkedTarget = bin;
+  }
+  if (!isHostCliRunnable(linkedTarget)) {
+    try {
+      rmSync(bin, { force: true });
+    } catch {
+      // best effort — installed:false still blocks login on the bad link
+    }
     return { installed: false, version: null };
   }
 

@@ -42,6 +42,10 @@ import {
   currentLoginCommandCorrelation,
   runWithLoginCommand,
 } from "../op-context";
+import {
+  inspectHostCliRuntime,
+  isCliRuntimeMissingOutput,
+} from "../path-utils";
 import type { TPendingAuth } from "../pending-auth";
 import {
   clearPendingAuth,
@@ -386,10 +390,16 @@ export const emitLoginSucceeded = (flow: TLoginFlowCtx): boolean => {
 
 const loginFailureMessage = (
   code: TAuthLoginFailedCode,
-): ReturnType<typeof safeDiagnosticMessage> =>
-  code === "poll_expired" || code === "prompt_timeout"
-    ? safeDiagnosticMessage`The login time budget expired.`
-    : safeDiagnosticMessage`Login ended in an unexpected failure.`;
+  reasonCode?: TDaemonProviderReasonCode,
+): ReturnType<typeof safeDiagnosticMessage> => {
+  if (code === "poll_expired" || code === "prompt_timeout") {
+    return safeDiagnosticMessage`The login time budget expired.`;
+  }
+  if (reasonCode === "cli_runtime_missing") {
+    return safeDiagnosticMessage`Login needs a runtime the daemon cannot find.`;
+  }
+  return safeDiagnosticMessage`Login ended in an unexpected failure.`;
+};
 
 export const emitLoginFailed = (
   flow: TLoginFlowCtx,
@@ -407,19 +417,24 @@ export const emitLoginFailed = (
   if (fail.code !== "user_cancelled") {
     try {
       const correlation_id = opaqueDoctorCorrelation(flow.flowId);
-      logWarn("login-flow", loginFailureMessage(fail.code), undefined, {
-        ...(correlation_id !== undefined ? { correlation_id } : {}),
-        ...projectDoctorOutcomeLedger({
-          provider: flow.slug,
-          operation_kind: "login",
-          outcome: "failed",
-          login_failure_code: fail.code,
-          failure_signature: classifyFailureOutput(fail.message),
-          ...(fail.reason_code !== undefined
-            ? { reason_code: fail.reason_code }
-            : {}),
-        }),
-      });
+      logWarn(
+        "login-flow",
+        loginFailureMessage(fail.code, fail.reason_code),
+        undefined,
+        {
+          ...(correlation_id !== undefined ? { correlation_id } : {}),
+          ...projectDoctorOutcomeLedger({
+            provider: flow.slug,
+            operation_kind: "login",
+            outcome: "failed",
+            login_failure_code: fail.code,
+            failure_signature: classifyFailureOutput(fail.message),
+            ...(fail.reason_code !== undefined
+              ? { reason_code: fail.reason_code }
+              : {}),
+          }),
+        },
+      );
     } catch {
       // Reporting must never change login outcome.
     }
@@ -487,7 +502,7 @@ export const finalizeLoginTerminal = (opts: {
     // failure) never runs, so record it here.
     logWarn(
       "login-flow",
-      loginFailureMessage(opts.event.code),
+      loginFailureMessage(opts.event.code, opts.event.reason_code),
       undefined,
       projectDoctorOutcomeLedger({
         provider: opts.provider,
@@ -495,6 +510,9 @@ export const finalizeLoginTerminal = (opts: {
         outcome: "failed",
         login_failure_code: opts.event.code,
         failure_signature: classifyFailureOutput(opts.event.message),
+        ...(opts.event.reason_code !== undefined
+          ? { reason_code: opts.event.reason_code }
+          : {}),
       }),
     );
   }
@@ -622,6 +640,7 @@ export const streamLoginFail = (
   readonly code: TAuthLoginFailedCode;
   readonly message: string;
   readonly retryable: boolean;
+  readonly reason_code?: TDaemonProviderReasonCode;
 } => {
   if (res.spawnFailure !== undefined) {
     return {
@@ -638,6 +657,18 @@ ${body}`
       : title;
   if (isInnerSpawnDenied(res.captured, res.exitCode)) {
     return { code: "spawn_denied", message: titled, retryable: false };
+  }
+  if (isCliRuntimeMissingOutput(res.captured)) {
+    const message =
+      crashDetail !== undefined
+        ? crashDetail(res.captured, res.exitCode)
+        : titled;
+    return {
+      code: "cli_crash",
+      message,
+      retryable: false,
+      reason_code: "cli_runtime_missing",
+    };
   }
   if (res.crashed) {
     return {
@@ -1187,6 +1218,33 @@ export const spawnStreamLogin = async <T>(
   }
   const child = proc;
   emitLoginStarted(flow);
+  try {
+    const target = opts.argv[0];
+    const runtime =
+      typeof target === "string" ? inspectHostCliRuntime(target) : null;
+    if (runtime !== null) {
+      const correlation_id = opaqueDoctorCorrelation(flow.flowId);
+      logInfo(
+        "login-flow",
+        safeDiagnosticMessage`Login spawn prepared.`,
+        undefined,
+        {
+          ...(correlation_id !== undefined ? { correlation_id } : {}),
+          ...projectDoctorOutcomeLedger({
+            provider: flow.slug,
+            operation_kind: "login",
+            phase: "start",
+          }),
+          timings: {
+            cli_is_script: runtime.kind === "script",
+            interpreter_resolved: runtime.interpreterResolved,
+          },
+        },
+      );
+    }
+  } catch {
+    // Observation must never change login outcome.
+  }
 
   const promptStream = (
     opts.stream === "stdout" ? child.stdout : child.stderr

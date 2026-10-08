@@ -275,6 +275,10 @@ export const cliHome = (provider: TCliProvider, home?: string): string =>
 export const cliBin = (provider: TCliProvider, home?: string): string =>
   join(cliRoot(provider, home), SPECS[provider].binRel);
 
+/** Shell command name for a provider CLI (`codex`, `claude`, `cursor-agent`, …). */
+export const cliCommand = (provider: TCliProvider): string =>
+  SPECS[provider].cmd;
+
 /**
  * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
  * order — `cli-install.ts` `cliInstallState` returns the first that exists and
