@@ -362,6 +362,88 @@ const readSlice = (
   };
 };
 
+/**
+ * Pre-consent backfill horizon. Reuses the pending-spool TTL (24h): records
+ * older than this are already outside the engine's retention intent, so the
+ * first allow after consent only rewinds within that same bound.
+ */
+const CONSENT_LOOKBACK_MS = DOCTOR_REPORT_PENDING_TTL_MS;
+
+/** Byte offset of the first journal line with observed_at_ms >= cutoff. */
+const firstLookbackOffset = (
+  path: string,
+  size: number,
+  cutoffMs: number,
+): number | null => {
+  if (size <= 0) return null;
+  const slice = readSlice(path, 0, size);
+  let start = 0;
+  let byteOffset = 0;
+  while (start < slice.text.length) {
+    const nl = slice.text.indexOf("\n", start);
+    if (nl === -1) break;
+    const line = slice.text.slice(start, nl);
+    const chunk = slice.text.slice(start, nl + 1);
+    const lineBytes = Buffer.byteLength(chunk);
+    start = nl + 1;
+    if (line.trim() !== "") {
+      try {
+        const parsed = parseDoctorReportEvent(JSON.parse(line) as unknown);
+        if (parsed.observed_at_ms >= cutoffMs) return byteOffset;
+      } catch {
+        // Legacy / corrupt lines are skipped the same way collectWindow does.
+      }
+    }
+    byteOffset += lineBytes;
+  }
+  return null;
+};
+
+/**
+ * Cursor that rewinds into the diagnostics journal by CONSENT_LOOKBACK_MS so
+ * first-consent / same-identity generation transitions can upload the
+ * pre-consent window. Account/origin mismatches must not use this.
+ */
+const lookbackCursorForScope = (scope: {
+  originScope: string;
+  accountScope: string;
+  generation: string | null;
+}): TCursor => {
+  const cutoffMs = clock() - CONSENT_LOOKBACK_MS;
+  const livePath = diagnosticsLogPath();
+  const rotatedPath = diagnosticsRotatedPath();
+  const live = fileStat(livePath);
+  const rotated = fileStat(rotatedPath);
+  let liveOffset = live?.size ?? 0;
+  let rotatedOffset = rotated?.size ?? 0;
+  if (rotated !== null) {
+    const rotatedStart = firstLookbackOffset(
+      rotatedPath,
+      rotated.size,
+      cutoffMs,
+    );
+    if (rotatedStart !== null) {
+      rotatedOffset = rotatedStart;
+      liveOffset = 0;
+    } else if (live !== null) {
+      liveOffset =
+        firstLookbackOffset(livePath, live.size, cutoffMs) ?? live.size;
+    }
+  } else if (live !== null) {
+    liveOffset =
+      firstLookbackOffset(livePath, live.size, cutoffMs) ?? live.size;
+  }
+  return {
+    origin_scope: scope.originScope,
+    account_scope: scope.accountScope,
+    generation: scope.generation,
+    live_offset: liveOffset,
+    rotated_offset: rotatedOffset,
+    live_id: live?.id ?? null,
+    rotated_id: rotated?.id ?? null,
+  };
+};
+
 const consumeLines = (
   text: string,
   maxEvents: number,
@@ -924,7 +1006,7 @@ export const reportingStatus = (): TDoctorReportingStatus => {
   };
 };
 
-const discardReportingWindow = (): void => {
+const resetReportingTimers = (): void => {
   transitionRevision += 1;
   purgePendingReports();
   if (debounceTimer !== null) clearTimer(debounceTimer);
@@ -932,12 +1014,30 @@ const discardReportingWindow = (): void => {
   debounceTimer = null;
   backoffTimer = null;
   backoffMs = 1_000;
-  writeCursor(tailCursorForScope(reportingScope()));
   clearAttemptMemory();
 };
 
+const discardReportingWindow = (): void => {
+  resetReportingTimers();
+  writeCursor(tailCursorForScope(reportingScope()));
+};
+
+/**
+ * Arm uploads from a bounded pre-consent lookback instead of the log tip.
+ * Used only for first allow / same-identity generation transitions — never
+ * after an explicit opt-out, and never across account/origin changes.
+ */
+const openReportingWindowWithLookback = (): void => {
+  resetReportingTimers();
+  writeCursor(lookbackCursorForScope(reportingScope()));
+  if (hasEligibleUnconsumedWork()) scheduleDoctorFlush();
+};
+
 export const applyLocalPreferenceAndMaybePurge = (_enabled: boolean): void => {
-  // A local choice starts a new window but cannot lift a cloud suspension.
+  // A local choice starts a new tail window and cannot lift a cloud
+  // suspension. Opt-out and opt-in both discard so records written while
+  // explicitly disabled are never backfilled; pre-consent backfill is only
+  // armed from onBootstrapReportingPolicy.
   discardReportingWindow();
 };
 
@@ -959,9 +1059,29 @@ export const onBootstrapReportingPolicy = (
   const recovering = cloudSuspended || revokedAtPolicyRevision !== null;
   cloudSuspended = false;
   revokedAtPolicyRevision = null;
-  const cursor = readCursor();
-  if (recovering || cursor === null || !cursorMatchesScope(cursor, scope)) {
+  // Recovery from an explicit cloud disable/revoke must not backfill the
+  // opted-out period (discard-on-disable left those records after the old
+  // cursor; jumping to the current tip drops them).
+  if (recovering) {
     discardReportingWindow();
+    return;
+  }
+  const cursor = readCursor();
+  if (cursor === null) {
+    openReportingWindowWithLookback();
+    return;
+  }
+  if (!cursorMatchesScope(cursor, scope)) {
+    const sameIdentity =
+      cursor.origin_scope === scope.originScope &&
+      cursor.account_scope === scope.accountScope;
+    // Same account/origin with a new generation is the typical first-consent
+    // transition (cursor was stamped with generation null before policy
+    // arrived). Look back so onboarding failures recorded pre-consent upload.
+    // A different account or origin still discards — the journal is shared
+    // on the machine and must not leak another identity's records.
+    if (sameIdentity) openReportingWindowWithLookback();
+    else discardReportingWindow();
     return;
   }
   if (hasEligibleUnconsumedWork()) scheduleDoctorFlush();

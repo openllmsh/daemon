@@ -346,9 +346,15 @@ enabled; explicit false stays off), without an environment rollout switch.
 Cloud denial suspends reporting in memory; it never rewrites the saved machine
 choice. An upload authorization rejection requires a fresh successful eligible
 bootstrap before retrying. Refresh revisions reject delayed bootstrap callbacks,
-and transition revisions fence stale upload completions. Suspension and recovery
+and transition revisions fence stale upload completions. Explicit opt-out
+(local disable or cloud `enabled === false`) and recovery from that suspension
 purge pending reports and move the cursor to the current tail, so disabled-period
-history is not replayed; ordinary same-generation refreshes retain pending retries.
+history is not replayed. The first allow after consent — no cursor, or a
+same-account/origin generation change (typical pre-policy → policy stamp) —
+instead rewinds the cursor by the pending-spool TTL (`DOCTOR_REPORT_PENDING_TTL_MS`,
+24h) and schedules a flush so onboarding failures recorded before consent are
+backfilled; an account or origin change still discards so one identity cannot
+upload another's journal lines. Ordinary same-generation refreshes retain pending retries.
 Historical local opt-outs and malformed existing preference files remain disabled.
 Delivery uses one active timer: observation debounce (`DOCTOR_REPORT_DEBOUNCE_MS`)
 or upload backoff (bounded by `DOCTOR_REPORT_MAX_BACKOFF_MS`), never both.
