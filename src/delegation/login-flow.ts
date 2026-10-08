@@ -658,7 +658,7 @@ ${body}`
   if (isInnerSpawnDenied(res.captured, res.exitCode)) {
     return { code: "spawn_denied", message: titled, retryable: false };
   }
-  if (isCliRuntimeMissingOutput(res.captured)) {
+  if (res.crashed && isCliRuntimeMissingOutput(res.captured)) {
     const message =
       crashDetail !== undefined
         ? crashDetail(res.captured, res.exitCode)

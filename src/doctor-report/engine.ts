@@ -1074,11 +1074,12 @@ export const onBootstrapReportingPolicy = (
   if (!cursorMatchesScope(cursor, scope)) {
     const sameIdentity =
       cursor.origin_scope === scope.originScope &&
-      cursor.account_scope === scope.accountScope;
+      cursor.account_scope === scope.accountScope &&
+      cursor.generation === null;
     // Same account/origin with a new generation is the typical first-consent
     // transition (cursor was stamped with generation null before policy
     // arrived). Look back so onboarding failures recorded pre-consent upload.
-    // A different account or origin still discards — the journal is shared
+    // A replaced (non-null) generation or a different account/origin discards — the journal is shared
     // on the machine and must not leak another identity's records.
     if (sameIdentity) openReportingWindowWithLookback();
     else discardReportingWindow();

@@ -1,7 +1,7 @@
 /**
  * Shared filesystem-path helpers for the daemon.
  */
-import { closeSync, existsSync, openSync, readSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 
@@ -75,7 +75,16 @@ const SHEBANG_READ_BYTES = 512;
  * Supports `#!/usr/bin/env node`, `#!/usr/bin/env -S node --flag`, and absolute
  * interpreters. Returns null when the file is not a shebang script.
  */
-export const parseShebangInterpreter = (shebangLine: string): string | null => {
+export const parseShebangInterpreter = (shebangLine: string): string | null =>
+  parseShebang(shebangLine)?.interpreter ?? null;
+
+type TShebang = {
+  readonly interpreter: string;
+  /** `PATH=` assigned by `env` before the command, if any. */
+  readonly envPath: string | null;
+};
+
+const parseShebang = (shebangLine: string): TShebang | null => {
   const trimmed = shebangLine.trimEnd();
   if (!trimmed.startsWith("#!")) return null;
   const body = trimmed.slice(2).trim();
@@ -86,6 +95,7 @@ export const parseShebangInterpreter = (shebangLine: string): string | null => {
   if (prog === undefined) return null;
   if (basename(prog) === "env") {
     let i = 1;
+    let envPath: string | null = null;
     // `env -S` / `env -i` / `env --split-string` — skip short flags until the
     // command name. Unknown long options stop the scan rather than invent one.
     while (i < tokens.length) {
@@ -102,6 +112,7 @@ export const parseShebangInterpreter = (shebangLine: string): string | null => {
       }
       // `NAME=value` environment assignments precede the command.
       if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+        if (t.startsWith("PATH=")) envPath = t.slice("PATH=".length);
         i += 1;
         continue;
       }
@@ -112,14 +123,19 @@ export const parseShebangInterpreter = (shebangLine: string): string | null => {
       break;
     }
     const cmd = tokens[i];
-    return cmd !== undefined && cmd.length > 0 ? cmd : null;
+    return cmd !== undefined && cmd.length > 0
+      ? { interpreter: cmd, envPath }
+      : null;
   }
-  return prog;
+  return { interpreter: prog, envPath: null };
 };
 
 const readShebangLine = (binPath: string): string | null => {
   let fd: number | null = null;
   try {
+    // Directories / FIFOs / devices are never a host CLI — and opening a FIFO
+    // would block discovery.
+    if (!statSync(binPath).isFile()) return null;
     // Read only the header: a native CLI can be hundreds of MB.
     fd = openSync(binPath, "r");
     const buf = Buffer.alloc(SHEBANG_READ_BYTES);
@@ -143,8 +159,18 @@ const readShebangLine = (binPath: string): string | null => {
   }
 };
 
-const interpreterResolves = (interpreter: string): boolean => {
+const interpreterResolves = (
+  interpreter: string,
+  envPath: string | null,
+): boolean => {
   if (isAbsolute(interpreter)) return existsSync(interpreter);
+  // `env PATH=…` searches only the assigned PATH, not the daemon's.
+  if (envPath !== null) {
+    return envPath
+      .split(delimiter)
+      .filter((d) => d.length > 0)
+      .some((d) => existsSync(join(d, interpreter)));
+  }
   return resolveOnPath(interpreter).length > 0;
 };
 
@@ -157,6 +183,11 @@ export const inspectHostCliRuntime = (
   binPath: string,
 ): THostCliRuntime | null => {
   if (!existsSync(binPath)) return null;
+  try {
+    if (!statSync(binPath).isFile()) return null;
+  } catch {
+    return null;
+  }
   const shebang = readShebangLine(binPath);
   if (shebang === null) {
     return {
@@ -165,8 +196,8 @@ export const inspectHostCliRuntime = (
       interpreterResolved: true,
     };
   }
-  const interpreter = parseShebangInterpreter(shebang);
-  if (interpreter === null) {
+  const parsed = parseShebang(shebang);
+  if (parsed === null) {
     // Shebang present but unparseable — do not treat as a usable host CLI.
     return {
       kind: "script",
@@ -176,8 +207,8 @@ export const inspectHostCliRuntime = (
   }
   return {
     kind: "script",
-    interpreter: basename(interpreter),
-    interpreterResolved: interpreterResolves(interpreter),
+    interpreter: basename(parsed.interpreter),
+    interpreterResolved: interpreterResolves(parsed.interpreter, parsed.envPath),
   };
 };
 
