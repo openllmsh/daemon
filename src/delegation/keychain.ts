@@ -1705,6 +1705,20 @@ const noteUnlockSuccess = (kc: string): TStoreRead<void> => {
   transientTimeouts.delete(kc);
   observeTransientTimeouts.delete(kc);
   recordUnlockSuccessForSkip(kc);
+  // Login-scoped only: the doctor allowlist already accepts these store_*
+  // fields + phase=readiness. Emitting under the login correlation id makes the
+  // next fresh-keychain incident diagnosable without paths/stderr.
+  const correlation_id = currentLoginCommandCorrelation();
+  if (correlation_id !== undefined) {
+    logInfo("keychain", safeDiagnosticMessage`keychain ready`, undefined, {
+      phase: "readiness",
+      outcome: "succeeded",
+      store_operation: "unlock",
+      store_stage: "final",
+      store_result: "succeeded",
+      correlation_id,
+    });
+  }
   return READY;
 };
 
@@ -1749,7 +1763,8 @@ const ensureKeychainNow = async (
     existedAtStart && !initialExistingKeychainUnlocks.has(kc);
   if (isInitialExistingUnlock) initialExistingKeychainUnlocks.add(kc);
   if (!existedAtStart) {
-    if (!(await createIsolatedKeychain(home, kc, signal))) {
+    const created = await createIsolatedKeychain(home, kc, signal);
+    if (!created) {
       logKeychainFailure(kc);
       return noteTransientFailure(kc, "keychain_create_failed");
     }
@@ -1757,6 +1772,10 @@ const ensureKeychainNow = async (
       logKeychainFailure(kc);
       return noteTransientFailure(kc, "keychain_create_failed");
     }
+    // createIsolatedKeychain already unlocked the final store. A second
+    // unlock here has failed in the field after a healthy create and then
+    // parked every Connect behind readiness backoff (G1).
+    return noteUnlockSuccess(kc);
   }
   // Unlock at the FINAL path (securityd keys unlock state by path). Unlocking
   // the reserved name by explicit path is fine — only `create-keychain` at it
@@ -2034,10 +2053,35 @@ export const resetKeychainStateForTests = (): void => {
  * credential without the "Keychain Not Found" dialog. Returns the same
  * tri-state as `ensureKeychainReady` — prompt-capable vendor login must not
  * spawn unless this is `present`.
+ *
+ * This is the EXPLICIT demand path (browser/CLI Connect). A prior transient
+ * unlock/create failure must not make the next user click fail instantly from
+ * readiness backoff — clear the active ensure backoff and re-attempt once.
+ * Passive observe + refresh keep their own backoff via
+ * {@link observeKeychainReady} / {@link ensureKeychainReady}.
  */
 export const ensureIsolatedKeychain = async (
   home: string,
-): Promise<TStoreRead<void>> => ensureKeychainReady(home);
+): Promise<TStoreRead<void>> => {
+  if (MAC) {
+    const kc = loginKeychainPath(home);
+    if (transientTimeouts.has(kc)) {
+      transientTimeouts.delete(kc);
+      const correlation_id = currentLoginCommandCorrelation();
+      logInfo(
+        "keychain",
+        safeDiagnosticMessage`keychain readiness demand reattempt`,
+        undefined,
+        {
+          phase: "readiness",
+          outcome: "unknown",
+          ...(correlation_id !== undefined ? { correlation_id } : {}),
+        },
+      );
+    }
+  }
+  return ensureKeychainReady(home);
+};
 
 /**
  * `security set-key-partition-list` matched no item. `-s` selects symmetric
@@ -2072,7 +2116,7 @@ export const grantKeychainToolAccess = async (
   if (res.code === 0) {
     logInfo(
       "keychain",
-      safeDiagnosticMessage`keychain grant succeeded`,
+      safeDiagnosticMessage`keychain grant persisted`,
       undefined,
       toStoreObservation({
         operation: "grant",
