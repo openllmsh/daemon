@@ -208,7 +208,10 @@ export const inspectHostCliRuntime = (
   return {
     kind: "script",
     interpreter: basename(parsed.interpreter),
-    interpreterResolved: interpreterResolves(parsed.interpreter, parsed.envPath),
+    interpreterResolved: interpreterResolves(
+      parsed.interpreter,
+      parsed.envPath,
+    ),
   };
 };
 
