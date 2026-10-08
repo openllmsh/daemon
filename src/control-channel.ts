@@ -1314,7 +1314,9 @@ export const migrateIfRelayMoved = async (
   if (current === null) return;
   let freshUrl: string;
   try {
-    freshUrl = (await fetchChannel()).wss_url;
+    // Probe — not a dial. Marks the request so cloud skips `daemon_connected`
+    // (F6: otherwise every healthy daemon emits ~60/h from this 45s check).
+    freshUrl = (await fetchChannel({ purpose: "probe" })).wss_url;
   } catch {
     return; // keyless / cloud unreachable — nothing to migrate to
   }

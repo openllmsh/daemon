@@ -385,6 +385,21 @@ export const fetchVideoJobPlan = async (
 };
 
 /**
+ * Why this channel fetch is happening.
+ *
+ * - `dial` (default): a real (re)connect — cloud fires `daemon_connected`.
+ * - `probe`: the healthy-socket migration check (`migrateIfRelayMoved`) —
+ *   cloud skips `daemon_connected` so the 45s probe does not pollute the
+ *   onboarding funnel (~60 events/h/daemon). Older daemons that omit the
+ *   flag keep firing (acceptable until they update).
+ */
+export type TFetchChannelPurpose = "dial" | "probe";
+
+export type TFetchChannelOptions = {
+  readonly purpose?: TFetchChannelPurpose;
+};
+
+/**
  * Ask the cloud for a relay channel: `GET /api/daemon/channel`. Returns the
  * stable per-env WSS URL + a short-lived connect ticket the daemon presents in
  * its `hello` frame. The daemon then holds ONE WebSocket to the relay — its
@@ -394,8 +409,16 @@ export const fetchVideoJobPlan = async (
  * be collapsed into InvalidApiKeyError, or a soft cap looks like a bad key).
  * See `docs/proposals/daemon-relay-websocket-push.md`.
  */
-export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
-  const resp = await cloudFetch(cloudUrl("/api/daemon/channel"), {
+export const fetchChannel = async (
+  options?: TFetchChannelOptions,
+): Promise<TRelayChannelResponse> => {
+  const purpose: TFetchChannelPurpose =
+    options?.purpose === "probe" ? "probe" : "dial";
+  const path =
+    purpose === "probe"
+      ? "/api/daemon/channel?purpose=probe"
+      : "/api/daemon/channel";
+  const resp = await cloudFetch(cloudUrl(path), {
     method: "GET",
     headers: authHeaders(),
   });
