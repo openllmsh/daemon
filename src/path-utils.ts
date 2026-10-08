@@ -1,7 +1,7 @@
 /**
  * Shared filesystem-path helpers for the daemon.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 
@@ -108,9 +108,13 @@ export const parseShebangInterpreter = (shebangLine: string): string | null => {
 };
 
 const readShebangLine = (binPath: string): string | null => {
+  let fd: number | null = null;
   try {
-    const buf = readFileSync(binPath);
-    const slice = buf.subarray(0, Math.min(buf.length, SHEBANG_READ_BYTES));
+    // Read only the header: a native CLI can be hundreds of MB.
+    fd = openSync(binPath, "r");
+    const buf = Buffer.alloc(SHEBANG_READ_BYTES);
+    const read = readSync(fd, buf, 0, SHEBANG_READ_BYTES, 0);
+    const slice = buf.subarray(0, read);
     if (slice.length < 2 || slice[0] !== 0x23 || slice[1] !== 0x21) {
       return null;
     }
@@ -124,6 +128,8 @@ const readShebangLine = (binPath: string): string | null => {
     return Buffer.from(slice.subarray(0, end)).toString("utf8");
   } catch {
     return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
 };
 
