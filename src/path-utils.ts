@@ -95,6 +95,16 @@ export const parseShebangInterpreter = (shebangLine: string): string | null => {
         i += 1;
         continue;
       }
+      // `-u NAME` / `-C DIR` take a separate value; skip both tokens.
+      if (t === "-u" || t === "-C") {
+        i += 2;
+        continue;
+      }
+      // `NAME=value` environment assignments precede the command.
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+        i += 1;
+        continue;
+      }
       if (t.startsWith("-") && !t.startsWith("--")) {
         i += 1;
         continue;
