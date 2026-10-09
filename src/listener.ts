@@ -49,7 +49,7 @@ import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
 import { runImageEditWalker, runImageWalker } from "./image-walker";
-import { logWarn } from "./logger";
+import { logWarn, safeDiagnosticMessage } from "./logger";
 import {
   buildMediaDefaultRequest,
   materializeSelectedModel,
@@ -60,6 +60,7 @@ import {
 import type { TParsedMultipart } from "./multipart";
 import { parseMultipartBytes } from "./multipart";
 import {
+  originFailureDiagnostic,
   originFailureMessage,
   originFailureStatus,
   originFailureType,
@@ -458,10 +459,11 @@ export const handleInference = async (req: Request): Promise<Response> => {
   ): Response | "passthrough" | "throw" => {
     const decision = planFetchFailureAction(err, req.signal);
     if (decision.action === "origin-error") {
-      logWarn(
-        "listener",
-        `plan fetch ${decision.kind} for ${label} — not repeating the same origin`,
-      );
+      logWarn("listener", originFailureDiagnostic(decision.kind), {
+        stage: "plan_fetch",
+        kind: decision.kind,
+        label,
+      });
       return withCors(
         req,
         errorJson(
@@ -474,7 +476,8 @@ export const handleInference = async (req: Request): Promise<Response> => {
     if (decision.action === "throw") return "throw";
     logWarn(
       "listener",
-      `plan fetch failed for ${label} — passing through to origin (${err instanceof Error ? err.message : String(err)})`,
+      safeDiagnosticMessage`Plan fetch failed; passing through to origin.`,
+      { label, error: err instanceof Error ? err.message : String(err) },
     );
     return "passthrough";
   };

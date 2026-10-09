@@ -31,6 +31,7 @@ const STAGE_MESSAGE: Record<
   start: safeDiagnosticMessage`Native authentication started.`,
   child_wait: safeDiagnosticMessage`Native authentication child waiting.`,
   child: safeDiagnosticMessage`Native authentication child completed.`,
+  prompt: safeDiagnosticMessage`Native authentication prompt surfaced.`,
   prep_wait: safeDiagnosticMessage`Native authentication preparation waiting.`,
   prep: safeDiagnosticMessage`Native authentication preparation completed.`,
   verify_wait: safeDiagnosticMessage`Native authentication verification waiting.`,
@@ -41,7 +42,9 @@ const STAGE_MESSAGE: Record<
 const operationKindFromProducer = (
   producer: TNativeAuthProducer,
 ): TDoctorAuthOperationKind | undefined => {
-  if (producer === "claude-login") return "login";
+  if (producer === "claude-login" || producer === "stream-login") {
+    return "login";
+  }
   if (producer === "claude-logout") return "logout";
   if (producer === "claude-auth-status") return "status_probe";
   return undefined;
@@ -55,6 +58,8 @@ export type TNativeAuthLifecycleTimings = {
   readonly spawn_setup_ms?: number;
   readonly child_wait_ms?: number;
   readonly cleanup_ms?: number;
+  /** Child exit status when it exited before the expected stage. */
+  readonly root_exit_code?: number;
 } & TDoctorOutcomeLedger;
 
 export const createNativeAuthLifecycle = (
@@ -116,6 +121,9 @@ export const createNativeAuthLifecycle = (
                 : {}),
               ...(extras?.cleanup_ms !== undefined
                 ? { cleanup_ms: extras.cleanup_ms }
+                : {}),
+              ...(extras?.root_exit_code !== undefined
+                ? { root_exit_code: extras.root_exit_code }
                 : {}),
             },
             ...(correlation_id !== undefined ? { correlation_id } : {}),

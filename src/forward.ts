@@ -21,6 +21,7 @@ import { daemonEnv } from "./env";
 import { logWarn } from "./logger";
 import {
   classifyOriginThrow,
+  originFailureDiagnostic,
   originFailureMessage,
   originFailureStatus,
   originFailureType,
@@ -63,7 +64,7 @@ const fetchOrigin = async (
     clearTimeout(timer);
     const kind = classifyOriginThrow(err, inbound.signal);
     if (kind === null) throw err;
-    logWarn("forward", `origin ${kind}: ${originFailureMessage(kind)}`);
+    logWarn("forward", originFailureDiagnostic(kind), { kind });
     return errorJson(
       originFailureStatus(kind),
       originFailureMessage(kind),

@@ -211,7 +211,15 @@ export const maybeUpdateCli = async (
     recordAttempt("cli", latest);
     logInfo("cli-update", `updated openllm CLI ${current} → ${latest}`);
   } catch (err) {
-    logError("cli-update", err, { target, latest });
+    logError(
+      "cli-update",
+      safeDiagnosticMessage`CLI self-update apply failed.`,
+      {
+        target,
+        latest,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
     try {
       rmSync(tmp, { force: true });
     } catch {

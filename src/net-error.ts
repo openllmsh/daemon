@@ -12,6 +12,8 @@ import {
   isTransientNetworkError,
   TRANSIENT_NETWORK_CODES,
 } from "./crash-policy";
+import type { TSafeDiagnosticMessage } from "./doctor-report/message";
+import { safeDiagnosticMessage } from "./doctor-report/message";
 
 /** Resolver failures are transport for origin fetch; they are not process-fatal
  *  crash-policy codes (those are connect/reset/unreachable). */
@@ -143,6 +145,17 @@ export const originFailureMessage = (kind: TOriginFailureKind): string => {
   if (kind === "abort") return "client aborted request";
   if (kind === "timeout") return "origin timed out before headers";
   return "origin is unreachable";
+};
+
+/** Upload-safe (closed) diagnostic for an origin failure kind. */
+export const originFailureDiagnostic = (
+  kind: TOriginFailureKind,
+): TSafeDiagnosticMessage => {
+  if (kind === "abort")
+    return safeDiagnosticMessage`Origin request aborted by client.`;
+  if (kind === "timeout")
+    return safeDiagnosticMessage`Origin timed out before headers.`;
+  return safeDiagnosticMessage`Origin is unreachable.`;
 };
 
 export const originFailureType = (kind: TOriginFailureKind): string => {

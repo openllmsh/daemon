@@ -294,7 +294,9 @@ export type TNativeAuthProducer =
   | "claude-refresh"
   | "claude-auth-status"
   | "claude-login"
-  | "claude-logout";
+  | "claude-logout"
+  /** Browser-URL stream logins (cursor, codex) recorded by makeStreamConnect. */
+  | "stream-login";
 
 const nativeAuthOperationMeta = (
   operationId: string | undefined,

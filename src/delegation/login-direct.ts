@@ -16,6 +16,7 @@
  */
 
 import type { TSubscriptionProviderSlug } from "@openllmsh/protocol";
+import { classifyFailureOutput } from "@openllmsh/protocol";
 import type { TReapOutcome } from "../child-supervisor";
 import { opaqueDoctorCorrelation } from "../doctor-report/correlation";
 import { clearPendingAuth } from "../pending-auth";
@@ -31,6 +32,7 @@ import type {
 } from "./login-flow";
 import {
   booleanLoginVerify,
+  currentLoginCommandCorrelation,
   emitLoginFailed,
   emitLoginStarted,
   emitLoginSucceeded,
@@ -131,16 +133,7 @@ export const makeBlockingConnect = (
           return { connected: false, detail: "daemon update in progress" };
         }
         const correlation = opaqueDoctorCorrelation(flow.flowId);
-        const lifecycleProvider = (
-          [
-            "claude_code",
-            "chatgpt",
-            "kimi_code",
-            "grok",
-            "cursor",
-            "muse",
-          ] as const satisfies ReadonlyArray<TSubscriptionProviderSlug>
-        ).find((item) => item === cfg.provider);
+        const lifecycleProvider = lifecycleProviderOf(cfg.provider);
         const lifecycle =
           cfg.nativeAuth === undefined
             ? null
@@ -466,6 +459,34 @@ export type TStreamConnectConfig = {
  * its OWN browser, so we do NOT open a second tab) and let the process complete
  * the flow in the background; the status watcher flips the card on success.
  */
+const LIFECYCLE_PROVIDERS = [
+  "claude_code",
+  "chatgpt",
+  "kimi_code",
+  "grok",
+  "cursor",
+  "muse",
+] as const satisfies ReadonlyArray<TSubscriptionProviderSlug>;
+
+const lifecycleProviderOf = (
+  provider: string,
+): TSubscriptionProviderSlug | undefined =>
+  LIFECYCLE_PROVIDERS.find((item) => item === provider);
+
+/** Stage recorder for browser-URL stream logins (correlated to the flow). */
+const streamLoginLifecycle = (
+  provider: string,
+): ReturnType<typeof createNativeAuthLifecycle> => {
+  const correlation = currentLoginCommandCorrelation();
+  const slug = lifecycleProviderOf(provider);
+  return createNativeAuthLifecycle({
+    scope: "login",
+    producer: "stream-login",
+    ...(correlation !== undefined ? { operationId: correlation } : {}),
+    ...(slug !== undefined ? { provider: slug } : {}),
+  });
+};
+
 export const makeStreamConnect = (
   cfg: TStreamConnectConfig,
 ): (() => Promise<TConnectResult>) => {
@@ -481,8 +502,12 @@ export const makeStreamConnect = (
         mode: "browser",
       },
       async () => {
+        const lifecycle = streamLoginLifecycle(cfg.provider);
+        const readyMark = lifecycle.mark();
+        lifecycle.record("readiness_wait", readyMark);
         const ready = await cfg.beforeLogin?.();
         if (!loginReady(ready)) {
+          // finalizeLoginTerminal records the failed readiness + terminal.
           const flow = resolveLoginFlow(cfg.provider, "browser");
           finalizeLoginTerminal({
             flow,
@@ -499,7 +524,11 @@ export const makeStreamConnect = (
           });
           return { connected: false, detail: KEYCHAIN_NOT_READY_DETAIL };
         }
+        lifecycle.record("readiness", readyMark);
         cfg.onStart?.();
+        lifecycle.record("start");
+        const childMark = lifecycle.mark();
+        lifecycle.record("child_wait", childMark);
         const res = await spawnStreamLogin({
           provider: cfg.provider,
           slot: cfg.slot,
@@ -519,13 +548,27 @@ export const makeStreamConnect = (
         });
         if (res.found === null) {
           if (res.cancelled === true) {
+            lifecycle.record("terminal", undefined, { outcome: "cancelled" });
             return { connected: false, detail: "sign-in cancelled" };
           }
           if (res.spawnFailure === undefined) cfg.onParseFail?.(res.captured);
           const fail = streamLoginFail(cfg.failDetail, res, cfg.crashDetail);
+          lifecycle.record("child", childMark, {
+            outcome:
+              fail.code === "poll_expired" || fail.code === "prompt_timeout"
+                ? "timeout"
+                : "failed",
+            login_failure_code: fail.code,
+            failure_signature: classifyFailureOutput(res.captured),
+            ...(typeof res.exitCode === "number"
+              ? { root_exit_code: res.exitCode }
+              : {}),
+          });
           emitLoginFailed(res.flow, fail);
           return { connected: false, detail: fail.message };
         }
+        // Time-to-URL: how long the user waited before a link appeared.
+        lifecycle.record("prompt", childMark);
         cfg.onParsed?.(res.found.url);
         const flow =
           cfg.slot.flow() ?? resolveLoginFlow(cfg.provider, "browser");

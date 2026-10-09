@@ -223,8 +223,11 @@ const fileStat = (path: string): { size: number; id: TFileId } | null => {
   }
 };
 
+// Inode only: both journals live in one state directory, and st_dev is
+// assigned at mount time (macOS renumbers volumes across reboots), so
+// comparing it read an untouched journal as replaced and re-uploaded it whole.
 const sameId = (a: TFileId | null, b: TFileId | null): boolean =>
-  a !== null && b !== null && a.dev === b.dev && a.ino === b.ino;
+  a !== null && b !== null && a.ino === b.ino;
 
 const tailCursorForScope = (scope: {
   originScope: string;

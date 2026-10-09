@@ -262,7 +262,15 @@ export const maybeSelfUpdate = async (
       await drainDisposableChildren();
       process.exit(0);
     } catch (err) {
-      logError("self-update", err, { target, latest });
+      logError(
+        "self-update",
+        safeDiagnosticMessage`Daemon self-update apply failed.`,
+        {
+          target,
+          latest,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
       try {
         rmSync(tmp, { force: true });
       } catch {
