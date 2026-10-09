@@ -553,16 +553,21 @@ export const makeStreamConnect = (
           }
           if (res.spawnFailure === undefined) cfg.onParseFail?.(res.captured);
           const fail = streamLoginFail(cfg.failDetail, res, cfg.crashDetail);
+          const failOutcome =
+            fail.code === "poll_expired" || fail.code === "prompt_timeout"
+              ? "timeout"
+              : "failed";
           lifecycle.record("child", childMark, {
-            outcome:
-              fail.code === "poll_expired" || fail.code === "prompt_timeout"
-                ? "timeout"
-                : "failed",
+            outcome: failOutcome,
             login_failure_code: fail.code,
             failure_signature: classifyFailureOutput(res.captured),
             ...(typeof res.exitCode === "number"
               ? { root_exit_code: res.exitCode }
               : {}),
+          });
+          lifecycle.record("terminal", undefined, {
+            outcome: failOutcome,
+            login_failure_code: fail.code,
           });
           emitLoginFailed(res.flow, fail);
           return { connected: false, detail: fail.message };
