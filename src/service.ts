@@ -216,64 +216,23 @@ export const renderPlist = (binPath: string): string => {
 };
 
 /**
- * OS-sandbox half of the unit (`docs/proposals/daemon-os-sandbox-and-typed-
- * control.md` §3.3b) — the directives that are SAFE in a `systemctl --user`
- * unit, which is the only kind the daemon registers (it installs without root).
+ * OS-sandbox half of the unit — intentionally EMPTY.
  *
- * The daemon runs UNPRIVILEGED, so the systemd layer here is **seccomp/prctl
- * only**. The earlier set included capability- and mount-namespace directives
- * (`ProtectKernelModules`, `ProtectKernelTunables`, `ProtectControlGroups`,
- * `ProtectHome`, `ProtectSystem`, `ReadWritePaths`, `PrivateTmp`) — but a user
- * manager has no `CAP_SETPCAP`, so any directive that drops a capability makes
- * the unit fail at the CAPABILITIES exec step with `218/CAPABILITIES`
- * ("Failed to drop capabilities: Operation not permitted") and the daemon
- * crash-loops, never starting. The mount directives are likewise privilege-
- * dependent (they fail on distros that restrict unprivileged user namespaces,
- * e.g. Ubuntu 24.04's AppArmor default).
+ * The daemon registers a `systemctl --user` unit (it installs without root).
+ * In an unprivileged unit, every seccomp/prctl directive — `SystemCallFilter=`,
+ * `SystemCallArchitectures=`, `RestrictAddressFamilies=`, `RestrictNamespaces=`,
+ * `LockPersonality=`, `RestrictRealtime=` — IMPLIES `NoNewPrivileges=yes`
+ * (systemd.exec(5)), and no_new_privs is inherited by every descendant. The
+ * daemon's device-session PTYs are the user's real shell, so that flag broke
+ * `sudo` inside them ("The \"no new privileges\" flag is set"). Capability and
+ * mount directives were already impossible here (`218/CAPABILITIES`).
  *
- * So FILESYSTEM confinement is **Landlock's** job (`sandbox/landlock.ts`):
- * in-process, unprivileged, inherited across `execve` — it needs no systemd
- * mount/capability privileges and is the real FS boundary on Linux (proven by
- * `tests/sandbox`). The directives kept below all apply per-process via seccomp
- * filters / prctl, which an unprivileged user unit CAN do. Omitted entirely
- * when the kill switch (`OPENLLM_DAEMON_NO_SANDBOX=1`) is set at registration.
- *
- * NOTE: we deliberately do NOT set `MemoryDenyWriteExecute=` — Bun's JIT needs
- * writable-executable pages, so W^X must stay off; never add it.
+ * So the unit carries no hardening at all. FS confinement stays Landlock's job
+ * (`sandbox/landlock.ts`), applied PER CHILD through the `--sandbox-exec` shim
+ * — the PTY path is deliberately unwrapped, so it keeps full privilege
+ * escalation. Never add a directive that implies NoNewPrivileges back here.
  */
-export const renderUnitHardening = (): string => {
-  if (process.env.OPENLLM_DAEMON_NO_SANDBOX === "1") return "";
-  return `# --- OS sandbox: seccomp/prctl only (a --user unit can't drop caps
-# or set up mount namespaces; FS confinement is Landlock's job — see
-# packages/daemon/src/sandbox/landlock.ts). ---
-NoNewPrivileges=yes
-# AF_NETLINK: glibc getaddrinfo enumerates interfaces over netlink.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-RestrictNamespaces=yes
-LockPersonality=yes
-RestrictRealtime=yes
-# Do not enable RestrictSUIDSGID here: on Ubuntu systemd 259 it makes GNU tar's
-# openat2(RESOLVE_BENEATH) extraction path fail with ENOSYS. Landlock remains
-# the daemon's filesystem boundary.
-# The daemon self-restricts via Landlock at boot, so the seccomp allow-list MUST
-# keep those syscalls callable. The \`@sandbox\` GROUP only exists on systemd
-# >= 257 — on Debian 12 / Ubuntu 22.04|24.04 (systemd <= 256, most production
-# Linux) it is silently ignored ("Unknown system call group, ignoring: @sandbox"),
-# so the daemon's landlock_create_ruleset() hit the default action and was
-# SIGSYS-KILLED at boot → an endless Restart=always crash loop, killed before any
-# log flushed. Whitelist the three Landlock syscalls BY NAME (resolves on every
-# systemd) AND keep @sandbox for forward-compat. SystemCallErrorNumber=EPERM is
-# the belt-and-braces: a blocked syscall returns EPERM (the daemon's sandbox
-# apply fails OPEN) instead of crash-looping — so a future syscall gap degrades,
-# never kills.
-# GNU tar on current glibc uses openat2() while extracting verified integration
-# bundles. Name it explicitly because @system-service on supported systemd
-# releases does not consistently include it.
-SystemCallFilter=@system-service @sandbox landlock_create_ruleset landlock_add_rule landlock_restrict_self openat2
-SystemCallErrorNumber=EPERM
-SystemCallArchitectures=native
-`;
-};
+export const renderUnitHardening = (): string => "";
 
 /**
  * Restart policy for the systemd unit — exponential backoff with a hard ceiling

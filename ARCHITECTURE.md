@@ -994,13 +994,11 @@ Two orthogonal hardenings from
     (`sandbox_init` + child inheritance, `tests/sandbox`). Non-file ops stay
     allowed so the OAuth-browser + keychain login flows run.
 
-  The **systemd user unit** (`renderUnitHardening()` in `service.ts`) adds a
-  defense-in-depth SECCOMP layer ONLY — `NoNewPrivileges`,
-  `RestrictAddressFamilies`, `SystemCallFilter=@system-service @sandbox`, etc.
-  It deliberately carries no capability/mount directives: a `systemctl --user`
-  unit runs unprivileged and can't drop capabilities (`218/CAPABILITIES`) or
-  set up mount namespaces, so FS confinement is Landlock's job, not systemd's.
-  W^X stays off (`MemoryDenyWriteExecute` is absent — Bun's JIT needs it).
+  The **systemd user unit** (`renderUnitHardening()` in `service.ts`) carries
+  NO hardening directives. In a `systemctl --user` unit every seccomp/prctl
+  directive implies `NoNewPrivileges=yes`, inherited by device-session PTYs —
+  which broke `sudo` there; capability/mount directives fail with
+  `218/CAPABILITIES`. FS confinement is Landlock's job, per child.
 
   Posture rides every status push as `DaemonStatus.sandbox`
   (`enforced`/`off`/`unsupported`/`error` — fail-open with a loud log, never
