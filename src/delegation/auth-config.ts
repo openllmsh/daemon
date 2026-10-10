@@ -43,6 +43,7 @@ import { cliBin, cliEnv, cliRoot } from "../cli-paths";
 import { logDebug, logInfo } from "../logger";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { isOtherKimiRegionOrigin, kimiEndpoints } from "./kimi-region";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
 
 /** The persisted shape (all fields optional). */
@@ -199,7 +200,10 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     env: () => ({}),
   },
   kimi_code: {
-    origin: "https://api.kimi.com",
+    // Region-dependent (global `api.kimi.ai` by default) — see `kimi-region.ts`.
+    get origin(): string {
+      return kimiEndpoints().apiOrigin;
+    },
     // The managed "Kimi For Coding" subscription speaks the OpenAI wire
     // (`/coding/v1/chat/completions`) — the genuine endpoint the official
     // `kimi-code-cli` POSTs to. Captured live by driving `kimi -p ping` headless
@@ -285,7 +289,13 @@ export const defaultUpstreamUrl = (provider: TCliProvider): string =>
  *  absent so it's never served and gets re-captured. */
 const urlIsInference = (provider: TCliProvider, url: string): boolean => {
   try {
-    return CAPTURE[provider].match(new URL(url).pathname);
+    const parsed = new URL(url);
+    // A capture from the OTHER Kimi region (before a mainland → global switch)
+    // is stale; any other host change is a vendor migration and is followed.
+    if (provider === "kimi_code" && isOtherKimiRegionOrigin(parsed.origin)) {
+      return false;
+    }
+    return CAPTURE[provider].match(parsed.pathname);
   } catch {
     return false;
   }

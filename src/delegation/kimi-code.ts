@@ -10,7 +10,7 @@
  * `~/.openllm/cli/kimi_code/` with `KIMI_CODE_HOME` pointed inside it
  * (see cli-paths.ts), so it never touches the user's `~/.kimi-code`.
  * Verified against the Kimi Code CLI source (ref/kimi-code — Node/TS):
- *   - OAuth token at `<KIMI_CODE_HOME>/credentials/kimi-code.json`, shape
+ *   - OAuth token at the region's credential slot under `<KIMI_CODE_HOME>/credentials/`, shape
  *     { access_token, refresh_token, expires_at (epoch SECONDS), … }.
  *   - Device id `<KIMI_CODE_HOME>/device_id` (uuid4) — forwarded as
  *     X-Msh-Device-Id so the identity is the real CLI's, not forged.
@@ -28,12 +28,13 @@
  *     `X-Msh-Version`, `X-Msh-Device-Name` (hostname),
  *     `X-Msh-Device-Model`, `X-Msh-Os-Version` (os.release()),
  *     `X-Msh-Device-Id`.
- *   - Usage: GET https://api.kimi.com/coding/v1/usages.
+ *   - Usage: GET <region api origin>/coding/v1/usages (global `api.kimi.ai`
+ *     by default; `kimi-region.ts`).
  */
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
@@ -56,6 +57,7 @@ import {
   parseKimiModelList,
   skippedModelDiscovery,
 } from "./fetch-model-list";
+import { kimiEndpoints, writeKimiRegionMarker } from "./kimi-region";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { makeCancelConnect } from "./login-flow";
@@ -92,11 +94,7 @@ const USAGE_PATH = "/coding/v1/usages";
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
 // (constants.ts + oauth.ts). Same host + public client id the CLI uses,
 // so the daemon runs the CLI's own login, not a forged one.
-const OAUTH_HOST = (
-  process.env.KIMI_CODE_OAUTH_HOST ??
-  process.env.KIMI_OAUTH_HOST ??
-  "https://auth.kimi.com"
-).replace(/\/$/, "");
+// The host is REGION-dependent (`kimi-region.ts`; global/kimi.ai by default).
 const OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 // When the access token is within this window of `expires_at`, `readToken`
@@ -111,8 +109,7 @@ const REFRESH_LEEWAY_MS = 5 * 60_000;
 
 const { bin, env } = cliLaunch(PROVIDER);
 const kimiHome = (): string => cliConfigDir(PROVIDER);
-const credentialPath = (): string =>
-  join(kimiHome(), "credentials", "kimi-code.json");
+const credentialPath = (): string => kimiEndpoints().credentialPath;
 
 type TKimiToken = {
   readonly access_token?: string;
@@ -130,7 +127,6 @@ type TKimiToken = {
 // endpoint and written verbatim (never hardcoded). These are the CLI's stable
 // structural constants (ref/kimi-code `managed-kimi-code.ts`).
 const MANAGED_PROVIDER = "managed:kimi-code"; // KIMI_CODE_PROVIDER_NAME
-const MANAGED_OAUTH_KEY = "oauth/kimi-code"; // KIMI_CODE_OAUTH_KEY
 const MANAGED_ALIAS_PREFIX = "kimi-code"; // managedModelKey = `${this}/<id>`
 const configTomlPath = (): string => join(kimiHome(), "config.toml");
 
@@ -170,6 +166,7 @@ const provisionModelConfig = async (
       }))
       .filter((m) => m.id.length > 0 && Number.isInteger(m.ctx) && m.ctx > 0);
     if (models.length === 0) return false;
+    const { oauthKey, oauthHost } = kimiEndpoints();
     const lines: string[] = [
       `default_model = "${MANAGED_ALIAS_PREFIX}/${models[0].id}"`,
       "",
@@ -180,7 +177,11 @@ const provisionModelConfig = async (
       "",
       `[providers."${MANAGED_PROVIDER}".oauth]`,
       'storage = "file"',
-      `key = "${MANAGED_OAUTH_KEY}"`,
+      `key = "${oauthKey}"`,
+      // The CLI omits `oauth_host` only for the legacy mainland slot.
+      ...(oauthKey === "oauth/kimi-code"
+        ? []
+        : [`oauth_host = "${oauthHost}"`]),
     ];
     for (const m of models) {
       lines.push(
@@ -216,7 +217,8 @@ const ensureModelConfig = async (accessToken: string): Promise<void> => {
   // `kimi -p` would refresh against the wrong host.
   if (
     existing.includes(MANAGED_PROVIDER) &&
-    existing.includes(`base_url = "${base}"`)
+    existing.includes(`base_url = "${base}"`) &&
+    existing.includes(`key = "${kimiEndpoints().oauthKey}"`)
   ) {
     configEnsured = true;
     return;
@@ -297,7 +299,7 @@ const readStoredToken = async (): Promise<TStoredKimiToken> => {
 
 /**
  * The current access token from
- * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
+ * the region's credential slot under `<KIMI_CODE_HOME>/credentials/`, triggering the CLI's native
  * refresh when it's within the leeway of `expires_at`. Used by
  * `credentialForUpstream` so inference carries a live token. Passive `status()`
  * and default `usage()` must not call this — they would refresh and provision
@@ -436,7 +438,7 @@ const postForm = async (
   params: Record<string, string>,
   headers: Record<string, string>,
 ): Promise<{ status: number; data: Record<string, unknown> }> => {
-  const resp = await fetch(`${OAUTH_HOST}${path}`, {
+  const resp = await fetch(`${kimiEndpoints().oauthHost}${path}`, {
     method: "POST",
     headers: {
       ...headers,
@@ -532,9 +534,9 @@ const writeCredential = (wire: Record<string, unknown>): void => {
       typeof wire.token_type === "string" ? wire.token_type : "Bearer",
     expires_in: Number.isFinite(expiresIn) ? expiresIn : 0,
   };
-  const dir = join(kimiHome(), "credentials");
+  const { credentialPath: path, region } = kimiEndpoints();
+  const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, "kimi-code.json");
   const temp = join(dir, `.kimi-code-${process.pid}-${Date.now()}.tmp`);
   writeFileSync(temp, JSON.stringify(blob), { encoding: "utf-8", mode: 0o600 });
   // Same-directory rename is atomic: readers see either the old complete
@@ -549,6 +551,7 @@ const writeCredential = (wire: Record<string, unknown>): void => {
     }
     throw error;
   }
+  writeKimiRegionMarker(region);
 };
 
 // ─── /usages parsing ─────────────────────────────────────────────────────
@@ -986,6 +989,9 @@ export const kimiCodeDelegate: TProviderDelegate = {
     // Kimi's CLI has no spawnable logout (device-code only) — clear the
     // isolated credential file. The device_id is kept (stable per box).
     await rm(credentialPath(), { force: true }).catch(() => {});
+    // Drop the region pin too, so the next login lands on the default
+    // (global) region unless the user re-pins it.
+    await rm(join(kimiHome(), "region"), { force: true }).catch(() => {});
     noteAuthStoreIdentityChange(PROVIDER);
     const cleared = (await readToken()) === null;
     return cleared

@@ -1250,12 +1250,16 @@ connected/failed directly — the dashboard's Connect button stays in its
 - **kimi_code** — the Kimi CLI has NO spawnable login (sign-in is the
   in-TUI `/login`, which needs a raw-mode TTY), so the daemon drives
   Kimi's OWN device-code OAuth flow directly — the exact flow the CLI runs
-  internally (`packages/oauth`): POST `auth.kimi.com/api/oauth/
+  internally (`packages/oauth`): POST `<oauth host>/api/oauth/
   device_authorization` (same public client id) → `open` the
   verification URL (code pre-embedded) → background-poll
-  `/api/oauth/token` (grant_type=device_code) → write
-  `<KIMI_CODE_HOME>/credentials/kimi-code.json` in the CLI's exact wire
-  shape (+ persist `device_id`). The status watcher then flips the card to
+  `/api/oauth/token` (grant_type=device_code) → write the region's
+  credential slot under `<KIMI_CODE_HOME>/credentials/` in the CLI's exact
+  wire shape (+ persist `device_id` and the `region` marker). The region
+  (`delegation/kimi-region.ts`) defaults to **global** (`auth.kimi.ai` /
+  `api.kimi.ai`), unlike the CLI's own mainland default; `KIMI_CODE_OAUTH_HOST`,
+  a `<KIMI_CODE_HOME>/region` marker (`mainland-cn`), or a pre-existing legacy
+  mainland credential select mainland-cn (`auth.kimi.com` / `api.kimi.com`). The status watcher then flips the card to
   connected (~5s). `connect` returns immediately with the device code /
   URL; no terminal, no TUI. Passive `status()` reads the credential file
   once and does not refresh or provision `config.toml`.
